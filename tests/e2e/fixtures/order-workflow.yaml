@@ -1,0 +1,65 @@
+# Sample Order Processing Workflow
+#
+# This workflow demonstrates:
+# - Multi-step execution
+# - Action invocation from workflow steps
+# - Signal handling (for approval)
+# - Custom terminal states
+#
+# Flow:
+#   1. validate-order: Validate input data
+#   2. process-payment: Charge the customer (via @actions/charge)
+#   3. await-approval: Wait for manual approval signal (for high-value orders)
+#   4. fulfill-order: Ship the order (via @actions/ship)
+#   5. Complete or Rejected terminal
+
+kind: Workflow
+name: order-processing
+version: "1.0.0"
+
+# Idempotency ensures same order isn't processed twice
+idempotency: required
+
+# Custom terminal states
+terminals:
+  OrderCompleted:
+    status: completed
+  OrderRejected:
+    status: failed
+  PaymentFailed:
+    status: failed
+
+# Start step - entry point
+start:
+  run: "@actions/validate-order"
+  transitions:
+    success: process-payment
+    failure: flo.Failed
+
+# Named steps
+steps:
+  process-payment:
+    run: "@actions/charge-payment"
+    transitions:
+      success: check-approval-needed
+      failure: PaymentFailed
+
+  check-approval-needed:
+    run: "@actions/check-approval"
+    transitions:
+      success: fulfill-order
+      failure: await-approval
+
+  await-approval:
+    waitForSignal:
+      type: approval
+      timeoutMs: 3600000
+      onTimeout: OrderRejected
+    transitions:
+      success: fulfill-order
+
+  fulfill-order:
+    run: "@actions/ship-order"
+    transitions:
+      success: OrderCompleted
+      failure: flo.Failed

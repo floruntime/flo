@@ -1,0 +1,127 @@
+# Payment Processing Workflow with Inline Plans
+#
+# This workflow demonstrates:
+# - Inline plan definitions with multiple executors (fallback chain)
+# - Health-weighted executor selection
+# - Circuit breakers and rate limiting
+# - Result caching with invalidation triggers
+# - Async payment tracking with polling
+#
+# Flow:
+#   1. start: Execute charge-payment plan
+#   2. check_payment_status: Poll for status if async (with backoff)
+#   3. notify_customer: Send confirmation
+
+kind: Workflow
+name: payment-processing
+version: "1.0.0"
+namespace: prod
+
+# Plans are defined inline in the workflow
+plans:
+  charge-payment:
+    # How to select among executors when multiple are healthy
+    selection: health-weighted  # static-order | round-robin | random | health-weighted
+    
+    # Multiple executors for the same logical action (fallback chain)
+    executors:
+      - name: stripe-primary
+        action: "@actions/charge-stripe"
+        priority: 100
+        retry:
+          max_attempts: 3
+          backoff: exponential      # constant | linear | exponential | exponential-jitter
+          initial_delay_ms: 1000
+          max_delay_ms: 30000
+          within_ms: 120000         # Total time budget (optional)
+        breaker:
+          failure_threshold: 5      # Open after N failures
+          cooldown_ms: 30000        # Stay open this long
+          half_open_max_calls: 3    # Probes before closing
+        rate_limit:
+          max_per_second: 100
+          max_per_minute: 5000
+        tracking:
+          mode: async               # sync | async (if async, waits for webhook)
+          timeout_ms: 300000        # 5 min timeout for async
+
+      - name: adyen-fallback
+        action: "@actions/charge-adyen"
+        priority: 50                # Lower priority = tried second
+        retry:
+          max_attempts: 2
+          backoff: exponential-jitter
+          initial_delay_ms: 500
+          max_delay_ms: 10000
+
+    # Plan-level configurations
+    health:
+      window_ms: 300000             # 5 min rolling window
+      decay: 0.9                    # Weight recent samples more
+      min_samples: 10               # Min calls before health-weighted kicks in
+
+    cache:
+      ttl_ms: 3600000               # Cache successful results for 1 hour
+      key: "charge:{input.customer_id}:{input.idempotency_key}"
+      invalidate_on: ["payment.refunded", "customer.deleted"]
+
+    fallback:
+      value: '{"status": "declined", "reason": "all_providers_unavailable"}'
+      condition: exhausted          # exhausted | any_error
+
+    errors:
+      retryable: ["timeout", "rate_limited", "temporary_failure"]
+      fatal: ["invalid_card", "fraud_detected", "insufficient_funds"]
+
+# Workflow definition
+start:
+  run: "@plan/charge-payment"          # Reference the plan
+  input:
+    customer_id: "$.input.customer_id"
+    amount: "$.input.amount"
+    idempotency_key: "$.input.order_id"
+  transitions:
+    success: notify_customer
+    pending: check_payment_status      # Async payment needs status polling
+    failure: flo.Failed
+
+steps:
+  # Poll for payment status when async tracking is used
+  check_payment_status:
+    run: "@actions/check-payment-status"
+    input:
+      payment_id: "$.steps._start.output.payment_id"
+      provider: "$.steps._start.output.provider"
+    poll:
+      initialDelayMs: 2000        # Wait 2s before first check
+      maxAttempts: 30             # Check up to 30 times (5 minutes total max)
+      backoff: exponential        # Exponential backoff
+      baseDelayMs: 2000           # Start with 2s delays
+      maxDelayMs: 30000           # Cap at 30s between checks
+    transitions:
+      success: notify_customer
+      failure: payment_failed
+      timeout: payment_timeout    # Max attempts exceeded
+
+  notify_customer:
+    run: "@actions/send-notification"
+    input:
+      customer_id: "$.input.customer_id"
+      template: "payment_success"
+      payment_id: "$.steps._start.output.payment_id"
+    transitions:
+      success: flo.Completed
+      failure: flo.Completed      # Notification failure shouldn't fail workflow
+
+terminals:
+  payment_failed:
+    status: failed
+    output:
+      reason: "$.steps.check_payment_status.output.error"
+      payment_id: "$.steps._start.output.payment_id"
+
+  payment_timeout:
+    status: failed
+    output:
+      reason: "Payment confirmation timed out"
+      payment_id: "$.steps._start.output.payment_id"

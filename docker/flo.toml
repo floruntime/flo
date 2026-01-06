@@ -1,0 +1,24 @@
+# Flo Server Configuration (Docker)
+# Override by mounting your own config: -v ./my-flo.toml:/etc/flo/flo.toml
+
+[server]
+port = 9000
+bind = "0.0.0.0"
+data_dir = "/data/flo"
+shards = 0  # auto-detect CPU count
+
+[storage]
+hot_window_seconds = 90
+durability = "async_flush"
+
+[logging]
+level = "info"
+
+[metrics]
+enabled = true
+# port = 9001 (auto: listen_port + 1)
+
+[dashboard]
+enabled = true
+bind = "0.0.0.0"
+# port = 9002 (auto: listen_port + 2)

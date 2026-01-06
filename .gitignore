@@ -1,0 +1,49 @@
+# Build artifacts
+zig-out/
+zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Benchmark binaries
+bin/
+
+# Test artifacts
+test_check
+*.db
+*.wal
+*.sst
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.github/copilot-instructions.md
+
+.zig-cache/
+
+*.txt
+
+# Benchmark data
+.data/
+data/
+profiling-results/
+#docs/from-gemini.md
+old-code/
+src/old_storage/
+tests/old_storage/
+
+# Dashboard build artifacts
+src/node/dashboard/dist/
+
+# Dashboard generated files
+src/node/dashboard/dist/
+src/node/dashboard/assets.zig

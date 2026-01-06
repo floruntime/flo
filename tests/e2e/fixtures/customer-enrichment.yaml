@@ -1,0 +1,111 @@
+# Customer Enrichment Pipeline
+#
+# This workflow demonstrates:
+# - Multi-step data enrichment pipeline
+# - JSONPath expressions to access previous step outputs
+# - Search attributes for queryability
+# - Custom terminal states with output mapping
+#
+# Flow:
+#   1. start: Validate input data
+#   2. enrich_company: Add company data
+#   3. enrich_social: Add social data
+#   4. score_lead: Calculate lead score
+#   5. store_result: Persist enriched profile
+
+kind: Workflow
+name: customer-enrichment
+version: "1.0.0"
+namespace: prod
+
+# Input schema is OPTIONAL - $.input still resolves from actual runtime input
+# If provided, Flo validates input against schema before execution
+# input:
+#   type: object
+#   properties:
+#     customer_id: { type: string }
+#     raw_data: { type: object }
+
+# Make certain fields queryable (extracted from $.input at runtime)
+searchAttributes:
+  - name: customer_id
+    type: string
+    path: $.input.customer_id
+
+# Start step (special - entry point)
+start:
+  run: "@actions/data-validator"
+  input:  # OPTIONAL - if omitted, $.input is passed as-is
+    raw_data: "$.input.raw_data"
+    rules: ["required_fields", "format_check"]
+  transitions:
+    success: enrich_company
+    failure: validation_failed
+
+steps:
+  # Step 2: Enrich with company data (accesses step 1 output)
+  enrich_company:
+    run: "@actions/company-enricher"
+    input:
+      # Access output from previous step (start)
+      # Note: start step output is at $.steps._start.output
+      normalized_data: "$.steps._start.output.normalized"
+      customer_id: "$.input.customer_id"
+    transitions:
+      success: enrich_social
+      failure: enrichment_failed
+
+  # Step 3: Enrich with social data (accesses step 2 output)
+  enrich_social:
+    run: "@actions/social-enricher"
+    input:
+      # Access company-enriched data from step 2
+      company_data: "$.steps.enrich_company.output"
+      email: "$.steps.enrich_company.output.email"
+    transitions:
+      success: score_lead
+      failure: enrichment_failed
+
+  # Step 4: Score the lead (accesses multiple previous steps)
+  score_lead:
+    run: "@actions/lead-scorer"
+    input:
+      # Can access ANY previous step's output
+      original: "$.input.raw_data"
+      validated: "$.steps._start.output"
+      company: "$.steps.enrich_company.output"
+      social: "$.steps.enrich_social.output"
+    transitions:
+      success: store_result
+      failure: scoring_failed
+
+  # Step 5: Store final result
+  store_result:
+    run: "@actions/data-store"
+    input:
+      customer_id: "$.input.customer_id"
+      enriched_profile: "$.steps.score_lead.output"
+      metadata:
+        pipeline_version: "1.0.0"
+        processed_at: "$.flo.timestamp"
+    transitions:
+      success: pipeline_complete
+      failure: flo.Failed
+
+terminals:
+  pipeline_complete:
+    status: completed
+    output:
+      customer_id: "$.input.customer_id"
+      profile: "$.steps.score_lead.output"
+      
+  validation_failed:
+    status: failed
+    output:
+      error: "$.steps._start.output.error"
+      
+  enrichment_failed:
+    status: failed
+  
+  scoring_failed:
+    status: failed

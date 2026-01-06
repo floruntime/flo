@@ -1,0 +1,48 @@
+# Account Reconciliation Workflow (Scheduled)
+#
+# This workflow runs automatically every 6 hours via the embedded cron schedule.
+# It reconciles accounts by running a full reconciliation action and then
+# generating a report.
+#
+# Schedule behavior:
+#   - Runs every 6 hours (cron: "0 */6 * * *")
+#   - At most 1 concurrent run at a time
+#   - Can be disabled/enabled at runtime:
+#       flo workflow disable reconcile-accounts
+#       flo workflow enable reconcile-accounts
+#
+# When disabled:
+#   - The cron schedule is paused (no new runs are started)
+#   - Manual starts via `flo workflow start` are also blocked
+#   - Existing running instances are NOT affected
+#
+# When re-enabled:
+#   - The cron schedule resumes from the next fire time
+#   - Manual starts are allowed again
+
+kind: Workflow
+name: reconcile-accounts
+version: "1.0.0"
+
+schedule:
+  cron: "0 */6 * * *"       # every 6 hours
+  max_concurrent: 1
+  input: '{"mode": "full"}'
+
+search_attributes:
+  - name: reconciliation_mode
+    type: string
+    from: input.mode
+
+start:
+  run: "@actions/reconcile"
+  transitions:
+    success: generate_report
+    failure: flo.Failed
+
+steps:
+  generate_report:
+    run: "@actions/reconcile-report"
+    transitions:
+      success: flo.Completed
+      failure: flo.Failed

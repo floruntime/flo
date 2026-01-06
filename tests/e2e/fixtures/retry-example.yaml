@@ -1,0 +1,56 @@
+# Retry Policy Example Workflow
+#
+# This workflow demonstrates different ways to use the retry block:
+# 1. On a direct action step
+# 2. Inside an inline plan for specific executors
+#
+# Retry parameters:
+#   - max_attempts: Maximum number of times to try (including first attempt)
+#   - backoff: exponential | linear | constant | exponential_jitter
+#   - initial_delay_ms: Delay before first retry
+#   - max_delay_ms: Maximum delay cap for backoff
+#   - within_ms: Total time budget for all retries (optional)
+
+kind: Workflow
+name: retry-example
+version: "1.0.0"
+
+# Example 1: Retry on an action step
+start:
+  run: "@actions/unreliable-service"
+  retry:
+    max_attempts: 5
+    backoff: exponential_jitter
+    initial_delay_ms: 500
+    max_delay_ms: 10000
+  transitions:
+    success: next_step
+    failure: flo.Failed
+
+steps:
+  next_step:
+    run: "@plan/resilient-plan"
+    transitions:
+      success: flo.Completed
+      failure: flo.Failed
+
+# Example 2: Retry inside an inline plan
+plans:
+  resilient-plan:
+    selection: static-order
+    executors:
+      - name: primary
+        run: "@actions/primary-backend"
+        priority: 100
+        retry:
+          max_attempts: 3
+          backoff: linear
+          initial_delay_ms: 1000
+      
+      - name: secondary
+        run: "@actions/secondary-backend"
+        priority: 50
+        retry:
+          max_attempts: 2
+          backoff: constant
+          initial_delay_ms: 2000

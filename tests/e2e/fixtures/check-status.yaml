@@ -1,0 +1,66 @@
+# Bank Transfer Workflow with Polling
+#
+# This workflow demonstrates the poll feature for checking external system status.
+# Many external systems (banks, payment processors) don't support webhooks,
+# so we need to poll for transfer status until completion.
+#
+# Flow:
+#   1. initiate_transfer: Start the bank transfer
+#   2. finalize: Complete the transfer (if success)
+#   3. check_status: Poll for status if pending (with exponential backoff)
+#
+# Poll behavior:
+#   - When action returns "pending" outcome, automatically re-executes
+#   - Uses exponential backoff between attempts
+#   - After max_attempts exceeded, outcome becomes "timeout"
+
+kind: Workflow
+name: bank-transfer-with-polling
+version: "1.0.0"
+namespace: prod
+
+start:
+  run: "@actions/initiate-transfer"
+  transitions:
+    success: finalize
+    pending: check_status
+    failure: flo.Failed
+
+steps:
+  check_status:
+    run: "@actions/check-transfer-status"
+    input:
+      transfer_id: "$.steps._start.output.transfer_id"
+    poll:
+      initialDelayMs: 5000      # Wait 5s before first poll
+      maxAttempts: 10           # Max 10 poll attempts
+      backoff: exponential      # constant | linear | exponential | exp-jitter
+      baseDelayMs: 1000         # Start with 1s delay
+      maxDelayMs: 60000         # Cap at 60s between polls
+    transitions:
+      success: finalize         # Transfer completed successfully
+      failure: transfer_failed  # Transfer failed
+      timeout: transfer_timeout # Max attempts exceeded, still pending
+
+  finalize:
+    run: "@actions/finalize-transfer"
+    input:
+      transfer_id: "$.steps._start.output.transfer_id"
+      status: "$.steps.check_status.output.status"
+    transitions:
+      success: flo.Completed
+      failure: flo.Failed
+
+terminals:
+  transfer_failed:
+    status: failed
+    output:
+      reason: "$.steps.check_status.output.error"
+      transfer_id: "$.steps._start.output.transfer_id"
+
+  transfer_timeout:
+    status: failed
+    output:
+      reason: "Transfer status check timed out after max poll attempts"
+      transfer_id: "$.steps._start.output.transfer_id"
+      last_status: "$.steps.check_status.output.status"

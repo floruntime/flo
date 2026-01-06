@@ -1,0 +1,23 @@
+services:
+  flo:
+    image: ghcr.io/floruntime/flo:latest
+    container_name: flo
+    ports:
+      - "9000:9000"   # Client API (server.port)
+      - "9001:9001"   # Metrics (listen_port + 1)
+      - "9002:9002"   # Dashboard (listen_port + 2)
+      # - "9500:9500" # Raft RPC (listen_port + 500, only for clustering)
+    volumes:
+      - flo-data:/data/flo
+      # Mount our local config which sets dashboard bind to 0.0.0.0
+      - ./flo.toml:/etc/flo/flo.toml
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  flo-data:
+    driver: local

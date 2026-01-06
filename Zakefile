@@ -1,0 +1,311 @@
+# Zakefile for Flo Storage (zflo)
+# High-performance storage engine written in Zig
+
+# ============================================================================
+# Building
+# ============================================================================
+
+## Build the project in debug mode
+build:
+    script:
+        echo "Building zflo (debug)..."
+        zig build
+
+## Build in release mode (optimized)
+build.release:
+    script:
+        echo "Building zflo (release)..."
+        zig build -Drelease=true
+
+## Build for production deployment
+build.prod:
+    arg: <target> [string?] "Target (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos)"
+    script:
+        let build_target = {{target}}
+        @if [ -z "{{build_target}}" ]; then
+            echo "Building for production (native)..."
+            zig build -Drelease=true
+        else
+            echo "Building for production ({{build_target}})..."
+            zig build -Drelease=true -Dtarget={{build_target}}
+        fi
+
+
+build.dashboard:
+    script:
+        echo "Building web dashboard..."
+        cd src/node/dashboard
+        npm install
+        npm run build
+        echo "✓ Dashboard build complete"
+
+## Clean build artifacts
+clean:
+    script:
+        echo "Cleaning build artifacts..."
+        rm -rf src/node/dashboard/dist src/node/dashboard/assets.zig zig-out zig-cache .zig-cache
+        echo "✓ Clean complete"
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+## Run all tests (unit + integration)
+test:
+    flag: --filter|-f [string?] "Test name pattern to match"
+    flag: --summary|-s [string="none"] "Summary level (all, none)"
+    script:
+        @
+            echo "Running all tests..."
+            if [ -z "{{filter}}" ]; then
+                zig build test --summary {{summary}}
+            else
+                zig build test -Dtest-filter="{{filter}}" --summary {{summary}}
+            fi
+        @
+
+## Run unit tests only
+test.unit:
+    flag: --filter|-f [string?] "Test name pattern to match"
+    flag: --summary|-s [string="none"] "Summary level (all, none)"
+    script:
+        @
+            echo "Running unit tests..."
+            if [ -z "{{filter}}" ]; then
+                zig build test-unit --summary all
+            else
+                zig build test-unit -Dtest-filter="{{filter}}" --summary {{summary}}
+            fi
+        @
+
+
+## Run integration tests only
+test.integration:
+    flag: --filter|-f [string?] "Test name pattern to match"
+    flag: --summary|-s [string="none"] "Summary level (all, none)"
+    script:
+        @
+            echo "Running integration tests..."
+            if [ -z "{{filter}}" ]; then
+                zig build test-integration --summary all
+            else
+                zig build test-integration -Dtest-filter="{{filter}}" --summary {{summary}}
+            fi
+        @
+
+
+## Run end-to-end tests (CLI → TCP → Server)
+test.e2e:
+    flag: --filter|-f [string?] "Test name pattern to match"
+    flag: --summary|-s [string="none"] "Summary level (all, none)"
+    script:
+        @
+            echo "Running e2e tests..."
+            echo "Note: This will build the flo binary and spawn it as a subprocess"
+            if [ -z "{{filter}}" ]; then
+                zig build test-e2e --summary all
+            else
+                zig build test-e2e -Dtest-filter="{{filter}}" --summary {{summary}}
+            fi
+        @
+
+
+# ============================================================================
+# Benchmarks - Storage Layer (Layer 3)
+# ============================================================================
+
+## Run StateEngine benchmark (in-memory HashMap)
+bench.state:
+    flag: --iterations|-n [string="100000"] "Number of iterations"
+    script:
+        echo "Running StateEngine benchmark..."
+        zig build bench-state -Drelease -- -n {{iterations}}
+
+## Run WAL benchmark (write-ahead log)
+bench.wal:
+    flag: --iterations|-n [string="50000"] "Number of iterations"
+    script:
+        echo "Running WAL benchmark..."
+        zig build bench-wal -Drelease -- -n {{iterations}}
+
+# ============================================================================
+# Benchmarks - Raft Layer (Layer 2)
+# ============================================================================
+
+## Run Raft propose/commit benchmark (single-node)
+bench.raft:
+    flag: --iterations|-n [string="10000"] "Number of iterations"
+    script:
+        echo "Running Raft benchmark..."
+        zig build bench-raft -Drelease -- -n {{iterations}}
+
+# ============================================================================
+# Benchmark Workflows
+# ============================================================================
+
+## Run all benchmarks (storage + raft)
+bench.all:
+    script:
+        echo "Running all benchmarks..."
+        echo ""
+        echo "1. StateEngine (in-memory)"
+        zig build bench-state -Drelease -- -n 50000
+        echo ""
+        echo "2. WAL (write-ahead log)"
+        zig build bench-wal -Drelease -- -n 20000
+        echo ""
+        echo "3. Raft (consensus)"
+        zig build bench-raft -Drelease -- -n 5000
+        echo ""
+        echo "✓ All benchmarks complete"
+
+## Run quick benchmarks (small iterations for CI)
+bench.quick:
+    script:
+        echo "Running quick benchmarks..."
+        echo ""
+        echo "StateEngine:"
+        zig build bench-state -Drelease -- -n 5000
+        echo ""
+        echo "WAL:"
+        zig build bench-wal -Drelease -- -n 2000
+        echo ""
+        echo "Raft:"
+        zig build bench-raft -Drelease -- -n 1000
+        echo ""
+        echo "✓ Quick benchmarks complete"
+
+# ============================================================================
+# Data Management
+# ============================================================================
+
+## Generate test data for benchmarks
+data:
+    arg: <num_keys> [string?] "Number of keys to generate (default: 1000000)"
+    script:
+        let keys = {{num_keys}}
+        @if [ -z "{{keys}}" ]; then
+            echo "Generating 1M keys for benchmark data..."
+            zig build generate-data -- 1000000
+        else
+            echo "Generating {{keys}} keys for benchmark data..."
+            zig build generate-data -- {{keys}}
+        fi
+        echo "✓ Data generation complete"
+
+## Clean benchmark data
+data.clean:
+    script:
+        echo "Cleaning benchmark data..."
+        rm -rf bench_data*.db
+        echo "✓ Benchmark data cleaned"
+
+# ============================================================================
+# Development
+# ============================================================================
+
+## Run the zflo CLI
+run:
+    arg: <command> [string?] "Command to run (start, bench, inspect, version)"
+    script:
+        let cmd = {{command}}
+        @if [ -z "{{cmd}}" ]; then
+            echo "Running zflo..."
+            zig build run
+        else
+            echo "Running zflo {{cmd}}..."
+            zig build run -- {{cmd}}
+        fi
+
+## Install zflo to system PATH
+install:
+    arch: macos
+    flag: --dir|-d [string="/opt/homebrew/bin"] "Install directory"
+    script:
+        ?@flo server stop
+        @rm -rf {{dir}}/flo
+        @zig build install-system -Dinstall_dir={{dir}}
+
+## Install zflo to system PATH (Linux)
+install:
+    arch: linux
+    flag: --dir|-d [string="$HOME/.local/bin"] "Install directory"
+    script:
+        @rm -rf {{dir}}/flo
+        @zig build install-system -Dinstall_dir={{dir}}
+
+## Format all Zig source files
+fmt:
+    script:
+        echo "Formatting Zig files..."
+        zig fmt src/
+        zig fmt bench/
+        zig fmt tests/
+        echo "✓ Formatting complete"
+
+## Check for compilation errors without building
+check:
+    script:
+        echo "Checking for compilation errors..."
+        zig build --help > /dev/null 2>&1 && echo "✓ Build file OK"
+        zig fmt --check src/ bench/ tests/ && echo "✓ Formatting OK" || echo "⚠ Run 'zake fmt' to format"
+
+# ============================================================================
+# Complete Workflows
+# ============================================================================
+
+## Complete development workflow (build + test + quick bench)
+dev:
+    script:
+        echo "Running complete development workflow..."
+        echo ""
+        echo "Step 1: Building..."
+        zig build
+        echo ""
+        echo "Step 2: Testing..."
+        zig build test --summary all
+        echo ""
+        echo "Step 3: Quick benchmark..."
+        zig build bench-state -Drelease -- -n 5000
+        echo ""
+        echo "✓ Development workflow complete"
+
+## Prepare for release (clean + build-release + test)
+release:
+    arg: <target> [string?] "Target platform (optional)"
+    script:
+        echo "Preparing release build..."
+        echo ""
+        echo "Step 1: Cleaning..."
+        rm -rf zig-out zig-cache .zig-cache
+        echo ""
+        echo "Step 2: Running tests..."
+        zig build test --summary all
+        echo ""
+        echo "Step 3: Building release..."
+        let build_target = {{target}}
+        @if [ -z "{{build_target}}" ]; then
+            zig build --release=fast
+        else
+            zig build --release=fast -Dtarget={{build_target}}
+        fi
+        echo ""
+        echo "✓ Release build complete"
+        @ls -lh zig-out/bin/
+
+## CI workflow (test + benchmarks)
+ci:
+    script:
+        echo "Running CI workflow..."
+        echo ""
+        echo "Step 1: Testing..."
+        zig build test --summary all
+        echo ""
+        echo "Step 2: Building release..."
+        zig build -Drelease
+        echo ""
+        echo "Step 3: Quick benchmarks..."
+        zig build bench-state -Drelease -- -n 5000
+        zig build bench-wal -Drelease -- -n 2000
+        echo ""
+        echo "✓ CI workflow complete"

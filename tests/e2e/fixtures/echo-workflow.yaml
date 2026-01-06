@@ -1,0 +1,18 @@
+# Simple Echo Workflow
+#
+# A minimal workflow that just invokes one action and completes.
+# Used for basic end-to-end testing of the workflow execution path.
+#
+# Flow:
+#   1. start: Run @actions/echo action
+#   2. Complete
+
+kind: Workflow
+name: echo-workflow
+version: "1.0.0"
+
+start:
+  run: "@actions/echo"
+  transitions:
+    success: flo.Completed
+    failure: flo.Failed
