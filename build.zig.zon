@@ -1,0 +1,17 @@
+.{
+    .name = .flo,
+    .version = "0.0.0",
+    .fingerprint = 0xa75e36e2f772bc4d,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .zware = .{
+            .url = "https://github.com/malcolmstill/zware/archive/master.tar.gz",
+            .hash = "zware-0.0.1-ZA7j6QwqBQA3LRAg37cZYusj_JRPY-rMAMOSQAOs_7Hh",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
