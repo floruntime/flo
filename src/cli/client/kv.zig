@@ -6,7 +6,7 @@
 const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
-const proto = @import("../../node/protocol/proto.zig");
+const proto = @import("../../protocol/proto.zig");
 
 /// Execute a GET command
 /// - wait_ms: Wait until exists (returns immediately if key exists, else waits)

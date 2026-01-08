@@ -22,3 +22,8 @@ test {
 test {
     _ = @import("protocol/proto.zig");
 }
+
+// Node layer — Phase 1
+test {
+    _ = @import("node/reactor.zig");
+}

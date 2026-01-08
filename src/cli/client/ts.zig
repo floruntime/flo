@@ -14,7 +14,7 @@ const std = @import("std");
 const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
-const proto = @import("../../node/protocol/proto.zig");
+const proto = @import("../../protocol/proto.zig");
 
 /// Write a single data point (single or multi-field)
 /// Fields format: "field1=1.0,field2=2.0" or just "1.0" for single-field

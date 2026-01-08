@@ -7,8 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
-const proto = @import("../../node/protocol/proto.zig");
-const RequestBuilder = @import("../../node/protocol/request_builder.zig").RequestBuilder;
+const proto = @import("../../protocol/proto.zig");
+const RequestBuilder = @import("../../protocol/request_builder.zig").RequestBuilder;
 
 /// Default connection timeout in seconds
 const CONNECTION_TIMEOUT_SEC: u32 = 5;

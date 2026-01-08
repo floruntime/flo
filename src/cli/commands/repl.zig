@@ -11,7 +11,7 @@ const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 
-const proto = @import("../../node/protocol/proto.zig");
+const proto = @import("../../protocol/proto.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {

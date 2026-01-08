@@ -8,7 +8,7 @@ const base = @import("base.zig");
 const wire = @import("../../util/wire.zig");
 const Client = base.Client;
 const Response = base.Response;
-const proto = @import("../../node/protocol/proto.zig");
+const proto = @import("../../protocol/proto.zig");
 const FixedWireWriter = wire.FixedWireWriter;
 
 /// Enqueue a message to a queue

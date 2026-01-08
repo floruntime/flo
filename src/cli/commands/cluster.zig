@@ -8,7 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
-const proto = @import("../../node/protocol/proto.zig");
+const proto = @import("../../protocol/proto.zig");
 const output = @import("../output.zig");
 const net = std.net;
 
