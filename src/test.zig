@@ -26,4 +26,5 @@ test {
 // Node layer — Phase 1
 test {
     _ = @import("node/reactor.zig");
+    _ = @import("node/inbox.zig");
 }

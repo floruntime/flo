@@ -353,7 +353,7 @@ test "Reactor: timer fires" {
     try reactor.addTimer(99, 10);
 
     // Sleep a bit then poll
-    std.time.sleep(20 * std.time.ns_per_ms);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     const events = try reactor.poll(50);
     var timer_fired = false;
