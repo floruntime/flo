@@ -3,5 +3,6 @@
 
 pub const inbox = @import("inbox.zig");
 pub const manifest = @import("manifest.zig");
+pub const shard_manifest = @import("shard_manifest.zig");
 pub const reactor = @import("reactor.zig");
 pub const router = @import("router.zig");

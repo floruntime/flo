@@ -372,11 +372,24 @@ pub fn readManifest(dir: std.fs.Dir, buf: []u8) !?[]const u8 {
     return buf[0..end];
 }
 
-/// Load the latest snapshot from a directory.
+/// Result of loading a snapshot file.
+pub const SnapshotLoad = struct { data: []u8, reader: SnapshotReader };
+
+/// Load a snapshot by filename from a directory.
 /// Returns the raw snapshot bytes. Caller owns the allocation.
-pub fn loadLatestSnapshot(allocator: Allocator, dir: std.fs.Dir) !?struct { data: []u8, reader: SnapshotReader } {
+pub fn loadSnapshotByName(allocator: Allocator, dir: std.fs.Dir, filename: []const u8) !?SnapshotLoad {
+    return loadSnapshotFile(allocator, dir, filename);
+}
+
+/// Load the latest snapshot from a directory (reads MANIFEST for the filename).
+/// Returns the raw snapshot bytes. Caller owns the allocation.
+pub fn loadLatestSnapshot(allocator: Allocator, dir: std.fs.Dir) !?SnapshotLoad {
     var manifest_buf: [256]u8 = undefined;
     const filename = try readManifest(dir, &manifest_buf) orelse return null;
+    return loadSnapshotFile(allocator, dir, filename);
+}
+
+fn loadSnapshotFile(allocator: Allocator, dir: std.fs.Dir, filename: []const u8) !?SnapshotLoad {
 
     const file = dir.openFile(filename, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,

@@ -78,6 +78,8 @@ const stream_handler_mod = @import("../stream/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const snapshot_mod = @import("../storage/snapshot.zig");
+const shard_manifest = @import("shard_manifest.zig");
+const ShardManifest = shard_manifest.ShardManifest;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -271,56 +273,79 @@ pub const Shard = struct {
             const shard_dir = try std.fmt.allocPrint(allocator, "{s}/{d:0>5}", .{ dir, shard_id });
             errdefer allocator.free(shard_dir);
 
-            // Ensure directory exists
+            // Ensure shard dir and subdirectories exist
             std.fs.cwd().makePath(shard_dir) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // ── Snapshot-aware recovery ────────────────────────────────
-            // 1. Try loading a snapshot first → restores all projection state
-            // 2. Then replay only segments with entries after the snapshot index
+            const segs_dir_path = try std.fmt.allocPrint(allocator, "{s}/segs", .{shard_dir});
+            defer allocator.free(segs_dir_path);
+            std.fs.cwd().makePath(segs_dir_path) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+
+            const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
+            defer allocator.free(snaps_dir_path);
+            std.fs.cwd().makePath(snaps_dir_path) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+
+            // ── Recovery from shard MANIFEST ────────────────────────────
+            // The MANIFEST is the single source of truth for:
+            //   - latest_snapshot: which .fsnap to load from snaps/
+            //   - cold_segments: what's been archived to object storage
             var replay_from: u64 = 0;
 
-            // Check for snapshots in shard_dir/snapshots/
-            const snap_dir_path = try std.fmt.allocPrint(allocator, "{s}/snapshots", .{shard_dir});
-            defer allocator.free(snap_dir_path);
+            if (ShardManifest.load(allocator, shard_dir)) |maybe_sm| {
+                if (maybe_sm) |sm_val| {
+                    var sm = sm_val;
+                    defer sm.deinit(allocator);
 
-            if (std.fs.cwd().openDir(snap_dir_path, .{})) |snap_dir_handle| {
-                var snap_dir = snap_dir_handle;
-                defer snap_dir.close();
+                    // Step 1: Load snapshot if referenced
+                    if (sm.latest_snapshot) |snap_name| {
+                        if (std.fs.cwd().openDir(snaps_dir_path, .{})) |snap_dir_handle| {
+                            var snap_dir = snap_dir_handle;
+                            defer snap_dir.close();
 
-                if (snapshot_mod.loadLatestSnapshot(allocator, snap_dir)) |maybe_snap| {
-                    if (maybe_snap) |snap| {
-                        defer allocator.free(snap.data);
-                        if (partition.recover(snap.data)) |snap_index| {
-                            replay_from = snap_index;
-                        } else |_| {
-                            // Snapshot recovery failed — fall back to full replay
-                            replay_from = 0;
+                            if (snapshot_mod.loadSnapshotByName(allocator, snap_dir, snap_name)) |maybe_snap| {
+                                if (maybe_snap) |snap| {
+                                    defer allocator.free(snap.data);
+                                    if (partition.recover(snap.data)) |snap_index| {
+                                        replay_from = snap_index;
+                                    } else |_| {
+                                        replay_from = 0;
+                                    }
+                                }
+                            } else |_| {}
+                        } else |_| {}
+                    }
+
+                    // Step 2: Load cold segment entries into partition
+                    if (partition.cold_tier) |ct| {
+                        for (sm.cold_segments.items) |seg| {
+                            ct.manifest.addEntry(.{
+                                .min_index = seg.min_index,
+                                .max_index = seg.max_index,
+                                .min_timestamp_ns = seg.min_ts,
+                                .max_timestamp_ns = seg.max_ts,
+                                .location = seg.location,
+                                .size_bytes = seg.size,
+                                .checksum = seg.crc,
+                            }) catch {};
                         }
                     }
-                } else |_| {
-                    // loadLatestSnapshot failed — fall back to full replay
                 }
             } else |_| {
-                // No snapshots directory — normal for first run
+                // MANIFEST load failed — fall back to full replay
             }
 
-            // Replay existing segment files into partition (UAL + projections).
+            // Replay existing segment files from segs/ into partition.
             // If a snapshot was loaded, skip entries at or below replay_from.
             var max_index: u64 = replay_from;
-            replaySegments(allocator, shard_dir, partition, &max_index, workflow_handler, replay_from);
-
-            // ── Step 2d: Load cold manifest (metadata only) ────────────
-            // Tells the partition what segments exist in object storage.
-            // NO data is fetched — just key→location metadata for on-demand reads.
-            const cold_dir_path = try std.fmt.allocPrint(allocator, "{s}/cold", .{shard_dir});
-            defer allocator.free(cold_dir_path);
-            partition.loadColdManifest(cold_dir_path) catch {};
+            replaySegments(allocator, segs_dir_path, partition, &max_index, workflow_handler, replay_from);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
-                // Advance Raft log indices past replayed data to avoid collisions
                 raft_node.log.last_idx = max_index + 1;
                 raft_node.commit_index = max_index + 1;
                 raft_node.last_applied = max_index + 1;
@@ -408,7 +433,9 @@ pub const Shard = struct {
         // Flush pending entries to segment file on shutdown
         if (self.shard_data_dir) |dir| {
             if (self.segment_writer.entry_count > 0) {
-                self.segment_writer.writeToFile(dir) catch {};
+                var segs_buf: [512]u8 = undefined;
+                const segs_path = std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir}) catch dir;
+                self.segment_writer.writeToFile(segs_path) catch {};
             }
         }
 
@@ -472,13 +499,13 @@ pub const Shard = struct {
     // ─── Snapshot ────────────────────────────────────────────────────────
 
     /// Take a snapshot of all partitions and write to disk.
-    /// Creates `{shard_data_dir}/snapshots/` if it doesn't exist.
+    /// Creates `{shard_data_dir}/snaps/` if it doesn't exist.
     /// Returns true if snapshot was written successfully.
     pub fn takeSnapshot(self: *Shard) bool {
         const dir_path = self.shard_data_dir orelse return false;
 
         var snap_path_buf: [512]u8 = undefined;
-        const snap_dir_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snapshots", .{dir_path}) catch return false;
+        const snap_dir_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snaps", .{dir_path}) catch return false;
 
         // Ensure snapshots directory exists
         std.fs.cwd().makePath(snap_dir_path) catch return false;
@@ -512,7 +539,7 @@ pub const Shard = struct {
             file.close();
 
             snap_dir.rename(tmp_name, filename) catch continue;
-            snapshot_mod.writeManifest(snap_dir, filename) catch {};
+            ShardManifest.setLatestSnapshot(self.allocator, dir_path, filename) catch {};
         }
 
         return true;
