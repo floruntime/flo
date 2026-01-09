@@ -50,10 +50,7 @@ pub const ColdTierConfig = struct {
     /// Shard ID (for namespacing cold keys)
     shard_id: u16 = 0,
 
-    /// Partition ID (for namespacing cold keys)
-    partition_id: u32 = 0,
-
-    /// Key prefix for all cold objects (e.g., "ual/shard-0/")
+    /// Key prefix for all cold objects (e.g., "ual/")
     key_prefix: []const u8 = "",
 
     /// Maximum local segments before triggering archival (0 = manual only)
@@ -145,10 +142,9 @@ pub const ColdTierManager = struct {
         // upload() uses the key transiently; manifest.addEntry() dupes it.
         const basename = std.fs.path.basename(source_name);
         var key_buf: [512]u8 = undefined;
-        const cold_key = std.fmt.bufPrint(&key_buf, "{s}{d:0>5}/partition-{d}/{s}", .{
+        const cold_key = std.fmt.bufPrint(&key_buf, "{s}{d:0>5}/{s}", .{
             self.config.key_prefix,
             self.config.shard_id,
-            self.config.partition_id,
             basename,
         }) catch return ColdTierError.IoError;
 
@@ -371,7 +367,6 @@ test "ColdTierManager: archive and download round-trip" {
     // Create ColdTierManager
     var manager = ColdTierManager.init(allocator, cb, .{
         .shard_id = 0,
-        .partition_id = 42,
         .key_prefix = "ual/",
         .verify_checksums = true,
     });
@@ -435,7 +430,6 @@ test "ColdTierManager: manifest save and load persistence" {
     {
         var manager = ColdTierManager.init(allocator, cb, .{
             .shard_id = 0,
-            .partition_id = 0,
         });
         defer manager.deinit();
 
@@ -453,7 +447,6 @@ test "ColdTierManager: manifest save and load persistence" {
     {
         var manager = ColdTierManager.init(allocator, cb, .{
             .shard_id = 0,
-            .partition_id = 0,
         });
         defer manager.deinit();
 
@@ -508,7 +501,6 @@ test "ColdTierManager: archiveWarmSegments scans directory" {
 
     var manager = ColdTierManager.init(allocator, cb, .{
         .shard_id = 0,
-        .partition_id = 0,
     });
     defer manager.deinit();
 

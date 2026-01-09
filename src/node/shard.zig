@@ -1665,7 +1665,7 @@ test "Shard: inbox shutdown message" {
     const sent = shard.inbox.send(.{
         .tag = .shutdown,
         .src_shard = 1,
-        .partition_id = 0,
+
         .payload_len = 0,
         .sequence = 0,
         .payload_ptr = null,

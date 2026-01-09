@@ -25,7 +25,7 @@
 //!       "max_index": 100,
 //!       "min_ts": 0,
 //!       "max_ts": 0,
-//!       "location": "00000/partition-0/0000000001.flseg",
+//!       "location": "00000/0000000001.flseg",
 //!       "size": 4096,
 //!       "crc": 12345678
 //!     }
@@ -231,7 +231,7 @@ test "shard manifest: save and load round-trip" {
         .max_index = 100,
         .min_ts = 5000,
         .max_ts = 9000,
-        .location = try allocator.dupe(u8, "00000/partition-0/0000000001.flseg"),
+        .location = try allocator.dupe(u8, "00000/0000000001.flseg"),
         .size = 4096,
         .crc = 12345678,
     });
@@ -250,7 +250,7 @@ test "shard manifest: save and load round-trip" {
     try std.testing.expectEqual(@as(u64, 100), seg.max_index);
     try std.testing.expectEqual(@as(u64, 5000), seg.min_ts);
     try std.testing.expectEqual(@as(u64, 9000), seg.max_ts);
-    try std.testing.expectEqualStrings("00000/partition-0/0000000001.flseg", seg.location);
+    try std.testing.expectEqualStrings("00000/0000000001.flseg", seg.location);
     try std.testing.expectEqual(@as(u64, 4096), seg.size);
     try std.testing.expectEqual(@as(u32, 12345678), seg.crc);
 }
