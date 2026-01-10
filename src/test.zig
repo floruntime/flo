@@ -27,4 +27,5 @@ test {
 test {
     _ = @import("node/reactor.zig");
     _ = @import("node/inbox.zig");
+    _ = @import("node/slab.zig");
 }
