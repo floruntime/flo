@@ -30,4 +30,5 @@ test {
     _ = @import("node/slab.zig");
     _ = @import("node/router.zig");
     _ = @import("node/dispatcher.zig");
+    _ = @import("node/connection.zig");
 }
