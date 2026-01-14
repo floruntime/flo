@@ -31,4 +31,5 @@ test {
     _ = @import("node/router.zig");
     _ = @import("node/dispatcher.zig");
     _ = @import("node/connection.zig");
+    _ = @import("node/shard.zig");
 }
