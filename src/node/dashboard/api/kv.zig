@@ -13,7 +13,8 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
-const KVProjection = @import("../../../projection/kv.zig").KVProjection;
+const kv_mod = @import("../../../projection/kv.zig");
+const KVProjection = kv_mod.KVProjection;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -181,9 +182,7 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 
 /// GET /kv/namespaces/:ns/keys/:key/history - Version history
 /// Query params: ?limit=N (default: 10)
-/// NOTE: The KV projection currently stores only the latest version per key.
-/// This endpoint returns the current version as a single-entry history.
-/// Full MVCC version chains will be added when the projection supports them.
+/// Returns current version plus previous versions from MVCC chain.
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = h.parseQueryParam(u32, query_string, "limit");
 
@@ -199,28 +198,26 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     var arr = try obj.arrayField("versions");
     try arr.begin();
 
-    // Search shard projections for current version
     var version_count: i64 = 0;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getKVProjection(ctx, i)) |kv| {
-            if (kv.get(key)) |entry_val| {
-                try arr.next();
-                var vobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try vobj.begin();
-                try vobj.intField("version", entry_val.lsn);
-                try vobj.intField("term", entry_val.term);
-                const ts_ms = @as(i64, @intCast(entry_val.timestamp_ns / std.time.ns_per_ms));
-                try vobj.intField("timestamp_ms", ts_ms);
-                try vobj.intField("size", @as(i64, @intCast(entry_val.value.len)));
-                try vobj.boolField("tombstone", entry_val.tombstone);
-                if (entry_val.expiry_ns > 0) {
-                    try vobj.intField("ttl_ms", @as(i64, @intCast(entry_val.expiry_ns / std.time.ns_per_ms)));
-                } else {
-                    try vobj.nullField("ttl_ms");
+            var hist_buf: [kv_mod.MAX_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
+            const hist_n = kv.getHistory(key, &hist_buf);
+            if (hist_n > 0) {
+                for (hist_buf[0..hist_n]) |ver| {
+                    try arr.next();
+                    var vobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                    try vobj.begin();
+                    try vobj.intField("version", ver.version);
+                    try vobj.intField("term", ver.term);
+                    const ts_ms = @as(i64, @intCast(ver.timestamp_ns / std.time.ns_per_ms));
+                    try vobj.intField("timestamp_ms", ts_ms);
+                    try vobj.intField("size", @as(i64, @intCast(ver.value.len)));
+                    try vobj.boolField("tombstone", ver.tombstone);
+                    try vobj.end();
                 }
-                try vobj.end();
-                version_count = 1;
+                version_count = @intCast(hist_n);
                 break;
             }
         }

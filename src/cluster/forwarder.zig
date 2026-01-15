@@ -43,6 +43,108 @@ pub const RECONNECT_BACKOFF_MS: i64 = 100;
 /// Maximum reconnect backoff in milliseconds
 pub const MAX_RECONNECT_BACKOFF_MS: i64 = 10000;
 
+// ── Circuit Breaker Constants ──────────────────────────────────────────
+
+/// Number of consecutive failures to trip the circuit breaker open
+pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+
+/// Time in milliseconds the circuit stays open before moving to half-open
+pub const CIRCUIT_BREAKER_OPEN_DURATION_MS: i64 = 10000;
+
+/// Number of successful probe requests in half-open to close the circuit
+pub const CIRCUIT_BREAKER_HALF_OPEN_SUCCESSES: u32 = 2;
+
+// =============================================================================
+// Circuit Breaker — per-peer failure tracking
+// =============================================================================
+
+/// Per-peer circuit breaker. Tracks consecutive failures and controls
+/// whether requests should be forwarded to a peer.
+///
+/// State machine:
+///   closed → (threshold failures) → open → (timeout) → half_open → (successes) → closed
+///                                                        ↓ (failure)
+///                                                       open
+pub const CircuitBreaker = struct {
+    state: CircuitState = .closed,
+    /// Consecutive failures while closed/half-open
+    consecutive_failures: u32 = 0,
+    /// Successes while half-open (resets on failure)
+    half_open_successes: u32 = 0,
+    /// Timestamp when the circuit was tripped open
+    opened_at_ms: i64 = 0,
+    /// Total number of times the circuit has tripped open
+    trip_count: u64 = 0,
+
+    pub const CircuitState = enum(u8) {
+        /// Normal operation — requests flow through
+        closed = 0,
+        /// Failures exceeded threshold — requests are rejected
+        open = 1,
+        /// Probing — limited requests allowed to test recovery
+        half_open = 2,
+    };
+
+    /// Check if a request should be allowed through.
+    pub fn allowRequest(self: *CircuitBreaker, now_ms: i64) bool {
+        switch (self.state) {
+            .closed => return true,
+            .open => {
+                // Transition to half-open after timeout
+                if (now_ms - self.opened_at_ms >= CIRCUIT_BREAKER_OPEN_DURATION_MS) {
+                    self.state = .half_open;
+                    self.half_open_successes = 0;
+                    self.consecutive_failures = 0;
+                    return true;
+                }
+                return false;
+            },
+            .half_open => return true,
+        }
+    }
+
+    /// Record a successful response from the peer.
+    pub fn recordSuccess(self: *CircuitBreaker) void {
+        switch (self.state) {
+            .closed => {
+                self.consecutive_failures = 0;
+            },
+            .half_open => {
+                self.half_open_successes += 1;
+                if (self.half_open_successes >= CIRCUIT_BREAKER_HALF_OPEN_SUCCESSES) {
+                    self.state = .closed;
+                    self.consecutive_failures = 0;
+                }
+            },
+            .open => {},
+        }
+    }
+
+    /// Record a failure from the peer.
+    pub fn recordFailure(self: *CircuitBreaker, now_ms: i64) void {
+        self.consecutive_failures += 1;
+        switch (self.state) {
+            .closed => {
+                if (self.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD) {
+                    self.trip(now_ms);
+                }
+            },
+            .half_open => {
+                // Any failure in half-open trips back to open
+                self.trip(now_ms);
+            },
+            .open => {},
+        }
+    }
+
+    fn trip(self: *CircuitBreaker, now_ms: i64) void {
+        self.state = .open;
+        self.opened_at_ms = now_ms;
+        self.half_open_successes = 0;
+        self.trip_count += 1;
+    }
+};
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -93,6 +195,8 @@ pub const PeerConnection = struct {
     last_error_ms: i64,
     /// Current reconnect backoff (ms)
     reconnect_backoff_ms: i64,
+    /// Per-peer circuit breaker
+    circuit: CircuitBreaker,
 
     pub fn init(node_id: NodeId, address: []const u8, port: u16) PeerConnection {
         var conn = PeerConnection{
@@ -108,6 +212,7 @@ pub const PeerConnection = struct {
             .last_success_ms = 0,
             .last_error_ms = 0,
             .reconnect_backoff_ms = RECONNECT_BACKOFF_MS,
+            .circuit = .{},
         };
         @memcpy(conn.address[0..conn.address_len], address[0..conn.address_len]);
         return conn;
@@ -131,6 +236,8 @@ pub const ForwardResult = union(enum) {
     overloaded: void,
     /// Target node is this node (shouldn't forward to self)
     local: void,
+    /// Circuit breaker is open — peer considered unhealthy
+    circuit_open: void,
 
     pub const QueuedInfo = struct {
         request_id: u64,
@@ -146,6 +253,7 @@ pub const ForwarderStats = struct {
     total_responses: u64,
     total_timeouts: u64,
     total_errors: u64,
+    circuit_open_rejections: u64,
 };
 
 // =============================================================================
@@ -173,6 +281,7 @@ pub const Forwarder = struct {
     total_responses: u64,
     total_timeouts: u64,
     total_errors: u64,
+    circuit_open_rejections: u64,
 
     /// Forward timeout (ms)
     timeout_ms: i64,
@@ -190,6 +299,7 @@ pub const Forwarder = struct {
             .total_responses = 0,
             .total_timeouts = 0,
             .total_errors = 0,
+            .circuit_open_rejections = 0,
             .timeout_ms = DEFAULT_TIMEOUT_MS,
         };
     }
@@ -266,6 +376,12 @@ pub const Forwarder = struct {
         // Check we have a peer entry
         const peer = self.peers.getPtr(target_node) orelse return .{ .no_route = {} };
 
+        // Circuit breaker check
+        if (!peer.circuit.allowRequest(now_ms)) {
+            self.circuit_open_rejections += 1;
+            return .{ .circuit_open = {} };
+        }
+
         // Check pending limit
         if (self.pending.count() >= MAX_PENDING_REQUESTS) {
             return .{ .overloaded = {} };
@@ -302,6 +418,7 @@ pub const Forwarder = struct {
             if (peer.inflight > 0) peer.inflight -= 1;
             peer.total_responses += 1;
             peer.last_success_ms = now_ms;
+            peer.circuit.recordSuccess();
         }
 
         _ = self.pending.remove(request_id);
@@ -318,6 +435,7 @@ pub const Forwarder = struct {
             if (peer.inflight > 0) peer.inflight -= 1;
             peer.total_errors += 1;
             peer.last_error_ms = now_ms;
+            peer.circuit.recordFailure(now_ms);
         }
 
         _ = self.pending.remove(request_id);
@@ -349,6 +467,7 @@ pub const Forwarder = struct {
             if (self.pending.get(rid)) |req| {
                 if (self.peers.getPtr(req.target_node)) |peer| {
                     if (peer.inflight > 0) peer.inflight -= 1;
+                    peer.circuit.recordFailure(now_ms);
                 }
             }
             _ = self.pending.remove(rid);
@@ -369,6 +488,7 @@ pub const Forwarder = struct {
             .total_responses = self.total_responses,
             .total_timeouts = self.total_timeouts,
             .total_errors = self.total_errors,
+            .circuit_open_rejections = self.circuit_open_rejections,
         };
     }
 
@@ -395,6 +515,19 @@ pub const Forwarder = struct {
             }
         }
         return count;
+    }
+
+    /// Get the circuit breaker state for a peer
+    pub fn peerCircuitState(self: *const Forwarder, node_id: NodeId) ?CircuitBreaker.CircuitState {
+        const peer = self.peers.get(node_id) orelse return null;
+        return peer.circuit.state;
+    }
+
+    /// Manually reset a peer's circuit breaker (for operational recovery)
+    pub fn resetCircuit(self: *Forwarder, node_id: NodeId) void {
+        if (self.peers.getPtr(node_id)) |peer| {
+            peer.circuit = .{};
+        }
     }
 };
 
@@ -585,4 +718,191 @@ test "Forwarder stats" {
     try testing.expectEqual(@as(u32, 1), s.peer_count);
     try testing.expectEqual(@as(u64, 2), s.total_forwarded);
     try testing.expectEqual(@as(u64, 1), s.total_responses);
+}
+
+// ── Circuit Breaker Tests ──────────────────────────────────────────────
+
+test "CircuitBreaker: starts closed, allows requests" {
+    var cb: CircuitBreaker = .{};
+    try testing.expect(cb.allowRequest(1000));
+    try testing.expectEqual(CircuitBreaker.CircuitState.closed, cb.state);
+}
+
+test "CircuitBreaker: trips open after threshold failures" {
+    var cb: CircuitBreaker = .{};
+
+    // Record failures below threshold — still closed
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD - 1) : (i += 1) {
+        cb.recordFailure(1000);
+        try testing.expectEqual(CircuitBreaker.CircuitState.closed, cb.state);
+    }
+
+    // One more failure trips it open
+    cb.recordFailure(1000);
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, cb.state);
+    try testing.expectEqual(@as(u64, 1), cb.trip_count);
+
+    // Requests are rejected while open
+    try testing.expect(!cb.allowRequest(1500));
+}
+
+test "CircuitBreaker: transitions to half-open after timeout" {
+    var cb: CircuitBreaker = .{};
+
+    // Trip it open at t=1000
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        cb.recordFailure(1000);
+    }
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, cb.state);
+
+    // Still open before timeout expires
+    try testing.expect(!cb.allowRequest(1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS - 1));
+
+    // Transitions to half-open after timeout
+    try testing.expect(cb.allowRequest(1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS));
+    try testing.expectEqual(CircuitBreaker.CircuitState.half_open, cb.state);
+}
+
+test "CircuitBreaker: closes after successful probes in half-open" {
+    var cb: CircuitBreaker = .{};
+
+    // Trip open → wait timeout → half-open
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        cb.recordFailure(1000);
+    }
+    _ = cb.allowRequest(1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS);
+    try testing.expectEqual(CircuitBreaker.CircuitState.half_open, cb.state);
+
+    // Record successes in half-open
+    i = 0;
+    while (i < CIRCUIT_BREAKER_HALF_OPEN_SUCCESSES) : (i += 1) {
+        cb.recordSuccess();
+    }
+    try testing.expectEqual(CircuitBreaker.CircuitState.closed, cb.state);
+}
+
+test "CircuitBreaker: failure in half-open trips back to open" {
+    var cb: CircuitBreaker = .{};
+
+    // Trip open → wait → half-open
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        cb.recordFailure(1000);
+    }
+    _ = cb.allowRequest(1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS);
+    try testing.expectEqual(CircuitBreaker.CircuitState.half_open, cb.state);
+
+    // Any failure in half-open sends it back to open
+    cb.recordFailure(1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS + 100);
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, cb.state);
+    try testing.expectEqual(@as(u64, 2), cb.trip_count);
+}
+
+test "CircuitBreaker: success resets consecutive failures" {
+    var cb: CircuitBreaker = .{};
+
+    // Accumulate some failures (below threshold)
+    cb.recordFailure(1000);
+    cb.recordFailure(1000);
+    cb.recordFailure(1000);
+    try testing.expectEqual(@as(u32, 3), cb.consecutive_failures);
+
+    // Success resets the counter
+    cb.recordSuccess();
+    try testing.expectEqual(@as(u32, 0), cb.consecutive_failures);
+    try testing.expectEqual(CircuitBreaker.CircuitState.closed, cb.state);
+}
+
+test "Forwarder: circuit breaker blocks forwarding to failing peer" {
+    var fwd = Forwarder.init(testing.allocator, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "10.0.0.2", 4444);
+
+    // Forward and fail enough requests to trip the circuit
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        const rid = @as(u64, i) + 1;
+        const result = try fwd.forward(2, rid, 100, 64, 1000);
+        switch (result) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        }
+        _ = fwd.fail(rid, 1000);
+    }
+
+    // Circuit should be open — next forward is rejected
+    const result = try fwd.forward(2, 99, 100, 64, 1500);
+    switch (result) {
+        .circuit_open => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    try testing.expectEqual(@as(u64, 1), fwd.circuit_open_rejections);
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+}
+
+test "Forwarder: circuit breaker recovers after timeout" {
+    var fwd = Forwarder.init(testing.allocator, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "10.0.0.2", 4444);
+
+    // Trip the circuit at t=1000
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        const rid = @as(u64, i) + 1;
+        _ = try fwd.forward(2, rid, 100, 64, 1000);
+        _ = fwd.fail(rid, 1000);
+    }
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+
+    // After open duration, should allow request (half-open)
+    const after_timeout = 1000 + CIRCUIT_BREAKER_OPEN_DURATION_MS;
+    const result = try fwd.forward(2, 50, 100, 64, after_timeout);
+    switch (result) {
+        .queued => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Complete it — should close the circuit after enough successes
+    _ = fwd.complete(50, after_timeout);
+    const result2 = try fwd.forward(2, 51, 100, 64, after_timeout);
+    switch (result2) {
+        .queued => {},
+        else => return error.TestUnexpectedResult,
+    }
+    _ = fwd.complete(51, after_timeout);
+
+    try testing.expectEqual(CircuitBreaker.CircuitState.closed, fwd.peerCircuitState(2).?);
+}
+
+test "Forwarder: resetCircuit manually clears state" {
+    var fwd = Forwarder.init(testing.allocator, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "10.0.0.2", 4444);
+
+    // Trip the circuit
+    var i: u32 = 0;
+    while (i < CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        const rid = @as(u64, i) + 1;
+        _ = try fwd.forward(2, rid, 100, 64, 1000);
+        _ = fwd.fail(rid, 1000);
+    }
+    try testing.expectEqual(CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+
+    // Manual reset
+    fwd.resetCircuit(2);
+    try testing.expectEqual(CircuitBreaker.CircuitState.closed, fwd.peerCircuitState(2).?);
+
+    // Should accept requests again
+    const result = try fwd.forward(2, 99, 100, 64, 1500);
+    switch (result) {
+        .queued => {},
+        else => return error.TestUnexpectedResult,
+    }
 }

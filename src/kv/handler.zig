@@ -661,13 +661,50 @@ pub const KVHandler = struct {
     // ── HISTORY ─────────────────────────────────────────────────────────
 
     fn handleHistory(self: *KVHandler, req: Request) CommandResult {
-        _ = self;
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
         }
 
-        // Version history not yet implemented in KVProjection MVCC
-        return .{ .err = .{ .code = .invalid_request, .message = "history not yet implemented" } };
+        if (isReservedKey(req.key)) {
+            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+        }
+
+        // Namespace-qualify key for projection lookup
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        // Fetch version history from projection
+        var hist_buf: [kv_mod.MAX_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
+        const n = self.kv.getHistory(qkey, &hist_buf);
+
+        if (n == 0) return .kv_not_found;
+
+        // Serialize: [count:u32] ([value_len:u32][value][version:u64])*
+        var total_size: usize = 4; // count header
+        for (hist_buf[0..n]) |ver| {
+            total_size += 4 + ver.value.len + 8; // value_len + value + version
+        }
+
+        const data = self.allocator.alloc(u8, total_size) catch
+            return .{ .err = .{ .code = .internal_error, .message = "history serialization failed" } };
+
+        var offset: usize = 0;
+        std.mem.writeInt(u32, data[offset..][0..4], @intCast(n), .little);
+        offset += 4;
+
+        for (hist_buf[0..n]) |ver| {
+            std.mem.writeInt(u32, data[offset..][0..4], @intCast(ver.value.len), .little);
+            offset += 4;
+            if (ver.value.len > 0) {
+                @memcpy(data[offset..][0..ver.value.len], ver.value);
+                offset += ver.value.len;
+            }
+            std.mem.writeInt(u64, data[offset..][0..8], ver.version, .little);
+            offset += 8;
+        }
+
+        return .{ .kv_history_result = .{ .data = data } };
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1273,15 +1310,54 @@ test "kv handler: pre-route by key" {
     try testing.expect(h1 != h_other);
 }
 
-test "kv handler: history not implemented" {
+test "kv handler: history returns not found for missing key" {
     const allocator = testing.allocator;
     var kv = KVProjection.init(allocator, 0);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_history, "k", "", ""));
+    try testing.expectEqual(CommandResult.kv_not_found, result);
+}
+
+test "kv handler: history returns versions" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+
+    // Put two versions (unqualified key — default ns uses raw key)
+    try kv.put("k", "v1", 1, 1, 100, 0);
+    try kv.put("k", "v2", 2, 1, 200, 0);
+
+    var handler = KVHandler.init(allocator, &kv);
+    const result = handler.handleCommand(makeRequest(.kv_history, "k", "", ""));
+    defer handler.freeResult(result);
     switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        .kv_history_result => |hist| {
+            // Parse: [count:u32] ([value_len:u32][value][version:u64])*
+            const data = hist.data;
+            try testing.expect(data.len >= 4);
+            const count = std.mem.readInt(u32, data[0..4], .little);
+            try testing.expectEqual(@as(u32, 2), count);
+
+            // First entry: current version (v2)
+            var off: usize = 4;
+            const v2_len = std.mem.readInt(u32, data[off..][0..4], .little);
+            off += 4;
+            try testing.expectEqualSlices(u8, "v2", data[off..][0..v2_len]);
+            off += v2_len;
+            const v2_ver = std.mem.readInt(u64, data[off..][0..8], .little);
+            try testing.expectEqual(@as(u64, 2), v2_ver);
+            off += 8;
+
+            // Second entry: previous version (v1)
+            const v1_len = std.mem.readInt(u32, data[off..][0..4], .little);
+            off += 4;
+            try testing.expectEqualSlices(u8, "v1", data[off..][0..v1_len]);
+            off += v1_len;
+            const v1_ver = std.mem.readInt(u64, data[off..][0..8], .little);
+            try testing.expectEqual(@as(u64, 1), v1_ver);
+        },
         else => return error.TestUnexpectedResult,
     }
 }

@@ -82,6 +82,7 @@ const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
 const Forwarder = @import("../cluster/forwarder.zig").Forwarder;
 const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
+const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const NodeId = @import("../raft/node.zig").NodeId;
 
 /// Maximum single-request size we handle on the stack.
@@ -192,6 +193,10 @@ pub const Shard = struct {
 
     /// Cluster partition table (null in single-node mode).
     partition_table: ?*PartitionTable,
+
+    /// Controller Raft coordinator (set on Shard 0 — routes namespace
+    /// create/delete through Raft for multi-node consistency).
+    coordinator: ?*Coordinator,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -427,6 +432,7 @@ pub const Shard = struct {
             .hot_flush_seconds = hot_flush_seconds,
             .forwarder = null,
             .partition_table = null,
+            .coordinator = null,
         };
     }
 
@@ -440,6 +446,12 @@ pub const Shard = struct {
     /// Wire a cluster partition table (enables cluster-aware routing).
     pub fn setPartitionTable(self: *Shard, pt: *PartitionTable) void {
         self.partition_table = pt;
+    }
+
+    /// Wire the Controller Raft coordinator (enables Raft-replicated namespace ops).
+    /// Should only be called on Shard 0.
+    pub fn setCoordinator(self: *Shard, coord: *Coordinator) void {
+        self.coordinator = coord;
     }
 
     pub fn deinit(self: *Shard) void {
@@ -676,6 +688,9 @@ pub const Shard = struct {
             },
             .overloaded => {
                 self.sendErrorResponse(conn, req.header.request_id, .overloaded, "forward queue full");
+            },
+            .circuit_open => {
+                self.sendErrorResponse(conn, req.header.request_id, .overloaded, "node circuit breaker open");
             },
             .local => {
                 // Shouldn't happen — routeCluster already checked. Dispatch locally.

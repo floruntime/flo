@@ -43,6 +43,7 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
+const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const connection_mod = @import("../node/connection.zig");
 
 const CommandResult = result_mod.CommandResult;
@@ -221,6 +222,27 @@ pub const NamespaceHandler = struct {
         return false;
     }
 
+    // ── Raft-Replicated Apply ───────────────────────────────────────────
+    // Called after Coordinator commits a namespace change via Raft.
+    // Updates the local in-memory registry to match the committed state.
+
+    /// Apply a Raft-committed namespace creation to the local registry.
+    pub fn applyCreate(self: *NamespaceHandler, name: []const u8) void {
+        if (self.namespaces.contains(name)) return; // idempotent
+        const owned = self.allocator.dupe(u8, name) catch return;
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+        self.namespaces.put(owned, .{ .created_at_ns = now_ns }) catch {
+            self.allocator.free(owned);
+        };
+    }
+
+    /// Apply a Raft-committed namespace deletion to the local registry.
+    pub fn applyDelete(self: *NamespaceHandler, name: []const u8) void {
+        if (self.namespaces.fetchRemove(name)) |kv| {
+            self.allocator.free(kv.key);
+        }
+    }
+
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -259,36 +281,144 @@ pub const NamespaceHandler = struct {
     fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const result = shard.namespace_handler.handleCommand(req);
-
-        // On force-delete, clean up all projection data for this namespace
         const op: OpCode = @enumFromInt(req.header.op_code);
-        if (op == .namespace_delete) {
-            switch (result) {
-                .namespace_deleted => {
-                    // Check force flag (byte in value field)
-                    const is_force = req.value.len > 0 and req.value[0] != 0;
-                    if (is_force) {
-                        // Clear KV entries with namespace prefix
-                        const ns = req.key;
-                        if (ns.len > 0) {
-                            var prefix_buf: [256]u8 = undefined;
-                            @memcpy(prefix_buf[0..ns.len], ns);
-                            prefix_buf[ns.len] = 0; // null separator
-                            const prefix = prefix_buf[0 .. ns.len + 1];
-                            _ = shard.defaultPartition().kv.clearByPrefix(prefix);
-                        }
-                        // Reset stream and queue projections
-                        shard.defaultPartition().stream.reset();
-                        shard.defaultPartition().queue.reset();
-                    }
-                },
-                else => {},
-            }
+
+        // Reads (list, info) always go to local handler
+        if (op == .namespace_list or op == .namespace_info) {
+            const result = shard.namespace_handler.handleCommand(req);
+            defer shard.namespace_handler.freeResult(result);
+            sendNamespaceResponse(shard, conn, req.header.request_id, result);
+            return;
         }
 
+        // Mutations (create, delete): route through Coordinator Raft if available
+        if (shard.coordinator) |coord| {
+            dispatchNamespaceViaRaft(shard, conn, req, op, coord);
+            return;
+        }
+
+        // No coordinator — fall back to local-only (single-node mode)
+        const result = shard.namespace_handler.handleCommand(req);
+        handleDeleteCleanup(shard, op, result, req);
         defer shard.namespace_handler.freeResult(result);
         sendNamespaceResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// Route create/delete through Controller Raft for consistent replication.
+    fn dispatchNamespaceViaRaft(shard: *Shard, conn: *Connection, req: Request, op: OpCode, coord: *Coordinator) void {
+        const name = req.key;
+
+        // Validate before proposing
+        if (name.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name is required");
+            return;
+        }
+
+        if (op == .namespace_create) {
+            // Validation checks that don't need Raft
+            if (name.len > MAX_NAMESPACE_LEN) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name too long");
+                return;
+            }
+            if (!isValidName(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
+                return;
+            }
+            if (isReserved(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved namespace name");
+                return;
+            }
+            if (shard.namespace_handler.namespaces.contains(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists");
+                return;
+            }
+
+            // Default partition count and replication factor
+            const partition_count: u16 = 32;
+            const replication_factor: u8 = 1;
+
+            _ = coord.proposeCreateNamespace(name, partition_count, replication_factor) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+                return;
+            };
+
+            // In single-node mode, commit is synchronous — apply now
+            _ = coord.applyCommitted() catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft apply failed");
+                return;
+            };
+
+            // Sync to local NamespaceHandler
+            shard.namespace_handler.applyCreate(name);
+            shard.sendOkResponse(conn, req.header.request_id, "");
+        } else if (op == .namespace_delete) {
+            if (isReserved(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete reserved namespace");
+                return;
+            }
+            if (std.mem.eql(u8, name, "default")) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete default namespace");
+                return;
+            }
+
+            const force = req.value.len > 0 and req.value[0] != 0;
+            if (!force and shard.namespace_handler.namespaceHasData(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace is not empty; use --force to delete");
+                return;
+            }
+
+            if (!shard.namespace_handler.namespaces.contains(name)) {
+                shard.sendErrorResponse(conn, req.header.request_id, .not_found, "namespace not found");
+                return;
+            }
+
+            _ = coord.proposeDeleteNamespace(name) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+                return;
+            };
+
+            _ = coord.applyCommitted() catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft apply failed");
+                return;
+            };
+
+            // Sync to local NamespaceHandler (removes from local map)
+            shard.namespace_handler.applyDelete(name);
+
+            // Clean up projection data on force-delete
+            if (force and name.len > 0) {
+                var prefix_buf: [256]u8 = undefined;
+                @memcpy(prefix_buf[0..name.len], name);
+                prefix_buf[name.len] = 0;
+                _ = shard.defaultPartition().kv.clearByPrefix(prefix_buf[0 .. name.len + 1]);
+                shard.defaultPartition().stream.reset();
+                shard.defaultPartition().queue.reset();
+            }
+
+            shard.sendOkResponse(conn, req.header.request_id, "");
+        }
+    }
+
+    /// Handle force-delete cleanup for non-Raft path.
+    fn handleDeleteCleanup(shard: *Shard, op: OpCode, cmd_result: CommandResult, req: Request) void {
+        if (op != .namespace_delete) return;
+        switch (cmd_result) {
+            .namespace_deleted => {
+                const is_force = req.value.len > 0 and req.value[0] != 0;
+                if (is_force) {
+                    const ns = req.key;
+                    if (ns.len > 0) {
+                        var prefix_buf: [256]u8 = undefined;
+                        @memcpy(prefix_buf[0..ns.len], ns);
+                        prefix_buf[ns.len] = 0;
+                        _ = shard.defaultPartition().kv.clearByPrefix(prefix_buf[0 .. ns.len + 1]);
+                    }
+                    shard.defaultPartition().stream.reset();
+                    shard.defaultPartition().queue.reset();
+                }
+            },
+            else => {},
+        }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -949,4 +1079,45 @@ test "validateKeySize: oversized key with namespace" {
 test "validateKeySize: oversized key without namespace" {
     const big = &[_]u8{'x'} ** (MAX_QUALIFIED_KEY + 1);
     try testing.expect(validateKeySize("", big) != null);
+}
+
+// ── Raft Apply Tests ────────────────────────────────────────────────────────
+
+test "namespace handler: applyCreate adds to local registry" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
+    handler.applyCreate("test-ns");
+    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
+    try testing.expect(handler.namespaces.contains("test-ns"));
+}
+
+test "namespace handler: applyCreate is idempotent" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("test-ns");
+    handler.applyCreate("test-ns"); // duplicate — should be no-op
+    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
+}
+
+test "namespace handler: applyDelete removes from local registry" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("test-ns");
+    try testing.expect(handler.namespaces.contains("test-ns"));
+
+    handler.applyDelete("test-ns");
+    try testing.expect(!handler.namespaces.contains("test-ns"));
+    try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
+}
+
+test "namespace handler: applyDelete non-existent is no-op" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyDelete("does-not-exist"); // should not crash
+    try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
 }

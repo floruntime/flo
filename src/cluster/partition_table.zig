@@ -53,6 +53,8 @@ pub const Assignment = struct {
     epoch: u64,
     /// Whether this assignment is pending (in-flight rebalance)
     pending: bool,
+    /// Whether this partition is temporarily unavailable (leader election, etc.)
+    unavailable: bool = false,
 
     pub fn hasReplica(self: *const Assignment, node_id: NodeId) bool {
         for (self.replicas[0..self.replica_count]) |r| {
@@ -239,6 +241,57 @@ pub const PartitionTable = struct {
         }
         // If no assignment exists, assume local (single-node mode)
         return true;
+    }
+
+    /// Check if a partition is available (has a leader and is not in transition)
+    pub fn isAvailable(self: *const PartitionTable, namespace_hash: u32, partition_id: u16) bool {
+        const key = packKey(namespace_hash, partition_id);
+        const a = self.assignments.get(key) orelse return true; // unassigned = single-node mode
+        return !a.unavailable and !a.pending;
+    }
+
+    /// Mark a partition as temporarily unavailable (e.g., leader election in progress)
+    pub fn markUnavailable(self: *PartitionTable, namespace_hash: u32, partition_id: u16) void {
+        const key = packKey(namespace_hash, partition_id);
+        if (self.assignments.getPtr(key)) |a| {
+            a.unavailable = true;
+        }
+    }
+
+    /// Mark a partition as available again (e.g., new leader elected)
+    pub fn markAvailable(self: *PartitionTable, namespace_hash: u32, partition_id: u16) void {
+        const key = packKey(namespace_hash, partition_id);
+        if (self.assignments.getPtr(key)) |a| {
+            a.unavailable = false;
+        }
+    }
+
+    /// Mark all partitions led by a given node as unavailable
+    /// (used when gossip detects a node failure)
+    pub fn markNodePartitionsUnavailable(self: *PartitionTable, node_id: NodeId) u32 {
+        var count: u32 = 0;
+        var iter = self.assignments.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.leader == node_id and !entry.value_ptr.unavailable) {
+                entry.value_ptr.unavailable = true;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Mark all partitions led by a given node as available
+    /// (used when gossip detects a node recovery)
+    pub fn markNodePartitionsAvailable(self: *PartitionTable, node_id: NodeId) u32 {
+        var count: u32 = 0;
+        var iter = self.assignments.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.leader == node_id and entry.value_ptr.unavailable) {
+                entry.value_ptr.unavailable = false;
+                count += 1;
+            }
+        }
+        return count;
     }
 
     /// Get all partition keys assigned to a specific node (as leader or replica)
@@ -615,4 +668,48 @@ test "Assignment hasReplica" {
     try testing.expect(a.hasReplica(3));
     try testing.expect(!a.hasReplica(1)); // leader is not in replicas
     try testing.expect(!a.hasReplica(4));
+}
+
+test "PartitionTable: partition availability" {
+    var table = PartitionTable.init(testing.allocator, 1);
+    defer table.deinit();
+
+    try table.assign(0x1000, 0, 1, &.{2});
+    try table.assign(0x1000, 1, 2, &.{1});
+
+    // All available by default
+    try testing.expect(table.isAvailable(0x1000, 0));
+    try testing.expect(table.isAvailable(0x1000, 1));
+
+    // Mark one unavailable
+    table.markUnavailable(0x1000, 0);
+    try testing.expect(!table.isAvailable(0x1000, 0));
+    try testing.expect(table.isAvailable(0x1000, 1));
+
+    // Mark available again
+    table.markAvailable(0x1000, 0);
+    try testing.expect(table.isAvailable(0x1000, 0));
+}
+
+test "PartitionTable: mark node partitions unavailable" {
+    var table = PartitionTable.init(testing.allocator, 1);
+    defer table.deinit();
+
+    // Node 2 leads two partitions
+    try table.assign(0x1000, 0, 2, &.{});
+    try table.assign(0x1000, 1, 2, &.{});
+    try table.assign(0x1000, 2, 3, &.{});
+
+    // Mark all of node 2's partitions unavailable
+    const marked = table.markNodePartitionsUnavailable(2);
+    try testing.expectEqual(@as(u32, 2), marked);
+
+    try testing.expect(!table.isAvailable(0x1000, 0));
+    try testing.expect(!table.isAvailable(0x1000, 1));
+    try testing.expect(table.isAvailable(0x1000, 2)); // node 3's partition unaffected
+
+    // Recover
+    const recovered = table.markNodePartitionsAvailable(2);
+    try testing.expectEqual(@as(u32, 2), recovered);
+    try testing.expect(table.isAvailable(0x1000, 0));
 }

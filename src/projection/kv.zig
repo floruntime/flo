@@ -60,10 +60,25 @@ pub const ScanEntry = struct {
 // KV Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Maximum number of historical versions retained per key.
+pub const MAX_VERSION_CHAIN_LEN: usize = 8;
+
+/// A historical version entry — stores previous value and metadata.
+pub const VersionEntry = struct {
+    value: []const u8,
+    version: u64,
+    lsn: u64,
+    term: u64,
+    timestamp_ns: u64,
+    tombstone: bool,
+};
+
 pub const KVProjection = struct {
     allocator: Allocator,
     /// Main hash map: key → KVEntry.
     map: std.StringHashMap(KVEntry),
+    /// Version chains: key → previous versions (newest first, bounded).
+    version_chains: std.StringHashMap(std.ArrayListUnmanaged(VersionEntry)),
     /// Memory limit in bytes (0 = unlimited).
     memory_limit: usize,
     /// Approximate current memory usage.
@@ -87,6 +102,7 @@ pub const KVProjection = struct {
         return .{
             .allocator = allocator,
             .map = std.StringHashMap(KVEntry).init(allocator),
+            .version_chains = std.StringHashMap(std.ArrayListUnmanaged(VersionEntry)).init(allocator),
             .memory_limit = memory_limit,
             .memory_used = 0,
             .applied_index = 0,
@@ -100,6 +116,16 @@ pub const KVProjection = struct {
             self.freeEntry(kv.value_ptr);
         }
         self.map.deinit();
+
+        // Free version chains
+        var vc_it = self.version_chains.iterator();
+        while (vc_it.next()) |entry| {
+            for (entry.value_ptr.items) |ver| {
+                if (ver.value.len > 0) self.allocator.free(@constCast(ver.value));
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.version_chains.deinit();
     }
 
     /// Number of live (non-tombstone) entries.
@@ -127,14 +153,13 @@ pub const KVProjection = struct {
         errdefer self.allocator.free(owned_value);
 
         if (self.map.getPtr(key)) |existing| {
+            // Save current version to history before overwriting
+            self.pushVersionChain(existing) catch {};
+
             // Key already in map — don't replace it (map references old key ptr).
             // Free the newly allocated key since we don't need it.
             self.allocator.free(owned_key);
-            // Free old value
-            self.memory_used -= existing.value.len;
-            if (existing.value.len > 0 and !existing.tombstone) {
-                self.allocator.free(@constCast(existing.value));
-            }
+            // Old value was moved to version chain (or freed if chain full)
             existing.value = owned_value;
             existing.lsn = lsn;
             existing.version += 1;
@@ -180,9 +205,10 @@ pub const KVProjection = struct {
     /// Delete a key (mark as tombstone).
     pub fn delete(self: *KVProjection, key: []const u8, lsn: u64, term: u64, timestamp_ns: u64) !void {
         if (self.map.getPtr(key)) |existing| {
-            // Free the value, keep the key for scan-skip
-            self.memory_used -= existing.value.len;
-            self.allocator.free(@constCast(existing.value));
+            // Save current version to history before overwriting
+            self.pushVersionChain(existing) catch {};
+
+            // Old value was moved to version chain (or freed if chain full)
             existing.value = "";
             existing.lsn = lsn;
             existing.version += 1;
@@ -317,6 +343,100 @@ pub const KVProjection = struct {
         }
 
         return total_removed;
+    }
+
+    // ─── Version Chain (MVCC History) ──────────────────────────────────────
+
+    /// Push the current entry's state onto the version chain.
+    /// Evicts the oldest version if chain exceeds MAX_VERSION_CHAIN_LEN.
+    fn pushVersionChain(self: *KVProjection, existing: *KVEntry) !void {
+        // Duplicate value for the historical entry
+        const hist_value = if (existing.value.len > 0 and !existing.tombstone)
+            existing.value // transfer ownership — caller must NOT free
+        else
+            @as([]const u8, "");
+
+        const hist = VersionEntry{
+            .value = hist_value,
+            .version = existing.version,
+            .lsn = existing.lsn,
+            .term = existing.term,
+            .timestamp_ns = existing.timestamp_ns,
+            .tombstone = existing.tombstone,
+        };
+
+        // Update memory accounting: value moved from current to chain
+        // (no net change yet — will be freed if evicted below)
+
+        const gop = try self.version_chains.getOrPut(existing.key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        var chain = gop.value_ptr;
+
+        // Evict oldest if at capacity
+        if (chain.items.len >= MAX_VERSION_CHAIN_LEN) {
+            const oldest = chain.orderedRemove(0);
+            if (oldest.value.len > 0) {
+                self.memory_used -|= oldest.value.len;
+                self.allocator.free(@constCast(oldest.value));
+            }
+        }
+
+        try chain.append(self.allocator, hist);
+    }
+
+    /// Get version history for a key (newest first).
+    /// Returns current entry + up to MAX_VERSION_CHAIN_LEN previous versions.
+    /// Caller does NOT own the returned data — references are borrowed.
+    pub fn getHistory(self: *KVProjection, key: []const u8, out: []VersionEntry) usize {
+        var n: usize = 0;
+
+        // Current version first
+        if (self.map.getPtr(key)) |entry| {
+            if (n < out.len) {
+                out[n] = .{
+                    .value = entry.value,
+                    .version = entry.version,
+                    .lsn = entry.lsn,
+                    .term = entry.term,
+                    .timestamp_ns = entry.timestamp_ns,
+                    .tombstone = entry.tombstone,
+                };
+                n += 1;
+            }
+        }
+
+        // Historical versions (newest to oldest = reverse iteration)
+        if (self.version_chains.getPtr(key)) |chain| {
+            var i: usize = chain.items.len;
+            while (i > 0 and n < out.len) {
+                i -= 1;
+                out[n] = chain.items[i];
+                n += 1;
+            }
+        }
+
+        return n;
+    }
+
+    /// Prune all version chains, freeing historical entries.
+    /// Returns the number of historical versions freed.
+    pub fn pruneVersionChains(self: *KVProjection) usize {
+        var freed: usize = 0;
+        var vc_it = self.version_chains.iterator();
+        while (vc_it.next()) |entry| {
+            for (entry.value_ptr.items) |ver| {
+                if (ver.value.len > 0) {
+                    self.memory_used -|= ver.value.len;
+                    self.allocator.free(@constCast(ver.value));
+                }
+                freed += 1;
+            }
+            entry.value_ptr.deinit(self.allocator);
+            entry.value_ptr.* = .{};
+        }
+        return freed;
     }
 
     /// Remove all tombstones and expired entries. Returns number purged.
@@ -573,6 +693,14 @@ pub const KVProjection = struct {
     // ─── Internal ──────────────────────────────────────────────────────────
 
     fn freeEntry(self: *KVProjection, entry: *KVEntry) void {
+        // Free version chain for this key
+        if (self.version_chains.fetchRemove(entry.key)) |chain_kv| {
+            var chain = chain_kv.value;
+            for (chain.items) |ver| {
+                if (ver.value.len > 0) self.allocator.free(@constCast(ver.value));
+            }
+            chain.deinit(self.allocator);
+        }
         self.allocator.free(@constCast(entry.key));
         if (entry.value.len > 0 and !entry.tombstone) {
             self.allocator.free(@constCast(entry.value));
@@ -775,8 +903,104 @@ test "kv: memory tracking" {
     try testing.expectEqual(@as(usize, 9), kv.memory_used);
 
     try kv.put("abc", "x", 2, 1, 0, 0);
-    // Updated: key(3) + value(1) = 4 bytes
+    // key(3) + new_value(1) + chain_value(6) = 10 bytes (old value retained in version chain)
+    try testing.expectEqual(@as(usize, 10), kv.memory_used);
+
+    // After pruning version chains, only current entry remains
+    _ = kv.pruneVersionChains();
     try testing.expectEqual(@as(usize, 4), kv.memory_used);
+}
+
+test "kv: version chain basic" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("k", "v1", 1, 1, 100, 0);
+    try kv.put("k", "v2", 2, 1, 200, 0);
+    try kv.put("k", "v3", 3, 1, 300, 0);
+
+    var hist: [10]VersionEntry = undefined;
+    const n = kv.getHistory("k", &hist);
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // Current version first
+    try testing.expectEqualSlices(u8, "v3", hist[0].value);
+    try testing.expectEqual(@as(u64, 3), hist[0].version);
+
+    // Then historical (newest to oldest)
+    try testing.expectEqualSlices(u8, "v2", hist[1].value);
+    try testing.expectEqual(@as(u64, 2), hist[1].version);
+    try testing.expectEqualSlices(u8, "v1", hist[2].value);
+    try testing.expectEqual(@as(u64, 1), hist[2].version);
+}
+
+test "kv: version chain preserves history on delete" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("k", "v1", 1, 1, 100, 0);
+    try kv.delete("k", 2, 1, 200);
+
+    var hist: [10]VersionEntry = undefined;
+    const n = kv.getHistory("k", &hist);
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // Current is tombstone
+    try testing.expect(hist[0].tombstone);
+    try testing.expectEqual(@as(u64, 2), hist[0].version);
+
+    // Previous was the live value
+    try testing.expectEqualSlices(u8, "v1", hist[1].value);
+    try testing.expect(!hist[1].tombstone);
+}
+
+test "kv: version chain bounded at max length" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    // Write MAX_VERSION_CHAIN_LEN + 2 versions (current + chain)
+    const total = MAX_VERSION_CHAIN_LEN + 2;
+    for (0..total) |i| {
+        var buf: [8]u8 = undefined;
+        const val = std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable;
+        try kv.put("k", val, @intCast(i + 1), 1, @intCast((i + 1) * 100), 0);
+    }
+
+    var hist: [MAX_VERSION_CHAIN_LEN + 1]VersionEntry = undefined;
+    const n = kv.getHistory("k", &hist);
+    // Current + MAX_VERSION_CHAIN_LEN historical
+    try testing.expectEqual(MAX_VERSION_CHAIN_LEN + 1, n);
+
+    // Oldest versions should have been evicted
+    try testing.expectEqual(@as(u64, total), hist[0].version); // current
+    try testing.expectEqual(@as(u64, total - 1), hist[1].version); // most recent historical
+}
+
+test "kv: version chain non-existent key returns 0" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    var hist: [10]VersionEntry = undefined;
+    const n = kv.getHistory("missing", &hist);
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "kv: prune version chains" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("a", "a1", 1, 1, 0, 0);
+    try kv.put("a", "a2", 2, 1, 0, 0);
+    try kv.put("b", "b1", 3, 1, 0, 0);
+    try kv.put("b", "b2", 4, 1, 0, 0);
+
+    const freed = kv.pruneVersionChains();
+    try testing.expectEqual(@as(usize, 2), freed); // one old version per key
+
+    // History should now only have current versions
+    var hist: [10]VersionEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), kv.getHistory("a", &hist));
+    try testing.expectEqual(@as(usize, 1), kv.getHistory("b", &hist));
 }
 
 test "kv: serialize/deserialize round-trip" {

@@ -350,6 +350,8 @@ pub const Gossip = struct {
         newly_suspected: u32 = 0,
         /// Nodes newly declared dead
         newly_dead: u32 = 0,
+        /// IDs of nodes newly declared dead (up to MAX_NODES)
+        newly_dead_ids: [MAX_NODES]NodeId = [_]NodeId{0} ** MAX_NODES,
     };
 
     // ── Message handling ────────────────────────────────────────────────
@@ -621,6 +623,9 @@ pub const Gossip = struct {
                     member.state = .dead;
                     member.state_changed_ms = now_ms;
                     self.members_declared_dead += 1;
+                    if (result.newly_dead < MAX_NODES) {
+                        result.newly_dead_ids[result.newly_dead] = member.node_id;
+                    }
                     result.newly_dead += 1;
 
                     try self.queueUpdate(.{
@@ -932,6 +937,7 @@ test "Gossip suspect escalates to dead" {
     // Tick after timeout
     const r2 = try g.tick(1300);
     try testing.expectEqual(@as(u32, 1), r2.newly_dead);
+    try testing.expectEqual(@as(NodeId, 2), r2.newly_dead_ids[0]);
 
     const member = g.getMember(2).?;
     try testing.expectEqual(MemberState.dead, member.state);
