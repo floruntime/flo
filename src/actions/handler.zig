@@ -783,6 +783,72 @@ pub const ActionsHandler = struct {
             else => {},
         }
     }
+
+    // ── Internal API (for WorkflowHandler) ──────────────────────────────
+
+    /// Result of an internal action invocation.
+    pub const InternalRunResult = struct {
+        status: ActionRunStatus,
+        output: ?[]const u8,
+    };
+
+    /// Invoke an action programmatically (used by WorkflowHandler).
+    /// Returns the action run_id string (heap-owned, stored in runs map).
+    /// Returns null if the action doesn't exist or on allocation failure.
+    pub fn invokeByName(self: *ActionsHandler, action_name: []const u8, input: ?[]const u8) ?[]const u8 {
+        // Check action exists
+        if (!self.actions.contains(action_name)) return null;
+
+        // Generate run ID
+        const run_id_num = self.nextRunId();
+        var run_id_buf: [20]u8 = undefined;
+        const run_id_str = std.fmt.bufPrint(&run_id_buf, "{d}", .{run_id_num}) catch return null;
+
+        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch return null;
+        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
+            self.allocator.free(owned_run_id);
+            return null;
+        };
+        const owned_input: ?[]const u8 = if (input) |i|
+            self.allocator.dupe(u8, i) catch null
+        else
+            null;
+
+        const now_ms: i64 = std.time.milliTimestamp();
+
+        self.runs.put(owned_run_id, .{
+            .run_id_owned = owned_run_id,
+            .action_name_owned = owned_action_name,
+            .input_owned = owned_input,
+            .status = .pending,
+            .created_at_ms = now_ms,
+            .started_at_ms = null,
+            .completed_at_ms = null,
+        }) catch {
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_action_name);
+            if (owned_input) |inp| self.allocator.free(inp);
+            return null;
+        };
+
+        // For WASM actions, execute inline (synchronous)
+        if (self.actions.get(action_name)) |action| {
+            if (action.action_type == 1) {
+                self.executeWasmAction(owned_run_id, &action, input orelse "");
+            }
+        }
+
+        return owned_run_id;
+    }
+
+    /// Check the status and result of an action run.
+    pub fn getRunResult(self: *ActionsHandler, run_id: []const u8) ?InternalRunResult {
+        const run = self.runs.get(run_id) orelse return null;
+        return .{
+            .status = run.status,
+            .output = run.result_owned,
+        };
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
