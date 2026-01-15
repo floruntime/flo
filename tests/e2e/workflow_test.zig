@@ -799,6 +799,18 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
     std.debug.print("[TEST] Final workflow status: {s}\n", .{
         std.mem.trim(u8, final_status.stdout, &std.ascii.whitespace),
     });
+
+    // 8. Query the action run to verify the workflow created a visible run
+    //    in the actions handler via invokeByName.
+    var action_status = try ctx.cli.run(&.{ "action", "status", task_id });
+    defer action_status.deinit();
+    try stdx.testing.assertSucceeded(action_status);
+
+    const action_out = std.mem.trim(u8, action_status.stdout, &std.ascii.whitespace);
+    std.debug.print("[TEST] Action run status for {s}: {s}\n", .{ task_id, action_out });
+
+    // The action run should be completed (worker marked it done in step 6)
+    try stdx.testing.assertContains(action_status, "completed");
 }
 
 /// Extract task ID from worker await output.
