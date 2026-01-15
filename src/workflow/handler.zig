@@ -1274,7 +1274,7 @@ pub const WorkflowHandler = struct {
         }
 
         // Invoke the action — creates a run record in ActionsHandler
-        const action_run_id = shard.actions_handler.invokeByName(action_name, input) orelse {
+        const action_run_id = shard.actions_handler.invokeByName(shard, action_name, input) orelse {
             return definition.StepOutcome.execution_failure;
         };
 

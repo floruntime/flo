@@ -795,7 +795,9 @@ pub const ActionsHandler = struct {
     /// Invoke an action programmatically (used by WorkflowHandler).
     /// Returns the action run_id string (heap-owned, stored in runs map).
     /// Returns null if the action doesn't exist or on allocation failure.
-    pub fn invokeByName(self: *ActionsHandler, action_name: []const u8, input: ?[]const u8) ?[]const u8 {
+    /// For user-hosted actions the `shard` is used to notify blocked
+    /// worker_await waiters so external workers can claim the run.
+    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8) ?[]const u8 {
         // Check action exists
         if (!self.actions.contains(action_name)) return null;
 
@@ -831,10 +833,15 @@ pub const ActionsHandler = struct {
             return null;
         };
 
-        // For WASM actions, execute inline (synchronous)
+        // For WASM actions, execute inline (synchronous).
+        // For user-hosted actions, notify worker_await waiters so
+        // a blocked worker can claim the pending run.
         if (self.actions.get(action_name)) |action| {
             if (action.action_type == 1) {
                 self.executeWasmAction(owned_run_id, &action, input orelse "");
+            } else {
+                // User-hosted: wake any workers waiting for this action
+                shard.waiter_pool.notifyAny(.worker_await, resolveWorkerAwait, @ptrCast(shard));
             }
         }
 
