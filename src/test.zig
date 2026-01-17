@@ -33,4 +33,5 @@ test {
     _ = @import("node/connection.zig");
     _ = @import("node/shard.zig");
     _ = @import("node/acceptor.zig");
+    _ = @import("node/shard_walker.zig");
 }
