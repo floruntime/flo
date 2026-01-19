@@ -167,7 +167,7 @@ pub fn create(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*c
     } else if (std.mem.eql(u8, spec.type_name, "classify")) {
         return createClassify(allocator, spec, tag_registry);
     } else if (std.mem.eql(u8, spec.type_name, "wasm")) {
-        return createWasm(allocator, spec);
+        return createWasm(allocator, spec, tag_registry);
     }
 
     return CreateError.UnknownOperatorType;
@@ -407,7 +407,7 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     };
 }
 
-fn createWasm(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
+fn createWasm(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*const TagRegistry) CreateError!CreateResult {
     const module_path = spec.module orelse {
         log.err("Native operator '{s}' (type=wasm) missing required 'module' path", .{spec.name});
         return CreateError.MissingConfig;
@@ -415,6 +415,7 @@ fn createWasm(allocator: Allocator, spec: *const OperatorSpec) CreateError!Creat
 
     const ptr = allocator.create(WasmOperator) catch return CreateError.OutOfMemory;
     ptr.* = WasmOperator.init(allocator, spec.name, module_path);
+    ptr.tag_registry = tag_registry;
 
     return .{
         .op = ptr.operator(),

@@ -31,6 +31,7 @@
 //!   flo.kv_get(key_ptr, key_len, buf_ptr, buf_len) -> i32
 //!   flo.kv_set(key_ptr, key_len, val_ptr, val_len) -> i32
 //!   flo.kv_delete(key_ptr, key_len) -> i32
+//!   flo.set_tag(name_ptr: u32, name_len: u32) -> i32
 //!
 //! ## Thread Safety
 //!
@@ -114,6 +115,9 @@ const kv_set_results = &[_]ValType{.I32};
 const kv_delete_params = &[_]ValType{ .I32, .I32 };
 const kv_delete_results = &[_]ValType{.I32};
 
+const set_tag_params = &[_]ValType{ .I32, .I32 };
+const set_tag_results = &[_]ValType{.I32};
+
 const wasi_clock_time_get_params = &[_]ValType{ .I32, .I64, .I32 };
 const wasi_clock_time_get_results = &[_]ValType{.I32};
 const wasi_random_get_params = &[_]ValType{ .I32, .I32 };
@@ -191,7 +195,10 @@ pub const KvResult = struct {
     value: ?[]const u8 = null,
 };
 
-/// Context passed to KV host functions via the usize context parameter.
+/// Callback type for tag resolution: maps tag name → bit position.
+pub const TagResolveFn = *const fn (ctx: *anyopaque, tag_name: []const u8) ?u5;
+
+/// Context passed to host functions via the usize context parameter.
 /// Lives for the duration of a single WASM execute() call.
 pub const WasmKvContext = struct {
     namespace: []const u8,
@@ -199,6 +206,13 @@ pub const WasmKvContext = struct {
     kv_dispatch_ctx: ?*anyopaque,
     allocator: Allocator,
     kv_enabled: bool,
+
+    /// Tag resolution callback (optional — processing only).
+    tag_resolve_fn: ?TagResolveFn = null,
+    tag_resolve_ctx: ?*anyopaque = null,
+    /// Accumulated tag bits set by the WASM guest via flo.set_tag().
+    /// Read by the caller after execute() to apply to the output record.
+    output_tags: u32 = 0,
 
     pub fn fromContext(context: usize) *WasmKvContext {
         return @ptrFromInt(context);
@@ -248,6 +262,7 @@ pub const WasmRunner = struct {
         try self.store.exposeHostFunction(flo_module, "kv_get", hostFnKvGet, 0, kv_get_params, kv_get_results);
         try self.store.exposeHostFunction(flo_module, "kv_set", hostFnKvSet, 0, kv_set_params, kv_set_results);
         try self.store.exposeHostFunction(flo_module, "kv_delete", hostFnKvDelete, 0, kv_delete_params, kv_delete_results);
+        try self.store.exposeHostFunction(flo_module, "set_tag", hostFnSetTag, 0, set_tag_params, set_tag_results);
 
         try self.store.exposeHostFunction(wasi_module, "clock_time_get", hostFnWasiClockTimeGet, 0, wasi_clock_time_get_params, wasi_clock_time_get_results);
         try self.store.exposeHostFunction(wasi_module, "random_get", hostFnWasiRandomGet, 0, wasi_random_get_params, wasi_random_get_results);
@@ -433,14 +448,15 @@ pub const WasmRunner = struct {
         return result;
     }
 
-    /// Update the context pointer for KV host functions.
+    /// Update the context pointer for host functions (KV + tag).
     fn updateHostFunctionContexts(self: *Self, context: usize) void {
         for (self.store.functions.items) |*func| {
             if (func.subtype == .host_function) {
                 const hf = &func.subtype.host_function;
                 if (hf.func == hostFnKvGet or
                     hf.func == hostFnKvSet or
-                    hf.func == hostFnKvDelete)
+                    hf.func == hostFnKvDelete or
+                    hf.func == hostFnSetTag)
                 {
                     hf.context = context;
                 }
@@ -641,6 +657,50 @@ fn hostFnKvDelete(vm: *VirtualMachine, context: usize) WasmError!void {
         .not_found => RC_NOT_FOUND,
         .err => RC_STATE_ERROR,
     });
+}
+
+// =============================================================================
+// Tag Host Function
+// =============================================================================
+
+/// flo.set_tag(name_ptr: u32, name_len: u32) -> i32
+///
+/// Resolve a tag name via the pipeline's TagRegistry and OR the
+/// corresponding bit into `output_tags`.  Returns 0 on success,
+/// RC_NOT_FOUND if the name is unknown, RC_STATE_ERROR if tagging
+/// is not available (e.g. Actions context).
+fn hostFnSetTag(vm: *VirtualMachine, context: usize) WasmError!void {
+    const name_len = vm.popOperand(u32);
+    const name_ptr = vm.popOperand(u32);
+
+    if (context == 0) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const ctx = WasmKvContext.fromContext(context);
+
+    const resolve_fn = ctx.tag_resolve_fn orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+    const resolve_ctx = ctx.tag_resolve_ctx orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+
+    const tag_name = readGuestBytes(vm, name_ptr, name_len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+
+    const bit = resolve_fn(resolve_ctx, tag_name) orelse {
+        vm.pushOperandNoCheck(i32, RC_NOT_FOUND);
+        return;
+    };
+
+    ctx.output_tags |= @as(u32, 1) << bit;
+    vm.pushOperandNoCheck(i32, RC_SUCCESS);
 }
 
 // =============================================================================
@@ -883,4 +943,81 @@ test "WasmKvContext round-trip" {
     try std.testing.expectEqualStrings("test-ns", recovered.namespace);
     try std.testing.expect(recovered.kv_enabled);
     try std.testing.expect(recovered.kv_dispatch_fn == null);
+}
+
+const TestTagRegistry = @import("../processing/definition.zig").TagRegistry;
+
+fn testTagResolve(ctx_ptr: *anyopaque, tag_name: []const u8) ?u5 {
+    const r: *const TestTagRegistry = @ptrCast(@alignCast(ctx_ptr));
+    return r.resolve(tag_name);
+}
+
+test "WasmRunner set_tag via txn_classifier" {
+    const allocator = std.testing.allocator;
+    const wasm_bytes = @embedFile("../processing/testdata/txn_classifier.wasm");
+
+    var runner = try WasmRunner.init(allocator);
+    defer runner.deinit();
+
+    var module = try runner.loadModule(wasm_bytes, .{});
+    defer module.deinit();
+
+    var reg: TestTagRegistry = .{};
+    _ = reg.getOrCreate("high-value"); // bit 0
+    _ = reg.getOrCreate("refund"); // bit 1
+    _ = reg.getOrCreate("standard"); // bit 2
+
+    var ctx = WasmKvContext{
+        .namespace = "",
+        .kv_dispatch_fn = null,
+        .kv_dispatch_ctx = null,
+        .allocator = allocator,
+        .kv_enabled = false,
+        .tag_resolve_fn = testTagResolve,
+        .tag_resolve_ctx = @constCast(@ptrCast(&reg)),
+        .output_tags = 0,
+    };
+
+    var result = try runner.executeWithKv(&module, "{\"txn_id\": \"T1\", \"amount\": 15000, \"merchant\": \"ACME\"}", &ctx);
+    defer result.deinit();
+
+    // Should have set "high-value" tag (bit 0)
+    try std.testing.expectEqual(@as(u32, 0b001), ctx.output_tags);
+
+    // Output should contain the classification
+    try std.testing.expect(std.mem.indexOf(u8, result.outputStr(), "\"class\":\"high-value\"") != null);
+}
+
+test "WasmRunner set_tag refund classification" {
+    const allocator = std.testing.allocator;
+    const wasm_bytes = @embedFile("../processing/testdata/txn_classifier.wasm");
+
+    var runner = try WasmRunner.init(allocator);
+    defer runner.deinit();
+
+    var module = try runner.loadModule(wasm_bytes, .{});
+    defer module.deinit();
+
+    var reg: TestTagRegistry = .{};
+    _ = reg.getOrCreate("high-value"); // bit 0
+    _ = reg.getOrCreate("refund"); // bit 1
+    _ = reg.getOrCreate("standard"); // bit 2
+
+    var ctx = WasmKvContext{
+        .namespace = "",
+        .kv_dispatch_fn = null,
+        .kv_dispatch_ctx = null,
+        .allocator = allocator,
+        .kv_enabled = false,
+        .tag_resolve_fn = testTagResolve,
+        .tag_resolve_ctx = @constCast(@ptrCast(&reg)),
+        .output_tags = 0,
+    };
+
+    var result = try runner.executeWithKv(&module, "{\"txn_id\": \"R1\", \"amount\": -500, \"merchant\": \"STORE\"}", &ctx);
+    defer result.deinit();
+
+    // Should have set "refund" tag (bit 1)
+    try std.testing.expectEqual(@as(u32, 0b010), ctx.output_tags);
+    try std.testing.expect(std.mem.indexOf(u8, result.outputStr(), "\"class\":\"refund\"") != null);
 }

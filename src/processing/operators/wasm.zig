@@ -6,16 +6,41 @@
 //! Uses the centralized WASM runner (`src/wasm/runner.zig`) shared
 //! with the actions subsystem.
 //!
-//! YAML example:
+//! ## Processing WASM Contract
+//!
+//! Guest exports (same as Actions ABI):
+//!   - `handle(input_ptr: u32, input_len: u32) -> i64`
+//!   - `alloc(size: u32) -> u32`
+//!   - `dealloc(ptr: u32, size: u32) -> void`
+//!
+//! Host imports (provided by Flo runtime):
+//!   - `flo.set_tag(name_ptr: u32, name_len: u32) -> i32`
+//!     Tag the output record for sink match-based routing. The tag name
+//!     is resolved via the pipeline's TagRegistry. Returns 0 on success,
+//!     -1 if the tag name is unknown.
+//!   - `flo.kv_get(key_ptr, key_len, buf_ptr, buf_len) -> i32`
+//!   - `flo.kv_set(key_ptr, key_len, val_ptr, val_len) -> i32`
+//!   - `flo.kv_delete(key_ptr, key_len) -> i32`
+//!   - `flo.log(level: u32, msg_ptr: u32, msg_len: u32) -> void`
+//!
+//! ## YAML example
+//!
 //!   ```yaml
 //!   operators:
 //!     - type: wasm
-//!       name: transform
+//!       name: enrich
 //!       module: ./transforms/enrich.wasm
+//!   sinks:
+//!     - name: enriched-sink
+//!       stream.name: enriched-output
+//!       match: [enriched]          # receives records tagged by WASM
 //!   ```
 //!
 //! The `module` field specifies the path to the WASM binary. The handler
 //! reads the bytes and calls `loadWasm()` after creation.
+//!
+//! Tagging is dynamic: the WASM module itself calls `flo.set_tag("enriched")`
+//! during `handle()`, and the bit is OR'd into the output record's tags.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,6 +55,8 @@ const wasm_runner = @import("../../wasm/runner.zig");
 const WasmRunner = wasm_runner.WasmRunner;
 const WasmModule = wasm_runner.WasmModule;
 const WasmConfig = wasm_runner.WasmConfig;
+const WasmKvContext = wasm_runner.WasmKvContext;
+const TagRegistry = @import("../definition.zig").TagRegistry;
 const log = @import("stdx").log;
 
 pub const WasmOperator = struct {
@@ -38,6 +65,8 @@ pub const WasmOperator = struct {
     allocator: Allocator,
     runner: ?WasmRunner = null,
     module: ?WasmModule = null,
+    /// Pipeline's tag registry for resolving tag names in flo.set_tag().
+    tag_registry: ?*const TagRegistry = null,
 
     const Self = @This();
 
@@ -89,7 +118,19 @@ pub const WasmOperator = struct {
         var runner = &(self.runner orelse return);
         const module = &(self.module orelse return);
 
-        var result = runner.execute(module, rec.value) catch |err| {
+        // Build execution context with tag resolution for flo.set_tag()
+        var wasm_ctx = WasmKvContext{
+            .namespace = "",
+            .kv_dispatch_fn = null,
+            .kv_dispatch_ctx = null,
+            .allocator = self.allocator,
+            .kv_enabled = false,
+            .tag_resolve_fn = if (self.tag_registry != null) tagResolveCallback else null,
+            .tag_resolve_ctx = if (self.tag_registry) |reg| @constCast(@ptrCast(reg)) else null,
+            .output_tags = 0,
+        };
+
+        var result = runner.executeWithKv(module, rec.value, &wasm_ctx) catch |err| {
             log.err("WASM operator '{s}' execution failed: {}", .{ self.name, err });
             return;
         };
@@ -104,6 +145,9 @@ pub const WasmOperator = struct {
         else
             @as([]const u8, &.{});
 
+        // Merge: input tags + any tags set by the WASM module via flo.set_tag()
+        const tags = rec.tags | wasm_ctx.output_tags;
+
         try ctx.emit(.{
             .key = key_dupe,
             .value = output,
@@ -111,8 +155,14 @@ pub const WasmOperator = struct {
             .source = rec.source,
             .headers = &.{},
             .owns_memory = true,
-            .tags = rec.tags,
+            .tags = tags,
         });
+    }
+
+    /// Callback passed to the WASM host for flo.set_tag() resolution.
+    fn tagResolveCallback(ctx_ptr: *anyopaque, tag_name: []const u8) ?u5 {
+        const reg: *const TagRegistry = @ptrCast(@alignCast(ctx_ptr));
+        return reg.resolve(tag_name);
     }
 
     fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
@@ -298,4 +348,112 @@ test "WasmOperator — multiple records" {
         "{\"eligible\":false,\"rules_evaluated\":2,\"rules_passed\":0}",
         output[1].value,
     );
+}
+
+test "WasmOperator — dynamic tagging via flo.set_tag" {
+    const allocator = testing.allocator;
+    const wasm_bytes = @embedFile("../testdata/txn_classifier.wasm");
+
+    var op = try allocator.create(WasmOperator);
+    op.* = WasmOperator.init(allocator, "txn-classify", "./txn_classifier.wasm");
+    defer {
+        op.deinit();
+        allocator.destroy(op);
+    }
+
+    // Set up tag registry (same names the WASM module calls set_tag with)
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("high-value"); // bit 0
+    _ = reg.getOrCreate("refund"); // bit 1
+    _ = reg.getOrCreate("standard"); // bit 2
+    op.tag_registry = &reg;
+
+    try op.loadWasm(wasm_bytes);
+    const iface = op.operator();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 1000,
+        .current_watermark_ms = 0,
+        .operator_name = "txn-classify",
+    };
+
+    // High-value transaction (amount >= 10000) → should tag "high-value" (bit 0)
+    try iface.processElement(
+        ProcessingRecord.init("t1", "{\"txn_id\": \"T1\", \"amount\": 25000, \"merchant\": \"ACME\"}", 100),
+        &ctx,
+    );
+    // Refund transaction (amount < 0) → should tag "refund" (bit 1)
+    try iface.processElement(
+        ProcessingRecord.init("t2", "{\"txn_id\": \"R1\", \"amount\": -200, \"merchant\": \"STORE\"}", 200),
+        &ctx,
+    );
+    // Standard transaction → should tag "standard" (bit 2)
+    try iface.processElement(
+        ProcessingRecord.init("t3", "{\"txn_id\": \"S1\", \"amount\": 50, \"merchant\": \"CAFE\"}", 300),
+        &ctx,
+    );
+
+    try testing.expectEqual(@as(usize, 3), collector.count());
+
+    const output = collector.drain();
+    try testing.expectEqual(@as(u32, 0b001), output[0].tags); // high-value
+    try testing.expectEqual(@as(u32, 0b010), output[1].tags); // refund
+    try testing.expectEqual(@as(u32, 0b100), output[2].tags); // standard
+
+    // Verify output contains classification
+    try testing.expect(std.mem.indexOf(u8, output[0].value, "\"class\":\"high-value\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output[1].value, "\"class\":\"refund\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output[2].value, "\"class\":\"standard\"") != null);
+}
+
+test "WasmOperator — dynamic tags merge with existing tags" {
+    const allocator = testing.allocator;
+    const wasm_bytes = @embedFile("../testdata/txn_classifier.wasm");
+
+    var op = try allocator.create(WasmOperator);
+    op.* = WasmOperator.init(allocator, "merge-wasm", "./txn_classifier.wasm");
+    defer {
+        op.deinit();
+        allocator.destroy(op);
+    }
+
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("high-value"); // bit 0
+    _ = reg.getOrCreate("refund"); // bit 1
+    _ = reg.getOrCreate("standard"); // bit 2
+    op.tag_registry = &reg;
+
+    try op.loadWasm(wasm_bytes);
+    const iface = op.operator();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 1000,
+        .current_watermark_ms = 0,
+        .operator_name = "merge-wasm",
+    };
+
+    // Record already has bit 3 set from a prior operator
+    var rec = ProcessingRecord.init("t1", "{\"txn_id\": \"M1\", \"amount\": 50000, \"merchant\": \"BIG\"}", 100);
+    rec.tags = 0b1000; // bit 3 pre-set
+
+    try iface.processElement(rec, &ctx);
+
+    try testing.expectEqual(@as(usize, 1), collector.count());
+    const output = collector.drain();
+    // Should have both pre-existing bit 3 AND "high-value" bit 0
+    try testing.expectEqual(@as(u32, 0b1001), output[0].tags);
 }
