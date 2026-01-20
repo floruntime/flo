@@ -227,8 +227,33 @@ pub const NamespaceHandler = struct {
         // No pre-route hooks — namespace commands route to Controller (Shard 0).
         dispatcher.register(.namespace_create, dispatchNamespace);
         dispatcher.register(.namespace_delete, dispatchNamespace);
-        dispatcher.register(.namespace_list, dispatchNamespace);
+        dispatcher.registerWalk(.namespace_list, dispatchNamespace, localScanNamespaces);
         dispatcher.register(.namespace_info, dispatchNamespace);
+    }
+
+    /// ShardWalker LocalScanFn for namespace_list — returns namespace names
+    /// from one shard's NamespaceHandler registry.
+    fn localScanNamespaces(
+        ctx: *anyopaque,
+        _: []const u8, // namespace (ignored — namespaces are global)
+        _: []const u8, // filter
+        _: ?[]const u8, // cursor
+        _: u32, // limit
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const handler: *NamespaceHandler = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [256][]const u8 = undefined;
+        };
+
+        var count: usize = 0;
+        var it = handler.namespaces.iterator();
+        while (it.next()) |entry| {
+            if (count >= S.name_buf.len) break;
+            S.name_buf[count] = entry.key_ptr.*;
+            count += 1;
+        }
+
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

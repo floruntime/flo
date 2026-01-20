@@ -138,7 +138,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_register, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_invoke, dispatchInvoke, preRouteByAction);
         dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
-        dispatcher.register(.action_list, dispatchAction);
+        dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.worker_await, dispatchWorkerAwait, preRouteByAction);
         dispatcher.registerWithRoute(.worker_register, dispatchWorkerCmd, preRouteByAction);
@@ -544,6 +544,31 @@ pub const ActionsHandler = struct {
             .data = data,
             .cursor = null,
         } };
+    }
+
+    /// ShardWalker LocalScanFn for action_list — returns action names
+    /// from one shard's ActionsHandler registry.
+    fn localScanActions(
+        ctx: *anyopaque,
+        _: []const u8, // namespace
+        _: []const u8, // filter
+        _: ?[]const u8, // cursor
+        _: u32, // limit
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const handler: *ActionsHandler = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [1024][]const u8 = undefined;
+        };
+
+        var count: usize = 0;
+        var it = handler.actions.iterator();
+        while (it.next()) |entry| {
+            if (count >= S.name_buf.len) break;
+            S.name_buf[count] = entry.value_ptr.name_owned;
+            count += 1;
+        }
+
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     // ── DELETE ───────────────────────────────────────────────────────────

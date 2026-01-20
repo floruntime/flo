@@ -14,9 +14,9 @@ export function ClusterOverview() {
     if (statsLoading && !stats) return <LoadingState />;
     if (statsError) return <ErrorState message={statsError} onRetry={refetchStats} />;
 
-    const totalIngestRate = streams?.reduce((acc, s) => acc + s.ingest_rate, 0) ?? 0;
-    const totalInvocations = actions?.reduce((acc, a) => acc + a.runs.total, 0) ?? 0;
-    const totalErrors = actions?.reduce((acc, a) => acc + a.runs.failed, 0) ?? 0;
+    const totalIngestRate = streams?.reduce((acc, s) => acc + (s.ingest_rate ?? 0), 0) ?? 0;
+    const totalInvocations = actions?.reduce((acc, a) => acc + (a.runs?.total ?? 0), 0) ?? 0;
+    const totalErrors = actions?.reduce((acc, a) => acc + (a.runs?.failed ?? 0), 0) ?? 0;
     const activeWorkflows = Array.isArray(workflows) ? workflows.filter(w => w.status === 'running').length : 0;
 
     return (
