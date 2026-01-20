@@ -220,7 +220,7 @@ pub const ProcessingHandler = struct {
         dispatcher.registerWithRoute(.processing_stop, dispatchProcessing, preRouteByProcessing);
         dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, preRouteByProcessing);
         dispatcher.registerWithRoute(.processing_status, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_list, dispatchProcessing, preRouteByProcessing);
+        dispatcher.registerWalk(.processing_list, dispatchProcessing, localScanJobs);
         dispatcher.registerWithRoute(.processing_savepoint, dispatchProcessing, preRouteByProcessing);
         dispatcher.registerWithRoute(.processing_restore, dispatchProcessing, preRouteByProcessing);
         dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, preRouteByProcessing);
@@ -234,6 +234,34 @@ pub const ProcessingHandler = struct {
         }
         // For submit/list with empty key, use namespace
         return 0;
+    }
+
+    /// ShardWalker LocalScanFn for processing_list — returns job names
+    /// from one shard's ProcessingHandler registry.
+    fn localScanJobs(
+        ctx: *anyopaque,
+        namespace: []const u8,
+        _: []const u8, // filter
+        _: ?[]const u8, // cursor
+        _: u32, // limit
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [1024][]const u8 = undefined;
+        };
+
+        const req_ns = if (namespace.len > 0) namespace else "default";
+        var count: usize = 0;
+        var it = handler.jobs.iterator();
+        while (it.next()) |entry| {
+            if (count >= S.name_buf.len) break;
+            const job = entry.value_ptr;
+            if (!std.mem.eql(u8, job.namespace_owned, req_ns)) continue;
+            S.name_buf[count] = job.name_owned;
+            count += 1;
+        }
+
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchProcessing(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

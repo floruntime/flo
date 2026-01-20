@@ -177,7 +177,7 @@ pub const Runtime = struct {
     /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
     /// Each entry is a per-shard array of projection pointers for one walk opcode.
     /// Slots: [0] = ts_list. More slots added as modules gain list support.
-    walk_ctx_slices: [6]?[]*anyopaque,
+    walk_ctx_slices: [8]?[]*anyopaque,
 
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         const shard_count = detectShardCount(config.num_shards);
@@ -197,7 +197,7 @@ pub const Runtime = struct {
             .dashboard_server = null,
             .dashboard_ctx = null,
             .metrics_registry = null,
-            .walk_ctx_slices = .{ null, null, null, null, null, null },
+            .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
         };
     }
 
@@ -492,8 +492,35 @@ pub const Runtime = struct {
         }
         self.walk_ctx_slices[4] = action_ctxs;
 
-        // Future: queue_list, workflow_list_definitions
-        // will be wired here when those projections support named-resource listing.
+        // queue_list → each shard's QueueHandler
+        const queue_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            queue_ctxs[i] = @ptrCast(shards[i].queue_handler);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.queue_list, queue_ctxs);
+        }
+        self.walk_ctx_slices[5] = queue_ctxs;
+
+        // processing_list → each shard's ProcessingHandler
+        const proc_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            proc_ctxs[i] = @ptrCast(shards[i].processing_handler);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.processing_list, proc_ctxs);
+        }
+        self.walk_ctx_slices[6] = proc_ctxs;
+
+        // workflow_list_definitions → each shard's WorkflowHandler
+        const wf_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            wf_ctxs[i] = @ptrCast(shards[i].workflow_handler);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.workflow_list_definitions, wf_ctxs);
+        }
+        self.walk_ctx_slices[7] = wf_ctxs;
     }
 
     /// Graceful shutdown in reverse order.

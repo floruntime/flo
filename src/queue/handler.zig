@@ -75,7 +75,34 @@ pub const QueueHandler = struct {
         dispatcher.registerWithRoute(.queue_dlq_requeue, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_dlq_delete, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_purge, dispatchQueue, preRouteByQueue);
-        dispatcher.register(.queue_list, dispatchQueue);
+        dispatcher.registerWalk(.queue_list, dispatchQueue, localScanQueues);
+    }
+
+    /// ShardWalker LocalScanFn for queue_list — returns queue names
+    /// from one shard's QueueProjection registry.
+    fn localScanQueues(
+        ctx: *anyopaque,
+        namespace: []const u8,
+        _: []const u8, // filter
+        _: ?[]const u8, // cursor
+        _: u32, // limit
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [256][]const u8 = undefined;
+        };
+
+        var count: usize = 0;
+        var it = handler.queue.known_queues.iterator();
+        while (it.next()) |entry| {
+            if (count >= S.name_buf.len) break;
+            const meta = entry.value_ptr;
+            if (namespace.len > 0 and !std.mem.eql(u8, meta.namespace, namespace)) continue;
+            S.name_buf[count] = meta.name;
+            count += 1;
+        }
+
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────

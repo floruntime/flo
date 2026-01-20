@@ -249,7 +249,38 @@ pub const WorkflowHandler = struct {
         dispatcher.register(.workflow_get_definition, dispatchWorkflow);
         dispatcher.register(.workflow_disable, dispatchWorkflow);
         dispatcher.register(.workflow_enable, dispatchWorkflow);
-        dispatcher.register(.workflow_list_definitions, dispatchWorkflow);
+        dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
+    }
+
+    /// ShardWalker LocalScanFn for workflow_list_definitions — returns
+    /// workflow definition names from one shard's WorkflowHandler registry.
+    fn localScanWorkflowDefs(
+        ctx: *anyopaque,
+        namespace: []const u8,
+        _: []const u8, // filter
+        _: ?[]const u8, // cursor
+        _: u32, // limit
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [256][]const u8 = undefined;
+        };
+
+        var count: usize = 0;
+        var dit = handler.definitions.iterator();
+        while (dit.next()) |entry| {
+            if (count >= S.name_buf.len) break;
+            if (namespace.len > 0) {
+                const map_key = entry.key_ptr.*;
+                // map_key format is "namespace:name"
+                if (!std.mem.startsWith(u8, map_key, namespace)) continue;
+                if (map_key.len <= namespace.len or map_key[namespace.len] != ':') continue;
+            }
+            S.name_buf[count] = entry.value_ptr.name_owned;
+            count += 1;
+        }
+
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
