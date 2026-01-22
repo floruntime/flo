@@ -37,4 +37,7 @@ test {
     _ = @import("node/task_scheduler.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
+    _ = @import("storage/ual/segment.zig");
+    _ = @import("storage/ual/writer.zig");
+    _ = @import("storage/ual/reader.zig");
 }
