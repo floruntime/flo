@@ -40,4 +40,5 @@ test {
     _ = @import("storage/ual/segment.zig");
     _ = @import("storage/ual/writer.zig");
     _ = @import("storage/ual/reader.zig");
+    _ = @import("storage/snapshot.zig");
 }
