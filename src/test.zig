@@ -42,4 +42,5 @@ test {
     _ = @import("storage/ual/reader.zig");
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/memory.zig");
+    _ = @import("storage/partition.zig");
 }
