@@ -44,3 +44,8 @@ test {
     _ = @import("storage/memory.zig");
     _ = @import("storage/partition.zig");
 }
+
+// Raft consensus — Phase 3
+test {
+    _ = @import("raft/log.zig");
+}
