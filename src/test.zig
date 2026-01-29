@@ -48,4 +48,5 @@ test {
 // Raft consensus — Phase 3
 test {
     _ = @import("raft/log.zig");
+    _ = @import("raft/node.zig");
 }
