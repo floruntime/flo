@@ -109,8 +109,9 @@ pub const RaftLog = struct {
     /// Returns the number of entries written to `buf`.
     pub fn getRange(self: *const RaftLog, start_index: u64, buf: []Entry) usize {
         if (start_index > self.last_idx) return 0;
-        const end_index = @min(start_index + buf.len - 1, self.last_idx);
-        return self.ual.readRange(start_index, end_index, buf);
+        // UAL.readRange uses exclusive upper bound, so add 1
+        const end_exclusive = @min(start_index + buf.len, self.last_idx + 1);
+        return self.ual.readRange(start_index, end_exclusive, buf);
     }
 
     // ── Truncation ──────────────────────────────────────────────────────

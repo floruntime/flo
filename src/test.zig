@@ -50,4 +50,5 @@ test {
     _ = @import("raft/log.zig");
     _ = @import("raft/node.zig");
     _ = @import("raft/election.zig");
+    _ = @import("raft/replication.zig");
 }
