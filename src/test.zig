@@ -54,3 +54,8 @@ test {
     _ = @import("raft/transport.zig");
     _ = @import("raft/snapshot.zig");
 }
+
+// Projections — Phase 4
+test {
+    _ = @import("projection/router.zig");
+}
