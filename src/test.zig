@@ -58,4 +58,5 @@ test {
 // Projections — Phase 4
 test {
     _ = @import("projection/router.zig");
+    _ = @import("projection/kv.zig");
 }

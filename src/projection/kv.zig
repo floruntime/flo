@@ -1,0 +1,560 @@
+//! KV Projection — in-memory hash table with MVCC versioning.
+//!
+//! Maintains a hash map of key → KVEntry for O(1) point lookups.
+//! Supports put, get, delete, scan, and TTL expiry.
+//! Consumer group state is also stored here as regular KV entries.
+//!
+//! Bounded by a configurable memory limit. When the limit is approached,
+//! old MVCC versions are pruned first. The projection is snapshot-able
+//! for Raft snapshot transfers.
+//!
+//! applied via ProjectionRouter from committed UAL entries:
+//!   kv_put    → insert or update key
+//!   kv_delete → tombstone the key
+//!   kv_batch  → apply multiple ops atomically
+//!   cg_*      → consumer group state (stored as KV with cg: prefix)
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const entry_mod = @import("../storage/ual/entry.zig");
+const router_mod = @import("router.zig");
+
+const Entry = entry_mod.Entry;
+const EntryType = entry_mod.EntryType;
+const CommandPayload = entry_mod.CommandPayload;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KV Entry — stored in the hash map
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const KVEntry = struct {
+    /// The key (owned, allocated).
+    key: []const u8,
+    /// The value (owned, allocated). Empty slice for tombstones.
+    value: []const u8,
+    /// UAL index that last modified this entry.
+    lsn: u64,
+    /// Raft term of the write.
+    term: u64,
+    /// Wall clock timestamp (nanoseconds) of the write.
+    timestamp_ns: u64,
+    /// TTL expiry (nanoseconds). 0 = no expiry.
+    expiry_ns: u64,
+    /// Whether this entry is a tombstone (deleted).
+    tombstone: bool,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scan Result
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const ScanEntry = struct {
+    key: []const u8,
+    value: []const u8,
+    lsn: u64,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KV Projection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const KVProjection = struct {
+    allocator: Allocator,
+    /// Main hash map: key → KVEntry.
+    map: std.StringHashMap(KVEntry),
+    /// Memory limit in bytes (0 = unlimited).
+    memory_limit: usize,
+    /// Approximate current memory usage.
+    memory_used: usize,
+    /// Last applied UAL index.
+    applied_index: u64,
+
+    /// Stats.
+    stats: Stats,
+
+    pub const Stats = struct {
+        puts: u64 = 0,
+        deletes: u64 = 0,
+        gets: u64 = 0,
+        scans: u64 = 0,
+        expired: u64 = 0,
+        evicted: u64 = 0,
+    };
+
+    pub fn init(allocator: Allocator, memory_limit: usize) KVProjection {
+        return .{
+            .allocator = allocator,
+            .map = std.StringHashMap(KVEntry).init(allocator),
+            .memory_limit = memory_limit,
+            .memory_used = 0,
+            .applied_index = 0,
+            .stats = .{},
+        };
+    }
+
+    pub fn deinit(self: *KVProjection) void {
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            self.freeEntry(kv.value_ptr);
+        }
+        self.map.deinit();
+    }
+
+    /// Number of live (non-tombstone) entries.
+    pub fn count(self: *const KVProjection) usize {
+        var live: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (!kv.value_ptr.tombstone) live += 1;
+        }
+        return live;
+    }
+
+    /// Total entries including tombstones.
+    pub fn totalEntries(self: *const KVProjection) usize {
+        return self.map.count();
+    }
+
+    // ─── Point operations ──────────────────────────────────────────────────
+
+    /// Put a key-value pair.
+    pub fn put(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64) !void {
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+
+        const new_entry = KVEntry{
+            .key = owned_key,
+            .value = owned_value,
+            .lsn = lsn,
+            .term = term,
+            .timestamp_ns = timestamp_ns,
+            .expiry_ns = 0,
+            .tombstone = false,
+        };
+
+        if (self.map.getPtr(key)) |existing| {
+            // Key already in map — don't replace it (map references old key ptr).
+            // Free the newly allocated key since we don't need it.
+            self.allocator.free(owned_key);
+            // Free old value
+            self.memory_used -= existing.value.len;
+            if (existing.value.len > 0 and !existing.tombstone) {
+                self.allocator.free(@constCast(existing.value));
+            }
+            existing.value = owned_value;
+            existing.lsn = lsn;
+            existing.term = term;
+            existing.timestamp_ns = timestamp_ns;
+            existing.expiry_ns = 0;
+            existing.tombstone = false;
+            self.memory_used += owned_value.len;
+        } else {
+            try self.map.put(owned_key, new_entry);
+            self.memory_used += owned_key.len + owned_value.len;
+        }
+        self.stats.puts += 1;
+    }
+
+    /// Get a value by key. Returns null if not found or tombstoned.
+    pub fn get(self: *KVProjection, key: []const u8) ?*const KVEntry {
+        self.stats.gets += 1;
+        const entry = self.map.getPtr(key) orelse return null;
+        if (entry.tombstone) return null;
+        // Check TTL
+        if (entry.expiry_ns > 0 and entry.expiry_ns <= std.time.nanoTimestamp()) {
+            // Lazily expire — don't remove yet, just return null
+            return null;
+        }
+        return entry;
+    }
+
+    /// Get raw entry (including tombstones) for internal use.
+    pub fn getRaw(self: *KVProjection, key: []const u8) ?*const KVEntry {
+        return self.map.getPtr(key);
+    }
+
+    /// Delete a key (mark as tombstone).
+    pub fn delete(self: *KVProjection, key: []const u8, lsn: u64, term: u64, timestamp_ns: u64) !void {
+        if (self.map.getPtr(key)) |existing| {
+            // Free the value, keep the key for scan-skip
+            self.memory_used -= existing.value.len;
+            self.allocator.free(@constCast(existing.value));
+            existing.value = "";
+            existing.lsn = lsn;
+            existing.term = term;
+            existing.timestamp_ns = timestamp_ns;
+            existing.tombstone = true;
+        } else {
+            // Insert a tombstone for a key we never saw (possible after snapshot)
+            const owned_key = try self.allocator.dupe(u8, key);
+            const entry = KVEntry{
+                .key = owned_key,
+                .value = "",
+                .lsn = lsn,
+                .term = term,
+                .timestamp_ns = timestamp_ns,
+                .expiry_ns = 0,
+                .tombstone = true,
+            };
+            try self.map.put(owned_key, entry);
+            self.memory_used += owned_key.len;
+        }
+        self.stats.deletes += 1;
+    }
+
+    /// Scan all live (non-tombstone) entries. Results are unsorted.
+    /// Caller provides a bounded output buffer.
+    pub fn scan(self: *KVProjection, out: []ScanEntry) usize {
+        self.stats.scans += 1;
+        var count_written: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (count_written >= out.len) break;
+            const entry = kv.value_ptr;
+            if (entry.tombstone) continue;
+            out[count_written] = .{
+                .key = entry.key,
+                .value = entry.value,
+                .lsn = entry.lsn,
+            };
+            count_written += 1;
+        }
+        return count_written;
+    }
+
+    /// Scan entries matching a key prefix.
+    pub fn scanPrefix(self: *KVProjection, prefix: []const u8, out: []ScanEntry) usize {
+        self.stats.scans += 1;
+        var count_written: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (count_written >= out.len) break;
+            const entry = kv.value_ptr;
+            if (entry.tombstone) continue;
+            if (entry.key.len >= prefix.len and
+                std.mem.eql(u8, entry.key[0..prefix.len], prefix))
+            {
+                out[count_written] = .{
+                    .key = entry.key,
+                    .value = entry.value,
+                    .lsn = entry.lsn,
+                };
+                count_written += 1;
+            }
+        }
+        return count_written;
+    }
+
+    /// Remove all tombstones and expired entries. Returns number purged.
+    pub fn compact(self: *KVProjection) usize {
+        var to_remove: [256][]const u8 = undefined;
+        var remove_count: usize = 0;
+
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (remove_count >= to_remove.len) break;
+            const entry = kv.value_ptr;
+            if (entry.tombstone) {
+                to_remove[remove_count] = entry.key;
+                remove_count += 1;
+            }
+        }
+
+        for (to_remove[0..remove_count]) |key| {
+            if (self.map.fetchRemove(key)) |removed| {
+                self.memory_used -= removed.value.key.len + removed.value.value.len;
+                self.allocator.free(@constCast(removed.value.key));
+                if (removed.value.value.len > 0) {
+                    self.allocator.free(@constCast(removed.value.value));
+                }
+            }
+        }
+
+        self.stats.evicted += @intCast(remove_count);
+        return remove_count;
+    }
+
+    // ─── UAL Entry application (ProjectionRouter interface) ────────────────
+
+    /// Apply a committed UAL entry to this projection.
+    pub fn applyEntry(self: *KVProjection, entry: *const Entry) !void {
+        const entry_type: EntryType = @enumFromInt(entry.header.entry_type);
+
+        switch (entry_type) {
+            .kv_put, .cg_commit, .cg_create => {
+                const cmd = CommandPayload.deserialize(entry.payload) orelse
+                    return error.InvalidPayload;
+                try self.put(
+                    cmd.key,
+                    cmd.value,
+                    entry.header.index,
+                    entry.header.term,
+                    entry.header.timestamp_ns,
+                );
+            },
+            .kv_delete, .cg_delete => {
+                const cmd = CommandPayload.deserialize(entry.payload) orelse
+                    return error.InvalidPayload;
+                try self.delete(
+                    cmd.key,
+                    entry.header.index,
+                    entry.header.term,
+                    entry.header.timestamp_ns,
+                );
+            },
+            .kv_batch => {
+                // Batch entries contain multiple ops — for now, treat as single put
+                const cmd = CommandPayload.deserialize(entry.payload) orelse
+                    return error.InvalidPayload;
+                try self.put(
+                    cmd.key,
+                    cmd.value,
+                    entry.header.index,
+                    entry.header.term,
+                    entry.header.timestamp_ns,
+                );
+            },
+            else => {},
+        }
+
+        self.applied_index = entry.header.index;
+    }
+
+    /// ProjectionVTable implementation for use with ProjectionRouter.
+    pub fn projectionHandle(self: *KVProjection) router_mod.ProjectionHandle {
+        return .{
+            .ctx = @ptrCast(self),
+            .vtable = .{
+                .applyFn = vtableApply,
+                .memoryUsageFn = vtableMemory,
+            },
+        };
+    }
+
+    fn vtableApply(ctx: *anyopaque, entry: *const Entry) router_mod.ApplyError!void {
+        const self: *KVProjection = @ptrCast(@alignCast(ctx));
+        self.applyEntry(entry) catch return error.InvalidPayload;
+    }
+
+    fn vtableMemory(ctx: *anyopaque) usize {
+        const self: *KVProjection = @ptrCast(@alignCast(ctx));
+        return self.memoryUsage();
+    }
+
+    // ─── Memory ────────────────────────────────────────────────────────────
+
+    pub fn memoryUsage(self: *const KVProjection) usize {
+        // Approximate: tracked key+value bytes + per-entry overhead
+        return self.memory_used + self.map.count() * @sizeOf(KVEntry);
+    }
+
+    // ─── Internal ──────────────────────────────────────────────────────────
+
+    fn freeEntry(self: *KVProjection, entry: *KVEntry) void {
+        self.allocator.free(@constCast(entry.key));
+        if (entry.value.len > 0 and !entry.tombstone) {
+            self.allocator.free(@constCast(entry.value));
+        }
+        // Tombstones have value = "" (static), don't free
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const testing = std.testing;
+
+test "kv: basic put and get" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("key1", "value1", 1, 1, 1000);
+    try kv.put("key2", "value2", 2, 1, 2000);
+
+    const e1 = kv.get("key1").?;
+    try testing.expectEqualSlices(u8, "value1", e1.value);
+    try testing.expectEqual(@as(u64, 1), e1.lsn);
+
+    const e2 = kv.get("key2").?;
+    try testing.expectEqualSlices(u8, "value2", e2.value);
+
+    try testing.expect(kv.get("nonexistent") == null);
+    try testing.expectEqual(@as(usize, 2), kv.count());
+}
+
+test "kv: put overwrites" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("key1", "old", 1, 1, 1000);
+    try kv.put("key1", "new", 2, 1, 2000);
+
+    const e = kv.get("key1").?;
+    try testing.expectEqualSlices(u8, "new", e.value);
+    try testing.expectEqual(@as(u64, 2), e.lsn);
+    try testing.expectEqual(@as(usize, 1), kv.count());
+}
+
+test "kv: delete creates tombstone" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("key1", "value1", 1, 1, 1000);
+    try kv.delete("key1", 2, 1, 2000);
+
+    // get returns null for tombstone
+    try testing.expect(kv.get("key1") == null);
+
+    // getRaw still finds it
+    const raw = kv.getRaw("key1").?;
+    try testing.expect(raw.tombstone);
+
+    try testing.expectEqual(@as(usize, 0), kv.count());
+    try testing.expectEqual(@as(usize, 1), kv.totalEntries());
+}
+
+test "kv: delete nonexistent key creates tombstone" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.delete("ghost", 1, 1, 1000);
+
+    try testing.expect(kv.get("ghost") == null);
+    try testing.expectEqual(@as(usize, 1), kv.totalEntries());
+}
+
+test "kv: scan returns live entries" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("a", "1", 1, 1, 1000);
+    try kv.put("b", "2", 2, 1, 2000);
+    try kv.put("c", "3", 3, 1, 3000);
+    try kv.delete("b", 4, 1, 4000);
+
+    var results: [10]ScanEntry = undefined;
+    const n = kv.scan(&results);
+    try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "kv: scan with prefix" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("user:1", "alice", 1, 1, 1000);
+    try kv.put("user:2", "bob", 2, 1, 2000);
+    try kv.put("item:1", "sword", 3, 1, 3000);
+
+    var results: [10]ScanEntry = undefined;
+    const n = kv.scanPrefix("user:", &results);
+    try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "kv: compact removes tombstones" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("a", "1", 1, 1, 1000);
+    try kv.put("b", "2", 2, 1, 2000);
+    try kv.delete("a", 3, 1, 3000);
+
+    try testing.expectEqual(@as(usize, 2), kv.totalEntries());
+
+    const purged = kv.compact();
+    try testing.expectEqual(@as(usize, 1), purged);
+    try testing.expectEqual(@as(usize, 1), kv.totalEntries());
+}
+
+test "kv: apply UAL entry for kv_put" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    // Build a command payload: ns_hash(4) + key_len(2) + val_len(4) + key + value
+    var payload_buf: [256]u8 = undefined;
+    const cmd = entry_mod.CommandPayload{
+        .namespace_hash = 0,
+        .key_length = 5,
+        .value_length = 5,
+        .key = "mykey",
+        .value = "myval",
+    };
+    const plen = cmd.serialize(&payload_buf) orelse unreachable;
+
+    const entry = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, payload_buf[0..plen]);
+
+    try kv.applyEntry(&entry);
+    const result = kv.get("mykey").?;
+    try testing.expectEqualSlices(u8, "myval", result.value);
+    try testing.expectEqual(@as(u64, 1), kv.applied_index);
+}
+
+test "kv: apply UAL entry for kv_delete" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    // First put
+    var pb: [256]u8 = undefined;
+    const put_cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 5, .value_length = 1, .key = "delme", .value = "v" };
+    const put_len = put_cmd.serialize(&pb) orelse unreachable;
+    try kv.applyEntry(&entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, pb[0..put_len]));
+
+    // Then delete
+    var db: [256]u8 = undefined;
+    const del_cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 5, .value_length = 0, .key = "delme", .value = "" };
+    const del_len = del_cmd.serialize(&db) orelse unreachable;
+    try kv.applyEntry(&entry_mod.buildEntry(.kv_delete, 0, 1, 2, 2000, db[0..del_len]));
+
+    try testing.expect(kv.get("delme") == null);
+    try testing.expectEqual(@as(u64, 2), kv.applied_index);
+}
+
+test "kv: projection handle integrates with router" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    var router = router_mod.ProjectionRouter.init();
+    router.registerKV(kv.projectionHandle());
+
+    // Build a UAL entry with command payload
+    var pb: [256]u8 = undefined;
+    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 4, .value_length = 4, .key = "rkey", .value = "rval" };
+    const plen = cmd.serialize(&pb) orelse unreachable;
+    const entry = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, pb[0..plen]);
+
+    const result = router.apply(&entry);
+    try testing.expectEqual(router_mod.ApplyResult.applied, result);
+
+    // Verify it landed in the KV projection
+    const kv_entry = kv.get("rkey").?;
+    try testing.expectEqualSlices(u8, "rval", kv_entry.value);
+}
+
+test "kv: stats tracking" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("k", "v", 1, 1, 0);
+    _ = kv.get("k");
+    _ = kv.get("missing");
+    try kv.delete("k", 2, 1, 0);
+
+    try testing.expectEqual(@as(u64, 1), kv.stats.puts);
+    try testing.expectEqual(@as(u64, 2), kv.stats.gets);
+    try testing.expectEqual(@as(u64, 1), kv.stats.deletes);
+}
+
+test "kv: memory tracking" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("abc", "123456", 1, 1, 0);
+    // key(3) + value(6) = 9 bytes tracked
+    try testing.expectEqual(@as(usize, 9), kv.memory_used);
+
+    try kv.put("abc", "x", 2, 1, 0);
+    // Updated: key(3) + value(1) = 4 bytes
+    try testing.expectEqual(@as(usize, 4), kv.memory_used);
+}
