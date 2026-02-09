@@ -59,4 +59,5 @@ test {
 test {
     _ = @import("projection/router.zig");
     _ = @import("projection/kv.zig");
+    _ = @import("projection/queue.zig");
 }
