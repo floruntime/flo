@@ -61,4 +61,5 @@ test {
     _ = @import("projection/kv.zig");
     _ = @import("projection/queue.zig");
     _ = @import("projection/stream.zig");
+    _ = @import("projection/ts.zig");
 }
