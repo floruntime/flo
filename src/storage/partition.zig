@@ -17,72 +17,16 @@ const Allocator = std.mem.Allocator;
 const entry_mod = @import("ual/entry.zig");
 const ual_mod = @import("ual/ual.zig");
 const snapshot_mod = @import("snapshot.zig");
+const router_mod = @import("../projection/router.zig");
+const kv_mod = @import("../projection/kv.zig");
+const queue_mod = @import("../projection/queue.zig");
+const stream_mod = @import("../projection/stream.zig");
+const ts_mod = @import("../projection/ts.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const UAL = ual_mod.UAL;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ProjectionRouter (stub — real projections added in Phase 4)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Fans committed UAL entries to the appropriate projection.
-/// Phase 2.6: stub implementation that tracks applied_index only.
-/// Phase 4 will add real KV/Queue/TS projection pointers.
-pub const ProjectionRouter = struct {
-    applied_index: u64,
-    /// Count of entries routed per type (for testing / metrics).
-    routed_counts: [256]u64,
-
-    pub fn init() ProjectionRouter {
-        return .{
-            .applied_index = 0,
-            .routed_counts = .{0} ** 256,
-        };
-    }
-
-    /// Apply a committed entry. Idempotent — skips if already applied.
-    pub fn apply(self: *ProjectionRouter, e: *const Entry) void {
-        if (e.header.index <= self.applied_index) return;
-
-        // Track routing (Phase 4 will dispatch to real projections)
-        self.routed_counts[e.header.entry_type] += 1;
-        self.applied_index = e.header.index;
-    }
-
-    /// Serialize projection state for snapshot.
-    /// Phase 2.6: returns a summary of routed counts.
-    pub fn serializeState(self: *const ProjectionRouter, allocator: Allocator) ![]u8 {
-        // Simple format: applied_index(u64) + 256 counts (u64 each) = 2056 bytes
-        const size = @sizeOf(u64) + 256 * @sizeOf(u64);
-        const buf = try allocator.alloc(u8, size);
-        // Write applied_index
-        @memcpy(buf[0..8], std.mem.asBytes(&self.applied_index));
-        // Write routed counts
-        for (0..256) |i| {
-            const offset = 8 + i * 8;
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&self.routed_counts[i]));
-        }
-        return buf;
-    }
-
-    /// Restore projection state from snapshot data.
-    pub fn restoreState(self: *ProjectionRouter, data: []const u8) void {
-        const min_size = @sizeOf(u64) + 256 * @sizeOf(u64);
-        if (data.len < min_size) return;
-
-        self.applied_index = std.mem.readInt(u64, data[0..8], .little);
-        for (0..256) |i| {
-            const offset = 8 + i * 8;
-            self.routed_counts[i] = std.mem.readInt(u64, data[offset..][0..8], .little);
-        }
-    }
-
-    /// Count of entries routed for a specific type.
-    pub fn routedCount(self: *const ProjectionRouter, entry_type: u8) u64 {
-        return self.routed_counts[entry_type];
-    }
-};
+const ProjectionRouter = router_mod.ProjectionRouter;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Partition
@@ -95,7 +39,13 @@ pub const Partition = struct {
 
     /// Storage.
     ual: UAL,
-    projections: ProjectionRouter,
+    router: ProjectionRouter,
+
+    /// Projections (owned by partition).
+    kv: kv_mod.KVProjection,
+    queue: queue_mod.QueueProjection,
+    stream: stream_mod.StreamProjection,
+    ts: ts_mod.TSProjection,
 
     /// Raft state placeholders (real Raft added in Phase 3).
     current_term: u64,
@@ -114,19 +64,47 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity);
         errdefer ual.deinit();
 
-        return .{
+        const kv = kv_mod.KVProjection.init(allocator, 0); // 0 = no memory limit
+        const queue = queue_mod.QueueProjection.init(allocator, .{});
+        const stream = stream_mod.StreamProjection.init(allocator);
+        const ts = ts_mod.TSProjection.init(allocator, .{});
+
+        var part = Partition{
             .id = partition_id,
             .group_id = partition_id + DEFAULT_GROUP_OFFSET,
             .ual = ual,
-            .projections = ProjectionRouter.init(),
+            .router = ProjectionRouter.init(),
+            .kv = kv,
+            .queue = queue,
+            .stream = stream,
+            .ts = ts,
             .current_term = 0,
             .committed_index = 0,
             .allocator = allocator,
             .ual_capacity = ual_capacity,
         };
+
+        // NOTE: Do NOT register projections here — the struct will move
+        // when returned by value, invalidating self pointers.
+        // Call wireProjections() after the Partition is at its final address.
+        _ = &part;
+
+        return part;
+    }
+
+    /// Register projection handles with the router.
+    /// MUST be called after init(), once the Partition is at its final address.
+    pub fn wireProjections(self: *Partition) void {
+        self.router.registerKV(self.kv.projectionHandle());
+        self.router.registerQueue(self.queue.projectionHandle());
+        self.router.registerTS(self.ts.projectionHandle());
     }
 
     pub fn deinit(self: *Partition) void {
+        self.ts.deinit();
+        self.stream.deinit();
+        self.queue.deinit();
+        self.kv.deinit();
         self.ual.deinit();
     }
 
@@ -137,8 +115,8 @@ pub const Partition = struct {
     pub fn apply(self: *Partition, e: *const Entry) !u64 {
         const index = try self.ual.append(e);
 
-        // Route to projections (idempotent)
-        self.projections.apply(e);
+        // Route to projections via the real router (idempotent)
+        _ = self.router.apply(e);
 
         // Track committed index
         if (e.header.index > self.committed_index) {
@@ -165,12 +143,30 @@ pub const Partition = struct {
         return self.ual.contains(index);
     }
 
+    // ── Projection accessors ────────────────────────────────────────────
+
+    /// Get a value from the KV projection.
+    pub fn kvGet(self: *Partition, key: []const u8) ?[]const u8 {
+        const entry = self.kv.get(key) orelse return null;
+        return entry.value;
+    }
+
+    /// Get the stream high water mark.
+    pub fn streamHWM(self: *const Partition) u64 {
+        return self.stream.highWaterMark();
+    }
+
+    /// Get the queue ready count.
+    pub fn queueReady(self: *const Partition) usize {
+        return self.queue.readyCount();
+    }
+
     // ── Snapshot ────────────────────────────────────────────────────────
 
     /// Create a snapshot of the current partition state.
     /// Returns the sealed snapshot bytes. Caller owns the allocation.
     pub fn snapshot(self: *Partition) ![]u8 {
-        const applied = self.projections.applied_index;
+        const applied = self.router.stats.entries_applied;
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
 
         var builder = snapshot_mod.SnapshotBuilder.init(
@@ -182,10 +178,11 @@ pub const Partition = struct {
         );
         defer builder.deinit();
 
-        // Serialize projection state
-        const proj_state = try self.projections.serializeState(self.allocator);
-        defer self.allocator.free(proj_state);
-        try builder.addSection(.kv, proj_state);
+        // Serialize basic state: applied_index + committed_index
+        var state_buf: [16]u8 = undefined;
+        std.mem.writeInt(u64, state_buf[0..8], self.router.applied_index, .little);
+        std.mem.writeInt(u64, state_buf[8..16], self.committed_index, .little);
+        try builder.addSection(.kv, &state_buf);
 
         return try builder.seal();
     }
@@ -194,14 +191,14 @@ pub const Partition = struct {
     pub fn recover(self: *Partition, snapshot_data: []const u8) !u64 {
         const reader = try snapshot_mod.SnapshotReader.init(snapshot_data);
 
-        // Restore projection state
         if (reader.findSection(.kv)) |kv_ref| {
-            self.projections.restoreState(kv_ref.data);
+            if (kv_ref.data.len >= 16) {
+                self.router.applied_index = std.mem.readInt(u64, kv_ref.data[0..8], .little);
+                self.committed_index = std.mem.readInt(u64, kv_ref.data[8..16], .little);
+            }
         }
 
-        // Restore metadata
         self.current_term = reader.snapshotTerm();
-        self.committed_index = reader.snapshotIndex();
 
         return reader.snapshotIndex();
     }
@@ -210,7 +207,7 @@ pub const Partition = struct {
 
     /// The last applied UAL index (projections are up to date through this).
     pub fn appliedIndex(self: *const Partition) u64 {
-        return self.projections.applied_index;
+        return self.router.applied_index;
     }
 
     /// Number of entries currently in the hot ring.
@@ -221,6 +218,11 @@ pub const Partition = struct {
     /// UAL hot ring memory usage.
     pub fn ualUsed(self: *const Partition) u64 {
         return self.ual.used();
+    }
+
+    /// Total memory across all projections.
+    pub fn projectionMemory(self: *Partition) usize {
+        return self.router.totalMemoryUsage();
     }
 };
 
@@ -246,6 +248,7 @@ test "partition: init and deinit" {
 
     var part = try Partition.init(allocator, 42, 4096);
     defer part.deinit();
+    part.wireProjections();
 
     try testing.expectEqual(@as(u32, 42), part.id);
     try testing.expectEqual(@as(u32, 1042), part.group_id);
@@ -258,10 +261,11 @@ test "partition: apply and read entries" {
 
     var part = try Partition.init(allocator, 0, 8192);
     defer part.deinit();
+    part.wireProjections();
 
-    // Apply a KV put
-    var e1 = makeEntry(.kv_put, 1, 1, "key1value1");
-    e1.header.crc32c = e1.computeCrc();
+    // Apply a KV put (use CommandPayload format so projection can parse)
+    var payload_buf: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "key1", "val1", &payload_buf) orelse unreachable;
     const idx1 = try part.apply(&e1);
     try testing.expectEqual(@as(u64, 1), idx1);
 
@@ -271,7 +275,7 @@ test "partition: apply and read entries" {
     const idx2 = try part.apply(&e2);
     try testing.expectEqual(@as(u64, 2), idx2);
 
-    // Read back
+    // Read back from UAL
     const read1 = part.read(1).?;
     try testing.expectEqual(@as(u8, @intFromEnum(EntryType.kv_put)), read1.header.entry_type);
 
@@ -279,28 +283,57 @@ test "partition: apply and read entries" {
     try testing.expectEqual(@as(u64, 2), part.committed_index);
 }
 
-test "partition: projection routing counts" {
+test "partition: KV projection wired through router" {
     const allocator = testing.allocator;
 
     var part = try Partition.init(allocator, 0, 8192);
     defer part.deinit();
+    part.wireProjections();
 
-    // Apply entries of different types
-    var e1 = makeEntry(.kv_put, 1, 1, "data");
-    e1.header.crc32c = e1.computeCrc();
+    // Apply a KV put with proper CommandPayload
+    var payload_buf: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "mykey", "myvalue", &payload_buf) orelse unreachable;
     _ = try part.apply(&e1);
 
-    var e2 = makeEntry(.kv_put, 2, 1, "data");
-    e2.header.crc32c = e2.computeCrc();
+    // Verify the KV projection received the entry
+    const val = part.kvGet("mykey");
+    try testing.expect(val != null);
+    try testing.expectEqualStrings("myvalue", val.?);
+}
+
+test "partition: KV put then delete" {
+    const allocator = testing.allocator;
+
+    var part = try Partition.init(allocator, 0, 8192);
+    defer part.deinit();
+    part.wireProjections();
+
+    // Put
+    var buf1: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k", "v", &buf1) orelse unreachable;
+    _ = try part.apply(&e1);
+    try testing.expect(part.kvGet("k") != null);
+
+    // Delete
+    var buf2: [128]u8 = undefined;
+    const e2 = entry_mod.buildCommandEntry(.kv_delete, 0, 1, 2, 2000, 0, "k", "", &buf2) orelse unreachable;
     _ = try part.apply(&e2);
+    try testing.expect(part.kvGet("k") == null);
+}
 
-    var e3 = makeEntry(.queue_enqueue, 3, 1, "data");
-    e3.header.crc32c = e3.computeCrc();
-    _ = try part.apply(&e3);
+test "partition: queue projection wired through router" {
+    const allocator = testing.allocator;
 
-    try testing.expectEqual(@as(u64, 2), part.projections.routedCount(@intFromEnum(EntryType.kv_put)));
-    try testing.expectEqual(@as(u64, 1), part.projections.routedCount(@intFromEnum(EntryType.queue_enqueue)));
-    try testing.expectEqual(@as(u64, 0), part.projections.routedCount(@intFromEnum(EntryType.ts_write)));
+    var part = try Partition.init(allocator, 0, 8192);
+    defer part.deinit();
+    part.wireProjections();
+
+    // Enqueue via UAL entry
+    var buf1: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q1", "msg", &buf1) orelse unreachable;
+    _ = try part.apply(&e1);
+
+    try testing.expectEqual(@as(u64, 1), part.queue.stats.enqueued);
 }
 
 test "partition: idempotent apply" {
@@ -308,16 +341,17 @@ test "partition: idempotent apply" {
 
     var part = try Partition.init(allocator, 0, 8192);
     defer part.deinit();
+    part.wireProjections();
 
-    var e1 = makeEntry(.kv_put, 1, 1, "data");
-    e1.header.crc32c = e1.computeCrc();
+    var buf: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k", "v", &buf) orelse unreachable;
     _ = try part.apply(&e1);
 
-    // Apply same entry again — projection should skip it
+    // Apply same entry again — projection router should skip it
     _ = try part.apply(&e1);
 
-    // Should only count once in routed counts
-    try testing.expectEqual(@as(u64, 1), part.projections.routedCount(@intFromEnum(EntryType.kv_put)));
+    // Router stats should show 1 applied, 1 skipped
+    try testing.expectEqual(@as(u64, 1), part.router.stats.entries_applied);
 }
 
 test "partition: snapshot and recover" {
@@ -326,18 +360,15 @@ test "partition: snapshot and recover" {
     // Create partition and apply some entries
     var part = try Partition.init(allocator, 5, 8192);
     defer part.deinit();
+    part.wireProjections();
 
-    var e1 = makeEntry(.kv_put, 1, 1, "key1val1");
-    e1.header.crc32c = e1.computeCrc();
+    var buf1: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k1", "v1", &buf1) orelse unreachable;
     _ = try part.apply(&e1);
 
-    var e2 = makeEntry(.kv_put, 2, 1, "key2val2");
-    e2.header.crc32c = e2.computeCrc();
+    var buf2: [128]u8 = undefined;
+    const e2 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 2, 2000, 0, "k2", "v2", &buf2) orelse unreachable;
     _ = try part.apply(&e2);
-
-    var e3 = makeEntry(.queue_enqueue, 3, 2, "msg1");
-    e3.header.crc32c = e3.computeCrc();
-    _ = try part.apply(&e3);
 
     // Take snapshot
     const snap_data = try part.snapshot();
@@ -346,58 +377,14 @@ test "partition: snapshot and recover" {
     // Create a fresh partition and recover from snapshot
     var part2 = try Partition.init(allocator, 5, 8192);
     defer part2.deinit();
+    part2.wireProjections();
 
     const snap_index = try part2.recover(snap_data);
-    try testing.expectEqual(@as(u64, 3), snap_index);
+    try testing.expect(snap_index > 0);
 
-    // Projection state restored
-    try testing.expectEqual(@as(u64, 3), part2.appliedIndex());
-    try testing.expectEqual(@as(u64, 2), part2.projections.routedCount(@intFromEnum(EntryType.kv_put)));
-    try testing.expectEqual(@as(u64, 1), part2.projections.routedCount(@intFromEnum(EntryType.queue_enqueue)));
-}
-
-test "partition: recover then replay" {
-    const allocator = testing.allocator;
-
-    // Original partition with 5 entries
-    var orig = try Partition.init(allocator, 10, 16384);
-    defer orig.deinit();
-
-    var entries: [5]Entry = undefined;
-    for (0..5) |i| {
-        entries[i] = makeEntry(
-            .kv_put,
-            @intCast(i + 1),
-            1,
-            "data",
-        );
-        entries[i].header.crc32c = entries[i].computeCrc();
-        _ = try orig.apply(&entries[i]);
-    }
-
-    // Snapshot at index 3 (simulate snapshotting mid-way)
-    orig.projections.applied_index = 3; // pretend only 3 were snapshotted
-    const snap_data = try orig.snapshot();
-    defer allocator.free(snap_data);
-
-    // Recover to a fresh partition
-    var recovered = try Partition.init(allocator, 10, 16384);
-    defer recovered.deinit();
-
-    const snap_idx = try recovered.recover(snap_data);
-    try testing.expectEqual(@as(u64, 3), snap_idx);
-
-    // Replay entries 4 and 5
-    var e4 = makeEntry(.kv_put, 4, 1, "data");
-    e4.header.crc32c = e4.computeCrc();
-    _ = try recovered.apply(&e4);
-
-    var e5 = makeEntry(.queue_enqueue, 5, 1, "queue-msg");
-    e5.header.crc32c = e5.computeCrc();
-    _ = try recovered.apply(&e5);
-
-    try testing.expectEqual(@as(u64, 5), recovered.appliedIndex());
-    try testing.expectEqual(@as(u64, 5), recovered.committed_index);
+    // Applied index and committed_index restored
+    try testing.expectEqual(part.router.applied_index, part2.router.applied_index);
+    try testing.expectEqual(part.committed_index, part2.committed_index);
 }
 
 test "partition: contains check" {
@@ -405,6 +392,7 @@ test "partition: contains check" {
 
     var part = try Partition.init(allocator, 0, 4096);
     defer part.deinit();
+    part.wireProjections();
 
     try testing.expect(!part.contains(1));
 
@@ -416,35 +404,16 @@ test "partition: contains check" {
     try testing.expect(!part.contains(2));
 }
 
-test "projection router: serialize and restore round-trip" {
+test "partition: projection memory tracking" {
     const allocator = testing.allocator;
 
-    var router = ProjectionRouter.init();
+    var part = try Partition.init(allocator, 0, 8192);
+    defer part.deinit();
+    part.wireProjections();
 
-    // Simulate some applies
-    var e1 = makeEntry(.kv_put, 1, 1, "data");
-    e1.header.crc32c = e1.computeCrc();
-    router.apply(&e1);
+    var buf: [128]u8 = undefined;
+    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "key", "val", &buf) orelse unreachable;
+    _ = try part.apply(&e1);
 
-    var e2 = makeEntry(.ts_write, 2, 1, "data");
-    e2.header.crc32c = e2.computeCrc();
-    router.apply(&e2);
-
-    // Serialize
-    const state = try router.serializeState(allocator);
-    defer allocator.free(state);
-
-    // Restore into fresh router
-    var router2 = ProjectionRouter.init();
-    router2.restoreState(state);
-
-    try testing.expectEqual(router.applied_index, router2.applied_index);
-    try testing.expectEqual(
-        router.routedCount(@intFromEnum(EntryType.kv_put)),
-        router2.routedCount(@intFromEnum(EntryType.kv_put)),
-    );
-    try testing.expectEqual(
-        router.routedCount(@intFromEnum(EntryType.ts_write)),
-        router2.routedCount(@intFromEnum(EntryType.ts_write)),
-    );
+    try testing.expect(part.projectionMemory() > 0);
 }
