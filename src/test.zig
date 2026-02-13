@@ -63,3 +63,8 @@ test {
     _ = @import("projection/stream.zig");
     _ = @import("projection/ts.zig");
 }
+
+// Handlers — Phase 5
+test {
+    _ = @import("kv/handler.zig");
+}
