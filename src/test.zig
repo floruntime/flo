@@ -67,4 +67,5 @@ test {
 // Handlers — Phase 5
 test {
     _ = @import("kv/handler.zig");
+    _ = @import("stream/handler.zig");
 }
