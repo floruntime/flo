@@ -69,4 +69,5 @@ test {
     _ = @import("kv/handler.zig");
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
+    _ = @import("ts/handler.zig");
 }

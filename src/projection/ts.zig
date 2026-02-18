@@ -59,7 +59,7 @@ pub const DataPoint = struct {
 // Stored Point — what we keep in the write buffer
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const StoredPoint = struct {
+pub const StoredPoint = struct {
     timestamp_ns: u64,
     field_value: f64, // normalized to f64
     ual_index: u64,
