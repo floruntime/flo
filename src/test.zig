@@ -70,4 +70,5 @@ test {
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
     _ = @import("ts/handler.zig");
+    _ = @import("namespace/handler.zig");
 }
