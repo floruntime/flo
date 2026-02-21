@@ -51,6 +51,10 @@ pub const Partition = struct {
     current_term: u64,
     committed_index: u64,
 
+    /// Warm store — payload copies for entries evicted from the hot ring buffer.
+    /// Populated on every apply() so reads can fall back to warm when UAL evicts.
+    warm_store: std.AutoHashMapUnmanaged(u64, []const u8),
+
     /// Lifecycle.
     allocator: Allocator,
     ual_capacity: usize,
@@ -60,8 +64,8 @@ pub const Partition = struct {
 
     // ── Construction ────────────────────────────────────────────────────
 
-    pub fn init(allocator: Allocator, partition_id: u32, ual_capacity: usize) !Partition {
-        var ual = try UAL.init(allocator, ual_capacity);
+    pub fn init(allocator: Allocator, partition_id: u32, ual_capacity: usize, max_hot_entries: u64) !Partition {
+        var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
         const kv = kv_mod.KVProjection.init(allocator, 0); // 0 = no memory limit
@@ -80,6 +84,7 @@ pub const Partition = struct {
             .ts = ts,
             .current_term = 0,
             .committed_index = 0,
+            .warm_store = .{},
             .allocator = allocator,
             .ual_capacity = ual_capacity,
         };
@@ -101,6 +106,13 @@ pub const Partition = struct {
     }
 
     pub fn deinit(self: *Partition) void {
+        // Free warm store payload copies
+        var wit = self.warm_store.iterator();
+        while (wit.next()) |kv| {
+            self.allocator.free(@constCast(kv.value_ptr.*));
+        }
+        self.warm_store.deinit(self.allocator);
+
         self.ts.deinit();
         self.stream.deinit();
         self.queue.deinit();
@@ -123,6 +135,19 @@ pub const Partition = struct {
             self.committed_index = e.header.index;
         }
 
+        // Save payload to warm store (survives UAL hot ring eviction).
+        // Uses the entry's own index as key.
+        if (e.payload.len > 0) {
+            const copy = self.allocator.dupe(u8, e.payload) catch return index;
+            // Free old copy if this index was already in warm store (idempotent apply)
+            if (self.warm_store.fetchRemove(e.header.index)) |old| {
+                self.allocator.free(@constCast(old.value));
+            }
+            self.warm_store.put(self.allocator, e.header.index, copy) catch {
+                self.allocator.free(copy);
+            };
+        }
+
         return index;
     }
 
@@ -141,6 +166,17 @@ pub const Partition = struct {
     /// Check if an entry exists in the hot ring.
     pub fn contains(self: *const Partition, index: u64) bool {
         return self.ual.contains(index);
+    }
+
+    /// Read a payload from the warm store (entries evicted from hot ring).
+    /// Returns the raw entry payload bytes, or null if not found.
+    pub fn readPayloadWarm(self: *const Partition, index: u64) ?[]const u8 {
+        return self.warm_store.get(index);
+    }
+
+    /// Check if an entry is still in the hot ring buffer.
+    pub fn isInHot(self: *const Partition, index: u64) bool {
+        return self.ual.read(index) != null;
     }
 
     // ── Projection accessors ────────────────────────────────────────────
@@ -246,7 +282,7 @@ fn makeEntry(entry_type: EntryType, index: u64, term: u64, payload: []const u8) 
 test "partition: init and deinit" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 42, 4096);
+    var part = try Partition.init(allocator, 42, 4096, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -259,7 +295,7 @@ test "partition: init and deinit" {
 test "partition: apply and read entries" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -286,7 +322,7 @@ test "partition: apply and read entries" {
 test "partition: KV projection wired through router" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -304,7 +340,7 @@ test "partition: KV projection wired through router" {
 test "partition: KV put then delete" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -324,7 +360,7 @@ test "partition: KV put then delete" {
 test "partition: queue projection wired through router" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -339,7 +375,7 @@ test "partition: queue projection wired through router" {
 test "partition: idempotent apply" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -358,7 +394,7 @@ test "partition: snapshot and recover" {
     const allocator = testing.allocator;
 
     // Create partition and apply some entries
-    var part = try Partition.init(allocator, 5, 8192);
+    var part = try Partition.init(allocator, 5, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -375,7 +411,7 @@ test "partition: snapshot and recover" {
     defer allocator.free(snap_data);
 
     // Create a fresh partition and recover from snapshot
-    var part2 = try Partition.init(allocator, 5, 8192);
+    var part2 = try Partition.init(allocator, 5, 8192, 0);
     defer part2.deinit();
     part2.wireProjections();
 
@@ -390,7 +426,7 @@ test "partition: snapshot and recover" {
 test "partition: contains check" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 4096);
+    var part = try Partition.init(allocator, 0, 4096, 0);
     defer part.deinit();
     part.wireProjections();
 
@@ -407,7 +443,7 @@ test "partition: contains check" {
 test "partition: projection memory tracking" {
     const allocator = testing.allocator;
 
-    var part = try Partition.init(allocator, 0, 8192);
+    var part = try Partition.init(allocator, 0, 8192, 0);
     defer part.deinit();
     part.wireProjections();
 

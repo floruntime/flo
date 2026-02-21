@@ -58,7 +58,7 @@ test "integration: UAL wraps around ring" {
     // Use a small ring buffer (4096 bytes).
     // Each entry is ~40 (header) + 10 (payload) = 50 bytes.
     // 4096 / 50 ≈ 81 entries before eviction starts.
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     const payload_text = "wrap-test!"; // 10 bytes

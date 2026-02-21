@@ -251,6 +251,8 @@ pub const Runtime = struct {
                 self.config.partition_count,
                 pipes[i][0],
                 self.config.data_dir,
+                self.config.tiered_log.buffer_capacity,
+                self.config.tiered_log.max_hot_entries,
             );
             shards_created += 1;
         }

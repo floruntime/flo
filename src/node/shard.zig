@@ -175,6 +175,8 @@ pub const Shard = struct {
         partition_count: u32,
         acceptor_pipe_rd: i32,
         data_dir: ?[]const u8,
+        ual_capacity: usize,
+        max_hot_entries: u64,
     ) !Shard {
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
@@ -192,7 +194,7 @@ pub const Shard = struct {
 
         const partition = try allocator.create(Partition);
         errdefer allocator.destroy(partition);
-        partition.* = try Partition.init(allocator, @as(u32, shard_id), Partition.DEFAULT_UAL_CAPACITY);
+        partition.* = try Partition.init(allocator, @as(u32, shard_id), ual_capacity, max_hot_entries);
         errdefer partition.deinit();
         partition.wireProjections();
         partitions[0] = partition;
@@ -531,7 +533,7 @@ pub const Shard = struct {
             // kv_scan uses scan wire format: [count:u32]([key_len:u16][key][value_len:u32(=0)])*[has_more:u8][cursor_len:u16][cursor]
             .kv_scan => serializeWalkKeysAsScan(self.allocator, deduped[0..dedup_count], result.next_cursor),
             // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
-            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
+            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream),
             // Default: name-list format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
             else => serializeWalkNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
         } catch {
@@ -897,7 +899,7 @@ fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, n
 ///
 /// The stream CLI expects u32 name lengths and a u32 partition_count per entry
 /// (distinct from the generic name-list format used by ts_list).
-fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
+fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection) ![]u8 {
     const cursor_bytes = next_cursor orelse &[_]u8{};
     const has_more: u8 = if (next_cursor != null) 1 else 0;
 
@@ -918,8 +920,9 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         pos += 4;
         @memcpy(buf[pos..][0..n.len], n);
         pos += n.len;
-        // partition_count — default to 1 (single-partition streams)
-        std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+        // partition_count from stream metadata
+        const pc = stream.getPartitionCount(n);
+        std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
     buf[pos] = has_more;
@@ -1149,7 +1152,7 @@ fn replaySegments(
                     std.hash.Wyhash.hash(0, cmd.key)
                 else
                     0;
-                _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash) catch {};
+                _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
             }
 
             // Track max index for LSN restoration
@@ -1171,7 +1174,7 @@ test "Shard: init and deinit" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
     defer shard.deinit();
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
@@ -1184,7 +1187,7 @@ test "Shard: add and remove connections" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
@@ -1205,7 +1208,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
     defer shard.deinit();
 
     // Track dispatched pings
@@ -1253,7 +1256,7 @@ test "Shard: inbox shutdown message" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
     defer shard.deinit();
 
     shard.running = true;

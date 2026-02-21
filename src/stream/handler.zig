@@ -265,6 +265,21 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
+        // Resolve partition index from options
+        var partition_index: u32 = 0;
+        if (req.findOption(.partition)) |opt| {
+            if (opt.asU32()) |p| {
+                partition_index = p;
+            }
+        } else if (req.findOption(.partition_key)) |opt| {
+            // Hash the partition key and map to a partition index
+            const pk_bytes = opt.data;
+            if (pk_bytes.len > 0) {
+                const pc = self.stream.getPartitionCount(req.key);
+                partition_index = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
+            }
+        }
+
         const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
         const payload_value = if (req.value.len > 0) req.value else "";
@@ -297,7 +312,7 @@ pub const StreamHandler = struct {
 
         // Track offset → ual_index in stream projection
         const name_hash = std.hash.Wyhash.hash(0, req.key);
-        const offset = self.stream.append(ual_index, timestamp_ns, name_hash) catch {
+        const offset = self.stream.append(ual_index, timestamp_ns, name_hash, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "append failed" } };
         };
 
@@ -347,7 +362,27 @@ pub const StreamHandler = struct {
         const name_hash = std.hash.Wyhash.hash(0, req.key);
         var buf: [MAX_READ_BATCH]OffsetEntry = undefined;
         const out = buf[0..capped];
-        const count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+
+        // Check for partition filter
+        var count: usize = 0;
+        if (req.findOption(.partition)) |opt| {
+            if (opt.asU32()) |p| {
+                count = self.stream.readRangeForStreamPartition(start_offset, end_offset, name_hash, p, out);
+            } else {
+                count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+            }
+        } else if (req.findOption(.partition_key)) |opt| {
+            const pk_bytes = opt.data;
+            if (pk_bytes.len > 0) {
+                const pc = self.stream.getPartitionCount(req.key);
+                const pi: u32 = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
+                count = self.stream.readRangeForStreamPartition(start_offset, end_offset, name_hash, pi, out);
+            } else {
+                count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+            }
+        } else {
+            count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+        }
 
         // readRange clamps start to max(start_offset, trim_offset+1), so compute actual
         const actual_start = @max(start_offset, self.stream.trim_offset + 1);
@@ -403,10 +438,9 @@ pub const StreamHandler = struct {
     // ── INFO ────────────────────────────────────────────────────────────
 
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
-        _ = req;
-
         const hwm = self.stream.highWaterMark();
         const count = self.stream.trackedOffsets();
+        const pc = self.stream.getPartitionCount(req.key);
 
         return .{ .stream_info = .{
             .first_timestamp_ms = 0,
@@ -415,7 +449,7 @@ pub const StreamHandler = struct {
             .last_seq = hwm,
             .count = count,
             .bytes = 0, // Not tracked by projection
-            .partition_count = 1,
+            .partition_count = pc,
         } };
     }
 
@@ -428,7 +462,7 @@ pub const StreamHandler = struct {
         var name_buf: [1024][]const u8 = undefined;
         const count = self.stream.scanStreamNames(&name_buf);
 
-        const data = serializeNameList(self.allocator, name_buf[0..count]) catch {
+        const data = serializeNameList(self.allocator, name_buf[0..count], self.stream) catch {
             return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
         };
 
@@ -441,6 +475,16 @@ pub const StreamHandler = struct {
         // Register the stream name for listing
         if (req.key.len > 0) {
             self.stream.registerStream(req.key) catch {};
+
+            // Parse partition_count from wire value (u32 LE) if present
+            var partition_count: u32 = 1;
+            if (req.value.len >= 4) {
+                var reader = WireReader.init(req.value);
+                if (reader.readU32()) |pc| {
+                    if (pc > 0) partition_count = pc;
+                }
+            }
+            self.stream.registerStreamMetadata(req.key, partition_count) catch {};
         }
         return .ok;
     }
@@ -793,10 +837,10 @@ pub const StreamHandler = struct {
         // Calculate total size
         var total: usize = 4; // count header
         for (entries) |entry| {
-            const payload = self.getPayloadFromUAL(entry.ual_index);
+            const result = self.getPayloadAndTier(entry.ual_index);
             // sequence(8) + timestamp_ms(8) + tier(1) + partition(4)
             // + key_present(1) + payload_len(4) + payload + header_count(4)
-            total += 8 + 8 + 1 + 4 + 1 + 4 + payload.len + 4;
+            total += 8 + 8 + 1 + 4 + 1 + 4 + result.payload.len + 4;
         }
 
         const buf = try self.allocator.alloc(u8, total);
@@ -809,7 +853,7 @@ pub const StreamHandler = struct {
         pos += 4;
 
         for (entries, 0..) |entry, i| {
-            const payload = self.getPayloadFromUAL(entry.ual_index);
+            const result = self.getPayloadAndTier(entry.ual_index);
             const offset = start_offset + i;
 
             // sequence (1-based offset)
@@ -821,12 +865,12 @@ pub const StreamHandler = struct {
             std.mem.writeInt(i64, buf[pos..][0..8], ts_ms, .little);
             pos += 8;
 
-            // tier (0 = hot)
-            buf[pos] = 0;
+            // tier (0=hot, 1=warm)
+            buf[pos] = result.tier;
             pos += 1;
 
-            // partition (0)
-            std.mem.writeInt(u32, buf[pos..][0..4], 0, .little);
+            // partition index from OffsetEntry
+            std.mem.writeInt(u32, buf[pos..][0..4], entry.partition_index, .little);
             pos += 4;
 
             // key_present (0 = no key)
@@ -834,11 +878,11 @@ pub const StreamHandler = struct {
             pos += 1;
 
             // payload (length-prefixed u32)
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(payload.len), .little);
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(result.payload.len), .little);
             pos += 4;
-            if (payload.len > 0) {
-                @memcpy(buf[pos .. pos + payload.len], payload);
-                pos += payload.len;
+            if (result.payload.len > 0) {
+                @memcpy(buf[pos .. pos + result.payload.len], result.payload);
+                pos += result.payload.len;
             }
 
             // header_count (0)
@@ -872,7 +916,7 @@ pub const StreamHandler = struct {
         ) orelse return error.EntryBuildFailed;
 
         const ual_index = try self.partition.apply(&entry);
-        return try self.stream.append(ual_index, timestamp_ns, 0); // 0 = internal pipeline, no stream name
+        return try self.stream.append(ual_index, timestamp_ns, 0, 0); // 0 = internal pipeline, no stream name
     }
 
     /// Public interface for processing pipeline — read payloads from offset range.
@@ -888,12 +932,12 @@ pub const StreamHandler = struct {
         while (count < capped) : (offset += 1) {
             const n = self.stream.readRange(offset, offset + 1, &buf);
             if (n == 0) break;
-            const payload = self.getPayloadFromUAL(buf[0].ual_index);
-            if (payload.len > 0) {
-                results[count] = payload;
+            const result = self.getPayloadAndTier(buf[0].ual_index);
+            if (result.payload.len > 0) {
+                results[count] = result.payload;
                 count += 1;
             } else {
-                break; // Evicted from hot ring
+                break; // Entry missing
             }
         }
 
@@ -904,14 +948,22 @@ pub const StreamHandler = struct {
     }
 
     /// Read a payload from the UAL by entry index (zero-copy).
-    /// Returns the message value from the CommandPayload, or "" if evicted.
-    fn getPayloadFromUAL(self: *StreamHandler, ual_index: u64) []const u8 {
+    /// Returns the message value and the tier byte (0=hot, 1=warm).
+    /// Falls back to the warm store when the entry has been evicted from the hot ring.
+    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
+        // Hot path — entry still in the UAL ring buffer
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
-                return cmd.value;
+                return .{ .payload = cmd.value, .tier = 0 };
             }
         }
-        return "";
+        // Warm fallback — payload copied to partition warm store on apply()
+        if (self.partition.readPayloadWarm(ual_index)) |raw| {
+            if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
+                return .{ .payload = cmd.value, .tier = 1 };
+            }
+        }
+        return .{ .payload = "", .tier = 0 };
     }
 
     /// Free any heap-allocated data in a CommandResult returned by this handler.
@@ -965,7 +1017,7 @@ fn decodeGroupConsumer(req: Request) ?struct { group: []const u8, consumer: []co
 
 /// Serialize a list of names in the standard walk wire format.
 /// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
-fn serializeNameList(allocator: Allocator, names: []const []const u8) ![]u8 {
+fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection) ![]u8 {
     // Stream list wire format (matches CLI expectations):
     // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16]
     var total: usize = 4; // count
@@ -986,8 +1038,9 @@ fn serializeNameList(allocator: Allocator, names: []const []const u8) ![]u8 {
         pos += 4;
         @memcpy(buf[pos..][0..name.len], name);
         pos += name.len;
-        // partition_count — default to 1
-        std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+        // partition_count from stream metadata
+        const pc = stream.getPartitionCount(name);
+        std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
 
@@ -1218,7 +1271,7 @@ test "stream handler: dispatcher registration" {
 
 test "stream handler: append" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1247,7 +1300,7 @@ test "stream handler: append" {
 
 test "stream handler: append empty stream name" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1262,7 +1315,7 @@ test "stream handler: append empty stream name" {
 
 test "stream handler: read" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1290,7 +1343,7 @@ test "stream handler: read" {
 
 test "stream handler: read with limit" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1323,7 +1376,7 @@ test "stream handler: read with limit" {
 
 test "stream handler: trim" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1350,7 +1403,7 @@ test "stream handler: trim" {
 
 test "stream handler: info" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1374,7 +1427,7 @@ test "stream handler: info" {
 
 test "stream handler: create is ok (implicit)" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1389,7 +1442,7 @@ test "stream handler: create is ok (implicit)" {
 
 test "stream handler: group lifecycle" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1445,7 +1498,7 @@ test "stream handler: group lifecycle" {
 
 test "stream handler: group read and ack" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1494,7 +1547,7 @@ test "stream handler: group read and ack" {
 
 test "stream handler: group info" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 
@@ -1521,7 +1574,7 @@ test "stream handler: group info" {
 
 test "stream handler: group not found errors" {
     const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096);
+    var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
     partition.wireProjections();
 

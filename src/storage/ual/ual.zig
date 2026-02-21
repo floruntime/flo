@@ -70,6 +70,10 @@ pub const UAL = struct {
     /// Highest index in the ring (last appended).
     max_index: u64,
 
+    /// Maximum entries allowed in hot ring before entry-count eviction kicks in.
+    /// 0 = unlimited (capacity-only eviction).
+    max_hot_entries: u64,
+
     /// Eviction callback — called when entries are evicted from the hot ring.
     on_evict: ?*const fn (data: []const u8, index: u64) void,
 
@@ -81,7 +85,7 @@ pub const UAL = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !UAL {
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, max_hot_entries: u64) !UAL {
         const buf = try allocator.alloc(u8, capacity);
         return .{
             .buffer = buf,
@@ -94,6 +98,7 @@ pub const UAL = struct {
             .total_bytes_written = 0,
             .min_live_index = 0,
             .max_index = 0,
+            .max_hot_entries = max_hot_entries,
             .on_evict = null,
             .on_append_ctx = null,
             .on_append = null,
@@ -153,6 +158,13 @@ pub const UAL = struct {
             self.min_live_index = entry.header.index;
         }
         self.max_index = entry.header.index;
+
+        // Entry-count-based eviction: keep at most max_hot_entries in the ring.
+        if (self.max_hot_entries > 0) {
+            while (self.entry_count > self.max_hot_entries) {
+                self.evictOldest();
+            }
+        }
 
         // Persistence callback — feeds entries to SegmentWriter for disk durability
         if (self.on_append) |cb| {
@@ -319,7 +331,7 @@ fn makeEntry(index: u64, payload: []const u8) Entry {
 }
 
 test "UAL: init and deinit" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     try testing.expectEqual(@as(u64, 0), ual.entry_count);
@@ -327,7 +339,7 @@ test "UAL: init and deinit" {
 }
 
 test "UAL: append and read" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     const entry = makeEntry(1, "hello");
@@ -342,7 +354,7 @@ test "UAL: append and read" {
 }
 
 test "UAL: multiple appends" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     var i: u64 = 1;
@@ -366,7 +378,7 @@ test "UAL: multiple appends" {
 
 test "UAL: eviction on full ring" {
     // Small ring — fits ~2 entries (header=40 + payload=10 = 50 each)
-    var ual = try UAL.init(testing.allocator, 120);
+    var ual = try UAL.init(testing.allocator, 120, 0);
     defer ual.deinit();
 
     const e1 = makeEntry(1, "aaaaaaaaaa"); // 50 bytes
@@ -388,7 +400,7 @@ test "UAL: eviction on full ring" {
 
 test "UAL: readCopy handles wrap-around" {
     // 100-byte ring, entries of ~50 bytes
-    var ual = try UAL.init(testing.allocator, 100);
+    var ual = try UAL.init(testing.allocator, 100, 0);
     defer ual.deinit();
 
     const e1 = makeEntry(1, "1234567890"); // 50 bytes
@@ -406,7 +418,7 @@ test "UAL: readCopy handles wrap-around" {
 }
 
 test "UAL: readRange" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     var i: u64 = 1;
@@ -424,7 +436,7 @@ test "UAL: readRange" {
 }
 
 test "UAL: contains" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     const entry = makeEntry(42, "x");
@@ -436,7 +448,7 @@ test "UAL: contains" {
 }
 
 test "UAL: entry too large for ring" {
-    var ual = try UAL.init(testing.allocator, 64);
+    var ual = try UAL.init(testing.allocator, 64, 0);
     defer ual.deinit();
 
     // Entry needs 40 (header) + 100 (payload) = 140 > 64
@@ -446,7 +458,7 @@ test "UAL: entry too large for ring" {
 }
 
 test "UAL: stats tracking" {
-    var ual = try UAL.init(testing.allocator, 4096);
+    var ual = try UAL.init(testing.allocator, 4096, 0);
     defer ual.deinit();
 
     const entry = makeEntry(1, "stats");

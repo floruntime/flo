@@ -42,7 +42,7 @@ pub const RaftLog = struct {
     // ── Construction ────────────────────────────────────────────────────
 
     pub fn init(allocator: Allocator, capacity: usize) !RaftLog {
-        var ual = try UAL.init(allocator, capacity);
+        var ual = try UAL.init(allocator, capacity, 0);
         errdefer ual.deinit();
 
         return .{

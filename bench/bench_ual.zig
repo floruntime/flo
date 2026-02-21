@@ -50,7 +50,7 @@ pub fn main() !void {
 
     // ── Append Benchmark ──
     {
-        var ual = try UAL.init(allocator, 4 * 1024 * 1024); // 4 MB ring
+        var ual = try UAL.init(allocator, 4 * 1024 * 1024, 0); // 4 MB ring
         defer ual.deinit();
 
         // Warmup
@@ -62,7 +62,7 @@ pub fn main() !void {
 
         // Reset
         ual.deinit();
-        ual = try UAL.init(allocator, 4 * 1024 * 1024);
+        ual = try UAL.init(allocator, 4 * 1024 * 1024, 0);
 
         const start = std.time.nanoTimestamp();
         benchAppend(&ual);
