@@ -26,6 +26,7 @@ const queue_mod = @import("../projection/queue.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const router = @import("../node/router.zig");
 
 const CommandResult = result_mod.CommandResult;
 const QueueProjection = queue_mod.QueueProjection;
@@ -81,7 +82,7 @@ pub const QueueHandler = struct {
 
     fn preRouteByQueue(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return std.hash.Wyhash.hash(0, req.key);
+        return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
     fn dispatchQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -823,6 +824,11 @@ test "queue handler: pre-route by queue" {
 
     const req_empty = makeRequest(.queue_enqueue, "", "", "");
     try testing.expectEqual(@as(?u64, 0), QueueHandler.preRouteByQueue(req_empty));
+
+    // Same queue, different namespace → different hash (namespace isolation)
+    var req_ns = makeRequest(.queue_enqueue, "queue-a", "", "");
+    req_ns.namespace = "other";
+    try testing.expect(QueueHandler.preRouteByQueue(req1) != QueueHandler.preRouteByQueue(req_ns));
 }
 
 test "queue handler: peek empty" {

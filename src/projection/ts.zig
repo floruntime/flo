@@ -411,6 +411,61 @@ pub const TSProjection = struct {
         return self.buffers.count();
     }
 
+    /// Scan unique measurement names into a caller-provided buffer.
+    ///
+    /// Returns the count of unique names written. Names are borrowed
+    /// references into the internal HashMap key storage — valid only
+    /// while the projection is not mutated.
+    pub fn scanMeasurementNames(self: *const TSProjection, buf: [][]const u8) usize {
+        var result_count: usize = 0;
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            if (result_count >= buf.len) break;
+            const key = kv.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+            const meas = key[0..sep];
+            // Dedup via linear scan (measurement count is typically small)
+            var dup = false;
+            for (buf[0..result_count]) |existing| {
+                if (std.mem.eql(u8, existing, meas)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                buf[result_count] = meas;
+                result_count += 1;
+            }
+        }
+        return result_count;
+    }
+
+    /// Return unique measurement names from the write buffers.
+    /// Caller owns the returned slices and must free them.
+    pub fn listMeasurements(self: *const TSProjection, allocator: Allocator) ![][]const u8 {
+        // Collect unique measurement names from buffer keys ("measurement\x00field")
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            // Find the \x00 separator
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+            const meas = key[0..sep];
+            _ = try seen.getOrPut(meas);
+        }
+
+        const names = try allocator.alloc([]const u8, seen.count());
+        var idx: usize = 0;
+        var sit = seen.iterator();
+        while (sit.next()) |entry| {
+            names[idx] = try allocator.dupe(u8, entry.key_ptr.*);
+            idx += 1;
+        }
+        return names;
+    }
+
     /// Total flushed blocks across all series.
     pub fn totalBlocks(self: *const TSProjection) usize {
         var total: usize = 0;

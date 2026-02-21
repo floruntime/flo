@@ -137,16 +137,6 @@ test "e2e/processing: status requires job_id argument" {
     try stdx.testing.assertFailed(result);
 }
 
-test "e2e/processing: metrics requires job_id argument" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.run(&.{ "processing", "metrics" });
-    defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
-}
-
 test "e2e/processing: savepoint requires job_id argument" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -621,13 +611,13 @@ test "e2e/processing: passthrough pipeline - data flows from source to sink stre
     try stdx.testing.assertContains(read_result, "second-record");
     try stdx.testing.assertContains(read_result, "third-record");
 
-    // Step 5: Verify job metrics show records processed
-    var metrics_result = try ctx.cli.run(&.{ "processing", "metrics", job_id });
-    defer metrics_result.deinit();
+    // Step 5: Verify job status shows records processed
+    var status_result = try ctx.cli.run(&.{ "processing", "status", job_id });
+    defer status_result.deinit();
 
-    try stdx.testing.assertSucceeded(metrics_result);
+    try stdx.testing.assertSucceeded(status_result);
     // Should show records_processed > 0
-    try testing.expect(!metrics_result.stdoutContains("\"records_processed\":0"));
+    try testing.expect(!status_result.stdoutContains("\"records_processed\":0"));
 
     // Step 6: Clean up — stop the job
     try ctx.exec(&.{ "processing", "stop", job_id });
@@ -682,7 +672,7 @@ test "e2e/processing: pipeline processes data appended after job submission" {
     try ctx.exec(&.{ "processing", "stop", job_id });
 }
 
-test "e2e/processing: job metrics reflect processed record count" {
+test "e2e/processing: job status reflects processed record count" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -708,13 +698,13 @@ test "e2e/processing: job metrics reflect processed record count" {
     // Wait for processing
     _ = try readStreamBlocking(ctx, "metrics-output", "metrics-5", "5000");
 
-    // Check metrics
-    var metrics_result = try ctx.cli.run(&.{ "processing", "metrics", job_id });
-    defer metrics_result.deinit();
+    // Check status
+    var status_result = try ctx.cli.run(&.{ "processing", "status", job_id });
+    defer status_result.deinit();
 
-    try stdx.testing.assertSucceeded(metrics_result);
-    // Metrics JSON should contain records_processed field
-    try stdx.testing.assertContains(metrics_result, "records_processed");
+    try stdx.testing.assertSucceeded(status_result);
+    // Status JSON should contain records_processed field
+    try stdx.testing.assertContains(status_result, "records_processed");
 
     try ctx.exec(&.{ "processing", "stop", job_id });
 }
@@ -1165,9 +1155,9 @@ test "e2e/processing: ts source - TS measurement data flows to stream sink" {
     defer ctx.deinit();
 
     // Step 1: Seed the TS measurement with data points via `flo ts write`
-    try ctx.exec(&.{ "ts", "write", "src_cpu", "host=web-01", "--", "72.5" });
-    try ctx.exec(&.{ "ts", "write", "src_cpu", "host=web-01", "--", "85.3" });
-    try ctx.exec(&.{ "ts", "write", "src_cpu", "host=web-02", "--", "45.0" });
+    try ctx.exec(&.{ "ts", "write", "src_cpu", "--tags", "host=web-01", "--value", "72.5" });
+    try ctx.exec(&.{ "ts", "write", "src_cpu", "--tags", "host=web-01", "--value", "85.3" });
+    try ctx.exec(&.{ "ts", "write", "src_cpu", "--tags", "host=web-02", "--value", "45.0" });
 
     // Step 2: Submit a processing job with a TS *source* that reads from src_cpu
     // The FloTsSource wraps each point as JSON: {"measurement":..., "value":..., ...}
@@ -1211,12 +1201,12 @@ test "e2e/processing: ts source - TS measurement data flows to stream sink" {
     // FloTsSource emits JSON containing measurement name and value
     try stdx.testing.assertContains(read_result, "src_cpu");
 
-    // Step 5: Verify job metrics show records processed
-    var metrics_result = try ctx.cli.run(&.{ "processing", "metrics", job_id });
-    defer metrics_result.deinit();
+    // Step 5: Verify job status shows records processed
+    var status_result = try ctx.cli.run(&.{ "processing", "status", job_id });
+    defer status_result.deinit();
 
-    try stdx.testing.assertSucceeded(metrics_result);
-    try testing.expect(!metrics_result.stdoutContains("\"records_processed\":0"));
+    try stdx.testing.assertSucceeded(status_result);
+    try testing.expect(!status_result.stdoutContains("\"records_processed\":0"));
 
     // Clean up
     try ctx.exec(&.{ "processing", "stop", job_id });
@@ -1246,8 +1236,8 @@ test "e2e/processing: ts source - late data written after job starts" {
     std.Thread.sleep(300 * std.time.ns_per_ms);
 
     // Step 2: Now write TS data — the source should pick it up on subsequent polls
-    try ctx.exec(&.{ "ts", "write", "src_late_cpu", "host=db-01", "--", "3.14" });
-    try ctx.exec(&.{ "ts", "write", "src_late_cpu", "host=db-01", "--", "2.71" });
+    try ctx.exec(&.{ "ts", "write", "src_late_cpu", "--tags", "host=db-01", "--value", "3.14" });
+    try ctx.exec(&.{ "ts", "write", "src_late_cpu", "--tags", "host=db-01", "--value", "2.71" });
 
     // Step 3: Wait for data to flow through
     const found = try readStreamBlocking(ctx, "ts-src-late-out", "src_late_cpu", "8000");
@@ -1272,9 +1262,9 @@ test "e2e/processing: ts source - with tag filter reads subset of data" {
     defer ctx.deinit();
 
     // Seed data with two different hosts
-    try ctx.exec(&.{ "ts", "write", "src_filtered", "host=web-01", "--", "10.0" });
-    try ctx.exec(&.{ "ts", "write", "src_filtered", "host=web-02", "--", "20.0" });
-    try ctx.exec(&.{ "ts", "write", "src_filtered", "host=web-01", "--", "30.0" });
+    try ctx.exec(&.{ "ts", "write", "src_filtered", "--tags", "host=web-01", "--value", "10.0" });
+    try ctx.exec(&.{ "ts", "write", "src_filtered", "--tags", "host=web-02", "--value", "20.0" });
+    try ctx.exec(&.{ "ts", "write", "src_filtered", "--tags", "host=web-01", "--value", "30.0" });
 
     // Submit job with tag filter: only read host=web-01
     const job_def =
@@ -1318,9 +1308,9 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
     defer ctx.deinit();
 
     // Step 1: Seed source measurement with data points
-    try ctx.exec(&.{ "ts", "write", "raw_temperature", "sensor=A1,room=lab", "--", "22.5" });
-    try ctx.exec(&.{ "ts", "write", "raw_temperature", "sensor=A1,room=lab", "--", "23.1" });
-    try ctx.exec(&.{ "ts", "write", "raw_temperature", "sensor=A2,room=lab", "--", "21.8" });
+    try ctx.exec(&.{ "ts", "write", "raw_temperature", "--tags", "sensor=A1,room=lab", "--value", "22.5" });
+    try ctx.exec(&.{ "ts", "write", "raw_temperature", "--tags", "sensor=A1,room=lab", "--value", "23.1" });
+    try ctx.exec(&.{ "ts", "write", "raw_temperature", "--tags", "sensor=A2,room=lab", "--value", "21.8" });
 
     // Step 2: Submit a TS-to-TS pipeline
     // Reads from raw_temperature → passthrough → writes to derived_temp
@@ -1384,7 +1374,7 @@ test "e2e/processing: ts source - job status shows RUNNING" {
     defer ctx.deinit();
 
     // Seed minimal data
-    try ctx.exec(&.{ "ts", "write", "src_status_check", "host=a", "--", "1.0" });
+    try ctx.exec(&.{ "ts", "write", "src_status_check", "--tags", "host=a", "--value", "1.0" });
 
     const job_def =
         \\kind: Processing
@@ -1415,7 +1405,7 @@ test "e2e/processing: ts source - stop and cancel lifecycle" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "ts", "write", "src_lifecycle", "host=a", "--", "1.0" });
+    try ctx.exec(&.{ "ts", "write", "src_lifecycle", "--tags", "host=a", "--value", "1.0" });
 
     const job_def =
         \\kind: Processing
@@ -1482,7 +1472,9 @@ test "e2e/processing: TS source definition parser roundtrip" {
         \\      tags:
         \\        host: web-01
         \\sinks:
-        \\  - stream: output
+        \\  - name: output
+        \\    stream:
+        \\      name: output
     ;
 
     var def = try parser.parseJobDefinition(testing.allocator, yaml);
@@ -1509,9 +1501,13 @@ test "e2e/processing: stream source definition is default kind" {
         \\kind: Processing
         \\name: parser-test-stream-default
         \\sources:
-        \\  - stream: events
+        \\  - name: events-source
+        \\    stream:
+        \\      name: events
         \\sinks:
-        \\  - stream: output
+        \\  - name: output
+        \\    stream:
+        \\      name: output
     ;
 
     var def = try parser.parseJobDefinition(testing.allocator, yaml);

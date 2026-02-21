@@ -30,9 +30,15 @@ const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
+const definition = @import("definition.zig");
+const SourceKind = definition.SourceKind;
+const SinkKind = definition.SinkKind;
+const ts_mod = @import("../projection/ts.zig");
+const StoredPoint = ts_mod.StoredPoint;
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
@@ -59,7 +65,32 @@ pub const ProcessingHandler = struct {
     /// Monotonic savepoint counter.
     next_savepoint_id: u64,
 
+    /// Per-job pipeline execution state (keyed by same job_id as jobs map).
+    pipelines: std.StringHashMap(PipelineState),
+
     const MAX_JOBS: usize = 100_000;
+
+    /// Per-job pipeline state: source/sink config + read cursor.
+    pub const PipelineState = struct {
+        // Source configuration
+        source_kind: SourceKind,
+        src_measurement: []const u8, // owned (TS source: measurement name)
+        src_field: []const u8, // owned (TS source: field name, default "value")
+        src_tag_hash: u64, // TS source: tag hash for filtering (0 = no filter)
+        src_stream: []const u8, // owned (stream source: stream name)
+        src_poll_ms: u32, // poll interval in milliseconds
+
+        // Sink configuration
+        sink_kind: SinkKind,
+        sink_target: []const u8, // owned (stream/queue sink: target name)
+        sink_measurement: []const u8, // owned (TS sink: measurement name)
+        sink_value_field: []const u8, // owned (TS sink: value field name)
+
+        // Read cursors — track what's been processed
+        ts_cursor_ns: u64, // TS source: next timestamp_ns to read from
+        stream_cursor: u64, // Stream source: last offset read
+        last_poll_ms: i64, // last time this pipeline was ticked
+    };
 
     pub const JobStatus = enum(u8) {
         running = 0,
@@ -105,10 +136,18 @@ pub const ProcessingHandler = struct {
             .next_job_id = 1,
             .savepoints = std.StringHashMap(SavepointRecord).init(allocator),
             .next_savepoint_id = 1,
+            .pipelines = std.StringHashMap(PipelineState).init(allocator),
         };
     }
 
     pub fn deinit(self: *ProcessingHandler) void {
+        // Free pipeline state
+        var pit = self.pipelines.iterator();
+        while (pit.next()) |entry| {
+            self.freePipelineState(entry.value_ptr);
+        }
+        self.pipelines.deinit();
+
         // Free all job records
         var jit = self.jobs.iterator();
         while (jit.next()) |entry| {
@@ -132,6 +171,15 @@ pub const ProcessingHandler = struct {
         self.allocator.free(job.yaml_owned);
     }
 
+    fn freePipelineState(self: *ProcessingHandler, pipe: *PipelineState) void {
+        if (pipe.src_measurement.len > 0) self.allocator.free(pipe.src_measurement);
+        if (pipe.src_field.len > 0) self.allocator.free(pipe.src_field);
+        if (pipe.src_stream.len > 0) self.allocator.free(pipe.src_stream);
+        if (pipe.sink_target.len > 0) self.allocator.free(pipe.sink_target);
+        if (pipe.sink_measurement.len > 0) self.allocator.free(pipe.sink_measurement);
+        if (pipe.sink_value_field.len > 0) self.allocator.free(pipe.sink_value_field);
+    }
+
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -146,9 +194,10 @@ pub const ProcessingHandler = struct {
     }
 
     /// Pre-routing: hash on key (job_id) for deterministic shard assignment.
+    /// Uses namespace-qualified hash: hash(namespace \0 job_id)
     fn preRouteByProcessing(req: Request) ?u64 {
         if (req.key.len > 0) {
-            return std.hash.Wyhash.hash(0, req.key);
+            return router.hashKeyWithNamespace(req.namespace, req.key);
         }
         // For submit/list with empty key, use namespace
         return 0;
@@ -257,6 +306,13 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "storage failed");
             return;
         };
+
+        // Create pipeline execution state from parsed definition
+        if (def.primarySource()) |src| {
+            if (def.primarySink()) |snk| {
+                self.createPipeline(owned_id, src, snk);
+            }
+        }
 
         // Return the job ID
         shard.sendOkResponse(conn, req.header.request_id, job_id);
@@ -505,6 +561,153 @@ pub const ProcessingHandler = struct {
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
+        }
+    }
+
+    // ── Pipeline Execution ──────────────────────────────────────────────
+
+    /// Create a pipeline execution state from parsed source/sink specifications.
+    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, snk: *const definition.SinkSpec) void {
+        // Compute tag hash for TS source filtering (same algorithm as TSHandler)
+        const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
+            var tag_buf: [1024]u8 = undefined;
+            var pos: usize = 0;
+            var i: usize = 0;
+            while (i + 1 < src.ts_tags.len) : (i += 2) {
+                if (pos > 0 and pos < tag_buf.len) {
+                    tag_buf[pos] = ',';
+                    pos += 1;
+                }
+                const kv = std.fmt.bufPrint(tag_buf[pos..], "{s}={s}", .{ src.ts_tags[i], src.ts_tags[i + 1] }) catch break;
+                pos += kv.len;
+            }
+            break :blk if (pos > 0) std.hash.Wyhash.hash(0, tag_buf[0..pos]) else 0;
+        } else 0;
+
+        const pipe_state = PipelineState{
+            .source_kind = src.kind,
+            .src_measurement = self.allocator.dupe(u8, src.ts_measurement) catch "",
+            .src_field = self.allocator.dupe(u8, if (src.ts_field.len > 0) src.ts_field else "value") catch "",
+            .src_tag_hash = tag_hash,
+            .src_stream = self.allocator.dupe(u8, src.stream) catch "",
+            .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
+            .sink_kind = snk.kind,
+            .sink_target = self.allocator.dupe(u8, snk.target) catch "",
+            .sink_measurement = self.allocator.dupe(u8, snk.ts_measurement) catch "",
+            .sink_value_field = self.allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
+            .ts_cursor_ns = 0,
+            .stream_cursor = 0,
+            .last_poll_ms = 0,
+        };
+        self.pipelines.put(job_id, pipe_state) catch {};
+    }
+
+    /// Drive all running pipelines: poll sources, push to sinks.
+    /// Called from Shard.tick() on each reactor iteration.
+    pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) void {
+        const now_ms = std.time.milliTimestamp();
+
+        var it = self.pipelines.iterator();
+        while (it.next()) |entry| {
+            const job_id = entry.key_ptr.*;
+            const pipe = entry.value_ptr;
+
+            // Only run for RUNNING jobs
+            const job = self.jobs.getPtr(job_id) orelse continue;
+            if (job.status != .running) continue;
+
+            // Enforce poll interval
+            const poll_ms: i64 = @intCast(pipe.src_poll_ms);
+            if (now_ms - pipe.last_poll_ms < poll_ms) continue;
+            pipe.last_poll_ms = now_ms;
+
+            switch (pipe.source_kind) {
+                .ts => tickTsSource(pipe, shard, job),
+                .stream => tickStreamSource(pipe, shard, job),
+            }
+        }
+    }
+
+    /// Tick a TS source pipeline: read points from TSProjection, write to sink.
+    fn tickTsSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+        var point_buf: [256]StoredPoint = undefined;
+        const result = shard.ts_handler.ts.queryRange(
+            pipe.src_measurement,
+            pipe.src_field,
+            pipe.ts_cursor_ns,
+            std.math.maxInt(u64),
+            &point_buf,
+        ) catch return;
+
+        const points = point_buf[0..result.points_in_buffer];
+        if (points.len == 0) return;
+
+        for (points) |pt| {
+            // Filter by tag hash if specified
+            if (pipe.src_tag_hash != 0 and pt.tag_hash != pipe.src_tag_hash) continue;
+
+            switch (pipe.sink_kind) {
+                .stream => {
+                    // Format TS point as JSON and append to stream
+                    var json_buf: [512]u8 = undefined;
+                    const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
+                    const json = std.fmt.bufPrint(&json_buf, "{{\"measurement\":\"{s}\",\"value\":{},\"timestamp_ms\":{d}}}", .{ pipe.src_measurement, pt.field_value, ts_ms }) catch continue;
+                    _ = shard.stream_handler.appendPayload(json) catch continue;
+                },
+                .ts => {
+                    // Write to destination TS measurement
+                    const ual_idx = shard.ts_handler.nextUalIndex();
+                    shard.ts_handler.ts.insert(
+                        pipe.sink_measurement,
+                        pipe.sink_value_field,
+                        pt.field_value,
+                        pt.timestamp_ns,
+                        ual_idx,
+                        pt.tag_hash,
+                    ) catch continue;
+                },
+                else => continue,
+            }
+
+            // Advance cursor past this point
+            if (pt.timestamp_ns >= pipe.ts_cursor_ns) {
+                pipe.ts_cursor_ns = pt.timestamp_ns + 1;
+            }
+
+            job.records_processed += 1;
+        }
+    }
+
+    /// Tick a stream source pipeline: read payloads from stream, write to sink.
+    fn tickStreamSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+        const payloads = shard.stream_handler.readPayloads(pipe.stream_cursor + 1, 100);
+        if (payloads.len == 0) return;
+        defer shard.stream_handler.allocator.free(payloads);
+
+        for (payloads) |payload| {
+            switch (pipe.sink_kind) {
+                .stream => {
+                    _ = shard.stream_handler.appendPayload(payload) catch continue;
+                },
+                .ts => {
+                    // Write JSON payload value to TS measurement
+                    const value = std.fmt.parseFloat(f64, payload) catch 0.0;
+                    const ual_idx = shard.ts_handler.nextUalIndex();
+                    const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
+                    shard.ts_handler.ts.insert(
+                        pipe.sink_measurement,
+                        pipe.sink_value_field,
+                        value,
+                        now_ns,
+                        ual_idx,
+                        0,
+                    ) catch continue;
+                },
+                else => continue,
+            }
+
+            pipe.stream_cursor += 1;
+            job.records_processed += 1;
         }
     }
 };

@@ -129,7 +129,8 @@ fn getArray(obj: JsonValue, key: []const u8) ?[]const JsonValue {
 /// name: my-pipeline
 /// sources:
 ///   - name: events-source
-///     stream: events
+///     stream:
+///       name: events
 /// sinks:
 ///   - name: output
 ///     stream:
@@ -653,7 +654,7 @@ fn appendExpandedSource(
 ///   - `kv:` object present  → SinkKind.kv
 ///   - `queue:` object present → SinkKind.queue
 ///   - `ts:` object present  → SinkKind.ts
-///   - `stream:` string present → SinkKind.stream
+///   - `stream:` object present → SinkKind.stream
 ///
 /// Optional `routes_from:` field maps this sink to a named side output tag.
 fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {

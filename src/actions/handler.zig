@@ -31,6 +31,7 @@ const RunStatus = @import("types.zig").RunStatus;
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
@@ -117,7 +118,7 @@ pub const ActionsHandler = struct {
 
     fn preRouteByAction(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return std.hash.Wyhash.hash(0, req.key);
+        return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
     fn dispatchAction(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -782,6 +783,11 @@ test "actions handler: pre-route by action" {
 
     const req_empty = makeRequest(.action_invoke, "", "");
     try testing.expectEqual(@as(?u64, 0), ActionsHandler.preRouteByAction(req_empty));
+
+    // Same action, different namespace → different hash (namespace isolation)
+    var req_ns = makeRequest(.action_invoke, "action-a", "");
+    req_ns.namespace = "other";
+    try testing.expect(ActionsHandler.preRouteByAction(req1) != ActionsHandler.preRouteByAction(req_ns));
 }
 
 test "actions handler: multiple invocations" {

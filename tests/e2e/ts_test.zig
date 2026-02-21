@@ -1301,3 +1301,37 @@ test "e2e/ts: floql full pipeline with math + round + glob" {
 
     try stdx.testing.assertSucceeded(result);
 }
+
+// =============================================================================
+// Multi-Shard Tests
+// =============================================================================
+
+test "e2e/ts: list returns all measurements across shards" {
+    // Start server with 4 shards — measurements hash to different shards
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    // Write 8 distinctly-named measurements. With 4 shards and Wyhash
+    // routing, these are very likely to land on at least 2 different shards.
+    const measurements = [_][]const u8{
+        "alpha_cpu",   "bravo_mem",   "charlie_disk", "delta_net",
+        "echo_iops",   "foxtrot_lat", "golf_tput",    "hotel_err",
+    };
+
+    for (measurements) |m| {
+        try ctx.exec(&.{ "ts", "write", m, "--value", "1.0" });
+    }
+
+    // ts list should return ALL measurements regardless of shard placement
+    var result = try ctx.cli.run(&.{ "ts", "list" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+
+    // Every measurement we wrote must appear in the listing
+    for (measurements) |m| {
+        try stdx.testing.assertContains(result, m);
+    }
+}

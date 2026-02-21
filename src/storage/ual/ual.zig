@@ -70,8 +70,14 @@ pub const UAL = struct {
     /// Highest index in the ring (last appended).
     max_index: u64,
 
-    /// Whether a flush callback is set.
+    /// Eviction callback — called when entries are evicted from the hot ring.
     on_evict: ?*const fn (data: []const u8, index: u64) void,
+
+    /// Persistence callback — called after every successful append.
+    /// Used to feed entries to the SegmentWriter for disk durability.
+    /// Wired AFTER segment replay to avoid re-persisting old entries.
+    on_append_ctx: ?*anyopaque,
+    on_append: ?*const fn (ctx: *anyopaque, entry: *const Entry) void,
 
     allocator: std.mem.Allocator,
 
@@ -89,6 +95,8 @@ pub const UAL = struct {
             .min_live_index = 0,
             .max_index = 0,
             .on_evict = null,
+            .on_append_ctx = null,
+            .on_append = null,
             .allocator = allocator,
         };
     }
@@ -145,6 +153,11 @@ pub const UAL = struct {
             self.min_live_index = entry.header.index;
         }
         self.max_index = entry.header.index;
+
+        // Persistence callback — feeds entries to SegmentWriter for disk durability
+        if (self.on_append) |cb| {
+            cb(self.on_append_ctx.?, entry);
+        }
 
         return entry.header.index;
     }

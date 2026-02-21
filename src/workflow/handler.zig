@@ -36,6 +36,7 @@ const validator = @import("validator.zig");
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
@@ -200,7 +201,7 @@ pub const WorkflowHandler = struct {
 
     fn preRouteByWorkflow(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return std.hash.Wyhash.hash(0, req.key);
+        return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

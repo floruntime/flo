@@ -153,6 +153,8 @@ pub const OffsetEntry = struct {
     ual_index: u64,
     /// Timestamp when appended.
     timestamp_ns: u64,
+    /// Hash of the stream name this entry belongs to (for per-stream filtering).
+    stream_name_hash: u64,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -167,6 +169,9 @@ pub const StreamProjection = struct {
 
     /// Consumer groups by name.
     groups: std.StringHashMap(ConsumerGroup),
+
+    /// Registered stream names (for listing).
+    stream_names: std.StringHashMap(void),
 
     /// High water mark — the latest appended offset.
     hwm: u64,
@@ -194,6 +199,7 @@ pub const StreamProjection = struct {
             .allocator = allocator,
             .offsets = std.AutoHashMap(u64, OffsetEntry).init(allocator),
             .groups = std.StringHashMap(ConsumerGroup).init(allocator),
+            .stream_names = std.StringHashMap(void).init(allocator),
             .hwm = 0,
             .trim_offset = 0,
             .applied_index = 0,
@@ -209,6 +215,12 @@ pub const StreamProjection = struct {
         }
         self.groups.deinit();
         self.offsets.deinit();
+        // Free stream name keys
+        var nit = self.stream_names.keyIterator();
+        while (nit.next()) |key| {
+            self.allocator.free(@constCast(key.*));
+        }
+        self.stream_names.deinit();
     }
 
     /// Reset the stream projection to empty state.
@@ -221,6 +233,12 @@ pub const StreamProjection = struct {
         }
         self.groups.clearAndFree();
         self.offsets.clearAndFree();
+        // Free stream name keys
+        var nit = self.stream_names.keyIterator();
+        while (nit.next()) |key| {
+            self.allocator.free(@constCast(key.*));
+        }
+        self.stream_names.clearAndFree();
         self.hwm = 0;
         self.trim_offset = 0;
         self.applied_index = 0;
@@ -231,13 +249,14 @@ pub const StreamProjection = struct {
 
     /// Append a record to the stream. Returns the assigned offset.
     /// The record payload is stored in the UAL at `ual_index`.
-    pub fn append(self: *StreamProjection, ual_index: u64, timestamp_ns: u64) !u64 {
+    pub fn append(self: *StreamProjection, ual_index: u64, timestamp_ns: u64, stream_name_hash: u64) !u64 {
         self.hwm += 1;
         const offset = self.hwm;
 
         try self.offsets.put(offset, .{
             .ual_index = ual_index,
             .timestamp_ns = timestamp_ns,
+            .stream_name_hash = stream_name_hash,
         });
 
         self.stats.appended += 1;
@@ -267,6 +286,30 @@ pub const StreamProjection = struct {
             if (self.offsets.get(offset)) |entry| {
                 buf[count] = entry;
                 count += 1;
+            }
+        }
+
+        self.stats.reads += count;
+        return count;
+    }
+
+    /// Read a range of offsets filtered by stream name hash.
+    /// Only returns entries belonging to the specified stream.
+    pub fn readRangeForStream(self: *StreamProjection, from_offset: u64, to_offset: u64, stream_name_hash: u64, buf: []OffsetEntry) usize {
+        const start = @max(from_offset, self.trim_offset + 1);
+        if (start > to_offset) return 0;
+        if (start > self.hwm) return 0;
+
+        const end = @min(to_offset, self.hwm);
+        var count: usize = 0;
+
+        var offset = start;
+        while (offset <= end and count < buf.len) : (offset += 1) {
+            if (self.offsets.get(offset)) |entry| {
+                if (entry.stream_name_hash == stream_name_hash) {
+                    buf[count] = entry;
+                    count += 1;
+                }
             }
         }
 
@@ -375,6 +418,36 @@ pub const StreamProjection = struct {
         return self.offsets.count();
     }
 
+    // ─── Stream Name Registry ──────────────────────────────────────────────
+
+    /// Register a stream name. No-op if already registered.
+    pub fn registerStream(self: *StreamProjection, name: []const u8) !void {
+        if (name.len == 0) return;
+        const gop = try self.stream_names.getOrPut(name);
+        if (!gop.found_existing) {
+            const owned = try self.allocator.dupe(u8, name);
+            gop.key_ptr.* = owned;
+        }
+    }
+
+    /// Scan registered stream names into a buffer. Returns the count written.
+    /// Returns borrowed references into the HashMap (zero-copy, valid until mutation).
+    pub fn scanStreamNames(self: *const StreamProjection, buf: [][]const u8) usize {
+        var count: usize = 0;
+        var it = self.stream_names.keyIterator();
+        while (it.next()) |key| {
+            if (count >= buf.len) break;
+            buf[count] = key.*;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Number of registered stream names.
+    pub fn streamCount(self: *const StreamProjection) usize {
+        return self.stream_names.count();
+    }
+
     // ─── UAL Entry application ─────────────────────────────────────────────
 
     pub fn applyEntry(self: *StreamProjection, ual_entry: *const Entry) !void {
@@ -382,7 +455,12 @@ pub const StreamProjection = struct {
 
         switch (entry_type) {
             .stream_append => {
-                _ = try self.append(ual_entry.header.index, ual_entry.header.timestamp_ns);
+                // Extract stream name hash from command payload key
+                const name_hash = if (CommandPayload.deserialize(ual_entry.payload)) |cmd|
+                    std.hash.Wyhash.hash(0, cmd.key)
+                else
+                    0;
+                _ = try self.append(ual_entry.header.index, ual_entry.header.timestamp_ns, name_hash);
             },
             .stream_trim => {
                 // Trim offset encoded in command payload key as u64
@@ -458,6 +536,12 @@ pub const StreamProjection = struct {
             mem += kv.value_ptr.members.count() * @sizeOf(Member);
         }
 
+        // Stream names
+        var nit = self.stream_names.keyIterator();
+        while (nit.next()) |key| {
+            mem += key.len;
+        }
+
         return mem;
     }
 };
@@ -472,8 +556,8 @@ test "stream: basic append and read" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const off1 = try s.append(100, 1000);
-    const off2 = try s.append(101, 2000);
+    const off1 = try s.append(100, 1000, 0);
+    const off2 = try s.append(101, 2000, 0);
 
     try testing.expectEqual(@as(u64, 1), off1);
     try testing.expectEqual(@as(u64, 2), off2);
@@ -493,10 +577,10 @@ test "stream: read range" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000);
-    _ = try s.append(101, 2000);
-    _ = try s.append(102, 3000);
-    _ = try s.append(103, 4000);
+    _ = try s.append(100, 1000, 0);
+    _ = try s.append(101, 2000, 0);
+    _ = try s.append(102, 3000, 0);
+    _ = try s.append(103, 4000, 0);
 
     var buf: [10]OffsetEntry = undefined;
     const count = s.readRange(2, 3, &buf);
@@ -509,9 +593,9 @@ test "stream: trim removes old offsets" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000);
-    _ = try s.append(101, 2000);
-    _ = try s.append(102, 3000);
+    _ = try s.append(100, 1000, 0);
+    _ = try s.append(101, 2000, 0);
+    _ = try s.append(102, 3000, 0);
 
     const trimmed = s.trim(2);
     try testing.expectEqual(@as(u64, 2), trimmed);
@@ -563,8 +647,8 @@ test "stream: commit offset" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000);
-    _ = try s.append(101, 2000);
+    _ = try s.append(100, 1000, 0);
+    _ = try s.append(101, 2000, 0);
 
     try s.createGroup("grp", 1000);
     _ = try s.joinGroup("grp", "c1", 2000);
@@ -591,8 +675,8 @@ test "stream: stats tracking" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000);
-    _ = try s.append(101, 2000);
+    _ = try s.append(100, 1000, 0);
+    _ = try s.append(101, 2000, 0);
     _ = s.read(1);
     _ = s.trim(1);
     try s.createGroup("g", 1000);
@@ -615,7 +699,7 @@ test "stream: memory usage estimate" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000);
+    _ = try s.append(100, 1000, 0);
     try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);

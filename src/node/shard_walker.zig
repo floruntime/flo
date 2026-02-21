@@ -88,11 +88,13 @@ pub fn ShardWalker(comptime ResultT: type) type {
         /// Parameters:
         ///   ctx:           domain-specific context (e.g., the projection)
         ///   namespace:     namespace filter
+        ///   filter:        prefix/pattern filter (empty = no filter)
         ///   local_cursor:  resume position (null = start of shard)
         ///   limit:         max items to return
         pub const LocalScanFn = *const fn (
             ctx: *anyopaque,
             namespace: []const u8,
+            filter: []const u8,
             local_cursor: ?[]const u8,
             limit: u32,
         ) ScanResult;
@@ -128,6 +130,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
         /// Parameters:
         ///   contexts:   per-shard scan contexts (index = shard_id)
         ///   namespace:  namespace to scan
+        ///   filter:     prefix/pattern filter (empty = no filter)
         ///   cursor:     raw encoded cursor (null = start)
         ///   limit:      max items to return
         ///   result_buf: caller-owned buffer for result items
@@ -136,6 +139,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
             self: *const Self,
             contexts: []const *anyopaque,
             namespace: []const u8,
+            filter: []const u8,
             cursor: ?[]const u8,
             limit: u32,
             result_buf: []ResultT,
@@ -151,7 +155,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
 
             while (current_shard < self.shard_count and remaining > 0) {
                 const ctx = contexts[@intCast(current_shard)];
-                const scan = self.local_scan(ctx, namespace, local_cursor, remaining);
+                const scan = self.local_scan(ctx, namespace, filter, local_cursor, remaining);
 
                 // Copy results into buffer
                 const to_copy = @min(scan.items.len, result_buf.len - collected);
@@ -210,7 +214,7 @@ const MockScanCtx = struct {
     shard_id: u16,
 };
 
-fn mockLocalScan(ctx_raw: *anyopaque, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
+fn mockLocalScan(ctx_raw: *anyopaque, _: []const u8, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
 
     // Decode local cursor as a u32 offset
@@ -288,7 +292,7 @@ test "ShardWalker: walk single shard, all items fit" {
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
 
-    const result = walker.walk(&contexts, "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
 
     try std.testing.expectEqual(@as(usize, 3), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
@@ -313,14 +317,14 @@ test "ShardWalker: walk with pagination (limit < items)" {
     var cursor_buf: [64]u8 = undefined;
 
     // First page: limit 3
-    const page1 = walker.walk(&contexts, "", null, 3, &result_buf, &cursor_buf);
+    const page1 = walker.walk(&contexts, "", "", null, 3, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 3), page1.items.len);
     try std.testing.expect(page1.next_cursor != null); // more items
 
     // Second page: use cursor
     var result_buf2: [16]TestItem = undefined;
     var cursor_buf2: [64]u8 = undefined;
-    const page2 = walker.walk(&contexts, "", page1.next_cursor, 3, &result_buf2, &cursor_buf2);
+    const page2 = walker.walk(&contexts, "", "", page1.next_cursor, 3, &result_buf2, &cursor_buf2);
     try std.testing.expectEqual(@as(usize, 2), page2.items.len); // remaining 2
     try std.testing.expectEqual(@as(?[]const u8, null), page2.next_cursor);
 }
@@ -347,7 +351,7 @@ test "ShardWalker: walk multiple shards" {
     var cursor_buf: [64]u8 = undefined;
 
     // Get all items across both shards
-    const result = walker.walk(&contexts, "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 5), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
 
@@ -379,7 +383,7 @@ test "ShardWalker: walk multiple shards with limit across boundary" {
     var cursor_buf: [64]u8 = undefined;
 
     // Limit 4 — should get 3 from shard 0, 1 from shard 1
-    const result = walker.walk(&contexts, "", null, 4, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, "", "", null, 4, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 4), result.items.len);
 
     // Next cursor should point to shard 1 with offset 1
@@ -388,7 +392,7 @@ test "ShardWalker: walk multiple shards with limit across boundary" {
     // Continue from cursor
     var result_buf2: [16]TestItem = undefined;
     var cursor_buf2: [64]u8 = undefined;
-    const page2 = walker.walk(&contexts, "", result.next_cursor, 10, &result_buf2, &cursor_buf2);
+    const page2 = walker.walk(&contexts, "", "", result.next_cursor, 10, &result_buf2, &cursor_buf2);
     try std.testing.expectEqual(@as(usize, 1), page2.items.len); // 1 remaining on shard 1
     try std.testing.expectEqual(@as(?[]const u8, null), page2.next_cursor);
 }
@@ -405,7 +409,7 @@ test "ShardWalker: empty shards" {
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
 
-    const result = walker.walk(&contexts, "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
 }

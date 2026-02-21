@@ -144,6 +144,8 @@ pub const Shard = struct {
 
     /// Workflow handler instance.
     workflow_handler: *WorkflowHandler,
+
+    // Processing handler instance.
     processing_handler: *ProcessingHandler,
 
     /// Segment writer — accumulates entries for persistence to .flseg files.
@@ -202,7 +204,7 @@ pub const Shard = struct {
 
         const stream_handler = try allocator.create(StreamHandler);
         errdefer allocator.destroy(stream_handler);
-        stream_handler.* = StreamHandler.init(allocator, &partition.stream);
+        stream_handler.* = StreamHandler.init(allocator, partition);
 
         const queue_handler = try allocator.create(QueueHandler);
         errdefer allocator.destroy(queue_handler);
@@ -257,9 +259,9 @@ pub const Shard = struct {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // Replay existing segment files into partition's KV projection
+            // Replay existing segment files into partition (UAL + projections)
             var max_index: u64 = 0;
-            replaySegments(allocator, shard_dir, &partition.kv, &max_index);
+            replaySegments(allocator, shard_dir, partition, &max_index);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -271,6 +273,14 @@ pub const Shard = struct {
 
             shard_data_dir = shard_dir;
         }
+
+        // Wire UAL persistence: entries auto-persist to SegmentWriter on append.
+        // This is wired AFTER segment replay so replayed entries don't get
+        // re-persisted (design: UAL → hot ring → flush to warm segments).
+        partition.ual.on_append_ctx = @ptrCast(seg_writer);
+        partition.ual.on_append = ualPersistCallback;
+        raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
+        raft_node.log.ual.on_append = ualPersistCallback;
 
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
@@ -347,6 +357,7 @@ pub const Shard = struct {
 
         // Clean up handlers (they don't own projections — partitions do)
         self.allocator.destroy(self.kv_handler);
+        self.stream_handler.deinit();
         self.allocator.destroy(self.stream_handler);
         self.allocator.destroy(self.queue_handler);
         self.allocator.destroy(self.ts_handler);
@@ -430,10 +441,106 @@ pub const Shard = struct {
     // ─── Dispatch ────────────────────────────────────────────────────────
 
     /// Dispatch a parsed request through the Dispatcher.
+    /// Walk opcodes (list/scan) are routed to executeWalk() for cross-shard
+    /// aggregation when walk contexts are wired (multi-shard mode).
     pub fn dispatchRequest(self: *Shard, conn: *Connection, req: proto.Request) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
-        self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+
+        // Check if this is a walk opcode with contexts wired
+        const op = req.header.op_code;
+        if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
+            // If there's also a pre-route function, check if it routes to a single shard.
+            // This supports dual-path opcodes like kv_scan: prefix → single shard,
+            // no prefix → multi-shard walk.
+            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
+                if (pre_route_fn(req) != null) {
+                    // Pre-route returned a hash → single-shard dispatch
+                    self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+                    return;
+                }
+            }
+            self.executeWalk(conn, req);
+        } else {
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+        }
+    }
+
+    // ─── Cross-Shard Walk ────────────────────────────────────────────────
+
+    /// Execute a cross-shard walk (list/scan) for the given request.
+    ///
+    /// Uses ShardWalker([]const u8) to sequentially scan all shards'
+    /// projections via the registered LocalScanFn, with cursor-based
+    /// pagination.  Results are deduplicated (defensive — routing should
+    /// prevent duplicates) and serialized in the standard list wire format.
+    ///
+    /// Wire format: [count:u32] ([name_len:u16][name])* [has_more:u8] [cursor_len:u16][cursor]
+    fn executeWalk(self: *Shard, conn: *Connection, req: proto.Request) void {
+        const NameWalker = @import("dispatcher.zig").NameWalker;
+        const op_idx = req.header.op_code;
+
+        const scan_fn = self.dispatcher.walk_fn[op_idx] orelse {
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            return;
+        };
+        const contexts = self.dispatcher.walk_contexts[op_idx] orelse {
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            return;
+        };
+
+        // Drive ShardWalker — sequential shard scan with cursor pagination
+        const walker = NameWalker.init(scan_fn, @intCast(contexts.len));
+        var result_buf: [NameWalker.MAX_BATCH][]const u8 = undefined;
+        var cursor_buf: [64]u8 = undefined;
+
+        const cursor: ?[]const u8 = if (req.value.len > 0) req.value else null;
+        const filter: []const u8 = req.key; // prefix filter (empty = no filter)
+
+        const result = walker.walk(
+            contexts,
+            req.namespace,
+            filter,
+            cursor,
+            NameWalker.MAX_BATCH,
+            &result_buf,
+            &cursor_buf,
+        );
+
+        // Dedup names (defensive — routing hashes should prevent duplicates,
+        // but edge cases during rebalance could produce them).
+        var deduped: [NameWalker.MAX_BATCH][]const u8 = undefined;
+        var dedup_count: usize = 0;
+        for (result.items) |name| {
+            var found = false;
+            for (deduped[0..dedup_count]) |existing| {
+                if (std.mem.eql(u8, existing, name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                deduped[dedup_count] = name;
+                dedup_count += 1;
+            }
+        }
+
+        // Serialize and send — select wire format based on opcode
+        const op_enum: proto.OpCode = @enumFromInt(op_idx);
+        const data = switch (op_enum) {
+            // kv_scan uses scan wire format: [count:u32]([key_len:u16][key][value_len:u32(=0)])*[has_more:u8][cursor_len:u16][cursor]
+            .kv_scan => serializeWalkKeysAsScan(self.allocator, deduped[0..dedup_count], result.next_cursor),
+            // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
+            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
+            // Default: name-list format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
+            else => serializeWalkNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
+        } catch {
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "walk serialization failed");
+            return;
+        };
+        defer self.allocator.free(data);
+
+        self.sendOkResponse(conn, req.header.request_id, data);
     }
 
     // ─── Inbox draining ──────────────────────────────────────────────────
@@ -511,6 +618,9 @@ pub const Shard = struct {
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
+
+        // Drive processing pipelines (poll sources → write sinks)
+        self.processing_handler.tickPipelines(self);
 
         return events.len;
     }
@@ -739,6 +849,133 @@ pub const Shard = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Walk Serialization — standard list wire format
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Serialize a list of names into the standard list wire format.
+///
+/// Wire format: [count:u32] ([name_len:u16][name])* [has_more:u8] [cursor_len:u16] [cursor]
+///
+/// This is the generic format used by all list/scan walk operations
+/// (ts_list, stream_list, queue_list, action_list, workflow_list_definitions).
+/// When `next_cursor` is non-null, has_more=1 and the cursor bytes follow cursor_len.
+fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
+
+    var total: usize = 4; // count: u32
+    for (names) |n| {
+        total += 2 + n.len; // name_len: u16 + name bytes
+    }
+    total += 1; // has_more: u8
+    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(names.len), .little);
+    var pos: usize = 4;
+    for (names) |n| {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(n.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..n.len], n);
+        pos += n.len;
+    }
+    buf[pos] = has_more;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
+    return buf;
+}
+
+/// Serialize walk results in stream list wire format.
+///
+/// Wire format: [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16][cursor]
+///
+/// The stream CLI expects u32 name lengths and a u32 partition_count per entry
+/// (distinct from the generic name-list format used by ts_list).
+fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
+
+    var total: usize = 4; // count: u32
+    for (names) |n| {
+        total += 4 + n.len + 4; // name_len: u32 + name bytes + partition_count: u32
+    }
+    total += 1; // has_more: u8
+    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(names.len), .little);
+    var pos: usize = 4;
+    for (names) |n| {
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(n.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..n.len], n);
+        pos += n.len;
+        // partition_count — default to 1 (single-partition streams)
+        std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+        pos += 4;
+    }
+    buf[pos] = has_more;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
+    return buf;
+}
+
+/// Serialize walk results in KV scan wire format (keys_only mode).
+///
+/// Wire format: [count:u32] ([key_len:u16][key][value_len:u32(=0)])* [has_more:u8] [cursor_len:u16][cursor]
+///
+/// This matches the KV scan response format that the CLI expects, with
+/// value_len=0 for each entry (keys-only walk).
+fn serializeWalkKeysAsScan(allocator: std.mem.Allocator, keys: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
+
+    var total: usize = 4; // count: u32
+    for (keys) |k| {
+        total += 2 + k.len; // key_len: u16 + key bytes
+        total += 4; // value_len: u32 (always 0)
+    }
+    total += 1; // has_more: u8
+    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(keys.len), .little);
+    var pos: usize = 4;
+    for (keys) |k| {
+        // Key
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(k.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..k.len], k);
+        pos += k.len;
+        // Value length = 0 (keys-only)
+        std.mem.writeInt(u32, buf[pos..][0..4], 0, .little);
+        pos += 4;
+    }
+    buf[pos] = has_more;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
+    return buf;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Waiter Callbacks — used by WaiterPool for timeout and resolution
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -759,16 +996,19 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         .stream_read => {
             // Stream blocking read timeout → empty messages response
             shard.sendOkResponse(conn, waiter.request_id, "");
+            shard.flushToClient(waiter.fd);
         },
         .queue_dequeue => {
             // Queue blocking dequeue timeout → empty messages response
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, 0, .little); // count = 0
             shard.sendOkResponse(conn, waiter.request_id, &buf);
+            shard.flushToClient(waiter.fd);
         },
         .worker_await => {
             // Worker await timeout → not_found (no task available)
             shard.sendErrorResponse(conn, waiter.request_id, .not_found, "no task available");
+            shard.flushToClient(waiter.fd);
         },
     }
 }
@@ -810,10 +1050,14 @@ pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 
     const conn = shard.getConnection(waiter.fd) orelse return true;
 
-    // Serialize offset entries
-    const data = stream_handler_mod.serializeOffsetEntriesPub(shard.stream_handler.allocator, entries[0..count]) catch return false;
+    // Compute actual start (readRange clamps to max(start, trim_offset+1))
+    const actual_start = @max(start, partition.stream.trim_offset + 1);
+
+    // Serialize with full message format including payloads
+    const data = shard.stream_handler.serializeMessagesWithPayloads(entries[0..count], actual_start) catch return false;
     defer shard.stream_handler.allocator.free(data);
     shard.sendOkResponse(conn, waiter.request_id, data);
+    shard.flushToClient(waiter.fd);
     return true;
 }
 
@@ -836,19 +1080,35 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
     defer shard.queue_handler.allocator.free(data);
     shard.sendOkResponse(conn, waiter.request_id, data);
+    shard.flushToClient(waiter.fd);
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UAL Persistence Callback
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Called by UAL.append() after every entry write. Feeds the entry to the
+/// SegmentWriter so it's included in the next segment flush to disk.
+/// This is the designed hot → warm flush path (UNIFIED_STORAGE_DESIGN §4.3).
+fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
+    writer.addEntry(entry) catch {};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Segment Replay — recover state from .flseg files on startup
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Replay all .flseg segment files in `dir_path` into the KV projection.
+/// Replay all .flseg segment files in `dir_path` into the partition.
+/// Entries are loaded into the UAL (for payload reads) and applied to projections.
+/// Stream entries additionally rebuild the StreamProjection offset tracking,
+/// since the ProjectionRouter skips stream entries (UAL direct reads by design).
 /// Tracks the maximum entry index seen for LSN restoration.
 fn replaySegments(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
-    kv_proj: *KVProjection,
+    partition: *Partition,
     max_index: *u64,
 ) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
@@ -868,18 +1128,28 @@ fn replaySegments(
         const result = SegmentReader.initFromFile(allocator, full_path) catch continue;
         defer allocator.free(result.buf);
 
-        // Iterate entries and apply to projection
+        // Iterate entries and apply to partition (UAL + projections)
         var offset: usize = 0;
         const data_len = result.reader.data_end - result.reader.data_start;
         while (offset < data_len) {
             const seg_entry = result.reader.readEntryAt(offset) orelse break;
-            const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
 
-            switch (etype) {
-                .kv_put, .kv_delete, .kv_batch => {
-                    kv_proj.applyEntry(&seg_entry) catch {};
-                },
-                else => {},
+            // Apply to UAL + projection router (handles KV, queue, TS routing)
+            const ual_index = partition.apply(&seg_entry) catch {
+                offset += seg_entry.totalSize();
+                continue;
+            };
+
+            // Stream entries: router skips them (.none), so manually rebuild
+            // the StreamProjection offset→ual_index mapping.
+            const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
+            if (etype == .stream_append) {
+                // Extract stream name hash from command payload for per-stream filtering
+                const name_hash = if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd|
+                    std.hash.Wyhash.hash(0, cmd.key)
+                else
+                    0;
+                _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash) catch {};
             }
 
             // Track max index for LSN restoration

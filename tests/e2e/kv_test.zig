@@ -1018,3 +1018,63 @@ test "e2e/kv: blocking get times out when key not set" {
     // Should return (nil) after timeout, not an error
     try testing.expect(result.stdoutContains("(nil)") or result.stderrContains("timed out") or !result.succeeded());
 }
+
+// =============================================================================
+// Multi-Shard Tests
+// =============================================================================
+
+test "e2e/kv: list returns all keys across shards" {
+    // Start server with 4 shards — keys hash to different shards
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    // Write 8 distinctly-named keys. With 4 shards and Wyhash routing,
+    // these are very likely to land on at least 2 different shards.
+    const keys = [_][]const u8{
+        "alpha_cpu",   "bravo_mem",   "charlie_disk", "delta_net",
+        "echo_iops",   "foxtrot_lat", "golf_tput",    "hotel_err",
+    };
+
+    for (keys) |k| {
+        try ctx.exec(&.{ "kv", "set", k, "v" });
+    }
+
+    // kv list should return ALL keys regardless of shard placement
+    var result = try ctx.cli.run(&.{ "kv", "ls" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+
+    // Every key we wrote must appear in the listing
+    for (keys) |k| {
+        try stdx.testing.assertContains(result, k);
+    }
+}
+
+test "e2e/kv: list with prefix returns correct subset across shards" {
+    // Multi-shard prefix scan — walk infrastructure passes filter to each shard.
+    // Each shard applies the prefix filter locally, so all matching keys
+    // are returned regardless of which shard they land on.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    // Write keys with two different prefixes — distributed across shards
+    try ctx.exec(&.{ "kv", "set", "user:alice", "a" });
+    try ctx.exec(&.{ "kv", "set", "user:bob", "b" });
+    try ctx.exec(&.{ "kv", "set", "user:charlie", "c" });
+    try ctx.exec(&.{ "kv", "set", "order:1001", "x" });
+    try ctx.exec(&.{ "kv", "set", "order:1002", "y" });
+
+    // Prefix scan with walk — returns all user: keys from all shards
+    var result = try ctx.cli.run(&.{ "kv", "list", "--prefix", "user:" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "user:alice");
+    try stdx.testing.assertContains(result, "user:bob");
+    try stdx.testing.assertContains(result, "user:charlie");
+}

@@ -25,6 +25,7 @@ const ts_mod = @import("../projection/ts.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const router = @import("../node/router.zig");
 
 const CommandResult = result_mod.CommandResult;
 const TSProjection = ts_mod.TSProjection;
@@ -61,7 +62,7 @@ pub const TSHandler = struct {
         dispatcher.registerWithRoute(.ts_read, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByMeasurement);
-        dispatcher.register(.ts_list, dispatchTS);
+        dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
         dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
     }
@@ -70,7 +71,30 @@ pub const TSHandler = struct {
 
     fn preRouteByMeasurement(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return std.hash.Wyhash.hash(0, req.key);
+        return router.hashKeyWithNamespace(req.namespace, req.key);
+    }
+
+    // ── Shard Walker: Local Scan ──────────────────────────────────────
+
+    /// ShardWalker LocalScanFn for ts_list — scans unique measurement
+    /// names from one shard's TSProjection.
+    ///
+    /// Returns borrowed references to HashMap key storage (zero allocation).
+    /// Safe as long as the projection is not mutated during the walk
+    /// (guaranteed — single-threaded shard).
+    pub fn localScanMeasurements(
+        ctx: *anyopaque,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+        _: u32,
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const ts: *TSProjection = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var name_buf: [1024][]const u8 = undefined;
+        };
+        const count = ts.scanMeasurementNames(&S.name_buf);
+        return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -251,8 +275,15 @@ pub const TSHandler = struct {
     fn handleList(self: *TSHandler, req: Request) CommandResult {
         _ = req;
 
-        const series_count = self.ts.seriesCount();
-        const data = serializeListResult(self.allocator, series_count) catch {
+        const names = self.ts.listMeasurements(self.allocator) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "ts list failed" } };
+        };
+        defer {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
+        }
+
+        const data = serializeListResult(self.allocator, names) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts list serialization failed" } };
         };
 
@@ -279,7 +310,7 @@ pub const TSHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    fn nextUalIndex(self: *TSHandler) u64 {
+    pub fn nextUalIndex(self: *TSHandler) u64 {
         const idx = self.next_ual_index;
         self.next_ual_index += 1;
         return idx;
@@ -418,11 +449,30 @@ fn serializeAggResult(allocator: Allocator, measurement: []const u8, value: ?f64
 }
 
 /// Serialize list result.
-/// Wire format: [count:u32]
-fn serializeListResult(allocator: Allocator, series_count: usize) ![]u8 {
-    const buf = try allocator.alloc(u8, 4);
+/// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16]
+fn serializeListResult(allocator: Allocator, names: []const []const u8) ![]u8 {
+    // Calculate total size
+    var total: usize = 4; // count
+    for (names) |n| {
+        total += 2 + n.len; // name_len + name
+    }
+    total += 1; // has_more
+    total += 2; // cursor_len (0)
+
+    const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
-    std.mem.writeInt(u32, buf[0..4], @intCast(series_count), .little);
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(names.len), .little);
+    var pos: usize = 4;
+    for (names) |n| {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(n.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..n.len], n);
+        pos += n.len;
+    }
+    buf[pos] = 0; // has_more = false
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len = 0
     return buf;
 }
 
@@ -703,6 +753,11 @@ test "ts handler: pre-route by measurement" {
 
     const req_empty = makeRequest(.ts_write, "", "", "");
     try testing.expectEqual(@as(?u64, 0), TSHandler.preRouteByMeasurement(req_empty));
+
+    // Same measurement, different namespace → different hash (namespace isolation)
+    var req_ns = makeRequest(.ts_write, "cpu", "", "");
+    req_ns.namespace = "other";
+    try testing.expect(TSHandler.preRouteByMeasurement(req1) != TSHandler.preRouteByMeasurement(req_ns));
 }
 
 test "ts handler: multiple writes same measurement" {

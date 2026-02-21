@@ -42,6 +42,7 @@ const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
+const router = @import("../node/router.zig");
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -109,30 +110,21 @@ pub const KVHandler = struct {
         dispatcher.registerWithRoute(.kv_get, dispatchGet, preRouteByKey);
         dispatcher.registerWithRoute(.kv_put, dispatchPut, preRouteByKey);
         dispatcher.registerWithRoute(.kv_delete, dispatchDelete, preRouteByKey);
-        dispatcher.registerWithRoute(.kv_scan, dispatchScan, preRouteScan);
+        dispatcher.registerWalk(.kv_scan, dispatchScan, localScanKeys);
         dispatcher.register(.kv_history, dispatchHistory);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
 
     /// Route by key hash — single-partition operations.
+    /// Uses namespace-qualified hash: hash(namespace \0 routing_key)
     fn preRouteByKey(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
         // Check for explicit routing key option
         if (req.findOption(.routing_key)) |opt| {
-            return std.hash.Wyhash.hash(0, opt.asString());
+            return router.hashKeyWithNamespace(req.namespace, opt.asString());
         }
-        return std.hash.Wyhash.hash(0, req.key);
-    }
-
-    /// Scan may be single-partition (prefix) or multi-shard (full scan).
-    fn preRouteScan(req: Request) ?u64 {
-        if (req.key.len > 0) {
-            // Prefix scan — route to the prefix's partition
-            return std.hash.Wyhash.hash(0, req.key);
-        }
-        // Full scan — requires ShardWalker (return null)
-        return null;
+        return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
     // ── Dispatch Wrappers ───────────────────────────────────────────────
@@ -305,6 +297,49 @@ pub const KVHandler = struct {
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
+    // ── Shard Walker: Local Scan ──────────────────────────────────────
+
+    /// ShardWalker LocalScanFn for kv_scan — scans key names from one shard's
+    /// KVProjection. Returns borrowed references (zero allocation).
+    /// Filters reserved keys and strips namespace prefix.
+    /// When filter is non-empty, only returns keys matching the prefix filter.
+    fn localScanKeys(
+        ctx: *anyopaque,
+        namespace: []const u8,
+        filter: []const u8,
+        _: ?[]const u8,
+        _: u32,
+    ) dispatcher_mod.NameWalker.ScanResult {
+        const kv: *KVProjection = @ptrCast(@alignCast(ctx));
+        const S = struct {
+            threadlocal var key_buf: [1024][]const u8 = undefined;
+            threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        };
+
+        // Build scan prefix: namespace prefix + optional filter
+        const ns_prefix = nsPrefix(&S.ns_buf, namespace);
+        var scan_prefix = ns_prefix;
+        if (filter.len > 0 and ns_prefix.len + filter.len <= S.ns_buf.len) {
+            @memcpy(S.ns_buf[ns_prefix.len..][0..filter.len], filter);
+            scan_prefix = S.ns_buf[0 .. ns_prefix.len + filter.len];
+        }
+
+        // Scan qualified key names from projection (filtered by prefix)
+        const raw_count = kv.scanKeyNames(scan_prefix, &S.key_buf);
+
+        // Strip namespace prefix and filter reserved keys in-place
+        var count: usize = 0;
+        for (S.key_buf[0..raw_count]) |key| {
+            const stripped = stripNsPrefix(key, namespace);
+            if (!isReservedKey(stripped)) {
+                S.key_buf[count] = stripped;
+                count += 1;
+            }
+        }
+
+        return .{ .items = S.key_buf[0..count], .next_cursor = null };
+    }
+
     fn dispatchScan(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -364,15 +399,13 @@ pub const KVHandler = struct {
         // Propose through Raft — in single-node mode this commits immediately
         const propose_result = try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
 
-        // Also persist to segment writer for disk durability
-        const entry = entry_mod.buildEntry(entry_type, flags, propose_result.term, propose_result.index, timestamp_ns, payload_buf[0..payload_len]);
-        shard.segment_writer.addEntry(&entry) catch {};
-
         // Broadcast to cluster peers via raft network
         if (shard.raft_network) |rn| {
-            var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
-            if (entry.serialize(&entry_buf)) |serialized_len| {
-                rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+            if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
+                var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
+                if (committed_entry.serialize(&entry_buf)) |serialized_len| {
+                    rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+                }
             }
         }
 
@@ -1202,7 +1235,7 @@ test "kv handler: dispatcher registration" {
     // Verify pre-route hooks
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_get)] != null);
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_put)] != null);
-    try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_scan)] != null);
+    try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_scan)] == null); // walk-only, no pre-route
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_history)] == null); // no routing for history
 
     // 5 handlers registered
@@ -1214,28 +1247,24 @@ test "kv handler: pre-route by key" {
     const req2 = makeRequest(.kv_get, "key1", "", "");
     const req3 = makeRequest(.kv_get, "key2", "", "");
 
-    // Same key → same hash
+    // Same key + same namespace → same hash
     const h1 = KVHandler.preRouteByKey(req1);
     const h2 = KVHandler.preRouteByKey(req2);
     try testing.expectEqual(h1, h2);
 
-    // Different key → different hash (with overwhelming probability)
+    // Different key + same namespace → different hash (with overwhelming probability)
     const h3 = KVHandler.preRouteByKey(req3);
     try testing.expect(h1 != h3);
 
     // Empty key → hash 0
     const req_empty = makeRequest(.kv_get, "", "", "");
     try testing.expectEqual(@as(?u64, 0), KVHandler.preRouteByKey(req_empty));
-}
 
-test "kv handler: pre-route scan" {
-    // Prefix scan → non-null hash
-    const req_prefix = makeRequest(.kv_scan, "prefix", "", "");
-    try testing.expect(KVHandler.preRouteScan(req_prefix) != null);
-
-    // Full scan → null (multi-shard)
-    const req_full = makeRequest(.kv_scan, "", "", "");
-    try testing.expect(KVHandler.preRouteScan(req_full) == null);
+    // Same key, different namespace → different hash (namespace isolation)
+    var req_ns = makeRequest(.kv_get, "key1", "", "");
+    req_ns.namespace = "other";
+    const h_other = KVHandler.preRouteByKey(req_ns);
+    try testing.expect(h1 != h_other);
 }
 
 test "kv handler: history not implemented" {

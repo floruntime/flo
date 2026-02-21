@@ -23,6 +23,7 @@ const Shard = @import("shard.zig").Shard;
 const Acceptor = @import("acceptor.zig").Acceptor;
 const Inbox = @import("inbox.zig").Inbox;
 const InboxMessage = @import("inbox.zig").Message;
+const proto = @import("../protocol/proto.zig");
 const Durability = @import("../engine/interfaces.zig").Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
@@ -114,6 +115,11 @@ pub const Runtime = struct {
     /// Metrics registry for dashboard and Prometheus endpoint.
     metrics_registry: ?*MetricsRegistry,
 
+    /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
+    /// Each entry is a per-shard array of projection pointers for one walk opcode.
+    /// Slots: [0] = ts_list. More slots added as modules gain list support.
+    walk_ctx_slices: [4]?[]*anyopaque,
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         const shard_count = detectShardCount(config.num_shards);
 
@@ -132,6 +138,7 @@ pub const Runtime = struct {
             .dashboard_server = null,
             .dashboard_ctx = null,
             .metrics_registry = null,
+            .walk_ctx_slices = .{ null, null, null, null },
         };
     }
 
@@ -170,6 +177,14 @@ pub const Runtime = struct {
                 if (pipe[1] >= 0) std.posix.close(pipe[1]);
             }
             self.allocator.free(pipes);
+        }
+
+        // Clean up walk context arrays (before shards — dispatchers reference these)
+        for (&self.walk_ctx_slices) |*slot| {
+            if (slot.*) |s| {
+                self.allocator.free(s);
+                slot.* = null;
+            }
         }
 
         // Clean up shards
@@ -241,6 +256,10 @@ pub const Runtime = struct {
         }
         self.shards = shards;
 
+        // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
+        // Each walk opcode gets a slice of per-shard projection pointers.
+        try self.wireWalkContexts(shards);
+
         // 3. Spawn shard threads
         const threads = try self.allocator.alloc(std.Thread, self.shard_count);
         self.shard_threads = threads;
@@ -310,6 +329,49 @@ pub const Runtime = struct {
         }
 
         self.started = true;
+    }
+
+    /// Wire cross-shard walk contexts for all walk-registered opcodes.
+    ///
+    /// For each walk opcode (e.g., ts_list, stream_list, queue_list), builds
+    /// a per-shard array of projection pointers and sets it on every shard's
+    /// dispatcher. This enables `Shard.executeWalk()` to iterate all shards'
+    /// projections for list/scan operations.
+    fn wireWalkContexts(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+
+        // ts_list → each shard's TSProjection
+        const ts_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            ts_ctxs[i] = @ptrCast(&shards[i].defaultPartition().ts);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.ts_list, ts_ctxs);
+        }
+        self.walk_ctx_slices[0] = ts_ctxs;
+
+        // kv_scan (full scan) → each shard's KVProjection
+        const kv_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            kv_ctxs[i] = @ptrCast(&shards[i].defaultPartition().kv);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.kv_scan, kv_ctxs);
+        }
+        self.walk_ctx_slices[1] = kv_ctxs;
+
+        // stream_list → each shard's StreamProjection
+        const stream_ctxs = try self.allocator.alloc(*anyopaque, n);
+        for (0..n) |i| {
+            stream_ctxs[i] = @ptrCast(&shards[i].defaultPartition().stream);
+        }
+        for (0..n) |i| {
+            shards[i].dispatcher.setWalkContexts(proto.OpCode.stream_list, stream_ctxs);
+        }
+        self.walk_ctx_slices[2] = stream_ctxs;
+
+        // Future: queue_list, action_list, workflow_list_definitions
+        // will be wired here when those projections support named-resource listing.
     }
 
     /// Graceful shutdown in reverse order.

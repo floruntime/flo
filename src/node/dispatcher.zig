@@ -40,6 +40,11 @@
 
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
+const shard_walker_mod = @import("shard_walker.zig");
+
+/// ShardWalker specialized for name-list operations (ts_list, stream_list, etc.).
+/// All list/scan walk opcodes return `[]const u8` names.
+pub const NameWalker = shard_walker_mod.ShardWalker([]const u8);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Types
@@ -69,6 +74,16 @@ pub const Dispatcher = struct {
     /// Pre-route hooks — indexed by OpCode (u8).
     pre_route: [256]?PreRouteFn,
 
+    /// ShardWalker local-scan functions — indexed by OpCode (u8).
+    /// Set for opcodes that need cross-shard walking (list/scan).
+    /// Matches `NameWalker.LocalScanFn` signature.
+    walk_fn: [256]?NameWalker.LocalScanFn,
+
+    /// Per-opcode cross-shard walk contexts.
+    /// walk_contexts[opcode] = slice of per-shard *anyopaque (one per shard).
+    /// Set by runtime after all shards are created.
+    walk_contexts: [256]?[]const *anyopaque,
+
     /// Error callback for unknown opcodes.
     on_error: ?ErrorFn,
 
@@ -80,6 +95,8 @@ pub const Dispatcher = struct {
         return .{
             .handlers = [_]?HandlerFn{null} ** 256,
             .pre_route = [_]?PreRouteFn{null} ** 256,
+            .walk_fn = [_]?NameWalker.LocalScanFn{null} ** 256,
+            .walk_contexts = [_]?[]const *anyopaque{null} ** 256,
             .on_error = null,
             .handler_count = 0,
         };
@@ -100,6 +117,43 @@ pub const Dispatcher = struct {
         }
         self.handlers[idx] = handler;
         self.pre_route[idx] = pre_route_fn;
+    }
+
+    /// Register a walk (list/scan) opcode — handler + ShardWalker local-scan function.
+    /// The handler is used as fallback for single-shard mode (walk_contexts not set).
+    /// When walk_contexts are wired, Shard.executeWalk() drives ShardWalker with scan_fn.
+    pub fn registerWalk(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn) void {
+        const idx = @intFromEnum(opcode);
+        if (self.handlers[idx] == null) {
+            self.handler_count += 1;
+        }
+        self.handlers[idx] = handler;
+        self.walk_fn[idx] = scan_fn;
+        // pre_route stays null — walk opcodes have no hash routing
+    }
+
+    /// Register a walk opcode with a pre-route hook for dual-path routing.
+    /// When pre_route returns a hash → single-shard dispatch via handler.
+    /// When pre_route returns null → multi-shard walk via scan_fn.
+    pub fn registerWalkWithRoute(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn, pre_route_fn: PreRouteFn) void {
+        const idx = @intFromEnum(opcode);
+        if (self.handlers[idx] == null) {
+            self.handler_count += 1;
+        }
+        self.handlers[idx] = handler;
+        self.walk_fn[idx] = scan_fn;
+        self.pre_route[idx] = pre_route_fn;
+    }
+
+    /// Set walk contexts for a walk-registered opcode (called by runtime).
+    /// contexts is a slice of per-shard *anyopaque — one projection per shard.
+    pub fn setWalkContexts(self: *Dispatcher, opcode: proto.OpCode, contexts: []const *anyopaque) void {
+        self.walk_contexts[@intFromEnum(opcode)] = contexts;
+    }
+
+    /// Check if an opcode is a walk (list/scan) operation.
+    pub fn isWalkOp(self: *const Dispatcher, op_code: u8) bool {
+        return self.walk_fn[op_code] != null;
     }
 
     /// Register a handler for a contiguous range of opcode values [lo, hi] inclusive.
@@ -148,6 +202,8 @@ pub const Dispatcher = struct {
         if (self.handlers[idx] != null) {
             self.handlers[idx] = null;
             self.pre_route[idx] = null;
+            self.walk_fn[idx] = null;
+            self.walk_contexts[idx] = null;
             self.handler_count -= 1;
         }
     }

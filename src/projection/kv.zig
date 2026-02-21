@@ -251,6 +251,30 @@ pub const KVProjection = struct {
         return count_written;
     }
 
+    /// Scan key names only (zero-allocation). Returns borrowed references
+    /// to HashMap key storage. Filters tombstones and expired entries.
+    /// Applies optional prefix matching. Caller must not mutate the
+    /// projection while references are alive (guaranteed by single-threaded shard).
+    pub fn scanKeyNames(self: *KVProjection, prefix: []const u8, out: [][]const u8) usize {
+        self.stats.scans += 1;
+        const now = std.time.nanoTimestamp();
+        var n_found: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (n_found >= out.len) break;
+            const entry = kv.value_ptr;
+            if (entry.tombstone) continue;
+            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue;
+            if (prefix.len > 0) {
+                if (entry.key.len < prefix.len or
+                    !std.mem.eql(u8, entry.key[0..prefix.len], prefix)) continue;
+            }
+            out[n_found] = entry.key;
+            n_found += 1;
+        }
+        return n_found;
+    }
+
     /// Remove all entries whose key starts with `prefix`.
     /// Used for namespace force-delete: pass "namespace\x00" to clear all keys in that namespace.
     /// Returns the number of entries removed.
