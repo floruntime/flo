@@ -360,11 +360,15 @@ fn isValidActionOrPlanReference(target: []const u8) bool {
     // Valid formats:
     // @actions/<name>
     // @plan/<name>
+    // @workflow/<name> or @workflow/<name>:<version>
     if (mem.startsWith(u8, target, "@actions/")) {
         return target.len > "@actions/".len;
     }
     if (mem.startsWith(u8, target, "@plan/")) {
         return target.len > "@plan/".len;
+    }
+    if (mem.startsWith(u8, target, "@workflow/")) {
+        return target.len > "@workflow/".len;
     }
     return false;
 }
@@ -611,11 +615,13 @@ test "validateWorkflow: valid workflow" {
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
+        .plans = &.{},
         .start = .{
             .run = .{
                 .target = "@actions/validate",
                 .input_mapping = null,
                 .retry = null,
+                .poll = null,
                 .transitions = &.{
                     .{ .outcome = "success", .target = "process" },
                     .{ .outcome = "failure", .target = "flo.Failed" },
@@ -630,6 +636,7 @@ test "validateWorkflow: valid workflow" {
                         .target = "@plan/processing",
                         .input_mapping = null,
                         .retry = null,
+                        .poll = null,
                         .transitions = &.{
                             .{ .outcome = "success", .target = "flo.Completed" },
                             .{ .outcome = "failure", .target = "flo.Failed" },
@@ -657,11 +664,13 @@ test "validateWorkflow: missing name" {
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
+        .plans = &.{},
         .start = .{
             .run = .{
                 .target = "@actions/test",
                 .input_mapping = null,
                 .retry = null,
+                .poll = null,
                 .transitions = &.{
                     .{ .outcome = "success", .target = "flo.Completed" },
                 },
@@ -687,11 +696,13 @@ test "validateWorkflow: invalid transition target" {
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
+        .plans = &.{},
         .start = .{
             .run = .{
                 .target = "@actions/test",
                 .input_mapping = null,
                 .retry = null,
+                .poll = null,
                 .transitions = &.{
                     .{ .outcome = "success", .target = "nonexistent_step" },
                 },
@@ -725,11 +736,13 @@ test "validateWorkflow: invalid action reference" {
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
+        .plans = &.{},
         .start = .{
             .run = .{
                 .target = "invalid-reference", // Missing @actions/ or @plan/ prefix
                 .input_mapping = null,
                 .retry = null,
+                .poll = null,
                 .transitions = &.{
                     .{ .outcome = "success", .target = "flo.Completed" },
                 },
@@ -763,11 +776,13 @@ test "validateWorkflow: unreachable step warning" {
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
+        .plans = &.{},
         .start = .{
             .run = .{
                 .target = "@actions/test",
                 .input_mapping = null,
                 .retry = null,
+                .poll = null,
                 .transitions = &.{
                     .{ .outcome = "success", .target = "flo.Completed" },
                 },
@@ -781,6 +796,7 @@ test "validateWorkflow: unreachable step warning" {
                         .target = "@actions/orphan",
                         .input_mapping = null,
                         .retry = null,
+                        .poll = null,
                         .transitions = &.{
                             .{ .outcome = "success", .target = "flo.Completed" },
                         },

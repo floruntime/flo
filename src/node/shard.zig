@@ -52,6 +52,7 @@ const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
+const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
 const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
@@ -140,6 +141,9 @@ pub const Shard = struct {
     /// Actions handler instance.
     actions_handler: *ActionsHandler,
 
+    /// Workflow handler instance.
+    workflow_handler: *WorkflowHandler,
+
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
 
@@ -216,6 +220,12 @@ pub const Shard = struct {
         errdefer allocator.destroy(actions_handler);
         actions_handler.* = ActionsHandler.init(allocator);
 
+        // Create Workflow handler
+        const workflow_handler = try allocator.create(WorkflowHandler);
+        errdefer allocator.destroy(workflow_handler);
+        workflow_handler.* = WorkflowHandler.init(allocator);
+
+
         // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);
         errdefer allocator.destroy(seg_writer);
@@ -264,6 +274,7 @@ pub const Shard = struct {
         TSHandler.register(&dispatcher);
         NamespaceHandler.register(&dispatcher);
         ActionsHandler.register(&dispatcher);
+        WorkflowHandler.register(&dispatcher);
 
         // Register ping handler
         dispatcher.register(.ping, handlePing);
@@ -290,6 +301,7 @@ pub const Shard = struct {
             .ts_handler = ts_handler,
             .namespace_handler = namespace_handler,
             .actions_handler = actions_handler,
+            .workflow_handler = workflow_handler,
             .raft_node = raft_node,
             .segment_writer = seg_writer,
             .shard_data_dir = shard_data_dir,
@@ -347,6 +359,8 @@ pub const Shard = struct {
         self.allocator.destroy(self.namespace_handler);
         self.actions_handler.deinit();
         self.allocator.destroy(self.actions_handler);
+        self.workflow_handler.deinit();
+        self.allocator.destroy(self.workflow_handler);
 
         self.inbox.deinit();
         self.slab.deinit();
