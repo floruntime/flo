@@ -75,6 +75,7 @@ test {
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");
+    _ = @import("processing/handler.zig");
 }
 
 // Dashboard — Phase 6.1
