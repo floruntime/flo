@@ -39,6 +39,9 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
+const network_mode = @import("../raft/network.zig");
+const ns_keys = @import("../namespace/handler.zig");
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -47,28 +50,19 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
-const entry_mod = @import("../storage/ual/entry.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
-const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const RaftNetwork = network_mode.RaftNetwork;
 
 /// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
 const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
 
-/// Max namespace-qualified key: namespace(128) + '\x00' + key(up to 64K).
-const MAX_QUALIFIED_KEY = 256;
-
-/// Build a namespace-qualified internal key: "<namespace>\x00<key>".
-/// For empty or "default" namespace, returns the raw key (no prefix).
-/// This ensures keys in different namespaces cannot collide.
-fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) []const u8 {
-    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
-    if (ns.len + 1 + raw_key.len > MAX_QUALIFIED_KEY) return raw_key;
-    @memcpy(buf[0..ns.len], ns);
-    buf[ns.len] = 0; // null separator
-    @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
-    return buf[0 .. ns.len + 1 + raw_key.len];
-}
+/// Re-export from centralized namespace module for local convenience.
+const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
+const qualifyKey = ns_keys.qualifyKey;
+const validateKeySize = ns_keys.validateKeySize;
+const stripNsPrefix = ns_keys.stripPrefix;
+const nsPrefix = ns_keys.namespacePrefix;
 
 /// Reserved key prefixes — operations on these are blocked for user requests.
 const RESERVED_PREFIXES = [_][]const u8{
@@ -150,9 +144,18 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
+        // Upfront key size validation — give the user a clear error before any business logic
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+
         // Namespace-qualify the key for projection lookup
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
 
         // Check for blocking options before normal GET.
         // Wire mapping (from CLI client):
@@ -206,9 +209,18 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
+        // Upfront key size validation — give the user a clear error before any business logic
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+
         // Namespace-qualify the key
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
 
         // Validate the request before proposing (uses qualified key)
         const validation = shard.kv_handler.*.validatePutQ(req, qkey);
@@ -247,9 +259,18 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
+        // Upfront key size validation — give the user a clear error before any business logic
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+
         // Namespace-qualify the key
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
 
         // Validate the request
         const validation = shard.kv_handler.*.validateDelete(req);
@@ -406,7 +427,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection lookup
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         const entry = self.kv.get(qkey) orelse return .kv_not_found;
         return .{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
@@ -426,7 +448,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection operations
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         // CAS check (qualified key)
         if (req.getCasVersion()) |expected_version| {
@@ -476,7 +499,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection operations
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
@@ -549,26 +573,20 @@ pub const KVHandler = struct {
         const limit = req.getLimit() orelse DEFAULT_SCAN_LIMIT;
         const capped_limit = @min(limit, MAX_SCAN_LIMIT);
 
-        // Namespace-qualify prefix for scanning
+        // Namespace-qualify prefix for scanning using centralized namespace utilities.
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const ns = req.namespace;
-        const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
 
         // Build qualified scan prefix:
         //   - If namespace + user prefix: "ns\0prefix"
         //   - If namespace + no prefix: "ns\0" (scan all in namespace)
         //   - If no namespace + user prefix: "prefix"
         //   - If no namespace + no prefix: full scan
-        const scan_prefix: []const u8 = if (has_ns) blk: {
-            if (req.key.len > 0) {
-                break :blk qualifyKey(&qbuf, ns, req.key);
-            } else {
-                // Scan all keys in this namespace — prefix is "ns\0"
-                @memcpy(qbuf[0..ns.len], ns);
-                qbuf[ns.len] = 0;
-                break :blk qbuf[0 .. ns.len + 1];
-            }
-        } else req.key;
+        const scan_prefix: []const u8 = if (req.key.len > 0)
+            qualifyKey(&qbuf, ns, req.key) catch
+                return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } }
+        else
+            nsPrefix(&qbuf, ns);
 
         // Allocate scan buffer on stack
         var scan_buf: [MAX_SCAN_LIMIT]ScanEntry = undefined;
@@ -581,14 +599,11 @@ pub const KVHandler = struct {
             self.kv.scan(out);
 
         // Filter out reserved keys and strip namespace prefix from results
-        const ns_prefix_len: usize = if (has_ns) ns.len + 1 else 0;
         var filtered_count: usize = 0;
         for (out[0..found_count]) |entry| {
             if (!isReservedKey(entry.key)) {
                 var stripped = entry;
-                if (ns_prefix_len > 0 and entry.key.len > ns_prefix_len) {
-                    stripped.key = entry.key[ns_prefix_len..];
-                }
+                stripped.key = stripNsPrefix(entry.key, ns);
                 scan_buf[filtered_count] = stripped;
                 filtered_count += 1;
             }

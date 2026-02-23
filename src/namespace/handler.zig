@@ -14,6 +14,28 @@
 //! - All mutations go through Controller Raft on Shard 0 (when wired).
 //! - No pre-route hooks — all namespace commands route to controller.
 //! - Reserved namespaces (`_sys`, `_internal`, `_flo`) cannot be created/deleted.
+//!
+//! ## Namespace Key Utilities (public API for all subsystems)
+//!
+//! All subsystems (KV, Stream, Queue, Actions, TS, Processing, Workflow) should
+//! use the public key utilities below for namespace isolation:
+//!
+//! ```zig
+//! const ns = @import("../namespace/handler.zig");
+//!
+//! // Validate key size early (returns error message or null if valid)
+//! if (ns.validateKeySize(req.namespace, req.key)) |msg| return error(msg);
+//!
+//! // Build namespace-qualified key: "myapp\x00mykey"
+//! var qbuf: [ns.MAX_QUALIFIED_KEY]u8 = undefined;
+//! const qkey = try ns.qualifyKey(&qbuf, req.namespace, req.key);
+//!
+//! // Strip prefix for display (scan results, error messages)
+//! const display_key = ns.stripPrefix(stored_key, req.namespace);
+//!
+//! // Build prefix for scanning all keys in a namespace
+//! const prefix = ns.namespacePrefix(&qbuf, req.namespace);
+//! ```
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,6 +53,103 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Namespace Key Utilities — public API for all subsystems
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Maximum length of a namespace name (alphanumeric + _-. only).
+pub const MAX_NAMESPACE_LEN: usize = 128;
+
+/// Maximum length of a namespace-qualified key (namespace + '\x00' + raw key).
+/// Sized as a practical stack-friendly limit: 128 (max namespace) + 1 (separator)
+/// + ~3967 bytes for the raw key portion = 4096 bytes total.
+///
+/// The wire protocol allows u16 keys (65535 bytes) but keys beyond 4KB are
+/// pathological — they bloat Raft log entries, dominate stack frames, and
+/// degrade hash table performance. All subsystems should validate against
+/// `MAX_KEY_LENGTH` at the dispatch layer.
+pub const MAX_QUALIFIED_KEY: usize = 4096;
+
+/// Maximum raw key length that a user can create (accounting for namespace
+/// prefix overhead). This is the limit to validate at key creation time so
+/// users get a clear error before data is stored.
+pub const MAX_KEY_LENGTH: usize = MAX_QUALIFIED_KEY - MAX_NAMESPACE_LEN - 1; // 3967
+
+/// Null byte separator between namespace and key in qualified keys.
+/// Chosen because namespace names are restricted to alphanumeric + _-. characters,
+/// so '\x00' can never appear in a valid namespace name.
+pub const NAMESPACE_SEPARATOR: u8 = 0;
+
+/// Build a namespace-qualified internal key: `"<namespace>\x00<key>"`.
+///
+/// For empty or "default" namespace, returns the raw key unchanged (no prefix).
+/// This is the canonical function — all subsystems should use this for
+/// namespace isolation rather than implementing their own qualification.
+///
+/// Returns `error.KeyTooLarge` if the combined length exceeds the buffer.
+///
+/// Lifetime: the returned slice borrows from `buf` (when prefixed) or from
+/// `raw_key` (when no prefix). Safe for synchronous operations, waiter
+/// registration (pool copies to inline buffer), and Raft propose (serializes
+/// immediately).
+pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) error{KeyTooLarge}![]const u8 {
+    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
+    const total = ns.len + 1 + raw_key.len;
+    if (total > MAX_QUALIFIED_KEY) return error.KeyTooLarge;
+    @memcpy(buf[0..ns.len], ns);
+    buf[ns.len] = NAMESPACE_SEPARATOR;
+    @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
+    return buf[0..total];
+}
+
+/// Strip namespace prefix from a qualified key for display to the user.
+///
+/// Given a stored key like `"myapp\x00mykey"` and namespace `"myapp"`, returns
+/// `"mykey"`. If the key doesn't have the expected prefix (wrong namespace,
+/// default namespace, or malformed), returns the key unchanged.
+pub fn stripPrefix(qualified: []const u8, ns: []const u8) []const u8 {
+    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return qualified;
+    const prefix_len = ns.len + 1;
+    if (qualified.len > prefix_len and
+        qualified[ns.len] == NAMESPACE_SEPARATOR and
+        std.mem.eql(u8, qualified[0..ns.len], ns))
+    {
+        return qualified[prefix_len..];
+    }
+    return qualified;
+}
+
+/// Build the namespace prefix for scanning all keys belonging to a namespace.
+///
+/// Returns `"ns\x00"` for non-default namespaces (use as a `scanPrefix` argument),
+/// or an empty slice for the default namespace (full scan).
+pub fn namespacePrefix(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8) []const u8 {
+    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return &.{};
+    @memcpy(buf[0..ns.len], ns);
+    buf[ns.len] = NAMESPACE_SEPARATOR;
+    return buf[0 .. ns.len + 1];
+}
+
+/// Validate that a key + namespace combination will fit within limits.
+///
+/// Call this at the dispatch layer (before any business logic) to give users
+/// a clear error message upfront rather than a confusing qualification failure
+/// deep in the handler.
+///
+/// Returns an error message string if invalid, or `null` if the key is valid.
+pub fn validateKeySize(ns: []const u8, key: []const u8) ?[]const u8 {
+    if (key.len == 0) return "key is required";
+    const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
+    if (has_ns) {
+        if (ns.len + 1 + key.len > MAX_QUALIFIED_KEY)
+            return "key too large for namespace (max 3967 bytes with namespace prefix)";
+    } else {
+        if (key.len > MAX_QUALIFIED_KEY)
+            return "key too large (max 4096 bytes)";
+    }
+    return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // NamespaceHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -41,7 +160,6 @@ pub const NamespaceHandler = struct {
     /// Will be replaced by Controller Raft storage when wired.
     namespaces: std.StringHashMap(NamespaceMeta),
 
-    const MAX_NAMESPACE_LEN: usize = 128;
     const MAX_NAMESPACES: usize = 1024;
 
     const reserved_prefixes = [_][]const u8{
@@ -728,4 +846,82 @@ test "namespace handler: freeResult non-allocated is no-op" {
     handler.freeResult(.{ .err = .{ .code = .invalid_request, .message = "test" } });
     handler.freeResult(.{ .namespace_created = {} });
     handler.freeResult(.{ .namespace_deleted = {} });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Namespace Key Utilities — Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "qualifyKey: default namespace returns raw key" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const raw = "mykey";
+    try testing.expectEqualStrings(raw, try qualifyKey(&buf, "", raw));
+    try testing.expectEqualStrings(raw, try qualifyKey(&buf, "default", raw));
+}
+
+test "qualifyKey: non-default namespace prefixes correctly" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const result = try qualifyKey(&buf, "myapp", "mykey");
+    try testing.expectEqual(@as(usize, 11), result.len); // "myapp" + \0 + "mykey"
+    try testing.expectEqualStrings("myapp", result[0..5]);
+    try testing.expectEqual(@as(u8, 0), result[5]);
+    try testing.expectEqualStrings("mykey", result[6..]);
+}
+
+test "qualifyKey: oversized key returns KeyTooLarge" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const big_key = &[_]u8{'x'} ** (MAX_QUALIFIED_KEY); // exactly fills buffer
+    const result = qualifyKey(&buf, "ns", big_key);
+    try testing.expectError(error.KeyTooLarge, result);
+}
+
+test "stripPrefix: removes namespace prefix" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const qualified = try qualifyKey(&buf, "myapp", "mykey");
+    try testing.expectEqualStrings("mykey", stripPrefix(qualified, "myapp"));
+}
+
+test "stripPrefix: default namespace is no-op" {
+    try testing.expectEqualStrings("mykey", stripPrefix("mykey", ""));
+    try testing.expectEqualStrings("mykey", stripPrefix("mykey", "default"));
+}
+
+test "stripPrefix: wrong namespace returns key unchanged" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const qualified = try qualifyKey(&buf, "myapp", "mykey");
+    try testing.expectEqualStrings(qualified, stripPrefix(qualified, "other"));
+}
+
+test "namespacePrefix: default returns empty" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), namespacePrefix(&buf, "").len);
+    try testing.expectEqual(@as(usize, 0), namespacePrefix(&buf, "default").len);
+}
+
+test "namespacePrefix: non-default returns ns plus separator" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const prefix = namespacePrefix(&buf, "prod");
+    try testing.expectEqual(@as(usize, 5), prefix.len);
+    try testing.expectEqualStrings("prod", prefix[0..4]);
+    try testing.expectEqual(@as(u8, 0), prefix[4]);
+}
+
+test "validateKeySize: valid keys" {
+    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("myapp", "mykey"));
+    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("", "mykey"));
+    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("default", "mykey"));
+}
+
+test "validateKeySize: empty key" {
+    try testing.expect(validateKeySize("myapp", "") != null);
+}
+
+test "validateKeySize: oversized key with namespace" {
+    const big = &[_]u8{'x'} ** MAX_QUALIFIED_KEY;
+    try testing.expect(validateKeySize("ns", big) != null);
+}
+
+test "validateKeySize: oversized key without namespace" {
+    const big = &[_]u8{'x'} ** (MAX_QUALIFIED_KEY + 1);
+    try testing.expect(validateKeySize("", big) != null);
 }
