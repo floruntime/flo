@@ -67,6 +67,7 @@ const Waiter = waiter_pool_mod.Waiter;
 const WaiterKind = waiter_pool_mod.WaiterKind;
 const stream_handler_mod = @import("../stream/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
+const Partition = @import("../storage/partition.zig").Partition;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -115,26 +116,20 @@ pub const Shard = struct {
     /// Total inbox messages processed (stats).
     inbox_messages_processed: u64,
 
-    /// KV projection (heap-allocated, stable pointer).
-    kv_projection: *KVProjection,
+    /// Partitions owned by this shard (heap-allocated, stable pointers).
+    /// Each Partition owns a UAL, ProjectionRouter, and all four projections.
+    /// Currently 1 partition per shard; will scale to N later.
+    partitions: []*Partition,
+    num_partitions: u32,
 
     /// KV handler instance (heap-allocated, stable pointer).
     kv_handler: *KVHandler,
 
-    /// Stream projection.
-    stream_projection: *StreamProjection,
-
     /// Stream handler instance.
     stream_handler: *StreamHandler,
 
-    /// Queue projection.
-    queue_projection: *QueueProjection,
-
     /// Queue handler instance.
     queue_handler: *QueueHandler,
-
-    /// TS projection.
-    ts_projection: *TSProjection,
 
     /// TS handler instance.
     ts_handler: *TSHandler,
@@ -144,9 +139,6 @@ pub const Shard = struct {
 
     /// Actions handler instance.
     actions_handler: *ActionsHandler,
-
-    /// Unified Append Log — hot ring buffer for recent entries.
-    ual: *UAL,
 
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
@@ -185,43 +177,34 @@ pub const Shard = struct {
         var inbox = try Inbox.init(allocator, 1024);
         errdefer inbox.deinit();
 
-        // Create KV projection (0 = unlimited memory for now)
-        const kv_proj = try allocator.create(KVProjection);
-        errdefer allocator.destroy(kv_proj);
-        kv_proj.* = KVProjection.init(allocator, 0);
-        errdefer kv_proj.deinit();
+        // Create the default partition (1 per shard for now).
+        // The partition owns UAL + ProjectionRouter + all four projections.
+        const partitions = try allocator.alloc(*Partition, 1);
+        errdefer allocator.free(partitions);
 
-        // Create KV handler
+        const partition = try allocator.create(Partition);
+        errdefer allocator.destroy(partition);
+        partition.* = try Partition.init(allocator, @as(u32, shard_id), Partition.DEFAULT_UAL_CAPACITY);
+        errdefer partition.deinit();
+        partition.wireProjections();
+        partitions[0] = partition;
+
+        // Create handlers pointing at the default partition's projections
         const kv_handler = try allocator.create(KVHandler);
         errdefer allocator.destroy(kv_handler);
-        kv_handler.* = KVHandler.init(allocator, kv_proj);
-
-        // Create Stream projection + handler
-        const stream_proj = try allocator.create(StreamProjection);
-        errdefer allocator.destroy(stream_proj);
-        stream_proj.* = StreamProjection.init(allocator);
+        kv_handler.* = KVHandler.init(allocator, &partition.kv);
 
         const stream_handler = try allocator.create(StreamHandler);
         errdefer allocator.destroy(stream_handler);
-        stream_handler.* = StreamHandler.init(allocator, stream_proj);
-
-        // Create Queue projection + handler
-        const queue_proj = try allocator.create(QueueProjection);
-        errdefer allocator.destroy(queue_proj);
-        queue_proj.* = QueueProjection.init(allocator, .{});
+        stream_handler.* = StreamHandler.init(allocator, &partition.stream);
 
         const queue_handler = try allocator.create(QueueHandler);
         errdefer allocator.destroy(queue_handler);
-        queue_handler.* = QueueHandler.init(allocator, queue_proj);
-
-        // Create TS projection + handler
-        const ts_proj = try allocator.create(TSProjection);
-        errdefer allocator.destroy(ts_proj);
-        ts_proj.* = TSProjection.init(allocator, .{});
+        queue_handler.* = QueueHandler.init(allocator, &partition.queue);
 
         const ts_handler = try allocator.create(TSHandler);
         errdefer allocator.destroy(ts_handler);
-        ts_handler.* = TSHandler.init(allocator, ts_proj);
+        ts_handler.* = TSHandler.init(allocator, &partition.ts);
 
         // Create Namespace handler (no projection needed)
         const namespace_handler = try allocator.create(NamespaceHandler);
@@ -233,12 +216,7 @@ pub const Shard = struct {
         errdefer allocator.destroy(actions_handler);
         actions_handler.* = ActionsHandler.init(allocator);
 
-        // Create UAL (hot ring buffer) and SegmentWriter (persistence)
-        const ual = try allocator.create(UAL);
-        errdefer allocator.destroy(ual);
-        ual.* = try UAL.init(allocator, ual_mod.DEFAULT_CAPACITY);
-        errdefer ual.deinit();
-
+        // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);
         errdefer allocator.destroy(seg_writer);
         seg_writer.* = SegmentWriter.init(allocator, @as(u32, shard_id), .none);
@@ -263,9 +241,9 @@ pub const Shard = struct {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // Replay existing segment files into KV projection
+            // Replay existing segment files into partition's KV projection
             var max_index: u64 = 0;
-            replaySegments(allocator, shard_dir, kv_proj, &max_index);
+            replaySegments(allocator, shard_dir, &partition.kv, &max_index);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -304,17 +282,14 @@ pub const Shard = struct {
             .next_conn_id = 1,
             .requests_dispatched = 0,
             .inbox_messages_processed = 0,
-            .kv_projection = kv_proj,
+            .partitions = partitions,
+            .num_partitions = 1,
             .kv_handler = kv_handler,
-            .stream_projection = stream_proj,
             .stream_handler = stream_handler,
-            .queue_projection = queue_proj,
             .queue_handler = queue_handler,
-            .ts_projection = ts_proj,
             .ts_handler = ts_handler,
             .namespace_handler = namespace_handler,
             .actions_handler = actions_handler,
-            .ual = ual,
             .raft_node = raft_node,
             .segment_writer = seg_writer,
             .shard_data_dir = shard_data_dir,
@@ -342,39 +317,30 @@ pub const Shard = struct {
             }
         }
 
-        // Clean up UAL and SegmentWriter
+        // Clean up SegmentWriter
         self.segment_writer.deinit();
         self.allocator.destroy(self.segment_writer);
-        self.ual.deinit();
-        self.allocator.destroy(self.ual);
 
         if (self.shard_data_dir) |dir| {
             self.allocator.free(dir);
         }
 
-        // Clean up KV resources
-        self.kv_projection.deinit();
+        // Clean up handlers (they don't own projections — partitions do)
         self.allocator.destroy(self.kv_handler);
+        self.allocator.destroy(self.stream_handler);
+        self.allocator.destroy(self.queue_handler);
+        self.allocator.destroy(self.ts_handler);
 
         // Clean up Raft consensus node
         self.raft_node.deinit();
         self.allocator.destroy(self.raft_node);
-        self.allocator.destroy(self.kv_projection);
 
-        // Clean up Stream resources
-        self.stream_projection.deinit();
-        self.allocator.destroy(self.stream_handler);
-        self.allocator.destroy(self.stream_projection);
-
-        // Clean up Queue resources
-        self.queue_projection.deinit();
-        self.allocator.destroy(self.queue_handler);
-        self.allocator.destroy(self.queue_projection);
-
-        // Clean up TS resources
-        self.ts_projection.deinit();
-        self.allocator.destroy(self.ts_handler);
-        self.allocator.destroy(self.ts_projection);
+        // Clean up partitions (each owns UAL + all projections)
+        for (self.partitions) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
+        self.allocator.free(self.partitions);
 
         // Clean up Namespace and Actions handlers
         self.namespace_handler.deinit();
@@ -385,6 +351,22 @@ pub const Shard = struct {
         self.inbox.deinit();
         self.slab.deinit();
         self.reactor.deinit();
+    }
+
+    // ─── Partition access ────────────────────────────────────────────────
+
+    /// Get the default (first) partition.
+    /// Currently each shard has exactly 1 partition.
+    pub fn defaultPartition(self: *Shard) *Partition {
+        return self.partitions[0];
+    }
+
+    /// Get a partition by partition_id.
+    /// For now, all partition_ids map to the single default partition.
+    /// When multi-partition is enabled, this will index into the array.
+    pub fn getPartition(self: *Shard, partition_id: u32) *Partition {
+        _ = partition_id;
+        return self.partitions[0];
     }
 
     // ─── Connection management ───────────────────────────────────────────
@@ -465,8 +447,8 @@ pub const Shard = struct {
                         const payload = data[0..len];
                         // Try to deserialize as a UAL entry
                         if (entry_mod.Entry.deserialize(payload)) |entry| {
-                            // Apply to KV projection (idempotent)
-                            self.kv_projection.applyEntry(&entry) catch {};
+                            // Apply to partition projections (idempotent)
+                            self.defaultPartition().kv.applyEntry(&entry) catch {};
                         }
                         // Free the duplicated payload
                         self.allocator.free(payload);
@@ -771,7 +753,7 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
 /// if version > min_version. Returns true if waiter was satisfied.
 pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const entry = shard.kv_projection.get(waiter.key()) orelse return false;
+    const entry = shard.defaultPartition().kv.get(waiter.key()) orelse return false;
     if (entry.lsn <= waiter.min_version) return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone, remove waiter
@@ -790,16 +772,16 @@ pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 /// Returns true if there are new messages to send.
 pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const stream_proj = shard.stream_projection;
+    const partition = shard.defaultPartition();
 
-    const hwm = stream_proj.highWaterMark();
+    const hwm = partition.stream.highWaterMark();
     if (hwm <= waiter.min_version) return false; // no new messages
 
     // Read from (min_version+1) to hwm
     const start = waiter.min_version + 1;
     const end = start + 100; // cap batch size
     var entries: [100]@import("../projection/stream.zig").OffsetEntry = undefined;
-    const count = stream_proj.readRange(start, end, &entries);
+    const count = partition.stream.readRange(start, end, &entries);
     if (count == 0) return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true;
@@ -815,12 +797,12 @@ pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 /// Returns true if a message was available and sent.
 pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const queue_proj = shard.queue_projection;
+    const partition = shard.defaultPartition();
 
     const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-    queue_proj.expireLeases(now_ns);
+    partition.queue.expireLeases(now_ns);
 
-    const maybe_result = queue_proj.dequeue(now_ns) catch return false;
+    const maybe_result = partition.queue.dequeue(now_ns) catch return false;
     const deq_result = maybe_result orelse return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true;

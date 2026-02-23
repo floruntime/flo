@@ -341,7 +341,7 @@ pub const KVHandler = struct {
             const next_idx = raft.last_applied + 1;
             // Grab Entry from RaftLog (may have payload on stack — getEntry borrows from UAL ring)
             if (raft.log.getEntry(next_idx)) |e| {
-                shard.kv_projection.applyEntry(&e) catch {};
+                shard.defaultPartition().kv.applyEntry(&e) catch {};
                 raft.last_applied = next_idx;
             } else {
                 // Entry evicted from ring — still advance last_applied to avoid stall

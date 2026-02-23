@@ -155,7 +155,7 @@ pub const StreamHandler = struct {
             }
 
             // Register waiter with stream's current high water mark
-            const hwm = shard.stream_projection.highWaterMark();
+            const hwm = shard.defaultPartition().stream.highWaterMark();
             _ = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
