@@ -97,6 +97,16 @@ pub const StreamHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
+
+        // Track namespace data for stream create operations
+        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        if (op == .stream_create) {
+            switch (cmd_result) {
+                .ok => shard.namespace_handler.markNamespaceHasData(req.namespace),
+                else => {},
+            }
+        }
+
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -107,9 +117,10 @@ pub const StreamHandler = struct {
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
 
-        // After a successful append, notify any blocking read waiters
+        // After a successful append, notify any blocking read waiters and track namespace data
         switch (cmd_result) {
             .stream_append_ok => {
+                shard.namespace_handler.markNamespaceHasData(req.namespace);
                 if (req.key.len > 0) {
                     shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
                 }

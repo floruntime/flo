@@ -75,11 +75,23 @@ pub const NamespaceHandler = struct {
     // ── Namespace Data Tracking ─────────────────────────────────────────
 
     /// Mark a namespace as having data written to it.
-    /// Called by KV/Stream/Queue handlers when writing with a non-default namespace.
+    /// Called by KV/Stream/Queue handlers after successful writes.
+    /// Auto-creates the "default" namespace entry when called with empty or "default" name.
     pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8) void {
-        if (name.len == 0 or std.mem.eql(u8, name, "default")) return;
-        if (self.namespaces.getPtr(name)) |meta| {
+        const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
+        if (self.namespaces.getPtr(effective)) |meta| {
             meta.data_count +|= 1; // saturating add
+        } else {
+            // Auto-create namespace entry (e.g., "default" on first bare-namespace write)
+            const key = self.allocator.dupe(u8, effective) catch return;
+            const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+            self.namespaces.put(key, .{
+                .created_at_ns = timestamp,
+                .data_count = 1,
+            }) catch {
+                self.allocator.free(key);
+                return;
+            };
         }
     }
 
@@ -105,6 +117,33 @@ pub const NamespaceHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.namespace_handler.handleCommand(req);
+
+        // On force-delete, clean up all projection data for this namespace
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        if (op == .namespace_delete) {
+            switch (result) {
+                .namespace_deleted => {
+                    // Check force flag (byte in value field)
+                    const is_force = req.value.len > 0 and req.value[0] != 0;
+                    if (is_force) {
+                        // Clear KV entries with namespace prefix
+                        const ns = req.key;
+                        if (ns.len > 0) {
+                            var prefix_buf: [256]u8 = undefined;
+                            @memcpy(prefix_buf[0..ns.len], ns);
+                            prefix_buf[ns.len] = 0; // null separator
+                            const prefix = prefix_buf[0 .. ns.len + 1];
+                            _ = shard.defaultPartition().kv.clearByPrefix(prefix);
+                        }
+                        // Reset stream and queue projections
+                        shard.defaultPartition().stream.reset();
+                        shard.defaultPartition().queue.reset();
+                    }
+                },
+                else => {},
+            }
+        }
+
         defer shard.namespace_handler.freeResult(result);
         sendNamespaceResponse(shard, conn, req.header.request_id, result);
     }
@@ -142,7 +181,7 @@ pub const NamespaceHandler = struct {
 
         // Check if already exists
         if (self.namespaces.contains(name)) {
-            return .{ .namespace_created = {} };
+            return .{ .err = .{ .code = .already_exists, .message = "namespace already exists" } };
         }
 
         // Check capacity
@@ -412,7 +451,7 @@ test "namespace handler: create" {
     try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
 }
 
-test "namespace handler: create idempotent" {
+test "namespace handler: create duplicate fails" {
     const allocator = testing.allocator;
     var handler = NamespaceHandler.init(allocator);
     defer handler.deinit();
@@ -420,7 +459,7 @@ test "namespace handler: create idempotent" {
     _ = handler.handleCommand(makeRequest(.namespace_create, "test-ns", ""));
     const result = handler.handleCommand(makeRequest(.namespace_create, "test-ns", ""));
     switch (result) {
-        .namespace_created => {},
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.already_exists, e.code),
         else => return error.TestUnexpectedResult,
     }
 
@@ -571,13 +610,13 @@ test "namespace handler: markNamespaceHasData" {
     handler.markNamespaceHasData("tracked");
     try testing.expect(handler.namespaceHasData("tracked"));
 
-    // Default namespace is ignored
+    // Default namespace is auto-created on first implicit write
     handler.markNamespaceHasData("default");
-    try testing.expect(!handler.namespaceHasData("default"));
+    try testing.expect(handler.namespaceHasData("default"));
 
-    // Non-existent namespace is ignored (no crash)
+    // Non-existent namespace is auto-created on write
     handler.markNamespaceHasData("ghost");
-    try testing.expect(!handler.namespaceHasData("ghost"));
+    try testing.expect(handler.namespaceHasData("ghost"));
 }
 
 test "namespace handler: list" {

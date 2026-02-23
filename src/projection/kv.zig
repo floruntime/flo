@@ -251,6 +251,46 @@ pub const KVProjection = struct {
         return count_written;
     }
 
+    /// Remove all entries whose key starts with `prefix`.
+    /// Used for namespace force-delete: pass "namespace\x00" to clear all keys in that namespace.
+    /// Returns the number of entries removed.
+    pub fn clearByPrefix(self: *KVProjection, prefix: []const u8) usize {
+        // Collect keys to remove (can't modify while iterating)
+        var to_remove_buf: [1024][]const u8 = undefined;
+        var total_removed: usize = 0;
+
+        // May need multiple passes if > 1024 keys match
+        while (true) {
+            var remove_count: usize = 0;
+            var it = self.map.iterator();
+            while (it.next()) |kv| {
+                if (remove_count >= to_remove_buf.len) break;
+                const entry_key = kv.value_ptr.key;
+                if (entry_key.len >= prefix.len and
+                    std.mem.eql(u8, entry_key[0..prefix.len], prefix))
+                {
+                    to_remove_buf[remove_count] = entry_key;
+                    remove_count += 1;
+                }
+            }
+
+            if (remove_count == 0) break;
+
+            for (to_remove_buf[0..remove_count]) |key| {
+                if (self.map.fetchRemove(key)) |removed| {
+                    self.memory_used -|= removed.value.key.len + removed.value.value.len;
+                    self.allocator.free(@constCast(removed.value.key));
+                    if (removed.value.value.len > 0) {
+                        self.allocator.free(@constCast(removed.value.value));
+                    }
+                }
+            }
+            total_removed += remove_count;
+        }
+
+        return total_removed;
+    }
+
     /// Remove all tombstones and expired entries. Returns number purged.
     pub fn compact(self: *KVProjection) usize {
         var to_remove: [256][]const u8 = undefined;

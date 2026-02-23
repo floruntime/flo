@@ -99,9 +99,10 @@ pub const QueueHandler = struct {
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
 
-        // After a successful enqueue, notify any blocking dequeue waiters
+        // After a successful enqueue, notify any blocking dequeue waiters and track namespace
         switch (result) {
             .queue_enqueued => {
+                shard.namespace_handler.markNamespaceHasData(req.namespace);
                 if (req.key.len > 0) {
                     shard.waiter_pool.notify(.queue_dequeue, req.key, @import("../node/shard.zig").resolveQueueWaiter, @ptrCast(shard));
                 }

@@ -187,6 +187,18 @@ pub const QueueProjection = struct {
         self.dlq.deinit(self.allocator);
     }
 
+    /// Reset the queue projection to empty state.
+    /// Used during namespace force-delete to clear all queue data.
+    pub fn reset(self: *QueueProjection) void {
+        self.messages.clearAndFree();
+        self.ready_heap.items.len = 0;
+        self.lease_heap.items.len = 0;
+        self.dlq.clearAndFree(self.allocator);
+        self.next_seq = 1;
+        self.applied_index = 0;
+        self.stats = .{};
+    }
+
     // ─── Core operations ───────────────────────────────────────────────────
 
     /// Enqueue a message with the given priority and UAL index.

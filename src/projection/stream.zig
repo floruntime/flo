@@ -211,6 +211,22 @@ pub const StreamProjection = struct {
         self.offsets.deinit();
     }
 
+    /// Reset the stream projection to empty state.
+    /// Used during namespace force-delete to clear all stream data.
+    pub fn reset(self: *StreamProjection) void {
+        // Free consumer groups
+        var git = self.groups.iterator();
+        while (git.next()) |kv| {
+            kv.value_ptr.deinit();
+        }
+        self.groups.clearAndFree();
+        self.offsets.clearAndFree();
+        self.hwm = 0;
+        self.trim_offset = 0;
+        self.applied_index = 0;
+        self.stats = .{};
+    }
+
     // ─── Core operations ───────────────────────────────────────────────────
 
     /// Append a record to the stream. Returns the assigned offset.

@@ -55,6 +55,21 @@ const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 /// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
 const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
 
+/// Max namespace-qualified key: namespace(128) + '\x00' + key(up to 64K).
+const MAX_QUALIFIED_KEY = 256;
+
+/// Build a namespace-qualified internal key: "<namespace>\x00<key>".
+/// For empty or "default" namespace, returns the raw key (no prefix).
+/// This ensures keys in different namespaces cannot collide.
+fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) []const u8 {
+    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
+    if (ns.len + 1 + raw_key.len > MAX_QUALIFIED_KEY) return raw_key;
+    @memcpy(buf[0..ns.len], ns);
+    buf[ns.len] = 0; // null separator
+    @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
+    return buf[0 .. ns.len + 1 + raw_key.len];
+}
+
 /// Reserved key prefixes — operations on these are blocked for user requests.
 const RESERVED_PREFIXES = [_][]const u8{
     "_action:",
@@ -135,6 +150,10 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
+        // Namespace-qualify the key for projection lookup
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
         // Check for blocking options before normal GET.
         // Wire mapping (from CLI client):
         //   CLI --wait  → wire block_ms  (wait-until-exists)
@@ -144,7 +163,7 @@ pub const KVHandler = struct {
 
         if (block_ms) |bms| {
             // Wait-until-exists semantics: if key exists, return immediately.
-            if (shard.kv_handler.*.kv.get(req.key)) |entry| {
+            if (shard.kv_handler.*.kv.get(qkey)) |entry| {
                 const result = CommandResult{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
                 sendKVResponse(shard, conn, req.header.request_id, result);
                 return;
@@ -154,7 +173,7 @@ pub const KVHandler = struct {
                 .kind = .kv_get,
                 .fd = conn.fd,
                 .request_id = req.header.request_id,
-                .key = req.key,
+                .key = qkey,
                 .min_version = 0,
                 .timeout_ms = bms,
             });
@@ -164,12 +183,12 @@ pub const KVHandler = struct {
 
         if (wait_ms) |wms| {
             // Watch-for-changes semantics: wait for version > current.
-            const current_version: u64 = if (shard.kv_handler.*.kv.get(req.key)) |entry| entry.lsn else 0;
+            const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.lsn else 0;
             _ = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .fd = conn.fd,
                 .request_id = req.header.request_id,
-                .key = req.key,
+                .key = qkey,
                 .min_version = current_version,
                 .timeout_ms = wms,
             });
@@ -187,16 +206,20 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        // Validate the request before proposing
-        const validation = shard.kv_handler.*.validatePut(req);
+        // Namespace-qualify the key
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
+        // Validate the request before proposing (uses qualified key)
+        const validation = shard.kv_handler.*.validatePutQ(req, qkey);
         if (validation) |err_result| {
             defer shard.kv_handler.*.freeResult(err_result);
             sendKVResponse(shard, conn, req.header.request_id, err_result);
             return;
         }
 
-        // Build CommandPayload and propose through Raft
-        const propose_result = proposeKVEntry(shard, .kv_put, req) catch |err| {
+        // Build CommandPayload and propose through Raft (uses qualified key)
+        const propose_result = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| {
             const result: CommandResult = switch (err) {
                 error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
                 else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
@@ -208,8 +231,8 @@ pub const KVHandler = struct {
         // Apply all committed entries (in single-node mode this is synchronous)
         applyCommittedEntries(shard);
 
-        // Notify any blocking GET waiters for this key via unified pool
-        shard.waiter_pool.notify(.kv_get, req.key, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+        // Notify any blocking GET waiters for this key via unified pool (qualified key)
+        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         // Build response from the committed version (the propose index IS the version)
         const cmd_result = CommandResult{ .kv_put_ok = .{ .version = propose_result.index } };
@@ -224,6 +247,10 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
+        // Namespace-qualify the key
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
         // Validate the request
         const validation = shard.kv_handler.*.validateDelete(req);
         if (validation) |err_result| {
@@ -232,15 +259,14 @@ pub const KVHandler = struct {
             return;
         }
 
-        // Check the key exists before proposing a delete
-        // (avoid proposing a no-op delete for a missing key)
-        if (shard.kv_handler.*.kv.get(req.key) == null) {
+        // Check the key exists before proposing a delete (qualified key)
+        if (shard.kv_handler.*.kv.get(qkey) == null) {
             sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
             return;
         }
 
-        // Propose the delete through Raft
-        _ = proposeKVEntry(shard, .kv_delete, req) catch |err| {
+        // Propose the delete through Raft (qualified key)
+        _ = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| {
             const result: CommandResult = switch (err) {
                 error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
                 else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
@@ -252,8 +278,8 @@ pub const KVHandler = struct {
         // Apply all committed entries
         applyCommittedEntries(shard);
 
-        // Notify any blocking GET waiters for this key via unified pool
-        shard.waiter_pool.notify(.kv_get, req.key, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+        // Notify any blocking GET waiters for this key via unified pool (qualified key)
+        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
@@ -282,15 +308,15 @@ pub const KVHandler = struct {
     ///
     /// After this returns successfully, call `applyCommittedEntries()` to apply
     /// any newly committed entries to the KV projection.
-    fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request) !@import("../raft/node.zig").ProposeResult {
+    fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request, qualified_key: []const u8) !@import("../raft/node.zig").ProposeResult {
         // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
         var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
         const value = if (entry_type == .kv_delete) &[_]u8{} else req.value;
         const cmd = entry_mod.CommandPayload{
             .namespace_hash = 0, // TODO: extract from request namespace
-            .key_length = @intCast(req.key.len),
+            .key_length = @intCast(qualified_key.len),
             .value_length = @intCast(value.len),
-            .key = req.key,
+            .key = qualified_key,
             .value = value,
         };
         var payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
@@ -378,7 +404,11 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
-        const entry = self.kv.get(req.key) orelse return .kv_not_found;
+        // Namespace-qualify key for projection lookup
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
+        const entry = self.kv.get(qkey) orelse return .kv_not_found;
         return .{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
     }
 
@@ -394,9 +424,13 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
-        // CAS check
+        // Namespace-qualify key for projection operations
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
+        // CAS check (qualified key)
         if (req.getCasVersion()) |expected_version| {
-            const current = self.kv.get(req.key);
+            const current = self.kv.get(qkey);
             if (current) |entry| {
                 if (entry.lsn != expected_version) {
                     return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
@@ -408,12 +442,12 @@ pub const KVHandler = struct {
             }
         }
 
-        // NX / XX conditions
+        // NX / XX conditions (qualified key)
         if (req.getIfNotExists()) {
-            if (self.kv.get(req.key) != null) return .kv_condition_not_met;
+            if (self.kv.get(qkey) != null) return .kv_condition_not_met;
         }
         if (req.getIfExists()) {
-            if (self.kv.get(req.key) == null) return .kv_condition_not_met;
+            if (self.kv.get(qkey) == null) return .kv_condition_not_met;
         }
 
         const lsn = self.nextLsn();
@@ -423,7 +457,7 @@ pub const KVHandler = struct {
             break :blk timestamp + ttl_secs * 1_000_000_000;
         } else 0;
 
-        self.kv.put(req.key, req.value, lsn, 0, timestamp, expiry_ns) catch {
+        self.kv.put(qkey, req.value, lsn, 0, timestamp, expiry_ns) catch {
             return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
         };
         return .{ .kv_put_ok = .{ .version = lsn } };
@@ -440,9 +474,13 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
+        // Namespace-qualify key for projection operations
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key);
+
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-        self.kv.delete(req.key, lsn, 0, timestamp) catch {
+        self.kv.delete(qkey, lsn, 0, timestamp) catch {
             return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
         };
         return .ok;
@@ -453,6 +491,11 @@ pub const KVHandler = struct {
     /// Validate a put request before proposing to Raft.
     /// Returns null if all checks pass, or a CommandResult error to send immediately.
     fn validatePut(self: *KVHandler, req: Request) ?CommandResult {
+        return self.validatePutQ(req, req.key);
+    }
+
+    /// Validate a put request with a namespace-qualified key for projection lookups.
+    fn validatePutQ(self: *KVHandler, req: Request, qkey: []const u8) ?CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
         }
@@ -460,9 +503,9 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
-        // CAS check — version must match current
+        // CAS check — version must match current (use qualified key for lookup)
         if (req.getCasVersion()) |expected_version| {
-            const current = self.kv.get(req.key);
+            const current = self.kv.get(qkey);
             if (current) |entry| {
                 if (entry.lsn != expected_version) {
                     return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
@@ -476,12 +519,12 @@ pub const KVHandler = struct {
 
         // NX: must not exist
         if (req.getIfNotExists()) {
-            if (self.kv.get(req.key) != null) return .kv_condition_not_met;
+            if (self.kv.get(qkey) != null) return .kv_condition_not_met;
         }
 
         // XX: must exist
         if (req.getIfExists()) {
-            if (self.kv.get(req.key) == null) return .kv_condition_not_met;
+            if (self.kv.get(qkey) == null) return .kv_condition_not_met;
         }
 
         return null; // all checks passed
@@ -506,21 +549,47 @@ pub const KVHandler = struct {
         const limit = req.getLimit() orelse DEFAULT_SCAN_LIMIT;
         const capped_limit = @min(limit, MAX_SCAN_LIMIT);
 
+        // Namespace-qualify prefix for scanning
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const ns = req.namespace;
+        const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
+
+        // Build qualified scan prefix:
+        //   - If namespace + user prefix: "ns\0prefix"
+        //   - If namespace + no prefix: "ns\0" (scan all in namespace)
+        //   - If no namespace + user prefix: "prefix"
+        //   - If no namespace + no prefix: full scan
+        const scan_prefix: []const u8 = if (has_ns) blk: {
+            if (req.key.len > 0) {
+                break :blk qualifyKey(&qbuf, ns, req.key);
+            } else {
+                // Scan all keys in this namespace — prefix is "ns\0"
+                @memcpy(qbuf[0..ns.len], ns);
+                qbuf[ns.len] = 0;
+                break :blk qbuf[0 .. ns.len + 1];
+            }
+        } else req.key;
+
         // Allocate scan buffer on stack
         var scan_buf: [MAX_SCAN_LIMIT]ScanEntry = undefined;
         const out = scan_buf[0..capped_limit];
 
-        // Prefix scan if key is provided, otherwise full scan
-        const found_count = if (req.key.len > 0)
-            self.kv.scanPrefix(req.key, out)
+        // Prefix scan if prefix is provided, otherwise full scan
+        const found_count = if (scan_prefix.len > 0)
+            self.kv.scanPrefix(scan_prefix, out)
         else
             self.kv.scan(out);
 
-        // Filter out reserved keys from results
+        // Filter out reserved keys and strip namespace prefix from results
+        const ns_prefix_len: usize = if (has_ns) ns.len + 1 else 0;
         var filtered_count: usize = 0;
         for (out[0..found_count]) |entry| {
             if (!isReservedKey(entry.key)) {
-                scan_buf[filtered_count] = entry;
+                var stripped = entry;
+                if (ns_prefix_len > 0 and entry.key.len > ns_prefix_len) {
+                    stripped.key = entry.key[ns_prefix_len..];
+                }
+                scan_buf[filtered_count] = stripped;
                 filtered_count += 1;
             }
         }
