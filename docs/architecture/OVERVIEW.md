@@ -53,11 +53,11 @@ The shard's main loop:
 
 ```
 loop {
-    reactor.poll()          // I/O events
-    processEvents()         // handle ready connections
-    drainInbox()            // cross-shard messages
-    checkWaiterTimeouts()   // blocking operation expiry
-    taskScheduler.tick()    // background tasks
+    reactor.poll()                  // I/O events
+    processEvents()                 // handle ready connections
+    drainInbox()                    // cross-shard messages
+    waiter_pool.expireTimeouts()    // blocking operation expiry
+    taskScheduler.tick()            // background tasks
 }
 ```
 

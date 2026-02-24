@@ -61,6 +61,12 @@ const segment_mod = @import("../storage/ual/segment.zig");
 const Entry = entry_mod.Entry;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const RaftNode = @import("../raft/node.zig").RaftNode;
+const waiter_pool_mod = @import("waiter_pool.zig");
+const WaiterPool = waiter_pool_mod.WaiterPool;
+const Waiter = waiter_pool_mod.Waiter;
+const WaiterKind = waiter_pool_mod.WaiterKind;
+const stream_handler_mod = @import("../stream/handler.zig");
+const queue_handler_mod = @import("../queue/handler.zig");
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -157,6 +163,10 @@ pub const Shard = struct {
     /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
     /// Writes go through propose() → commit → apply to projections.
     raft_node: *RaftNode,
+
+    /// Unified waiter pool — handles blocking GET, blocking dequeue,
+    /// stream long-poll, and worker_await across all subsystems.
+    waiter_pool: WaiterPool,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -310,6 +320,7 @@ pub const Shard = struct {
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
+            .waiter_pool = WaiterPool.init(),
         };
     }
 
@@ -398,6 +409,8 @@ pub const Shard = struct {
 
     /// Remove connection, unregister from reactor, and close the fd.
     pub fn closeConnection(self: *Shard, fd: i32) void {
+        // Clean up any pending waiters for this connection
+        self.waiter_pool.removeByFd(fd);
         self.reactor.removeSource(fd);
         self.removeConnection(fd);
         posix.close(fd);
@@ -490,8 +503,8 @@ pub const Shard = struct {
         // Drain inbox each tick
         _ = self.drainInbox();
 
-        // Expire stale blocking-GET waiters (sends not_found to timed-out clients)
-        self.kv_handler.*.checkWaiterTimeouts(self);
+        // Expire stale blocking waiters across all subsystems
+        self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
 
         return events.len;
     }
@@ -718,6 +731,107 @@ pub const Shard = struct {
         return self.connections.count();
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Waiter Callbacks — used by WaiterPool for timeout and resolution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Timeout callback: send an appropriate "no data" response based on waiter kind.
+fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const conn = shard.getConnection(waiter.fd) orelse return;
+    switch (waiter.kind) {
+        .kv_get => {
+            // KV blocking GET timeout → not_found
+            var resp = proto.Response.initError(waiter.request_id, .not_found);
+            var buf: [128]u8 = undefined;
+            if (resp.serialize(&buf)) |serialized| {
+                _ = conn.queueWrite(serialized);
+                shard.flushToClient(waiter.fd);
+            } else |_| {}
+        },
+        .stream_read => {
+            // Stream blocking read timeout → empty messages response
+            shard.sendOkResponse(conn, waiter.request_id, "");
+        },
+        .queue_dequeue => {
+            // Queue blocking dequeue timeout → empty messages response
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, 0, .little); // count = 0
+            shard.sendOkResponse(conn, waiter.request_id, &buf);
+        },
+        .worker_await => {
+            // Worker await timeout → not_found (no task available)
+            shard.sendErrorResponse(conn, waiter.request_id, .not_found, "no task available");
+        },
+    }
+}
+
+/// KV waiter resolver: look up the key in the KV projection and send the value
+/// if version > min_version. Returns true if waiter was satisfied.
+pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const entry = shard.kv_projection.get(waiter.key()) orelse return false;
+    if (entry.lsn <= waiter.min_version) return false;
+
+    const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone, remove waiter
+    var resp = proto.Response.init(waiter.request_id, .ok, entry.value);
+    resp.prefix = entry.lsn;
+    const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
+    var buf: [MAX_BUF]u8 = undefined;
+    if (resp.serialize(&buf)) |serialized| {
+        _ = conn.queueWrite(serialized);
+        shard.flushToClient(waiter.fd);
+    } else |_| {}
+    return true;
+}
+
+/// Stream waiter resolver: read new messages starting from min_version (last offset).
+/// Returns true if there are new messages to send.
+pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const stream_proj = shard.stream_projection;
+
+    const hwm = stream_proj.highWaterMark();
+    if (hwm <= waiter.min_version) return false; // no new messages
+
+    // Read from (min_version+1) to hwm
+    const start = waiter.min_version + 1;
+    const end = start + 100; // cap batch size
+    var entries: [100]@import("../projection/stream.zig").OffsetEntry = undefined;
+    const count = stream_proj.readRange(start, end, &entries);
+    if (count == 0) return false;
+
+    const conn = shard.getConnection(waiter.fd) orelse return true;
+
+    // Serialize offset entries
+    const data = stream_handler_mod.serializeOffsetEntriesPub(shard.stream_handler.allocator, entries[0..count]) catch return false;
+    defer shard.stream_handler.allocator.free(data);
+    shard.sendOkResponse(conn, waiter.request_id, data);
+    return true;
+}
+
+/// Queue waiter resolver: try to dequeue a message.
+/// Returns true if a message was available and sent.
+pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const queue_proj = shard.queue_projection;
+
+    const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+    queue_proj.expireLeases(now_ns);
+
+    const maybe_result = queue_proj.dequeue(now_ns) catch return false;
+    const deq_result = maybe_result orelse return false;
+
+    const conn = shard.getConnection(waiter.fd) orelse return true;
+
+    // Serialize single dequeue result
+    const results = [1]@import("../projection/queue.zig").DequeueResult{deq_result};
+    const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
+    defer shard.queue_handler.allocator.free(data);
+    shard.sendOkResponse(conn, waiter.request_id, data);
+    return true;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Segment Replay — recover state from .flseg files on startup

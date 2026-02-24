@@ -37,6 +37,7 @@ const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // QueueHandler
@@ -63,8 +64,8 @@ pub const QueueHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.queue_enqueue, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dequeue, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_enqueue, dispatchEnqueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dequeue, dispatchDequeue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_complete, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_fail, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_peek, dispatchQueue, preRouteByQueue);
@@ -87,6 +88,79 @@ pub const QueueHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.queue_handler.handleCommand(req);
+        defer shard.queue_handler.freeResult(result);
+        sendQueueResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// Dedicated dispatch for queue_enqueue — notifies blocking dequeue waiters.
+    fn dispatchEnqueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.queue_handler.handleCommand(req);
+        defer shard.queue_handler.freeResult(result);
+
+        // After a successful enqueue, notify any blocking dequeue waiters
+        switch (result) {
+            .queue_enqueued => {
+                if (req.key.len > 0) {
+                    shard.waiter_pool.notify(.queue_dequeue, req.key, @import("../node/shard.zig").resolveQueueWaiter, @ptrCast(shard));
+                }
+            },
+            else => {},
+        }
+
+        sendQueueResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// Dedicated dispatch for queue_dequeue — supports blocking via block_ms.
+    fn dispatchDequeue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Check for blocking dequeue (--block → block_ms)
+        const block_ms = req.getBlockMs();
+
+        // Try dequeue first
+        const result = shard.queue_handler.handleCommand(req);
+
+        if (block_ms) |bms| {
+            // Check if we got any messages
+            switch (result) {
+                .queue_messages => |m| {
+                    if (m.data.len > 4) {
+                        const count = std.mem.readInt(u32, m.data[0..4], .little);
+                        if (count > 0) {
+                            // Got messages — return immediately
+                            defer shard.queue_handler.freeResult(result);
+                            sendQueueResponse(shard, conn, req.header.request_id, result);
+                            return;
+                        }
+                    }
+                    // Empty result — register blocking waiter
+                    shard.queue_handler.freeResult(result);
+                },
+                else => {
+                    // Error or other — send immediately
+                    defer shard.queue_handler.freeResult(result);
+                    sendQueueResponse(shard, conn, req.header.request_id, result);
+                    return;
+                },
+            }
+
+            // Register waiter
+            _ = shard.waiter_pool.register(.{
+                .kind = .queue_dequeue,
+                .fd = conn.fd,
+                .request_id = req.header.request_id,
+                .key = req.key,
+                .min_version = 0,
+                .timeout_ms = bms,
+            });
+            conn.response_deferred = true;
+            return;
+        }
+
+        // Non-blocking — standard path
         defer shard.queue_handler.freeResult(result);
         sendQueueResponse(shard, conn, req.header.request_id, result);
     }
@@ -377,6 +451,12 @@ fn parseSeqFromValue(value: []const u8) ?u64 {
 /// Serialize dequeue results.
 /// Wire format: [count:u32] ([seq:u64][ual_index:u64][priority:u32][attempts:u32])*
 fn serializeDequeueResults(allocator: Allocator, results: []const DequeueResult) ![]u8 {
+    return serializeDequeueResultsPub(allocator, results);
+}
+
+/// Public variant of serializeDequeueResults — used by the WaiterPool resolver
+/// in shard.zig to build queue responses for blocking dequeue.
+pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const DequeueResult) ![]u8 {
     const entry_size: usize = 24; // u64 + u64 + u32 + u32
     const total = 4 + results.len * entry_size;
 

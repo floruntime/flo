@@ -34,6 +34,7 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // StreamHandler
@@ -63,8 +64,8 @@ pub const StreamHandler = struct {
     /// Register stream and consumer-group opcode handlers with the Dispatcher.
     pub fn register(dispatcher: *Dispatcher) void {
         // Stream operations (0x10–0x1F)
-        dispatcher.registerWithRoute(.stream_append, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_read, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_append, dispatchAppend, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_read, dispatchRead, preRouteByStream);
         dispatcher.registerWithRoute(.stream_trim, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_info, dispatchStream, preRouteByStream);
         dispatcher.register(.stream_list, dispatchStream);
@@ -94,6 +95,80 @@ pub const StreamHandler = struct {
     fn dispatchStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.stream_handler.handleCommand(req);
+        defer shard.stream_handler.freeResult(cmd_result);
+        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
+    /// Dedicated dispatch for stream_append — notifies blocking read waiters after append.
+    fn dispatchAppend(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.stream_handler.handleCommand(req);
+        defer shard.stream_handler.freeResult(cmd_result);
+
+        // After a successful append, notify any blocking read waiters
+        switch (cmd_result) {
+            .stream_append_ok => {
+                if (req.key.len > 0) {
+                    shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
+                }
+            },
+            else => {},
+        }
+
+        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
+    /// Dedicated dispatch for stream_read — supports blocking via block_ms.
+    fn dispatchRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Check for blocking read (--follow / --wait → block_ms)
+        const block_ms = req.getBlockMs();
+
+        if (block_ms) |bms| {
+            // Try reading first — if data exists, return immediately
+            const cmd_result = shard.stream_handler.handleCommand(req);
+
+            switch (cmd_result) {
+                .stream_messages => |m| {
+                    // Check if we got any actual messages (count > 0)
+                    if (m.data.len > 4) {
+                        const count = std.mem.readInt(u32, m.data[0..4], .little);
+                        if (count > 0) {
+                            defer shard.stream_handler.freeResult(cmd_result);
+                            sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+                            return;
+                        }
+                    }
+                    // No data — register a blocking waiter
+                    shard.stream_handler.freeResult(cmd_result);
+                },
+                else => {
+                    // Error or other result — send immediately
+                    defer shard.stream_handler.freeResult(cmd_result);
+                    sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+                    return;
+                },
+            }
+
+            // Register waiter with stream's current high water mark
+            const hwm = shard.stream_projection.highWaterMark();
+            _ = shard.waiter_pool.register(.{
+                .kind = .stream_read,
+                .fd = conn.fd,
+                .request_id = req.header.request_id,
+                .key = req.key,
+                .min_version = hwm,
+                .timeout_ms = bms,
+            });
+            conn.response_deferred = true;
+            return;
+        }
+
+        // Non-blocking read — standard path
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
@@ -560,6 +635,12 @@ fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
 /// Serialize offset entries to binary format.
 /// Wire format: [count:u32] ([offset:u64][ual_index:u64][timestamp_ns:u64])*
 fn serializeOffsetEntries(allocator: Allocator, entries: []const OffsetEntry) ![]u8 {
+    return serializeOffsetEntriesPub(allocator, entries);
+}
+
+/// Public variant of serializeOffsetEntries — used by the WaiterPool resolver
+/// in shard.zig to build stream responses for blocking reads.
+pub fn serializeOffsetEntriesPub(allocator: Allocator, entries: []const OffsetEntry) ![]u8 {
     const entry_size: usize = 24; // 3 x u64
     const total = 4 + entries.len * entry_size;
 

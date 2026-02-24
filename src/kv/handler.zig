@@ -38,6 +38,7 @@ const kv_mod = @import("../projection/kv.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -74,24 +75,6 @@ const DEFAULT_SCAN_LIMIT: u32 = 100;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const KVHandler = struct {
-    // ── Blocking GET waiter infrastructure ───────────────────────────────
-
-    /// Maximum concurrent blocking GET waiters per shard.
-    const MAX_KV_WAITERS = 64;
-
-    /// A pending blocking GET registration.
-    const KVWaiter = struct {
-        fd: i32,
-        request_id: u64,
-        key_buf: [256]u8,
-        key_len: u16,
-        /// Trigger when version > min_version. 0 = trigger on any creation.
-        min_version: u64,
-        /// milliTimestamp() after which to send not_found. maxInt = infinite.
-        expires_at_ms: i64,
-        active: bool,
-    };
-
     // ── Fields ──────────────────────────────────────────────────────────
 
     kv: *KVProjection,
@@ -101,17 +84,11 @@ pub const KVHandler = struct {
     /// Production writes use the Raft log index as their version.
     next_lsn: u64,
 
-    /// Waiter slots (fixed-size, swap-remove on completion).
-    waiters: [MAX_KV_WAITERS]KVWaiter,
-    waiter_count: u16,
-
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
             .next_lsn = 1,
-            .waiters = undefined,
-            .waiter_count = 0,
         };
     }
 
@@ -172,8 +149,15 @@ pub const KVHandler = struct {
                 sendKVResponse(shard, conn, req.header.request_id, result);
                 return;
             }
-            // Key absent — register waiter; response sent when key is created.
-            _ = shard.kv_handler.*.registerWaiter(conn.fd, req.header.request_id, req.key, 0, bms);
+            // Key absent — register waiter in unified pool; response sent when key is created.
+            _ = shard.waiter_pool.register(.{
+                .kind = .kv_get,
+                .fd = conn.fd,
+                .request_id = req.header.request_id,
+                .key = req.key,
+                .min_version = 0,
+                .timeout_ms = bms,
+            });
             conn.response_deferred = true;
             return;
         }
@@ -181,7 +165,14 @@ pub const KVHandler = struct {
         if (wait_ms) |wms| {
             // Watch-for-changes semantics: wait for version > current.
             const current_version: u64 = if (shard.kv_handler.*.kv.get(req.key)) |entry| entry.lsn else 0;
-            _ = shard.kv_handler.*.registerWaiter(conn.fd, req.header.request_id, req.key, current_version, wms);
+            _ = shard.waiter_pool.register(.{
+                .kind = .kv_get,
+                .fd = conn.fd,
+                .request_id = req.header.request_id,
+                .key = req.key,
+                .min_version = current_version,
+                .timeout_ms = wms,
+            });
             conn.response_deferred = true;
             return;
         }
@@ -217,8 +208,8 @@ pub const KVHandler = struct {
         // Apply all committed entries (in single-node mode this is synchronous)
         applyCommittedEntries(shard);
 
-        // Notify any blocking GET waiters for this key
-        shard.kv_handler.*.notifyWaiters(shard, req.key);
+        // Notify any blocking GET waiters for this key via unified pool
+        shard.waiter_pool.notify(.kv_get, req.key, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         // Build response from the committed version (the propose index IS the version)
         const cmd_result = CommandResult{ .kv_put_ok = .{ .version = propose_result.index } };
@@ -261,8 +252,8 @@ pub const KVHandler = struct {
         // Apply all committed entries
         applyCommittedEntries(shard);
 
-        // Notify any blocking GET waiters for this key
-        shard.kv_handler.*.notifyWaiters(shard, req.key);
+        // Notify any blocking GET waiters for this key via unified pool
+        shard.waiter_pool.notify(.kv_get, req.key, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
@@ -583,103 +574,8 @@ pub const KVHandler = struct {
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────
-
-    /// Register a waiter for a blocking GET.  Returns true on success.
-    /// `timeout_ms`: 0 = infinite wait, >0 = expire after N ms.
-    /// `min_version`: 0 = trigger on any creation, >0 = trigger when version > min_version.
-    pub fn registerWaiter(self: *KVHandler, fd: i32, request_id: u64, key: []const u8, min_version: u64, timeout_ms: u32) bool {
-        if (self.waiter_count >= MAX_KV_WAITERS) return false;
-        if (key.len == 0 or key.len > 256) return false;
-
-        const now_ms = std.time.milliTimestamp();
-        const expires: i64 = if (timeout_ms == 0) std.math.maxInt(i64) else now_ms + @as(i64, @intCast(timeout_ms));
-
-        var w = &self.waiters[self.waiter_count];
-        w.fd = fd;
-        w.request_id = request_id;
-        w.key_buf = undefined;
-        @memcpy(w.key_buf[0..key.len], key);
-        w.key_len = @intCast(key.len);
-        w.min_version = min_version;
-        w.expires_at_ms = expires;
-        w.active = true;
-        self.waiter_count += 1;
-        return true;
-    }
-
-    /// Notify waiters matching `key`.  Sends the value response and removes
-    /// satisfied waiters.  Called after a PUT or DELETE commits.
-    pub fn notifyWaiters(self: *KVHandler, shard_ptr: *anyopaque, key: []const u8) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        var i: u16 = 0;
-        while (i < self.waiter_count) {
-            const w = &self.waiters[i];
-            if (!w.active) {
-                i += 1;
-                continue;
-            }
-
-            const wkey = w.key_buf[0..w.key_len];
-            if (wkey.len == key.len and std.mem.eql(u8, wkey, key)) {
-                if (self.kv.get(key)) |entry| {
-                    if (entry.lsn > w.min_version) {
-                        // Satisfied — send value response on the waiting connection.
-                        if (shard.getConnection(w.fd)) |conn| {
-                            var resp = proto.Response.init(w.request_id, .ok, entry.value);
-                            resp.prefix = entry.lsn;
-                            var buf: [MAX_RESPONSE_BUF]u8 = undefined;
-                            if (resp.serialize(&buf)) |serialized| {
-                                _ = conn.queueWrite(serialized);
-                                shard.flushToClient(w.fd);
-                            } else |_| {}
-                        }
-                        self.removeWaiter(i);
-                        continue; // don't increment — slot was swapped
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-
-    /// Expire waiters whose deadline has passed.  Sends not_found on the
-    /// waiting connection.  Called from the shard tick loop.
-    pub fn checkWaiterTimeouts(self: *KVHandler, shard_ptr: *anyopaque) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const now_ms = std.time.milliTimestamp();
-        var i: u16 = 0;
-        while (i < self.waiter_count) {
-            const w = &self.waiters[i];
-            if (!w.active) {
-                i += 1;
-                continue;
-            }
-
-            if (now_ms >= w.expires_at_ms) {
-                // Expired — send not_found.
-                if (shard.getConnection(w.fd)) |conn| {
-                    var resp = proto.Response.initError(w.request_id, .not_found);
-                    var buf2: [128]u8 = undefined;
-                    if (resp.serialize(&buf2)) |serialized| {
-                        _ = conn.queueWrite(serialized);
-                        shard.flushToClient(w.fd);
-                    } else |_| {}
-                }
-                self.removeWaiter(i);
-                continue;
-            }
-            i += 1;
-        }
-    }
-
-    /// Remove waiter at `index` by swap-removing with last.
-    fn removeWaiter(self: *KVHandler, index: u16) void {
-        if (self.waiter_count == 0) return;
-        if (index < self.waiter_count - 1) {
-            self.waiters[index] = self.waiters[self.waiter_count - 1];
-        }
-        self.waiter_count -= 1;
-    }
+    // (Moved to unified WaiterPool in node/waiter_pool.zig)
+    // Handlers use shard.waiter_pool.register() / .notify() / .expireTimeouts()
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

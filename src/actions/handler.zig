@@ -33,6 +33,7 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
@@ -107,10 +108,11 @@ pub const ActionsHandler = struct {
 
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.action_register, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_invoke, dispatchInvoke, preRouteByAction);
         dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
         dispatcher.register(.action_list, dispatchAction);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.worker_await, dispatchWorkerAwait, preRouteByAction);
     }
 
     fn preRouteByAction(req: Request) ?u64 {
@@ -124,6 +126,69 @@ pub const ActionsHandler = struct {
         const result = shard.actions_handler.handleCommand(req);
         defer shard.actions_handler.freeResult(result);
         sendActionResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// Dedicated dispatch for action_invoke — notifies worker_await waiters.
+    fn dispatchInvoke(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.actions_handler.handleCommand(req);
+        defer shard.actions_handler.freeResult(result);
+
+        // After a successful invoke, notify any worker_await waiters for this action
+        switch (result) {
+            .action_invoked => {
+                if (req.key.len > 0) {
+                    shard.waiter_pool.notify(.worker_await, req.key, resolveWorkerAwait, @ptrCast(shard));
+                }
+            },
+            else => {},
+        }
+
+        sendActionResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// Blocking wait for a task to be dispatched.  Workers call this to receive work.
+    fn dispatchWorkerAwait(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (req.key.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "action name is required");
+            return;
+        }
+
+        // Check if there's already a pending run to claim
+        if (shard.actions_handler.claimPendingRun(req.key)) |run_id| {
+            shard.sendOkResponse(conn, req.header.request_id, run_id);
+            return;
+        }
+
+        // No pending work — register blocking waiter
+        const block_ms = req.getBlockMs() orelse 30_000; // default 30s for worker_await
+        _ = shard.waiter_pool.register(.{
+            .kind = .worker_await,
+            .fd = conn.fd,
+            .request_id = req.header.request_id,
+            .key = req.key,
+            .min_version = 0,
+            .timeout_ms = block_ms,
+        });
+        conn.response_deferred = true;
+    }
+
+    /// Try to claim a pending run for the given action. Returns the run_id if found.
+    fn claimPendingRun(self: *ActionsHandler, action_name: []const u8) ?[]const u8 {
+        var it = self.runs.iterator();
+        while (it.next()) |entry| {
+            const run = entry.value_ptr;
+            if (run.status == .pending and std.mem.eql(u8, run.action_name_owned, action_name)) {
+                run.status = .running;
+                run.started_at_ms = std.time.milliTimestamp();
+                return run.run_id_owned;
+            }
+        }
+        return null;
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -365,6 +430,25 @@ pub const ActionsHandler = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Waiter Callbacks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Waiter = waiter_pool_mod.Waiter;
+
+/// Worker await resolver: claim a pending run matching the action name.
+fn resolveWorkerAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const action_name = waiter.key();
+
+    // Try to claim a pending run
+    const run_id = shard.actions_handler.claimPendingRun(action_name) orelse return false;
+
+    const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone
+    shard.sendOkResponse(conn, waiter.request_id, run_id);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Response Serialization — CommandResult → Wire Response
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -487,8 +571,9 @@ test "actions handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_status)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_list)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_delete)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.worker_await)] != null);
 
-    try testing.expectEqual(@as(u16, 5), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
 }
 
 test "actions handler: register" {
