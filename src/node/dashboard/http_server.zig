@@ -10,8 +10,8 @@
 //! Endpoints:
 //! - GET /health         - Health check (always public)
 //! - GET /api/v1/*       - REST API for dashboard data (requires admin_token if set)
-//! - GET /api/v1/kv/namespaces/:ns/keys/:key/watch — SSE live updates
-//! - GET /api/v1/workflow/namespaces/:ns/runs/:run_id/watch — SSE workflow run updates
+//! - GET /api/v1/kv/namespaces/:ns/keys/:key/watch — SSE live updates (stub)
+//! - GET /api/v1/workflow/namespaces/:ns/runs/:run_id/watch — SSE workflow run updates (stub)
 //! - GET /*              - Embedded static files (requires admin_token if set)
 //!
 //! The dashboard assets are embedded at compile time from web/dist/
@@ -20,11 +20,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const api = @import("api.zig");
 const assets = @import("assets.zig");
-const json = @import("../../util/json.zig");
-const MetricsRegistry = @import("../../metrics/registry.zig").MetricsRegistry;
-const Dispatcher = @import("../dispatch/dispatcher.zig").Dispatcher;
-const Core = @import("../core/core.zig").Core;
 const http = @import("../../util/http/mod.zig");
+const DashboardContext = api.DashboardContext;
 
 // =============================================================================
 // Server Configuration and Implementation
@@ -43,9 +40,7 @@ pub const DashboardServer = struct {
 
     allocator: Allocator,
     config: DashboardServerConfig,
-    dispatchers: []*Dispatcher,
-    cores: ?[]*Core, // Optional: for MetadataCache access (cores[0] = Controller)
-    metrics: *MetricsRegistry,
+    ctx: *DashboardContext,
     listener: ?std.posix.socket_t = null,
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -53,16 +48,12 @@ pub const DashboardServer = struct {
     pub fn init(
         allocator: Allocator,
         config: DashboardServerConfig,
-        dispatchers: []*Dispatcher,
-        cores: ?[]*Core,
-        metrics: *MetricsRegistry,
+        ctx: *DashboardContext,
     ) Self {
         return .{
             .allocator = allocator,
             .config = config,
-            .dispatchers = dispatchers,
-            .cores = cores,
-            .metrics = metrics,
+            .ctx = ctx,
         };
     }
 
@@ -147,19 +138,14 @@ pub const DashboardServer = struct {
     }
 
     fn handleConnection(self: *Self, client: std.posix.socket_t) void {
-        // Track whether we should close the socket on return.
-        // SSE connections transfer ownership to a detached thread.
-        var close_on_exit = true;
         defer {
-            if (close_on_exit) {
-                // Graceful close: use SO_LINGER to ensure send buffer is flushed
-                // before the kernel sends FIN. Without this, close() on a socket
-                // with buffered data sends RST ("Connection reset by peer")
-                // which breaks Docker port forwarding.
-                const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
-                std.posix.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
-                std.posix.close(client);
-            }
+            // Graceful close: use SO_LINGER to ensure send buffer is flushed
+            // before the kernel sends FIN. Without this, close() on a socket
+            // with buffered data sends RST ("Connection reset by peer")
+            // which breaks Docker port forwarding.
+            const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
+            std.posix.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+            std.posix.close(client);
         }
 
         var buf: [8192]u8 = undefined;
@@ -197,19 +183,12 @@ pub const DashboardServer = struct {
             }
         }
 
-        // ---- SSE Watch: detect before normal routing ----
-        // SSE connections are long-lived — we transfer socket ownership to a
-        // detached thread and skip the defer-close above.
+        // ---- SSE Watch paths: detect and respond with "not wired" ----
+        // SSE support will be wired in a future phase via shard inbox.
         if (parsed.method == .GET) {
             if (parsed.pathAfter("/api/v1/")) |api_path| {
-                if (parseSSEWatchPath(api_path)) |watch| {
-                    close_on_exit = false;
-                    self.spawnSSEWatcher(client, watch.namespace, watch.key, cors_headers);
-                    return;
-                }
-                if (parseWorkflowSSEPath(api_path)) |wf_watch| {
-                    close_on_exit = false;
-                    self.spawnWorkflowSSEWatcher(client, wf_watch.namespace, wf_watch.run_id, cors_headers);
+                if (parseSSEWatchPath(api_path) != null or parseWorkflowSSEPath(api_path) != null) {
+                    self.sendResponse(client, .ok, .json, "{\"error\":\"SSE not yet wired to shard inbox\"}", cors_headers);
                     return;
                 }
             }
@@ -229,8 +208,7 @@ pub const DashboardServer = struct {
     fn handleApiRequest(self: *Self, client: std.posix.socket_t, parsed: http.ParsedRequest, body: []const u8, cors_headers: ?[]const u8) void {
         const path = parsed.pathAfter("/api/v1/") orelse "";
 
-        // Route to appropriate handler (method-aware)
-        const response = api.handleRequest(self.allocator, parsed.method, path, parsed.query_string, body, self.dispatchers, self.cores, self.metrics) catch |err| {
+        const response = api.handleRequest(self.allocator, parsed.method, path, parsed.query_string, body, self.ctx) catch |err| {
             std.log.warn("Dashboard API error: {}", .{err});
             self.sendError(client, .internal_server_error, "Internal server error");
             return;
@@ -257,33 +235,32 @@ pub const DashboardServer = struct {
         self.sendError(client, .not_found, "Dashboard not available");
     }
 
-    fn sendResponse(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: http.ContentType, body: []const u8, cors_headers: ?[]const u8) void {
-        self.sendResponseRaw(client, status, content_type.toString(), body, cors_headers);
+    fn sendResponse(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: http.ContentType, body_data: []const u8, cors_headers: ?[]const u8) void {
+        self.sendResponseRaw(client, status, content_type.toString(), body_data, cors_headers);
     }
 
-    fn sendResponseRaw(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body: []const u8, cors_headers: ?[]const u8) void {
-        _ = self;
-        var buf: [1024]u8 = undefined;
+    fn sendResponseRaw(_: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body_data: []const u8, cors_headers: ?[]const u8) void {
+        var hdr_buf: [1024]u8 = undefined;
         const cors = cors_headers orelse "";
         const response = std.fmt.bufPrint(
-            &buf,
+            &hdr_buf,
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "{s}" ++
                 "Connection: close\r\n" ++
                 "\r\n",
-            .{ status.statusLine(), content_type, body.len, cors },
+            .{ status.statusLine(), content_type, body_data.len, cors },
         ) catch return;
 
         _ = std.posix.write(client, response) catch return;
-        _ = std.posix.write(client, body) catch return;
+        _ = std.posix.write(client, body_data) catch return;
     }
 
     fn sendError(self: *Self, client: std.posix.socket_t, status: http.StatusCode, message: []const u8) void {
         var json_buf: [256]u8 = undefined;
-        const body = std.fmt.bufPrint(&json_buf, "{{\"error\":\"{s}\"}}", .{message}) catch return;
-        self.sendResponse(client, status, .json, body, null);
+        const body_data = std.fmt.bufPrint(&json_buf, "{{\"error\":\"{s}\"}}", .{message}) catch return;
+        self.sendResponse(client, status, .json, body_data, null);
     }
 
     fn getCorsHeaders(self: *Self, request: []const u8) ?[]const u8 {
@@ -296,7 +273,6 @@ pub const DashboardServer = struct {
                 const origin = std.mem.trim(u8, line[7..], " ");
                 // Check if origin is allowed
                 if (std.mem.indexOf(u8, self.config.cors_origins, origin) != null) {
-                    // Return CORS headers (stored in static buffer)
                     return "Access-Control-Allow-Origin: *\r\n" ++
                         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" ++
                         "Access-Control-Allow-Headers: Content-Type\r\n";
@@ -306,11 +282,11 @@ pub const DashboardServer = struct {
         return null;
     }
 
-    fn sendCorsPreflightResponse(self: *Self, client: std.posix.socket_t, cors_headers: ?[]const u8) void {
+    fn sendCorsPreflightResponse(_: *Self, client: std.posix.socket_t, cors_headers: ?[]const u8) void {
         const cors = cors_headers orelse "";
-        var buf: [512]u8 = undefined;
+        var hdr_buf: [512]u8 = undefined;
         const response = std.fmt.bufPrint(
-            &buf,
+            &hdr_buf,
             "HTTP/1.1 204 No Content\r\n" ++
                 "{s}" ++
                 "Content-Length: 0\r\n" ++
@@ -319,7 +295,6 @@ pub const DashboardServer = struct {
             .{cors},
         ) catch return;
         _ = std.posix.write(client, response) catch return;
-        _ = self;
     }
 
     /// Validate admin token if configured.
@@ -364,331 +339,12 @@ pub const DashboardServer = struct {
         try std.posix.getsockname(sock, @ptrCast(&addr), &len);
         return std.mem.bigToNative(u16, addr.port);
     }
-
-    // -----------------------------------------------------------------
-    // SSE Watch — spawn a detached thread for a live key subscription
-    // -----------------------------------------------------------------
-
-    /// Spawn a detached thread that owns `client` and streams SSE events.
-    /// The caller has already set `close_on_exit = false` so the socket
-    /// won't be closed by the defer in `handleConnection`.
-    fn spawnSSEWatcher(self: *Self, client: std.posix.socket_t, namespace: []const u8, key: []const u8, cors_headers: ?[]const u8) void {
-        // Heap-allocate everything the detached thread needs — the
-        // stack-local `request` buffer will be gone after we return.
-        const ns_copy = self.allocator.dupe(u8, namespace) catch {
-            std.posix.close(client);
-            return;
-        };
-        const key_copy = self.allocator.dupe(u8, key) catch {
-            self.allocator.free(ns_copy);
-            std.posix.close(client);
-            return;
-        };
-        const ctx = self.allocator.create(SSEContext) catch {
-            self.allocator.free(ns_copy);
-            self.allocator.free(key_copy);
-            std.posix.close(client);
-            return;
-        };
-        ctx.* = .{
-            .server = self,
-            .client = client,
-            .namespace = ns_copy,
-            .key = key_copy,
-            .cors_headers = cors_headers,
-        };
-
-        const thread = std.Thread.spawn(.{}, sseWatchLoop, .{ctx}) catch {
-            self.allocator.free(ns_copy);
-            self.allocator.free(key_copy);
-            self.allocator.destroy(ctx);
-            std.posix.close(client);
-            return;
-        };
-        thread.detach();
-    }
-
-    // -----------------------------------------------------------------
-    // SSE Workflow Watch — stream run status/history changes
-    // -----------------------------------------------------------------
-
-    fn spawnWorkflowSSEWatcher(self: *Self, client: std.posix.socket_t, namespace: []const u8, run_id: []const u8, cors_headers: ?[]const u8) void {
-        const ns_copy = self.allocator.dupe(u8, namespace) catch {
-            std.posix.close(client);
-            return;
-        };
-        const rid_copy = self.allocator.dupe(u8, run_id) catch {
-            self.allocator.free(ns_copy);
-            std.posix.close(client);
-            return;
-        };
-        const ctx = self.allocator.create(WorkflowSSEContext) catch {
-            self.allocator.free(ns_copy);
-            self.allocator.free(rid_copy);
-            std.posix.close(client);
-            return;
-        };
-        ctx.* = .{
-            .server = self,
-            .client = client,
-            .namespace = ns_copy,
-            .run_id = rid_copy,
-            .cors_headers = cors_headers,
-        };
-
-        const thread = std.Thread.spawn(.{}, workflowSSEWatchLoop, .{ctx}) catch {
-            self.allocator.free(ns_copy);
-            self.allocator.free(rid_copy);
-            self.allocator.destroy(ctx);
-            std.posix.close(client);
-            return;
-        };
-        thread.detach();
-    }
 };
 
 // =============================================================================
-// Helpers
+// SSE Path Parsers (path detection only — watch loops will be added
+// when shard inbox is wired)
 // =============================================================================
-
-/// Parse an IPv4 address string into bytes
-fn parseIpAddress(addr_str: []const u8) ![4]u8 {
-    var result: [4]u8 = undefined;
-    var parts = std.mem.splitScalar(u8, addr_str, '.');
-    var i: usize = 0;
-
-    while (parts.next()) |part| {
-        if (i >= 4) return error.InvalidAddress;
-        result[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
-        i += 1;
-    }
-
-    if (i != 4) return error.InvalidAddress;
-    return result;
-}
-
-// =============================================================================
-// SSE Workflow Watch — parse path and run poll loop
-// =============================================================================
-
-/// Result of parsing a workflow SSE watch path.
-const WorkflowSSEWatchTarget = struct {
-    namespace: []const u8,
-    run_id: []const u8,
-};
-
-/// Parse `workflow/namespaces/:ns/runs/:run_id/watch` from the API sub-path.
-fn parseWorkflowSSEPath(api_path: []const u8) ?WorkflowSSEWatchTarget {
-    const prefix = "workflow/namespaces/";
-    if (!std.mem.startsWith(u8, api_path, prefix)) return null;
-    const rest = api_path[prefix.len..];
-    const ns_end = std.mem.indexOf(u8, rest, "/") orelse return null;
-    const namespace = rest[0..ns_end];
-
-    const after_ns = rest[ns_end + 1 ..];
-    const runs_prefix = "runs/";
-    if (!std.mem.startsWith(u8, after_ns, runs_prefix)) return null;
-    const run_rest = after_ns[runs_prefix.len..];
-
-    const rid_end = std.mem.indexOf(u8, run_rest, "/") orelse return null;
-    const run_id = run_rest[0..rid_end];
-    const sub = run_rest[rid_end + 1 ..];
-
-    if (std.mem.eql(u8, sub, "watch")) {
-        return .{ .namespace = namespace, .run_id = run_id };
-    }
-    return null;
-}
-
-/// Heap-allocated context for the detached workflow SSE watcher thread.
-const WorkflowSSEContext = struct {
-    server: *DashboardServer,
-    client: std.posix.socket_t,
-    namespace: []const u8,
-    run_id: []const u8,
-    cors_headers: ?[]const u8,
-};
-
-fn workflowSSEWatchLoop(ctx: *WorkflowSSEContext) void {
-    const server = ctx.server;
-    const allocator = server.allocator;
-
-    defer {
-        std.log.info("SSE workflow watch ended: ns={s} run={s}", .{ ctx.namespace, ctx.run_id });
-        std.posix.close(ctx.client);
-        allocator.free(ctx.namespace);
-        allocator.free(ctx.run_id);
-        allocator.destroy(ctx);
-    }
-
-    std.log.info("SSE workflow watch started: ns={s} run={s}", .{ ctx.namespace, ctx.run_id });
-
-    // Disable Nagle so each SSE frame flushes immediately.
-    const nodelay: u32 = 1;
-    std.posix.setsockopt(ctx.client, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay)) catch {};
-
-    // ---- Send SSE response headers ----
-    const cors = if (ctx.cors_headers) |c| c else "";
-    var hdr_buf: [512]u8 = undefined;
-    const headers = std.fmt.bufPrint(
-        &hdr_buf,
-        "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/event-stream\r\n" ++
-            "Cache-Control: no-cache\r\n" ++
-            "X-Accel-Buffering: no\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "{s}" ++
-            "\r\n",
-        .{cors},
-    ) catch return;
-    _ = std.posix.write(ctx.client, headers) catch return;
-
-    _ = std.posix.write(ctx.client,
-        "event: connected\ndata: {\"status\":\"ok\"}\n\n",
-    ) catch return;
-
-    // ---- Poll loop ----
-    var last_status: ?[]const u8 = null;
-    defer if (last_status) |s| allocator.free(s);
-    var last_event_count: u64 = 0;
-    var heartbeat_counter: u32 = 0;
-    var terminal = false;
-
-    while (server.running.load(.acquire) and !terminal) {
-        if (server.dispatchers.len == 0) break;
-
-        // Use the first dispatcher for workflow commands (dispatcher routes internally)
-        const dispatcher = server.dispatchers[0];
-        const request_id: u64 = 0;
-        const client_id: u64 = 0;
-
-        // --- Fetch status ---
-        const status_result = dispatcher.dispatch(.{
-            .workflow_status = .{
-                .namespace = ctx.namespace,
-                .run_id = ctx.run_id,
-            },
-        }, client_id, request_id, null) catch {
-            std.Thread.sleep(500_000_000);
-            heartbeat_counter += 1;
-            if (heartbeat_counter >= 30) {
-                heartbeat_counter = 0;
-                _ = std.posix.write(ctx.client, ":heartbeat\n\n") catch return;
-            }
-            continue;
-        };
-
-        if (status_result) |sr| {
-            switch (sr) {
-                .workflow_status_result => |s| {
-                    const changed = if (last_status) |ls| !std.mem.eql(u8, ls, s.data) else true;
-                    if (changed) {
-                        // Send status event
-                        var frame = std.ArrayList(u8){};
-                        defer frame.deinit(allocator);
-                        const w = frame.writer(allocator);
-                        w.writeAll("event: status\ndata: ") catch continue;
-                        w.writeAll(s.data) catch continue;
-                        w.writeAll("\n\n") catch continue;
-                        _ = std.posix.write(ctx.client, frame.items) catch return;
-
-                        // Track last status
-                        if (last_status) |ls| allocator.free(ls);
-                        last_status = allocator.dupe(u8, s.data) catch null;
-
-                        // Check terminal state
-                        if (std.mem.indexOf(u8, s.data, "\"completed\"") != null or
-                            std.mem.indexOf(u8, s.data, "\"failed\"") != null or
-                            std.mem.indexOf(u8, s.data, "\"cancelled\"") != null or
-                            std.mem.indexOf(u8, s.data, "\"timed_out\"") != null)
-                        {
-                            terminal = true;
-                        }
-                    }
-                    allocator.free(s.data);
-                },
-                .err => |e| {
-                    // Not found — send error and close
-                    var frame = std.ArrayList(u8){};
-                    defer frame.deinit(allocator);
-                    const w = frame.writer(allocator);
-                    w.writeAll("event: error\ndata: {\"error\":\"") catch return;
-                    w.writeAll(e.message) catch return;
-                    w.writeAll("\"}\n\n") catch return;
-                    _ = std.posix.write(ctx.client, frame.items) catch {};
-                    return;
-                },
-                else => {},
-            }
-        }
-
-        // --- Fetch history for event count ---
-        const history_result = dispatcher.dispatch(.{
-            .workflow_history = .{
-                .namespace = ctx.namespace,
-                .run_id = ctx.run_id,
-                .limit = 200,
-            },
-        }, client_id, request_id, null) catch null;
-
-        if (history_result) |hr| {
-            switch (hr) {
-                .workflow_history_result => |h| {
-                    // Count events (number of objects in JSON array)
-                    var count: u64 = 0;
-                    for (h.data) |c| {
-                        if (c == '{') count += 1;
-                    }
-                    if (count != last_event_count) {
-                        last_event_count = count;
-                        // Send full history
-                        var frame = std.ArrayList(u8){};
-                        defer frame.deinit(allocator);
-                        const w = frame.writer(allocator);
-                        w.writeAll("event: history\ndata: ") catch continue;
-                        w.writeAll(h.data) catch continue;
-                        w.writeAll("\n\n") catch continue;
-                        _ = std.posix.write(ctx.client, frame.items) catch return;
-                    }
-                    allocator.free(h.data);
-                },
-                else => {},
-            }
-        }
-
-        // Heartbeat every ~15 s.
-        heartbeat_counter += 1;
-        if (heartbeat_counter >= 30) {
-            heartbeat_counter = 0;
-            _ = std.posix.write(ctx.client, ":heartbeat\n\n") catch return;
-        }
-
-        // Send terminal event and stop polling
-        if (terminal) {
-            _ = std.posix.write(ctx.client, "event: terminal\ndata: {\"done\":true}\n\n") catch {};
-            // Give client 1s to process before closing
-            std.Thread.sleep(1_000_000_000);
-            return;
-        }
-
-        std.Thread.sleep(500_000_000); // 500 ms
-    }
-}
-
-// =============================================================================
-// SSE KV Watch — parse path and run poll loop
-// =============================================================================
-//
-// SSE connections are long-lived: the HTTP socket stays open and the server
-// pushes `data:` frames whenever the key's version changes. A detached thread
-// owns each SSE socket so the main accept-loop is never blocked.
-//
-// Path: GET /api/v1/kv/namespaces/:ns/keys/:key/watch
-//
-// Events emitted:
-//   event: update   — key value changed (includes full value + version)
-//   event: delete   — key was deleted
-//   :heartbeat      — keep-alive comment every ~15 s
 
 /// Result of parsing an SSE watch path.
 const SSEWatchTarget = struct {
@@ -720,168 +376,98 @@ fn parseSSEWatchPath(api_path: []const u8) ?SSEWatchTarget {
     return null;
 }
 
-/// Heap-allocated context for the detached SSE watcher thread.
-const SSEContext = struct {
-    server: *DashboardServer,
-    client: std.posix.socket_t,
-    namespace: []const u8, // owned
-    key: []const u8, // owned
-    cors_headers: ?[]const u8, // static/comptime — NOT owned
+/// Result of parsing a workflow SSE watch path.
+const WorkflowSSEWatchTarget = struct {
+    namespace: []const u8,
+    run_id: []const u8,
 };
 
-/// Entry point called from `sseWatchLoop` (the detached thread).
-/// Polls the KV store for the watched key every 500 ms and pushes SSE
-/// frames whenever the version changes (or the key is deleted).
-fn sseWatchLoop(ctx: *SSEContext) void {
-    const server = ctx.server;
-    const allocator = server.allocator;
+/// Parse `workflow/namespaces/:ns/runs/:run_id/watch` from the API sub-path.
+fn parseWorkflowSSEPath(api_path: []const u8) ?WorkflowSSEWatchTarget {
+    const prefix = "workflow/namespaces/";
+    if (!std.mem.startsWith(u8, api_path, prefix)) return null;
+    const rest = api_path[prefix.len..];
+    const ns_end = std.mem.indexOf(u8, rest, "/") orelse return null;
+    const namespace = rest[0..ns_end];
 
-    defer {
-        std.log.info("SSE watch ended: ns={s} key={s}", .{ ctx.namespace, ctx.key });
-        // We own the socket — close it when we exit.
-        // NOTE: Do NOT call setsockopt(SO_LINGER) here. When the browser
-        // closes the SSE connection the socket is in a reset state, and
-        // setsockopt may return EINVAL which Zig maps to `unreachable`,
-        // crashing the thread. A plain close() is safe and sufficient
-        // for long-lived SSE connections.
-        std.posix.close(ctx.client);
+    const after_ns = rest[ns_end + 1 ..];
+    const runs_prefix = "runs/";
+    if (!std.mem.startsWith(u8, after_ns, runs_prefix)) return null;
+    const run_rest = after_ns[runs_prefix.len..];
 
-        // Free heap copies of namespace / key.
-        allocator.free(ctx.namespace);
-        allocator.free(ctx.key);
-        allocator.destroy(ctx);
+    const rid_end = std.mem.indexOf(u8, run_rest, "/") orelse return null;
+    const run_id = run_rest[0..rid_end];
+    const sub = run_rest[rid_end + 1 ..];
+
+    if (std.mem.eql(u8, sub, "watch")) {
+        return .{ .namespace = namespace, .run_id = run_id };
     }
-
-    std.log.info("SSE watch started: ns={s} key={s}", .{ ctx.namespace, ctx.key });
-
-    // Disable Nagle's algorithm so each write() flushes immediately.
-    // Without this, the kernel buffers small SSE events (~200 bytes)
-    // waiting for more data, delaying delivery to the browser.
-    const nodelay: u32 = 1;
-    std.posix.setsockopt(ctx.client, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay)) catch {};
-
-    // ---- Send SSE response headers ----
-    const cors = if (ctx.cors_headers) |c| c else "";
-    var hdr_buf: [512]u8 = undefined;
-    const headers = std.fmt.bufPrint(
-        &hdr_buf,
-        "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/event-stream\r\n" ++
-            "Cache-Control: no-cache\r\n" ++
-            "X-Accel-Buffering: no\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "{s}" ++
-            "\r\n",
-        .{cors},
-    ) catch return;
-    _ = std.posix.write(ctx.client, headers) catch return;
-
-    // Send an initial "connected" event so the frontend knows the
-    // stream is alive before the first poll fires.
-    _ = std.posix.write(ctx.client,
-        "event: connected\ndata: {\"status\":\"ok\"}\n\n",
-    ) catch return;
-
-    // ---- Poll loop ----
-    var last_version: u64 = 0;
-    var heartbeat_counter: u32 = 0;
-
-    while (server.running.load(.acquire)) {
-        if (server.dispatchers.len == 0) break;
-
-        const helpers = @import("api/helpers.zig");
-        const target = helpers.routeToShard(server.dispatchers, ctx.namespace, ctx.key);
-
-        const maybe_result = target.dispatch(.{
-            .kv_get = .{
-                .namespace = ctx.namespace,
-                .key = ctx.key,
-                .version = null,
-            },
-        }, 0, 0, null) catch |err| {
-            std.log.warn("SSE dispatch error for {s}/{s}: {}", .{ ctx.namespace, ctx.key, err });
-            std.Thread.sleep(500_000_000);
-            heartbeat_counter += 1;
-            continue;
-        };
-
-        if (maybe_result) |res| {
-            switch (res) {
-                .kv_value => |v| {
-                    defer allocator.free(v.value);
-                    if (v.version != last_version) {
-                        last_version = v.version;
-                        std.log.info("SSE update: {s}/{s} v{d}", .{ ctx.namespace, ctx.key, v.version });
-                        // Build JSON via ArrayList + ObjectBuilder so value is
-                        // properly escaped (may contain quotes, newlines, etc.).
-                        const event_json = buildUpdateEvent(allocator, ctx.key, ctx.namespace, v.value, v.version) catch continue;
-                        defer allocator.free(event_json);
-                        _ = std.posix.write(ctx.client, event_json) catch return;
-                    }
-                },
-                .kv_not_found => {
-                    if (last_version != 0) {
-                        last_version = 0;
-                        std.log.info("SSE delete: {s}/{s}", .{ ctx.namespace, ctx.key });
-                        const event_json = buildDeleteEvent(allocator, ctx.key, ctx.namespace) catch continue;
-                        defer allocator.free(event_json);
-                        _ = std.posix.write(ctx.client, event_json) catch return;
-                    }
-                },
-                else => {},
-            }
-        } else {
-            std.log.debug("SSE dispatch returned null for {s}/{s}", .{ ctx.namespace, ctx.key });
-        }
-
-        // Heartbeat comment every ~15 s (30 × 500 ms) to keep proxies happy.
-        heartbeat_counter += 1;
-        if (heartbeat_counter >= 30) {
-            heartbeat_counter = 0;
-            _ = std.posix.write(ctx.client, ":heartbeat\n\n") catch return;
-        }
-
-        std.Thread.sleep(500_000_000); // 500 ms
-    }
+    return null;
 }
 
-/// Build an `event: update\ndata: {...}\n\n` SSE frame with properly
-/// escaped JSON (values may contain quotes, newlines, binary, etc.).
-fn buildUpdateEvent(allocator: Allocator, key: []const u8, namespace: []const u8, value: []const u8, version: u64) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+/// Parse an IPv4 address string into bytes
+fn parseIpAddress(addr_str: []const u8) ![4]u8 {
+    var result: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, addr_str, '.');
+    var i: usize = 0;
 
-    try w.writeAll("event: update\ndata: ");
+    while (parts.next()) |part| {
+        if (i >= 4) return error.InvalidAddress;
+        result[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
+        i += 1;
+    }
 
-    var obj = json.ObjectBuilder(@TypeOf(w)).init(w);
-    try obj.begin();
-    try obj.stringField("key", key);
-    try obj.stringField("namespace", namespace);
-    try obj.stringField("value", value);
-    try obj.intField("version", version);
-    try obj.boolField("found", true);
-    try obj.end();
-
-    try w.writeAll("\n\n");
-    return try buf.toOwnedSlice(allocator);
+    if (i != 4) return error.InvalidAddress;
+    return result;
 }
 
-/// Build an `event: delete\ndata: {...}\n\n` SSE frame.
-fn buildDeleteEvent(allocator: Allocator, key: []const u8, namespace: []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+// =============================================================================
+// Tests
+// =============================================================================
 
-    try w.writeAll("event: delete\ndata: ");
+test "parseIpAddress valid" {
+    const addr = try parseIpAddress("127.0.0.1");
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, addr);
+}
 
-    var obj = json.ObjectBuilder(@TypeOf(w)).init(w);
-    try obj.begin();
-    try obj.stringField("key", key);
-    try obj.stringField("namespace", namespace);
-    try obj.boolField("found", false);
-    try obj.end();
+test "parseIpAddress invalid" {
+    const result = parseIpAddress("not.an.ip");
+    try std.testing.expectError(error.InvalidAddress, result);
+}
 
-    try w.writeAll("\n\n");
-    return try buf.toOwnedSlice(allocator);
+test "parseSSEWatchPath correct" {
+    const target = parseSSEWatchPath("kv/namespaces/default/keys/mykey/watch");
+    try std.testing.expect(target != null);
+    try std.testing.expectEqualStrings("default", target.?.namespace);
+    try std.testing.expectEqualStrings("mykey", target.?.key);
+}
+
+test "parseSSEWatchPath no watch suffix" {
+    const target = parseSSEWatchPath("kv/namespaces/default/keys/mykey");
+    try std.testing.expect(target == null);
+}
+
+test "parseSSEWatchPath unrelated path" {
+    const target = parseSSEWatchPath("streams/events");
+    try std.testing.expect(target == null);
+}
+
+test "parseWorkflowSSEPath correct" {
+    const target = parseWorkflowSSEPath("workflow/namespaces/default/runs/run-123/watch");
+    try std.testing.expect(target != null);
+    try std.testing.expectEqualStrings("default", target.?.namespace);
+    try std.testing.expectEqualStrings("run-123", target.?.run_id);
+}
+
+test "parseWorkflowSSEPath no watch suffix" {
+    const target = parseWorkflowSSEPath("workflow/namespaces/default/runs/run-123");
+    try std.testing.expect(target == null);
+}
+
+test "DashboardServerConfig defaults" {
+    const config = DashboardServerConfig{};
+    try std.testing.expectEqual(@as(u16, 9080), config.port);
+    try std.testing.expectEqualStrings("127.0.0.1", config.bind);
+    try std.testing.expectEqualStrings("*", config.cors_origins);
+    try std.testing.expectEqualStrings("", config.admin_token);
 }

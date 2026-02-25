@@ -7,30 +7,26 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
-const Dispatcher = h.Dispatcher;
-const MetricsRegistry = h.MetricsRegistry;
-const queue_handler = @import("../../../queue/handler.zig");
+const DashboardContext = h.DashboardContext;
 
 /// GET /queues - List all queues
-pub fn getQueues(allocator: Allocator, dispatchers: []*Dispatcher, metrics: *MetricsRegistry) ![]const u8 {
-    _ = dispatchers;
-
-    var json_buf = std.ArrayList(u8){};
+pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+    var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    metrics.mutex.lock();
-    defer metrics.mutex.unlock();
+    ctx.metrics.mutex.lock();
+    defer ctx.metrics.mutex.unlock();
 
-    var it = metrics.queues.iterator();
+    var it = ctx.metrics.queues.iterator();
     while (it.next()) |entry| {
         const queue_entry = entry.value_ptr.*;
 
         // Skip internal/system queues (prefixed with '_')
-        if (queue_handler.isInternalQueue(queue_entry.queue)) continue;
+        if (queue_entry.queue.len > 0 and queue_entry.queue[0] == '_') continue;
 
         try arr.next();
         const snap = queue_entry.metrics.snapshot();
@@ -55,10 +51,8 @@ pub fn getQueues(allocator: Allocator, dispatchers: []*Dispatcher, metrics: *Met
 }
 
 /// GET /queues/:name - Queue detail
-pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, dispatchers: []*Dispatcher, metrics: *MetricsRegistry) ![]const u8 {
-    _ = dispatchers;
-
-    var json_buf = std.ArrayList(u8){};
+pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+    var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
@@ -66,11 +60,11 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, dispatchers:
     try obj.begin();
     try obj.stringField("name", queue_name);
 
-    metrics.mutex.lock();
-    defer metrics.mutex.unlock();
+    ctx.metrics.mutex.lock();
+    defer ctx.metrics.mutex.unlock();
 
     var found = false;
-    var it = metrics.queues.iterator();
+    var it = ctx.metrics.queues.iterator();
     while (it.next()) |entry| {
         const queue_entry = entry.value_ptr.*;
         if (std.mem.eql(u8, queue_entry.queue, queue_name)) {
@@ -104,4 +98,31 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, dispatchers:
 
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "getQueues returns empty array when no queues registered" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try getQueues(allocator, &ctx);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "getQueueDetail returns zeroed queue for unknown name" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try getQueueDetail(allocator, "unknown", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"pending\":0") != null);
 }

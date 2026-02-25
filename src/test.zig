@@ -73,3 +73,19 @@ test {
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
 }
+
+// Dashboard — Phase 6.1
+test {
+    _ = @import("node/dashboard/api/helpers.zig");
+    _ = @import("node/dashboard/api/system.zig");
+    _ = @import("node/dashboard/api/queues.zig");
+    _ = @import("node/dashboard/api/kv.zig");
+    _ = @import("node/dashboard/api/streams.zig");
+    _ = @import("node/dashboard/api/namespaces.zig");
+    _ = @import("node/dashboard/api/timeseries.zig");
+    _ = @import("node/dashboard/api/actions.zig");
+    _ = @import("node/dashboard/api/workflows.zig");
+    _ = @import("node/dashboard/api/processing.zig");
+    _ = @import("node/dashboard/api.zig");
+    _ = @import("node/dashboard/http_server.zig");
+}

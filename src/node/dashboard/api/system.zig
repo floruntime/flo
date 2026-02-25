@@ -7,15 +7,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
-const Dispatcher = h.Dispatcher;
-const MetricsRegistry = h.MetricsRegistry;
+const DashboardContext = h.DashboardContext;
 
 /// GET /cluster/stats - Cluster health and statistics
-pub fn getClusterStats(allocator: Allocator, dispatchers: []*Dispatcher, metrics: *MetricsRegistry) ![]const u8 {
-    const server_metrics = metrics.server.snapshot();
-    const num_shards = dispatchers.len;
+pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+    const server_metrics = ctx.metrics.server.snapshot();
+    const num_shards = ctx.num_shards;
 
-    const uptime_secs = server_metrics.uptime_seconds;
+    const uptime_secs = ctx.uptimeSeconds();
     const days = uptime_secs / 86400;
     const hours = (uptime_secs % 86400) / 3600;
     const mins = (uptime_secs % 3600) / 60;
@@ -23,7 +22,7 @@ pub fn getClusterStats(allocator: Allocator, dispatchers: []*Dispatcher, metrics
     var uptime_buf: [64]u8 = undefined;
     const uptime_str = std.fmt.bufPrint(&uptime_buf, "{d}d {d}h {d}m", .{ days, hours, mins }) catch "0d 0h 0m";
 
-    var json_buf = std.ArrayList(u8){};
+    var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
@@ -44,7 +43,7 @@ pub fn getClusterStats(allocator: Allocator, dispatchers: []*Dispatcher, metrics
     var nodes_arr = try obj.arrayField("nodes");
     try nodes_arr.begin();
 
-    for (0..dispatchers.len) |i| {
+    for (0..num_shards) |i| {
         try nodes_arr.next();
         var node_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
         try node_obj.begin();
@@ -64,10 +63,10 @@ pub fn getClusterStats(allocator: Allocator, dispatchers: []*Dispatcher, metrics
 }
 
 /// GET /metrics - Metrics in JSON format
-pub fn getMetricsJson(allocator: Allocator, metrics: *MetricsRegistry) ![]const u8 {
-    const server_metrics = metrics.server.snapshot();
+pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+    const server_metrics = ctx.metrics.server.snapshot();
 
-    var json_buf = std.ArrayList(u8){};
+    var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
@@ -81,14 +80,14 @@ pub fn getMetricsJson(allocator: Allocator, metrics: *MetricsRegistry) ![]const 
     try server_obj.intField("commands_total", server_metrics.commands_total);
     try server_obj.intField("bytes_received", server_metrics.bytes_received);
     try server_obj.intField("bytes_sent", server_metrics.bytes_sent);
-    try server_obj.intField("uptime_seconds", server_metrics.uptime_seconds);
+    try server_obj.intField("uptime_seconds", ctx.uptimeSeconds());
     try server_obj.end();
 
-    try obj.intField("streams", metrics.streamCount());
-    try obj.intField("queues", metrics.queueCount());
-    try obj.intField("kv_namespaces", metrics.kvNamespaceCount());
+    try obj.intField("streams", ctx.metrics.streamCount());
+    try obj.intField("queues", ctx.metrics.queueCount());
+    try obj.intField("kv_namespaces", ctx.metrics.kvNamespaceCount());
 
-    const wf = metrics.workflow.snapshot();
+    const wf = ctx.metrics.workflow.snapshot();
     var wf_obj = try obj.objectField("workflows");
     try wf_obj.begin();
     try wf_obj.intField("active_runs", wf.active_runs);
@@ -105,4 +104,42 @@ pub fn getMetricsJson(allocator: Allocator, metrics: *MetricsRegistry) ![]const 
 
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "getClusterStats returns valid JSON" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 2);
+
+    const result = try getClusterStats(allocator, &ctx);
+    defer allocator.free(result);
+
+    // Should contain key fields
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"rps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"num_shards\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "shard-0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "shard-1") != null);
+}
+
+test "getMetricsJson returns valid JSON" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try getMetricsJson(allocator, &ctx);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"server\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"workflows\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"streams\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"queues\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"kv_namespaces\"") != null);
 }

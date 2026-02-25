@@ -1,31 +1,53 @@
 //! Dashboard API Shared Helpers
 //!
 //! Reusable utilities for all API domain modules:
+//! - DashboardContext: Central context for all dashboard API handlers
 //! - BinaryReader: Safe little-endian binary wire format parser
 //! - Query parameter parsing (generic over int types + string)
-//! - Route-to-shard helper (hash-based routing)
 //! - JSON error responses
-//! - Stream discovery from state engines (used by streams, namespaces, groups)
-//! - Discovered* types + free helpers for actions, workers, runs
+//! - Run statistics types + JSON helpers
 
 const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 pub const json = @import("../../../util/json.zig");
-pub const routing = @import("../../dispatch/routing.zig");
-pub const Dispatcher = @import("../../dispatch/dispatcher.zig").Dispatcher;
-pub const Core = @import("../../core/core.zig").Core;
 pub const MetricsRegistry = @import("../../../metrics/registry.zig").MetricsRegistry;
-pub const protocol = @import("../../protocol/result.zig");
-pub const Command = protocol.Command;
-pub const StartOffset = protocol.StartOffset;
-pub const CommandResult = @import("../../protocol/result.zig").CommandResult;
-pub const Tier = @import("../../../engine/consensus/mod.zig").Tier;
-pub const StateEngine = @import("../../../engine/state/mod.zig").StateEngine;
-pub const ActionMeta = @import("../../../actions/types.zig").ActionMeta;
-pub const ActionRun = @import("../../../actions/types.zig").ActionRun;
-pub const WorkerMeta = @import("../../../actions/types.zig").WorkerMeta;
-pub const action_keys = @import("../../../actions/keys.zig");
+
+// =============================================================================
+// Dashboard Context — Central context for all dashboard API handlers
+// =============================================================================
+
+/// Central context providing data access for dashboard API handlers.
+///
+/// In the new shard architecture, the dashboard thread communicates with
+/// shards via inbox messages. DashboardContext encapsulates this pattern
+/// and provides metrics access for statistics endpoints.
+///
+/// During the rewrite, handlers that need shard data return properly-shaped
+/// JSON with empty/zero values. As the runtime matures, DashboardContext
+/// will be extended with inbox-based shard queries.
+pub const DashboardContext = struct {
+    allocator: Allocator,
+    metrics: *MetricsRegistry,
+    num_shards: u32,
+    start_time: i64,
+
+    pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
+        return .{
+            .allocator = allocator,
+            .metrics = metrics,
+            .num_shards = num_shards,
+            .start_time = std.time.timestamp(),
+        };
+    }
+
+    /// Get uptime in seconds
+    pub fn uptimeSeconds(self: *const DashboardContext) u64 {
+        const now = std.time.timestamp();
+        const diff = now - self.start_time;
+        return if (diff > 0) @intCast(diff) else 0;
+    }
+};
 
 // =============================================================================
 // BinaryReader — Safe little-endian binary wire format parser
@@ -90,7 +112,7 @@ pub const BinaryReader = struct {
         return slice;
     }
 
-    /// Read a length-prefixed byte slice. The length prefix type is compile-time selected.
+    /// Read a length-prefixed byte slice.
     pub fn readLenPrefixed(self: *BinaryReader, comptime LenType: type) ?[]const u8 {
         const len: usize = switch (LenType) {
             u16 => @intCast(self.readU16() orelse return null),
@@ -126,237 +148,26 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
 }
 
 // =============================================================================
-// Shard Routing
-// =============================================================================
-
-/// Hash-route a namespaced key to the owning dispatcher (shard).
-/// Delegates to Dispatcher.shardForKey so the routing logic lives in one place.
-pub fn routeToShard(dispatchers: []*Dispatcher, namespace: []const u8, key: []const u8) *Dispatcher {
-    if (dispatchers.len == 0) return dispatchers[0];
-    const owner = dispatchers[0].shardForKey(namespace, key);
-    return if (owner < dispatchers.len) dispatchers[owner] else dispatchers[0];
-}
-
-// =============================================================================
 // JSON Error Response
 // =============================================================================
 
 /// Create JSON error response: {"error":"<message>"}
 pub fn jsonError(allocator: Allocator, message: []const u8) ![]const u8 {
-    var json_buf = std.ArrayList(u8){};
+    var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
 
-    try std.fmt.format(json_buf.writer(allocator),
-        \\{{"error":"{s}"}}
-    , .{message});
+    const writer = json_buf.writer(allocator);
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("error", message);
+    try obj.end();
 
     return try json_buf.toOwnedSlice(allocator);
 }
 
 // =============================================================================
-// Stream Discovery — Shared by streams, namespaces, and consumer group endpoints
+// Run Statistics Types + JSON Helpers
 // =============================================================================
-
-/// Stream info discovered from state engine scan
-pub const DiscoveredStream = struct {
-    name: []const u8,
-    namespace: []const u8,
-    partition_count: u32,
-};
-
-/// Scan all cores' state engines for streams.
-/// Key format in state engine: "ns:{namespace}:stream:{topic}:info"
-/// Caller owns returned slice and must free via `freeDiscoveredStreams`.
-pub fn scanStreamsFromCores(allocator: Allocator, cores: ?[]*Core, ns_filter: ?[]const u8) ![]DiscoveredStream {
-    const c = cores orelse return try allocator.alloc(DiscoveredStream, 0);
-    if (c.len == 0) return try allocator.alloc(DiscoveredStream, 0);
-
-    var streams: std.ArrayList(DiscoveredStream) = .empty;
-    errdefer {
-        for (streams.items) |s| {
-            allocator.free(s.name);
-            allocator.free(s.namespace);
-        }
-        streams.deinit(allocator);
-    }
-
-    for (c) |core| {
-        const state = core.state_engine;
-
-        var prefix_buf: [256]u8 = undefined;
-        const prefix = if (ns_filter) |ns|
-            std.fmt.bufPrint(&prefix_buf, "ns:{s}:stream:", .{ns}) catch continue
-        else
-            std.fmt.bufPrint(&prefix_buf, "ns:", .{}) catch continue;
-
-        var iter = state.scan(prefix);
-
-        while (iter.next()) |entry| {
-            const key = entry.key;
-
-            if (!std.mem.endsWith(u8, key, ":info")) continue;
-
-            const ns_start = if (std.mem.startsWith(u8, key, "ns:")) @as(usize, 3) else continue;
-            const stream_marker = std.mem.indexOf(u8, key[ns_start..], ":stream:") orelse continue;
-            const namespace = key[ns_start .. ns_start + stream_marker];
-
-            const after_stream = key[ns_start + stream_marker + 8 ..];
-            const colon_idx = std.mem.lastIndexOf(u8, after_stream, ":") orelse continue;
-            const topic = after_stream[0..colon_idx];
-
-            if (topic.len == 0) continue;
-
-            var found = false;
-            for (streams.items) |s| {
-                if (std.mem.eql(u8, s.name, topic) and std.mem.eql(u8, s.namespace, namespace)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                const name_copy = try allocator.dupe(u8, topic);
-                errdefer allocator.free(name_copy);
-                const ns_copy = try allocator.dupe(u8, namespace);
-                errdefer allocator.free(ns_copy);
-                try streams.append(allocator, .{
-                    .name = name_copy,
-                    .namespace = ns_copy,
-                    .partition_count = 1,
-                });
-            }
-        }
-    }
-
-    return try streams.toOwnedSlice(allocator);
-}
-
-/// Free a slice returned by `scanStreamsFromCores`.
-pub fn freeDiscoveredStreams(allocator: Allocator, discovered: []DiscoveredStream) void {
-    for (discovered) |s| {
-        allocator.free(s.name);
-        allocator.free(s.namespace);
-    }
-    allocator.free(discovered);
-}
-
-/// Scan streams and find the namespace for a given stream name.
-/// Returns the namespace (slice into discovered) and the discovered list.
-/// Caller must call `freeDiscoveredStreams` on the returned `.discovered`.
-pub fn discoverStreamNamespace(
-    allocator: Allocator,
-    cores: ?[]*Core,
-    stream_name: []const u8,
-) !struct { ns: []const u8, discovered: []DiscoveredStream } {
-    const discovered = try scanStreamsFromCores(allocator, cores, null);
-    var ns: []const u8 = "default";
-    for (discovered) |s| {
-        if (std.mem.eql(u8, s.name, stream_name)) {
-            ns = s.namespace;
-            break;
-        }
-    }
-    return .{ .ns = ns, .discovered = discovered };
-}
-
-/// Count streams per namespace by scanning state engines
-pub fn countStreamsInNamespace(cores: ?[]*Core, namespace: []const u8) u32 {
-    const c = cores orelse return 0;
-    if (c.len == 0) return 0;
-
-    var count: u32 = 0;
-    var seen_buf: [64][]const u8 = undefined;
-    var seen_count: usize = 0;
-
-    for (c) |core| {
-        const state = core.state_engine;
-
-        var prefix_buf: [256]u8 = undefined;
-        const prefix = std.fmt.bufPrint(&prefix_buf, "ns:{s}:stream:", .{namespace}) catch continue;
-        var iter = state.scan(prefix);
-
-        while (iter.next()) |entry| {
-            const key = entry.key;
-            if (!std.mem.endsWith(u8, key, ":info")) continue;
-
-            const after_prefix = key[prefix.len..];
-            const colon_idx = std.mem.lastIndexOf(u8, after_prefix, ":") orelse continue;
-            const topic = after_prefix[0..colon_idx];
-            if (topic.len == 0) continue;
-
-            var found = false;
-            for (seen_buf[0..seen_count]) |s| {
-                if (std.mem.eql(u8, s, topic)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found and seen_count < seen_buf.len) {
-                seen_buf[seen_count] = topic;
-                seen_count += 1;
-                count += 1;
-            }
-        }
-    }
-    return count;
-}
-
-// =============================================================================
-// Action/Worker/Run Types + Free Helpers
-// =============================================================================
-
-/// Discovered action from state engine scan
-pub const DiscoveredAction = struct {
-    name: []const u8,
-    namespace: []const u8,
-    action_type: []const u8,
-    owner: []const u8,
-    description: []const u8,
-    version: []const u8,
-    enabled: bool,
-    timeout_ms: u32,
-    max_retries: u32,
-    retry_delay_ms: u32,
-    trigger_stream: []const u8,
-    trigger_group: []const u8,
-    created_at: i64,
-    updated_at: i64,
-};
-
-pub fn freeDiscoveredActions(allocator: Allocator, discovered: []DiscoveredAction) void {
-    for (discovered) |a| {
-        allocator.free(a.name);
-        allocator.free(a.namespace);
-        allocator.free(a.action_type);
-        allocator.free(a.owner);
-        allocator.free(a.description);
-        allocator.free(a.version);
-        allocator.free(a.trigger_stream);
-        allocator.free(a.trigger_group);
-    }
-    allocator.free(discovered);
-}
-
-/// Discovered worker from state engine scan
-pub const DiscoveredWorker = struct {
-    worker_id: []const u8,
-    namespace: []const u8,
-    task_types: []const u8,
-    healthy: bool,
-    current_load: u8,
-    max_concurrent: u32,
-    active_tasks: u32,
-    last_seen: i64,
-    registered_at: i64,
-};
-
-pub fn freeDiscoveredWorkers(allocator: Allocator, discovered: []DiscoveredWorker) void {
-    for (discovered) |w| {
-        allocator.free(w.worker_id);
-        allocator.free(w.namespace);
-        allocator.free(w.task_types);
-    }
-    allocator.free(discovered);
-}
 
 /// Run statistics counters
 pub const RunCounts = struct {
@@ -369,33 +180,9 @@ pub const RunCounts = struct {
     timed_out: u32 = 0,
 };
 
-/// Discovered run from state engine scan
-pub const DiscoveredRun = struct {
-    run_id: []const u8,
-    status: []const u8,
-    attempt: u32,
-    created_at: i64,
-    started_at: i64,
-    completed_at: i64,
-    worker_id: []const u8,
-    error_message: []const u8,
-    outcome: []const u8,
-};
-
-pub fn freeDiscoveredRuns(allocator: Allocator, runs: []DiscoveredRun) void {
-    for (runs) |r| {
-        allocator.free(r.run_id);
-        allocator.free(r.status);
-        if (r.worker_id.len > 0) allocator.free(r.worker_id);
-        if (r.error_message.len > 0) allocator.free(r.error_message);
-        if (r.outcome.len > 0) allocator.free(r.outcome);
-    }
-    allocator.free(runs);
-}
-
 /// Write RunCounts as a nested JSON object field
-pub fn writeRunCountsJson(obj: anytype, counts: RunCounts) !void {
-    var runs_obj = try obj.objectField("runs");
+pub fn writeRunCountsJson(writer: anytype, counts: RunCounts) !void {
+    var runs_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try runs_obj.begin();
     try runs_obj.intField("total", counts.total);
     try runs_obj.intField("pending", counts.pending);
@@ -407,15 +194,65 @@ pub fn writeRunCountsJson(obj: anytype, counts: RunCounts) !void {
     try runs_obj.end();
 }
 
-/// Write a DiscoveredRun as JSON fields into an object builder
-pub fn writeRunJson(obj: anytype, run: DiscoveredRun) !void {
-    try obj.stringField("run_id", run.run_id);
-    try obj.stringField("status", run.status);
-    try obj.intField("attempt", run.attempt);
-    try obj.intField("created_at", run.created_at);
-    if (run.started_at != 0) try obj.intField("started_at", run.started_at);
-    if (run.completed_at != 0) try obj.intField("completed_at", run.completed_at);
-    if (run.worker_id.len > 0) try obj.stringField("worker_id", run.worker_id);
-    if (run.error_message.len > 0) try obj.stringField("error", run.error_message);
-    if (run.outcome.len > 0) try obj.stringField("outcome", run.outcome);
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "BinaryReader reads little-endian integers" {
+    var buf: [20]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 42, .little);
+    std.mem.writeInt(u64, buf[4..12], 123456, .little);
+    std.mem.writeInt(u16, buf[12..14], 999, .little);
+
+    var reader = BinaryReader.init(&buf);
+    try std.testing.expectEqual(@as(u32, 42), reader.readU32().?);
+    try std.testing.expectEqual(@as(u64, 123456), reader.readU64().?);
+    try std.testing.expectEqual(@as(u16, 999), reader.readU16().?);
+}
+
+test "BinaryReader returns null on underflow" {
+    var reader = BinaryReader.init(&[_]u8{ 1, 2 });
+    try std.testing.expect(reader.readU32() == null);
+}
+
+test "BinaryReader readBytes and readLenPrefixed" {
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], 3, .little);
+    buf[2] = 'a';
+    buf[3] = 'b';
+    buf[4] = 'c';
+
+    var reader = BinaryReader.init(&buf);
+    const data = reader.readLenPrefixed(u16).?;
+    try std.testing.expectEqualStrings("abc", data);
+}
+
+test "parseQueryParam parses string and integer params" {
+    const qs: []const u8 = "limit=100&prefix=test&offset=50";
+    try std.testing.expectEqual(@as(u32, 100), parseQueryParam(u32, qs, "limit").?);
+    try std.testing.expectEqualStrings("test", parseQueryParam([]const u8, qs, "prefix").?);
+    try std.testing.expectEqual(@as(u64, 50), parseQueryParam(u64, qs, "offset").?);
+    try std.testing.expect(parseQueryParam(u32, qs, "missing") == null);
+}
+
+test "parseQueryParam returns null for empty or missing" {
+    try std.testing.expect(parseQueryParam(u32, null, "x") == null);
+    try std.testing.expect(parseQueryParam([]const u8, "key=", "key") == null);
+}
+
+test "jsonError produces valid JSON" {
+    const allocator = std.testing.allocator;
+    const result = try jsonError(allocator, "not found");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{\"error\":\"not found\"}", result);
+}
+
+test "DashboardContext init and uptime" {
+    const allocator = std.testing.allocator;
+    var metrics = MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+
+    const ctx = DashboardContext.init(allocator, &metrics, 4);
+    try std.testing.expectEqual(@as(u32, 4), ctx.num_shards);
+    try std.testing.expect(ctx.uptimeSeconds() <= 1);
 }
