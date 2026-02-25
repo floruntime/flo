@@ -441,6 +441,127 @@ pub const ServerMetrics = struct {
     }
 };
 
+// =============================================================================
+// Per-Shard Metrics
+// =============================================================================
+
+/// Per-shard metrics for the thread-per-shard architecture.
+///
+/// Each CPU-pinned shard thread updates its own ShardMetrics instance via
+/// lock-free atomics. The dedicated metrics HTTP thread reads all shard
+/// instances during Prometheus export — no mutex contention on the hot path.
+///
+/// Usage:
+/// ```zig
+/// // During node startup (once)
+/// try registry.initShards(num_cpus);
+///
+/// // In each shard thread
+/// const my_metrics = registry.shardMetrics(shard_id).?;
+/// my_metrics.recordCommand();
+/// my_metrics.recordBytesReceived(1024);
+/// ```
+pub const ShardMetrics = struct {
+    shard_id: u16,
+
+    /// Current active connections owned by this shard
+    connections: Atomic(u64) = Atomic(u64).init(0),
+    /// Total commands processed on this shard
+    commands_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total bytes received on this shard
+    bytes_received: Atomic(u64) = Atomic(u64).init(0),
+    /// Total bytes sent from this shard
+    bytes_sent: Atomic(u64) = Atomic(u64).init(0),
+    /// Current subscriptions on this shard
+    subscriptions: Atomic(u64) = Atomic(u64).init(0),
+    /// Total partitions owned by this shard
+    partitions: Atomic(u64) = Atomic(u64).init(0),
+    /// Reactor event loop iterations (measures utilization)
+    reactor_loops: Atomic(u64) = Atomic(u64).init(0),
+    /// Total inbox messages processed
+    inbox_processed: Atomic(u64) = Atomic(u64).init(0),
+    /// Current inbox messages pending (snapshot gauge)
+    inbox_pending: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn init(id: u16) ShardMetrics {
+        return .{ .shard_id = id };
+    }
+
+    // --- Convenience update methods (called by shard threads) ---
+
+    pub fn connectionOpened(self: *ShardMetrics) void {
+        _ = self.connections.fetchAdd(1, .monotonic);
+    }
+
+    pub fn connectionClosed(self: *ShardMetrics) void {
+        _ = self.connections.fetchSub(1, .monotonic);
+    }
+
+    pub fn recordCommand(self: *ShardMetrics) void {
+        _ = self.commands_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordBytesReceived(self: *ShardMetrics, bytes: u64) void {
+        _ = self.bytes_received.fetchAdd(bytes, .monotonic);
+    }
+
+    pub fn recordBytesSent(self: *ShardMetrics, bytes: u64) void {
+        _ = self.bytes_sent.fetchAdd(bytes, .monotonic);
+    }
+
+    pub fn subscriptionAdded(self: *ShardMetrics) void {
+        _ = self.subscriptions.fetchAdd(1, .monotonic);
+    }
+
+    pub fn subscriptionRemoved(self: *ShardMetrics) void {
+        _ = self.subscriptions.fetchSub(1, .monotonic);
+    }
+
+    pub fn setPartitions(self: *ShardMetrics, count: u64) void {
+        self.partitions.store(count, .monotonic);
+    }
+
+    pub fn recordReactorLoop(self: *ShardMetrics) void {
+        _ = self.reactor_loops.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordInboxProcessed(self: *ShardMetrics, count: u64) void {
+        _ = self.inbox_processed.fetchAdd(count, .monotonic);
+    }
+
+    pub fn setInboxPending(self: *ShardMetrics, count: u64) void {
+        self.inbox_pending.store(count, .monotonic);
+    }
+
+    pub const Snapshot = struct {
+        shard_id: u16,
+        connections: u64,
+        commands_total: u64,
+        bytes_received: u64,
+        bytes_sent: u64,
+        subscriptions: u64,
+        partitions: u64,
+        reactor_loops: u64,
+        inbox_processed: u64,
+        inbox_pending: u64,
+    };
+
+    pub fn snapshot(self: *const ShardMetrics) Snapshot {
+        return .{
+            .shard_id = self.shard_id,
+            .connections = self.connections.load(.monotonic),
+            .commands_total = self.commands_total.load(.monotonic),
+            .bytes_received = self.bytes_received.load(.monotonic),
+            .bytes_sent = self.bytes_sent.load(.monotonic),
+            .subscriptions = self.subscriptions.load(.monotonic),
+            .partitions = self.partitions.load(.monotonic),
+            .reactor_loops = self.reactor_loops.load(.monotonic),
+            .inbox_processed = self.inbox_processed.load(.monotonic),
+            .inbox_pending = self.inbox_pending.load(.monotonic),
+        };
+    }
+};
+
 /// MetricsRegistry is the global metrics aggregator for all Flo primitives
 ///
 /// Design:
@@ -498,6 +619,13 @@ pub const MetricsRegistry = struct {
     /// Processing engine metrics (singleton - one per node)
     processing: ProcessingMetrics,
 
+    /// Per-shard metrics for the thread-per-shard architecture.
+    /// Indexed by shard_id. Null until initShards() is called.
+    shard_counters: ?[]ShardMetrics,
+
+    /// Number of configured shards (0 until initShards() is called)
+    num_shards: u32,
+
     mutex: std.Thread.Mutex,
 
     pub const StreamEntry = struct {
@@ -533,6 +661,8 @@ pub const MetricsRegistry = struct {
             .tiered_logs = std.AutoHashMap(u32, TieredLogEntry).init(allocator),
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
+            .shard_counters = null,
+            .num_shards = 0,
             .mutex = std.Thread.Mutex{},
         };
     }
@@ -540,6 +670,12 @@ pub const MetricsRegistry = struct {
     pub fn deinit(self: *MetricsRegistry) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Free shard counters
+        if (self.shard_counters) |counters| {
+            self.allocator.free(counters);
+            self.shard_counters = null;
+        }
 
         // Free stream keys and entries
         var stream_key_iter = self.streams.keyIterator();
@@ -717,6 +853,37 @@ pub const MetricsRegistry = struct {
         return &self.tiered_logs.getPtr(group_id).?.metrics;
     }
 
+    /// Initialize per-shard metrics counters.
+    /// Must be called once during node startup with the number of shards.
+    /// Each shard thread then obtains its ShardMetrics via shardMetrics(shard_id).
+    pub fn initShards(self: *MetricsRegistry, num_shards_arg: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.shard_counters != null) return error.AlreadyInitialized;
+        if (num_shards_arg == 0) return error.InvalidShardCount;
+
+        const counters = try self.allocator.alloc(ShardMetrics, num_shards_arg);
+        for (counters, 0..) |*c, i| {
+            c.* = ShardMetrics.init(@intCast(i));
+        }
+        self.shard_counters = counters;
+        self.num_shards = num_shards_arg;
+    }
+
+    /// Get per-shard metrics for a specific shard.
+    /// Returns null if initShards() has not been called or shard_id is out of range.
+    pub fn shardMetrics(self: *MetricsRegistry, shard_id: u16) ?*ShardMetrics {
+        const counters = self.shard_counters orelse return null;
+        if (shard_id >= counters.len) return null;
+        return &counters[shard_id];
+    }
+
+    /// Get number of configured shards.
+    pub fn shardCount(self: *MetricsRegistry) u32 {
+        return self.num_shards;
+    }
+
     /// Export all metrics in Prometheus text format
     ///
     /// Returns: Allocated string (caller must free)
@@ -732,6 +899,17 @@ pub const MetricsRegistry = struct {
 
         // Export server metrics first
         try writeServerMetrics(writer, self.server.snapshot());
+
+        // Export per-shard metrics
+        if (self.shard_counters) |counters| {
+            try writer.print("\n# HELP flo_shards_total Total number of shards\n", .{});
+            try writer.print("# TYPE flo_shards_total gauge\n", .{});
+            try writer.print("flo_shards_total {d}\n", .{counters.len});
+
+            for (counters) |*shard| {
+                try writeShardMetrics(writer, shard.snapshot());
+            }
+        }
 
         // Export stream metrics
         var iter = self.streams.valueIterator();
@@ -1042,6 +1220,19 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
 }
 
+/// Write per-shard metrics in Prometheus format
+fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
+    try writer.print("flo_shard_connections{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.connections });
+    try writer.print("flo_shard_commands_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.commands_total });
+    try writer.print("flo_shard_bytes_received_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bytes_received });
+    try writer.print("flo_shard_bytes_sent_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bytes_sent });
+    try writer.print("flo_shard_subscriptions{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.subscriptions });
+    try writer.print("flo_shard_partitions{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.partitions });
+    try writer.print("flo_shard_reactor_loops_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.reactor_loops });
+    try writer.print("flo_shard_inbox_processed_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_processed });
+    try writer.print("flo_shard_inbox_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_pending });
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1113,4 +1304,126 @@ test "registry: stream count" {
     // Duplicate registration doesn't increase count
     _ = try registry.registerStream("prod", "orders", 0);
     try testing.expectEqual(@as(usize, 2), registry.streamCount());
+}
+
+test "registry: per-shard metrics" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Before initShards, shardMetrics returns null
+    try testing.expect(registry.shardMetrics(0) == null);
+    try testing.expectEqual(@as(u32, 0), registry.shardCount());
+
+    // Initialize 4 shards
+    try registry.initShards(4);
+    try testing.expectEqual(@as(u32, 4), registry.shardCount());
+
+    // Access shard metrics
+    const shard0 = registry.shardMetrics(0).?;
+    const shard1 = registry.shardMetrics(1).?;
+
+    // Out of range returns null
+    try testing.expect(registry.shardMetrics(4) == null);
+    try testing.expect(registry.shardMetrics(100) == null);
+
+    // Update shard counters
+    shard0.connectionOpened();
+    shard0.connectionOpened();
+    shard0.recordCommand();
+    shard0.recordBytesReceived(1024);
+    shard1.connectionOpened();
+    shard1.recordCommand();
+    shard1.recordCommand();
+    shard1.recordBytesSent(2048);
+
+    // Verify snapshots
+    const snap0 = shard0.snapshot();
+    try testing.expectEqual(@as(u64, 2), snap0.connections);
+    try testing.expectEqual(@as(u64, 1), snap0.commands_total);
+    try testing.expectEqual(@as(u64, 1024), snap0.bytes_received);
+    try testing.expectEqual(@as(u16, 0), snap0.shard_id);
+
+    const snap1 = shard1.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap1.connections);
+    try testing.expectEqual(@as(u64, 2), snap1.commands_total);
+    try testing.expectEqual(@as(u64, 2048), snap1.bytes_sent);
+    try testing.expectEqual(@as(u16, 1), snap1.shard_id);
+}
+
+test "registry: per-shard prometheus export" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.initShards(2);
+
+    // Add some shard activity
+    const shard0 = registry.shardMetrics(0).?;
+    shard0.connectionOpened();
+    shard0.recordCommand();
+
+    const shard1 = registry.shardMetrics(1).?;
+    shard1.recordBytesReceived(512);
+
+    const text = try registry.exportPrometheus(allocator);
+    defer allocator.free(text);
+
+    // Verify per-shard metrics appear
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shards_total 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_connections{shard_id=\"0\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_commands_total{shard_id=\"0\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_shard_bytes_received_total{shard_id=\"1\"} 512") != null);
+}
+
+test "registry: double initShards fails" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.initShards(4);
+    try testing.expectError(error.AlreadyInitialized, registry.initShards(2));
+}
+
+test "registry: shard metrics connection open/close" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.initShards(1);
+    const shard = registry.shardMetrics(0).?;
+
+    shard.connectionOpened();
+    shard.connectionOpened();
+    shard.connectionOpened();
+    try testing.expectEqual(@as(u64, 3), shard.snapshot().connections);
+
+    shard.connectionClosed();
+    try testing.expectEqual(@as(u64, 2), shard.snapshot().connections);
+}
+
+test "registry: shard metrics reactor and inbox" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.initShards(2);
+    const shard = registry.shardMetrics(0).?;
+
+    shard.recordReactorLoop();
+    shard.recordReactorLoop();
+    shard.recordInboxProcessed(10);
+    shard.setInboxPending(5);
+    shard.setPartitions(8);
+
+    const snap = shard.snapshot();
+    try testing.expectEqual(@as(u64, 2), snap.reactor_loops);
+    try testing.expectEqual(@as(u64, 10), snap.inbox_processed);
+    try testing.expectEqual(@as(u64, 5), snap.inbox_pending);
+    try testing.expectEqual(@as(u64, 8), snap.partitions);
 }

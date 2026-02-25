@@ -127,7 +127,7 @@ pub const HttpMetricsServer = struct {
             if (parsed.pathStartsWith("/metrics")) {
                 try self.sendMetrics(client);
             } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
-                try http.writeResponse(client, .ok, .text, "ok\n");
+                try self.sendHealth(client);
             } else {
                 try http.writeResponse(client, .not_found, .text, "Not Found\n");
             }
@@ -136,7 +136,7 @@ pub const HttpMetricsServer = struct {
             if (std.mem.startsWith(u8, request, "GET /metrics")) {
                 try self.sendMetrics(client);
             } else if (std.mem.startsWith(u8, request, "GET /health") or std.mem.startsWith(u8, request, "GET /")) {
-                try http.writeResponse(client, .ok, .text, "ok\n");
+                try self.sendHealth(client);
             } else {
                 try http.writeResponse(client, .not_found, .text, "Not Found\n");
             }
@@ -149,6 +149,24 @@ pub const HttpMetricsServer = struct {
 
         var header_buf: [256]u8 = undefined;
         const header = http.formatResponseHeaders(&header_buf, .ok, .prometheus, body.len) orelse
+            return error.BufferTooSmall;
+
+        _ = try std.posix.write(client, header);
+        _ = try std.posix.write(client, body);
+    }
+
+    /// Send JSON health response with shard and uptime info
+    fn sendHealth(self: *Self, client: std.posix.socket_t) !void {
+        const server_snap = self.registry.server.snapshot();
+        var body_buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "{{\"status\":\"ok\",\"shards\":{d},\"uptime_seconds\":{d},\"connections\":{d}}}\n", .{
+            self.registry.shardCount(),
+            server_snap.uptime_seconds,
+            server_snap.connections,
+        }) catch return http.writeResponse(client, .ok, .text, "ok\n");
+
+        var header_buf: [256]u8 = undefined;
+        const header = http.formatResponseHeaders(&header_buf, .ok, .json, body.len) orelse
             return error.BufferTooSmall;
 
         _ = try std.posix.write(client, header);
