@@ -19,10 +19,31 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const command_mod = @import("command.zig");
-const Command = command_mod.Command;
-const Record = command_mod.Record;
+const proto = @import("proto.zig");
 const CommandResult = @import("result.zig").CommandResult;
+
+/// A RESP command translated to Flo wire protocol terms.
+/// The RESP connection handler converts this to a proto.Request for the Dispatcher.
+pub const RespCommand = struct {
+    opcode: proto.OpCode,
+    namespace: []const u8,
+    key: []const u8,
+    value: []const u8,
+    ttl_ms: ?u64 = null,
+    count: u32 = 1,
+};
+
+/// Header for stream record payloads
+pub const Header = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Record for stream appends
+pub const Record = struct {
+    payload: []const u8,
+    headers: ?[]const Header = null,
+};
 
 /// RESP data types
 pub const RespType = enum {
@@ -313,12 +334,12 @@ pub const UseResult = struct {
 
 /// Result of translating a RESP command
 pub const TranslateResult = union(enum) {
-    command: Command,
+    command: RespCommand,
     use_namespace: UseResult,
     select_db: u32, // SELECT db_num (Redis compatibility)
 };
 
-/// Translate a RESP command array to a Flo Command (with namespace)
+/// Translate a RESP command array to a Flo RespCommand (with namespace)
 /// Pass current session namespace. For USE command, returns UseResult instead.
 pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []const u8) !TranslateResult {
     const arr = switch (value) {
@@ -359,14 +380,21 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
 
     // Match commands
     if (std.mem.eql(u8, cmd, "PING")) {
-        return .{ .command = .{ .ping = {} } };
+        return .{ .command = .{
+            .opcode = .ping,
+            .namespace = namespace,
+            .key = "",
+            .value = "",
+        } };
     } else if (std.mem.eql(u8, cmd, "GET")) {
         if (arr.len < 2) return error.InvalidCommand;
         const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
-        return .{ .command = .{ .kv_get = .{
+        return .{ .command = .{
+            .opcode = .kv_get,
             .namespace = namespace,
             .key = try allocator.dupe(u8, key),
-        } } };
+            .value = "",
+        } };
     } else if (std.mem.eql(u8, cmd, "SET")) {
         if (arr.len < 3) return error.InvalidCommand;
         const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
@@ -389,25 +417,27 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
             }
         }
 
-        return .{ .command = .{ .kv_put = .{
+        return .{ .command = .{
+            .opcode = .kv_put,
             .namespace = namespace,
             .key = try allocator.dupe(u8, key),
             .value = try allocator.dupe(u8, val),
             .ttl_ms = ttl_ms,
-        } } };
+        } };
     } else if (std.mem.eql(u8, cmd, "DEL")) {
         if (arr.len < 2) return error.InvalidCommand;
         const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
-        return .{ .command = .{ .kv_delete = .{
+        return .{ .command = .{
+            .opcode = .kv_delete,
             .namespace = namespace,
             .key = try allocator.dupe(u8, key),
-        } } };
+            .value = "",
+        } };
     } else if (std.mem.eql(u8, cmd, "XADD")) {
         if (arr.len < 4) return error.InvalidCommand;
-        const stream = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const stream_name = getBulkString(arr[1]) orelse return error.InvalidCommand;
         // arr[2] is the ID (* for auto-generate)
-        // Remaining are field-value pairs
-        // For simplicity, we concatenate all as payload
+        // Remaining are field-value pairs concatenated as payload
         var payload: std.ArrayListUnmanaged(u8) = .{};
         defer payload.deinit(allocator);
 
@@ -421,22 +451,16 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
             try payload.append(allocator, '\n');
         }
 
-        const batch = try allocator.alloc(Record, 1);
-        batch[0] = .{
-            .payload = try payload.toOwnedSlice(allocator),
-            .headers = null,
-        };
-
-        return .{ .command = .{ .stream_append = .{
+        return .{ .command = .{
+            .opcode = .stream_append,
             .namespace = namespace,
-            .stream = try allocator.dupe(u8, stream),
-            .batch = batch,
-        } } };
+            .key = try allocator.dupe(u8, stream_name),
+            .value = try payload.toOwnedSlice(allocator),
+        } };
     } else if (std.mem.eql(u8, cmd, "XREAD")) {
         // XREAD [COUNT count] [BLOCK ms] STREAMS stream [stream...] id [id...]
         // Simplified: just support single stream
         var count: u32 = 100;
-        var block_ms: ?u32 = null;
         var stream_idx: usize = 0;
 
         var k: usize = 1;
@@ -446,7 +470,8 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
                 count = @intCast(getInteger(arr[k + 1]) orelse 100);
                 k += 1;
             } else if (std.ascii.eqlIgnoreCase(arg, "BLOCK") and k + 1 < arr.len) {
-                block_ms = @intCast(getInteger(arr[k + 1]) orelse 0);
+                // Block timeout parsed but stored in count for now
+                _ = getInteger(arr[k + 1]);
                 k += 1;
             } else if (std.ascii.eqlIgnoreCase(arg, "STREAMS")) {
                 stream_idx = k + 1;
@@ -455,16 +480,38 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
         }
 
         if (stream_idx == 0 or stream_idx >= arr.len) return error.InvalidCommand;
-        const stream = getBulkString(arr[stream_idx]) orelse return error.InvalidCommand;
+        const stream_name = getBulkString(arr[stream_idx]) orelse return error.InvalidCommand;
 
-        return .{ .command = .{ .stream_read = .{
+        return .{ .command = .{
+            .opcode = .stream_read,
             .namespace = namespace,
-            .stream = try allocator.dupe(u8, stream),
-            .start = .{ .tail = {} },
+            .key = try allocator.dupe(u8, stream_name),
+            .value = "",
             .count = count,
-        } } };
+        } };
+    } else if (std.mem.eql(u8, cmd, "LPUSH") or std.mem.eql(u8, cmd, "RPUSH")) {
+        // Map Redis list push to Flo queue enqueue
+        if (arr.len < 3) return error.InvalidCommand;
+        const queue_name = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const val = getBulkString(arr[2]) orelse return error.InvalidCommand;
+        return .{ .command = .{
+            .opcode = .queue_enqueue,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, queue_name),
+            .value = try allocator.dupe(u8, val),
+        } };
+    } else if (std.mem.eql(u8, cmd, "LPOP") or std.mem.eql(u8, cmd, "RPOP")) {
+        // Map Redis list pop to Flo queue dequeue
+        if (arr.len < 2) return error.InvalidCommand;
+        const queue_name = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        return .{ .command = .{
+            .opcode = .queue_dequeue,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, queue_name),
+            .value = "",
+        } };
     } else {
-        return .{ .command = .{ .unknown = .{ .opcode = 0xFF } } };
+        return error.UnknownCommand;
     }
 }
 
@@ -612,7 +659,7 @@ test "translateCommand PING" {
     defer freeValue(allocator, &result.value);
 
     const translated = try translateCommand(allocator, result.value, "default");
-    try std.testing.expect(translated.command == .ping);
+    try std.testing.expectEqual(proto.OpCode.ping, translated.command.opcode);
 }
 
 test "translateCommand GET" {
@@ -625,7 +672,74 @@ test "translateCommand GET" {
 
     const translated = try translateCommand(allocator, result.value, "default");
     const cmd = translated.command;
-    defer allocator.free(cmd.kv_get.key);
+    defer allocator.free(cmd.key);
 
-    try std.testing.expectEqualStrings("foo", cmd.kv_get.key);
+    try std.testing.expectEqual(proto.OpCode.kv_get, cmd.opcode);
+    try std.testing.expectEqualStrings("foo", cmd.key);
+    try std.testing.expectEqualStrings("default", cmd.namespace);
+}
+
+test "translateCommand SET with TTL" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*5\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$2\r\nEX\r\n$2\r\n60\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "myns");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_put, cmd.opcode);
+    try std.testing.expectEqualStrings("foo", cmd.key);
+    try std.testing.expectEqualStrings("bar", cmd.value);
+    try std.testing.expectEqual(@as(?u64, 60000), cmd.ttl_ms); // 60 * 1000
+}
+
+test "translateCommand DEL" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$3\r\nDEL\r\n$5\r\nmykey\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+
+    try std.testing.expectEqual(proto.OpCode.kv_delete, cmd.opcode);
+    try std.testing.expectEqualStrings("mykey", cmd.key);
+}
+
+test "translateCommand USE namespace" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$3\r\nUSE\r\n$4\r\nprod\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    try std.testing.expectEqualStrings("prod", translated.use_namespace.namespace);
+}
+
+test "translateCommand LPUSH maps to queue enqueue" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*3\r\n$5\r\nLPUSH\r\n$5\r\ntasks\r\n$4\r\nwork\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.queue_enqueue, cmd.opcode);
+    try std.testing.expectEqualStrings("tasks", cmd.key);
+    try std.testing.expectEqualStrings("work", cmd.value);
 }
