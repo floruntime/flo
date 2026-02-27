@@ -200,9 +200,10 @@ pub const Partition = struct {
     // ── Snapshot ────────────────────────────────────────────────────────
 
     /// Create a snapshot of the current partition state.
+    /// Serializes all four projections into separate sections.
     /// Returns the sealed snapshot bytes. Caller owns the allocation.
     pub fn snapshot(self: *Partition) ![]u8 {
-        const applied = self.router.stats.entries_applied;
+        const applied = self.router.applied_index;
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
 
         var builder = snapshot_mod.SnapshotBuilder.init(
@@ -214,29 +215,62 @@ pub const Partition = struct {
         );
         defer builder.deinit();
 
-        // Serialize basic state: applied_index + committed_index
-        var state_buf: [16]u8 = undefined;
-        std.mem.writeInt(u64, state_buf[0..8], self.router.applied_index, .little);
-        std.mem.writeInt(u64, state_buf[8..16], self.committed_index, .little);
-        try builder.addSection(.kv, &state_buf);
+        // ── KV Projection ──────────────────────────────────────────────
+        const kv_data = try self.kv.serialize(self.allocator);
+        defer self.allocator.free(kv_data);
+        try builder.addSection(.kv, kv_data);
+
+        // ── Queue Projection ───────────────────────────────────────────
+        const queue_data = try self.queue.serialize(self.allocator);
+        defer self.allocator.free(queue_data);
+        try builder.addSection(.queue, queue_data);
+
+        // ── Stream Projection ──────────────────────────────────────────
+        const stream_data = try self.stream.serialize(self.allocator);
+        defer self.allocator.free(stream_data);
+        try builder.addSection(.stream, stream_data);
+
+        // ── TS Projection ──────────────────────────────────────────────
+        const ts_data = try self.ts.serialize(self.allocator);
+        defer self.allocator.free(ts_data);
+        try builder.addSection(.ts, ts_data);
 
         return try builder.seal();
     }
 
-    /// Recover partition state from a snapshot + UAL replay.
+    /// Recover partition state from a snapshot.
+    /// Deserializes all projection sections and restores metadata.
+    /// Returns the snapshot's applied UAL index (replay UAL from index+1).
     pub fn recover(self: *Partition, snapshot_data: []const u8) !u64 {
         const reader = try snapshot_mod.SnapshotReader.init(snapshot_data);
 
+        // Restore metadata from snapshot header
+        const snap_index = reader.snapshotIndex();
+        self.current_term = reader.snapshotTerm();
+        self.router.applied_index = snap_index;
+        self.committed_index = snap_index; // at snapshot time, committed == applied
+
+        // ── KV Projection ──────────────────────────────────────────────
         if (reader.findSection(.kv)) |kv_ref| {
-            if (kv_ref.data.len >= 16) {
-                self.router.applied_index = std.mem.readInt(u64, kv_ref.data[0..8], .little);
-                self.committed_index = std.mem.readInt(u64, kv_ref.data[8..16], .little);
-            }
+            try self.kv.deserialize(kv_ref.data);
         }
 
-        self.current_term = reader.snapshotTerm();
+        // ── Queue Projection ───────────────────────────────────────────
+        if (reader.findSection(.queue)) |queue_ref| {
+            try self.queue.deserialize(queue_ref.data);
+        }
 
-        return reader.snapshotIndex();
+        // ── Stream Projection ──────────────────────────────────────────
+        if (reader.findSection(.stream)) |stream_ref| {
+            try self.stream.deserialize(stream_ref.data);
+        }
+
+        // ── TS Projection ──────────────────────────────────────────────
+        if (reader.findSection(.ts)) |ts_ref| {
+            try self.ts.deserialize(ts_ref.data);
+        }
+
+        return snap_index;
     }
 
     // ── Queries ─────────────────────────────────────────────────────────

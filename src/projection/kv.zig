@@ -436,6 +436,131 @@ pub const KVProjection = struct {
         return self.memory_used + self.map.count() * @sizeOf(KVEntry);
     }
 
+    // ─── Snapshot Serialization ────────────────────────────────────────────
+
+    /// Serialize the full KV projection state to a byte buffer.
+    /// Format: [entry_count: u64] then per entry:
+    ///   [key_len: u32][value_len: u32][lsn: u64][term: u64]
+    ///   [timestamp_ns: u64][expiry_ns: u64][flags: u8]
+    ///   [key bytes][value bytes]
+    /// Caller owns the returned slice.
+    pub fn serialize(self: *KVProjection, allocator: Allocator) ![]u8 {
+        // Calculate total size
+        const entry_count = self.map.count();
+        var total_size: usize = 8; // entry_count: u64
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr;
+            // key_len(4) + value_len(4) + lsn(8) + term(8) + timestamp_ns(8) + expiry_ns(8) + flags(1)
+            total_size += 41 + entry.key.len + entry.value.len;
+        }
+
+        const buf = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(buf);
+
+        var offset: usize = 0;
+
+        // Entry count
+        std.mem.writeInt(u64, buf[offset..][0..8], @intCast(entry_count), .little);
+        offset += 8;
+
+        // Entries
+        it = self.map.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr;
+
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.key.len), .little);
+            offset += 4;
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.value.len), .little);
+            offset += 4;
+            std.mem.writeInt(u64, buf[offset..][0..8], entry.lsn, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], entry.term, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], entry.timestamp_ns, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], entry.expiry_ns, .little);
+            offset += 8;
+            buf[offset] = if (entry.tombstone) 1 else 0;
+            offset += 1;
+
+            @memcpy(buf[offset..][0..entry.key.len], entry.key);
+            offset += entry.key.len;
+            if (entry.value.len > 0) {
+                @memcpy(buf[offset..][0..entry.value.len], entry.value);
+            }
+            offset += entry.value.len;
+        }
+
+        return buf;
+    }
+
+    /// Restore KV projection state from serialized bytes.
+    /// Clears all existing state before restoring.
+    pub fn deserialize(self: *KVProjection, data: []const u8) !void {
+        // Clear existing state
+        var old_it = self.map.iterator();
+        while (old_it.next()) |kv| {
+            self.freeEntry(kv.value_ptr);
+        }
+        self.map.clearAndFree();
+        self.memory_used = 0;
+
+        if (data.len < 8) return;
+
+        var offset: usize = 0;
+        const entry_count = std.mem.readInt(u64, data[offset..][0..8], .little);
+        offset += 8;
+
+        var i: u64 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (offset + 41 > data.len) return error.InvalidPayload;
+
+            const key_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            const value_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            const lsn = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const term = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const timestamp_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const expiry_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const tombstone = data[offset] != 0;
+            offset += 1;
+
+            if (offset + key_len + value_len > data.len) return error.InvalidPayload;
+
+            const key = data[offset..][0..key_len];
+            offset += key_len;
+            const value = data[offset..][0..value_len];
+            offset += value_len;
+
+            // Restore into hash map
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+
+            const owned_value = if (value_len > 0 and !tombstone)
+                try self.allocator.dupe(u8, value)
+            else
+                "";
+            errdefer if (owned_value.len > 0) self.allocator.free(@constCast(owned_value));
+
+            try self.map.put(owned_key, .{
+                .key = owned_key,
+                .value = owned_value,
+                .lsn = lsn,
+                .term = term,
+                .timestamp_ns = timestamp_ns,
+                .expiry_ns = expiry_ns,
+                .tombstone = tombstone,
+            });
+            self.memory_used += owned_key.len + owned_value.len;
+        }
+    }
+
     // ─── Internal ──────────────────────────────────────────────────────────
 
     fn freeEntry(self: *KVProjection, entry: *KVEntry) void {
@@ -643,4 +768,55 @@ test "kv: memory tracking" {
     try kv.put("abc", "x", 2, 1, 0, 0);
     // Updated: key(3) + value(1) = 4 bytes
     try testing.expectEqual(@as(usize, 4), kv.memory_used);
+}
+
+test "kv: serialize/deserialize round-trip" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("key1", "value1", 1, 1, 1000, 0);
+    try kv.put("key2", "value2", 2, 1, 2000, 5000);
+    try kv.put("key3", "v3", 3, 2, 3000, 0);
+
+    // Serialize
+    const data = try kv.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    // Deserialize into a fresh projection
+    var kv2 = KVProjection.init(testing.allocator, 0);
+    defer kv2.deinit();
+
+    try kv2.deserialize(data);
+
+    // Verify all entries restored
+    try testing.expectEqual(@as(usize, 3), kv2.count());
+
+    const e1 = kv2.getRaw("key1").?;
+    try testing.expectEqualStrings("value1", e1.value);
+    try testing.expectEqual(@as(u64, 1), e1.lsn);
+    try testing.expectEqual(@as(u64, 1), e1.term);
+    try testing.expectEqual(@as(u64, 1000), e1.timestamp_ns);
+    try testing.expectEqual(@as(u64, 0), e1.expiry_ns);
+
+    const e2 = kv2.getRaw("key2").?;
+    try testing.expectEqualStrings("value2", e2.value);
+    try testing.expectEqual(@as(u64, 5000), e2.expiry_ns);
+
+    const e3 = kv2.getRaw("key3").?;
+    try testing.expectEqualStrings("v3", e3.value);
+    try testing.expectEqual(@as(u64, 2), e3.term);
+}
+
+test "kv: serialize empty projection" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    const data = try kv.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var kv2 = KVProjection.init(testing.allocator, 0);
+    defer kv2.deinit();
+
+    try kv2.deserialize(data);
+    try testing.expectEqual(@as(usize, 0), kv2.count());
 }

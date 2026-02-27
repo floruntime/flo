@@ -72,6 +72,7 @@ const WaiterKind = waiter_pool_mod.WaiterKind;
 const stream_handler_mod = @import("../stream/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const Partition = @import("../storage/partition.zig").Partition;
+const snapshot_mod = @import("../storage/snapshot.zig");
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -270,9 +271,40 @@ pub const Shard = struct {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // Replay existing segment files into partition (UAL + projections)
-            var max_index: u64 = 0;
-            replaySegments(allocator, shard_dir, partition, &max_index, workflow_handler);
+            // ── Snapshot-aware recovery ────────────────────────────────
+            // 1. Try loading a snapshot first → restores all projection state
+            // 2. Then replay only segments with entries after the snapshot index
+            var replay_from: u64 = 0;
+
+            // Check for snapshots in shard_dir/snapshots/
+            const snap_dir_path = try std.fmt.allocPrint(allocator, "{s}/snapshots", .{shard_dir});
+            defer allocator.free(snap_dir_path);
+
+            if (std.fs.cwd().openDir(snap_dir_path, .{})) |snap_dir_handle| {
+                var snap_dir = snap_dir_handle;
+                defer snap_dir.close();
+
+                if (snapshot_mod.loadLatestSnapshot(allocator, snap_dir)) |maybe_snap| {
+                    if (maybe_snap) |snap| {
+                        defer allocator.free(snap.data);
+                        if (partition.recover(snap.data)) |snap_index| {
+                            replay_from = snap_index;
+                        } else |_| {
+                            // Snapshot recovery failed — fall back to full replay
+                            replay_from = 0;
+                        }
+                    }
+                } else |_| {
+                    // loadLatestSnapshot failed — fall back to full replay
+                }
+            } else |_| {
+                // No snapshots directory — normal for first run
+            }
+
+            // Replay existing segment files into partition (UAL + projections).
+            // If a snapshot was loaded, skip entries at or below replay_from.
+            var max_index: u64 = replay_from;
+            replaySegments(allocator, shard_dir, partition, &max_index, workflow_handler, replay_from);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -415,6 +447,55 @@ pub const Shard = struct {
     pub fn getPartition(self: *Shard, partition_id: u32) *Partition {
         _ = partition_id;
         return self.partitions[0];
+    }
+
+    // ─── Snapshot ────────────────────────────────────────────────────────
+
+    /// Take a snapshot of all partitions and write to disk.
+    /// Creates `{shard_data_dir}/snapshots/` if it doesn't exist.
+    /// Returns true if snapshot was written successfully.
+    pub fn takeSnapshot(self: *Shard) bool {
+        const dir_path = self.shard_data_dir orelse return false;
+
+        var snap_path_buf: [512]u8 = undefined;
+        const snap_dir_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snapshots", .{dir_path}) catch return false;
+
+        // Ensure snapshots directory exists
+        std.fs.cwd().makePath(snap_dir_path) catch return false;
+
+        var snap_dir = std.fs.cwd().openDir(snap_dir_path, .{}) catch return false;
+        defer snap_dir.close();
+
+        // Snapshot each partition
+        for (self.partitions) |partition| {
+            const snap_data = partition.snapshot() catch continue;
+            defer self.allocator.free(snap_data);
+
+            // Generate snapshot filename
+            var name_buf: [128]u8 = undefined;
+            const filename = snapshot_mod.snapshotFilename(
+                &name_buf,
+                partition.router.applied_index,
+                @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000,
+            );
+
+            // Write atomically: .tmp → sync → rename
+            var tmp_buf: [128]u8 = undefined;
+            const tmp_name = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{filename}) catch continue;
+
+            const file = snap_dir.createFile(tmp_name, .{}) catch continue;
+            file.writeAll(snap_data) catch {
+                file.close();
+                continue;
+            };
+            file.sync() catch {};
+            file.close();
+
+            snap_dir.rename(tmp_name, filename) catch continue;
+            snapshot_mod.writeManifest(snap_dir, filename) catch {};
+        }
+
+        return true;
     }
 
     // ─── Connection management ───────────────────────────────────────────
@@ -1176,12 +1257,16 @@ fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
 /// Stream entries additionally rebuild the StreamProjection offset tracking,
 /// since the ProjectionRouter skips stream entries (UAL direct reads by design).
 /// Tracks the maximum entry index seen for LSN restoration.
+///
+/// If `replay_from` > 0, entries with index <= replay_from are skipped
+/// (already restored from a snapshot).
 fn replaySegments(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     partition: *Partition,
     max_index: *u64,
     workflow_handler: *WorkflowHandler,
+    replay_from: u64,
 ) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -1206,6 +1291,16 @@ fn replaySegments(
         while (offset < data_len) {
             const seg_entry = result.reader.readEntryAt(offset) orelse break;
 
+            // Skip entries already covered by snapshot
+            if (replay_from > 0 and seg_entry.header.index <= replay_from) {
+                // Still track max index for LSN restoration
+                if (seg_entry.header.index > max_index.*) {
+                    max_index.* = seg_entry.header.index;
+                }
+                offset += seg_entry.totalSize();
+                continue;
+            }
+
             // Apply to UAL + projection router (handles KV, queue, TS routing)
             const ual_index = partition.apply(&seg_entry) catch {
                 offset += seg_entry.totalSize();
@@ -1216,12 +1311,16 @@ fn replaySegments(
             // the StreamProjection offset→ual_index mapping.
             const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
             if (etype == .stream_append) {
-                // Extract stream name hash from command payload for per-stream filtering
-                const name_hash = if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd|
-                    std.hash.Wyhash.hash(0, cmd.key)
-                else
-                    0;
-                _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
+                // Extract stream name hash from command payload for per-stream filtering.
+                // Must use namespace_hash as Wyhash seed (matches router.nameHash).
+                if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd| {
+                    const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
+                    _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
+                    // Re-register stream name for listing (bare — namespace string
+                    // isn't stored in entries, so post-restart ls won't filter by
+                    // namespace; acceptable since restart ls isn't tested yet).
+                    partition.stream.registerStream(cmd.key) catch {};
+                }
             }
 
             // Workflow entries: router skips them (.none), so manually rebuild

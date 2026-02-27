@@ -545,6 +545,216 @@ pub const TSProjection = struct {
 
         return mem;
     }
+
+    /// Clear all state, freeing owned memory.
+    pub fn reset(self: *TSProjection) void {
+        var bit = self.buffers.iterator();
+        while (bit.next()) |kv| {
+            kv.value_ptr.deinit();
+            self.allocator.free(@constCast(kv.key_ptr.*));
+        }
+        self.buffers.clearAndFree();
+
+        var blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            kv.value_ptr.deinit(self.allocator);
+            self.allocator.free(@constCast(kv.key_ptr.*));
+        }
+        self.blocks.clearAndFree();
+
+        self.applied_index = 0;
+        self.stats = .{};
+    }
+
+    // ─── Snapshot Serialization ────────────────────────────────────────────
+
+    /// Serialize the full TS projection state.
+    /// Format: [buffer_capacity: u32]
+    ///   [buffer_count: u32] then per write buffer:
+    ///     [key_len: u16][key bytes][point_count: u32]
+    ///     per point: [timestamp_ns: u64][field_value: f64][ual_index: u64][tag_hash: u64]
+    ///   [block_series_count: u32] then per block series:
+    ///     [key_len: u16][key bytes][block_count: u32]
+    ///     per block: [min_ts: u64][max_ts: u64][point_count: u32][ual_start: u64][ual_end: u64]
+    /// Caller owns returned slice.
+    pub fn serialize(self: *TSProjection, allocator: Allocator) ![]u8 {
+        // Calculate total size
+        var total_size: usize = 4; // buffer_capacity
+
+        // Buffers: count(4) + per buffer(key_len(2) + key + point_count(4) + points(32 each))
+        total_size += 4;
+        var bit = self.buffers.iterator();
+        while (bit.next()) |kv| {
+            total_size += 2 + kv.key_ptr.len + 4 + kv.value_ptr.points.items.len * 32;
+        }
+
+        // Blocks: count(4) + per series(key_len(2) + key + block_count(4) + blocks(36 each))
+        total_size += 4;
+        var blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            total_size += 2 + kv.key_ptr.len + 4 + kv.value_ptr.items.len * 36;
+        }
+
+        const buf = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(buf);
+        var offset: usize = 0;
+
+        // buffer_capacity
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.buffer_capacity), .little);
+        offset += 4;
+
+        // Write buffers
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.buffers.count()), .little);
+        offset += 4;
+        bit = self.buffers.iterator();
+        while (bit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const wb = kv.value_ptr;
+            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(key.len), .little);
+            offset += 2;
+            @memcpy(buf[offset..][0..key.len], key);
+            offset += key.len;
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(wb.points.items.len), .little);
+            offset += 4;
+            for (wb.points.items) |point| {
+                std.mem.writeInt(u64, buf[offset..][0..8], point.timestamp_ns, .little);
+                offset += 8;
+                @as(*align(1) f64, @ptrCast(buf[offset..][0..8])).* = point.field_value;
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], point.ual_index, .little);
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], point.tag_hash, .little);
+                offset += 8;
+            }
+        }
+
+        // Blocks
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.blocks.count()), .little);
+        offset += 4;
+        blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const block_list = kv.value_ptr;
+            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(key.len), .little);
+            offset += 2;
+            @memcpy(buf[offset..][0..key.len], key);
+            offset += key.len;
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(block_list.items.len), .little);
+            offset += 4;
+            for (block_list.items) |block| {
+                std.mem.writeInt(u64, buf[offset..][0..8], block.min_timestamp_ns, .little);
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], block.max_timestamp_ns, .little);
+                offset += 8;
+                std.mem.writeInt(u32, buf[offset..][0..4], block.point_count, .little);
+                offset += 4;
+                std.mem.writeInt(u64, buf[offset..][0..8], block.ual_index_start, .little);
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], block.ual_index_end, .little);
+                offset += 8;
+            }
+        }
+
+        return buf;
+    }
+
+    /// Restore TS projection state from serialized bytes.
+    /// Clears all existing state before restoring.
+    pub fn deserialize(self: *TSProjection, data: []const u8) !void {
+        self.reset();
+
+        if (data.len < 4) return;
+        var offset: usize = 0;
+
+        // buffer_capacity
+        self.buffer_capacity = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        // Write buffers
+        if (offset + 4 > data.len) return;
+        const buf_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        var bi: u32 = 0;
+        while (bi < buf_count) : (bi += 1) {
+            if (offset + 2 > data.len) return;
+            const key_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + key_len + 4 > data.len) return;
+            const key = try self.allocator.dupe(u8, data[offset..][0..key_len]);
+            offset += key_len;
+            const point_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+
+            var wb = WriteBuffer.init(self.allocator, self.buffer_capacity);
+            errdefer wb.deinit();
+
+            var pi: u32 = 0;
+            while (pi < point_count) : (pi += 1) {
+                if (offset + 32 > data.len) {
+                    wb.deinit();
+                    self.allocator.free(key);
+                    return;
+                }
+                const timestamp_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
+                offset += 8;
+                const field_value: f64 = @as(*align(1) const f64, @ptrCast(data[offset..][0..8])).*;
+                offset += 8;
+                const ual_index = std.mem.readInt(u64, data[offset..][0..8], .little);
+                offset += 8;
+                const tag_hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+                offset += 8;
+
+                try wb.append(.{
+                    .timestamp_ns = timestamp_ns,
+                    .field_value = field_value,
+                    .ual_index = ual_index,
+                    .tag_hash = tag_hash,
+                });
+            }
+
+            try self.buffers.put(key, wb);
+        }
+
+        // Blocks
+        if (offset + 4 > data.len) return;
+        const block_series_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        var si: u32 = 0;
+        while (si < block_series_count) : (si += 1) {
+            if (offset + 2 > data.len) return;
+            const key_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + key_len + 4 > data.len) return;
+            const key = try self.allocator.dupe(u8, data[offset..][0..key_len]);
+            offset += key_len;
+            const block_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+
+            var block_list: std.ArrayList(Block) = .empty;
+            errdefer block_list.deinit(self.allocator);
+
+            var bk: u32 = 0;
+            while (bk < block_count) : (bk += 1) {
+                if (offset + 36 > data.len) {
+                    block_list.deinit(self.allocator);
+                    self.allocator.free(key);
+                    return;
+                }
+                try block_list.append(self.allocator, .{
+                    .min_timestamp_ns = std.mem.readInt(u64, data[offset..][0..8], .little),
+                    .max_timestamp_ns = std.mem.readInt(u64, data[offset + 8 ..][0..8], .little),
+                    .point_count = std.mem.readInt(u32, data[offset + 16 ..][0..4], .little),
+                    .ual_index_start = std.mem.readInt(u64, data[offset + 20 ..][0..8], .little),
+                    .ual_index_end = std.mem.readInt(u64, data[offset + 28 ..][0..8], .little),
+                });
+                offset += 36;
+            }
+
+            try self.blocks.put(key, block_list);
+        }
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -697,4 +907,58 @@ test "ts: projection handle vtable" {
 
     const handle = ts.projectionHandle();
     try testing.expect(handle.memoryUsage() > 0);
+}
+
+test "ts: serialize/deserialize round-trip" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 3 });
+    defer ts.deinit();
+
+    // Insert points into different series
+    try ts.insert("cpu", "usage", 82.5, 1000, 1, 0);
+    try ts.insert("cpu", "usage", 75.0, 2000, 2, 0);
+    try ts.insert("mem", "used", 4096.0, 1000, 3, 0);
+
+    // Force a flush by filling the buffer (capacity=3)
+    try ts.insert("cpu", "usage", 90.0, 3000, 4, 0);
+    try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
+
+    // Serialize
+    const data = try ts.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    // Deserialize into fresh projection
+    var ts2 = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer ts2.deinit();
+
+    try ts2.deserialize(data);
+
+    // Buffer capacity should be restored from serialized data (3, not 100)
+    try testing.expectEqual(@as(usize, 3), ts2.buffer_capacity);
+
+    // Verify series restored
+    try testing.expectEqual(@as(usize, 2), ts2.seriesCount()); // cpu\0usage and mem\0used
+
+    // Verify mem\0used buffer has 1 point
+    var buf: [10]StoredPoint = undefined;
+    const mem_result = try ts2.queryRange("mem", "used", 0, 9999, &buf);
+    try testing.expectEqual(@as(usize, 1), mem_result.points_in_buffer);
+    try testing.expectApproxEqAbs(@as(f64, 4096.0), buf[0].field_value, 0.001);
+
+    // Verify blocks were restored
+    try testing.expectEqual(@as(usize, 1), ts2.totalBlocks());
+}
+
+test "ts: serialize empty projection" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    defer ts.deinit();
+
+    const data = try ts.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var ts2 = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer ts2.deinit();
+
+    try ts2.deserialize(data);
+    try testing.expectEqual(@as(usize, 1024), ts2.buffer_capacity);
+    try testing.expectEqual(@as(usize, 0), ts2.seriesCount());
 }

@@ -558,6 +558,242 @@ pub const QueueProjection = struct {
             payload_bytes +
             @sizeOf(QueueProjection);
     }
+
+    // ─── Snapshot Serialization ────────────────────────────────────────────
+
+    /// Serialize the full queue projection state.
+    /// Format: [next_seq: u64][message_count: u32] then per message:
+    ///   [seq: u64][ual_index: u64][priority: u32][state: u8][attempts: u32]
+    ///   [lease_expiry_ns: u64][enqueued_at_ns: u64][queue_name_hash: u64]
+    ///   [payload_len: u32][payload bytes]
+    /// Then: [dlq_count: u32] then per DLQ entry:
+    ///   [seq: u64][ual_index: u64][attempts: u32][moved_at_ns: u64]
+    /// Then: [known_queue_count: u32] then per known queue:
+    ///   [name_hash: u64][name_len: u16][name bytes][ns_len: u16][ns bytes]
+    ///   [enqueued: u64][dequeued: u64]
+    /// Caller owns returned slice.
+    pub fn serialize(self: *QueueProjection, allocator: Allocator) ![]u8 {
+        // Calculate total size
+        var total_size: usize = 8 + 4; // next_seq + message_count
+        var msg_it = self.messages.iterator();
+        while (msg_it.next()) |kv| {
+            // Fixed fields: 8+8+4+1+4+8+8+8+4 = 53 bytes + payload
+            total_size += 53 + kv.value_ptr.payload.len;
+        }
+        // DLQ: count(4) + entries(8+8+4+8=28 each)
+        total_size += 4 + self.dlq.items.len * 28;
+        // Known queues
+        total_size += 4; // count
+        var kq_it = self.known_queues.iterator();
+        while (kq_it.next()) |kv| {
+            // hash(8) + name_len(2) + name + ns_len(2) + ns + enqueued(8) + dequeued(8)
+            total_size += 28 + kv.value_ptr.name.len + kv.value_ptr.namespace.len;
+        }
+
+        const buf = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(buf);
+        var offset: usize = 0;
+
+        // next_seq
+        std.mem.writeInt(u64, buf[offset..][0..8], self.next_seq, .little);
+        offset += 8;
+
+        // Messages
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.messages.count()), .little);
+        offset += 4;
+
+        msg_it = self.messages.iterator();
+        while (msg_it.next()) |kv| {
+            const msg = kv.value_ptr;
+            std.mem.writeInt(u64, buf[offset..][0..8], msg.seq, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], msg.ual_index, .little);
+            offset += 8;
+            std.mem.writeInt(u32, buf[offset..][0..4], msg.priority, .little);
+            offset += 4;
+            buf[offset] = @intFromEnum(msg.state);
+            offset += 1;
+            std.mem.writeInt(u32, buf[offset..][0..4], msg.attempts, .little);
+            offset += 4;
+            std.mem.writeInt(u64, buf[offset..][0..8], msg.lease_expiry_ns, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], msg.enqueued_at_ns, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], msg.queue_name_hash, .little);
+            offset += 8;
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(msg.payload.len), .little);
+            offset += 4;
+            if (msg.payload.len > 0) {
+                @memcpy(buf[offset..][0..msg.payload.len], msg.payload);
+            }
+            offset += msg.payload.len;
+        }
+
+        // DLQ
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.dlq.items.len), .little);
+        offset += 4;
+        for (self.dlq.items) |dlq_entry| {
+            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.seq, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.ual_index, .little);
+            offset += 8;
+            std.mem.writeInt(u32, buf[offset..][0..4], dlq_entry.attempts, .little);
+            offset += 4;
+            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.moved_at_ns, .little);
+            offset += 8;
+        }
+
+        // Known queues
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.known_queues.count()), .little);
+        offset += 4;
+        kq_it = self.known_queues.iterator();
+        while (kq_it.next()) |kv| {
+            const hash = kv.key_ptr.*;
+            const meta = kv.value_ptr;
+            std.mem.writeInt(u64, buf[offset..][0..8], hash, .little);
+            offset += 8;
+            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(meta.name.len), .little);
+            offset += 2;
+            @memcpy(buf[offset..][0..meta.name.len], meta.name);
+            offset += meta.name.len;
+            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(meta.namespace.len), .little);
+            offset += 2;
+            @memcpy(buf[offset..][0..meta.namespace.len], meta.namespace);
+            offset += meta.namespace.len;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.enqueued, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.dequeued, .little);
+            offset += 8;
+        }
+
+        return buf;
+    }
+
+    /// Restore queue projection state from serialized bytes.
+    /// Clears all existing state before restoring.
+    pub fn deserialize(self: *QueueProjection, data: []const u8) !void {
+        self.reset();
+
+        if (data.len < 12) return;
+        var offset: usize = 0;
+
+        // next_seq
+        self.next_seq = std.mem.readInt(u64, data[offset..][0..8], .little);
+        offset += 8;
+
+        // Messages
+        const msg_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        var i: u32 = 0;
+        while (i < msg_count) : (i += 1) {
+            if (offset + 53 > data.len) return;
+
+            const seq = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const ual_index = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const priority = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            const state: MessageState = @enumFromInt(data[offset]);
+            offset += 1;
+            const attempts = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            const lease_expiry_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const enqueued_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const queue_name_hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const payload_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+
+            if (offset + payload_len > data.len) return;
+            const payload = if (payload_len > 0)
+                try self.allocator.dupe(u8, data[offset..][0..payload_len])
+            else
+                &[_]u8{};
+            offset += payload_len;
+
+            try self.messages.put(seq, .{
+                .seq = seq,
+                .ual_index = ual_index,
+                .priority = priority,
+                .state = state,
+                .attempts = attempts,
+                .lease_expiry_ns = lease_expiry_ns,
+                .enqueued_at_ns = enqueued_at_ns,
+                .queue_name_hash = queue_name_hash,
+                .payload = payload,
+            });
+
+            // Rebuild heaps from message state
+            if (state == .ready) {
+                try self.ready_heap.add(.{ .seq = seq, .priority = priority });
+            } else if (state == .leased and lease_expiry_ns > 0) {
+                try self.lease_heap.add(.{ .seq = seq, .expiry_ns = lease_expiry_ns });
+            }
+        }
+
+        // DLQ
+        if (offset + 4 > data.len) return;
+        const dlq_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        var d: u32 = 0;
+        while (d < dlq_count) : (d += 1) {
+            if (offset + 28 > data.len) return;
+            const dlq_entry = DLQEntry{
+                .seq = std.mem.readInt(u64, data[offset..][0..8], .little),
+                .ual_index = std.mem.readInt(u64, data[offset + 8 ..][0..8], .little),
+                .attempts = std.mem.readInt(u32, data[offset + 16 ..][0..4], .little),
+                .moved_at_ns = std.mem.readInt(u64, data[offset + 20 ..][0..8], .little),
+            };
+            offset += 28;
+            try self.dlq.append(self.allocator, dlq_entry);
+        }
+
+        // Known queues
+        if (offset + 4 > data.len) return;
+        const kq_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+
+        var k: u32 = 0;
+        while (k < kq_count) : (k += 1) {
+            if (offset + 12 > data.len) return;
+            const hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + name_len > data.len) return;
+            const name = try self.allocator.dupe(u8, data[offset..][0..name_len]);
+            offset += name_len;
+
+            if (offset + 2 > data.len) {
+                self.allocator.free(name);
+                return;
+            }
+            const ns_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + ns_len + 16 > data.len) {
+                self.allocator.free(name);
+                return;
+            }
+            const namespace = try self.allocator.dupe(u8, data[offset..][0..ns_len]);
+            offset += ns_len;
+            const enqueued = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const dequeued = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+
+            try self.known_queues.put(hash, .{
+                .name = name,
+                .namespace = namespace,
+                .enqueued = enqueued,
+                .dequeued = dequeued,
+            });
+        }
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -781,4 +1017,56 @@ test "queue: projection handle with router" {
 
     try testing.expectEqual(router_mod.ApplyResult.applied, result);
     try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
+}
+
+test "queue: serialize/deserialize round-trip" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
+    defer q.deinit();
+
+    // Enqueue messages
+    _ = try q.enqueue(100, 1, 1000, 42, "hello");
+    _ = try q.enqueue(101, 2, 2000, 42, "world");
+    _ = try q.enqueue(102, 0, 3000, 99, "other-queue");
+
+    // Register known queues
+    try q.registerQueue(42, "tasks", "default");
+    try q.registerQueue(99, "orders", "production");
+
+    // Serialize
+    const data = try q.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    // Deserialize into fresh projection
+    var q2 = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
+    defer q2.deinit();
+
+    try q2.deserialize(data);
+
+    // Verify messages restored
+    try testing.expectEqual(@as(usize, 3), q2.messages.count());
+
+    // Verify next_seq was preserved (should be 4 after 3 enqueues)
+    try testing.expectEqual(q.next_seq, q2.next_seq);
+
+    // Verify known queues restored
+    try testing.expectEqual(@as(usize, 2), q2.queueCount());
+
+    // Verify we can dequeue from the restored projection
+    const d1 = (try q2.dequeue(4000, 42)).?;
+    try testing.expectEqualStrings("hello", d1.payload);
+}
+
+test "queue: serialize empty projection" {
+    var q = QueueProjection.init(testing.allocator, .{});
+    defer q.deinit();
+
+    const data = try q.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var q2 = QueueProjection.init(testing.allocator, .{});
+    defer q2.deinit();
+
+    try q2.deserialize(data);
+    try testing.expectEqual(@as(usize, 0), q2.messages.count());
+    try testing.expectEqual(@as(u64, 1), q2.next_seq);
 }
