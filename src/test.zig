@@ -91,3 +91,8 @@ test {
     _ = @import("node/dashboard/api.zig");
     _ = @import("node/dashboard/http_server.zig");
 }
+
+// Cluster — Phase 7
+test {
+    _ = @import("cluster/coordinator.zig");
+}
