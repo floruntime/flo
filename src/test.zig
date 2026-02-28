@@ -45,6 +45,17 @@ test {
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/memory.zig");
     _ = @import("storage/partition.zig");
+    _ = @import("storage/cold/manifest.zig");
+    _ = @import("storage/cold/backend.zig");
+    _ = @import("storage/cold/noop.zig");
+    _ = @import("storage/cold/file.zig");
+    _ = @import("storage/cold/http_client.zig");
+    _ = @import("storage/cold/http_client_tls.zig");
+    _ = @import("storage/cold/aws_sigv4.zig");
+    _ = @import("storage/cold/s3.zig");
+    _ = @import("storage/cold/azure.zig");
+    _ = @import("storage/cold/mod.zig");
+    _ = @import("storage/cold/tier_manager.zig");
 }
 
 // Raft consensus — Phase 3
