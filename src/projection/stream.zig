@@ -520,9 +520,11 @@ pub const StreamProjection = struct {
 
         switch (entry_type) {
             .stream_append => {
-                // Extract stream name hash from command payload key
+                // Extract stream name hash from command payload, incorporating
+                // namespace_hash as the Wyhash seed for namespace isolation.
+                // This matches the live path: router.nameHash(ns_hash, key).
                 const name_hash = if (CommandPayload.deserialize(ual_entry.payload)) |cmd|
-                    std.hash.Wyhash.hash(0, cmd.key)
+                    std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key)
                 else
                     0;
                 _ = try self.append(ual_entry.header.index, ual_entry.header.timestamp_ns, name_hash, 0);

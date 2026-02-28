@@ -171,6 +171,23 @@ pub fn hashStreamPartition(namespace: []const u8, stream: []const u8, partition_
     return h.final();
 }
 
+/// Compute a compact 32-bit namespace hash for storage in UAL command entries.
+/// Returns 0 for empty namespace (backward-compatible: existing entries have 0).
+pub fn namespaceHash(namespace: []const u8) u32 {
+    if (namespace.len == 0) return 0;
+    return @truncate(std.hash.Wyhash.hash(HASH_SEED, namespace));
+}
+
+/// Hash a resource name (stream, queue, measurement) incorporating the namespace
+/// hash as the Wyhash seed. This allows both live lookups (with full namespace)
+/// and recovery from persisted entries (with only the stored namespace_hash: u32).
+///
+/// Backward-compatible: when namespace_hash=0, produces the same result as
+/// `Wyhash.hash(0, name)` which is what pre-isolation code used.
+pub fn nameHash(namespace_hash: u32, name: []const u8) u64 {
+    return std.hash.Wyhash.hash(@as(u64, namespace_hash), name);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hash tag extraction
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -328,4 +345,35 @@ test "Router: stream partition hashing" {
     // Different partition IDs → (likely) different hashes
     const h3 = hashStreamPartition("prod", "events", 1);
     try std.testing.expect(h1 != h3);
+}
+
+test "Router: namespaceHash and nameHash" {
+    // Default namespace always produces a non-zero hash
+    const ns_default = namespaceHash("default");
+    try std.testing.expect(ns_default != 0);
+
+    // Non-empty namespace → non-zero
+    const ns_a = namespaceHash("prod");
+    try std.testing.expect(ns_a != 0);
+
+    // Different namespaces → different hashes
+    const ns_b = namespaceHash("staging");
+    try std.testing.expect(ns_a != ns_b);
+
+    // nameHash with namespace_hash=0 matches Wyhash.hash(0, name) — backward compat
+    const legacy_hash = std.hash.Wyhash.hash(0, "events");
+    const new_hash = nameHash(0, "events");
+    try std.testing.expectEqual(legacy_hash, new_hash);
+
+    // nameHash with non-zero namespace_hash produces different result — isolation
+    const ns_hash = nameHash(ns_a, "events");
+    try std.testing.expect(ns_hash != legacy_hash);
+
+    // Same namespace + same name → same hash (deterministic)
+    const ns_hash2 = nameHash(ns_a, "events");
+    try std.testing.expectEqual(ns_hash, ns_hash2);
+
+    // Different namespace + same name → different hash (isolated)
+    const ns_hash3 = nameHash(ns_b, "events");
+    try std.testing.expect(ns_hash != ns_hash3);
 }

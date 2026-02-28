@@ -1033,8 +1033,8 @@ test "e2e/kv: list returns all keys across shards" {
     // Write 8 distinctly-named keys. With 4 shards and Wyhash routing,
     // these are very likely to land on at least 2 different shards.
     const keys = [_][]const u8{
-        "alpha_cpu",   "bravo_mem",   "charlie_disk", "delta_net",
-        "echo_iops",   "foxtrot_lat", "golf_tput",    "hotel_err",
+        "alpha_cpu", "bravo_mem",   "charlie_disk", "delta_net",
+        "echo_iops", "foxtrot_lat", "golf_tput",    "hotel_err",
     };
 
     for (keys) |k| {
@@ -1077,4 +1077,141 @@ test "e2e/kv: list with prefix returns correct subset across shards" {
     try stdx.testing.assertContains(result, "user:alice");
     try stdx.testing.assertContains(result, "user:bob");
     try stdx.testing.assertContains(result, "user:charlie");
+}
+
+// =============================================================================
+// Namespace Isolation
+// =============================================================================
+
+test "e2e/kv: same key in different namespaces are independent" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create two namespaces
+    try ctx.exec(&.{ "ns", "create", "kv_ns_a" });
+    try ctx.exec(&.{ "ns", "create", "kv_ns_b" });
+
+    // Set the same key with different values in different namespaces
+    try ctx.exec(&.{ "kv", "set", "config", "value_from_a", "-n", "kv_ns_a" });
+    try ctx.exec(&.{ "kv", "set", "config", "value_from_b", "-n", "kv_ns_b" });
+
+    // Each namespace returns its own value
+    const val_a = try ctx.execCapture(&.{ "kv", "get", "config", "-n", "kv_ns_a" });
+    try testing.expect(std.mem.indexOf(u8, val_a, "value_from_a") != null);
+
+    const val_b = try ctx.execCapture(&.{ "kv", "get", "config", "-n", "kv_ns_b" });
+    try testing.expect(std.mem.indexOf(u8, val_b, "value_from_b") != null);
+}
+
+test "e2e/kv: delete in one namespace does not affect another" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "kv_del_a" });
+    try ctx.exec(&.{ "ns", "create", "kv_del_b" });
+
+    // Set the same key in both namespaces
+    try ctx.exec(&.{ "kv", "set", "shared", "alpha", "-n", "kv_del_a" });
+    try ctx.exec(&.{ "kv", "set", "shared", "beta", "-n", "kv_del_b" });
+
+    // Delete in namespace A
+    try ctx.exec(&.{ "kv", "delete", "shared", "-n", "kv_del_a" });
+
+    // Namespace A should be nil
+    var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--format", "table" });
+    defer result_a.deinit();
+    try stdx.testing.assertContains(result_a, "(nil)");
+
+    // Namespace B should still have its value
+    const val_b = try ctx.execCapture(&.{ "kv", "get", "shared", "-n", "kv_del_b" });
+    try testing.expect(std.mem.indexOf(u8, val_b, "beta") != null);
+}
+
+test "e2e/kv: overwrite in one namespace does not affect another" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "kv_ow_a" });
+    try ctx.exec(&.{ "ns", "create", "kv_ow_b" });
+
+    // Set same key in both namespaces
+    try ctx.exec(&.{ "kv", "set", "setting", "original_a", "-n", "kv_ow_a" });
+    try ctx.exec(&.{ "kv", "set", "setting", "original_b", "-n", "kv_ow_b" });
+
+    // Overwrite only in namespace A
+    try ctx.exec(&.{ "kv", "set", "setting", "updated_a", "-n", "kv_ow_a" });
+
+    // Namespace A should have the new value
+    const val_a = try ctx.execCapture(&.{ "kv", "get", "setting", "-n", "kv_ow_a" });
+    try testing.expect(std.mem.indexOf(u8, val_a, "updated_a") != null);
+
+    // Namespace B should still have its original value
+    const val_b = try ctx.execCapture(&.{ "kv", "get", "setting", "-n", "kv_ow_b" });
+    try testing.expect(std.mem.indexOf(u8, val_b, "original_b") != null);
+}
+
+test "e2e/kv: list only shows keys in the requested namespace" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "kv_ls_a" });
+    try ctx.exec(&.{ "ns", "create", "kv_ls_b" });
+
+    // Populate different keys in each namespace
+    try ctx.exec(&.{ "kv", "set", "onlyInA", "a", "-n", "kv_ls_a" });
+    try ctx.exec(&.{ "kv", "set", "onlyInB", "b", "-n", "kv_ls_b" });
+
+    // List namespace A — should see onlyInA but not onlyInB
+    var result_a = try ctx.cli.run(&.{ "kv", "ls", "-n", "kv_ls_a" });
+    defer result_a.deinit();
+    try stdx.testing.assertContains(result_a, "onlyInA");
+    try stdx.testing.assertNotContains(result_a, "onlyInB");
+
+    // List namespace B — should see onlyInB but not onlyInA
+    var result_b = try ctx.cli.run(&.{ "kv", "ls", "-n", "kv_ls_b" });
+    defer result_b.deinit();
+    try stdx.testing.assertContains(result_b, "onlyInB");
+    try stdx.testing.assertNotContains(result_b, "onlyInA");
+}
+
+test "e2e/kv: conditional --nx is per-namespace" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "kv_nx_a" });
+    try ctx.exec(&.{ "ns", "create", "kv_nx_b" });
+
+    // Set key with --nx in namespace A
+    try ctx.exec(&.{ "kv", "set", "unique", "first", "--nx", "-n", "kv_nx_a" });
+
+    // Same key with --nx in namespace B should succeed (key doesn't exist there)
+    try ctx.exec(&.{ "kv", "set", "unique", "second", "--nx", "-n", "kv_nx_b" });
+
+    // Verify both values
+    const val_a = try ctx.execCapture(&.{ "kv", "get", "unique", "-n", "kv_nx_a" });
+    try testing.expect(std.mem.indexOf(u8, val_a, "first") != null);
+
+    const val_b = try ctx.execCapture(&.{ "kv", "get", "unique", "-n", "kv_nx_b" });
+    try testing.expect(std.mem.indexOf(u8, val_b, "second") != null);
+}
+
+test "e2e/kv: default namespace is isolated from named namespaces" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "kv_custom" });
+
+    // Set key in default namespace (no -n flag)
+    try ctx.exec(&.{ "kv", "set", "mykey", "default_val" });
+
+    // Set same key in custom namespace
+    try ctx.exec(&.{ "kv", "set", "mykey", "custom_val", "-n", "kv_custom" });
+
+    // Default namespace read
+    const val_default = try ctx.execCapture(&.{ "kv", "get", "mykey" });
+    try testing.expect(std.mem.indexOf(u8, val_default, "default_val") != null);
+
+    // Custom namespace read
+    const val_custom = try ctx.execCapture(&.{ "kv", "get", "mykey", "-n", "kv_custom" });
+    try testing.expect(std.mem.indexOf(u8, val_custom, "custom_val") != null);
 }

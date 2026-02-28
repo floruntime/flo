@@ -97,11 +97,11 @@ pub const ServerProcess = struct {
     /// Tiered log configuration for tests
     pub const TieredLogConfig = struct {
         /// Hot tier buffer capacity in bytes (default: 16MB)
-        buffer_capacity: usize = 16 * 1024 * 1024,
+        hot_buffer_capacity: usize = 16 * 1024 * 1024,
         /// Max entries before spilling to warm tier (0 = use buffer capacity)
         max_hot_entries: usize = 0,
         /// Time window before flushing to warm (seconds, 0 = disabled)
-        hot_window_seconds: u32 = 0,
+        hot_flush_seconds: u32 = 0,
     };
 
     /// Server configuration for tests
@@ -222,8 +222,23 @@ pub const ServerProcess = struct {
         var fbs = std.io.fixedBufferStream(&config_buf);
         const config_writer = fbs.writer();
 
-        // Storage section with durability
-        try config_writer.print("[storage]\ndurability = \"{s}\"\n\n", .{self.config.durability.toConfigString()});
+        // Storage section with durability + tier settings
+        try config_writer.print("[storage]\ndurability = \"{s}\"\n", .{self.config.durability.toConfigString()});
+
+        // Tier settings (all under [storage])
+        if (self.config.tiered_log.hot_buffer_capacity != 16 * 1024 * 1024 or
+            self.config.tiered_log.max_hot_entries != 0 or
+            self.config.tiered_log.hot_flush_seconds != 0)
+        {
+            try config_writer.print("hot_buffer_capacity = {d}\n", .{self.config.tiered_log.hot_buffer_capacity});
+            if (self.config.tiered_log.max_hot_entries > 0) {
+                try config_writer.print("max_hot_entries = {d}\n", .{self.config.tiered_log.max_hot_entries});
+            }
+            if (self.config.tiered_log.hot_flush_seconds > 0) {
+                try config_writer.print("hot_flush_seconds = {d}\n", .{self.config.tiered_log.hot_flush_seconds});
+            }
+        }
+        try config_writer.print("\n", .{});
 
         // Background task intervals
         try config_writer.print("[background_tasks]\nnamespace_deletion_interval_ms = {d}\n\n", .{self.config.namespace_deletion_interval_ms});
@@ -250,21 +265,6 @@ pub const ServerProcess = struct {
             } else {
                 // Default to data_dir/archive
                 try config_writer.print("file_base_path = \"{s}/archive\"\n", .{self.data_dir});
-            }
-        }
-
-        // Tiered log section (for controlling hot→warm transitions)
-        if (self.config.tiered_log.buffer_capacity != 16 * 1024 * 1024 or
-            self.config.tiered_log.max_hot_entries != 0 or
-            self.config.tiered_log.hot_window_seconds != 0)
-        {
-            try config_writer.print("\n[tiered_log]\n", .{});
-            try config_writer.print("buffer_capacity = {d}\n", .{self.config.tiered_log.buffer_capacity});
-            if (self.config.tiered_log.max_hot_entries > 0) {
-                try config_writer.print("max_hot_entries = {d}\n", .{self.config.tiered_log.max_hot_entries});
-            }
-            if (self.config.tiered_log.hot_window_seconds > 0) {
-                try config_writer.print("hot_window_seconds = {d}\n", .{self.config.tiered_log.hot_window_seconds});
             }
         }
 

@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
+const node_router = @import("../node/router.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -55,6 +56,10 @@ pub const Message = struct {
     lease_expiry_ns: u64,
     /// When the message was enqueued (nanoseconds).
     enqueued_at_ns: u64,
+    /// Queue name hash — identifies which queue this message belongs to.
+    queue_name_hash: u64,
+    /// Message payload (allocator-owned copy).
+    payload: []const u8,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +82,8 @@ pub const DequeueResult = struct {
     ual_index: u64,
     priority: u32,
     attempts: u32,
+    payload: []const u8,
+    enqueued_at_ns: u64,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -134,6 +141,9 @@ pub const QueueProjection = struct {
     dlq: std.ArrayList(DLQEntry),
     dlq_limit: usize,
 
+    /// Known queue metadata: queue_name_hash → QueueMeta.
+    known_queues: std.AutoHashMap(u64, QueueMeta),
+
     /// Next sequence number.
     next_seq: u64,
 
@@ -148,6 +158,13 @@ pub const QueueProjection = struct {
 
     /// Stats.
     stats: Stats,
+
+    pub const QueueMeta = struct {
+        name: []const u8,
+        namespace: []const u8,
+        enqueued: u64,
+        dequeued: u64,
+    };
 
     pub const Stats = struct {
         enqueued: u64 = 0,
@@ -172,6 +189,7 @@ pub const QueueProjection = struct {
             .lease_heap = std.PriorityQueue(LeaseItem, void, leaseCompare).init(allocator, {}),
             .dlq = .empty,
             .dlq_limit = config.dlq_limit,
+            .known_queues = std.AutoHashMap(u64, QueueMeta).init(allocator),
             .next_seq = 1,
             .applied_index = 0,
             .max_attempts = config.max_attempts,
@@ -181,19 +199,47 @@ pub const QueueProjection = struct {
     }
 
     pub fn deinit(self: *QueueProjection) void {
+        // Free owned payload copies
+        var msg_it = self.messages.iterator();
+        while (msg_it.next()) |kv| {
+            if (kv.value_ptr.payload.len > 0) {
+                self.allocator.free(kv.value_ptr.payload);
+            }
+        }
         self.messages.deinit();
         self.ready_heap.deinit();
         self.lease_heap.deinit();
         self.dlq.deinit(self.allocator);
+        // Free known queue name/namespace copies
+        var q_it = self.known_queues.iterator();
+        while (q_it.next()) |kv| {
+            self.allocator.free(kv.value_ptr.name);
+            self.allocator.free(kv.value_ptr.namespace);
+        }
+        self.known_queues.deinit();
     }
 
     /// Reset the queue projection to empty state.
     /// Used during namespace force-delete to clear all queue data.
     pub fn reset(self: *QueueProjection) void {
+        // Free owned payload copies
+        var msg_it = self.messages.iterator();
+        while (msg_it.next()) |kv| {
+            if (kv.value_ptr.payload.len > 0) {
+                self.allocator.free(kv.value_ptr.payload);
+            }
+        }
         self.messages.clearAndFree();
         self.ready_heap.items.len = 0;
         self.lease_heap.items.len = 0;
         self.dlq.clearAndFree(self.allocator);
+        // Free known queue name/namespace copies
+        var kq_it = self.known_queues.iterator();
+        while (kq_it.next()) |kv| {
+            self.allocator.free(kv.value_ptr.name);
+            self.allocator.free(kv.value_ptr.namespace);
+        }
+        self.known_queues.clearAndFree();
         self.next_seq = 1;
         self.applied_index = 0;
         self.stats = .{};
@@ -201,10 +247,17 @@ pub const QueueProjection = struct {
 
     // ─── Core operations ───────────────────────────────────────────────────
 
-    /// Enqueue a message with the given priority and UAL index.
-    pub fn enqueue(self: *QueueProjection, ual_index: u64, priority: u32, timestamp_ns: u64) !u64 {
+    /// Enqueue a message with the given priority, UAL index, queue identity, and payload.
+    pub fn enqueue(self: *QueueProjection, ual_index: u64, priority: u32, timestamp_ns: u64, queue_name_hash: u64, payload: []const u8) !u64 {
         const seq = self.next_seq;
         self.next_seq += 1;
+
+        // Own a copy of the payload
+        const payload_copy = if (payload.len > 0)
+            try self.allocator.dupe(u8, payload)
+        else
+            &[_]u8{};
+        errdefer if (payload_copy.len > 0) self.allocator.free(payload_copy);
 
         const msg = Message{
             .seq = seq,
@@ -214,25 +267,68 @@ pub const QueueProjection = struct {
             .attempts = 0,
             .lease_expiry_ns = 0,
             .enqueued_at_ns = timestamp_ns,
+            .queue_name_hash = queue_name_hash,
+            .payload = payload_copy,
         };
 
         try self.messages.put(seq, msg);
         try self.ready_heap.add(.{ .seq = seq, .priority = priority });
 
+        // Update known-queue stats
+        if (self.known_queues.getPtr(queue_name_hash)) |meta| {
+            meta.enqueued += 1;
+        }
+
         self.stats.enqueued += 1;
         return seq;
     }
 
-    /// Dequeue the highest-priority ready message.
-    /// Returns null if no ready messages.
-    pub fn dequeue(self: *QueueProjection, now_ns: u64) !?DequeueResult {
+    /// Register a queue name so it appears in `list` and stats are tracked per-queue.
+    pub fn registerQueue(self: *QueueProjection, queue_name_hash: u64, name: []const u8, namespace: []const u8) !void {
+        const gop = try self.known_queues.getOrPut(queue_name_hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .name = try self.allocator.dupe(u8, name),
+                .namespace = try self.allocator.dupe(u8, namespace),
+                .enqueued = 0,
+                .dequeued = 0,
+            };
+        }
+    }
+
+    /// Number of known queue names on this shard.
+    pub fn queueCount(self: *const QueueProjection) usize {
+        return self.known_queues.count();
+    }
+
+    /// Dequeue the highest-priority ready message matching queue_name_hash.
+    /// Pass queue_name_hash == 0 to dequeue from any queue (legacy path).
+    /// Returns null if no matching ready messages.
+    pub fn dequeue(self: *QueueProjection, now_ns: u64, queue_name_hash: u64) !?DequeueResult {
         // First, expire any leases
         self.expireLeases(now_ns);
 
-        // Pop from ready heap
+        // We may need to skip non-matching items; collect them for re-push.
+        var skipped_buf: [128]HeapItem = undefined;
+        var skipped_count: usize = 0;
+        var found: ?DequeueResult = null;
+
         while (self.ready_heap.removeOrNull()) |item| {
             if (self.messages.getPtr(item.seq)) |msg| {
                 if (msg.state != .ready) continue; // stale heap entry
+
+                // Filter by queue name hash (0 = match any)
+                if (queue_name_hash != 0 and msg.queue_name_hash != queue_name_hash) {
+                    if (skipped_count < skipped_buf.len) {
+                        skipped_buf[skipped_count] = item;
+                        skipped_count += 1;
+                    } else {
+                        // Too many skipped — re-add and give up
+                        self.ready_heap.add(item) catch {};
+                        break;
+                    }
+                    continue;
+                }
 
                 // Lease the message
                 msg.state = .leased;
@@ -246,21 +342,37 @@ pub const QueueProjection = struct {
 
                 self.stats.dequeued += 1;
 
-                return .{
+                // Update known-queue stats
+                if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| {
+                    meta.dequeued += 1;
+                }
+
+                found = .{
                     .seq = msg.seq,
                     .ual_index = msg.ual_index,
                     .priority = msg.priority,
                     .attempts = msg.attempts,
+                    .payload = msg.payload,
+                    .enqueued_at_ns = msg.enqueued_at_ns,
                 };
+                break;
             }
         }
 
-        return null;
+        // Re-push any skipped items
+        for (skipped_buf[0..skipped_count]) |item| {
+            self.ready_heap.add(item) catch {};
+        }
+
+        return found;
     }
 
     /// Acknowledge a leased message (mark as complete, remove).
     pub fn ack(self: *QueueProjection, seq: u64) !void {
-        if (self.messages.fetchRemove(seq)) |_| {
+        if (self.messages.fetchRemove(seq)) |kv| {
+            if (kv.value.payload.len > 0) {
+                self.allocator.free(kv.value.payload);
+            }
             self.stats.acked += 1;
         }
     }
@@ -364,12 +476,27 @@ pub const QueueProjection = struct {
             .queue_enqueue => {
                 // Parse priority from command payload value (first 4 bytes) or default 0
                 var priority: u32 = 0;
+                var payload: []const u8 = &[_]u8{};
+                var q_name_hash: u64 = 0;
+                var q_name: []const u8 = "";
                 if (CommandPayload.deserialize(entry.payload)) |cmd| {
                     if (cmd.value.len >= 4) {
                         priority = std.mem.readInt(u32, cmd.value[0..4], .little);
+                        // Rest of value after 4-byte priority is the actual payload
+                        if (cmd.value.len > 4) {
+                            payload = cmd.value[4..];
+                        }
+                    } else {
+                        payload = cmd.value;
                     }
+                    q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
+                    q_name = cmd.key;
                 }
-                _ = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns);
+                _ = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
+                // Register queue during recovery so list works after restart
+                if (q_name.len > 0) {
+                    self.registerQueue(q_name_hash, q_name, "default") catch {};
+                }
             },
             .queue_ack => {
                 // Seq is encoded in the command payload key as a u64
@@ -419,9 +546,16 @@ pub const QueueProjection = struct {
     }
 
     pub fn memoryUsage(self: *const QueueProjection) usize {
-        // Approximate: per-message overhead + heap + DLQ
+        // Approximate: per-message overhead + heap + DLQ + payload bytes + known queues
+        var payload_bytes: usize = 0;
+        var it = self.messages.iterator();
+        while (it.next()) |kv| {
+            payload_bytes += kv.value_ptr.payload.len;
+        }
         return self.messages.count() * @sizeOf(Message) +
             self.dlq.items.len * @sizeOf(DLQEntry) +
+            self.known_queues.count() * @sizeOf(QueueMeta) +
+            payload_bytes +
             @sizeOf(QueueProjection);
     }
 };
@@ -436,41 +570,43 @@ test "queue: basic enqueue and dequeue" {
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer q.deinit();
 
-    const seq1 = try q.enqueue(100, 0, 1000);
-    const seq2 = try q.enqueue(101, 0, 2000);
+    const seq1 = try q.enqueue(100, 0, 1000, 42, "hello");
+    const seq2 = try q.enqueue(101, 0, 2000, 42, "world");
 
     try testing.expectEqual(@as(u64, 1), seq1);
     try testing.expectEqual(@as(u64, 2), seq2);
     try testing.expectEqual(@as(usize, 2), q.readyCount());
 
     // Dequeue returns highest priority (FIFO for same priority)
-    const d1 = (try q.dequeue(3000)).?;
+    const d1 = (try q.dequeue(3000, 42)).?;
     try testing.expectEqual(seq1, d1.seq);
     try testing.expectEqual(@as(u64, 100), d1.ual_index);
+    try testing.expectEqualStrings("hello", d1.payload);
 
-    const d2 = (try q.dequeue(3000)).?;
+    const d2 = (try q.dequeue(3000, 42)).?;
     try testing.expectEqual(seq2, d2.seq);
+    try testing.expectEqualStrings("world", d2.payload);
 
     // No more ready
-    try testing.expect(try q.dequeue(3000) == null);
+    try testing.expect(try q.dequeue(3000, 42) == null);
 }
 
 test "queue: priority ordering" {
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer q.deinit();
 
-    _ = try q.enqueue(100, 10, 1000); // low priority
-    _ = try q.enqueue(101, 1, 2000); // high priority
-    _ = try q.enqueue(102, 5, 3000); // medium priority
+    _ = try q.enqueue(100, 10, 1000, 42, "low"); // low priority
+    _ = try q.enqueue(101, 1, 2000, 42, "high"); // high priority
+    _ = try q.enqueue(102, 5, 3000, 42, "med"); // medium priority
 
     // Should dequeue in priority order: 1, 5, 10
-    const d1 = (try q.dequeue(4000)).?;
+    const d1 = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 1), d1.priority);
 
-    const d2 = (try q.dequeue(4000)).?;
+    const d2 = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 5), d2.priority);
 
-    const d3 = (try q.dequeue(4000)).?;
+    const d3 = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 10), d3.priority);
 }
 
@@ -478,8 +614,8 @@ test "queue: ack removes message" {
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000 });
     defer q.deinit();
 
-    const seq = try q.enqueue(100, 0, 1000);
-    _ = try q.dequeue(2000);
+    const seq = try q.enqueue(100, 0, 1000, 42, "msg");
+    _ = try q.dequeue(2000, 42);
     try q.ack(seq);
 
     try testing.expectEqual(@as(usize, 0), q.totalMessages());
@@ -493,15 +629,15 @@ test "queue: nack re-enqueues" {
     });
     defer q.deinit();
 
-    const seq = try q.enqueue(100, 0, 1000);
-    _ = try q.dequeue(2000);
+    const seq = try q.enqueue(100, 0, 1000, 42, "msg");
+    _ = try q.dequeue(2000, 42);
 
     // Nack — should re-enqueue
     try q.nack(seq, 3000);
     try testing.expectEqual(@as(usize, 1), q.readyCount());
 
     // Dequeue again — attempts should be 2
-    const d = (try q.dequeue(4000)).?;
+    const d = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 2), d.attempts);
 }
 
@@ -512,14 +648,14 @@ test "queue: nack to DLQ after max attempts" {
     });
     defer q.deinit();
 
-    const seq = try q.enqueue(100, 0, 1000);
+    const seq = try q.enqueue(100, 0, 1000, 42, "msg");
 
     // Attempt 1
-    _ = try q.dequeue(2000);
+    _ = try q.dequeue(2000, 42);
     try q.nack(seq, 3000); // re-enqueue (attempt 1 < 2)
 
     // Attempt 2
-    _ = try q.dequeue(4000);
+    _ = try q.dequeue(4000, 42);
     try q.nack(seq, 5000); // DLQ (attempt 2 >= 2)
 
     try testing.expectEqual(@as(usize, 1), q.dlqCount());
@@ -532,8 +668,8 @@ test "queue: lease expiry returns message to ready" {
     });
     defer q.deinit();
 
-    _ = try q.enqueue(100, 0, 1000);
-    _ = try q.dequeue(2000); // leased until 3000
+    _ = try q.enqueue(100, 0, 1000, 42, "msg");
+    _ = try q.dequeue(2000, 42); // leased until 3000
 
     try testing.expectEqual(@as(usize, 0), q.readyCount());
     try testing.expectEqual(@as(usize, 1), q.leasedCount());
@@ -545,7 +681,7 @@ test "queue: lease expiry returns message to ready" {
     try testing.expectEqual(@as(u64, 1), q.stats.leases_expired);
 
     // Can dequeue again
-    const d = (try q.dequeue(5000)).?;
+    const d = (try q.dequeue(5000, 42)).?;
     try testing.expectEqual(@as(u32, 2), d.attempts);
 }
 
@@ -555,13 +691,13 @@ test "queue: dequeue auto-expires leases" {
     });
     defer q.deinit();
 
-    const seq1 = try q.enqueue(100, 0, 1000);
-    _ = try q.dequeue(2000); // leased seq1 until 2100
+    const seq1 = try q.enqueue(100, 0, 1000, 42, "a");
+    _ = try q.dequeue(2000, 42); // leased seq1 until 2100
 
-    const seq2 = try q.enqueue(101, 0, 2000);
+    const seq2 = try q.enqueue(101, 0, 2000, 42, "b");
 
     // Dequeue at time 3000 — seq1 lease expired, should be available again
-    const d = (try q.dequeue(3000)).?;
+    const d = (try q.dequeue(3000, 42)).?;
     // seq1 should have been re-enqueued and dequeued first (FIFO, same priority)
     // Actually it could be either depending on heap ordering with seq tiebreak
     try testing.expect(d.seq == seq1 or d.seq == seq2);
@@ -571,7 +707,7 @@ test "queue: empty dequeue returns null" {
     var q = QueueProjection.init(testing.allocator, .{});
     defer q.deinit();
 
-    try testing.expect(try q.dequeue(1000) == null);
+    try testing.expect(try q.dequeue(1000, 0) == null);
 }
 
 test "queue: stats tracking" {
@@ -581,9 +717,9 @@ test "queue: stats tracking" {
     });
     defer q.deinit();
 
-    _ = try q.enqueue(100, 0, 1000);
-    _ = try q.enqueue(101, 0, 2000);
-    _ = try q.dequeue(3000);
+    _ = try q.enqueue(100, 0, 1000, 42, "a");
+    _ = try q.enqueue(101, 0, 2000, 42, "b");
+    _ = try q.dequeue(3000, 42);
 
     try testing.expectEqual(@as(u64, 2), q.stats.enqueued);
     try testing.expectEqual(@as(u64, 1), q.stats.dequeued);
@@ -593,10 +729,43 @@ test "queue: memory usage estimate" {
     var q = QueueProjection.init(testing.allocator, .{});
     defer q.deinit();
 
-    _ = try q.enqueue(100, 0, 1000);
-    _ = try q.enqueue(101, 0, 2000);
+    _ = try q.enqueue(100, 0, 1000, 42, "hello");
+    _ = try q.enqueue(101, 0, 2000, 42, "world");
 
     try testing.expect(q.memoryUsage() > 0);
+}
+
+test "queue: dequeue filters by queue_name_hash" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000 });
+    defer q.deinit();
+
+    _ = try q.enqueue(100, 0, 1000, 1, "queue-A msg");
+    _ = try q.enqueue(101, 0, 2000, 2, "queue-B msg");
+    _ = try q.enqueue(102, 0, 3000, 1, "queue-A msg2");
+
+    // Dequeue from queue 2 only
+    const d1 = (try q.dequeue(4000, 2)).?;
+    try testing.expectEqualStrings("queue-B msg", d1.payload);
+
+    // No more in queue 2
+    try testing.expect(try q.dequeue(4000, 2) == null);
+
+    // Queue 1 still has 2
+    const d2 = (try q.dequeue(4000, 1)).?;
+    try testing.expectEqualStrings("queue-A msg", d2.payload);
+    const d3 = (try q.dequeue(4000, 1)).?;
+    try testing.expectEqualStrings("queue-A msg2", d3.payload);
+}
+
+test "queue: registerQueue and queueCount" {
+    var q = QueueProjection.init(testing.allocator, .{});
+    defer q.deinit();
+
+    try q.registerQueue(42, "tasks", "default");
+    try q.registerQueue(99, "orders", "default");
+    try q.registerQueue(42, "tasks", "default"); // duplicate — no-op
+
+    try testing.expectEqual(@as(usize, 2), q.queueCount());
 }
 
 test "queue: projection handle with router" {

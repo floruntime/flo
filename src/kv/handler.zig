@@ -369,7 +369,7 @@ pub const KVHandler = struct {
         var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
         const value = if (entry_type == .kv_delete) &[_]u8{} else req.value;
         const cmd = entry_mod.CommandPayload{
-            .namespace_hash = 0, // TODO: extract from request namespace
+            .namespace_hash = router.namespaceHash(req.namespace),
             .key_length = @intCast(qualified_key.len),
             .value_length = @intCast(value.len),
             .key = qualified_key,

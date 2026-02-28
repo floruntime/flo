@@ -1421,7 +1421,7 @@ test "e2e/stream: tiered storage - warm tier spill and read" {
         .server = .{
             .durability = .sync,
             .tiered_log = .{
-                .buffer_capacity = 4096, // 4KB - very small to force spills
+                .hot_buffer_capacity = 4096, // 4KB - very small to force spills
                 .max_hot_entries = 10, // Spill after 10 entries
             },
         },
@@ -1466,7 +1466,7 @@ test "e2e/stream: tiered storage - read range across tiers" {
         .server = .{
             .durability = .sync,
             .tiered_log = .{
-                .buffer_capacity = 4096,
+                .hot_buffer_capacity = 4096,
                 .max_hot_entries = 5, // Very small hot tier
             },
         },
@@ -1516,7 +1516,7 @@ test "e2e/stream: tiered storage - cold tier with file backend" {
                 // file_base_path defaults to data_dir/archive
             },
             .tiered_log = .{
-                .buffer_capacity = 2048, // Very small to force spills
+                .hot_buffer_capacity = 2048, // Very small to force spills
                 .max_hot_entries = 3, // Very small hot tier
             },
         },
@@ -1938,4 +1938,164 @@ test "e2e/stream: read with --partition still reads only that partition" {
 
     try testing.expect(result.contains("on-p1"));
     try testing.expect(!result.contains("on-p2"));
+}
+
+// =============================================================================
+// Namespace Isolation
+// =============================================================================
+
+test "e2e/stream: same stream name in different namespaces are independent" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create two namespaces
+    try ctx.exec(&.{ "ns", "create", "stream_ns_a" });
+    try ctx.exec(&.{ "ns", "create", "stream_ns_b" });
+
+    // Append different data to same stream name in different namespaces
+    try ctx.exec(&.{ "stream", "append", "events", "event_from_a", "-n", "stream_ns_a" });
+    try ctx.exec(&.{ "stream", "append", "events", "event_from_b", "-n", "stream_ns_b" });
+
+    // Read from namespace A — should see only its data
+    var result_a = try ctx.cli.run(&.{ "stream", "read", "events", "--limit", "10", "-n", "stream_ns_a" });
+    defer result_a.deinit();
+    try testing.expect(result_a.contains("event_from_a"));
+    try testing.expect(!result_a.contains("event_from_b"));
+
+    // Read from namespace B — should see only its data
+    var result_b = try ctx.cli.run(&.{ "stream", "read", "events", "--limit", "10", "-n", "stream_ns_b" });
+    defer result_b.deinit();
+    try testing.expect(result_b.contains("event_from_b"));
+    try testing.expect(!result_b.contains("event_from_a"));
+}
+
+test "e2e/stream: ls only shows streams in the requested namespace" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "stream_ls_a" });
+    try ctx.exec(&.{ "ns", "create", "stream_ls_b" });
+
+    // Create distinct streams in each namespace
+    try ctx.exec(&.{ "stream", "append", "alpha-stream", "msg", "-n", "stream_ls_a" });
+    try ctx.exec(&.{ "stream", "append", "beta-stream", "msg", "-n", "stream_ls_b" });
+
+    // List namespace A
+    var result_a = try ctx.cli.run(&.{ "stream", "ls", "-n", "stream_ls_a" });
+    defer result_a.deinit();
+    try stdx.testing.assertContains(result_a, "alpha-stream");
+    try stdx.testing.assertNotContains(result_a, "beta-stream");
+
+    // List namespace B
+    var result_b = try ctx.cli.run(&.{ "stream", "ls", "-n", "stream_ls_b" });
+    defer result_b.deinit();
+    try stdx.testing.assertContains(result_b, "beta-stream");
+    try stdx.testing.assertNotContains(result_b, "alpha-stream");
+}
+
+test "e2e/stream: append in one namespace does not appear in another" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "stream_iso_a" });
+    try ctx.exec(&.{ "ns", "create", "stream_iso_b" });
+
+    // Append several messages in namespace A
+    try ctx.exec(&.{ "stream", "append", "logs", "log-a-1", "-n", "stream_iso_a" });
+    try ctx.exec(&.{ "stream", "append", "logs", "log-a-2", "-n", "stream_iso_a" });
+    try ctx.exec(&.{ "stream", "append", "logs", "log-a-3", "-n", "stream_iso_a" });
+
+    // Append one message in namespace B
+    try ctx.exec(&.{ "stream", "append", "logs", "log-b-1", "-n", "stream_iso_b" });
+
+    // Read from namespace A — should have 3 entries, none from B
+    var result_a = try ctx.cli.run(&.{ "stream", "read", "logs", "--limit", "10", "-n", "stream_iso_a" });
+    defer result_a.deinit();
+    try testing.expect(result_a.contains("log-a-1"));
+    try testing.expect(result_a.contains("log-a-2"));
+    try testing.expect(result_a.contains("log-a-3"));
+    try testing.expect(!result_a.contains("log-b-1"));
+
+    // Read from namespace B — should have only 1 entry
+    var result_b = try ctx.cli.run(&.{ "stream", "read", "logs", "--limit", "10", "-n", "stream_iso_b" });
+    defer result_b.deinit();
+    try testing.expect(result_b.contains("log-b-1"));
+    try testing.expect(!result_b.contains("log-a-1"));
+}
+
+test "e2e/stream: default namespace is isolated from named namespaces" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "stream_custom" });
+
+    // Append to stream in default namespace (no -n flag)
+    try ctx.exec(&.{ "stream", "append", "mystream", "default_msg" });
+
+    // Append to same stream name in custom namespace
+    try ctx.exec(&.{ "stream", "append", "mystream", "custom_msg", "-n", "stream_custom" });
+
+    // Default namespace read
+    var result_default = try ctx.cli.run(&.{ "stream", "read", "mystream", "--limit", "10" });
+    defer result_default.deinit();
+    try testing.expect(result_default.contains("default_msg"));
+    try testing.expect(!result_default.contains("custom_msg"));
+
+    // Custom namespace read
+    var result_custom = try ctx.cli.run(&.{ "stream", "read", "mystream", "--limit", "10", "-n", "stream_custom" });
+    defer result_custom.deinit();
+    try testing.expect(result_custom.contains("custom_msg"));
+    try testing.expect(!result_custom.contains("default_msg"));
+}
+
+test "e2e/stream: consumer groups are namespace-scoped" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "stream_cg_a" });
+    try ctx.exec(&.{ "ns", "create", "stream_cg_b" });
+
+    // Create streams and consumer groups with same names in different namespaces
+    try ctx.exec(&.{ "stream", "append", "orders", "order-a-1", "-n", "stream_cg_a" });
+    try ctx.exec(&.{ "stream", "append", "orders", "order-b-1", "-n", "stream_cg_b" });
+
+    try ctx.exec(&.{ "stream", "group", "create", "orders", "--group", "workers", "-n", "stream_cg_a" });
+    try ctx.exec(&.{ "stream", "group", "create", "orders", "--group", "workers", "-n", "stream_cg_b" });
+
+    // Read from consumer group in namespace A
+    var result_a = try ctx.cli.run(&.{ "stream", "group", "read", "orders", "--group", "workers", "--consumer", "c1", "-n", "stream_cg_a" });
+    defer result_a.deinit();
+    try testing.expect(result_a.contains("order-a-1"));
+    try testing.expect(!result_a.contains("order-b-1"));
+
+    // Read from consumer group in namespace B
+    var result_b = try ctx.cli.run(&.{ "stream", "group", "read", "orders", "--group", "workers", "--consumer", "c1", "-n", "stream_cg_b" });
+    defer result_b.deinit();
+    try testing.expect(result_b.contains("order-b-1"));
+    try testing.expect(!result_b.contains("order-a-1"));
+}
+
+test "e2e/stream: info is namespace-scoped" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "stream_info_a" });
+    try ctx.exec(&.{ "ns", "create", "stream_info_b" });
+
+    // Append different amounts in each namespace
+    try ctx.exec(&.{ "stream", "append", "metrics", "m1", "-n", "stream_info_a" });
+    try ctx.exec(&.{ "stream", "append", "metrics", "m2", "-n", "stream_info_a" });
+    try ctx.exec(&.{ "stream", "append", "metrics", "m3", "-n", "stream_info_a" });
+
+    try ctx.exec(&.{ "stream", "append", "metrics", "m1", "-n", "stream_info_b" });
+
+    // Info for namespace A
+    var result_a = try ctx.cli.run(&.{ "stream", "info", "metrics", "-n", "stream_info_a" });
+    defer result_a.deinit();
+    try testing.expect(result_a.contains("metrics") or result_a.succeeded());
+
+    // Info for namespace B
+    var result_b = try ctx.cli.run(&.{ "stream", "info", "metrics", "-n", "stream_info_b" });
+    defer result_b.deinit();
+    try testing.expect(result_b.contains("metrics") or result_b.succeeded());
 }

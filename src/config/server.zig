@@ -46,8 +46,7 @@ pub const ServerConfig = struct {
     shards: u16 = 0, // 0 = auto-detect CPU count; defines data topology (permanent!)
     partition_count: u32 = 0, // 0 = auto (max(4096, shards × 32)); virtual partitions for rebalancing
 
-    // [storage] section
-    hot_window_seconds: u64 = 90,
+    // [storage] section — unified tier configuration
     // NOTE: memtable_size_mb removed - no SpilloverEngine in "Log is Data" architecture
     durability: Durability = .async_flush, // sync, async_flush, or ephemeral
 
@@ -59,7 +58,7 @@ pub const ServerConfig = struct {
     // [cold_storage] section
     cold_storage: ColdStorageConfig = .{},
 
-    // [tiered_log] section - controls hot/warm/cold tier behavior
+    // Tier settings (parsed from [storage] section)
     tiered_log: TieredLogConfig = .{},
 
     // [auth] section
@@ -137,7 +136,6 @@ pub const ServerConfig = struct {
             .data_dir = self.data_dir,
             .listen_port = self.port,
             .listen_addr = self.bind,
-            .hot_window_seconds = self.hot_window_seconds,
             .durability = self.durability,
             .cold_storage = if (self.cold_storage.provider != .none) self.cold_storage else null,
             .tiered_log = self.tiered_log,
@@ -214,32 +212,26 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         }
     }
 
-    // Parse [storage] section
+    // Parse [storage] section — unified tier configuration
     if (table.getTable("storage")) |storage| {
-        if (storage.getInt("hot_window_seconds")) |h| {
-            config.hot_window_seconds = @intCast(h);
-        }
         // NOTE: memtable_size_mb parsing removed - no SpilloverEngine
         if (storage.getString("durability")) |d| {
             config.durability = Durability.fromString(d);
         }
-    }
-
-    // Parse [tiered_log] section
-    if (table.getTable("tiered_log")) |tl| {
-        if (tl.getInt("buffer_capacity")) |b| {
-            config.tiered_log.buffer_capacity = @intCast(b);
+        // Tier settings (all under [storage])
+        if (storage.getInt("hot_buffer_capacity")) |b| {
+            config.tiered_log.hot_buffer_capacity = @intCast(b);
         }
-        if (tl.getInt("max_hot_entries")) |m| {
+        if (storage.getInt("max_hot_entries")) |m| {
             config.tiered_log.max_hot_entries = @intCast(m);
         }
-        if (tl.getInt("hot_window_seconds")) |h| {
-            config.tiered_log.hot_window_seconds = @intCast(h);
+        if (storage.getInt("hot_flush_seconds")) |h| {
+            config.tiered_log.hot_flush_seconds = @intCast(h);
         }
-        if (tl.getInt("max_local_segments")) |s| {
+        if (storage.getInt("max_local_segments")) |s| {
             config.tiered_log.max_local_segments = @intCast(s);
         }
-        if (tl.getBool("enable_wal_truncation")) |e| {
+        if (storage.getBool("enable_wal_truncation")) |e| {
             config.tiered_log.enable_wal_truncation = e;
         }
     }
@@ -522,19 +514,30 @@ pub fn generateDefaultConfig() []const u8 {
     \\# partition_count = 0
     \\
     \\[storage]
-    \\# --- Flash Engine (Streams/Logs) ---
-    \\# Hot data window in seconds (kept in Ring Buffer RAM)
-    \\# Events older than this are flushed to disk segments.
-    \\hot_window_seconds = 90
-    \\
-    \\# NOTE: memtable_size_mb removed - state engine is pure in-memory
-    \\# in "Log is Data" architecture (recovery from Raft log replay)
-    \\
     \\# --- WAL Durability ---
     \\# sync: Wait for fsync after every write (strongest guarantee)
     \\# async_flush: Background flush every ~1ms (highest throughput, default)
     \\# ephemeral: Skip WAL entirely (for caches/temporary data)
     \\durability = "async_flush"
+    \\
+    \\# --- Hot Tier (RAM Ring Buffer) ---
+    \\# Per-partition mmap'd ring buffer capacity in bytes (default: 64MB)
+    \\hot_buffer_capacity = 67108864
+    \\
+    \\# Max seconds entries stay in hot tier before flush to warm (0 = disabled)
+    \\# Recommended production value: 300 (5 minutes)
+    \\# hot_flush_seconds = 300
+    \\
+    \\# Max entries in hot tier before eviction (0 = rely on buffer capacity only)
+    \\# Non-zero values useful for testing deterministic spill behavior
+    \\# max_hot_entries = 0
+    \\
+    \\# --- Warm Tier (Disk Segments) ---
+    \\# Max local segments before archival to cold tier
+    \\# max_local_segments = 100
+    \\
+    \\# Truncate WAL entries after safe segment flush
+    \\# enable_wal_truncation = true
     \\
     \\[background_tasks]
     \\# Namespace deletion task interval in milliseconds

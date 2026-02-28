@@ -40,6 +40,7 @@ const Dispatcher = @import("dispatcher.zig").Dispatcher;
 const Connection = @import("connection.zig").Connection;
 const RingBuffer = @import("connection.zig").RingBuffer;
 const Router = @import("router.zig").Router;
+const node_router = @import("router.zig");
 const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
 const KVProjection = @import("../projection/kv.zig").KVProjection;
@@ -54,6 +55,7 @@ const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
+const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
 const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
@@ -168,6 +170,12 @@ pub const Shard = struct {
     /// stream long-poll, and worker_await across all subsystems.
     waiter_pool: WaiterPool,
 
+    /// Cooperative periodic background tasks (hot_flush, TTL sweep, etc.).
+    task_scheduler: TaskScheduler,
+
+    /// Maximum age of entries in the hot ring (seconds). 0 = disabled.
+    hot_flush_seconds: u64,
+
     pub fn init(
         allocator: std.mem.Allocator,
         shard_id: u16,
@@ -177,6 +185,7 @@ pub const Shard = struct {
         data_dir: ?[]const u8,
         ual_capacity: usize,
         max_hot_entries: u64,
+        hot_flush_seconds: u64,
     ) !Shard {
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
@@ -210,7 +219,7 @@ pub const Shard = struct {
 
         const queue_handler = try allocator.create(QueueHandler);
         errdefer allocator.destroy(queue_handler);
-        queue_handler.* = QueueHandler.init(allocator, &partition.queue);
+        queue_handler.* = QueueHandler.init(allocator, partition);
 
         const ts_handler = try allocator.create(TSHandler);
         errdefer allocator.destroy(ts_handler);
@@ -328,6 +337,8 @@ pub const Shard = struct {
             .pipe_registered = false,
             .raft_network = null,
             .waiter_pool = WaiterPool.init(),
+            .task_scheduler = TaskScheduler.init(),
+            .hot_flush_seconds = hot_flush_seconds,
         };
     }
 
@@ -621,6 +632,9 @@ pub const Shard = struct {
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
 
+        // Run cooperative background tasks (hot_flush, TTL sweep, etc.)
+        _ = self.task_scheduler.tick(2_000_000); // 2ms budget
+
         // Drive processing pipelines (poll sources → write sinks)
         self.processing_handler.tickPipelines(self);
 
@@ -641,6 +655,36 @@ pub const Shard = struct {
     /// Signal the shard to stop.
     pub fn shutdown(self: *Shard) void {
         self.running = false;
+    }
+
+    // ─── Background tasks ────────────────────────────────────────────────
+
+    /// Register cooperative background tasks. Called from runtime AFTER
+    /// the Shard is at its final heap address (since init returns by value).
+    pub fn registerBackgroundTasks(self: *Shard) void {
+        if (self.hot_flush_seconds > 0) {
+            self.task_scheduler.register(
+                "hot_flush",
+                1_000, // check every 1 second
+                500_000, // 0.5ms budget per invocation
+                hotFlushTask,
+                @ptrCast(self),
+            ) catch {};
+        }
+    }
+
+    /// TaskScheduler callback: evict entries older than hot_flush_seconds
+    /// from every partition's UAL hot ring.
+    fn hotFlushTask(ctx: *anyopaque, _: u64) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const cutoff_ns = now_ns -| (self.hot_flush_seconds * std.time.ns_per_s);
+
+        var total_evicted: u64 = 0;
+        for (self.partitions) |partition| {
+            total_evicted += partition.ual.evictOlderThan(cutoff_ns);
+        }
+        return total_evicted;
     }
 
     // ─── Event processing ────────────────────────────────────────────────
@@ -1073,15 +1117,39 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
     partition.queue.expireLeases(now_ns);
 
-    const maybe_result = partition.queue.dequeue(now_ns) catch return false;
+    // min_version holds the pre-computed queue_name_hash
+    const queue_name_hash = waiter.min_version;
+    const maybe_result = partition.queue.dequeue(now_ns, queue_name_hash) catch return false;
     const deq_result = maybe_result orelse return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true;
 
-    // Serialize single dequeue result
+    // Serialize BEFORE auto-ack (ack frees the message payload).
     const results = [1]@import("../projection/queue.zig").DequeueResult{deq_result};
     const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
     defer shard.queue_handler.allocator.free(data);
+
+    // Auto-ack: persist a queue_ack entry so the message doesn't reappear after restart
+    {
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+        if (entry_mod.buildCommandEntry(
+            .queue_ack,
+            entry_mod.Flags.NONE,
+            partition.current_term,
+            partition.ual.max_index + 1,
+            now_ns,
+            0, // namespace hash not needed for ack
+            &seq_key,
+            &[_]u8{},
+            payload_buf[0..payload_size],
+        )) |entry| {
+            _ = partition.apply(&entry) catch {};
+        }
+    }
+
     shard.sendOkResponse(conn, waiter.request_id, data);
     shard.flushToClient(waiter.fd);
     return true;
@@ -1174,7 +1242,7 @@ test "Shard: init and deinit" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
@@ -1187,7 +1255,7 @@ test "Shard: add and remove connections" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
@@ -1208,7 +1276,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
 
     // Track dispatched pings
@@ -1256,7 +1324,7 @@ test "Shard: inbox shutdown message" {
     defer std.posix.close(pipe_fds[0]);
     defer std.posix.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
 
     shard.running = true;

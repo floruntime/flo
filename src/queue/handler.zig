@@ -27,6 +27,8 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
+const Partition = @import("../storage/partition.zig").Partition;
 
 const CommandResult = result_mod.CommandResult;
 const QueueProjection = queue_mod.QueueProjection;
@@ -46,19 +48,17 @@ const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 pub const QueueHandler = struct {
     queue: *QueueProjection,
+    partition: *Partition,
     allocator: Allocator,
-
-    /// Monotonic UAL index counter — stand-in for real UAL index.
-    next_ual_index: u64,
 
     const MAX_DEQUEUE_BATCH: u32 = 100;
     const DEFAULT_DEQUEUE_COUNT: u32 = 1;
 
-    pub fn init(allocator: Allocator, queue: *QueueProjection) QueueHandler {
+    pub fn init(allocator: Allocator, partition: *Partition) QueueHandler {
         return .{
-            .queue = queue,
+            .queue = &partition.queue,
+            .partition = partition,
             .allocator = allocator,
-            .next_ual_index = 1,
         };
     }
 
@@ -149,13 +149,15 @@ pub const QueueHandler = struct {
                 },
             }
 
-            // Register waiter
+            // Register waiter — store queue_name_hash in min_version for the resolver
+            const ns_hash_w = router.namespaceHash(req.namespace);
+            const q_hash = router.nameHash(ns_hash_w, req.key);
             _ = shard.waiter_pool.register(.{
                 .kind = .queue_dequeue,
                 .fd = conn.fd,
                 .request_id = req.header.request_id,
                 .key = req.key,
-                .min_version = 0,
+                .min_version = q_hash,
                 .timeout_ms = bms,
             });
             conn.response_deferred = true;
@@ -195,12 +197,66 @@ pub const QueueHandler = struct {
         }
 
         const priority: u32 = if (req.getPriority()) |p| @as(u32, p) else 0;
-        const ual_index = self.nextUalIndex();
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const ns_hash = router.namespaceHash(req.namespace);
 
-        const seq = self.queue.enqueue(ual_index, priority, now_ns) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "enqueue failed" } };
+        // Build value: [priority:u32][payload]
+        const value_len = 4 + req.value.len;
+        var value_buf: [4 + 4096]u8 = undefined;
+        const value_slice = if (value_len <= value_buf.len) blk: {
+            std.mem.writeInt(u32, value_buf[0..4], priority, .little);
+            if (req.value.len > 0) {
+                @memcpy(value_buf[4..][0..req.value.len], req.value);
+            }
+            break :blk value_buf[0..value_len];
+        } else blk: {
+            const dyn = self.allocator.alloc(u8, value_len) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+            };
+            std.mem.writeInt(u32, dyn[0..4], priority, .little);
+            if (req.value.len > 0) {
+                @memcpy(dyn[4..][0..req.value.len], req.value);
+            }
+            break :blk dyn;
         };
+        defer if (value_len > value_buf.len) self.allocator.free(value_slice);
+
+        // Build command entry
+        const next_index = self.partition.ual.max_index + 1;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
+        var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256 + 4 + 4096]u8 = undefined;
+        const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
+            break :blk self.allocator.alloc(u8, payload_size) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+            };
+        };
+        defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
+
+        const entry = entry_mod.buildCommandEntry(
+            .queue_enqueue,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            req.key,
+            value_slice,
+            payload_buf,
+        ) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+        };
+
+        // Persist to UAL — router fans out to queue.applyEntry() → queue.enqueue()
+        _ = self.partition.apply(&entry) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
+        };
+
+        // Register the queue name so it appears in queue list
+        const q_name_hash = router.nameHash(ns_hash, req.key);
+        self.queue.registerQueue(q_name_hash, req.key, req.namespace) catch {};
+
+        // Seq was assigned by the projection during apply
+        const seq = self.queue.next_seq - 1;
 
         // Return message ID as the sequence number string
         var id_buf: [20]u8 = undefined;
@@ -219,16 +275,18 @@ pub const QueueHandler = struct {
         const count = req.getCount() orelse DEFAULT_DEQUEUE_COUNT;
         const capped = @min(count, MAX_DEQUEUE_BATCH);
         const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const ns_hash = router.namespaceHash(req.namespace);
+        const queue_name_hash = router.nameHash(ns_hash, req.key);
 
         // Expire stale leases first
         self.queue.expireLeases(now_ns);
 
-        // Dequeue up to count messages
+        // Dequeue up to count messages matching this queue
         var results: [MAX_DEQUEUE_BATCH]DequeueResult = undefined;
         var actual: u32 = 0;
 
         for (0..capped) |_| {
-            const maybe_result = self.queue.dequeue(now_ns) catch break;
+            const maybe_result = self.queue.dequeue(now_ns, queue_name_hash) catch break;
             if (maybe_result) |deq_result| {
                 results[actual] = deq_result;
                 actual += 1;
@@ -237,10 +295,16 @@ pub const QueueHandler = struct {
             }
         }
 
-        // Serialize dequeue results
+        // Serialize dequeue results BEFORE auto-ack (ack frees message payloads).
         const data = serializeDequeueResults(self.allocator, results[0..actual]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "dequeue serialization failed" } };
         };
+
+        // Persist auto-ack entries so dequeued messages don't reappear after restart.
+        // In this simplified model, dequeue = consume (not a lease-based model).
+        for (results[0..actual]) |r| {
+            self.persistAck(ns_hash, r.seq);
+        }
 
         return .{ .queue_messages = .{ .data = data } };
     }
@@ -257,8 +321,32 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
-        self.queue.ack(seq) catch {
-            return .{ .err = .{ .code = .not_found, .message = "message not found or not leased" } };
+        // Build command entry: key = [seq:u64], value = empty
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const ns_hash = router.namespaceHash(req.namespace);
+        const next_index = self.partition.ual.max_index + 1;
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, seq, .little);
+
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8; // 8-byte seq key, no value
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+
+        const entry = entry_mod.buildCommandEntry(
+            .queue_ack,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            &seq_key,
+            &[_]u8{},
+            payload_buf[0..payload_size],
+        ) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+        };
+
+        _ = self.partition.apply(&entry) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
 
         return .ok;
@@ -275,10 +363,32 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        // Build command entry: key = [seq:u64], value = empty
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const ns_hash = router.namespaceHash(req.namespace);
+        const next_index = self.partition.ual.max_index + 1;
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, seq, .little);
 
-        self.queue.nack(seq, now_ns) catch {
-            return .{ .err = .{ .code = .not_found, .message = "message not found or not leased" } };
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+
+        const entry = entry_mod.buildCommandEntry(
+            .queue_nack,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            &seq_key,
+            &[_]u8{},
+            payload_buf[0..payload_size],
+        ) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+        };
+
+        _ = self.partition.apply(&entry) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
 
         return .ok;
@@ -363,18 +473,116 @@ pub const QueueHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *QueueHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // Queue listing requires metadata store
-        return .{ .err = .{ .code = .invalid_request, .message = "queue list not yet implemented" } };
+        // Serialize known queues for this shard.
+        // Wire format: [count:u32] ([name_len:u32][name][ns_len:u32][ns]
+        //   [pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*
+        //   [has_more:u8] [cursor_len:u16]
+        const target_ns = req.namespace;
+
+        // First pass: count matching queues and total size
+        var match_count: u32 = 0;
+        var body_size: usize = 0;
+        {
+            var it = self.queue.known_queues.iterator();
+            while (it.next()) |kv| {
+                const meta = kv.value_ptr;
+                if (std.mem.eql(u8, meta.namespace, target_ns)) {
+                    body_size += 4 + meta.name.len + 4 + meta.namespace.len + 5 * 8;
+                    match_count += 1;
+                }
+            }
+        }
+
+        const total = 4 + body_size + 1 + 2; // count + entries + has_more + cursor_len
+        const buf = self.allocator.alloc(u8, total) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
+        };
+        errdefer self.allocator.free(buf);
+        var offset: usize = 0;
+
+        // Count
+        std.mem.writeInt(u32, buf[offset..][0..4], match_count, .little);
+        offset += 4;
+
+        // Entries
+        {
+            var it = self.queue.known_queues.iterator();
+            while (it.next()) |kv| {
+                const meta = kv.value_ptr;
+                if (!std.mem.eql(u8, meta.namespace, target_ns)) continue;
+
+                // name_len + name
+                std.mem.writeInt(u32, buf[offset..][0..4], @intCast(meta.name.len), .little);
+                offset += 4;
+                @memcpy(buf[offset..][0..meta.name.len], meta.name);
+                offset += meta.name.len;
+
+                // ns_len + ns
+                std.mem.writeInt(u32, buf[offset..][0..4], @intCast(meta.namespace.len), .little);
+                offset += 4;
+                @memcpy(buf[offset..][0..meta.namespace.len], meta.namespace);
+                offset += meta.namespace.len;
+
+                // pending (= enqueued - dequeued, approximate)
+                const pending = if (meta.enqueued > meta.dequeued) meta.enqueued - meta.dequeued else 0;
+                std.mem.writeInt(u64, buf[offset..][0..8], pending, .little);
+                offset += 8;
+
+                // available (same as pending for now)
+                std.mem.writeInt(u64, buf[offset..][0..8], pending, .little);
+                offset += 8;
+
+                // enqueued
+                std.mem.writeInt(u64, buf[offset..][0..8], meta.enqueued, .little);
+                offset += 8;
+
+                // dequeued
+                std.mem.writeInt(u64, buf[offset..][0..8], meta.dequeued, .little);
+                offset += 8;
+
+                // dlq
+                std.mem.writeInt(u64, buf[offset..][0..8], @intCast(self.queue.dlqCount()), .little);
+                offset += 8;
+            }
+        }
+
+        // has_more = 0 (single-shard response, CLI does shard walking)
+        buf[offset] = 0;
+        offset += 1;
+
+        // cursor_len = 0 (no cursor)
+        std.mem.writeInt(u16, buf[offset..][0..2], 0, .little);
+        offset += 2;
+
+        return .{ .queue_messages = .{ .data = buf } };
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    fn nextUalIndex(self: *QueueHandler) u64 {
-        const idx = self.next_ual_index;
-        self.next_ual_index += 1;
-        return idx;
+    /// Persist a queue_ack UAL entry for a dequeued message.
+    /// Called automatically after dequeue so consumed messages don't reappear after restart.
+    fn persistAck(self: *QueueHandler, ns_hash: u32, seq: u64) void {
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const next_index = self.partition.ual.max_index + 1;
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, seq, .little);
+
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+
+        const entry = entry_mod.buildCommandEntry(
+            .queue_ack,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            &seq_key,
+            &[_]u8{},
+            payload_buf[0..payload_size],
+        ) orelse return;
+
+        _ = self.partition.apply(&entry) catch {};
     }
 
     pub fn freeResult(self: *QueueHandler, cmd_result: CommandResult) void {
@@ -451,7 +659,7 @@ fn parseSeqFromValue(value: []const u8) ?u64 {
 }
 
 /// Serialize dequeue results.
-/// Wire format: [count:u32] ([seq:u64][ual_index:u64][priority:u32][attempts:u32])*
+/// Wire format: [count:u32] ([seq:u64][payload_len:u32][payload][enqueued_at:i64][delivery_count:u32][priority:u8])*
 fn serializeDequeueResults(allocator: Allocator, results: []const DequeueResult) ![]u8 {
     return serializeDequeueResultsPub(allocator, results);
 }
@@ -459,8 +667,16 @@ fn serializeDequeueResults(allocator: Allocator, results: []const DequeueResult)
 /// Public variant of serializeDequeueResults — used by the WaiterPool resolver
 /// in shard.zig to build queue responses for blocking dequeue.
 pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const DequeueResult) ![]u8 {
-    const entry_size: usize = 24; // u64 + u64 + u32 + u32
-    const total = 4 + results.len * entry_size;
+    // Calculate total size: count header + per-message (seq + payload_len + payload + enqueued_at + delivery_count + priority)
+    var total: usize = 4; // u32 count
+    for (results) |r| {
+        total += 8; // seq: u64
+        total += 4; // payload_len: u32
+        total += r.payload.len; // payload bytes
+        total += 8; // enqueued_at: i64
+        total += 4; // delivery_count: u32
+        total += 1; // priority: u8
+    }
 
     const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
@@ -472,12 +688,20 @@ pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const Dequeue
     for (results) |r| {
         std.mem.writeInt(u64, buf[offset..][0..8], r.seq, .little);
         offset += 8;
-        std.mem.writeInt(u64, buf[offset..][0..8], r.ual_index, .little);
-        offset += 8;
-        std.mem.writeInt(u32, buf[offset..][0..4], r.priority, .little);
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(r.payload.len), .little);
         offset += 4;
+        if (r.payload.len > 0) {
+            @memcpy(buf[offset..][0..r.payload.len], r.payload);
+            offset += r.payload.len;
+        }
+        // enqueued_at as i64 (convert from u64 ns to ms for the CLI)
+        const enqueued_ms: i64 = @intCast(r.enqueued_at_ns / 1_000_000);
+        std.mem.writeInt(i64, buf[offset..][0..8], enqueued_ms, .little);
+        offset += 8;
         std.mem.writeInt(u32, buf[offset..][0..4], r.attempts, .little);
         offset += 4;
+        buf[offset] = @intCast(r.priority);
+        offset += 1;
     }
 
     return buf;
@@ -551,6 +775,18 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     };
 }
 
+fn initTestPartition(allocator: Allocator) !*Partition {
+    const partition = try allocator.create(Partition);
+    partition.* = try Partition.init(allocator, 0, 4096, 0);
+    partition.wireProjections();
+    return partition;
+}
+
+fn deinitTestPartition(allocator: Allocator, partition: *Partition) void {
+    partition.deinit();
+    allocator.destroy(partition);
+}
+
 test "queue handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     QueueHandler.register(&dispatcher);
@@ -572,10 +808,10 @@ test "queue handler: dispatcher registration" {
 
 test "queue handler: enqueue" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     const result = handler.handleCommand(makeRequest(.queue_enqueue, "tasks", "payload", ""));
     switch (result) {
@@ -585,16 +821,16 @@ test "queue handler: enqueue" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(u64, 1), queue.stats.enqueued);
-    try testing.expectEqual(@as(usize, 1), queue.readyCount());
+    try testing.expectEqual(@as(u64, 1), partition.queue.stats.enqueued);
+    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
 }
 
 test "queue handler: enqueue with priority" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     // Enqueue with priority 5
     var opts_buf: [32]u8 = undefined;
@@ -608,15 +844,15 @@ test "queue handler: enqueue with priority" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(usize, 1), queue.readyCount());
+    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
 }
 
 test "queue handler: enqueue empty queue name" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
     const result = handler.handleCommand(makeRequest(.queue_enqueue, "", "data", ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
@@ -626,10 +862,10 @@ test "queue handler: enqueue empty queue name" {
 
 test "queue handler: dequeue" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     // Enqueue 3 messages
     _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "a", ""));
@@ -652,17 +888,17 @@ test "queue handler: dequeue" {
         else => return error.TestUnexpectedResult,
     }
 
-    // 2 leased, 1 ready
-    try testing.expectEqual(@as(usize, 2), queue.leasedCount());
-    try testing.expectEqual(@as(usize, 1), queue.readyCount());
+    // Dequeue is auto-ack (consume), so 0 leased, 1 ready
+    try testing.expectEqual(@as(usize, 0), partition.queue.leasedCount());
+    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
 }
 
 test "queue handler: dequeue empty queue" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     const result = handler.handleCommand(makeRequest(.queue_dequeue, "q1", "", ""));
     switch (result) {
@@ -677,10 +913,10 @@ test "queue handler: dequeue empty queue" {
 
 test "queue handler: complete (ack)" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     // Enqueue and dequeue
     _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "msg", ""));
@@ -707,16 +943,19 @@ test "queue handler: complete (ack)" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(u64, 1), queue.stats.acked);
-    try testing.expectEqual(@as(usize, 0), queue.leasedCount());
+    // Auto-ack already consumed the message during dequeue, so:
+    // - stats.acked = 1 (from auto-ack during dequeue)
+    // - explicit ack is a no-op (message already removed)
+    try testing.expectEqual(@as(u64, 1), partition.queue.stats.acked);
+    try testing.expectEqual(@as(usize, 0), partition.queue.leasedCount());
 }
 
 test "queue handler: fail (nack)" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     // Enqueue and dequeue
     _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "msg", ""));
@@ -739,17 +978,18 @@ test "queue handler: fail (nack)" {
         else => return error.TestUnexpectedResult,
     }
 
-    try testing.expectEqual(@as(u64, 1), queue.stats.nacked);
-    // Message should be re-enqueued (attempt 1 < max_attempts 5)
-    try testing.expectEqual(@as(usize, 1), queue.readyCount());
+    // With auto-ack, the message was already consumed during dequeue.
+    // Nack on a consumed message is a no-op.
+    try testing.expectEqual(@as(u64, 0), partition.queue.stats.nacked);
+    try testing.expectEqual(@as(usize, 0), partition.queue.readyCount());
 }
 
 test "queue handler: stats" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "a", ""));
     _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "b", ""));
@@ -768,10 +1008,10 @@ test "queue handler: stats" {
 
 test "queue handler: dlq list" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     const result = handler.handleCommand(makeRequest(.queue_dlq_list, "q1", "", ""));
     switch (result) {
@@ -787,10 +1027,10 @@ test "queue handler: dlq list" {
 
 test "queue handler: complete invalid seq" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     // ack on non-existent seq is a silent no-op in the projection
     const result = handler.handleCommand(makeRequest(.queue_complete, "q1", "999", ""));
@@ -802,10 +1042,10 @@ test "queue handler: complete invalid seq" {
 
 test "queue handler: complete missing seq" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     const result = handler.handleCommand(makeRequest(.queue_complete, "q1", "", ""));
     switch (result) {
@@ -833,10 +1073,10 @@ test "queue handler: pre-route by queue" {
 
 test "queue handler: peek empty" {
     const allocator = testing.allocator;
-    var queue = QueueProjection.init(allocator, .{});
-    defer queue.deinit();
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
 
-    var handler = QueueHandler.init(allocator, &queue);
+    var handler = QueueHandler.init(allocator, partition);
 
     const result = handler.handleCommand(makeRequest(.queue_peek, "q1", "", ""));
     switch (result) {

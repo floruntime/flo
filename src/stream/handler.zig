@@ -297,7 +297,7 @@ pub const StreamHandler = struct {
             self.partition.current_term,
             next_index,
             timestamp_ns,
-            0, // namespace_hash — not needed for stream routing
+            router.namespaceHash(req.namespace),
             req.key,
             payload_value,
             payload_buf,
@@ -311,7 +311,8 @@ pub const StreamHandler = struct {
         };
 
         // Track offset → ual_index in stream projection
-        const name_hash = std.hash.Wyhash.hash(0, req.key);
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
         const offset = self.stream.append(ual_index, timestamp_ns, name_hash, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "append failed" } };
         };
@@ -358,8 +359,9 @@ pub const StreamHandler = struct {
             }
         }
 
-        // Read the range — filter by stream name hash for isolation
-        const name_hash = std.hash.Wyhash.hash(0, req.key);
+        // Read the range — filter by namespace-qualified stream name hash for isolation
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
         var buf: [MAX_READ_BATCH]OffsetEntry = undefined;
         const out = buf[0..capped];
 

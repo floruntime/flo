@@ -318,6 +318,31 @@ pub const UAL = struct {
             self.min_live_index = hdr.index + 1;
         }
     }
+
+    /// Evict entries from the head of the ring whose timestamp_ns < cutoff_ns.
+    /// Since the ring is FIFO with monotonically increasing timestamps,
+    /// we scan from oldest until we find an entry that is young enough.
+    /// Returns the number of entries evicted.
+    pub fn evictOlderThan(self: *UAL, cutoff_ns: u64) u64 {
+        var evicted: u64 = 0;
+
+        while (self.entry_count > 0) {
+            // Peek at the oldest entry's header
+            var hdr_buf: [HEADER_SIZE]u8 = undefined;
+            self.readFromRing(self.read_pos, &hdr_buf);
+
+            const hdr: *const Header = @ptrCast(@alignCast(&hdr_buf));
+            if (hdr.magic != entry_mod.ENTRY_MAGIC) break;
+
+            // If the oldest entry is newer than cutoff, stop
+            if (hdr.timestamp_ns >= cutoff_ns) break;
+
+            self.evictOldest();
+            evicted += 1;
+        }
+
+        return evicted;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

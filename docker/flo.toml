@@ -8,8 +8,8 @@ data_dir = "/data/flo"
 shards = 0  # auto-detect CPU count
 
 [storage]
-hot_window_seconds = 90
 durability = "async_flush"
+hot_buffer_capacity = 67108864
 
 [logging]
 level = "info"

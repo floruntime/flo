@@ -41,7 +41,6 @@ pub const RuntimeConfig = struct {
     data_dir: []const u8 = "~/.flo/data",
     listen_port: u16 = 9000,
     listen_addr: []const u8 = "0.0.0.0",
-    hot_window_seconds: u64 = 90,
     durability: Durability = .async_flush,
     cold_storage: ?ColdStorageConfig = null,
     tiered_log: TieredLogConfig = .{},
@@ -251,8 +250,9 @@ pub const Runtime = struct {
                 self.config.partition_count,
                 pipes[i][0],
                 self.config.data_dir,
-                self.config.tiered_log.buffer_capacity,
+                self.config.tiered_log.hot_buffer_capacity,
                 self.config.tiered_log.max_hot_entries,
+                self.config.tiered_log.hot_flush_seconds,
             );
             shards_created += 1;
         }
@@ -261,6 +261,12 @@ pub const Runtime = struct {
         // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
         // Each walk opcode gets a slice of per-shard projection pointers.
         try self.wireWalkContexts(shards);
+
+        // 2.6 Register cooperative background tasks (hot_flush, etc.).
+        // Must happen after shards are at final heap addresses.
+        for (0..self.shard_count) |i| {
+            shards[i].registerBackgroundTasks();
+        }
 
         // 3. Spawn shard threads
         const threads = try self.allocator.alloc(std.Thread, self.shard_count);
