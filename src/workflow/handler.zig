@@ -267,10 +267,14 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        // Use req.key as workflow name if provided (client-side extraction).
-        // Fall back to the name from the parsed definition for backward
-        // compatibility with direct API callers that send key="".
-        const name = if (req.key.len > 0) req.key else def.name;
+        // Workflow name must be sent as req.key by all callers (CLI extracts
+        // it from YAML client-side). The server validates it matches the
+        // parsed definition to catch mismatches early.
+        if (req.key.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required as key");
+            return;
+        }
+        const name = req.key;
         const version = def.version;
 
         // Build namespace-qualified key for the definitions map
