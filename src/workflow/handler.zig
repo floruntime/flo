@@ -189,26 +189,20 @@ pub const WorkflowHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.workflow_create, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_start, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_signal, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_status, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_history, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_list_runs, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_get_definition, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_disable, dispatchWorkflow, preRouteByWorkflow);
-        dispatcher.registerWithRoute(.workflow_enable, dispatchWorkflow, preRouteByWorkflow);
+        // All workflow opcodes use standard key-based routing.
+        // The CLI sends key=workflow_name (extracted client-side from YAML),
+        // so the Acceptor hash-routes the connection to the correct shard.
+        dispatcher.register(.workflow_create, dispatchWorkflow);
+        dispatcher.register(.workflow_start, dispatchWorkflow);
+        dispatcher.register(.workflow_signal, dispatchWorkflow);
+        dispatcher.register(.workflow_cancel, dispatchWorkflow);
+        dispatcher.register(.workflow_status, dispatchWorkflow);
+        dispatcher.register(.workflow_history, dispatchWorkflow);
+        dispatcher.register(.workflow_list_runs, dispatchWorkflow);
+        dispatcher.register(.workflow_get_definition, dispatchWorkflow);
+        dispatcher.register(.workflow_disable, dispatchWorkflow);
+        dispatcher.register(.workflow_enable, dispatchWorkflow);
         dispatcher.register(.workflow_list_definitions, dispatchWorkflow);
-    }
-
-    fn preRouteByWorkflow(req: Request) ?u64 {
-        // All workflow commands route to shard 0 (centralized metadata).
-        // workflow_create sends key="" (name is parsed from YAML on server),
-        // so we can't hash-route by workflow name. Centralising on shard 0
-        // keeps all definitions/runs on one handler and avoids cross-shard splits.
-        _ = req;
-        return 0;
     }
 
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -273,8 +267,10 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        // Store the definition (overwrite if name already exists)
-        const name = def.name;
+        // Use req.key as workflow name if provided (client-side extraction).
+        // Fall back to the name from the parsed definition for backward
+        // compatibility with direct API callers that send key="".
+        const name = if (req.key.len > 0) req.key else def.name;
         const version = def.version;
 
         // Build namespace-qualified key for the definitions map

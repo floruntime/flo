@@ -23,14 +23,15 @@ const FixedWireWriter = wire.FixedWireWriter;
 /// Create a workflow definition from YAML
 /// Wire format:
 ///   - namespace: req.namespace
-///   - key: (unused)
+///   - key: workflow name (extracted client-side from YAML for routing)
 ///   - value: definition_yaml
 pub fn create(
     client: *Client,
     namespace: []const u8,
+    name: []const u8,
     definition_yaml: []const u8,
 ) !Response {
-    return client.sendRequest(.workflow_create, namespace, "", definition_yaml);
+    return client.sendRequest(.workflow_create, namespace, name, definition_yaml);
 }
 
 /// Start a workflow run

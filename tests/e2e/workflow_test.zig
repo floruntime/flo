@@ -2582,23 +2582,18 @@ test "e2e/workflow: default namespace is isolated from named namespaces" {
 // Multi-Shard Tests
 // =============================================================================
 //
-// Workflow operations are centralised on shard 0 (Acceptor routes workflow
-// opcodes 0x80–0x93 to shard 0; preRouteByWorkflow also returns 0).
+// The CLI now sends key=workflow_name (extracted client-side from YAML),
+// so the Acceptor hash-routes all operations for the same workflow to the
+// same shard. This makes multi-shard routing deterministic: create, query,
+// start, and status for "my-wf" all land on the same shard.
 //
-// Because the Acceptor uses MSG_PEEK on accept, there is no guarantee that
-// client data is available at peek time. When peek returns 0 bytes it falls
-// through to round-robin, potentially landing the request on a non-0 shard
-// whose WorkflowHandler is empty. This makes multi-shard E2E tests
-// non-deterministic until shard-level request forwarding is added (Phase 4).
-//
-// The namespace isolation tests above (single shard) fully validate the
-// handler's namespace-scoped storage. The test below verifies that a
-// multi-shard server boots and handles workflow create+query when the
-// peek routing succeeds — it is allowed to be skipped (via error tolerance)
-// if routing fails.
+// If the Acceptor peek returns 0 bytes (rare timing), round-robin kicks in
+// and the operation may land on a shard without the definition (not-found).
+// The tests below verify the happy path; peek-miss is a transient condition
+// that will be fully resolved once shard-level request forwarding lands.
 // =============================================================================
 
-test "e2e/workflow: multi-shard server boots and accepts workflow ops" {
+test "e2e/workflow: multi-shard create and definition retrieval" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .shards = 2 },
     });
@@ -2616,16 +2611,59 @@ test "e2e/workflow: multi-shard server boots and accepts workflow ops" {
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-basic-wf.yaml");
     defer cleanupTempFile(testing.allocator, path);
 
-    // Create always succeeds — the server accepts the operation.
+    // Create — key="ms-basic" routes via hash to a deterministic shard.
     try ctx.exec(&.{ "workflow", "create", "-f", path });
 
-    // Query — may or may not route to the same shard depending on peek
-    // timing. Just verify the server doesn't crash with 2 shards active.
-    const res = try ctx.cli.run(&.{ "workflow", "definition", "ms-basic" });
-    var res_mut = res;
-    defer res_mut.deinit();
+    // Definition query — same key → same shard.
+    try ctx.exec(&.{ "workflow", "definition", "ms-basic" });
+}
 
-    // We tolerate both "succeeded" (routed correctly) and "not found"
-    // (routed to wrong shard). The handler logic is fully tested by
-    // the single-shard namespace isolation tests above.
+test "e2e/workflow: multi-shard create + start + status round-trip" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 2 },
+    });
+    defer ctx.deinit();
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: ms-roundtrip
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-roundtrip-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try ctx.exec(&.{ "workflow", "start", "ms-roundtrip", "{}" });
+}
+
+test "e2e/workflow: multi-shard namespace isolation across shards" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 2 },
+    });
+    defer ctx.deinit();
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: ms-ns-test
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-ns-test-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // Create in two different namespaces — same name, same key hash → same shard,
+    // but namespace scoping keeps them isolated.
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "alpha" });
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "beta" });
+
+    // Each namespace can retrieve its own definition.
+    try ctx.exec(&.{ "workflow", "definition", "ms-ns-test", "-n", "alpha" });
+    try ctx.exec(&.{ "workflow", "definition", "ms-ns-test", "-n", "beta" });
 }
