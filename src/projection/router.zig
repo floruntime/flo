@@ -253,6 +253,9 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Snapshot installation
         .raft_snapshot => .snapshot,
 
+        // Workflow — restored in replaySegments, no live projection
+        .workflow_create, .workflow_start => .none,
+
         // Checkpoint — processing runtime
         .checkpoint => .none,
     };

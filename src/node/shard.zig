@@ -272,7 +272,7 @@ pub const Shard = struct {
 
             // Replay existing segment files into partition (UAL + projections)
             var max_index: u64 = 0;
-            replaySegments(allocator, shard_dir, partition, &max_index);
+            replaySegments(allocator, shard_dir, partition, &max_index, workflow_handler);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -1181,6 +1181,7 @@ fn replaySegments(
     dir_path: []const u8,
     partition: *Partition,
     max_index: *u64,
+    workflow_handler: *WorkflowHandler,
 ) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -1221,6 +1222,12 @@ fn replaySegments(
                 else
                     0;
                 _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
+            }
+
+            // Workflow entries: router skips them (.none), so manually rebuild
+            // the WorkflowHandler in-memory definition and run maps.
+            if (etype == .workflow_create or etype == .workflow_start) {
+                workflow_handler.replayEntry(&seg_entry);
             }
 
             // Track max index for LSN restoration

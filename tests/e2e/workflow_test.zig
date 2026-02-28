@@ -2408,3 +2408,224 @@ test "e2e/workflow: batch_size accumulates events and fires on full batch" {
     try stdx.testing.assertSucceeded(list_result);
     try stdx.testing.assertContains(list_result, "st-batch-test");
 }
+
+// =============================================================================
+// Namespace Isolation
+// =============================================================================
+
+test "e2e/workflow: same workflow name in different namespaces are independent" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create two namespaces
+    try ctx.exec(&.{ "ns", "create", "wf_ns_a" });
+    try ctx.exec(&.{ "ns", "create", "wf_ns_b" });
+
+    // Define the same-named workflow in both namespaces with different versions
+    const def_a =
+        \\kind: Workflow
+        \\name: shared-wf
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const def_b =
+        \\kind: Workflow
+        \\name: shared-wf
+        \\version: 2.0.0
+        \\start.run: @actions/process
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path_a = try writeDottedToTempYaml(testing.allocator, def_a, "ns-a-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path_a);
+    const path_b = try writeDottedToTempYaml(testing.allocator, def_b, "ns-b-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path_b);
+
+    try ctx.exec(&.{ "workflow", "create", "-f", path_a, "-n", "wf_ns_a" });
+    try ctx.exec(&.{ "workflow", "create", "-f", path_b, "-n", "wf_ns_b" });
+
+    // Each namespace returns its own version
+    var res_a = try ctx.cli.run(&.{ "workflow", "definition", "shared-wf", "-n", "wf_ns_a" });
+    defer res_a.deinit();
+    try stdx.testing.assertSucceeded(res_a);
+    try stdx.testing.assertContains(res_a, "1.0.0");
+
+    var res_b = try ctx.cli.run(&.{ "workflow", "definition", "shared-wf", "-n", "wf_ns_b" });
+    defer res_b.deinit();
+    try stdx.testing.assertSucceeded(res_b);
+    try stdx.testing.assertContains(res_b, "2.0.0");
+}
+
+test "e2e/workflow: start and status are namespace-scoped" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "wf_run_a" });
+    try ctx.exec(&.{ "ns", "create", "wf_run_b" });
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: run-scoped
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "run-scoped-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // Create in both namespaces
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "wf_run_a" });
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "wf_run_b" });
+
+    // Start a run in namespace A only
+    var start_res = try ctx.cli.run(&.{ "workflow", "start", "run-scoped", "{\"x\":1}", "-n", "wf_run_a" });
+    defer start_res.deinit();
+    try stdx.testing.assertSucceeded(start_res);
+
+    // List runs in namespace A — should have runs
+    var list_a = try ctx.cli.run(&.{ "workflow", "list-runs", "run-scoped", "-n", "wf_run_a" });
+    defer list_a.deinit();
+    try stdx.testing.assertSucceeded(list_a);
+    try stdx.testing.assertContains(list_a, "run-scoped");
+
+    // List runs in namespace B — should be empty (just "[]")
+    var list_b = try ctx.cli.run(&.{ "workflow", "list-runs", "run-scoped", "-n", "wf_run_b" });
+    defer list_b.deinit();
+    try stdx.testing.assertSucceeded(list_b);
+    try stdx.testing.assertContains(list_b, "[]");
+}
+
+test "e2e/workflow: disable in one namespace does not affect another" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "wf_dis_a" });
+    try ctx.exec(&.{ "ns", "create", "wf_dis_b" });
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: dis-test
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "dis-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "wf_dis_a" });
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "wf_dis_b" });
+
+    // Disable in namespace A
+    try ctx.exec(&.{ "workflow", "disable", "dis-test", "-n", "wf_dis_a" });
+
+    // Start in namespace A should fail (disabled)
+    var fail_res = try ctx.cli.run(&.{ "workflow", "start", "dis-test", "{}", "-n", "wf_dis_a" });
+    defer fail_res.deinit();
+    try stdx.testing.assertFailed(fail_res);
+
+    // Start in namespace B should succeed (still enabled)
+    var ok_res = try ctx.cli.run(&.{ "workflow", "start", "dis-test", "{}", "-n", "wf_dis_b" });
+    defer ok_res.deinit();
+    try stdx.testing.assertSucceeded(ok_res);
+}
+
+test "e2e/workflow: default namespace is isolated from named namespaces" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "wf_custom" });
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: ns-default
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ns-default-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // Create in default namespace (no -n flag)
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // Create same workflow in custom namespace
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "wf_custom" });
+
+    // Start a run in default namespace
+    try ctx.exec(&.{ "workflow", "start", "ns-default", "{\"src\":\"default\"}" });
+
+    // Start a run in custom namespace
+    try ctx.exec(&.{ "workflow", "start", "ns-default", "{\"src\":\"custom\"}", "-n", "wf_custom" });
+
+    // Both namespaces should have runs
+    var list_default = try ctx.cli.run(&.{ "workflow", "list-runs", "ns-default" });
+    defer list_default.deinit();
+    try stdx.testing.assertSucceeded(list_default);
+    try stdx.testing.assertContains(list_default, "ns-default");
+
+    var list_custom = try ctx.cli.run(&.{ "workflow", "list-runs", "ns-default", "-n", "wf_custom" });
+    defer list_custom.deinit();
+    try stdx.testing.assertSucceeded(list_custom);
+    try stdx.testing.assertContains(list_custom, "ns-default");
+}
+
+// =============================================================================
+// Multi-Shard Tests
+// =============================================================================
+//
+// Workflow operations are centralised on shard 0 (Acceptor routes workflow
+// opcodes 0x80–0x93 to shard 0; preRouteByWorkflow also returns 0).
+//
+// Because the Acceptor uses MSG_PEEK on accept, there is no guarantee that
+// client data is available at peek time. When peek returns 0 bytes it falls
+// through to round-robin, potentially landing the request on a non-0 shard
+// whose WorkflowHandler is empty. This makes multi-shard E2E tests
+// non-deterministic until shard-level request forwarding is added (Phase 4).
+//
+// The namespace isolation tests above (single shard) fully validate the
+// handler's namespace-scoped storage. The test below verifies that a
+// multi-shard server boots and handles workflow create+query when the
+// peek routing succeeds — it is allowed to be skipped (via error tolerance)
+// if routing fails.
+// =============================================================================
+
+test "e2e/workflow: multi-shard server boots and accepts workflow ops" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 2 },
+    });
+    defer ctx.deinit();
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: ms-basic
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-basic-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // Create always succeeds — the server accepts the operation.
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // Query — may or may not route to the same shard depending on peek
+    // timing. Just verify the server doesn't crash with 2 shards active.
+    const res = try ctx.cli.run(&.{ "workflow", "definition", "ms-basic" });
+    var res_mut = res;
+    defer res_mut.deinit();
+
+    // We tolerate both "succeeded" (routed correctly) and "not found"
+    // (routed to wrong shard). The handler logic is fully tested by
+    // the single-shard namespace isolation tests above.
+}

@@ -86,6 +86,10 @@ pub const EntryType = enum(u8) {
     raft_noop = 0xF1,
     raft_snapshot = 0xF2,
 
+    // ── Workflow ──
+    workflow_create = 0x50,
+    workflow_start = 0x51,
+
     // ── Checkpoint ──
     checkpoint = 0xE0,
 
@@ -97,6 +101,7 @@ pub const EntryType = enum(u8) {
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => true,
             .ts_write, .ts_write_batch => true,
             .cg_commit, .cg_create, .cg_delete => true,
+            .workflow_create, .workflow_start => true,
             .raft_config, .raft_noop, .raft_snapshot, .checkpoint => false,
         };
     }

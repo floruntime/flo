@@ -162,6 +162,15 @@ pub const Acceptor = struct {
             return 0;
         }
 
+        // Workflow opcodes (0x80-0x93) are centralised on shard 0.
+        // workflow_create sends key="" (name is parsed from YAML server-side),
+        // so key-based routing would scatter definitions across shards while
+        // queries land on a different shard. Pin everything to shard 0.
+        if (header.op_code >= 0x80 and header.op_code <= 0x93) {
+            self.routed_by_key += 1;
+            return 0;
+        }
+
         // Need more than just the header to get namespace+key for routing.
         // If we got enough bytes, parse the payload length and try to extract key.
         // For the initial implementation, treat partial-payload as round-robin.

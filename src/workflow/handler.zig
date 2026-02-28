@@ -37,6 +37,8 @@ const validator = @import("validator.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
+const Partition = @import("../storage/partition.zig").Partition;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
@@ -51,15 +53,14 @@ const OpCode = proto.OpCode;
 pub const WorkflowHandler = struct {
     allocator: Allocator,
 
-    /// In-memory definition store: workflow name → DefinitionRecord.
-    /// For simplicity, stores the latest version per name.
-    /// Key is owned (duped from name).
+    /// In-memory definition store: "namespace:name" → DefinitionRecord.
+    /// Key is namespace-qualified (allocated separately from record fields).
     definitions: std.StringHashMap(DefinitionRecord),
 
-    /// In-memory run store: run_id (string) → RunRecord.
+    /// In-memory run store: "namespace:run_id" → RunRecord.
     runs: std.StringHashMap(RunRecord),
 
-    /// Disabled workflows: workflow_name → void.
+    /// Disabled workflows: "namespace:name" → void.
     disabled: std.StringHashMap(void),
 
     /// Monotonic run counter.
@@ -137,23 +138,25 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn deinit(self: *WorkflowHandler) void {
-        // Free all definition records
+        // Free all definition records (ns-qualified key + record fields)
         var dit = self.definitions.iterator();
         while (dit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*); // ns-qualified key
             self.allocator.free(entry.value_ptr.name_owned);
             self.allocator.free(entry.value_ptr.version_owned);
             self.allocator.free(entry.value_ptr.yaml_owned);
         }
         self.definitions.deinit();
 
-        // Free all run records
+        // Free all run records (ns-qualified key + record fields)
         var rit = self.runs.iterator();
         while (rit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*); // ns-qualified key
             self.freeRunRecord(entry.value_ptr);
         }
         self.runs.deinit();
 
-        // Free disabled keys
+        // Free disabled keys (ns-qualified)
         var diit = self.disabled.iterator();
         while (diit.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -200,8 +203,12 @@ pub const WorkflowHandler = struct {
     }
 
     fn preRouteByWorkflow(req: Request) ?u64 {
-        if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        // All workflow commands route to shard 0 (centralized metadata).
+        // workflow_create sends key="" (name is parsed from YAML on server),
+        // so we can't hash-route by workflow name. Centralising on shard 0
+        // keeps all definitions/runs on one handler and avoids cross-shard splits.
+        _ = req;
+        return 0;
     }
 
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -270,8 +277,15 @@ pub const WorkflowHandler = struct {
         const name = def.name;
         const version = def.version;
 
+        // Build namespace-qualified key for the definitions map
+        const ns_key = self.makeNsKey(req.namespace, name) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+
         // Remove old definition if exists
-        if (self.definitions.fetchRemove(name)) |old| {
+        if (self.definitions.fetchRemove(ns_key)) |old| {
+            self.allocator.free(old.key); // free old ns-qualified key
             self.allocator.free(old.value.name_owned);
             self.allocator.free(old.value.version_owned);
             self.allocator.free(old.value.yaml_owned);
@@ -279,19 +293,20 @@ pub const WorkflowHandler = struct {
 
         // Duplicate all owned data
         const owned_name = self.allocator.dupe(u8, name) catch {
+            self.allocator.free(ns_key);
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
-        errdefer self.allocator.free(owned_name);
 
         const owned_version = self.allocator.dupe(u8, version) catch {
+            self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
-        errdefer self.allocator.free(owned_version);
 
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
+            self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             self.allocator.free(owned_version);
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
@@ -300,12 +315,13 @@ pub const WorkflowHandler = struct {
 
         const now_ms: i64 = std.time.milliTimestamp();
 
-        self.definitions.put(owned_name, .{
+        self.definitions.put(ns_key, .{
             .name_owned = owned_name,
             .version_owned = owned_version,
             .yaml_owned = owned_yaml,
             .created_at_ms = now_ms,
         }) catch {
+            self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             self.allocator.free(owned_version);
             self.allocator.free(owned_yaml);
@@ -314,6 +330,7 @@ pub const WorkflowHandler = struct {
         };
 
         // Return the workflow name
+        self.persistCreate(shard, req.namespace, name, owned_yaml);
         shard.sendOkResponse(conn, req.header.request_id, owned_name);
     }
 
@@ -327,14 +344,21 @@ pub const WorkflowHandler = struct {
             return;
         }
 
+        // Build namespace-qualified key for definition/disabled lookups
+        const def_ns_key = self.makeNsKey(req.namespace, workflow_name) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(def_ns_key);
+
         // Check workflow exists
-        if (!self.definitions.contains(workflow_name)) {
+        if (!self.definitions.contains(def_ns_key)) {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
             return;
         }
 
         // Check workflow is not disabled
-        if (self.disabled.contains(workflow_name)) {
+        if (self.disabled.contains(def_ns_key)) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow is disabled");
             return;
         }
@@ -436,12 +460,18 @@ pub const WorkflowHandler = struct {
             break :blk std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch "wfrun-0";
         };
 
-        // Duplicate for storage
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
+        // Build namespace-qualified key for the runs map
+        const run_ns_key = self.makeNsKey(req.namespace, run_id_str) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
-        errdefer self.allocator.free(owned_run_id);
+
+        // Duplicate for storage
+        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
+            self.allocator.free(run_ns_key);
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
 
         const owned_wf_name = self.allocator.dupe(u8, workflow_name) catch {
             self.allocator.free(owned_run_id);
@@ -520,13 +550,15 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        self.runs.put(owned_run_id, run) catch {
+        self.runs.put(run_ns_key, run) catch {
+            self.allocator.free(run_ns_key);
             self.freeRunRecord(&run);
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run store failed");
             return;
         };
 
         // Return the run ID
+        self.persistStart(shard, req.namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
         shard.sendOkResponse(conn, req.header.request_id, owned_run_id);
     }
 
@@ -540,7 +572,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const run = self.runs.getPtr(run_id) orelse {
+        const run_ns_key = self.makeNsKey(req.namespace, run_id) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(run_ns_key);
+
+        const run = self.runs.getPtr(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -603,7 +641,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const run = self.runs.getPtr(run_id) orelse {
+        const run_ns_key = self.makeNsKey(req.namespace, run_id) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(run_ns_key);
+
+        const run = self.runs.getPtr(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -628,7 +672,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const run = self.runs.get(run_id) orelse {
+        const run_ns_key = self.makeNsKey(req.namespace, run_id) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(run_ns_key);
+
+        const run = self.runs.get(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -662,7 +712,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const run = self.runs.get(run_id) orelse {
+        const run_ns_key = self.makeNsKey(req.namespace, run_id) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(run_ns_key);
+
+        const run = self.runs.get(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -737,11 +793,22 @@ pub const WorkflowHandler = struct {
             return;
         };
 
+        // Build namespace prefix for filtering ("namespace:")
+        const ns_prefix = self.makeNsKey(req.namespace, "") orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(ns_prefix);
+
         var count: u32 = 0;
         var rit = self.runs.iterator();
         while (rit.next()) |entry| {
             if (count >= limit) break;
             const run = entry.value_ptr;
+            const map_key = entry.key_ptr.*;
+
+            // Only include runs from the current namespace
+            if (!std.mem.startsWith(u8, map_key, ns_prefix)) continue;
 
             // Filter by workflow name if specified
             if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) {
@@ -786,7 +853,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const def = self.definitions.get(name) orelse {
+        const ns_key = self.makeNsKey(req.namespace, name) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(ns_key);
+
+        const def = self.definitions.get(ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -812,22 +885,27 @@ pub const WorkflowHandler = struct {
             return;
         }
 
+        const ns_key = self.makeNsKey(req.namespace, name) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+
         // Check workflow exists
-        if (!self.definitions.contains(name)) {
+        if (!self.definitions.contains(ns_key)) {
+            self.allocator.free(ns_key);
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
             return;
         }
 
-        if (!self.disabled.contains(name)) {
-            const owned_name = self.allocator.dupe(u8, name) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            };
-            self.disabled.put(owned_name, {}) catch {
-                self.allocator.free(owned_name);
+        if (!self.disabled.contains(ns_key)) {
+            self.disabled.put(ns_key, {}) catch {
+                self.allocator.free(ns_key);
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "disable failed");
                 return;
             };
+        } else {
+            // Already disabled — free the temp key
+            self.allocator.free(ns_key);
         }
 
         shard.sendOkResponse(conn, req.header.request_id, "");
@@ -843,7 +921,13 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        if (self.disabled.fetchRemove(name)) |old| {
+        const ns_key = self.makeNsKey(req.namespace, name) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(ns_key);
+
+        if (self.disabled.fetchRemove(ns_key)) |old| {
             self.allocator.free(old.key);
         }
 
@@ -853,6 +937,13 @@ pub const WorkflowHandler = struct {
     // ── LIST DEFINITIONS ────────────────────────────────────────────────
 
     fn handleListDefinitions(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+        // Build namespace prefix for filtering ("namespace:")
+        const ns_prefix = self.makeNsKey(req.namespace, "") orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(ns_prefix);
+
         var result_buf: [65536]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&result_buf);
         const writer = fbs.writer();
@@ -866,6 +957,11 @@ pub const WorkflowHandler = struct {
         var dit = self.definitions.iterator();
         while (dit.next()) |entry| {
             const def = entry.value_ptr;
+            const map_key = entry.key_ptr.*;
+
+            // Only include definitions from the current namespace
+            if (!std.mem.startsWith(u8, map_key, ns_prefix)) continue;
+
             if (count > 0) writer.writeByte(',') catch return;
             std.fmt.format(writer,
                 \\{{"name":"{s}","version":"{s}","created_at":{d}}}
@@ -890,6 +986,11 @@ pub const WorkflowHandler = struct {
         return id;
     }
 
+    /// Build a namespace-qualified key: "namespace:name" for map lookups.
+    fn makeNsKey(self: *WorkflowHandler, namespace: []const u8, name: []const u8) ?[]const u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ namespace, name }) catch null;
+    }
+
     fn addHistoryEvent(self: *WorkflowHandler, run: *RunRecord, event_type: []const u8, detail: []const u8, timestamp_ms: i64) void {
         const owned_type = self.allocator.dupe(u8, event_type) catch return;
         const owned_detail = self.allocator.dupe(u8, detail) catch {
@@ -903,6 +1004,268 @@ pub const WorkflowHandler = struct {
         }) catch {
             self.allocator.free(owned_type);
             self.allocator.free(owned_detail);
+        };
+    }
+
+    // ── UAL Persistence ────────────────────────────────────────────────
+
+    /// Persist a workflow_create entry to the UAL so the definition survives restart.
+    /// The key stored is "namespace:name" so replay can directly use it as the ns-qualified map key.
+    fn persistCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) void {
+        _ = self;
+        const partition = shard.defaultPartition();
+        const ns_hash = router.namespaceHash(namespace);
+        const next_index = partition.ual.max_index + 1;
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+
+        // Build ns-qualified key: "namespace:name"
+        var key_buf: [600]u8 = undefined;
+        const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, name }) catch return;
+
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + ns_key.len + yaml.len;
+        if (payload_size > 65536) return; // safety limit
+        var stack_buf: [65536]u8 = undefined;
+        const payload_buf = stack_buf[0..payload_size];
+
+        const entry = entry_mod.buildCommandEntry(
+            .workflow_create,
+            entry_mod.Flags.NONE,
+            partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            ns_key,
+            yaml,
+            payload_buf,
+        ) orelse return;
+
+        _ = partition.apply(&entry) catch {};
+    }
+
+    /// Persist a workflow_start entry to the UAL so the run survives restart.
+    /// Key stored is "namespace:run_id". Value format: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at_ms:i64][input...]
+    fn persistStart(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        namespace: []const u8,
+        run_id: []const u8,
+        wf_name: []const u8,
+        version: []const u8,
+        input: []const u8,
+        created_at_ms: i64,
+    ) void {
+        _ = self;
+        const partition = shard.defaultPartition();
+        const ns_hash = router.namespaceHash(namespace);
+        const next_index = partition.ual.max_index + 1;
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+
+        // Build ns-qualified key: "namespace:run_id"
+        var ns_key_buf: [600]u8 = undefined;
+        const ns_key = std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id }) catch return;
+
+        // Serialize value: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64][input...]
+        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + input.len;
+        if (value_len > 65000) return;
+        var value_buf: [65536]u8 = undefined;
+        var off: usize = 0;
+
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(wf_name.len), .little);
+        off += 2;
+        @memcpy(value_buf[off .. off + wf_name.len], wf_name);
+        off += wf_name.len;
+
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(version.len), .little);
+        off += 2;
+        @memcpy(value_buf[off .. off + version.len], version);
+        off += version.len;
+
+        value_buf[off] = @intFromEnum(RunStatus.running);
+        off += 1;
+
+        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
+        off += 8;
+
+        @memcpy(value_buf[off .. off + input.len], input);
+        off += input.len;
+
+        const value = value_buf[0..off];
+
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + ns_key.len + value.len;
+        var payload_buf: [65536]u8 = undefined;
+
+        const entry = entry_mod.buildCommandEntry(
+            .workflow_start,
+            entry_mod.Flags.NONE,
+            partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            ns_key,
+            value,
+            payload_buf[0..payload_size],
+        ) orelse return;
+
+        _ = partition.apply(&entry) catch {};
+    }
+
+    /// Replay a persisted workflow entry (called during segment replay on startup).
+    pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) void {
+        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+
+        switch (etype) {
+            .workflow_create => self.replayCreate(cmd.key, cmd.value),
+            .workflow_start => self.replayStart(cmd.key, cmd.value),
+            else => {},
+        }
+    }
+
+    /// Replay a workflow_create entry. The key is "namespace:name" (ns-qualified).
+    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8) void {
+        // Extract raw name from "namespace:name"
+        const raw_name = if (std.mem.indexOfScalar(u8, ns_key_raw, ':')) |idx|
+            ns_key_raw[idx + 1 ..]
+        else
+            ns_key_raw;
+
+        // Allocate ns-qualified key for map lookup
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
+
+        // Remove old definition if exists
+        if (self.definitions.fetchRemove(ns_key)) |old| {
+            self.allocator.free(old.key); // old ns-qualified key
+            self.allocator.free(old.value.name_owned);
+            self.allocator.free(old.value.version_owned);
+            self.allocator.free(old.value.yaml_owned);
+        }
+
+        // Parse to get version
+        var def = parser.parseWorkflow(self.allocator, yaml) catch {
+            self.allocator.free(ns_key);
+            return;
+        };
+        const version = self.allocator.dupe(u8, def.version) catch {
+            def.deinit(self.allocator);
+            self.allocator.free(ns_key);
+            return;
+        };
+        def.deinit(self.allocator);
+
+        const owned_name = self.allocator.dupe(u8, raw_name) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(version);
+            return;
+        };
+        const owned_yaml = self.allocator.dupe(u8, yaml) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_name);
+            self.allocator.free(version);
+            return;
+        };
+
+        self.definitions.put(ns_key, .{
+            .name_owned = owned_name,
+            .version_owned = version,
+            .yaml_owned = owned_yaml,
+            .created_at_ms = 0,
+        }) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_name);
+            self.allocator.free(version);
+            self.allocator.free(owned_yaml);
+        };
+    }
+
+    /// Replay a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
+    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
+        // Extract raw run_id from "namespace:run_id"
+        const raw_run_id = if (std.mem.indexOfScalar(u8, ns_key_raw, ':')) |idx|
+            ns_key_raw[idx + 1 ..]
+        else
+            ns_key_raw;
+
+        // Deserialize: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64][input...]
+        var off: usize = 0;
+        if (off + 2 > value.len) return;
+        const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + wf_name_len > value.len) return;
+        const wf_name = value[off .. off + wf_name_len];
+        off += wf_name_len;
+
+        if (off + 2 > value.len) return;
+        const ver_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + ver_len > value.len) return;
+        const version = value[off .. off + ver_len];
+        off += ver_len;
+
+        if (off + 1 > value.len) return;
+        const status: RunStatus = @enumFromInt(value[off]);
+        off += 1;
+
+        if (off + 8 > value.len) return;
+        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+        off += 8;
+
+        const input = if (off < value.len) value[off..] else "{}";
+
+        // Allocate ns-qualified key for map
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
+
+        // Duplicate all record fields
+        const owned_rid = self.allocator.dupe(u8, raw_run_id) catch {
+            self.allocator.free(ns_key);
+            return;
+        };
+        const owned_wf = self.allocator.dupe(u8, wf_name) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_rid);
+            return;
+        };
+        const owned_ver = self.allocator.dupe(u8, version) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_rid);
+            self.allocator.free(owned_wf);
+            return;
+        };
+        const owned_inp = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_rid);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ver);
+            return;
+        };
+
+        // Skip if already replayed (idempotent)
+        if (self.runs.contains(ns_key)) {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_rid);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ver);
+            self.allocator.free(owned_inp);
+            return;
+        }
+
+        self.runs.put(ns_key, .{
+            .run_id_owned = owned_rid,
+            .workflow_name_owned = owned_wf,
+            .workflow_version_owned = owned_ver,
+            .status = status,
+            .input_owned = owned_inp,
+            .created_at_ms = created_at_ms,
+            .started_at_ms = created_at_ms,
+            .completed_at_ms = null,
+            .idempotency_key_owned = null,
+            .signals = .empty,
+            .history = .empty,
+        }) catch {
+            self.allocator.free(ns_key);
+            self.allocator.free(owned_rid);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ver);
+            self.allocator.free(owned_inp);
         };
     }
 
