@@ -14,7 +14,7 @@ fn makeEntry(index: u64, payload: []const u8) Entry {
 }
 
 test "integration: UAL append and read back" {
-    var ual = try UAL.init(testing.allocator, 64 * 1024); // 64 KB — plenty of room
+    var ual = try UAL.init(testing.allocator, 64 * 1024, 0); // 64 KB — plenty of room
     defer ual.deinit();
 
     // Append 100 entries with unique payloads

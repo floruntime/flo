@@ -9,7 +9,7 @@
 //! - Inbox throughput: MPSC ring under contention
 //! - UAL consistency: append, read, ring wrap-around
 //! - KV projection: concurrent operations, TTL, scan consistency
-//! - KV WAL recovery: write, close, replay, verify state
+//! - Cold tier: UAL segment archival, on-demand retrieval, manifest persistence
 //! - Router: partition distribution uniformity
 //! - Shard walker: cross-shard scan iteration
 
@@ -21,7 +21,7 @@ test {
     _ = @import("test_inbox.zig");
     _ = @import("test_ual.zig");
     _ = @import("test_kv_projection.zig");
-    _ = @import("test_kv_wal_recovery.zig");
     _ = @import("test_router.zig");
     _ = @import("test_reactor.zig");
+    _ = @import("test_cold_tier.zig");
 }
