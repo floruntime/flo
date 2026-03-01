@@ -1,8 +1,16 @@
 //! KV Handler — registers KV opcodes with Dispatcher and handles KV operations.
 //!
 //! Read operations (get, scan, history) query the KV projection directly.
-//! Write operations (put, delete) go through the KV projection directly for now;
-//! they will be rewired through Raft propose when the full pipeline is connected.
+//! Write operations (put, delete) go through the full Raft propose pipeline:
+//!   1. Build CommandPayload from the request (key + value + TTL)
+//!   2. Propose the entry to RaftNode — in single-node mode this commits immediately
+//!   3. Apply all newly committed entries (commit_index > last_applied) to the
+//!      KV projection via applyEntry()
+//!   4. Send the response to the client
+//!
+//! In multi-node mode the leader replicates via AppendEntries before committing.
+//! The shard's tick loop drives replication; this handler waits for commit by
+//! calling applyCommittedEntries() which reads up to commit_index.
 //!
 //! ## Handler Registration
 //!
@@ -14,8 +22,8 @@
 //! ## Dispatch Flow
 //!
 //! Acceptor → Shard → Dispatcher → KVHandler.dispatch{Get,Put,...}
-//!   → handleCommand(kv, op, req) → CommandResult
-//!   → serialize → Connection.queueWrite
+//!   → [writes] raft_node.propose() → applyCommittedEntries() → sendResponse
+//!   → [reads]  projection.get/scan() → sendResponse
 //!
 //! ## Reserved Keys
 //!
@@ -38,9 +46,13 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
-const KVWAL = @import("../storage/kv_wal.zig").KVWAL;
+const entry_mod = @import("../storage/ual/entry.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+
+/// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
+const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
 
 /// Reserved key prefixes — operations on these are blocked for user requests.
 const RESERVED_PREFIXES = [_][]const u8{
@@ -62,17 +74,44 @@ const DEFAULT_SCAN_LIMIT: u32 = 100;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const KVHandler = struct {
+    // ── Blocking GET waiter infrastructure ───────────────────────────────
+
+    /// Maximum concurrent blocking GET waiters per shard.
+    const MAX_KV_WAITERS = 64;
+
+    /// A pending blocking GET registration.
+    const KVWaiter = struct {
+        fd: i32,
+        request_id: u64,
+        key_buf: [256]u8,
+        key_len: u16,
+        /// Trigger when version > min_version. 0 = trigger on any creation.
+        min_version: u64,
+        /// milliTimestamp() after which to send not_found. maxInt = infinite.
+        expires_at_ms: i64,
+        active: bool,
+    };
+
+    // ── Fields ──────────────────────────────────────────────────────────
+
     kv: *KVProjection,
     allocator: Allocator,
 
-    /// Monotonic LSN counter — stand-in for Raft index until full pipeline.
+    /// Counter for direct-write path (handleCommand used in tests and internal ops).
+    /// Production writes use the Raft log index as their version.
     next_lsn: u64,
+
+    /// Waiter slots (fixed-size, swap-remove on completion).
+    waiters: [MAX_KV_WAITERS]KVWaiter,
+    waiter_count: u16,
 
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
             .next_lsn = 1,
+            .waiters = undefined,
+            .waiter_count = 0,
         };
     }
 
@@ -118,30 +157,74 @@ pub const KVHandler = struct {
     fn dispatchGet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const cmd_result = shard.kv_handler.handleCommand(req);
-        defer shard.kv_handler.freeResult(cmd_result);
+
+        // Check for blocking options before normal GET.
+        // Wire mapping (from CLI client):
+        //   CLI --wait  → wire block_ms  (wait-until-exists)
+        //   CLI --block → wire wait_ms   (watch-for-changes / next version)
+        const block_ms = req.getBlockMs(); // wait-until-exists
+        const wait_ms = req.getWaitMs(); // watch-for-changes
+
+        if (block_ms) |bms| {
+            // Wait-until-exists semantics: if key exists, return immediately.
+            if (shard.kv_handler.*.kv.get(req.key)) |entry| {
+                const result = CommandResult{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
+                sendKVResponse(shard, conn, req.header.request_id, result);
+                return;
+            }
+            // Key absent — register waiter; response sent when key is created.
+            _ = shard.kv_handler.*.registerWaiter(conn.fd, req.header.request_id, req.key, 0, bms);
+            conn.response_deferred = true;
+            return;
+        }
+
+        if (wait_ms) |wms| {
+            // Watch-for-changes semantics: wait for version > current.
+            const current_version: u64 = if (shard.kv_handler.*.kv.get(req.key)) |entry| entry.lsn else 0;
+            _ = shard.kv_handler.*.registerWaiter(conn.fd, req.header.request_id, req.key, current_version, wms);
+            conn.response_deferred = true;
+            return;
+        }
+
+        // Normal non-blocking GET.
+        const cmd_result = shard.kv_handler.*.handleCommand(req);
+        defer shard.kv_handler.*.freeResult(cmd_result);
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
     fn dispatchPut(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const cmd_result = shard.kv_handler.handleCommand(req);
-        defer shard.kv_handler.freeResult(cmd_result);
 
-        // Persist successful puts to WAL
-        switch (cmd_result) {
-            .kv_put_ok => {
-                if (shard.kv_wal) |wal| {
-                    const ttl = req.getTtlSeconds() orelse 0;
-                    const now = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-                    const expiry: u64 = if (ttl > 0) now + ttl * 1_000_000_000 else 0;
-                    wal.appendPut(req.key, req.value, expiry) catch {};
-                    wal.sync();
-                }
-            },
-            else => {},
+        // Validate the request before proposing
+        const validation = shard.kv_handler.*.validatePut(req);
+        if (validation) |err_result| {
+            defer shard.kv_handler.*.freeResult(err_result);
+            sendKVResponse(shard, conn, req.header.request_id, err_result);
+            return;
         }
+
+        // Build CommandPayload and propose through Raft
+        const propose_result = proposeKVEntry(shard, .kv_put, req) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        // Apply all committed entries (in single-node mode this is synchronous)
+        applyCommittedEntries(shard);
+
+        // Notify any blocking GET waiters for this key
+        shard.kv_handler.*.notifyWaiters(shard, req.key);
+
+        // Build response from the committed version (the propose index IS the version)
+        const cmd_result = CommandResult{ .kv_put_ok = .{ .version = propose_result.index } };
+
+        // Track namespace data for non-empty delete check
+        shard.namespace_handler.markNamespaceHasData(req.namespace);
 
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
@@ -149,49 +232,144 @@ pub const KVHandler = struct {
     fn dispatchDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const cmd_result = shard.kv_handler.handleCommand(req);
-        defer shard.kv_handler.freeResult(cmd_result);
 
-        // Persist successful deletes to WAL
-        switch (cmd_result) {
-            .ok => {
-                if (shard.kv_wal) |wal| {
-                    wal.appendDelete(req.key) catch {};
-                    wal.sync();
-                }
-            },
-            else => {},
+        // Validate the request
+        const validation = shard.kv_handler.*.validateDelete(req);
+        if (validation) |err_result| {
+            defer shard.kv_handler.*.freeResult(err_result);
+            sendKVResponse(shard, conn, req.header.request_id, err_result);
+            return;
         }
 
-        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
+        // Check the key exists before proposing a delete
+        // (avoid proposing a no-op delete for a missing key)
+        if (shard.kv_handler.*.kv.get(req.key) == null) {
+            sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+            return;
+        }
+
+        // Propose the delete through Raft
+        _ = proposeKVEntry(shard, .kv_delete, req) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        // Apply all committed entries
+        applyCommittedEntries(shard);
+
+        // Notify any blocking GET waiters for this key
+        shard.kv_handler.*.notifyWaiters(shard, req.key);
+
+        sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
     fn dispatchScan(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const cmd_result = shard.kv_handler.handleCommand(req);
-        defer shard.kv_handler.freeResult(cmd_result);
+        const cmd_result = shard.kv_handler.*.handleCommand(req);
+        defer shard.kv_handler.*.freeResult(cmd_result);
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
     fn dispatchHistory(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const cmd_result = shard.kv_handler.handleCommand(req);
-        defer shard.kv_handler.freeResult(cmd_result);
+        const cmd_result = shard.kv_handler.*.handleCommand(req);
+        defer shard.kv_handler.*.freeResult(cmd_result);
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    // ── Core Command Logic ──────────────────────────────────────────────
+    // ── Raft Propose ────────────────────────────────────────────────────
+
+    /// Build a CommandPayload from the request, set entry flags (TTL, tombstone),
+    /// and propose the entry through RaftNode. Returns the ProposeResult with
+    /// .index (becomes the entry version) and .term.
+    ///
+    /// After this returns successfully, call `applyCommittedEntries()` to apply
+    /// any newly committed entries to the KV projection.
+    fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request) !@import("../raft/node.zig").ProposeResult {
+        // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
+        var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
+        const value = if (entry_type == .kv_delete) &[_]u8{} else req.value;
+        const cmd = entry_mod.CommandPayload{
+            .namespace_hash = 0, // TODO: extract from request namespace
+            .key_length = @intCast(req.key.len),
+            .value_length = @intCast(value.len),
+            .key = req.key,
+            .value = value,
+        };
+        var payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
+
+        // Set flags and append TTL if present
+        var flags: u16 = entry_mod.Flags.NONE;
+        if (entry_type == .kv_delete) {
+            flags |= entry_mod.Flags.TOMBSTONE;
+        }
+
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+
+        if (entry_type == .kv_put) {
+            if (req.getTtlSeconds()) |ttl_secs| {
+                if (ttl_secs > 0) {
+                    flags |= entry_mod.Flags.HAS_TTL;
+                    const expiry_ns = timestamp_ns + ttl_secs * 1_000_000_000;
+                    std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
+                    payload_len += 8;
+                }
+            }
+        }
+
+        // Propose through Raft — in single-node mode this commits immediately
+        const propose_result = try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
+
+        // Also persist to segment writer for disk durability
+        const entry = entry_mod.buildEntry(entry_type, flags, propose_result.term, propose_result.index, timestamp_ns, payload_buf[0..payload_len]);
+        shard.segment_writer.addEntry(&entry) catch {};
+
+        // Broadcast to cluster peers via raft network
+        if (shard.raft_network) |rn| {
+            var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
+            if (entry.serialize(&entry_buf)) |serialized_len| {
+                rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+            }
+        }
+
+        return propose_result;
+    }
+
+    /// Apply all entries committed by Raft (commit_index > last_applied) to the
+    /// KV projection. In single-node mode this is a tight synchronous loop since
+    /// propose() advances commit_index immediately.
+    fn applyCommittedEntries(shard: *Shard) void {
+        const raft = shard.raft_node;
+        while (raft.last_applied < raft.commit_index) {
+            const next_idx = raft.last_applied + 1;
+            // Grab Entry from RaftLog (may have payload on stack — getEntry borrows from UAL ring)
+            if (raft.log.getEntry(next_idx)) |e| {
+                shard.kv_projection.applyEntry(&e) catch {};
+                raft.last_applied = next_idx;
+            } else {
+                // Entry evicted from ring — still advance last_applied to avoid stall
+                raft.last_applied = next_idx;
+            }
+        }
+    }
+
+    // ── Core Command Logic ─────────────────────────────────────────────
 
     /// Dispatch a KV command to the appropriate handler.
-    /// Returns a CommandResult that the caller serializes and sends.
+    /// Used for read operations and direct/test writes (bypasses Raft).
+    /// Production write path goes through dispatchPut/dispatchDelete → proposeKVEntry.
     pub fn handleCommand(self: *KVHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .kv_get => self.handleGet(req),
-            .kv_put => self.handlePut(req),
-            .kv_delete => self.handleDelete(req),
+            .kv_put => self.handlePutDirect(req),
+            .kv_delete => self.handleDeleteDirect(req),
             .kv_scan => self.handleScan(req),
             .kv_history => self.handleHistory(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown KV opcode" } },
@@ -213,18 +391,19 @@ pub const KVHandler = struct {
         return .{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
     }
 
-    // ── PUT ─────────────────────────────────────────────────────────────
+    // ── PUT direct (used by handleCommand — test/internal path) ─────────
 
-    fn handlePut(self: *KVHandler, req: Request) CommandResult {
+    /// Direct put to the KV projection. Bypasses Raft — used for testing and
+    /// internal operations. Production writes go through proposeKVEntry().
+    fn handlePutDirect(self: *KVHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
         }
-
         if (isReservedKey(req.key)) {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
-        // Check compare-and-swap (CAS) — version must match current
+        // CAS check
         if (req.getCasVersion()) |expected_version| {
             const current = self.kv.get(req.key);
             if (current) |entry| {
@@ -232,64 +411,102 @@ pub const KVHandler = struct {
                     return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
                 }
             } else {
-                // CAS on non-existent key: version 0 means "must not exist"
                 if (expected_version != 0) {
                     return .{ .kv_cas_failed = .{ .current_version = 0 } };
                 }
             }
         }
 
-        // Check if_not_exists condition (NX)
+        // NX / XX conditions
         if (req.getIfNotExists()) {
-            if (self.kv.get(req.key) != null) {
-                return .kv_condition_not_met;
-            }
+            if (self.kv.get(req.key) != null) return .kv_condition_not_met;
         }
-
-        // Check if_exists condition (XX)
         if (req.getIfExists()) {
-            if (self.kv.get(req.key) == null) {
-                return .kv_condition_not_met;
-            }
+            if (self.kv.get(req.key) == null) return .kv_condition_not_met;
         }
 
-        // TODO: Replace direct put with Raft propose for write path
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-
-        // Compute TTL expiry (nanoseconds from epoch)
         const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
-            if (ttl_secs == 0) break :blk 0; // 0 means no expiry
+            if (ttl_secs == 0) break :blk 0;
             break :blk timestamp + ttl_secs * 1_000_000_000;
         } else 0;
 
         self.kv.put(req.key, req.value, lsn, 0, timestamp, expiry_ns) catch {
             return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
         };
-
         return .{ .kv_put_ok = .{ .version = lsn } };
     }
 
-    // ── DELETE ──────────────────────────────────────────────────────────
+    // ── DELETE direct (used by handleCommand — test/internal path) ───────
 
-    fn handleDelete(self: *KVHandler, req: Request) CommandResult {
+    /// Direct delete from the KV projection. Bypasses Raft.
+    fn handleDeleteDirect(self: *KVHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
         }
-
         if (isReservedKey(req.key)) {
             return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
         }
 
-        // TODO: Replace direct delete with Raft propose for write path
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-
         self.kv.delete(req.key, lsn, 0, timestamp) catch {
             return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
         };
-
         return .ok;
+    }
+
+    // ── PUT validation (pre-checks only — no write to projection) ───────
+
+    /// Validate a put request before proposing to Raft.
+    /// Returns null if all checks pass, or a CommandResult error to send immediately.
+    fn validatePut(self: *KVHandler, req: Request) ?CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        }
+        if (isReservedKey(req.key)) {
+            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+        }
+
+        // CAS check — version must match current
+        if (req.getCasVersion()) |expected_version| {
+            const current = self.kv.get(req.key);
+            if (current) |entry| {
+                if (entry.lsn != expected_version) {
+                    return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
+                }
+            } else {
+                if (expected_version != 0) {
+                    return .{ .kv_cas_failed = .{ .current_version = 0 } };
+                }
+            }
+        }
+
+        // NX: must not exist
+        if (req.getIfNotExists()) {
+            if (self.kv.get(req.key) != null) return .kv_condition_not_met;
+        }
+
+        // XX: must exist
+        if (req.getIfExists()) {
+            if (self.kv.get(req.key) == null) return .kv_condition_not_met;
+        }
+
+        return null; // all checks passed
+    }
+
+    // ── DELETE validation (pre-checks only — no write to projection) ─────
+
+    /// Validate a delete request before proposing to Raft.
+    fn validateDelete(_: *KVHandler, req: Request) ?CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        }
+        if (isReservedKey(req.key)) {
+            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+        }
+        return null; // all checks passed
     }
 
     // ── SCAN ────────────────────────────────────────────────────────────
@@ -347,13 +564,121 @@ pub const KVHandler = struct {
         return lsn;
     }
 
-    /// Free any heap-allocated data in a CommandResult returned by this handler.
-    /// Currently only kv_scan_result allocates.
+    /// Free any heap-allocated data inside a CommandResult.
+    /// Call this (via defer) after sending the response to the client.
     pub fn freeResult(self: *KVHandler, cmd_result: CommandResult) void {
         switch (cmd_result) {
-            .kv_scan_result => |r| self.allocator.free(r.data),
+            .kv_scan_result => |scan| {
+                if (scan.data.len > 0) {
+                    self.allocator.free(scan.data);
+                }
+            },
+            .kv_history_result => |hist| {
+                if (hist.data.len > 0) {
+                    self.allocator.free(hist.data);
+                }
+            },
             else => {},
         }
+    }
+
+    // ── Blocking GET Waiter Management ──────────────────────────────────
+
+    /// Register a waiter for a blocking GET.  Returns true on success.
+    /// `timeout_ms`: 0 = infinite wait, >0 = expire after N ms.
+    /// `min_version`: 0 = trigger on any creation, >0 = trigger when version > min_version.
+    pub fn registerWaiter(self: *KVHandler, fd: i32, request_id: u64, key: []const u8, min_version: u64, timeout_ms: u32) bool {
+        if (self.waiter_count >= MAX_KV_WAITERS) return false;
+        if (key.len == 0 or key.len > 256) return false;
+
+        const now_ms = std.time.milliTimestamp();
+        const expires: i64 = if (timeout_ms == 0) std.math.maxInt(i64) else now_ms + @as(i64, @intCast(timeout_ms));
+
+        var w = &self.waiters[self.waiter_count];
+        w.fd = fd;
+        w.request_id = request_id;
+        w.key_buf = undefined;
+        @memcpy(w.key_buf[0..key.len], key);
+        w.key_len = @intCast(key.len);
+        w.min_version = min_version;
+        w.expires_at_ms = expires;
+        w.active = true;
+        self.waiter_count += 1;
+        return true;
+    }
+
+    /// Notify waiters matching `key`.  Sends the value response and removes
+    /// satisfied waiters.  Called after a PUT or DELETE commits.
+    pub fn notifyWaiters(self: *KVHandler, shard_ptr: *anyopaque, key: []const u8) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        var i: u16 = 0;
+        while (i < self.waiter_count) {
+            const w = &self.waiters[i];
+            if (!w.active) {
+                i += 1;
+                continue;
+            }
+
+            const wkey = w.key_buf[0..w.key_len];
+            if (wkey.len == key.len and std.mem.eql(u8, wkey, key)) {
+                if (self.kv.get(key)) |entry| {
+                    if (entry.lsn > w.min_version) {
+                        // Satisfied — send value response on the waiting connection.
+                        if (shard.getConnection(w.fd)) |conn| {
+                            var resp = proto.Response.init(w.request_id, .ok, entry.value);
+                            resp.prefix = entry.lsn;
+                            var buf: [MAX_RESPONSE_BUF]u8 = undefined;
+                            if (resp.serialize(&buf)) |serialized| {
+                                _ = conn.queueWrite(serialized);
+                                shard.flushToClient(w.fd);
+                            } else |_| {}
+                        }
+                        self.removeWaiter(i);
+                        continue; // don't increment — slot was swapped
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Expire waiters whose deadline has passed.  Sends not_found on the
+    /// waiting connection.  Called from the shard tick loop.
+    pub fn checkWaiterTimeouts(self: *KVHandler, shard_ptr: *anyopaque) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const now_ms = std.time.milliTimestamp();
+        var i: u16 = 0;
+        while (i < self.waiter_count) {
+            const w = &self.waiters[i];
+            if (!w.active) {
+                i += 1;
+                continue;
+            }
+
+            if (now_ms >= w.expires_at_ms) {
+                // Expired — send not_found.
+                if (shard.getConnection(w.fd)) |conn| {
+                    var resp = proto.Response.initError(w.request_id, .not_found);
+                    var buf2: [128]u8 = undefined;
+                    if (resp.serialize(&buf2)) |serialized| {
+                        _ = conn.queueWrite(serialized);
+                        shard.flushToClient(w.fd);
+                    } else |_| {}
+                }
+                self.removeWaiter(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Remove waiter at `index` by swap-removing with last.
+    fn removeWaiter(self: *KVHandler, index: u16) void {
+        if (self.waiter_count == 0) return;
+        if (index < self.waiter_count - 1) {
+            self.waiters[index] = self.waiters[self.waiter_count - 1];
+        }
+        self.waiter_count -= 1;
     }
 };
 

@@ -296,7 +296,7 @@ pub const KVProjection = struct {
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
-                    0, // TODO: extract TTL from UAL entry
+                    extractExpiry(entry, &cmd),
                 );
             },
             .kv_delete, .cg_delete => {
@@ -319,13 +319,29 @@ pub const KVProjection = struct {
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
-                    0, // TODO: extract TTL from UAL entry
+                    extractExpiry(entry, &cmd),
                 );
             },
             else => {},
         }
 
         self.applied_index = entry.header.index;
+    }
+
+    /// Extract expiry_ns from a UAL entry if the HAS_TTL flag is set.
+    /// TTL is encoded as 8 bytes of u64 LE appended after the CommandPayload data.
+    fn extractExpiry(entry: *const Entry, cmd: *const CommandPayload) u64 {
+        const Flags = entry_mod.Flags;
+        if (entry.header.flags & Flags.HAS_TTL == 0) return 0;
+
+        // TTL bytes start after command prefix (ns_hash:4 + key_len:2 + val_len:4 = 10)
+        // plus key + value data
+        const COMMAND_PREFIX_SIZE = entry_mod.COMMAND_PREFIX_SIZE;
+        const ttl_offset = COMMAND_PREFIX_SIZE + cmd.key_length + cmd.value_length;
+        if (entry.payload.len >= ttl_offset + 8) {
+            return std.mem.readInt(u64, entry.payload[ttl_offset..][0..8], .little);
+        }
+        return 0;
     }
 
     /// ProjectionVTable implementation for use with ProjectionRouter.

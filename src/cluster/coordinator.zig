@@ -292,7 +292,7 @@ pub const Coordinator = struct {
         @memcpy(buf[6..][0..name.len], name);
 
         self.proposals_total += 1;
-        return self.raft.propose(.raft_config, buf);
+        return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
     /// Propose deleting a namespace
@@ -308,7 +308,7 @@ pub const Coordinator = struct {
         @memcpy(buf[3..][0..name.len], name);
 
         self.proposals_total += 1;
-        return self.raft.propose(.raft_config, buf);
+        return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
     /// Propose adding a node to the cluster
@@ -335,7 +335,7 @@ pub const Coordinator = struct {
         @memcpy(buf[9..][0..address.len], address);
 
         self.proposals_total += 1;
-        return self.raft.propose(.raft_config, buf);
+        return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
     /// Propose removing a node from the cluster
@@ -347,7 +347,7 @@ pub const Coordinator = struct {
         std.mem.writeInt(u32, buf[1..5], target_node_id, .little);
 
         self.proposals_total += 1;
-        return self.raft.propose(.raft_config, &buf);
+        return self.raft.propose(.raft_config, 0, 0, &buf);
     }
 
     /// Propose a partition assignment change
@@ -381,7 +381,7 @@ pub const Coordinator = struct {
         }
 
         self.proposals_total += 1;
-        return self.raft.propose(.raft_config, buf[0 .. 12 + @as(usize, replica_count) * 4]);
+        return self.raft.propose(.raft_config, 0, 0, buf[0 .. 12 + @as(usize, replica_count) * 4]);
     }
 
     // ── Apply (called when entries are committed) ───────────────────────

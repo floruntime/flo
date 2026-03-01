@@ -281,8 +281,8 @@ test "replication: build request for lagging peer" {
     defer cleanupNodes(&nodes);
 
     // Leader proposes entries
-    _ = try nodes[0].propose(.kv_put, "key1");
-    _ = try nodes[0].propose(.kv_put, "key2");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "key1");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "key2");
 
     var rm = ReplicationManager.init(&nodes[0]);
 
@@ -325,7 +325,7 @@ test "replication: follower receives replicated entries" {
     defer cleanupNodes(&nodes);
 
     // Leader proposes an entry
-    const result = try nodes[0].propose(.kv_put, "hello");
+    const result = try nodes[0].propose(.kv_put, 0, 0, "hello");
     try testing.expectEqual(@as(u64, 1), result.index);
 
     var rm = ReplicationManager.init(&nodes[0]);
@@ -348,9 +348,9 @@ test "replication: commit advances after majority replication" {
     defer cleanupNodes(&nodes);
 
     // Leader proposes 3 entries
-    _ = try nodes[0].propose(.kv_put, "k1");
-    _ = try nodes[0].propose(.kv_put, "k2");
-    _ = try nodes[0].propose(.kv_put, "k3");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "k1");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "k2");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "k3");
 
     var rm = ReplicationManager.init(&nodes[0]);
 
@@ -376,8 +376,8 @@ test "replication: log mismatch triggers backtrack" {
     defer cleanupNodes(&nodes);
 
     // Leader proposes entries
-    _ = try nodes[0].propose(.kv_put, "k1");
-    _ = try nodes[0].propose(.kv_put, "k2");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "k1");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "k2");
 
     // Give follower a conflicting entry at index 1 (wrong term)
     var conflict = makeEntry(.kv_put, 99, 1, "conflict");
@@ -408,7 +408,7 @@ test "replication: pipeline allows multiple in-flight" {
 
     // Add many entries
     for (0..10) |_| {
-        _ = try nodes[0].propose(.kv_put, "data");
+        _ = try nodes[0].propose(.kv_put, 0, 0, "data");
     }
 
     var rm = ReplicationManager.init(&nodes[0]);
@@ -469,7 +469,7 @@ test "replication: full 3-node scenario with multiple rounds" {
     var rm = ReplicationManager.init(&nodes[0]);
 
     // Round 1: propose and replicate
-    _ = try nodes[0].propose(.kv_put, "round1");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "round1");
 
     var buf: [16]Entry = undefined;
 
@@ -486,8 +486,8 @@ test "replication: full 3-node scenario with multiple rounds" {
     try testing.expectEqual(@as(u8, 2), rm.caughtUpPeers());
 
     // Round 2: more entries
-    _ = try nodes[0].propose(.kv_put, "round2a");
-    _ = try nodes[0].propose(.kv_put, "round2b");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "round2a");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "round2b");
 
     // Replicate to follower 1 only (simulates async)
     const req2 = rm.buildAppendRequest(0, &buf).?;
@@ -517,7 +517,7 @@ test "replication: peers matching at least" {
     var nodes = try setupThreeNodeCluster(allocator);
     defer cleanupNodes(&nodes);
 
-    _ = try nodes[0].propose(.kv_put, "data");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "data");
 
     var rm = ReplicationManager.init(&nodes[0]);
 
@@ -548,7 +548,7 @@ test "replication: stats tracking" {
     var nodes = try setupThreeNodeCluster(allocator);
     defer cleanupNodes(&nodes);
 
-    _ = try nodes[0].propose(.kv_put, "stats_test");
+    _ = try nodes[0].propose(.kv_put, 0, 0, "stats_test");
 
     var rm = ReplicationManager.init(&nodes[0]);
 

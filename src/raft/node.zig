@@ -444,15 +444,16 @@ pub const RaftNode = struct {
     // ── Propose (Leader) ────────────────────────────────────────────────
 
     /// Propose a new entry (leader only). Returns error if not leader.
-    pub fn propose(self: *RaftNode, entry_type: EntryType, payload: []const u8) !ProposeResult {
+    /// Flags and timestamp are written into the entry header (e.g. HAS_TTL, TOMBSTONE).
+    pub fn propose(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
 
         var e = entry_mod.buildEntry(
             entry_type,
-            entry_mod.Flags.NONE,
+            flags,
             self.current_term,
             self.log.lastIndex() + 1,
-            0,
+            timestamp_ns,
             payload,
         );
         e.header.crc32c = e.computeCrc();
@@ -568,12 +569,12 @@ test "raft node: single-node propose" {
     try node.bootstrap();
 
     // Propose entries — should commit immediately in single-node mode
-    const r1 = try node.propose(.kv_put, "key1val1");
+    const r1 = try node.propose(.kv_put, 0, 0, "key1val1");
     try testing.expectEqual(@as(u64, 2), r1.index); // 1 is noop
     try testing.expectEqual(@as(u64, 1), r1.term);
     try testing.expectEqual(@as(u64, 2), node.commit_index);
 
-    const r2 = try node.propose(.kv_put, "key2val2");
+    const r2 = try node.propose(.kv_put, 0, 0, "key2val2");
     try testing.expectEqual(@as(u64, 3), r2.index);
     try testing.expectEqual(@as(u64, 3), node.commit_index);
 }
@@ -584,7 +585,7 @@ test "raft node: propose rejected when not leader" {
     var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
     defer node.deinit();
 
-    const result = node.propose(.kv_put, "data");
+    const result = node.propose(.kv_put, 0, 0, "data");
     try testing.expectError(error.NotLeader, result);
 }
 
@@ -853,7 +854,7 @@ test "raft node: leader commit advancement with 3-node cluster" {
     try testing.expectEqual(Role.leader, node.role);
 
     // Propose an entry — goes at index 1 (no noop in election path)
-    _ = try node.propose(.kv_put, "key1val1");
+    _ = try node.propose(.kv_put, 0, 0, "key1val1");
     try testing.expectEqual(@as(u64, 0), node.commit_index); // not committed yet
 
     // Peer 2 acks

@@ -26,6 +26,12 @@ const InboxMessage = @import("inbox.zig").Message;
 const Durability = @import("../engine/interfaces.zig").Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
+const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const generateNodeId = @import("../raft/network.zig").generateNodeId;
+const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
+const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
+const DashboardContext = @import("dashboard/api.zig").DashboardContext;
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
 pub const RuntimeConfig = struct {
@@ -96,6 +102,18 @@ pub const Runtime = struct {
     /// Whether the runtime has been started.
     started: bool,
 
+    /// Raft networking layer for cluster entry replication.
+    raft_network: ?*RaftNetwork,
+
+    /// Dashboard HTTP server (serves REST API + static files).
+    dashboard_server: ?*DashboardServer,
+
+    /// Dashboard context (metrics + shard info for API handlers).
+    dashboard_ctx: ?*DashboardContext,
+
+    /// Metrics registry for dashboard and Prometheus endpoint.
+    metrics_registry: ?*MetricsRegistry,
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         const shard_count = detectShardCount(config.num_shards);
 
@@ -110,12 +128,39 @@ pub const Runtime = struct {
             .acceptor_thread = null,
             .pipe_write_ends = null,
             .started = false,
+            .raft_network = null,
+            .dashboard_server = null,
+            .dashboard_ctx = null,
+            .metrics_registry = null,
         };
     }
 
     pub fn deinit(self: *Runtime) void {
         if (self.started) {
             self.stop();
+        }
+
+        // Clean up dashboard
+        if (self.dashboard_server) |server| {
+            server.deinit();
+            self.allocator.destroy(server);
+            self.dashboard_server = null;
+        }
+        if (self.dashboard_ctx) |ctx| {
+            self.allocator.destroy(ctx);
+            self.dashboard_ctx = null;
+        }
+        if (self.metrics_registry) |metrics| {
+            metrics.deinit();
+            self.allocator.destroy(metrics);
+            self.metrics_registry = null;
+        }
+
+        // Clean up raft network
+        if (self.raft_network) |rn| {
+            rn.deinit();
+            self.allocator.destroy(rn);
+            self.raft_network = null;
         }
 
         // Clean up pipes
@@ -204,6 +249,37 @@ pub const Runtime = struct {
             threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
         }
 
+        // 3.5 Create raft network if cluster is enabled
+        if (self.config.cluster_raft_port > 0 or self.config.cluster_seeds.len > 0) {
+            const raft_port = self.config.cluster_raft_port;
+            const node_id = if (self.config.cluster_node_id > 0)
+                self.config.cluster_node_id
+            else
+                generateNodeId(self.config.listen_port);
+
+            const rn = try self.allocator.create(RaftNetwork);
+            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
+            rn.setShardInbox(&shards[0].inbox);
+            shards[0].raft_network = rn;
+            self.raft_network = rn;
+
+            try rn.start();
+
+            // Connect to seed nodes
+            for (self.config.cluster_seeds) |seed| {
+                const seed_port = parseSeedPort(seed) orelse continue;
+                // Retry connection a few times since seed may still be starting
+                var attempt: usize = 0;
+                while (attempt < 30) : (attempt += 1) {
+                    rn.connectToPeer("127.0.0.1", seed_port) catch {
+                        std.Thread.sleep(200 * std.time.ns_per_ms);
+                        continue;
+                    };
+                    break;
+                }
+            }
+        }
+
         // 4. Create and start acceptor
         var acceptor = Acceptor.init(write_ends, shards[0].router);
         try acceptor.listen(self.config.listen_port);
@@ -212,12 +288,43 @@ pub const Runtime = struct {
         // 5. Spawn acceptor thread
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
 
+        // 6. Start dashboard HTTP server if enabled
+        if (self.config.dashboard_enabled) {
+            const metrics = try self.allocator.create(MetricsRegistry);
+            metrics.* = MetricsRegistry.init(self.allocator);
+            self.metrics_registry = metrics;
+
+            const ctx = try self.allocator.create(DashboardContext);
+            ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
+            self.dashboard_ctx = ctx;
+
+            const server = try self.allocator.create(DashboardServer);
+            server.* = DashboardServer.init(self.allocator, .{
+                .port = self.config.dashboard_port,
+                .bind = self.config.dashboard_bind,
+                .cors_origins = self.config.dashboard_cors_origins orelse "*",
+                .admin_token = self.config.dashboard_admin_token orelse "",
+            }, ctx);
+            self.dashboard_server = server;
+            try server.start();
+        }
+
         self.started = true;
     }
 
     /// Graceful shutdown in reverse order.
     pub fn stop(self: *Runtime) void {
         if (!self.started) return;
+
+        // 0. Stop dashboard HTTP server first
+        if (self.dashboard_server) |server| {
+            server.stop();
+        }
+
+        // 0.5 Stop raft network
+        if (self.raft_network) |rn| {
+            rn.stop();
+        }
 
         // 1. Stop acceptor
         if (self.acceptor) |*acc| {
@@ -291,6 +398,13 @@ fn detectShardCount(configured: u16) u16 {
     // Reserve 1 core for acceptor, 1 for OS. Min 1 shard.
     const shards = if (cpus > 2) cpus - 2 else 1;
     return @intCast(@min(shards, 256));
+}
+
+/// Parse port from a seed address like "127.0.0.1:9500" or "localhost:9500".
+fn parseSeedPort(seed: []const u8) ?u16 {
+    const colon_idx = std.mem.lastIndexOfScalar(u8, seed, ':') orelse return null;
+    if (colon_idx + 1 >= seed.len) return null;
+    return std.fmt.parseInt(u16, seed[colon_idx + 1 ..], 10) catch null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

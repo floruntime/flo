@@ -52,6 +52,9 @@ pub const NamespaceHandler = struct {
 
     pub const NamespaceMeta = struct {
         created_at_ns: u64,
+        /// Tracks whether data has been written to this namespace.
+        /// Incremented by markNamespaceHasData(), used for non-empty delete check.
+        data_count: u32 = 0,
     };
 
     pub fn init(allocator: Allocator) NamespaceHandler {
@@ -67,6 +70,25 @@ pub const NamespaceHandler = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.namespaces.deinit();
+    }
+
+    // ── Namespace Data Tracking ─────────────────────────────────────────
+
+    /// Mark a namespace as having data written to it.
+    /// Called by KV/Stream/Queue handlers when writing with a non-default namespace.
+    pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8) void {
+        if (name.len == 0 or std.mem.eql(u8, name, "default")) return;
+        if (self.namespaces.getPtr(name)) |meta| {
+            meta.data_count +|= 1; // saturating add
+        }
+    }
+
+    /// Check if a namespace has had data written to it.
+    pub fn namespaceHasData(self: *NamespaceHandler, name: []const u8) bool {
+        if (self.namespaces.get(name)) |meta| {
+            return meta.data_count > 0;
+        }
+        return false;
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -163,13 +185,21 @@ pub const NamespaceHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "cannot delete default namespace" } };
         }
 
+        // Parse force flag from req.value[0]
+        const force = req.value.len > 0 and req.value[0] != 0;
+
+        // If not force, check if namespace has data
+        if (!force and self.namespaceHasData(name)) {
+            return .{ .err = .{ .code = .namespace_not_empty, .message = "namespace is not empty; use --force to delete" } };
+        }
+
         if (self.namespaces.fetchRemove(name)) |kv| {
             self.allocator.free(kv.key);
             return .{ .namespace_deleted = {} };
         }
 
-        // Idempotent — deleting non-existent namespace is OK
-        return .{ .namespace_deleted = {} };
+        // Non-existent namespace — return not_found error
+        return .{ .err = .{ .code = .not_found, .message = "namespace not found" } };
     }
 
     // ── LIST ────────────────────────────────────────────────────────────
@@ -323,6 +353,7 @@ fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
         .unauthorized => .unauthorized,
         .not_found => .not_found,
         .already_exists => .conflict,
+        .namespace_not_empty => .conflict,
         .timeout => .internal_error,
         .internal_error => .internal_error,
         .unavailable => .internal_error,
@@ -455,14 +486,14 @@ test "namespace handler: delete" {
     try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
 }
 
-test "namespace handler: delete non-existent is idempotent" {
+test "namespace handler: delete non-existent returns not_found" {
     const allocator = testing.allocator;
     var handler = NamespaceHandler.init(allocator);
     defer handler.deinit();
 
     const result = handler.handleCommand(makeRequest(.namespace_delete, "ghost", ""));
     switch (result) {
-        .namespace_deleted => {},
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -489,6 +520,64 @@ test "namespace handler: delete reserved blocked" {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "namespace handler: delete non-empty without force blocked" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    _ = handler.handleCommand(makeRequest(.namespace_create, "myns", ""));
+    handler.markNamespaceHasData("myns");
+
+    // Delete without force should fail
+    const result = handler.handleCommand(makeRequest(.namespace_delete, "myns", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.namespace_not_empty, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Namespace should still exist
+    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
+}
+
+test "namespace handler: delete non-empty with force succeeds" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    _ = handler.handleCommand(makeRequest(.namespace_create, "myns", ""));
+    handler.markNamespaceHasData("myns");
+
+    // Delete with force=1 should succeed
+    const force_value = [_]u8{1};
+    const result = handler.handleCommand(makeRequest(.namespace_delete, "myns", &force_value));
+    switch (result) {
+        .namespace_deleted => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
+}
+
+test "namespace handler: markNamespaceHasData" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    _ = handler.handleCommand(makeRequest(.namespace_create, "tracked", ""));
+    try testing.expect(!handler.namespaceHasData("tracked"));
+
+    handler.markNamespaceHasData("tracked");
+    try testing.expect(handler.namespaceHasData("tracked"));
+
+    // Default namespace is ignored
+    handler.markNamespaceHasData("default");
+    try testing.expect(!handler.namespaceHasData("default"));
+
+    // Non-existent namespace is ignored (no crash)
+    handler.markNamespaceHasData("ghost");
+    try testing.expect(!handler.namespaceHasData("ghost"));
 }
 
 test "namespace handler: list" {

@@ -52,7 +52,15 @@ const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
-const KVWAL = @import("../storage/kv_wal.zig").KVWAL;
+const ual_mod = @import("../storage/ual/ual.zig");
+const UAL = ual_mod.UAL;
+const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
+const entry_mod = @import("../storage/ual/entry.zig");
+const segment_mod = @import("../storage/ual/segment.zig");
+const Entry = entry_mod.Entry;
+const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const RaftNode = @import("../raft/node.zig").RaftNode;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -131,14 +139,24 @@ pub const Shard = struct {
     /// Actions handler instance.
     actions_handler: *ActionsHandler,
 
-    /// KV WAL for persistence (null when no data_dir).
-    kv_wal: ?*KVWAL,
+    /// Unified Append Log — hot ring buffer for recent entries.
+    ual: *UAL,
+
+    /// Segment writer — accumulates entries for persistence to .flseg files.
+    segment_writer: *SegmentWriter,
 
     /// Per-shard data directory path (owned, null if ephemeral).
     shard_data_dir: ?[]const u8,
 
     /// Whether the acceptor pipe has been registered with the reactor.
     pipe_registered: bool,
+
+    /// Raft network reference (set by runtime for shard 0, null otherwise).
+    raft_network: ?*RaftNetwork,
+
+    /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
+    /// Writes go through propose() → commit → apply to projections.
+    raft_node: *RaftNode,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,13 +218,30 @@ pub const Shard = struct {
         errdefer allocator.destroy(namespace_handler);
         namespace_handler.* = NamespaceHandler.init(allocator);
 
-        // Create Actions handler (no projection needed)
+        // Create Actions handler
         const actions_handler = try allocator.create(ActionsHandler);
         errdefer allocator.destroy(actions_handler);
         actions_handler.* = ActionsHandler.init(allocator);
 
-        // Create KV WAL for persistence (if data_dir is configured)
-        var kv_wal: ?*KVWAL = null;
+        // Create UAL (hot ring buffer) and SegmentWriter (persistence)
+        const ual = try allocator.create(UAL);
+        errdefer allocator.destroy(ual);
+        ual.* = try UAL.init(allocator, ual_mod.DEFAULT_CAPACITY);
+        errdefer ual.deinit();
+
+        const seg_writer = try allocator.create(SegmentWriter);
+        errdefer allocator.destroy(seg_writer);
+        seg_writer.* = SegmentWriter.init(allocator, @as(u32, shard_id), .none);
+        errdefer seg_writer.deinit();
+
+        // Create Raft consensus node — bootstrapped as single-node leader.
+        // Runtime can add peers later for multi-node clusters.
+        const raft_node = try allocator.create(RaftNode);
+        errdefer allocator.destroy(raft_node);
+        raft_node.* = try RaftNode.init(allocator, @as(u32, shard_id) + 1, @as(u32, shard_id), 4096, .{});
+        errdefer raft_node.deinit();
+        try raft_node.bootstrap();
+
         var shard_data_dir: ?[]const u8 = null;
         if (data_dir) |dir| {
             // Build shard-specific data directory: data_dir/shard-N/
@@ -218,28 +253,18 @@ pub const Shard = struct {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // Build WAL file path
-            const wal_path = try std.fmt.allocPrint(allocator, "{s}/kv.wal", .{shard_dir});
-            defer allocator.free(wal_path);
+            // Replay existing segment files into KV projection
+            var max_index: u64 = 0;
+            replaySegments(allocator, shard_dir, kv_proj, &max_index);
 
-            // Open WAL and replay into KV projection
-            const wal = try allocator.create(KVWAL);
-            errdefer allocator.destroy(wal);
-            wal.* = try KVWAL.init(allocator, wal_path);
-            errdefer wal.deinit();
+            // Restore handler LSN counter to avoid index collisions
+            if (max_index > 0) {
+                // Advance Raft log indices past replayed data to avoid collisions
+                raft_node.log.last_idx = max_index + 1;
+                raft_node.commit_index = max_index + 1;
+                raft_node.last_applied = max_index + 1;
+            }
 
-            // Replay existing WAL entries into KV projection
-            _ = wal.replay(kv_proj, struct {
-                fn put(proj: *KVProjection, key: []const u8, value: []const u8, lsn: u64, expiry_ns: u64) !void {
-                    try proj.put(key, value, lsn, 0, 0, expiry_ns);
-                }
-            }.put, struct {
-                fn del(proj: *KVProjection, key: []const u8, lsn: u64) !void {
-                    try proj.delete(key, lsn, 0, 0);
-                }
-            }.del) catch {};
-
-            kv_wal = wal;
             shard_data_dir = shard_dir;
         }
 
@@ -279,9 +304,12 @@ pub const Shard = struct {
             .ts_handler = ts_handler,
             .namespace_handler = namespace_handler,
             .actions_handler = actions_handler,
-            .kv_wal = kv_wal,
+            .ual = ual,
+            .raft_node = raft_node,
+            .segment_writer = seg_writer,
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
+            .raft_network = null,
         };
     }
 
@@ -296,11 +324,19 @@ pub const Shard = struct {
         }
         self.connections.deinit(self.allocator);
 
-        // Clean up KV WAL
-        if (self.kv_wal) |wal| {
-            wal.deinit();
-            self.allocator.destroy(wal);
+        // Flush pending entries to segment file on shutdown
+        if (self.shard_data_dir) |dir| {
+            if (self.segment_writer.entry_count > 0) {
+                self.segment_writer.writeToFile(dir) catch {};
+            }
         }
+
+        // Clean up UAL and SegmentWriter
+        self.segment_writer.deinit();
+        self.allocator.destroy(self.segment_writer);
+        self.ual.deinit();
+        self.allocator.destroy(self.ual);
+
         if (self.shard_data_dir) |dir| {
             self.allocator.free(dir);
         }
@@ -308,6 +344,10 @@ pub const Shard = struct {
         // Clean up KV resources
         self.kv_projection.deinit();
         self.allocator.destroy(self.kv_handler);
+
+        // Clean up Raft consensus node
+        self.raft_node.deinit();
+        self.allocator.destroy(self.raft_node);
         self.allocator.destroy(self.kv_projection);
 
         // Clean up Stream resources
@@ -402,6 +442,24 @@ pub const Shard = struct {
             .shutdown => {
                 self.running = false;
             },
+            .raft_message => {
+                // Received a replicated entry from a peer node.
+                // Deserialize and apply to KV projection.
+                if (msg.payload_ptr) |ptr| {
+                    const data: [*]u8 = @ptrCast(ptr);
+                    const len = msg.payload_len;
+                    if (len > 0) {
+                        const payload = data[0..len];
+                        // Try to deserialize as a UAL entry
+                        if (entry_mod.Entry.deserialize(payload)) |entry| {
+                            // Apply to KV projection (idempotent)
+                            self.kv_projection.applyEntry(&entry) catch {};
+                        }
+                        // Free the duplicated payload
+                        self.allocator.free(payload);
+                    }
+                }
+            },
             else => {
                 // Other message types will be handled in later phases
             },
@@ -431,6 +489,9 @@ pub const Shard = struct {
 
         // Drain inbox each tick
         _ = self.drainInbox();
+
+        // Expire stale blocking-GET waiters (sends not_found to timed-out clients)
+        self.kv_handler.*.checkWaiterTimeouts(self);
 
         return events.len;
     }
@@ -583,9 +644,14 @@ pub const Shard = struct {
             const pending_before = conn.write_buf.readable();
             self.dispatchRequest(conn, req);
 
-            // If handler didn't queue any response, send a default error
+            // If handler didn't queue any response, check if it was deferred
             if (conn.write_buf.readable() == pending_before) {
-                self.sendErrorResponse(conn, req.header.request_id, .internal_error, "not implemented");
+                if (conn.response_deferred) {
+                    // Handler intentionally deferred the response (e.g. blocking GET)
+                    conn.response_deferred = false;
+                } else {
+                    self.sendErrorResponse(conn, req.header.request_id, .internal_error, "not implemented");
+                }
             }
 
             // Try to flush writes immediately
@@ -594,7 +660,7 @@ pub const Shard = struct {
     }
 
     /// Flush pending write data from a connection to the socket.
-    fn flushToClient(self: *Shard, fd: i32) void {
+    pub fn flushToClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
 
         while (conn.hasPendingWrites()) {
@@ -652,6 +718,59 @@ pub const Shard = struct {
         return self.connections.count();
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Segment Replay — recover state from .flseg files on startup
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Replay all .flseg segment files in `dir_path` into the KV projection.
+/// Tracks the maximum entry index seen for LSN restoration.
+fn replaySegments(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    kv_proj: *KVProjection,
+    max_index: *u64,
+) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |de| {
+        if (de.kind != .file) continue;
+        // Match .flseg extension
+        if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
+
+        // Build full path
+        var path_buf: [512]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, de.name }) catch continue;
+
+        // Open and read the segment file
+        const result = SegmentReader.initFromFile(allocator, full_path) catch continue;
+        defer allocator.free(result.buf);
+
+        // Iterate entries and apply to projection
+        var offset: usize = 0;
+        const data_len = result.reader.data_end - result.reader.data_start;
+        while (offset < data_len) {
+            const seg_entry = result.reader.readEntryAt(offset) orelse break;
+            const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
+
+            switch (etype) {
+                .kv_put, .kv_delete, .kv_batch => {
+                    kv_proj.applyEntry(&seg_entry) catch {};
+                },
+                else => {},
+            }
+
+            // Track max index for LSN restoration
+            if (seg_entry.header.index > max_index.*) {
+                max_index.* = seg_entry.header.index;
+            }
+
+            offset += seg_entry.totalSize();
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests

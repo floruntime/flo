@@ -309,6 +309,10 @@ pub const Connection = struct {
     /// Unique connection ID within the shard.
     id: u32,
 
+    /// Set by handlers that intentionally defer the response (e.g. blocking GET).
+    /// processRequests checks this to suppress the default "not implemented" error.
+    response_deferred: bool,
+
     pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32) !Connection {
         var read_buf = try RingBuffer.init(allocator);
         errdefer read_buf.deinit();
@@ -330,6 +334,7 @@ pub const Connection = struct {
             .last_active = now,
             .write_armed = false,
             .id = conn_id,
+            .response_deferred = false,
         };
     }
 

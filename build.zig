@@ -47,6 +47,22 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // ── Install to System PATH ──
+
+    const install_dir_option = b.option([]const u8, "install_dir", "Directory to install flo binary");
+    const default_install_dir = if (b.graph.host.result.os.tag == .macos) "/opt/homebrew/bin" else "/usr/local/bin";
+    const install_dir = install_dir_option orelse default_install_dir;
+
+    const system_install_step = b.step("install-system", "Install flo to system PATH directory (default: /usr/local/bin on Linux, /opt/homebrew/bin on macOS)");
+    const install_cmd = b.addSystemCommand(&.{ "sh", "-c" });
+    const build_root_str = b.pathFromRoot("zig-out/bin/flo");
+    const install_script = std.fmt.allocPrint(b.allocator,
+        \\mkdir -p "{s}" && cp "{s}" "{s}/flo" && chmod +x "{s}/flo" && echo "✓ Installed flo to {s}/flo"
+    , .{ install_dir, build_root_str, install_dir, install_dir, install_dir }) catch unreachable;
+    install_cmd.addArg(install_script);
+    install_cmd.step.dependOn(b.getInstallStep());
+    system_install_step.dependOn(&install_cmd.step);
+
     // ── Library Module (for tests) ──
 
     const src_module = b.createModule(.{
@@ -126,6 +142,32 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // ── Benchmarks ──
+
+    const bench_step = b.step("bench", "Build all benchmarks");
+
+    const bench_sources = [_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "bench-ual", .source = "bench/bench_ual.zig" },
+        .{ .name = "bench-kv", .source = "bench/bench_kv.zig" },
+        .{ .name = "bench-inbox", .source = "bench/bench_inbox.zig" },
+    };
+
+    for (bench_sources) |def| {
+        const bench_exe = b.addExecutable(.{
+            .name = def.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(def.source),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        bench_exe.root_module.addImport("src", src_module);
+        bench_exe.root_module.addImport("stdx", stdx_module);
+        bench_exe.linkLibC();
+        b.installArtifact(bench_exe);
+        bench_step.dependOn(&bench_exe.step);
+    }
 
     // ── Documentation ──
 
