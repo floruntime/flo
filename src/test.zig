@@ -98,4 +98,5 @@ test {
     _ = @import("cluster/partition_table.zig");
     _ = @import("cluster/forwarder.zig");
     _ = @import("cluster/gossip.zig");
+    _ = @import("cluster/membership.zig");
 }
