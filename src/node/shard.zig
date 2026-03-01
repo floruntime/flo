@@ -306,6 +306,13 @@ pub const Shard = struct {
             var max_index: u64 = replay_from;
             replaySegments(allocator, shard_dir, partition, &max_index, workflow_handler, replay_from);
 
+            // ── Step 2d: Load cold manifest (metadata only) ────────────
+            // Tells the partition what segments exist in object storage.
+            // NO data is fetched — just key→location metadata for on-demand reads.
+            const cold_dir_path = try std.fmt.allocPrint(allocator, "{s}/cold", .{shard_dir});
+            defer allocator.free(cold_dir_path);
+            partition.loadColdManifest(cold_dir_path) catch {};
+
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
                 // Advance Raft log indices past replayed data to avoid collisions

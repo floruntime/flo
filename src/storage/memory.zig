@@ -25,8 +25,9 @@ pub const ComponentId = enum(u8) {
     ts_projection = 3,
     io_buffers = 4,
     snapshot_buffer = 5,
+    warm_store = 6,
 
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 };
 
 /// Eviction callback — asks a component to free `target_bytes`, returns actual freed.
@@ -146,6 +147,7 @@ pub const MemoryController = struct {
             total / 8, // ts_projection: 12.5%
             total / 16, // io_buffers: 6.25%
             total / 32, // snapshot_buffer: 3.125%
+            total / 16, // warm_store: 6.25%
         };
     }
 
@@ -403,7 +405,7 @@ test "memory controller: peak tracking" {
 }
 
 test "memory controller: eviction triggered when budget exceeded" {
-    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100, 0 });
 
     var mock = MockProjection.init(150);
     mc.registerEviction(.kv_projection, @ptrCast(&mock), MockProjection.evict);
@@ -420,7 +422,7 @@ test "memory controller: eviction triggered when budget exceeded" {
 
 test "memory controller: reserve borrow when eviction insufficient" {
     // No eviction callback registered → goes straight to reserve
-    var mc = MemoryController.initWithBudgets(1000, .{ 100, 100, 100, 100, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 100, 100, 100, 100, 100, 100, 0 });
     // Reserve = 1000 - 600 = 400
 
     try testing.expectEqual(@as(usize, 400), mc.reserve_total);
@@ -436,7 +438,7 @@ test "memory controller: reserve borrow when eviction insufficient" {
 }
 
 test "memory controller: pressure error when reserve exhausted" {
-    var mc = MemoryController.initWithBudgets(200, .{ 50, 50, 50, 50, 0, 0 });
+    var mc = MemoryController.initWithBudgets(200, .{ 50, 50, 50, 50, 0, 0, 0 });
     // Reserve = 200 - 200 = 0
 
     try testing.expectEqual(@as(usize, 0), mc.reserve_total);
@@ -451,7 +453,7 @@ test "memory controller: pressure error when reserve exhausted" {
 }
 
 test "memory controller: checkPressure with usage reporter" {
-    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100, 0 });
 
     var mock = MockProjection.init(180); // Just below high watermark (0.85 * 200 = 170)
     mc.registerUsage(.kv_projection, @ptrCast(&mock), MockProjection.usage);
@@ -466,7 +468,7 @@ test "memory controller: checkPressure with usage reporter" {
 }
 
 test "memory controller: checkPressure no eviction below watermark" {
-    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100, 0 });
 
     var mock = MockProjection.init(100); // Well below high watermark (170)
     mc.registerUsage(.kv_projection, @ptrCast(&mock), MockProjection.usage);
@@ -498,7 +500,7 @@ test "memory controller: watermark calculations" {
 }
 
 test "memory controller: custom watermarks" {
-    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100, 0 });
 
     mc.setWatermarks(.kv_projection, 0.90, 0.60);
 
@@ -510,7 +512,7 @@ test "memory controller: custom watermarks" {
 }
 
 test "memory controller: multiple components" {
-    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100 });
+    var mc = MemoryController.initWithBudgets(1000, .{ 200, 200, 200, 200, 100, 100, 0 });
 
     try mc.requestMemory(.ual_hot, 50);
     try mc.requestMemory(.kv_projection, 75);
@@ -523,7 +525,7 @@ test "memory controller: multiple components" {
 }
 
 test "memory controller: eviction frees exact amount" {
-    var mc = MemoryController.initWithBudgets(500, .{ 100, 100, 100, 100, 50, 50 });
+    var mc = MemoryController.initWithBudgets(500, .{ 100, 100, 100, 100, 50, 50, 0 });
 
     var mock = MockProjection.init(80);
     mc.registerEviction(.ual_hot, @ptrCast(&mock), MockProjection.evict);
@@ -541,7 +543,7 @@ test "memory controller: eviction frees exact amount" {
 }
 
 test "memory controller: release more than used clamps to zero" {
-    var mc = MemoryController.initWithBudgets(500, .{ 100, 100, 100, 100, 50, 50 });
+    var mc = MemoryController.initWithBudgets(500, .{ 100, 100, 100, 100, 50, 50, 0 });
 
     try mc.requestMemory(.io_buffers, 30);
     mc.releaseMemory(.io_buffers, 100); // Release more than allocated

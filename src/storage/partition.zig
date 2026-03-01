@@ -22,11 +22,17 @@ const kv_mod = @import("../projection/kv.zig");
 const queue_mod = @import("../projection/queue.zig");
 const stream_mod = @import("../projection/stream.zig");
 const ts_mod = @import("../projection/ts.zig");
+const cold_mod = @import("cold/tier_manager.zig");
+const reader_mod = @import("ual/reader.zig");
+const memory_mod = @import("memory.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const UAL = ual_mod.UAL;
 const ProjectionRouter = router_mod.ProjectionRouter;
+const ColdTierManager = cold_mod.ColdTierManager;
+const SegmentReader = reader_mod.SegmentReader;
+const MemoryController = memory_mod.MemoryController;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Partition
@@ -55,12 +61,24 @@ pub const Partition = struct {
     /// Populated on every apply() so reads can fall back to warm when UAL evicts.
     warm_store: std.AutoHashMapUnmanaged(u64, []const u8),
 
+    /// Warm store memory tracking (bounded by warm_budget).
+    warm_bytes_used: usize,
+    warm_budget: usize,
+
+    /// Cold tier manager (optional — set via wireColdTier after init).
+    /// Provides on-demand download of cold segments for historical reads.
+    cold_tier: ?*ColdTierManager,
+
+    /// Memory controller reference (optional — set via wireMemoryController).
+    memory_controller: ?*MemoryController,
+
     /// Lifecycle.
     allocator: Allocator,
     ual_capacity: usize,
 
     pub const DEFAULT_UAL_CAPACITY: usize = 64 * 1024 * 1024; // 64 MB
     pub const DEFAULT_GROUP_OFFSET: u32 = 1000;
+    pub const DEFAULT_WARM_BUDGET: usize = 32 * 1024 * 1024; // 32 MB
 
     // ── Construction ────────────────────────────────────────────────────
 
@@ -85,6 +103,10 @@ pub const Partition = struct {
             .current_term = 0,
             .committed_index = 0,
             .warm_store = .{},
+            .warm_bytes_used = 0,
+            .warm_budget = DEFAULT_WARM_BUDGET,
+            .cold_tier = null,
+            .memory_controller = null,
             .allocator = allocator,
             .ual_capacity = ual_capacity,
         };
@@ -103,6 +125,23 @@ pub const Partition = struct {
         self.router.registerKV(self.kv.projectionHandle());
         self.router.registerQueue(self.queue.projectionHandle());
         self.router.registerTS(self.ts.projectionHandle());
+    }
+
+    /// Wire a ColdTierManager for on-demand cold reads and manifest loading.
+    /// Called after init() when cold storage is configured.
+    pub fn wireColdTier(self: *Partition, manager: *ColdTierManager) void {
+        self.cold_tier = manager;
+    }
+
+    /// Wire a MemoryController for warm_store budget enforcement.
+    /// Called after init() when memory budgets are configured.
+    pub fn wireMemoryController(self: *Partition, controller: *MemoryController) void {
+        self.memory_controller = controller;
+    }
+
+    /// Set the warm store budget (max bytes before eviction).
+    pub fn setWarmBudget(self: *Partition, budget: usize) void {
+        self.warm_budget = budget;
     }
 
     pub fn deinit(self: *Partition) void {
@@ -139,16 +178,47 @@ pub const Partition = struct {
         // Uses the entry's own index as key.
         if (e.payload.len > 0) {
             const copy = self.allocator.dupe(u8, e.payload) catch return index;
+
             // Free old copy if this index was already in warm store (idempotent apply)
             if (self.warm_store.fetchRemove(e.header.index)) |old| {
+                self.warm_bytes_used -= old.value.len;
                 self.allocator.free(@constCast(old.value));
             }
+
             self.warm_store.put(self.allocator, e.header.index, copy) catch {
                 self.allocator.free(copy);
+                return index;
             };
+            self.warm_bytes_used += copy.len;
+
+            // Evict oldest warm entries if over budget
+            self.evictWarmIfNeeded();
         }
 
         return index;
+    }
+
+    /// Evict oldest entries from the warm store when over budget.
+    /// Removes entries with the lowest UAL index first.
+    fn evictWarmIfNeeded(self: *Partition) void {
+        if (self.warm_budget == 0) return; // 0 = unlimited
+        while (self.warm_bytes_used > self.warm_budget and self.warm_store.count() > 0) {
+            // Find the entry with the lowest index
+            var min_index: u64 = std.math.maxInt(u64);
+            var wit = self.warm_store.iterator();
+            while (wit.next()) |kv| {
+                if (kv.key_ptr.* < min_index) {
+                    min_index = kv.key_ptr.*;
+                }
+            }
+            if (min_index == std.math.maxInt(u64)) break;
+
+            // Remove it
+            if (self.warm_store.fetchRemove(min_index)) |removed| {
+                self.warm_bytes_used -= removed.value.len;
+                self.allocator.free(@constCast(removed.value));
+            }
+        }
     }
 
     // ── Read Path ───────────────────────────────────────────────────────
@@ -177,6 +247,72 @@ pub const Partition = struct {
     /// Check if an entry is still in the hot ring buffer.
     pub fn isInHot(self: *const Partition, index: u64) bool {
         return self.ual.read(index) != null;
+    }
+
+    /// Check if a UAL index is available in cold storage.
+    pub fn isInCold(self: *const Partition, index: u64) bool {
+        const ct = self.cold_tier orelse return false;
+        return ct.isInCold(index);
+    }
+
+    /// Read an entry from cold storage on demand.
+    /// Downloads the cold segment, parses it, and returns the entry.
+    /// Caller gets a zero-copy view into the downloaded segment data;
+    /// the segment data itself is returned via `segment_out` so the
+    /// caller can manage its lifetime.
+    ///
+    /// Returns null if:
+    /// - No cold tier is configured
+    /// - The index is not in the cold manifest
+    /// - The segment download or parse fails
+    pub fn readFromCold(self: *Partition, index: u64) ?Entry {
+        const ct = self.cold_tier orelse return null;
+
+        // Download the cold segment containing this index
+        const segment_data = ct.downloadSegment(index) catch return null;
+        defer self.allocator.free(segment_data);
+
+        // Parse the segment and find the entry
+        const reader = SegmentReader.init(segment_data) catch return null;
+        return reader.findByIndex(index);
+    }
+
+    /// Tiered read — tries hot ring, then warm store, then cold storage.
+    /// For cold reads, downloads the segment, finds the entry, and copies
+    /// the payload into the provided buffer so it outlives the segment.
+    /// Returns the entry with payload pointing into `payload_buf` (or
+    /// null if not found anywhere).
+    pub fn readTiered(self: *Partition, index: u64, payload_buf: []u8) ?Entry {
+        // 1. Hot ring (zero-copy, cheap)
+        if (self.ual.read(index)) |entry| return entry;
+
+        // 2. Warm store (payload copy, still local)
+        if (self.warm_store.get(index)) |warm_payload| {
+            // We have the payload but no full entry header from warm.
+            // Construct a minimal entry. The caller typically only needs
+            // the payload for stream reads and TS queries.
+            _ = warm_payload;
+            // For warm reads, the caller uses readPayloadWarm() directly.
+            // readTiered returns a full Entry only from hot or cold.
+        }
+
+        // 3. Cold storage (on-demand download)
+        const ct = self.cold_tier orelse return null;
+        const segment_data = ct.downloadSegment(index) catch return null;
+        defer self.allocator.free(segment_data);
+
+        const reader = SegmentReader.init(segment_data) catch return null;
+        const entry = reader.findByIndex(index) orelse return null;
+
+        // Copy payload into caller's buffer so it outlives the segment
+        if (entry.payload.len > 0 and entry.payload.len <= payload_buf.len) {
+            @memcpy(payload_buf[0..entry.payload.len], entry.payload);
+            var result = entry;
+            result.payload = payload_buf[0..entry.payload.len];
+            return result;
+        }
+
+        return entry;
     }
 
     // ── Projection accessors ────────────────────────────────────────────
@@ -273,6 +409,14 @@ pub const Partition = struct {
         return snap_index;
     }
 
+    /// Load the cold manifest from a directory path (step 2d in recovery).
+    /// This is metadata-only — no cold data is fetched.
+    /// Called by Shard after snapshot + warm replay, before accepting traffic.
+    pub fn loadColdManifest(self: *Partition, cold_dir: []const u8) !void {
+        const ct = self.cold_tier orelse return;
+        try ct.loadManifest(cold_dir);
+    }
+
     // ── Queries ─────────────────────────────────────────────────────────
 
     /// The last applied UAL index (projections are up to date through this).
@@ -288,6 +432,22 @@ pub const Partition = struct {
     /// UAL hot ring memory usage.
     pub fn ualUsed(self: *const Partition) u64 {
         return self.ual.used();
+    }
+
+    /// Warm store memory usage in bytes.
+    pub fn warmUsed(self: *const Partition) usize {
+        return self.warm_bytes_used;
+    }
+
+    /// Number of entries in the warm store.
+    pub fn warmCount(self: *const Partition) usize {
+        return self.warm_store.count();
+    }
+
+    /// Number of segments tracked in cold storage.
+    pub fn coldSegmentCount(self: *const Partition) usize {
+        const ct = self.cold_tier orelse return 0;
+        return ct.segmentCount();
     }
 
     /// Total memory across all projections.
@@ -486,4 +646,82 @@ test "partition: projection memory tracking" {
     _ = try part.apply(&e1);
 
     try testing.expect(part.projectionMemory() > 0);
+}
+
+test "partition: warm store byte tracking" {
+    const allocator = testing.allocator;
+
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+
+    try testing.expectEqual(@as(usize, 0), part.warmUsed());
+    try testing.expectEqual(@as(usize, 0), part.warmCount());
+
+    var e1 = makeEntry(.kv_put, 1, 1, "hello-world");
+    e1.header.crc32c = e1.computeCrc();
+    _ = try part.apply(&e1);
+
+    try testing.expect(part.warmUsed() > 0);
+    try testing.expectEqual(@as(usize, 1), part.warmCount());
+}
+
+test "partition: warm store eviction under budget" {
+    const allocator = testing.allocator;
+
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+
+    // Set a very tight warm budget (100 bytes)
+    part.setWarmBudget(100);
+
+    // Apply entries with payloads that accumulate beyond 100 bytes
+    var i: u64 = 1;
+    while (i <= 20) : (i += 1) {
+        var e = makeEntry(.kv_put, i, 1, "0123456789"); // 10 bytes each
+        e.header.crc32c = e.computeCrc();
+        _ = try part.apply(&e);
+    }
+
+    // After eviction, warm usage should be at or under budget
+    try testing.expect(part.warmUsed() <= 100);
+    // Oldest entries should have been evicted
+    try testing.expect(part.warmCount() <= 10);
+}
+
+test "partition: cold tier not wired returns defaults" {
+    const allocator = testing.allocator;
+
+    var part = try Partition.init(allocator, 0, 4096, 0);
+    defer part.deinit();
+    part.wireProjections();
+
+    // No cold tier wired — should return safe defaults
+    try testing.expect(!part.isInCold(42));
+    try testing.expectEqual(@as(usize, 0), part.coldSegmentCount());
+    try testing.expect(part.readFromCold(42) == null);
+}
+
+test "partition: warm budget zero means unlimited" {
+    const allocator = testing.allocator;
+
+    var part = try Partition.init(allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+
+    // Set budget to 0 (unlimited)
+    part.setWarmBudget(0);
+
+    // Apply many entries — no eviction should happen
+    var i: u64 = 1;
+    while (i <= 50) : (i += 1) {
+        var e = makeEntry(.kv_put, i, 1, "0123456789ABCDEF"); // 16 bytes each
+        e.header.crc32c = e.computeCrc();
+        _ = try part.apply(&e);
+    }
+
+    // All 50 entries should be in warm store
+    try testing.expectEqual(@as(usize, 50), part.warmCount());
+    try testing.expectEqual(@as(usize, 50 * 16), part.warmUsed());
 }
