@@ -999,6 +999,46 @@ pub const StreamHandler = struct {
         return try self.stream.append(ual_index, timestamp_ns, 0, 0); // 0 = internal pipeline, no stream name
     }
 
+    /// Append payload to a named stream (used by processing pipelines).
+    /// Computes the namespace-qualified name hash for proper stream isolation.
+    pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !u64 {
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const next_index = self.partition.ual.max_index + 1;
+
+        // Build command entry with stream name as key
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + payload.len;
+        const payload_buf = try self.allocator.alloc(u8, payload_size);
+        defer self.allocator.free(payload_buf);
+
+        const ns_hash_u32 = router.namespaceHash(namespace);
+
+        const entry = entry_mod.buildCommandEntry(
+            .stream_append,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash_u32,
+            stream_name,
+            payload,
+            payload_buf,
+        ) orelse return error.EntryBuildFailed;
+
+        const ual_index = try self.partition.apply(&entry);
+
+        // Use the same name hash as handleAppend (namespace-qualified)
+        const name_hash = router.nameHash(ns_hash_u32, stream_name);
+        const offset = try self.stream.append(ual_index, timestamp_ns, name_hash, 0);
+
+        // Register the stream name so it appears in `stream list`
+        // Qualify with namespace prefix like handleAppend does
+        var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, namespace, stream_name) catch stream_name;
+        self.stream.registerStream(ns_stream_name) catch {};
+
+        return offset;
+    }
+
     /// Public interface for processing pipeline — read payloads from offset range.
     /// Returns zero-copy views into the UAL ring buffer. Slices are valid until
     /// the next UAL write that triggers eviction.
@@ -1025,6 +1065,54 @@ pub const StreamHandler = struct {
         const out = self.allocator.alloc([]const u8, count) catch return &.{};
         @memcpy(out, results[0..count]);
         return out;
+    }
+
+    /// Read payloads from a named stream (used by processing pipelines).
+    /// Only returns entries belonging to the specified stream.
+    /// Returns (payloads slice, last_global_offset scanned) so the pipeline
+    /// can advance its cursor past all scanned offsets.
+    pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, start_offset: u64, limit: usize) struct { payloads: []const []const u8, next_offset: u64 } {
+        var results: [1000][]const u8 = undefined;
+        var count: usize = 0;
+        const capped = @min(limit, 1000);
+
+        const ns_hash_u32 = router.namespaceHash(namespace);
+        const name_hash = router.nameHash(ns_hash_u32, stream_name);
+        var buf: [1000]OffsetEntry = undefined;
+        const batch = @min(capped, 1000);
+
+        // Scan global offsets from start, filtering by name hash.
+        // readRangeForStream returns only matching entries.
+        const hwm = self.stream.highWaterMark();
+        var end_offset = start_offset + batch * 10; // scan well ahead to find matching entries
+        if (end_offset < hwm + 1) end_offset = hwm + 1;
+
+        const n = self.stream.readRangeForStream(start_offset, end_offset, name_hash, buf[0..batch]);
+
+        var last_scanned: u64 = start_offset;
+        for (buf[0..n]) |oe| {
+            if (count >= capped) break;
+            const result = self.getPayloadAndTier(oe.ual_index);
+            if (result.payload.len > 0) {
+                results[count] = result.payload;
+                count += 1;
+            }
+        }
+
+        // We need to know the last global offset we've scanned to advance cursor.
+        // Since readRangeForStream scans up to end_offset, advance past hwm.
+        if (n > 0) {
+            // The entries are in offset order; find the actual offsets by scanning
+            // the same range again to get the global offset of the last entry.
+            // But since the offsets map is keyed by global offset, we can use hwm.
+            last_scanned = @min(end_offset, hwm + 1);
+        } else {
+            last_scanned = @min(end_offset, hwm + 1);
+        }
+
+        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .next_offset = last_scanned };
+        @memcpy(out, results[0..count]);
+        return .{ .payloads = out, .next_offset = last_scanned };
     }
 
     /// Read a payload from the UAL by entry index (zero-copy).

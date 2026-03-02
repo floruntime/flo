@@ -263,10 +263,12 @@ pub const ActionsHandler = struct {
         var ver_buf: [12]u8 = undefined;
         const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{version}) catch "1";
 
-        return .{ .action_registered = .{
-            .name = name, // req-owned, same lifetime as request
-            .version = ver_str,
-        } };
+        return .{
+            .action_registered = .{
+                .name = name, // req-owned, same lifetime as request
+                .version = ver_str,
+            },
+        };
     }
 
     // ── INVOKE ──────────────────────────────────────────────────────────
@@ -322,10 +324,12 @@ pub const ActionsHandler = struct {
             }
         }
 
-        return .{ .action_invoked = .{
-            .run_id = owned_run_id, // points to heap-owned copy in runs map
-            .queue_position = @intCast(self.runs.count()),
-        } };
+        return .{
+            .action_invoked = .{
+                .run_id = owned_run_id, // points to heap-owned copy in runs map
+                .queue_position = @intCast(self.runs.count()),
+            },
+        };
     }
 
     /// Execute a WASM action inline. Updates the run record with the result.
