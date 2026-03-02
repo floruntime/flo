@@ -90,6 +90,47 @@ test {
     _ = @import("processing/operator.zig");
     _ = @import("processing/collector.zig");
     _ = @import("processing/context.zig");
+    // Processing: topology & chain
+    _ = @import("processing/topology.zig");
+    _ = @import("processing/chain.zig");
+    // Processing: endpoints
+    _ = @import("processing/endpoints/source.zig");
+    _ = @import("processing/endpoints/sink.zig");
+    // Processing: keyed state
+    _ = @import("processing/state.zig");
+    _ = @import("processing/keys.zig");
+    // Processing: declarative operators
+    _ = @import("processing/operators/expr_filter.zig");
+    _ = @import("processing/operators/passthrough.zig");
+    _ = @import("processing/operators/json_keyby.zig");
+    _ = @import("processing/operators/json_aggregate.zig");
+    _ = @import("processing/operators/json_map.zig");
+    _ = @import("processing/operators/json_flatmap.zig");
+    _ = @import("processing/operators/native_registry.zig");
+    // Processing: windowing
+    _ = @import("processing/window/assigner.zig");
+    _ = @import("processing/window/trigger.zig");
+    _ = @import("processing/window/function.zig");
+    _ = @import("processing/window/operator.zig");
+    _ = @import("processing/window/session.zig");
+    _ = @import("processing/window/lateness.zig");
+    // Processing: time
+    _ = @import("processing/time/watermark.zig");
+    _ = @import("processing/time/tracker.zig");
+    _ = @import("processing/time/timer.zig");
+    // Processing: checkpointing
+    _ = @import("processing/checkpoint/storage.zig");
+    _ = @import("processing/checkpoint/offsets.zig");
+    _ = @import("processing/checkpoint/snapshot.zig");
+    _ = @import("processing/checkpoint/coordinator.zig");
+    _ = @import("processing/checkpoint/alignment.zig");
+    _ = @import("processing/checkpoint/recovery.zig");
+    // Processing: side outputs & metrics
+    _ = @import("processing/side_output.zig");
+    _ = @import("processing/metrics.zig");
+    // Processing: definition & parser
+    _ = @import("processing/definition.zig");
+    _ = @import("processing/parser.zig");
 }
 
 // Dashboard — Phase 6.1

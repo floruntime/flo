@@ -17,6 +17,9 @@ const Allocator = std.mem.Allocator;
 const OutputCollector = @import("collector.zig").OutputCollector;
 const record_mod = @import("record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
+const KeyedStateAccess = @import("state.zig").KeyedStateAccess;
+const TimerService = @import("time/timer.zig").TimerService;
+const SideOutputManager = @import("side_output.zig").SideOutputManager;
 
 // =============================================================================
 // OperatorMetrics - Per-operator counters
@@ -67,9 +70,13 @@ pub const OperatorContext = struct {
     /// Operator name (for logging/debugging)
     operator_name: []const u8,
 
-    // Phase 2+ fields (keyed state, timers, side outputs) will be added
-    // when the corresponding modules are ported. These are nullable optional
-    // fields on the operator interface — callers check before use.
+    // Phase 2+ optional fields — callers check before use
+    /// Keyed state access (for stateful operators)
+    keyed_state: ?*KeyedStateAccess = null,
+    /// Timer service (for event-time / processing-time timers)
+    timer_service: ?*TimerService = null,
+    /// Side output manager (for branching pipelines)
+    side_outputs: ?*SideOutputManager = null,
 
     /// Convenience: emit a record downstream
     pub fn emit(self: *OperatorContext, rec: ProcessingRecord) !void {
@@ -89,6 +96,21 @@ pub const OperatorContext = struct {
     /// Get current watermark
     pub fn watermark(self: *const OperatorContext) i64 {
         return self.current_watermark_ms;
+    }
+
+    /// Get keyed state access (returns null if operator is stateless)
+    pub fn getKeyedState(self: *OperatorContext) ?*KeyedStateAccess {
+        return self.keyed_state;
+    }
+
+    /// Get timer service (returns null if timers not configured)
+    pub fn getTimerService(self: *OperatorContext) ?*TimerService {
+        return self.timer_service;
+    }
+
+    /// Get side output manager (returns null if no side outputs)
+    pub fn getSideOutputs(self: *OperatorContext) ?*SideOutputManager {
+        return self.side_outputs;
     }
 };
 
