@@ -38,11 +38,15 @@ const Inbox = @import("inbox.zig").Inbox;
 const InboxMessage = @import("inbox.zig").Message;
 const Dispatcher = @import("dispatcher.zig").Dispatcher;
 const Connection = @import("connection.zig").Connection;
+const connection_mod = @import("connection.zig");
 const RingBuffer = @import("connection.zig").RingBuffer;
 const Router = @import("router.zig").Router;
 const node_router = @import("router.zig");
 const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
+const resp_mod = @import("../protocol/resp.zig");
+const result_mod = @import("../protocol/result.zig");
+const CommandResult = result_mod.CommandResult;
 const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const StreamProjection = @import("../projection/stream.zig").StreamProjection;
@@ -855,8 +859,16 @@ pub const Shard = struct {
         // Accumulate data in the read buffer
         _ = conn.read_buf.write(tmp_buf[0..n]);
 
-        // Process complete requests
-        self.processRequests(fd, conn);
+        // Detect protocol on first data if not yet determined
+        if (conn.protocol == .unknown) {
+            conn.detectAndSetProtocol();
+        }
+
+        // Dispatch based on protocol
+        switch (conn.protocol) {
+            .resp => self.processRespRequests(fd, conn),
+            else => self.processRequests(fd, conn),
+        }
     }
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.
@@ -919,6 +931,171 @@ pub const Shard = struct {
 
             // Try to flush writes immediately
             self.flushToClient(fd);
+        }
+    }
+
+    // ─── RESP Protocol Handler ──────────────────────────────────────────
+
+    /// Process RESP (Redis protocol) requests from a connection's read buffer.
+    /// Parses RESP commands, translates to Flo operations, executes directly
+    /// via the appropriate handler, and serializes responses back to RESP.
+    fn processRespRequests(self: *Shard, fd: i32, conn: *Connection) void {
+        var resp_parser = resp_mod.Parser.init(self.allocator);
+        defer resp_parser.deinit();
+
+        while (conn.read_buf.readable() > 0) {
+            // Peek all available data without consuming
+            const available = conn.read_buf.readable();
+            var parse_buf: [MAX_REQUEST_SIZE]u8 = undefined;
+            const to_copy = @min(available, MAX_REQUEST_SIZE);
+            const copied = conn.read_buf.read(parse_buf[0..to_copy]);
+            if (copied == 0) break;
+
+            // Try to parse a complete RESP value
+            const parsed = resp_parser.parse(parse_buf[0..copied]) catch {
+                // Parse error — send RESP error and close
+                _ = conn.read_buf.write(parse_buf[0..copied]);
+                _ = conn.queueWrite("-ERR invalid RESP data\r\n");
+                self.flushToClient(fd);
+                self.closeConnection(fd);
+                return;
+            };
+
+            if (parsed == null) {
+                // Incomplete — put data back and wait for more
+                _ = conn.read_buf.write(parse_buf[0..copied]);
+                break;
+            }
+
+            const result = parsed.?;
+            var resp_value = result.value;
+            const consumed = result.consumed;
+
+            // Put back unconsumed bytes
+            if (copied > consumed) {
+                _ = conn.read_buf.write(parse_buf[consumed..copied]);
+            }
+
+            defer resp_mod.freeValue(self.allocator, &resp_value);
+
+            // Get session namespace (default "default")
+            const namespace = conn.namespace orelse "default";
+
+            // Translate RESP command to Flo operation
+            const translate_result = resp_mod.translateCommand(self.allocator, resp_value, namespace) catch |err| {
+                switch (err) {
+                    error.UnknownCommand => {
+                        _ = conn.queueWrite("-ERR unknown command\r\n");
+                    },
+                    else => {
+                        _ = conn.queueWrite("-ERR invalid command\r\n");
+                    },
+                }
+                self.flushToClient(fd);
+                resp_parser.reset();
+                continue;
+            };
+
+            switch (translate_result) {
+                .use_namespace => |u| {
+                    conn.namespace = u.namespace;
+                    _ = conn.queueWrite("+OK\r\n");
+                },
+                .select_db => {
+                    // Redis SELECT — acknowledge silently
+                    _ = conn.queueWrite("+OK\r\n");
+                },
+                .command => |cmd| {
+                    self.executeRespCommand(conn, cmd);
+                },
+            }
+
+            self.flushToClient(fd);
+            resp_parser.reset();
+        }
+    }
+
+    /// Execute a translated RESP command through the appropriate handler
+    /// and queue the RESP-formatted response.
+    fn executeRespCommand(self: *Shard, conn: *Connection, cmd: resp_mod.RespCommand) void {
+        // Build a proto.Request from the RESP command
+        const req = proto.Request{
+            .header = .{
+                .magic = proto.MAGIC,
+                .payload_length = 0,
+                .request_id = conn.requests_total,
+                .crc32 = 0,
+                .version = proto.VERSION,
+                .op_code = @intFromEnum(cmd.opcode),
+                .flags = 0,
+                .reserved = 0,
+            },
+            .namespace = cmd.namespace,
+            .key = cmd.key,
+            .value = cmd.value,
+            .options = "",
+        };
+
+        conn.requests_total += 1;
+
+        // Dispatch to the appropriate handler and get CommandResult
+        const cmd_result = self.handleRespOpcode(cmd.opcode, req);
+
+        // Translate CommandResult → RESP and serialize
+        const resp_value = resp_mod.translateResult(cmd_result);
+        const response_bytes = resp_mod.serialize(self.allocator, resp_value) catch {
+            _ = conn.queueWrite("-ERR internal error\r\n");
+            return;
+        };
+        defer self.allocator.free(response_bytes);
+
+        _ = conn.queueWrite(response_bytes);
+
+        // Free any heap-allocated fields from translateCommand
+        self.freeRespCommand(cmd);
+    }
+
+    /// Route a RESP opcode to the appropriate handler, returning a CommandResult.
+    fn handleRespOpcode(self: *Shard, opcode: proto.OpCode, req: proto.Request) CommandResult {
+        return switch (opcode) {
+            .ping => .pong,
+            .kv_get => self.kv_handler.handleCommand(req),
+            .kv_put => self.kv_handler.handleCommand(req),
+            .kv_delete => self.kv_handler.handleCommand(req),
+            .stream_append => self.stream_handler.handleCommand(req),
+            .stream_read => self.stream_handler.handleCommand(req),
+            .queue_enqueue => self.queue_handler.handleCommand(req),
+            .queue_dequeue => self.queue_handler.handleCommand(req),
+            else => .{ .err = .{ .code = .invalid_request, .message = "unsupported RESP command" } },
+        };
+    }
+
+    /// Free heap-allocated fields from a translated RESP command.
+    /// Only frees key/value if they were heap-allocated (non-empty, since
+    /// translateCommand uses allocator.dupe for non-empty strings).
+    fn freeRespCommand(self: *Shard, cmd: resp_mod.RespCommand) void {
+        // translateCommand allocates via dupe — these are heap slices.
+        // Empty strings are literal "" (not heap allocated).
+        switch (cmd.opcode) {
+            .ping => {}, // key="" value="" — literals
+            .kv_get, .kv_delete, .queue_dequeue => {
+                // key is duped, value is literal ""
+                if (cmd.key.len > 0) self.allocator.free(cmd.key);
+            },
+            .kv_put, .stream_append, .queue_enqueue => {
+                // Both key and value are duped
+                if (cmd.key.len > 0) self.allocator.free(cmd.key);
+                if (cmd.value.len > 0) self.allocator.free(cmd.value);
+            },
+            .stream_read => {
+                // key is duped, value is literal ""
+                if (cmd.key.len > 0) self.allocator.free(cmd.key);
+            },
+            else => {
+                // Conservative: try to free both if non-empty
+                if (cmd.key.len > 0) self.allocator.free(cmd.key);
+                if (cmd.value.len > 0) self.allocator.free(cmd.value);
+            },
         }
     }
 
