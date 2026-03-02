@@ -476,6 +476,84 @@ pub const TSProjection = struct {
         return total;
     }
 
+    // ─── Delete / Retention ────────────────────────────────────────────────
+
+    /// Delete all data for a measurement (all fields).
+    /// Returns the number of series removed.
+    pub fn deleteMeasurement(self: *TSProjection, measurement: []const u8) usize {
+        var removed: usize = 0;
+
+        // Delete matching write buffers
+        var bit = self.buffers.iterator();
+        while (bit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            // Series key format: "measurement\x00field_name"
+            if (std.mem.indexOfScalar(u8, key, 0)) |sep| {
+                if (std.mem.eql(u8, key[0..sep], measurement)) {
+                    kv.value_ptr.deinit();
+                    self.allocator.free(@constCast(key));
+                    self.buffers.removeByPtr(kv.key_ptr);
+                    removed += 1;
+                }
+            }
+        }
+
+        // Delete matching blocks
+        var blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (std.mem.indexOfScalar(u8, key, 0)) |sep| {
+                if (std.mem.eql(u8, key[0..sep], measurement)) {
+                    kv.value_ptr.deinit(self.allocator);
+                    self.allocator.free(@constCast(key));
+                    self.blocks.removeByPtr(kv.key_ptr);
+                }
+            }
+        }
+
+        return removed;
+    }
+
+    /// Apply a retention policy: remove all points older than `cutoff_ns`.
+    /// Returns the number of points evicted across all series.
+    pub fn applyRetention(self: *TSProjection, cutoff_ns: u64) usize {
+        var evicted: usize = 0;
+
+        // Evict from write buffers
+        var bit = self.buffers.iterator();
+        while (bit.next()) |kv| {
+            const buf = kv.value_ptr;
+            var write_idx: usize = 0;
+            for (buf.points.items) |pt| {
+                if (pt.timestamp_ns >= cutoff_ns) {
+                    buf.points.items[write_idx] = pt;
+                    write_idx += 1;
+                } else {
+                    evicted += 1;
+                }
+            }
+            buf.points.shrinkRetainingCapacity(write_idx);
+        }
+
+        // Evict old blocks (entire blocks where max_timestamp < cutoff)
+        var blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            const block_list = kv.value_ptr;
+            var write_idx: usize = 0;
+            for (block_list.items) |block| {
+                if (block.max_timestamp_ns >= cutoff_ns) {
+                    block_list.items[write_idx] = block;
+                    write_idx += 1;
+                } else {
+                    evicted += block.point_count;
+                }
+            }
+            block_list.shrinkRetainingCapacity(write_idx);
+        }
+
+        return evicted;
+    }
+
     // ─── UAL Entry application ─────────────────────────────────────────────
 
     pub fn applyEntry(self: *TSProjection, ual_entry: *const Entry) !void {

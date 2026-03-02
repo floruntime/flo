@@ -27,6 +27,12 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 
+// FloQL pipeline
+const floql_parser = @import("floql/parser.zig");
+const floql_executor = @import("floql/executor.zig");
+const floql_ast = @import("floql/ast.zig");
+const ss_mod = @import("floql/series_set.zig");
+
 const CommandResult = result_mod.CommandResult;
 const TSProjection = ts_mod.TSProjection;
 const StoredPoint = ts_mod.StoredPoint;
@@ -263,11 +269,100 @@ pub const TSHandler = struct {
     // ── FLOQL ───────────────────────────────────────────────────────────
 
     fn handleFloQL(self: *TSHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // FloQL execution is wired through the existing parser + executor (KEEP files).
-        // Full integration requires cross-module wiring — stub for now.
-        return .{ .err = .{ .code = .invalid_request, .message = "floql not yet wired" } };
+        // FloQL query string is carried in req.value (key is empty).
+        const query_str = if (req.value.len > 0) req.value else {
+            return .{ .err = .{ .code = .invalid_request, .message = "floql query string is required" } };
+        };
+
+        // 1. Parse the FloQL query
+        var query = floql_parser.Parser.parse(query_str, self.allocator) catch {
+            return .{ .err = .{ .code = .invalid_request, .message = "floql parse error" } };
+        };
+        defer query.deinit(self.allocator);
+
+        // 2. Resolve source: query.source → measurement + time range → StoredPoint[]
+        const measurement = query.source.measurement;
+        if (measurement.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "floql: measurement name is required" } };
+        }
+
+        // Resolve time range
+        const now_ms: i64 = std.time.milliTimestamp();
+        var from_ns: u64 = 0;
+        var to_ns: u64 = std.math.maxInt(u64);
+        if (query.source.range.duration_ms > 0) {
+            const from_ms = now_ms - query.source.range.duration_ms;
+            from_ns = if (from_ms > 0) @intCast(@as(u64, @bitCast(from_ms)) * 1_000_000) else 0;
+            to_ns = @intCast(@as(u64, @bitCast(now_ms)) * 1_000_000);
+        } else if (query.source.range.from_ms > 0) {
+            from_ns = @intCast(@as(u64, @bitCast(query.source.range.from_ms)) * 1_000_000);
+            if (query.source.range.to_ms > 0) {
+                to_ns = @intCast(@as(u64, @bitCast(query.source.range.to_ms)) * 1_000_000);
+            }
+        }
+
+        // Resolve field: from field() stage (if present), default to "value"
+        var field_name: []const u8 = "value";
+        for (query.stages) |stage| {
+            switch (stage) {
+                .field => |f| {
+                    field_name = f.name;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        // 3. Query the TSProjection for raw points
+        var point_buf: [4096]StoredPoint = undefined;
+        const qr = self.ts.queryRange(measurement, field_name, from_ns, to_ns, &point_buf) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
+        };
+
+        // 4. Convert StoredPoint[] → SeriesSet (initial pipeline input)
+        const count_pts = qr.points_in_buffer;
+        var dp_slice = self.allocator.alloc(ss_mod.DataPoint, count_pts) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "floql: out of memory" } };
+        };
+        for (point_buf[0..count_pts], 0..) |sp, i| {
+            dp_slice[i] = .{
+                .timestamp_ms = @intCast(sp.timestamp_ns / 1_000_000),
+                .value = sp.field_value,
+            };
+        }
+
+        var series_slice = self.allocator.alloc(ss_mod.Series, 1) catch {
+            self.allocator.free(dp_slice);
+            return .{ .err = .{ .code = .internal_error, .message = "floql: out of memory" } };
+        };
+        series_slice[0] = .{
+            .key = measurement,
+            .field = field_name,
+            .points = dp_slice,
+        };
+
+        var initial = ss_mod.SeriesSet.fromOwned(self.allocator, series_slice);
+
+        // 5. Execute the pipeline stages
+        // Note: execute() returns the input unchanged (same pointer) when pipeline is empty.
+        // When pipeline has stages, it returns a new SeriesSet and does NOT free initial.
+        var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch {
+            initial.deinit();
+            return .{ .err = .{ .code = .internal_error, .message = "floql: execution failed" } };
+        };
+        defer result_set.deinit();
+
+        // If pipeline had stages, initial is a separate allocation — free it
+        if (query.stages.len > 0) {
+            initial.deinit();
+        }
+
+        // 6. Encode SeriesSet → wire bytes
+        const encoded = result_set.encode(self.allocator) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "floql: encoding failed" } };
+        };
+
+        return .{ .ts_floql_result = .{ .data = encoded } };
     }
 
     // ── LIST ────────────────────────────────────────────────────────────
@@ -293,19 +388,38 @@ pub const TSHandler = struct {
     // ── DELETE ───────────────────────────────────────────────────────────
 
     fn handleDelete(self: *TSHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // Delete requires removing series from the projection — not yet in API
-        return .{ .err = .{ .code = .invalid_request, .message = "ts delete not yet implemented" } };
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
+        }
+
+        const removed = self.ts.deleteMeasurement(req.key);
+        _ = removed;
+        return .ok;
     }
 
     // ── RETENTION ───────────────────────────────────────────────────────
 
     fn handleRetention(self: *TSHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // Retention policy management — not yet implemented
-        return .{ .err = .{ .code = .invalid_request, .message = "ts retention not yet implemented" } };
+        // Retention policy: key = measurement (empty = all), value = duration string e.g. "7d"
+        // Parse retention duration from value
+        if (req.value.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "retention duration is required (e.g. '7d', '24h')" } };
+        }
+
+        const duration_ms = floql_ast.parseDuration(req.value) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "invalid retention duration" } };
+        };
+
+        const now_ms = std.time.milliTimestamp();
+        const cutoff_ms = now_ms - duration_ms;
+        const cutoff_ns: u64 = if (cutoff_ms > 0)
+            @intCast(@as(u64, @bitCast(cutoff_ms)) * 1_000_000)
+        else
+            0;
+
+        const evicted = self.ts.applyRetention(cutoff_ns);
+        _ = evicted;
+        return .ok;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -325,6 +439,7 @@ pub const TSHandler = struct {
             .ts_read_result => |r| self.allocator.free(r.data),
             .ts_query_result => |r| self.allocator.free(r.data),
             .ts_list_result => |r| self.allocator.free(r.data),
+            .ts_floql_result => |r| self.allocator.free(r.data),
             else => {},
         }
     }
@@ -364,6 +479,9 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, r.data);
         },
         .ts_list_result => |r| {
+            shard.sendOkResponse(conn, request_id, r.data);
+        },
+        .ts_floql_result => |r| {
             shard.sendOkResponse(conn, request_id, r.data);
         },
         else => {
@@ -791,4 +909,176 @@ test "ts handler: freeResult non-heap-allocated is no-op" {
     // ok result should be safe to free (no-op)
     handler.freeResult(.ok);
     handler.freeResult(.{ .err = .{ .code = .invalid_request, .message = "test" } });
+}
+
+test "ts handler: floql basic pipeline" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    // Write data points
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "10.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "20.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "30.0", ""));
+
+    // Execute FloQL query: get all points from cpu in a large time range
+    const result = handler.handleCommand(makeRequest(.ts_floql, "", "cpu[24h]", ""));
+    switch (result) {
+        .ts_floql_result => |r| {
+            defer handler.freeResult(result);
+            // Should have encoded SeriesSet with 1 series, 3 points
+            const series_count = std.mem.readInt(u32, r.data[0..4], .little);
+            try testing.expectEqual(@as(u32, 1), series_count);
+        },
+        .err => |e| {
+            std.debug.print("FloQL error: {s}\n", .{e.message});
+            return error.TestUnexpectedResult;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: floql empty query" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const result = handler.handleCommand(makeRequest(.ts_floql, "", "", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: floql invalid syntax" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const result = handler.handleCommand(makeRequest(.ts_floql, "", "|||bad", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: floql with pipeline stages" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    // Write some data
+    for (0..6) |i| {
+        var val_buf: [32]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&val_buf, "{d}.0", .{(i + 1) * 10}) catch unreachable;
+        _ = handler.handleCommand(makeRequest(.ts_write, "mem", val_str, ""));
+    }
+
+    // Execute: mem[24h] | where(> 30)
+    const result = handler.handleCommand(makeRequest(.ts_floql, "", "mem[24h] | where(> 30)", ""));
+    switch (result) {
+        .ts_floql_result => |r| {
+            defer handler.freeResult(result);
+            const series_count = std.mem.readInt(u32, r.data[0..4], .little);
+            try testing.expectEqual(@as(u32, 1), series_count);
+        },
+        .err => |e| {
+            std.debug.print("FloQL pipeline error: {s}\n", .{e.message});
+            return error.TestUnexpectedResult;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: delete measurement" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "10.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "20.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "memory", "30.0", ""));
+
+    try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
+
+    // Delete cpu measurement
+    const del_result = handler.handleCommand(makeRequest(.ts_delete, "cpu", "", ""));
+    switch (del_result) {
+        .ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // cpu should be gone
+    const read_result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", ""));
+    switch (read_result) {
+        .ts_read_result => |r| {
+            defer handler.freeResult(read_result);
+            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
+            try testing.expectEqual(@as(u32, 0), count_pts);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // memory should still exist
+    const mem_result = handler.handleCommand(makeRequest(.ts_read, "memory", "", ""));
+    switch (mem_result) {
+        .ts_read_result => |r| {
+            defer handler.freeResult(mem_result);
+            const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
+            try testing.expectEqual(@as(u32, 1), count_pts);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: delete empty measurement" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const result = handler.handleCommand(makeRequest(.ts_delete, "", "", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: retention empty duration" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const result = handler.handleCommand(makeRequest(.ts_retention, "", "", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: retention invalid duration" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const result = handler.handleCommand(makeRequest(.ts_retention, "", "bad", ""));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
 }
