@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
+const definition = @import("definition.zig");
 const validator = @import("validator.zig");
 
 const shard_mod = @import("../node/shard.zig");
@@ -73,19 +74,28 @@ pub const WorkflowHandler = struct {
     pub const RunStatus = enum(u8) {
         pending = 0,
         running = 1,
-        completed = 2,
-        failed = 3,
-        cancelled = 4,
-        timed_out = 5,
+        waiting = 2,
+        completed = 3,
+        failed = 4,
+        cancelled = 5,
+        timed_out = 6,
 
         pub fn toString(self: RunStatus) []const u8 {
             return switch (self) {
                 .pending => "pending",
                 .running => "running",
+                .waiting => "waiting",
                 .completed => "completed",
                 .failed => "failed",
                 .cancelled => "cancelled",
                 .timed_out => "timed_out",
+            };
+        }
+
+        pub fn isTerminal(self: RunStatus) bool {
+            return switch (self) {
+                .pending, .running, .waiting => false,
+                .completed, .failed, .cancelled, .timed_out => true,
             };
         }
     };
@@ -107,6 +117,12 @@ pub const WorkflowHandler = struct {
         started_at_ms: ?i64,
         completed_at_ms: ?i64,
         idempotency_key_owned: ?[]const u8,
+
+        /// Current step name in the workflow graph (null = at start step).
+        current_step_name_owned: ?[]const u8 = null,
+
+        /// Signal type the run is waiting for (non-null when status == .waiting).
+        wait_signal_type_owned: ?[]const u8 = null,
 
         /// Signals received by this run.
         signals: std.ArrayList(Signal),
@@ -170,6 +186,8 @@ pub const WorkflowHandler = struct {
         self.allocator.free(run.workflow_version_owned);
         self.allocator.free(run.input_owned);
         if (run.idempotency_key_owned) |k| self.allocator.free(k);
+        if (run.current_step_name_owned) |s| self.allocator.free(s);
+        if (run.wait_signal_type_owned) |s| self.allocator.free(s);
 
         // Free signals
         for (run.signals.items) |sig| {
@@ -560,6 +578,11 @@ pub const WorkflowHandler = struct {
         // Return the run ID
         self.persistStart(shard, req.namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
         shard.sendOkResponse(conn, req.header.request_id, owned_run_id);
+
+        // Begin step execution. The run is already in the map; advanceWorkflow
+        // will drive it through the workflow graph until it reaches a terminal
+        // or a wait_for_signal step.
+        self.advanceWorkflow(run_ns_key, req.namespace);
     }
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
@@ -628,6 +651,29 @@ pub const WorkflowHandler = struct {
         // Add history event
         self.addHistoryEvent(run, "signal_received", signal_type, now_ms);
 
+        // If the run is waiting for this signal type, resume execution
+        if (run.status == .waiting) {
+            if (run.wait_signal_type_owned) |expected| {
+                if (std.mem.eql(u8, expected, signal_type)) {
+                    run.status = .running;
+                    // Clear wait state
+                    self.allocator.free(expected);
+                    run.wait_signal_type_owned = null;
+                    self.addHistoryEvent(run, "signal_matched", signal_type, now_ms);
+
+                    // Resume: need a non-deferred ns_key copy for advanceWorkflow
+                    const resume_key = self.allocator.dupe(u8, run_ns_key) catch {
+                        shard.sendOkResponse(conn, req.header.request_id, "");
+                        return;
+                    };
+                    defer self.allocator.free(resume_key);
+
+                    // Follow the "success" transition from the current wait step
+                    self.advanceWorkflow(resume_key, req.namespace);
+                }
+            }
+        }
+
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -685,13 +731,15 @@ pub const WorkflowHandler = struct {
 
         // Build JSON status
         var buf: [8192]u8 = undefined;
+        const current_step = run.current_step_name_owned orelse "start";
         const status_json = std.fmt.bufPrint(&buf,
-            \\{{"run_id":"{s}","workflow":"{s}","version":"{s}","status":"{s}","input":{s},"created_at":{d}}}
+            \\{{"run_id":"{s}","workflow":"{s}","version":"{s}","status":"{s}","current_step":"{s}","input":{s},"created_at":{d}}}
         , .{
             run.run_id_owned,
             run.workflow_name_owned,
             run.workflow_version_owned,
             run.status.toString(),
+            current_step,
             run.input_owned,
             run.created_at_ms,
         }) catch {
@@ -976,6 +1024,154 @@ pub const WorkflowHandler = struct {
         writer.writeByte(']') catch return;
 
         shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+    }
+
+    // ── Step Executor ───────────────────────────────────────────────────
+
+    /// Maximum steps a single advanceWorkflow call may execute before bailing
+    /// out as a safety net against infinite-loop workflow definitions.
+    const MAX_ADVANCE_STEPS: u32 = 256;
+
+    /// Drive a run through the workflow step graph.
+    ///
+    /// Starting from the run's current position (start step if null),
+    /// execute `.run` steps synchronously and follow their transitions.
+    /// When a `.wait_for_signal` step is reached the run enters `.waiting`
+    /// and this method returns.  When a terminal transition is reached
+    /// the run is completed/failed accordingly.
+    ///
+    /// `run_ns_key` must be a key that is valid in `self.runs`.
+    /// `namespace` is used only for definition lookups.
+    fn advanceWorkflow(self: *WorkflowHandler, run_ns_key: []const u8, namespace: []const u8) void {
+        const run = self.runs.getPtr(run_ns_key) orelse return;
+        if (run.status.isTerminal()) return;
+
+        // Look up the definition
+        const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+        defer self.allocator.free(def_ns_key);
+
+        const def_record = self.definitions.get(def_ns_key) orelse return;
+
+        // Parse the definition to access the step graph
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+        defer def.deinit(self.allocator);
+
+        const now_ms: i64 = std.time.milliTimestamp();
+        var steps_executed: u32 = 0;
+
+        while (steps_executed < MAX_ADVANCE_STEPS) {
+            steps_executed += 1;
+
+            // Determine current step
+            const step: definition.Step = if (run.current_step_name_owned) |step_name|
+                def.getStep(step_name) orelse {
+                    // Step not found in definition — fail the run
+                    self.completeRun(run, .failed, "step not found in definition", now_ms);
+                    return;
+                }
+            else
+                def.start; // first step
+
+            switch (step) {
+                .run => |run_step| {
+                    // Record step start
+                    const step_label = run.current_step_name_owned orelse "start";
+                    self.addHistoryEvent(run, "step_started", step_label, now_ms);
+
+                    // Determine outcome. For now, all run steps auto-succeed.
+                    // When the async action invocation pipeline is wired, this
+                    // will instead set .waiting + .awaiting_action and return.
+                    const outcome = definition.StepOutcome.success;
+
+                    self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+
+                    // Follow transition
+                    const transition = run_step.resolveTransition(outcome) orelse {
+                        // No matching transition — fail
+                        self.completeRun(run, .failed, "no transition for outcome", now_ms);
+                        return;
+                    };
+
+                    // Check if target is a terminal
+                    if (terminalStatus(transition.target)) |status| {
+                        self.completeRun(run, status, transition.target, now_ms);
+                        return;
+                    }
+
+                    // Transition to next step
+                    self.setCurrentStep(run, transition.target);
+                },
+
+                .wait_for_signal => |wait_step| {
+                    const step_label = run.current_step_name_owned orelse "start";
+                    self.addHistoryEvent(run, "waiting_for_signal", wait_step.signal_type, now_ms);
+
+                    // Check if a matching signal has already been received
+                    var signal_found = false;
+                    for (run.signals.items) |sig| {
+                        if (std.mem.eql(u8, sig.signal_type_owned, wait_step.signal_type)) {
+                            signal_found = true;
+                            break;
+                        }
+                    }
+
+                    if (signal_found) {
+                        // Signal already received — follow "success" transition
+                        self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+                        const transition = wait_step.getTransition(definition.StepOutcome.success) orelse {
+                            self.completeRun(run, .failed, "no success transition for wait step", now_ms);
+                            return;
+                        };
+
+                        if (terminalStatus(transition.target)) |status| {
+                            self.completeRun(run, status, transition.target, now_ms);
+                            return;
+                        }
+                        self.setCurrentStep(run, transition.target);
+                        continue; // advance to next step
+                    }
+
+                    // No signal yet — park the run in waiting state
+                    run.status = .waiting;
+                    const owned_sig = self.allocator.dupe(u8, wait_step.signal_type) catch return;
+                    if (run.wait_signal_type_owned) |old| self.allocator.free(old);
+                    run.wait_signal_type_owned = owned_sig;
+                    return; // will resume when signal arrives
+                },
+            }
+        }
+
+        // Safety: too many steps — possible infinite loop in definition
+        self.completeRun(run, .failed, "max step limit reached", now_ms);
+    }
+
+    /// Map a builtin terminal name to handler RunStatus.
+    fn terminalStatus(name: []const u8) ?RunStatus {
+        if (std.mem.eql(u8, name, "flo.Completed")) return .completed;
+        if (std.mem.eql(u8, name, "flo.Failed")) return .failed;
+        if (std.mem.eql(u8, name, "flo.Cancelled")) return .cancelled;
+        if (std.mem.eql(u8, name, "flo.TimedOut")) return .timed_out;
+        return null;
+    }
+
+    /// Transition the run to a terminal status.
+    fn completeRun(self: *WorkflowHandler, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
+        run.status = status;
+        run.completed_at_ms = now_ms;
+        const event_type = switch (status) {
+            .completed => "workflow_completed",
+            .failed => "workflow_failed",
+            .cancelled => "workflow_cancelled",
+            .timed_out => "workflow_timed_out",
+            else => "workflow_ended",
+        };
+        self.addHistoryEvent(run, event_type, detail, now_ms);
+    }
+
+    /// Update the run's current step pointer.
+    fn setCurrentStep(self: *WorkflowHandler, run: *RunRecord, step_name: []const u8) void {
+        if (run.current_step_name_owned) |old| self.allocator.free(old);
+        run.current_step_name_owned = self.allocator.dupe(u8, step_name) catch null;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1329,4 +1525,189 @@ test "workflow handler: init and deinit" {
 
     try testing.expectEqual(@as(usize, 0), handler.definitionCount());
     try testing.expectEqual(@as(usize, 0), handler.runCount());
+}
+
+// ── Step Executor Tests ─────────────────────────────────────────────────
+
+/// Minimal 2-step workflow: start → step_b → flo.Completed
+const test_workflow_json =
+    \\{"kind":"Workflow","name":"test-wf","version":"1.0.0",
+    \\"start":{"run":"@actions/step-a","transitions":{"success":"step_b"}},
+    \\"steps":{"step_b":{"run":"@actions/step-b","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}}
+;
+
+/// Workflow with a wait_for_signal step
+const test_wait_workflow_json =
+    \\{"kind":"Workflow","name":"wait-wf","version":"1.0.0",
+    \\"start":{"run":"@actions/init","transitions":{"success":"wait_approval"}},
+    \\"steps":{"wait_approval":{"waitForSignal":{"type":"approval"},"transitions":{"success":"flo.Completed"}}}}
+;
+
+fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
+    const alloc = handler.allocator;
+    const owned_ns = alloc.dupe(u8, ns_key) catch return;
+    const owned_rid = alloc.dupe(u8, run_id) catch {
+        alloc.free(owned_ns);
+        return;
+    };
+    const owned_wf = alloc.dupe(u8, wf_name) catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_rid);
+        return;
+    };
+    const owned_ver = alloc.dupe(u8, "1.0.0") catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_rid);
+        alloc.free(owned_wf);
+        return;
+    };
+    const owned_input = alloc.dupe(u8, "{}") catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_rid);
+        alloc.free(owned_wf);
+        alloc.free(owned_ver);
+        return;
+    };
+
+    handler.runs.put(owned_ns, .{
+        .run_id_owned = owned_rid,
+        .workflow_name_owned = owned_wf,
+        .workflow_version_owned = owned_ver,
+        .status = .running,
+        .input_owned = owned_input,
+        .created_at_ms = 0,
+        .started_at_ms = 0,
+        .completed_at_ms = null,
+        .idempotency_key_owned = null,
+        .signals = .empty,
+        .history = .empty,
+    }) catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_rid);
+        alloc.free(owned_wf);
+        alloc.free(owned_ver);
+        alloc.free(owned_input);
+    };
+}
+
+fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8, yaml: []const u8) void {
+    const alloc = handler.allocator;
+    const owned_ns = alloc.dupe(u8, ns_key) catch return;
+    const owned_name = alloc.dupe(u8, name) catch {
+        alloc.free(owned_ns);
+        return;
+    };
+    const owned_ver = alloc.dupe(u8, "1.0.0") catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_name);
+        return;
+    };
+    const owned_yaml = alloc.dupe(u8, yaml) catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_name);
+        alloc.free(owned_ver);
+        return;
+    };
+
+    handler.definitions.put(owned_ns, .{
+        .name_owned = owned_name,
+        .version_owned = owned_ver,
+        .yaml_owned = owned_yaml,
+        .created_at_ms = 0,
+    }) catch {
+        alloc.free(owned_ns);
+        alloc.free(owned_name);
+        alloc.free(owned_ver);
+        alloc.free(owned_yaml);
+    };
+}
+
+test "step executor: linear workflow completes" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-1", "run-1", "test-wf");
+
+    try testing.expectEqual(@as(usize, 1), handler.runCount());
+    handler.advanceWorkflow("default:run-1", "default");
+
+    const run = handler.runs.get("default:run-1").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try testing.expect(run.completed_at_ms != null);
+    // History should have: step_started(start), step_completed(start),
+    // step_started(step_b), step_completed(step_b), workflow_completed
+    try testing.expect(run.history.items.len >= 5);
+}
+
+test "step executor: wait_for_signal parks run" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
+    createTestRun(&handler, "default:run-2", "run-2", "wait-wf");
+
+    handler.advanceWorkflow("default:run-2", "default");
+
+    const run = handler.runs.get("default:run-2").?;
+    // Should be waiting after start → wait_approval
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(run.wait_signal_type_owned != null);
+    try testing.expectEqualStrings("approval", run.wait_signal_type_owned.?);
+}
+
+test "step executor: signal resumes waiting workflow" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
+    createTestRun(&handler, "default:run-3", "run-3", "wait-wf");
+
+    // Advance until it parks
+    handler.advanceWorkflow("default:run-3", "default");
+    {
+        const run = handler.runs.get("default:run-3").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    }
+
+    // Simulate signal delivery: set up matching signal, clear wait, resume
+    {
+        const run = handler.runs.getPtr("default:run-3").?;
+        // Add matching signal
+        const sig_type = try allocator.dupe(u8, "approval");
+        try run.signals.append(allocator, .{
+            .signal_type_owned = sig_type,
+            .payload_owned = null,
+            .received_at_ms = 0,
+        });
+        // Clear wait and set running (simulates what handleSignal does)
+        if (run.wait_signal_type_owned) |old| allocator.free(old);
+        run.wait_signal_type_owned = null;
+        run.status = .running;
+    }
+
+    // Resume execution
+    handler.advanceWorkflow("default:run-3", "default");
+
+    const run = handler.runs.get("default:run-3").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+}
+
+test "step executor: missing definition does not crash" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    // No definition registered
+    createTestRun(&handler, "default:run-4", "run-4", "nonexistent-wf");
+
+    // Should gracefully no-op (no definition found)
+    handler.advanceWorkflow("default:run-4", "default");
+
+    const run = handler.runs.get("default:run-4").?;
+    // Still running since we couldn't find the definition to advance
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
 }
