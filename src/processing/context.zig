@@ -1,16 +1,10 @@
 //! Operator Context
 //!
 //! Provides operators with access to output collection, timing,
-//! and (in later phases) keyed state and timer services.
+//! keyed state, timer services, and side outputs.
 //!
 //! The OperatorContext is created per-operator invocation and gives
 //! each operator a consistent interface to the processing runtime.
-//!
-//! ## Phasing
-//!
-//! Phase 1 (current): emit(), metrics, timing  — stateless operators only
-//! Phase 2+: keyed_state, timer_service         — stateful operators
-//! Phase 4+: side_outputs                        — branching pipelines
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -70,8 +64,7 @@ pub const OperatorContext = struct {
     /// Operator name (for logging/debugging)
     operator_name: []const u8,
 
-    // Phase 2+ optional fields — callers check before use
-    /// Keyed state access (for stateful operators)
+    /// Keyed state access (for stateful operators, null if stateless)
     keyed_state: ?*KeyedStateAccess = null,
     /// Timer service (for event-time / processing-time timers)
     timer_service: ?*TimerService = null,

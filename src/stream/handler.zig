@@ -973,32 +973,6 @@ pub const StreamHandler = struct {
         return buf;
     }
 
-    /// Public interface for processing pipeline — append payload to stream and return offset.
-    pub fn appendPayload(self: *StreamHandler, payload: []const u8) !u64 {
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
-
-        // Build command entry with empty key (internal pipeline append)
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + payload.len;
-        const payload_buf = try self.allocator.alloc(u8, payload_size);
-        defer self.allocator.free(payload_buf);
-
-        const entry = entry_mod.buildCommandEntry(
-            .stream_append,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            0,
-            "", // no key for internal pipeline
-            payload,
-            payload_buf,
-        ) orelse return error.EntryBuildFailed;
-
-        const ual_index = try self.partition.apply(&entry);
-        return try self.stream.append(ual_index, timestamp_ns, 0, 0); // 0 = internal pipeline, no stream name
-    }
-
     /// Append payload to a named stream (used by processing pipelines).
     /// Computes the namespace-qualified name hash for proper stream isolation.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !u64 {
@@ -1037,34 +1011,6 @@ pub const StreamHandler = struct {
         self.stream.registerStream(ns_stream_name) catch {};
 
         return offset;
-    }
-
-    /// Public interface for processing pipeline — read payloads from offset range.
-    /// Returns zero-copy views into the UAL ring buffer. Slices are valid until
-    /// the next UAL write that triggers eviction.
-    pub fn readPayloads(self: *StreamHandler, start_offset: u64, limit: usize) []const []const u8 {
-        var results: [1000][]const u8 = undefined;
-        var count: usize = 0;
-        const capped = @min(limit, 1000);
-
-        var buf: [1]OffsetEntry = undefined;
-        var offset = start_offset;
-        while (count < capped) : (offset += 1) {
-            const n = self.stream.readRange(offset, offset + 1, &buf);
-            if (n == 0) break;
-            const result = self.getPayloadAndTier(buf[0].ual_index);
-            if (result.payload.len > 0) {
-                results[count] = result.payload;
-                count += 1;
-            } else {
-                break; // Entry missing
-            }
-        }
-
-        // Return a heap-allocated copy of the slice
-        const out = self.allocator.alloc([]const u8, count) catch return &.{};
-        @memcpy(out, results[0..count]);
-        return out;
     }
 
     /// Read payloads from a named stream (used by processing pipelines).

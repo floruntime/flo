@@ -448,10 +448,17 @@ pub const ProcessingHandler = struct {
             return;
         };
 
+        // Resolve effective namespace for filtering
+        const req_ns = if (req.namespace.len > 0) req.namespace else "default";
+
         var count: u32 = 0;
         var jit = self.jobs.iterator();
         while (jit.next()) |entry| {
             if (count >= limit) break;
+
+            // Filter: only include jobs belonging to the requested namespace
+            const job_ns = entry.value_ptr.namespace_owned;
+            if (!std.mem.eql(u8, job_ns, req_ns)) continue;
 
             if (count > 0) {
                 writer.writeByte(',') catch {
