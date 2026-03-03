@@ -23,6 +23,8 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const ts_mod = @import("../projection/ts.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
 
 const CommandResult = result_mod.CommandResult;
 const TSProjection = ts_mod.TSProjection;
@@ -30,6 +32,8 @@ const StoredPoint = ts_mod.StoredPoint;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TSHandler
@@ -53,13 +57,13 @@ pub const TSHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.ts_write, dispatchStub, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_read, dispatchStub, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_query, dispatchStub, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_floql, dispatchStub, preRouteByMeasurement);
-        dispatcher.register(.ts_list, dispatchStub);
-        dispatcher.registerWithRoute(.ts_delete, dispatchStub, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_retention, dispatchStub, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_write, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_read, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByMeasurement);
+        dispatcher.register(.ts_list, dispatchTS);
+        dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────
@@ -69,10 +73,12 @@ pub const TSHandler = struct {
         return std.hash.Wyhash.hash(0, req.key);
     }
 
-    fn dispatchStub(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.ts_handler.handleCommand(req);
+        defer shard.ts_handler.freeResult(result);
+        sendTSResponse(shard, conn, req.header.request_id, result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -299,6 +305,54 @@ pub const TSHandler = struct {
 
 fn parseF64FromString(s: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, s) catch null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Response Dispatch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .ok => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .err => |e| {
+            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+        },
+        .ts_write_ok => |w| {
+            // Send count (1 point written) as 8-byte u64 LE
+            _ = w;
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, 1, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
+        .ts_read_result => |r| {
+            shard.sendOkResponse(conn, request_id, r.data);
+        },
+        .ts_query_result => |r| {
+            shard.sendOkResponse(conn, request_id, r.data);
+        },
+        .ts_list_result => |r| {
+            shard.sendOkResponse(conn, request_id, r.data);
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled ts response");
+        },
+    }
+}
+
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        .conflict => .conflict,
+        else => .internal_error,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

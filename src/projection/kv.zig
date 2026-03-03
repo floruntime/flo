@@ -117,8 +117,8 @@ pub const KVProjection = struct {
 
     // ─── Point operations ──────────────────────────────────────────────────
 
-    /// Put a key-value pair.
-    pub fn put(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64) !void {
+    /// Put a key-value pair. expiry_ns = 0 means no expiration.
+    pub fn put(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64, expiry_ns: u64) !void {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
@@ -130,7 +130,7 @@ pub const KVProjection = struct {
             .lsn = lsn,
             .term = term,
             .timestamp_ns = timestamp_ns,
-            .expiry_ns = 0,
+            .expiry_ns = expiry_ns,
             .tombstone = false,
         };
 
@@ -147,7 +147,7 @@ pub const KVProjection = struct {
             existing.lsn = lsn;
             existing.term = term;
             existing.timestamp_ns = timestamp_ns;
-            existing.expiry_ns = 0;
+            existing.expiry_ns = expiry_ns;
             existing.tombstone = false;
             self.memory_used += owned_value.len;
         } else {
@@ -208,12 +208,14 @@ pub const KVProjection = struct {
     /// Caller provides a bounded output buffer.
     pub fn scan(self: *KVProjection, out: []ScanEntry) usize {
         self.stats.scans += 1;
+        const now = std.time.nanoTimestamp();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
             if (count_written >= out.len) break;
             const entry = kv.value_ptr;
             if (entry.tombstone) continue;
+            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue; // expired
             out[count_written] = .{
                 .key = entry.key,
                 .value = entry.value,
@@ -227,12 +229,14 @@ pub const KVProjection = struct {
     /// Scan entries matching a key prefix.
     pub fn scanPrefix(self: *KVProjection, prefix: []const u8, out: []ScanEntry) usize {
         self.stats.scans += 1;
+        const now = std.time.nanoTimestamp();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
             if (count_written >= out.len) break;
             const entry = kv.value_ptr;
             if (entry.tombstone) continue;
+            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue; // expired
             if (entry.key.len >= prefix.len and
                 std.mem.eql(u8, entry.key[0..prefix.len], prefix))
             {
@@ -292,6 +296,7 @@ pub const KVProjection = struct {
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
+                    0, // TODO: extract TTL from UAL entry
                 );
             },
             .kv_delete, .cg_delete => {
@@ -314,6 +319,7 @@ pub const KVProjection = struct {
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
+                    0, // TODO: extract TTL from UAL entry
                 );
             },
             else => {},
@@ -371,8 +377,8 @@ test "kv: basic put and get" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("key1", "value1", 1, 1, 1000);
-    try kv.put("key2", "value2", 2, 1, 2000);
+    try kv.put("key1", "value1", 1, 1, 1000, 0);
+    try kv.put("key2", "value2", 2, 1, 2000, 0);
 
     const e1 = kv.get("key1").?;
     try testing.expectEqualSlices(u8, "value1", e1.value);
@@ -389,8 +395,8 @@ test "kv: put overwrites" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("key1", "old", 1, 1, 1000);
-    try kv.put("key1", "new", 2, 1, 2000);
+    try kv.put("key1", "old", 1, 1, 1000, 0);
+    try kv.put("key1", "new", 2, 1, 2000, 0);
 
     const e = kv.get("key1").?;
     try testing.expectEqualSlices(u8, "new", e.value);
@@ -402,7 +408,7 @@ test "kv: delete creates tombstone" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("key1", "value1", 1, 1, 1000);
+    try kv.put("key1", "value1", 1, 1, 1000, 0);
     try kv.delete("key1", 2, 1, 2000);
 
     // get returns null for tombstone
@@ -430,9 +436,9 @@ test "kv: scan returns live entries" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("a", "1", 1, 1, 1000);
-    try kv.put("b", "2", 2, 1, 2000);
-    try kv.put("c", "3", 3, 1, 3000);
+    try kv.put("a", "1", 1, 1, 1000, 0);
+    try kv.put("b", "2", 2, 1, 2000, 0);
+    try kv.put("c", "3", 3, 1, 3000, 0);
     try kv.delete("b", 4, 1, 4000);
 
     var results: [10]ScanEntry = undefined;
@@ -444,9 +450,9 @@ test "kv: scan with prefix" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("user:1", "alice", 1, 1, 1000);
-    try kv.put("user:2", "bob", 2, 1, 2000);
-    try kv.put("item:1", "sword", 3, 1, 3000);
+    try kv.put("user:1", "alice", 1, 1, 1000, 0);
+    try kv.put("user:2", "bob", 2, 1, 2000, 0);
+    try kv.put("item:1", "sword", 3, 1, 3000, 0);
 
     var results: [10]ScanEntry = undefined;
     const n = kv.scanPrefix("user:", &results);
@@ -457,8 +463,8 @@ test "kv: compact removes tombstones" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("a", "1", 1, 1, 1000);
-    try kv.put("b", "2", 2, 1, 2000);
+    try kv.put("a", "1", 1, 1, 1000, 0);
+    try kv.put("b", "2", 2, 1, 2000, 0);
     try kv.delete("a", 3, 1, 3000);
 
     try testing.expectEqual(@as(usize, 2), kv.totalEntries());
@@ -536,7 +542,7 @@ test "kv: stats tracking" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("k", "v", 1, 1, 0);
+    try kv.put("k", "v", 1, 1, 0, 0);
     _ = kv.get("k");
     _ = kv.get("missing");
     try kv.delete("k", 2, 1, 0);
@@ -550,11 +556,11 @@ test "kv: memory tracking" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    try kv.put("abc", "123456", 1, 1, 0);
+    try kv.put("abc", "123456", 1, 1, 0, 0);
     // key(3) + value(6) = 9 bytes tracked
     try testing.expectEqual(@as(usize, 9), kv.memory_used);
 
-    try kv.put("abc", "x", 2, 1, 0);
+    try kv.put("abc", "x", 2, 1, 0, 0);
     // Updated: key(3) + value(1) = 4 bytes
     try testing.expectEqual(@as(usize, 4), kv.memory_used);
 }

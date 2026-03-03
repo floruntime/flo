@@ -695,7 +695,7 @@ pub const Gossip = struct {
             // Apply update only if incarnation is newer or state is more severe
             if (update.incarnation > member.incarnation or
                 (update.incarnation == member.incarnation and
-                @intFromEnum(update.state) > @intFromEnum(member.state)))
+                    @intFromEnum(update.state) > @intFromEnum(member.state)))
             {
                 member.state = update.state;
                 member.incarnation = update.incarnation;

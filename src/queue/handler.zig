@@ -24,6 +24,8 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const queue_mod = @import("../projection/queue.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
 
 const CommandResult = result_mod.CommandResult;
 const QueueProjection = queue_mod.QueueProjection;
@@ -33,6 +35,8 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // QueueHandler
@@ -59,17 +63,17 @@ pub const QueueHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.queue_enqueue, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dequeue, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_complete, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_fail, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_peek, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_stats, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_list, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_requeue, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dlq_delete, dispatchStub, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_purge, dispatchStub, preRouteByQueue);
-        dispatcher.register(.queue_list, dispatchStub);
+        dispatcher.registerWithRoute(.queue_enqueue, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dequeue, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_complete, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_fail, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_peek, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_stats, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_list, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_requeue, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dlq_delete, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_purge, dispatchQueue, preRouteByQueue);
+        dispatcher.register(.queue_list, dispatchQueue);
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────
@@ -79,10 +83,12 @@ pub const QueueHandler = struct {
         return std.hash.Wyhash.hash(0, req.key);
     }
 
-    fn dispatchStub(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.queue_handler.handleCommand(req);
+        defer shard.queue_handler.freeResult(result);
+        sendQueueResponse(shard, conn, req.header.request_id, result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -304,6 +310,60 @@ pub const QueueHandler = struct {
         }
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Response Serialization — CommandResult → Wire Response
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert a CommandResult to a wire response and queue it on the connection.
+fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .ok => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .err => |e| {
+            const status = errorCodeToStatus(e.code);
+            shard.sendErrorResponse(conn, request_id, status, e.message);
+        },
+        .queue_enqueued => |q| {
+            // Parse message_id string back to u64 and send as 8-byte LE
+            const seq = std.fmt.parseInt(u64, q.message_id, 10) catch 0;
+            var seq_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &seq_buf, seq, .little);
+            shard.sendOkResponse(conn, request_id, &seq_buf);
+        },
+        .queue_messages => |m| {
+            shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .queue_peek_messages => |m| {
+            shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .queue_dlq_messages => |m| {
+            shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .kv_not_found => {
+            shard.sendErrorResponse(conn, request_id, .not_found, "queue not found");
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled queue response");
+        },
+    }
+}
+
+/// Map CommandResult.ErrorCode to wire StatusCode.
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        .conflict => .conflict,
+        else => .internal_error,
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization

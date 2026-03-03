@@ -20,11 +20,15 @@ const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
 
 const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // NamespaceHandler
@@ -69,16 +73,18 @@ pub const NamespaceHandler = struct {
 
     pub fn register(dispatcher: *Dispatcher) void {
         // No pre-route hooks — namespace commands route to Controller (Shard 0).
-        dispatcher.register(.namespace_create, dispatchStub);
-        dispatcher.register(.namespace_delete, dispatchStub);
-        dispatcher.register(.namespace_list, dispatchStub);
-        dispatcher.register(.namespace_info, dispatchStub);
+        dispatcher.register(.namespace_create, dispatchNamespace);
+        dispatcher.register(.namespace_delete, dispatchNamespace);
+        dispatcher.register(.namespace_list, dispatchNamespace);
+        dispatcher.register(.namespace_info, dispatchNamespace);
     }
 
-    fn dispatchStub(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.namespace_handler.handleCommand(req);
+        defer shard.namespace_handler.freeResult(result);
+        sendNamespaceResponse(shard, conn, req.header.request_id, result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -277,6 +283,52 @@ pub const NamespaceHandler = struct {
         }
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Response Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Map namespace CommandResult variants to wire responses.
+fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .ok, .namespace_created, .namespace_deleted => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .err => |e| {
+            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+        },
+        .namespace_list => |n| {
+            shard.sendOkResponse(conn, request_id, n.data);
+        },
+        .namespace_info => |n| {
+            // Wire format: [exists:u8][name_len:u16 LE][name:bytes]
+            var buf: [3 + 128]u8 = undefined;
+            buf[0] = if (n.exists) 1 else 0;
+            std.mem.writeInt(u16, buf[1..3], @intCast(n.name.len), .little);
+            if (n.name.len > 0) {
+                @memcpy(buf[3 .. 3 + n.name.len], n.name);
+            }
+            shard.sendOkResponse(conn, request_id, buf[0 .. 3 + n.name.len]);
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled namespace response");
+        },
+    }
+}
+
+/// Map CommandResult.ErrorCode to wire StatusCode.
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        else => .internal_error,
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests

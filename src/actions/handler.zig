@@ -29,6 +29,11 @@ const ActionMeta = @import("types.zig").ActionMeta;
 const ActionType = @import("types.zig").ActionType;
 const RunStatus = @import("types.zig").RunStatus;
 
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
+
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -101,11 +106,11 @@ pub const ActionsHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.action_register, dispatchStub, preRouteByAction);
-        dispatcher.registerWithRoute(.action_invoke, dispatchStub, preRouteByAction);
-        dispatcher.registerWithRoute(.action_status, dispatchStub, preRouteByAction);
-        dispatcher.register(.action_list, dispatchStub);
-        dispatcher.registerWithRoute(.action_delete, dispatchStub, preRouteByAction);
+        dispatcher.registerWithRoute(.action_register, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
+        dispatcher.register(.action_list, dispatchAction);
+        dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
     }
 
     fn preRouteByAction(req: Request) ?u64 {
@@ -113,10 +118,12 @@ pub const ActionsHandler = struct {
         return std.hash.Wyhash.hash(0, req.key);
     }
 
-    fn dispatchStub(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchAction(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const result = shard.actions_handler.handleCommand(req);
+        defer shard.actions_handler.freeResult(result);
+        sendActionResponse(shard, conn, req.header.request_id, result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -356,6 +363,95 @@ pub const ActionsHandler = struct {
         }
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Response Serialization — CommandResult → Wire Response
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert a CommandResult to a wire response and queue it on the connection.
+fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .ok, .action_deleted => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .err => |e| {
+            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+        },
+        .action_registered => |r| {
+            shard.sendOkResponse(conn, request_id, r.name);
+        },
+        .action_invoked => |i| {
+            shard.sendOkResponse(conn, request_id, i.run_id);
+        },
+        .action_run_status => |s| {
+            // Serialize run status fields into a buffer using the same wire
+            // format as CommandResult.serialize (result.zig).
+            var buf: [4096]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const writer = fbs.writer();
+            // run_id
+            writer.writeInt(u32, @intCast(s.run_id.len), .little) catch return;
+            writer.writeAll(s.run_id) catch return;
+            // status
+            writer.writeByte(@intFromEnum(s.status)) catch return;
+            // created_at
+            writer.writeInt(i64, s.created_at, .little) catch return;
+            // started_at (optional i64)
+            if (s.started_at) |v| {
+                writer.writeByte(1) catch return;
+                writer.writeInt(i64, v, .little) catch return;
+            } else {
+                writer.writeByte(0) catch return;
+            }
+            // completed_at (optional i64)
+            if (s.completed_at) |v| {
+                writer.writeByte(1) catch return;
+                writer.writeInt(i64, v, .little) catch return;
+            } else {
+                writer.writeByte(0) catch return;
+            }
+            // output (optional slice)
+            if (s.output) |o| {
+                writer.writeByte(1) catch return;
+                writer.writeInt(u32, @intCast(o.len), .little) catch return;
+                writer.writeAll(o) catch return;
+            } else {
+                writer.writeByte(0) catch return;
+            }
+            // error_message (optional slice)
+            if (s.error_message) |e| {
+                writer.writeByte(1) catch return;
+                writer.writeInt(u32, @intCast(e.len), .little) catch return;
+                writer.writeAll(e) catch return;
+            } else {
+                writer.writeByte(0) catch return;
+            }
+            // retry_count
+            writer.writeInt(u32, s.retry_count, .little) catch return;
+            shard.sendOkResponse(conn, request_id, fbs.getWritten());
+        },
+        .action_list_result => |l| {
+            shard.sendOkResponse(conn, request_id, l.data);
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled action response");
+        },
+    }
+}
+
+/// Map CommandResult.ErrorCode to wire StatusCode.
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        else => .internal_error,
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests

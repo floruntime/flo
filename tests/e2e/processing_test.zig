@@ -201,85 +201,86 @@ test "e2e/processing: list accepts no arguments" {
 // Processing Protocol Serialization Tests
 // =============================================================================
 
-test "e2e/processing: command serialization roundtrip - submit" {
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: protocol request building - submit" {
+    const proto = src.protocol.proto;
+    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
 
-    const cmd = Command{ .processing_submit = .{
-        .namespace = "test-ns",
-        .definition_yaml = "name: test-job\nversion: 1.0",
-    } };
+    var builder = RequestBuilder.init(testing.allocator);
+    const req = builder.build(
+        proto.OpCode.processing_submit,
+        "test-ns",
+        "",
+        "name: test-job\nversion: 1.0",
+        "",
+    );
 
-    // Verify routing hash computation
-    const hash = cmd.computeRoutingHash();
-    try testing.expect(hash != 0);
-
-    // Verify serialized size
-    const size = cmd.serializedSize();
-    try testing.expect(size > 0);
+    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_submit), req.header.op_code);
+    try testing.expect(req.header.request_id > 0);
 }
 
-test "e2e/processing: command serialization roundtrip - stop" {
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: protocol request building - stop" {
+    const proto = src.protocol.proto;
+    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
 
-    const cmd = Command{ .processing_stop = .{
-        .namespace = "test-ns",
-        .job_id = "job-abc-123",
-    } };
+    var builder = RequestBuilder.init(testing.allocator);
+    const req = builder.build(
+        proto.OpCode.processing_stop,
+        "test-ns",
+        "job-abc-123",
+        "",
+        "",
+    );
 
-    const hash = cmd.computeRoutingHash();
-    try testing.expect(hash != 0);
-
-    const size = cmd.serializedSize();
-    try testing.expect(size > 0);
+    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_stop), req.header.op_code);
+    try testing.expect(req.header.request_id > 0);
 }
 
-test "e2e/processing: command serialization roundtrip - list" {
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: protocol request building - list" {
+    const proto = src.protocol.proto;
+    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
 
-    const cmd = Command{ .processing_list = .{
-        .namespace = "default",
-        .limit = 50,
-        .cursor = null,
-    } };
+    var builder = RequestBuilder.init(testing.allocator);
+    const req = builder.build(
+        proto.OpCode.processing_list,
+        "default",
+        "",
+        "",
+        "",
+    );
 
-    const hash = cmd.computeRoutingHash();
-    try testing.expect(hash != 0);
-
-    const size = cmd.serializedSize();
-    try testing.expect(size > 0);
+    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_list), req.header.op_code);
 }
 
-test "e2e/processing: command serialization roundtrip - rescale" {
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: protocol request building - rescale" {
+    const proto = src.protocol.proto;
+    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
 
-    const cmd = Command{ .processing_rescale = .{
-        .namespace = "prod",
-        .job_id = "job-xyz",
-        .parallelism = 8,
-    } };
+    var builder = RequestBuilder.init(testing.allocator);
+    const req = builder.build(
+        proto.OpCode.processing_rescale,
+        "prod",
+        "job-xyz",
+        "8",
+        "",
+    );
 
-    const hash = cmd.computeRoutingHash();
-    try testing.expect(hash != 0);
-
-    const size = cmd.serializedSize();
-    // namespace(4+4) + job_id(4+7) + parallelism(4) = 23
-    try testing.expect(size > 0);
+    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_rescale), req.header.op_code);
 }
 
-test "e2e/processing: command serialization roundtrip - restore" {
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: protocol request building - restore" {
+    const proto = src.protocol.proto;
+    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
 
-    const cmd = Command{ .processing_restore = .{
-        .namespace = "ns",
-        .job_id = "job-1",
-        .savepoint_id = "sp-42",
-    } };
+    var builder = RequestBuilder.init(testing.allocator);
+    const req = builder.build(
+        proto.OpCode.processing_restore,
+        "ns",
+        "job-1",
+        "sp-42",
+        "",
+    );
 
-    const hash = cmd.computeRoutingHash();
-    try testing.expect(hash != 0);
-
-    const size = cmd.serializedSize();
-    try testing.expect(size > 0);
+    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_restore), req.header.op_code);
 }
 
 // =============================================================================
@@ -287,8 +288,8 @@ test "e2e/processing: command serialization roundtrip - restore" {
 // =============================================================================
 
 test "e2e/processing: result opcode mapping" {
-    const CommandResult = src.node.protocol.result.CommandResult;
-    const proto = src.node.protocol.proto;
+    const CommandResult = src.protocol.result.CommandResult;
+    const proto = src.protocol.proto;
 
     // Test all processing result → opcode mappings
     const submitted = CommandResult{ .processing_submitted = .{ .job_id = "job-1" } };
@@ -317,7 +318,7 @@ test "e2e/processing: result opcode mapping" {
 }
 
 test "e2e/processing: result serialized size" {
-    const CommandResult = src.node.protocol.result.CommandResult;
+    const CommandResult = src.protocol.result.CommandResult;
 
     const submitted = CommandResult{ .processing_submitted = .{ .job_id = "job-123" } };
     const size = submitted.serializedSize();
@@ -333,40 +334,35 @@ test "e2e/processing: result serialized size" {
 }
 
 // =============================================================================
-// Processing Dispatcher Domain Tests
+// Processing OpCode Contract Tests
 // =============================================================================
 
-test "e2e/processing: dispatcher routes processing commands" {
-    const Dispatcher = src.node.dispatch.dispatcher.Dispatcher;
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: processing opcodes are defined" {
+    const proto = src.protocol.proto;
 
-    var dispatcher = try Dispatcher.init(testing.allocator, 1, 0, 1, null, null, null, null, null, null, null);
-    defer dispatcher.deinit();
-
-    // Processing submit should route through dispatcher (returns error since no handler)
-    const result = try dispatcher.dispatch(Command{ .processing_submit = .{
-        .namespace = "default",
-        .definition_yaml = "name: test",
-    } }, 1, 1, null);
-
-    // Should get a result (error because handler is a stub)
-    try testing.expect(result != null);
+    // Processing opcodes must exist and have stable values (wire contract)
+    try testing.expectEqual(@as(u8, 0xC0), @intFromEnum(proto.OpCode.processing_submit));
+    try testing.expectEqual(@as(u8, 0xC1), @intFromEnum(proto.OpCode.processing_stop));
+    try testing.expectEqual(@as(u8, 0xC2), @intFromEnum(proto.OpCode.processing_cancel));
+    try testing.expectEqual(@as(u8, 0xC3), @intFromEnum(proto.OpCode.processing_status));
+    try testing.expectEqual(@as(u8, 0xC4), @intFromEnum(proto.OpCode.processing_list));
+    try testing.expectEqual(@as(u8, 0xC6), @intFromEnum(proto.OpCode.processing_savepoint));
+    try testing.expectEqual(@as(u8, 0xC7), @intFromEnum(proto.OpCode.processing_restore));
+    try testing.expectEqual(@as(u8, 0xC8), @intFromEnum(proto.OpCode.processing_rescale));
 }
 
-test "e2e/processing: dispatcher routes processing list" {
-    const Dispatcher = src.node.dispatch.dispatcher.Dispatcher;
-    const Command = src.node.protocol.command.Command;
+test "e2e/processing: processing response opcodes are defined" {
+    const proto = src.protocol.proto;
 
-    var dispatcher = try Dispatcher.init(testing.allocator, 1, 0, 1, null, null, null, null, null, null, null);
-    defer dispatcher.deinit();
-
-    const result = try dispatcher.dispatch(Command{ .processing_list = .{
-        .namespace = "default",
-        .limit = 100,
-        .cursor = null,
-    } }, 1, 1, null);
-
-    try testing.expect(result != null);
+    // Response opcodes must pair with request opcodes (wire contract)
+    try testing.expectEqual(@as(u8, 0xC9), @intFromEnum(proto.OpCode.processing_submit_response));
+    try testing.expectEqual(@as(u8, 0xCA), @intFromEnum(proto.OpCode.processing_stop_response));
+    try testing.expectEqual(@as(u8, 0xCB), @intFromEnum(proto.OpCode.processing_cancel_response));
+    try testing.expectEqual(@as(u8, 0xCC), @intFromEnum(proto.OpCode.processing_status_response));
+    try testing.expectEqual(@as(u8, 0xCD), @intFromEnum(proto.OpCode.processing_list_response));
+    try testing.expectEqual(@as(u8, 0xCF), @intFromEnum(proto.OpCode.processing_savepoint_response));
+    try testing.expectEqual(@as(u8, 0xD0), @intFromEnum(proto.OpCode.processing_restore_response));
+    try testing.expectEqual(@as(u8, 0xD1), @intFromEnum(proto.OpCode.processing_rescale_response));
 }
 
 // =============================================================================
@@ -1455,14 +1451,14 @@ test "e2e/processing: ts source - stop and cancel lifecycle" {
 // =============================================================================
 
 test "e2e/processing: SourceKind enum string representation" {
-    const SourceKind = src.processing.job_definition.SourceKind;
+    const SourceKind = src.processing.definition.SourceKind;
 
     try testing.expectEqualStrings("stream", SourceKind.stream.toStr());
     try testing.expectEqualStrings("ts", SourceKind.ts.toStr());
 }
 
 test "e2e/processing: SourceKind values are stable" {
-    const SourceKind = src.processing.job_definition.SourceKind;
+    const SourceKind = src.processing.definition.SourceKind;
 
     // Enum backing values must remain stable for wire compatibility
     try testing.expectEqual(@as(u8, 0), @intFromEnum(SourceKind.stream));
@@ -1470,7 +1466,7 @@ test "e2e/processing: SourceKind values are stable" {
 }
 
 test "e2e/processing: TS source definition parser roundtrip" {
-    const parser = src.processing.job_parser;
+    const parser = src.processing.parser;
 
     // This YAML defines a TS source — parsed by the server-side parser
     const yaml =
@@ -1493,9 +1489,9 @@ test "e2e/processing: TS source definition parser roundtrip" {
     defer def.deinit(testing.allocator);
 
     try testing.expectEqualStrings("parser-test-ts-source", def.name);
-    try testing.expectEqual(@as(usize, 1), def.sources.len);
+    try testing.expectEqual(@as(usize, 1), def.sources.items.len);
 
-    const src_spec = def.sources[0];
+    const src_spec = def.sources.items[0];
     try testing.expectEqual(parser.SourceKind.ts, src_spec.kind);
     try testing.expectEqualStrings("cpu_usage", src_spec.ts_measurement);
     try testing.expectEqualStrings("idle", src_spec.ts_field);
@@ -1507,7 +1503,7 @@ test "e2e/processing: TS source definition parser roundtrip" {
 }
 
 test "e2e/processing: stream source definition is default kind" {
-    const parser = src.processing.job_parser;
+    const parser = src.processing.parser;
 
     const yaml =
         \\kind: Processing
@@ -1521,7 +1517,7 @@ test "e2e/processing: stream source definition is default kind" {
     var def = try parser.parseJobDefinition(testing.allocator, yaml);
     defer def.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), def.sources.len);
-    try testing.expectEqual(parser.SourceKind.stream, def.sources[0].kind);
-    try testing.expectEqualStrings("events", def.sources[0].stream);
+    try testing.expectEqual(@as(usize, 1), def.sources.items.len);
+    try testing.expectEqual(parser.SourceKind.stream, def.sources.items[0].kind);
+    try testing.expectEqualStrings("events", def.sources.items[0].stream);
 }

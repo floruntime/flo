@@ -22,6 +22,10 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const stream_mod = @import("../projection/stream.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
 
 const CommandResult = result_mod.CommandResult;
 const StreamProjection = stream_mod.StreamProjection;
@@ -59,22 +63,22 @@ pub const StreamHandler = struct {
     /// Register stream and consumer-group opcode handlers with the Dispatcher.
     pub fn register(dispatcher: *Dispatcher) void {
         // Stream operations (0x10–0x1F)
-        dispatcher.registerWithRoute(.stream_append, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_read, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_trim, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_info, dispatchStub, preRouteByStream);
-        dispatcher.register(.stream_list, dispatchStub);
-        dispatcher.registerWithRoute(.stream_create, dispatchStub, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_append, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_read, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_trim, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_info, dispatchStream, preRouteByStream);
+        dispatcher.register(.stream_list, dispatchStream);
+        dispatcher.registerWithRoute(.stream_create, dispatchStream, preRouteByStream);
 
         // Consumer group operations (0x20–0x2C)
-        dispatcher.registerWithRoute(.stream_group_create, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_join, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_leave, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_read, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_ack, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_nack, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_delete, dispatchStub, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_info, dispatchStub, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_create, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_join, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_leave, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_read, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_ack, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_nack, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_delete, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_info, dispatchStream, preRouteByStream);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -87,11 +91,12 @@ pub const StreamHandler = struct {
 
     // ── Dispatch Wrappers ───────────────────────────────────────────────
 
-    fn dispatchStub(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
-        // TODO: Extract StreamProjection from Shard partition and dispatch.
+    fn dispatchStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.stream_handler.handleCommand(req);
+        defer shard.stream_handler.freeResult(cmd_result);
+        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -448,6 +453,105 @@ pub const StreamHandler = struct {
         }
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Response Serialization — CommandResult → Wire Response
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert a stream CommandResult to a wire response and queue it on the connection.
+fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .ok => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .err => |e| {
+            const status = errorCodeToStatus(e.code);
+            shard.sendErrorResponse(conn, request_id, status, e.message);
+        },
+        .kv_not_found => {
+            shard.sendErrorResponse(conn, request_id, .not_found, "not found");
+        },
+        .stream_append_ok => |a| {
+            // Send sequence as 8-byte u64 LE
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, a.sequence, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
+        .stream_messages => |m| {
+            shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .stream_info => |i| {
+            // Serialize: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+            var buf: [52]u8 = undefined;
+            var off: usize = 0;
+            std.mem.writeInt(u64, buf[off..][0..8], i.first_timestamp_ms, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.first_seq, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.last_timestamp_ms, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.last_seq, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.count, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.bytes, .little);
+            off += 8;
+            std.mem.writeInt(u32, buf[off..][0..4], i.partition_count, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
+        .stream_trimmed => |t| {
+            // Send deleted_count + first_seq as two u64 LE values (16 bytes)
+            var buf: [16]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], t.deleted_count, .little);
+            std.mem.writeInt(u64, buf[8..16], t.first_seq, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
+        .group_joined => |j| {
+            // Serialize: [generation_id:u64][partition_count:u32][partition:u32]*
+            const part_count: u32 = @intCast(j.assigned_partitions.len);
+            var buf: [256]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], j.generation_id, .little);
+            std.mem.writeInt(u32, buf[8..12], part_count, .little);
+            var off: usize = 12;
+            for (j.assigned_partitions) |p| {
+                if (off + 4 > buf.len) break;
+                std.mem.writeInt(u32, buf[off..][0..4], p, .little);
+                off += 4;
+            }
+            shard.sendOkResponse(conn, request_id, buf[0..off]);
+        },
+        .group_messages => |m| {
+            shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .group_pending => |p| {
+            shard.sendOkResponse(conn, request_id, p.data);
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled stream response");
+        },
+    }
+}
+
+/// Map CommandResult.ErrorCode to wire StatusCode.
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        .stream_not_found => .not_found,
+        .stream_offset_out_of_range => .bad_request,
+        .stream_partition_not_found => .not_found,
+        .group_not_found => .not_found,
+        .group_rebalancing => .internal_error,
+        .group_consumer_not_found => .not_found,
+        .conflict => .conflict,
+        else => .internal_error,
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization

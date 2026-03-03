@@ -158,7 +158,10 @@ pub const Runtime = struct {
         }
 
         for (0..self.shard_count) |i| {
-            pipes[i] = try std.posix.pipe();
+            // Non-blocking read end so shard's acceptFromPipe drain loop
+            // returns WouldBlock instead of blocking when pipe is empty.
+            const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
+            pipes[i] = .{ fds[0], fds[1] };
             pipes_created += 1;
         }
         self.pipes = pipes;
@@ -187,6 +190,7 @@ pub const Runtime = struct {
                 self.shard_count,
                 self.config.partition_count,
                 pipes[i][0],
+                self.config.data_dir,
             );
             shards_created += 1;
         }

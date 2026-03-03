@@ -28,6 +28,8 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const kv_mod = @import("../projection/kv.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const shard_mod = @import("../node/shard.zig");
+const connection_mod = @import("../node/connection.zig");
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -36,6 +38,9 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
+const KVWAL = @import("../storage/kv_wal.zig").KVWAL;
+const Shard = shard_mod.Shard;
+const Connection = connection_mod.Connection;
 
 /// Reserved key prefixes — operations on these are blocked for user requests.
 const RESERVED_PREFIXES = [_][]const u8{
@@ -110,36 +115,71 @@ pub const KVHandler = struct {
     // When Shard owns Partitions, these will extract the correct
     // Partition's KVProjection based on routing.
 
-    fn dispatchGet(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
-        // TODO: Extract KVProjection from Shard partition, call handleGet,
-        //       serialize CommandResult, send via Connection.queueWrite.
+    fn dispatchGet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.kv_handler.handleCommand(req);
+        defer shard.kv_handler.freeResult(cmd_result);
+        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    fn dispatchPut(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchPut(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.kv_handler.handleCommand(req);
+        defer shard.kv_handler.freeResult(cmd_result);
+
+        // Persist successful puts to WAL
+        switch (cmd_result) {
+            .kv_put_ok => {
+                if (shard.kv_wal) |wal| {
+                    const ttl = req.getTtlSeconds() orelse 0;
+                    const now = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+                    const expiry: u64 = if (ttl > 0) now + ttl * 1_000_000_000 else 0;
+                    wal.appendPut(req.key, req.value, expiry) catch {};
+                    wal.sync();
+                }
+            },
+            else => {},
+        }
+
+        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    fn dispatchDelete(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.kv_handler.handleCommand(req);
+        defer shard.kv_handler.freeResult(cmd_result);
+
+        // Persist successful deletes to WAL
+        switch (cmd_result) {
+            .ok => {
+                if (shard.kv_wal) |wal| {
+                    wal.appendDelete(req.key) catch {};
+                    wal.sync();
+                }
+            },
+            else => {},
+        }
+
+        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    fn dispatchScan(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchScan(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.kv_handler.handleCommand(req);
+        defer shard.kv_handler.freeResult(cmd_result);
+        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    fn dispatchHistory(shard: *anyopaque, conn: *anyopaque, req: Request) void {
-        _ = shard;
-        _ = conn;
-        _ = req;
+    fn dispatchHistory(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const cmd_result = shard.kv_handler.handleCommand(req);
+        defer shard.kv_handler.freeResult(cmd_result);
+        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -217,7 +257,13 @@ pub const KVHandler = struct {
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
 
-        self.kv.put(req.key, req.value, lsn, 0, timestamp) catch {
+        // Compute TTL expiry (nanoseconds from epoch)
+        const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
+            if (ttl_secs == 0) break :blk 0; // 0 means no expiry
+            break :blk timestamp + ttl_secs * 1_000_000_000;
+        } else 0;
+
+        self.kv.put(req.key, req.value, lsn, 0, timestamp, expiry_ns) catch {
             return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
         };
 
@@ -312,6 +358,85 @@ pub const KVHandler = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Response Serialization — CommandResult → Wire Response
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Maximum response buffer: 24-byte header + 8-byte prefix + 256KB payload
+const MAX_RESPONSE_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
+
+/// Convert a CommandResult to a wire response and queue it on the connection.
+/// Handles all KV result variants: kv_value (with version prefix), kv_put_ok,
+/// kv_not_found, kv_cas_failed, kv_condition_not_met, kv_scan_result, ok, err.
+fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
+    switch (cmd_result) {
+        .kv_value => |v| {
+            // CLI expects: [version:u64 LE][value bytes]
+            var resp = proto.Response.init(request_id, .ok, v.value);
+            resp.prefix = v.version;
+            var buf: [MAX_RESPONSE_BUF]u8 = undefined;
+            const serialized = resp.serialize(&buf) catch return;
+            _ = conn.queueWrite(serialized);
+        },
+        .kv_not_found => {
+            var resp = proto.Response.initError(request_id, .not_found);
+            var buf: [128]u8 = undefined;
+            const serialized = resp.serialize(&buf) catch return;
+            _ = conn.queueWrite(serialized);
+        },
+        .kv_put_ok => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .ok => {
+            shard.sendOkResponse(conn, request_id, "");
+        },
+        .kv_cas_failed => {
+            var resp = proto.Response.initError(request_id, .conflict);
+            var buf: [128]u8 = undefined;
+            const serialized = resp.serialize(&buf) catch return;
+            _ = conn.queueWrite(serialized);
+        },
+        .kv_condition_not_met => {
+            var resp = proto.Response.initError(request_id, .conflict);
+            var buf: [128]u8 = undefined;
+            const serialized = resp.serialize(&buf) catch return;
+            _ = conn.queueWrite(serialized);
+        },
+        .kv_scan_result => |scan| {
+            shard.sendOkResponse(conn, request_id, scan.data);
+        },
+        .kv_history_result => |hist| {
+            shard.sendOkResponse(conn, request_id, hist.data);
+        },
+        .err => |e| {
+            const status = errorCodeToStatus(e.code);
+            shard.sendErrorResponse(conn, request_id, status, e.message);
+        },
+        else => {
+            shard.sendErrorResponse(conn, request_id, .internal_error, "unexpected result type");
+        },
+    }
+}
+
+/// Map CommandResult.ErrorCode to wire StatusCode.
+fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
+    return switch (code) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .not_found => .not_found,
+        .already_exists => .conflict,
+        .timeout => .internal_error,
+        .internal_error => .internal_error,
+        .unavailable => .internal_error,
+        .kv_key_too_large => .bad_request,
+        .kv_value_too_large => .bad_request,
+        .kv_namespace_not_found => .not_found,
+        .kv_txn_conflict => .conflict,
+        .conflict => .conflict,
+        else => .internal_error,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -326,15 +451,18 @@ fn isReservedKey(key: []const u8) bool {
 }
 
 /// Serialize scan results to binary format.
-/// Wire format: [count:u32] ([key_len:u16][key][value_len:u32][value][version:u64])* [has_more:u8]
-/// If keys_only=true, value and version are omitted.
+/// Wire format: [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8]
+/// When keys_only=true, value_len is 0 and value is empty (field is still present).
 fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry, keys_only: bool) ![]u8 {
     // Calculate total size
     var total: usize = 4; // count header
     for (entries) |entry| {
         total += 2 + entry.key.len; // key_len + key
-        if (!keys_only) {
-            total += 4 + entry.value.len + 8; // value_len + value + version
+        // Always include value_len field; when keys_only, value_len=0
+        if (keys_only) {
+            total += 4; // value_len only (0)
+        } else {
+            total += 4 + entry.value.len; // value_len + value
         }
     }
     total += 1; // has_more flag
@@ -355,16 +483,15 @@ fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry, keys_o
         @memcpy(buf[offset..][0..entry.key.len], entry.key);
         offset += entry.key.len;
 
-        if (!keys_only) {
-            // Value
+        // Value — always present; empty when keys_only
+        if (keys_only) {
+            std.mem.writeInt(u32, buf[offset..][0..4], 0, .little);
+            offset += 4;
+        } else {
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.value.len), .little);
             offset += 4;
             @memcpy(buf[offset..][0..entry.value.len], entry.value);
             offset += entry.value.len;
-
-            // Version (LSN)
-            std.mem.writeInt(u64, buf[offset..][0..8], entry.lsn, .little);
-            offset += 8;
         }
     }
 
@@ -405,7 +532,7 @@ test "kv handler: get existing key" {
     var kv = KVProjection.init(allocator, 0);
     defer kv.deinit();
 
-    try kv.put("hello", "world", 1, 0, 1000);
+    try kv.put("hello", "world", 1, 0, 1000, 0);
 
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_get, "hello", "", ""));
@@ -453,7 +580,7 @@ test "kv handler: get reserved key blocked" {
     defer kv.deinit();
 
     // Manually put a reserved key (bypass handler)
-    try kv.put("_sys:config", "secret", 1, 0, 1000);
+    try kv.put("_sys:config", "secret", 1, 0, 1000, 0);
 
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_get, "_sys:config", "", ""));
@@ -739,8 +866,8 @@ test "kv handler: scan filters reserved keys" {
     defer kv.deinit();
 
     // Insert user key and reserved key directly into projection
-    try kv.put("user_key", "val", 1, 0, 1000);
-    try kv.put("_sys:hidden", "secret", 2, 0, 2000);
+    try kv.put("user_key", "val", 1, 0, 1000, 0);
+    try kv.put("_sys:hidden", "secret", 2, 0, 2000, 0);
 
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_scan, "", "", ""));
