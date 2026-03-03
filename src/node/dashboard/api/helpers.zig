@@ -20,17 +20,20 @@ pub const MetricsRegistry = @import("../../../metrics/registry.zig").MetricsRegi
 /// Central context providing data access for dashboard API handlers.
 ///
 /// In the new shard architecture, the dashboard thread communicates with
-/// shards via inbox messages. DashboardContext encapsulates this pattern
-/// and provides metrics access for statistics endpoints.
+/// shards via direct projection reads (read-only) and MetricsRegistry
+/// (mutex-protected metadata).
 ///
-/// During the rewrite, handlers that need shard data return properly-shaped
-/// JSON with empty/zero values. As the runtime matures, DashboardContext
-/// will be extended with inbox-based shard queries.
+/// `shard_ptrs` holds opaque pointers to the Shard array — each API
+/// handler casts to the concrete type when it needs projection data.
+/// Read-only access is safe for dashboard display purposes.
 pub const DashboardContext = struct {
     allocator: Allocator,
     metrics: *MetricsRegistry,
     num_shards: u32,
     start_time: i64,
+    /// Opaque pointers to Shard structs (set by runtime after shard creation).
+    /// Handlers cast via `getShard()` to access projections read-only.
+    shard_ptrs: ?[]*anyopaque,
 
     pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
         return .{
@@ -38,6 +41,7 @@ pub const DashboardContext = struct {
             .metrics = metrics,
             .num_shards = num_shards,
             .start_time = std.time.timestamp(),
+            .shard_ptrs = null,
         };
     }
 

@@ -53,8 +53,7 @@ pub fn handleRequest(
         return queues.getQueues(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "queues/")) {
-        const name = path["queues/".len..];
-        return queues.getQueueDetail(allocator, name, ctx);
+        return routeQueue(allocator, method, path["queues/".len..], query_string, ctx);
     }
 
     // ── kv ──────────────────────────────────────────────────
@@ -77,6 +76,28 @@ pub fn handleRequest(
     }
 
     // ── workflow ─────────────────────────────────────────────
+    if (std.mem.eql(u8, path, "workflows")) {
+        // Frontend uses "workflows" — alias to workflow/definitions list
+        return workflows.handleWorkflowRequest(allocator, method, "/definitions", query_string, body, ctx);
+    }
+    if (std.mem.startsWith(u8, path, "workflows/")) {
+        // Frontend uses "workflows/:id" — alias to workflow/runs/:id
+        const run_rest = path["workflows/".len..];
+        // Check for sub-resource  (:id/history)
+        const slash_idx = std.mem.indexOfScalar(u8, run_rest, '/');
+        if (slash_idx) |idx| {
+            const run_id = run_rest[0..idx];
+            const sub2 = run_rest[idx..];
+            // Build /runs/:id/sub path
+            const buf = try std.fmt.allocPrint(allocator, "/runs/{s}{s}", .{ run_id, sub2 });
+            defer allocator.free(buf);
+            return workflows.handleWorkflowRequest(allocator, method, buf, query_string, body, ctx);
+        }
+        // Just /workflows/:id → /runs/:id
+        const buf = try std.fmt.allocPrint(allocator, "/runs/{s}", .{run_rest});
+        defer allocator.free(buf);
+        return workflows.handleWorkflowRequest(allocator, method, buf, query_string, body, ctx);
+    }
     if (std.mem.startsWith(u8, path, "workflow")) {
         const sub = if (path.len > "workflow".len) path["workflow".len..] else "";
         return workflows.handleWorkflowRequest(allocator, method, sub, query_string, body, ctx);
@@ -113,6 +134,31 @@ pub fn handleRequest(
 }
 
 // ─── Sub-routers ─────────────────────────────────────────────────────────────
+
+/// Route /queues/:name[/messages|/dlq[/:seq[/requeue]]|/purge]
+fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const slash_idx = std.mem.indexOfScalar(u8, rest, '/');
+    const name = if (slash_idx) |idx| rest[0..idx] else rest;
+    const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
+
+    if (sub.len == 0) return queues.getQueueDetail(allocator, name, ctx);
+    if (std.mem.eql(u8, sub, "messages")) return queues.getQueueMessages(allocator, name, query_string, ctx);
+    if (std.mem.eql(u8, sub, "dlq")) return queues.getQueueDLQ(allocator, name, query_string, ctx);
+    if (std.mem.eql(u8, sub, "purge")) return queues.purgeQueue(allocator, name, ctx);
+
+    // dlq/:seq or dlq/:seq/requeue
+    if (std.mem.startsWith(u8, sub, "dlq/")) {
+        const dlq_rest = sub["dlq/".len..];
+        if (std.mem.endsWith(u8, dlq_rest, "/requeue")) {
+            const seq_str = dlq_rest[0 .. dlq_rest.len - "/requeue".len];
+            return queues.requeueDLQEntry(allocator, name, seq_str, ctx);
+        }
+        // DELETE /dlq/:seq
+        if (method == .DELETE) return queues.deleteDLQEntry(allocator, name, dlq_rest, ctx);
+    }
+
+    return helpers.jsonError(allocator, "Not found");
+}
 
 /// Route /namespaces/:ns[/streams|/queues|/kv]
 fn routeNamespace(allocator: Allocator, rest: []const u8, _: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
@@ -369,4 +415,48 @@ test "route kv key get" {
     const result = try handleRequest(allocator, .GET, "kv/namespaces/default/keys/mykey", null, "", &ctx);
     defer allocator.free(result);
     try std.testing.expect(result.len > 0);
+}
+
+test "route workflows alias maps to workflow definitions" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try handleRequest(allocator, .GET, "workflows", null, "", &ctx);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "route queue messages" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try handleRequest(allocator, .GET, "queues/myq/messages", null, "", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"messages\":[]") != null);
+}
+
+test "route queue dlq" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try handleRequest(allocator, .GET, "queues/myq/dlq", null, "", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"entries\":[]") != null);
+}
+
+test "route queue purge" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try handleRequest(allocator, .POST, "queues/myq/purge", null, "", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
 }

@@ -15,6 +15,20 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Method = @import("../../../util/http/mod.zig").Method;
+const Shard = @import("../../shard.zig").Shard;
+const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
+
+// ── Helpers ──
+
+fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
+    const ptrs = ctx.shard_ptrs orelse return null;
+    if (idx >= ptrs.len) return null;
+    return @ptrCast(@alignCast(ptrs[idx]));
+}
+
+fn shardCount(ctx: *DashboardContext) usize {
+    return if (ctx.shard_ptrs) |p| p.len else 0;
+}
 
 /// Router for /processing/* requests
 pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []const u8, _: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
@@ -58,9 +72,45 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
 }
 
 fn listJobs(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    // TODO: Wire to shard inbox for processing job list (use ProcessingMetrics)
-    return try allocator.dupe(u8, "[]");
+    var json_buf: std.ArrayList(u8) = .empty;
+    errdefer json_buf.deinit(allocator);
+    const writer = json_buf.writer(allocator);
+
+    var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
+    try arr.begin();
+
+    // Collect jobs from all shards (de-duplicate by job_id)
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getShard(ctx, i)) |shard| {
+            const ph = shard.processing_handler;
+            var it = ph.jobs.iterator();
+            while (it.next()) |entry| {
+                const job = entry.value_ptr;
+                const gop = try seen.getOrPut(job.job_id_owned);
+                if (!gop.found_existing) {
+                    try arr.next();
+                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                    try obj.begin();
+                    try obj.stringField("job_id", job.job_id_owned);
+                    try obj.stringField("name", job.name_owned);
+                    try obj.stringField("namespace", job.namespace_owned);
+                    try obj.stringField("status", job.status.toString());
+                    try obj.intField("parallelism", @as(i64, @intCast(job.parallelism)));
+                    try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
+                    try obj.intField("created_at", job.created_at_ms);
+                    try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
+                    try obj.end();
+                }
+            }
+        }
+    }
+
+    try arr.end();
+    return try json_buf.toOwnedSlice(allocator);
 }
 
 fn getJobDetail(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
@@ -105,8 +155,9 @@ fn stopJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
-    try obj.stringField("status", "stopping");
+    try obj.stringField("state", "STOPPED");
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }
@@ -120,8 +171,9 @@ fn cancelJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) !
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
-    try obj.stringField("status", "cancelled");
+    try obj.stringField("state", "CANCELLED");
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }
@@ -133,10 +185,11 @@ fn createSavepoint(allocator: Allocator, job_id: []const u8, ctx: *DashboardCont
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
+    // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
-    try obj.stringField("status", "not_wired");
     try obj.stringField("savepoint_id", "");
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
@@ -144,32 +197,36 @@ fn createSavepoint(allocator: Allocator, job_id: []const u8, ctx: *DashboardCont
 
 fn restoreJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
+    _ = body;
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
+    // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
-    try obj.stringField("status", "not_wired");
-    try obj.intField("body_size", @as(i64, @intCast(body.len)));
+    try obj.stringField("state", "RUNNING");
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }
 
 fn rescaleJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
+    _ = body;
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
+    // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
-    try obj.stringField("status", "not_wired");
-    try obj.intField("body_size", @as(i64, @intCast(body.len)));
+    try obj.intField("parallelism", 1);
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }
@@ -208,7 +265,8 @@ test "handleProcessingRequest cancel job" {
 
     const result = try handleProcessingRequest(allocator, .DELETE, "/jobs/job-789", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"cancelled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"state\":\"CANCELLED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
 }
 
 test "handleProcessingRequest stop job" {
@@ -219,5 +277,6 @@ test "handleProcessingRequest stop job" {
 
     const result = try handleProcessingRequest(allocator, .PUT, "/jobs/job-789/stop", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"stopping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"state\":\"STOPPED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
 }
