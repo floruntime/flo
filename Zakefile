@@ -34,9 +34,13 @@ build.prod:
 build.dashboard:
     script:
         echo "Building web dashboard..."
-        cd src/node/dashboard
+        cd web
         npm install
         npm run build
+        echo "Copying dashboard assets to src/node/dashboard/dist/..."
+        rm -rf ../src/node/dashboard/dist
+        mkdir -p ../src/node/dashboard/dist
+        cp -r dist/* ../src/node/dashboard/dist/
         echo "✓ Dashboard build complete"
 
 ## Clean build artifacts

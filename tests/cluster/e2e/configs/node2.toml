@@ -1,0 +1,28 @@
+# Flo Cluster Node 2 — local e2e testing
+# Listen: 4451, Metrics: 4452, Dashboard: 4453, Raft: 4951, Gossip: 5051
+
+[server]
+port = 4451
+bind = "127.0.0.1"
+data_dir = "/tmp/flo-cluster-test/node2"
+shards = 2
+
+[storage]
+durability = "async_flush"
+
+[logging]
+level = "info"
+
+[metrics]
+enabled = true
+# port = 0 → auto: 4451 + 1 = 4452
+
+[dashboard]
+enabled = true
+bind = "127.0.0.1"
+# port = 0 → auto: 4451 + 2 = 4453
+
+[cluster]
+enabled = true
+node_id = 2
+seeds = ["127.0.0.1:5041", "127.0.0.1:5051", "127.0.0.1:5061"]

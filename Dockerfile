@@ -60,12 +60,10 @@ RUN case "${TARGETPLATFORM}" in \
 # Stage 3: Runtime image
 FROM alpine:3.19
 
-# Install runtime dependencies
+# Install runtime dependencies (curl for healthcheck; nc is built into busybox)
 RUN apk add --no-cache \
     ca-certificates \
-    curl \
-    libgcc \
-    libstdc++
+    curl
 
 # Create data directory
 RUN mkdir -p /data/flo
@@ -78,9 +76,12 @@ COPY docker/flo.toml /etc/flo/flo.toml
 # Raft (port+500) and Gossip (port+600) only needed for clustering
 EXPOSE 9000 9001 9002
 
-# Health check
+# Health check: try dashboard /health first (rich JSON), fall back to TCP
+# connect on the main port (works even when dashboard is disabled).
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
-    CMD curl -sf http://localhost:9000/health || exit 1
+    CMD curl -sf http://localhost:9002/health \
+     || nc -z localhost 9000 \
+     || exit 1
 
 # Run as non-root user
 RUN addgroup -g 1000 flo && \
