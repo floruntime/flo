@@ -400,13 +400,17 @@ pub const TSHandler = struct {
     // ── RETENTION ───────────────────────────────────────────────────────
 
     fn handleRetention(self: *TSHandler, req: Request) CommandResult {
-        // Retention policy: key = measurement (empty = all), value = duration string e.g. "7d"
-        // Parse retention duration from value
-        if (req.value.len == 0) {
+        // Retention policy: key = measurement, duration from TLV option or value
+        // Client sends raw_ttl via OptionTag.ts_raw_ttl; fallback to req.value
+        const duration_str: []const u8 = if (req.findOption(.ts_raw_ttl)) |opt|
+            opt.asString()
+        else if (req.value.len > 0)
+            req.value
+        else {
             return .{ .err = .{ .code = .invalid_request, .message = "retention duration is required (e.g. '7d', '24h')" } };
-        }
+        };
 
-        const duration_ms = floql_ast.parseDuration(req.value) orelse {
+        const duration_ms = floql_ast.parseDuration(duration_str) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "invalid retention duration" } };
         };
 
@@ -466,10 +470,11 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
         },
         .ts_write_ok => |w| {
-            // Send count (1 point written) as 8-byte u64 LE
-            _ = w;
-            var buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buf, 1, .little);
+            // Send [series_hash:u64][timestamp_ms:i64][sequence:u64] (24 bytes)
+            var buf: [24]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], w.series_hash, .little);
+            std.mem.writeInt(i64, buf[8..16], w.timestamp_ms, .little);
+            std.mem.writeInt(u64, buf[16..24], w.sequence, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
         .ts_read_result => |r| {
