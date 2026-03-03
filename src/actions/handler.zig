@@ -56,11 +56,20 @@ pub const ActionsHandler = struct {
     /// In-memory run store. run_id → RunRecord.
     runs: std.StringHashMap(RunRecord),
 
+    /// In-memory worker registry. worker_id → WorkerRecord.
+    workers: std.StringHashMap(WorkerRecord),
+
     /// Monotonic run counter.
     next_run_id: u64,
 
     const MAX_ACTION_NAME_LEN: usize = 256;
     const MAX_ACTIONS: usize = 10_000;
+    const MAX_WORKERS: usize = 10_000;
+
+    pub const WorkerRecord = struct {
+        worker_id_owned: []const u8,
+        labels_owned: ?[]const u8 = null,
+    };
 
     pub const ActionRecord = struct {
         name_owned: []const u8,
@@ -75,6 +84,9 @@ pub const ActionsHandler = struct {
     pub const RunRecord = struct {
         run_id_owned: []const u8,
         action_name_owned: []const u8,
+        input_owned: ?[]const u8,
+        labels_owned: ?[]const u8 = null,
+        result_owned: ?[]const u8 = null,
         status: ActionRunStatus,
         created_at_ms: i64,
         started_at_ms: ?i64,
@@ -86,6 +98,7 @@ pub const ActionsHandler = struct {
             .allocator = allocator,
             .actions = std.StringHashMap(ActionRecord).init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
+            .workers = std.StringHashMap(WorkerRecord).init(allocator),
             .next_run_id = 1,
         };
     }
@@ -104,8 +117,19 @@ pub const ActionsHandler = struct {
         while (rit.next()) |entry| {
             self.allocator.free(entry.value_ptr.run_id_owned);
             self.allocator.free(entry.value_ptr.action_name_owned);
+            if (entry.value_ptr.input_owned) |inp| self.allocator.free(inp);
+            if (entry.value_ptr.labels_owned) |lbl| self.allocator.free(lbl);
+            if (entry.value_ptr.result_owned) |res| self.allocator.free(res);
         }
         self.runs.deinit();
+
+        // Free all owned worker data
+        var wit = self.workers.iterator();
+        while (wit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.worker_id_owned);
+            if (entry.value_ptr.labels_owned) |lbl| self.allocator.free(lbl);
+        }
+        self.workers.deinit();
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -117,6 +141,9 @@ pub const ActionsHandler = struct {
         dispatcher.register(.action_list, dispatchAction);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.worker_await, dispatchWorkerAwait, preRouteByAction);
+        dispatcher.registerWithRoute(.worker_register, dispatchWorkerCmd, preRouteByAction);
+        dispatcher.registerWithRoute(.worker_complete, dispatchWorkerCmd, preRouteByAction);
+        dispatcher.registerWithRoute(.worker_fail, dispatchWorkerCmd, preRouteByAction);
     }
 
     fn preRouteByAction(req: Request) ?u64 {
@@ -139,12 +166,11 @@ pub const ActionsHandler = struct {
         const result = shard.actions_handler.handleCommand(req);
         defer shard.actions_handler.freeResult(result);
 
-        // After a successful invoke, notify any worker_await waiters for this action
+        // After a successful invoke, notify any worker_await waiters.
+        // Use notifyAny because waiter keys are compound (action_name + worker_id).
         switch (result) {
             .action_invoked => {
-                if (req.key.len > 0) {
-                    shard.waiter_pool.notify(.worker_await, req.key, resolveWorkerAwait, @ptrCast(shard));
-                }
+                shard.waiter_pool.notifyAny(.worker_await, resolveWorkerAwait, @ptrCast(shard));
             },
             else => {},
         }
@@ -152,45 +178,115 @@ pub const ActionsHandler = struct {
         sendActionResponse(shard, conn, req.header.request_id, result);
     }
 
+    /// Dispatch for worker_register, worker_complete, worker_fail opcodes.
+    fn dispatchWorkerCmd(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        switch (op) {
+            .worker_register => {
+                shard.actions_handler.handleWorkerRegister(req);
+                shard.sendOkResponse(conn, req.header.request_id, "");
+            },
+            .worker_complete => {
+                const err_msg = shard.actions_handler.handleWorkerComplete(req);
+                if (err_msg) |msg| {
+                    shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
+                } else {
+                    shard.sendOkResponse(conn, req.header.request_id, "");
+                }
+            },
+            .worker_fail => {
+                const err_msg = shard.actions_handler.handleWorkerFail(req);
+                if (err_msg) |msg| {
+                    shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
+                } else {
+                    shard.sendOkResponse(conn, req.header.request_id, "");
+                }
+            },
+            else => {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown worker opcode");
+            },
+        }
+    }
+
     /// Blocking wait for a task to be dispatched.  Workers call this to receive work.
     fn dispatchWorkerAwait(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (req.key.len == 0) {
+        // Wire format: key = worker_id, value = [count:u32][type_len:u16][type]*
+        // Extract the first task type as the action name for matching.
+        const action_name = extractFirstTaskType(req.value) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "action name is required");
             return;
-        }
+        };
+
+        const worker_id = req.key;
+
+        // Look up worker labels for label matching
+        const worker_labels: ?[]const u8 = if (worker_id.len > 0)
+            if (shard.actions_handler.workers.get(worker_id)) |w| w.labels_owned else null
+        else
+            null;
 
         // Check if there's already a pending run to claim
-        if (shard.actions_handler.claimPendingRun(req.key)) |run_id| {
-            shard.sendOkResponse(conn, req.header.request_id, run_id);
+        if (shard.actions_handler.claimPendingRun(action_name, worker_labels)) |task| {
+            sendTaskAssignment(shard, conn, req.header.request_id, task.run_id, task.input);
             return;
         }
 
-        // No pending work — register blocking waiter
+        // No pending work — register blocking waiter.
+        // Encode compound key: action_name + worker_id (no separator needed,
+        // min_version stores action_name.len).
         const block_ms = req.getBlockMs() orelse 30_000; // default 30s for worker_await
+        var compound_key_buf: [256]u8 = undefined;
+        const action_len: usize = @min(action_name.len, 200);
+        const remaining: usize = 256 - action_len;
+        const wid_len: usize = @min(worker_id.len, remaining);
+        @memcpy(compound_key_buf[0..action_len], action_name[0..action_len]);
+        if (wid_len > 0) {
+            @memcpy(compound_key_buf[action_len .. action_len + wid_len], worker_id[0..wid_len]);
+        }
         _ = shard.waiter_pool.register(.{
             .kind = .worker_await,
             .fd = conn.fd,
             .request_id = req.header.request_id,
-            .key = req.key,
-            .min_version = 0,
+            .key = compound_key_buf[0 .. action_len + wid_len],
+            .min_version = action_len,
             .timeout_ms = block_ms,
         });
         conn.response_deferred = true;
     }
 
-    /// Try to claim a pending run for the given action. Returns the run_id if found.
-    fn claimPendingRun(self: *ActionsHandler, action_name: []const u8) ?[]const u8 {
+    /// Claimed task info returned by claimPendingRun.
+    const ClaimedTask = struct {
+        run_id: []const u8,
+        input: ?[]const u8,
+    };
+
+    /// Try to claim a pending run for the given action. Returns the run_id and input if found.
+    /// If worker_labels is provided, only claims runs whose required labels match.
+    fn claimPendingRun(self: *ActionsHandler, action_name: []const u8, worker_labels: ?[]const u8) ?ClaimedTask {
         var it = self.runs.iterator();
         while (it.next()) |entry| {
             const run = entry.value_ptr;
-            if (run.status == .pending and std.mem.eql(u8, run.action_name_owned, action_name)) {
-                run.status = .running;
-                run.started_at_ms = std.time.milliTimestamp();
-                return run.run_id_owned;
+            if (run.status != .pending) continue;
+            if (!std.mem.eql(u8, run.action_name_owned, action_name)) continue;
+
+            // Label check: if run requires labels, worker must have matching labels
+            if (run.labels_owned) |required| {
+                if (worker_labels) |wl| {
+                    if (!labelsMatch(self.allocator, required, wl)) continue;
+                } else {
+                    // Run requires labels but worker has none — skip
+                    continue;
+                }
             }
+
+            run.status = .running;
+            run.started_at_ms = std.time.milliTimestamp();
+            return .{ .run_id = run.run_id_owned, .input = run.input_owned };
         }
         return null;
     }
@@ -301,11 +397,26 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
         };
 
+        // Store input payload so worker_await can return it.
+        // Parse the invoke value to extract labels and actual input.
+        const parsed_value = parseInvokeValue(req.value);
+        const owned_input: ?[]const u8 = if (parsed_value.input.len > 0)
+            self.allocator.dupe(u8, parsed_value.input) catch null
+        else
+            null;
+
+        const owned_labels: ?[]const u8 = if (parsed_value.labels) |l|
+            self.allocator.dupe(u8, l) catch null
+        else
+            null;
+
         const now_ms: i64 = std.time.milliTimestamp();
 
         self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
             .action_name_owned = owned_action_name,
+            .input_owned = owned_input,
+            .labels_owned = owned_labels,
             .status = .pending,
             .created_at_ms = now_ms,
             .started_at_ms = null,
@@ -313,6 +424,8 @@ pub const ActionsHandler = struct {
         }) catch {
             self.allocator.free(owned_run_id);
             self.allocator.free(owned_action_name);
+            if (owned_input) |inp| self.allocator.free(inp);
+            if (owned_labels) |lbl| self.allocator.free(lbl);
             return .{ .err = .{ .code = .internal_error, .message = "run store failed" } };
         };
 
@@ -468,17 +581,164 @@ pub const ActionsHandler = struct {
         return self.runs.count();
     }
 
+    // ── Worker Command Handlers ─────────────────────────────────────────
+
+    /// Register a worker. key = worker_id.
+    /// value = [count:u32][type_len:u16][type_name]*[has_labels:u8][labels_len:u16][labels]?
+    fn handleWorkerRegister(self: *ActionsHandler, req: Request) void {
+        if (req.key.len == 0) return;
+        const worker_id = req.key;
+
+        // Parse optional labels from value (after task_types).
+        var labels: ?[]const u8 = null;
+        const value = req.value;
+        var offset: usize = 0;
+        if (value.len >= 4) {
+            const count = std.mem.readInt(u32, value[0..4], .little);
+            offset = 4;
+            for (0..count) |_| {
+                if (offset + 2 > value.len) break;
+                const tlen = std.mem.readInt(u16, value[offset..][0..2], .little);
+                offset += 2 + tlen;
+            }
+            // Check for labels
+            if (offset < value.len) {
+                const has_labels = value[offset];
+                offset += 1;
+                if (has_labels == 1 and offset + 2 <= value.len) {
+                    const llen = std.mem.readInt(u16, value[offset..][0..2], .little);
+                    offset += 2;
+                    if (offset + llen <= value.len) {
+                        labels = value[offset .. offset + llen];
+                    }
+                }
+            }
+        }
+
+        // Remove old registration if exists
+        if (self.workers.fetchRemove(worker_id)) |old| {
+            self.allocator.free(old.value.worker_id_owned);
+            if (old.value.labels_owned) |lbl| self.allocator.free(lbl);
+        }
+
+        const owned_id = self.allocator.dupe(u8, worker_id) catch return;
+        const owned_labels: ?[]const u8 = if (labels) |l|
+            self.allocator.dupe(u8, l) catch null
+        else
+            null;
+
+        self.workers.put(owned_id, .{
+            .worker_id_owned = owned_id,
+            .labels_owned = owned_labels,
+        }) catch {
+            self.allocator.free(owned_id);
+            if (owned_labels) |lbl| self.allocator.free(lbl);
+        };
+    }
+
+    /// Complete a task. key = worker_id.
+    /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
+    ///         [outcome_len:u16][outcome][result_len:u16][result]
+    fn handleWorkerComplete(self: *ActionsHandler, req: Request) ?[]const u8 {
+        const value = req.value;
+        var offset: usize = 0;
+
+        // Parse action_name (skip it — we use task_id to find the run)
+        if (offset + 2 > value.len) return "invalid value format";
+        const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2 + aname_len;
+
+        // Parse task_id
+        if (offset + 2 > value.len) return "invalid value format";
+        const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2;
+        if (offset + tid_len > value.len) return "invalid value format";
+        const task_id = value[offset .. offset + tid_len];
+        offset += tid_len;
+
+        // Parse outcome
+        if (offset + 2 > value.len) return "invalid value format";
+        const outcome_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2 + outcome_len;
+
+        // Parse result
+        var result_data: []const u8 = "";
+        if (offset + 2 <= value.len) {
+            const rlen = std.mem.readInt(u16, value[offset..][0..2], .little);
+            offset += 2;
+            if (offset + rlen <= value.len) {
+                result_data = value[offset .. offset + rlen];
+            }
+        }
+
+        // Find and update the run
+        if (self.runs.getPtr(task_id)) |run| {
+            run.status = .completed;
+            run.completed_at_ms = std.time.milliTimestamp();
+            // Store result
+            if (result_data.len > 0) {
+                if (run.result_owned) |old| self.allocator.free(old);
+                run.result_owned = self.allocator.dupe(u8, result_data) catch null;
+            }
+            return null; // success
+        }
+        return "run not found";
+    }
+
+    /// Fail a task. key = worker_id.
+    /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
+    fn handleWorkerFail(self: *ActionsHandler, req: Request) ?[]const u8 {
+        const value = req.value;
+        var offset: usize = 0;
+
+        // Parse action_name (skip)
+        if (offset + 2 > value.len) return "invalid value format";
+        const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2 + aname_len;
+
+        // Parse task_id
+        if (offset + 2 > value.len) return "invalid value format";
+        const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2;
+        if (offset + tid_len > value.len) return "invalid value format";
+        const task_id = value[offset .. offset + tid_len];
+        offset += tid_len;
+
+        // Parse retry flag
+        if (offset >= value.len) return "invalid value format";
+        const retry = value[offset] == 1;
+        offset += 1;
+
+        // Find and update the run
+        if (self.runs.getPtr(task_id)) |run| {
+            if (retry) {
+                // Put back to pending for retry
+                run.status = .pending;
+                run.started_at_ms = null;
+            } else {
+                run.status = .failed;
+                run.completed_at_ms = std.time.milliTimestamp();
+            }
+            return null; // success
+        }
+        return "run not found";
+    }
+
     // ── Serialization ───────────────────────────────────────────────────
 
-    /// Wire format: [count:u32] ([name_len:u16][name][type:u8][version:u32][enabled:u8])*
+    /// Wire format (scan format matching CLI expectations):
+    ///   [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16]
+    /// Key = action name, Value = [type:u8][version:u32][enabled:u8]
     fn serializeActionList(self: *ActionsHandler) ![]u8 {
-        var total_size: usize = 4;
+        const value_size: usize = 1 + 4 + 1; // type + version + enabled
+        var total_size: usize = 4; // count
         var entry_count: u32 = 0;
         var it = self.actions.iterator();
         while (it.next()) |entry| {
-            total_size += 2 + entry.value_ptr.name_owned.len + 1 + 4 + 1; // name_len + name + type + version + enabled
+            total_size += 2 + entry.value_ptr.name_owned.len + 4 + value_size;
             entry_count += 1;
         }
+        total_size += 1 + 2; // has_more(u8) + cursor_len(u16)
 
         const buf = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(buf);
@@ -490,10 +750,14 @@ pub const ActionsHandler = struct {
         var it2 = self.actions.iterator();
         while (it2.next()) |entry| {
             const rec = entry.value_ptr;
+            // key_len + key
             std.mem.writeInt(u16, buf[offset..][0..2], @intCast(rec.name_owned.len), .little);
             offset += 2;
             @memcpy(buf[offset .. offset + rec.name_owned.len], rec.name_owned);
             offset += rec.name_owned.len;
+            // value_len + value (type + version + enabled)
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(value_size), .little);
+            offset += 4;
             buf[offset] = rec.action_type;
             offset += 1;
             std.mem.writeInt(u32, buf[offset..][0..4], rec.version, .little);
@@ -501,6 +765,12 @@ pub const ActionsHandler = struct {
             buf[offset] = if (rec.enabled) 1 else 0;
             offset += 1;
         }
+
+        // No more data, no cursor
+        buf[offset] = 0; // has_more = false
+        offset += 1;
+        std.mem.writeInt(u16, buf[offset..][0..2], 0, .little); // cursor_len = 0
+        offset += 2;
 
         return buf;
     }
@@ -522,16 +792,162 @@ pub const ActionsHandler = struct {
 const Waiter = waiter_pool_mod.Waiter;
 
 /// Worker await resolver: claim a pending run matching the action name.
+/// Waiter key is compound: action_name + worker_id (min_version = action_name.len).
 fn resolveWorkerAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const action_name = waiter.key();
+    const full_key = waiter.key_buf[0..waiter.key_len];
+    const action_name_len = @as(usize, @intCast(waiter.min_version));
+    if (action_name_len > full_key.len) return false;
+    const action_name = full_key[0..action_name_len];
+    const worker_id = full_key[action_name_len..];
+
+    // Look up worker labels for label matching
+    const worker_labels: ?[]const u8 = if (worker_id.len > 0)
+        if (shard.actions_handler.workers.get(worker_id)) |w| w.labels_owned else null
+    else
+        null;
 
     // Try to claim a pending run
-    const run_id = shard.actions_handler.claimPendingRun(action_name) orelse return false;
+    const task = shard.actions_handler.claimPendingRun(action_name, worker_labels) orelse return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone
-    shard.sendOkResponse(conn, waiter.request_id, run_id);
+    sendTaskAssignment(shard, conn, waiter.request_id, task.run_id, task.input);
+    shard.flushToClient(waiter.fd);
     return true;
+}
+
+/// Send a task assignment response in the wire format the CLI expects:
+///   [task_id_len:u16][task_id][payload]
+fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, run_id: []const u8, input: ?[]const u8) void {
+    const payload = input orelse "";
+    var buf: [8192]u8 = undefined;
+    const total = 2 + run_id.len + payload.len;
+    if (total > buf.len) {
+        shard.sendOkResponse(conn, request_id, run_id);
+        return;
+    }
+    std.mem.writeInt(u16, buf[0..2], @intCast(run_id.len), .little);
+    @memcpy(buf[2 .. 2 + run_id.len], run_id);
+    if (payload.len > 0) {
+        @memcpy(buf[2 + run_id.len .. 2 + run_id.len + payload.len], payload);
+    }
+    shard.sendOkResponse(conn, request_id, buf[0..total]);
+}
+
+/// Extract the first task type (action name) from the worker_await value.
+/// Wire format: [count:u32][type_len:u16][type_name]...
+fn extractFirstTaskType(value: []const u8) ?[]const u8 {
+    if (value.len < 6) return null; // need at least count(4) + len(2)
+    const count = std.mem.readInt(u32, value[0..4], .little);
+    if (count == 0) return null;
+    const type_len = std.mem.readInt(u16, value[4..6], .little);
+    if (value.len < 6 + type_len) return null;
+    const name = value[6 .. 6 + type_len];
+    if (name.len == 0) return null;
+    return name;
+}
+
+/// Parse the invoke value wire format to extract labels and actual input.
+/// Wire format:
+///   [priority:u8][delay_ms:i64][has_caller:u8]
+///   [has_idempotency:u8]([idem_len:u16][idem_key])?
+///   [has_labels:u8]([labels_len:u16][labels])?
+///   [input...]
+/// If the value is too short for the header, returns it as-is (backward compat).
+fn parseInvokeValue(value: []const u8) struct { labels: ?[]const u8, input: []const u8 } {
+    // Minimum header: priority(1) + delay_ms(8) + has_caller(1) + has_idem(1) = 11 bytes
+    if (value.len < 11) return .{ .labels = null, .input = value };
+
+    var offset: usize = 0;
+    offset += 1; // priority
+    offset += 8; // delay_ms
+    offset += 1; // has_caller (always 0 currently)
+    if (offset >= value.len) return .{ .labels = null, .input = "" };
+
+    // Idempotency key (optional)
+    const has_idem = value[offset];
+    offset += 1;
+    if (has_idem == 1) {
+        if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
+        const idem_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2 + idem_len;
+    }
+    if (offset >= value.len) return .{ .labels = null, .input = "" };
+
+    // Labels (optional)
+    var labels: ?[]const u8 = null;
+    const has_labels = value[offset];
+    offset += 1;
+    if (has_labels == 1) {
+        if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
+        const labels_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        offset += 2;
+        if (offset + labels_len <= value.len) {
+            labels = value[offset .. offset + labels_len];
+            offset += labels_len;
+        }
+    }
+
+    const input = if (offset < value.len) value[offset..] else "";
+    return .{ .labels = labels, .input = input };
+}
+
+/// Check if worker_labels satisfy all required_labels.
+/// Both are JSON object strings e.g. {"gpu":true,"region":"us-east"}.
+/// Returns true if every key-value in required exists with the same value in worker.
+fn labelsMatch(allocator: Allocator, required_json: []const u8, worker_json: []const u8) bool {
+    const req_parsed = std.json.parseFromSlice(std.json.Value, allocator, required_json, .{}) catch return false;
+    defer req_parsed.deinit();
+    const wrk_parsed = std.json.parseFromSlice(std.json.Value, allocator, worker_json, .{}) catch return false;
+    defer wrk_parsed.deinit();
+
+    const req_obj = switch (req_parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+    const wrk_obj = switch (wrk_parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+
+    const req_keys = req_obj.keys();
+    const req_values = req_obj.values();
+    for (req_keys, req_values) |rkey, rval| {
+        const wval = wrk_obj.get(rkey) orelse return false;
+        if (!jsonValEq(rval, wval)) return false;
+    }
+    return true;
+}
+
+/// Compare two JSON scalar values for equality.
+fn jsonValEq(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .null => switch (b) {
+            .null => true,
+            else => false,
+        },
+        .bool => |va| switch (b) {
+            .bool => |vb| va == vb,
+            else => false,
+        },
+        .integer => |va| switch (b) {
+            .integer => |vb| va == vb,
+            else => false,
+        },
+        .float => |va| switch (b) {
+            .float => |vb| va == vb,
+            else => false,
+        },
+        .string => |va| switch (b) {
+            .string => |vb| std.mem.eql(u8, va, vb),
+            else => false,
+        },
+        .number_string => |va| switch (b) {
+            .number_string => |vb| std.mem.eql(u8, va, vb),
+            else => false,
+        },
+        .array, .object => false,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -658,8 +1074,11 @@ test "actions handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_list)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_delete)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.worker_await)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.worker_register)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.worker_complete)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.worker_fail)] != null);
 
-    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 9), dispatcher.handler_count);
 }
 
 test "actions handler: register" {
