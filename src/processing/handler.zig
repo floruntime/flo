@@ -42,6 +42,17 @@ const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
+const native_registry = @import("operators/native_registry.zig");
+const operator_mod = @import("operator.zig");
+const Operator = operator_mod.Operator;
+const collector_mod = @import("collector.zig");
+const OutputCollector = collector_mod.OutputCollector;
+const context_mod = @import("context.zig");
+const OperatorContext = context_mod.OperatorContext;
+const OperatorMetrics = context_mod.OperatorMetrics;
+const record_mod = @import("record.zig");
+const ProcessingRecord = record_mod.ProcessingRecord;
+
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -70,7 +81,7 @@ pub const ProcessingHandler = struct {
 
     const MAX_JOBS: usize = 100_000;
 
-    /// Per-job pipeline state: source/sink config + read cursor.
+    /// Per-job pipeline state: source/sink config + read cursor + operator chain.
     pub const PipelineState = struct {
         // Source configuration
         source_kind: SourceKind,
@@ -90,6 +101,10 @@ pub const ProcessingHandler = struct {
         ts_cursor_ns: u64, // TS source: next timestamp_ns to read from
         stream_cursor: u64, // Stream source: last offset read
         last_poll_ms: i64, // last time this pipeline was ticked
+
+        // Operator chain — instantiated from job definition
+        operators: []Operator = &.{},
+        operator_backings: []native_registry.CreateResult = &.{},
     };
 
     pub const JobStatus = enum(u8) {
@@ -172,6 +187,13 @@ pub const ProcessingHandler = struct {
     }
 
     fn freePipelineState(self: *ProcessingHandler, pipe: *PipelineState) void {
+        // Free operator chain
+        for (pipe.operator_backings) |*backing| {
+            backing.deinit(self.allocator);
+        }
+        if (pipe.operator_backings.len > 0) self.allocator.free(pipe.operator_backings);
+        if (pipe.operators.len > 0) self.allocator.free(pipe.operators);
+
         if (pipe.src_measurement.len > 0) self.allocator.free(pipe.src_measurement);
         if (pipe.src_field.len > 0) self.allocator.free(pipe.src_field);
         if (pipe.src_stream.len > 0) self.allocator.free(pipe.src_stream);
@@ -310,7 +332,7 @@ pub const ProcessingHandler = struct {
         // Create pipeline execution state from parsed definition
         if (def.primarySource()) |src| {
             if (def.primarySink()) |snk| {
-                self.createPipeline(owned_id, src, snk);
+                self.createPipeline(owned_id, src, snk, &def);
             }
         }
 
@@ -567,7 +589,8 @@ pub const ProcessingHandler = struct {
     // ── Pipeline Execution ──────────────────────────────────────────────
 
     /// Create a pipeline execution state from parsed source/sink specifications.
-    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, snk: *const definition.SinkSpec) void {
+    /// Instantiates the operator chain from the job definition.
+    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, snk: *const definition.SinkSpec, def: *const definition.JobDefinition) void {
         // Compute tag hash for TS source filtering (same algorithm as TSHandler)
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
             var tag_buf: [1024]u8 = undefined;
@@ -584,22 +607,56 @@ pub const ProcessingHandler = struct {
             break :blk if (pos > 0) std.hash.Wyhash.hash(0, tag_buf[0..pos]) else 0;
         } else 0;
 
-        const pipe_state = PipelineState{
+        // Instantiate operator chain from definition
+        const op_specs = def.operators.items;
+        var ops = self.allocator.alloc(Operator, op_specs.len) catch {
+            // Fall through — pipeline will operate with no operators (passthrough)
+            self.pipelines.put(job_id, makePipeState(self.allocator, src, snk, tag_hash)) catch {};
+            return;
+        };
+        var backings = self.allocator.alloc(native_registry.CreateResult, op_specs.len) catch {
+            self.allocator.free(ops);
+            self.pipelines.put(job_id, makePipeState(self.allocator, src, snk, tag_hash)) catch {};
+            return;
+        };
+
+        var count: usize = 0;
+        for (op_specs) |*spec| {
+            if (!native_registry.isNativeType(spec.type_name)) continue;
+            const result = native_registry.create(self.allocator, spec) catch continue;
+            backings[count] = result;
+            ops[count] = result.op;
+            count += 1;
+        }
+
+        var pipe_state = makePipeState(self.allocator, src, snk, tag_hash);
+        if (count > 0) {
+            pipe_state.operators = ops[0..count];
+            pipe_state.operator_backings = backings[0..count];
+        } else {
+            self.allocator.free(ops);
+            self.allocator.free(backings);
+        }
+        self.pipelines.put(job_id, pipe_state) catch {};
+    }
+
+    /// Helper to build a PipelineState with source/sink config (no operators).
+    fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, snk: *const definition.SinkSpec, tag_hash: u64) PipelineState {
+        return .{
             .source_kind = src.kind,
-            .src_measurement = self.allocator.dupe(u8, src.ts_measurement) catch "",
-            .src_field = self.allocator.dupe(u8, if (src.ts_field.len > 0) src.ts_field else "value") catch "",
+            .src_measurement = allocator.dupe(u8, src.ts_measurement) catch "",
+            .src_field = allocator.dupe(u8, if (src.ts_field.len > 0) src.ts_field else "value") catch "",
             .src_tag_hash = tag_hash,
-            .src_stream = self.allocator.dupe(u8, src.stream) catch "",
+            .src_stream = allocator.dupe(u8, src.stream) catch "",
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
             .sink_kind = snk.kind,
-            .sink_target = self.allocator.dupe(u8, snk.target) catch "",
-            .sink_measurement = self.allocator.dupe(u8, snk.ts_measurement) catch "",
-            .sink_value_field = self.allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
+            .sink_target = allocator.dupe(u8, snk.target) catch "",
+            .sink_measurement = allocator.dupe(u8, snk.ts_measurement) catch "",
+            .sink_value_field = allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
             .ts_cursor_ns = 0,
             .stream_cursor = 0,
             .last_poll_ms = 0,
         };
-        self.pipelines.put(job_id, pipe_state) catch {};
     }
 
     /// Drive all running pipelines: poll sources, push to sinks.
@@ -628,7 +685,7 @@ pub const ProcessingHandler = struct {
         }
     }
 
-    /// Tick a TS source pipeline: read points from TSProjection, write to sink.
+    /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
     fn tickTsSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         var point_buf: [256]StoredPoint = undefined;
         const result = shard.ts_handler.ts.queryRange(
@@ -646,27 +703,22 @@ pub const ProcessingHandler = struct {
             // Filter by tag hash if specified
             if (pipe.src_tag_hash != 0 and pt.tag_hash != pipe.src_tag_hash) continue;
 
-            switch (pipe.sink_kind) {
-                .stream => {
-                    // Format TS point as JSON and append to stream
-                    var json_buf: [512]u8 = undefined;
-                    const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-                    const json = std.fmt.bufPrint(&json_buf, "{{\"measurement\":\"{s}\",\"value\":{},\"timestamp_ms\":{d}}}", .{ pipe.src_measurement, pt.field_value, ts_ms }) catch continue;
-                    _ = shard.stream_handler.appendPayload(json) catch continue;
-                },
-                .ts => {
-                    // Write to destination TS measurement
-                    const ual_idx = shard.ts_handler.nextUalIndex();
-                    shard.ts_handler.ts.insert(
-                        pipe.sink_measurement,
-                        pipe.sink_value_field,
-                        pt.field_value,
-                        pt.timestamp_ns,
-                        ual_idx,
-                        pt.tag_hash,
-                    ) catch continue;
-                },
-                else => continue,
+            // Format TS point as JSON record
+            var json_buf: [512]u8 = undefined;
+            const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
+            const json = std.fmt.bufPrint(&json_buf, "{{\"measurement\":\"{s}\",\"value\":{},\"timestamp_ms\":{d}}}", .{ pipe.src_measurement, pt.field_value, ts_ms }) catch continue;
+
+            // Apply operator chain (or pass through directly)
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, shard.allocator) catch null;
+
+            if (output_records) |records| {
+                defer shard.allocator.free(records);
+                for (records) |rec| {
+                    writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash);
+                }
+            } else {
+                // No operators or chain failed — direct passthrough
+                writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash);
             }
 
             // Advance cursor past this point
@@ -678,36 +730,115 @@ pub const ProcessingHandler = struct {
         }
     }
 
-    /// Tick a stream source pipeline: read payloads from stream, write to sink.
+    /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
     fn tickStreamSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         const payloads = shard.stream_handler.readPayloads(pipe.stream_cursor + 1, 100);
         if (payloads.len == 0) return;
         defer shard.stream_handler.allocator.free(payloads);
 
         for (payloads) |payload| {
-            switch (pipe.sink_kind) {
-                .stream => {
-                    _ = shard.stream_handler.appendPayload(payload) catch continue;
-                },
-                .ts => {
-                    // Write JSON payload value to TS measurement
-                    const value = std.fmt.parseFloat(f64, payload) catch 0.0;
-                    const ual_idx = shard.ts_handler.nextUalIndex();
-                    const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
-                    shard.ts_handler.ts.insert(
-                        pipe.sink_measurement,
-                        pipe.sink_value_field,
-                        value,
-                        now_ns,
-                        ual_idx,
-                        0,
-                    ) catch continue;
-                },
-                else => continue,
+            const output_records = applyOperatorChain(pipe.operators, payload, std.time.milliTimestamp(), shard.allocator) catch null;
+
+            if (output_records) |records| {
+                defer shard.allocator.free(records);
+                for (records) |rec| {
+                    writeSinkRecordFromStream(pipe, shard, rec.value);
+                }
+            } else {
+                writeSinkRecordFromStream(pipe, shard, payload);
             }
 
             pipe.stream_cursor += 1;
             job.records_processed += 1;
+        }
+    }
+
+    /// Apply the operator chain to a single input value.
+    /// Returns owned slice of output records (caller must free), or null if no operators.
+    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
+        if (operators.len == 0) return null;
+
+        // Set up collector + context for the chain
+        var collector = OutputCollector.init(allocator);
+        defer collector.deinit();
+        var metrics = OperatorMetrics{};
+        var ctx = OperatorContext{
+            .collector = &collector,
+            .metrics = &metrics,
+            .allocator = allocator,
+            .current_processing_time_ms = std.time.milliTimestamp(),
+            .current_watermark_ms = event_time_ms,
+            .operator_name = "",
+        };
+
+        // Feed the initial record into the first operator
+        const input_rec = ProcessingRecord.fromValue(value, event_time_ms);
+        try operators[0].processElement(input_rec, &ctx);
+
+        // Chain: each operator processes the output of the previous one
+        var i: usize = 1;
+        while (i < operators.len) : (i += 1) {
+            // Snapshot current output before clearing
+            const prev_count = collector.count();
+            const prev_output = collector.drain();
+            // Dupe the records since clear will allow the backing to be reused
+            const staged = allocator.dupe(ProcessingRecord, prev_output[0..prev_count]) catch return null;
+            defer allocator.free(staged);
+            collector.clear();
+            for (staged) |rec| {
+                try operators[i].processElement(rec, &ctx);
+            }
+        }
+
+        // Return final output — must dupe since collector.deinit() frees the backing array
+        const final = collector.drain();
+        if (final.len == 0) {
+            return &.{};
+        }
+        return allocator.dupe(ProcessingRecord, final) catch &.{};
+    }
+
+    /// Write a processed record to the configured sink (TS source variant).
+    fn writeSinkRecord(pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64) void {
+        switch (pipe.sink_kind) {
+            .stream => {
+                _ = shard.stream_handler.appendPayload(payload) catch return;
+            },
+            .ts => {
+                const ual_idx = shard.ts_handler.nextUalIndex();
+                shard.ts_handler.ts.insert(
+                    pipe.sink_measurement,
+                    pipe.sink_value_field,
+                    field_value,
+                    timestamp_ns,
+                    ual_idx,
+                    tag_hash,
+                ) catch return;
+            },
+            else => {},
+        }
+    }
+
+    /// Write a processed record to the configured sink (stream source variant).
+    fn writeSinkRecordFromStream(pipe: *PipelineState, shard: *Shard, payload: []const u8) void {
+        switch (pipe.sink_kind) {
+            .stream => {
+                _ = shard.stream_handler.appendPayload(payload) catch return;
+            },
+            .ts => {
+                const value = std.fmt.parseFloat(f64, payload) catch 0.0;
+                const ual_idx = shard.ts_handler.nextUalIndex();
+                const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
+                shard.ts_handler.ts.insert(
+                    pipe.sink_measurement,
+                    pipe.sink_value_field,
+                    value,
+                    now_ns,
+                    ual_idx,
+                    0,
+                ) catch return;
+            },
+            else => {},
         }
     }
 };
@@ -736,4 +867,60 @@ test "ProcessingHandler: init and deinit" {
     const handler = ProcessingHandler.init(std.testing.allocator);
     var h = handler;
     h.deinit();
+}
+
+test "ProcessingHandler: applyOperatorChain with no operators returns null" {
+    const result = try ProcessingHandler.applyOperatorChain(&.{}, "hello", 100, std.testing.allocator);
+    try std.testing.expect(result == null);
+}
+
+test "ProcessingHandler: applyOperatorChain with passthrough operator" {
+    const allocator = std.testing.allocator;
+
+    // Create a passthrough operator via native_registry
+    var spec = definition.OperatorSpec{
+        .type_name = "passthrough",
+        .name = "test-pass",
+        .module = "",
+        .config = null,
+    };
+    var create_result = try native_registry.create(allocator, &spec);
+    defer create_result.deinit(allocator);
+
+    var ops = [_]Operator{create_result.op};
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, allocator);
+    try std.testing.expect(result != null);
+    const records = result.?;
+    defer allocator.free(records);
+
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings("test-value", records[0].value);
+    try std.testing.expectEqual(@as(i64, 42), records[0].event_time_ms);
+}
+
+test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
+    const allocator = std.testing.allocator;
+
+    // Create a filter operator with "key_not_empty" condition — since our records
+    // have an empty key (fromValue), the filter should reject them.
+    const config_entries = [_]definition.OperatorSpec.ConfigEntry{
+        .{ .key = "condition", .value = "key_not_empty" },
+    };
+    var spec = definition.OperatorSpec{
+        .type_name = "filter",
+        .name = "test-filter",
+        .module = "",
+        .config = &config_entries,
+    };
+    var create_result = try native_registry.create(allocator, &spec);
+    defer create_result.deinit(allocator);
+
+    // Feed a record with no key — filter should reject it
+    var ops = [_]Operator{create_result.op};
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, allocator);
+    try std.testing.expect(result != null);
+    const records = result.?;
+    defer allocator.free(records);
+    // key_not_empty filter rejects records with empty key
+    try std.testing.expectEqual(@as(usize, 0), records.len);
 }

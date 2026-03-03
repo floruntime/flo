@@ -87,6 +87,9 @@ test {
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");
     _ = @import("processing/handler.zig");
+    _ = @import("processing/operator.zig");
+    _ = @import("processing/collector.zig");
+    _ = @import("processing/context.zig");
 }
 
 // Dashboard — Phase 6.1
