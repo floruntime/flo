@@ -35,12 +35,35 @@ const DashboardContext = @import("dashboard/api.zig").DashboardContext;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
+///
+/// ## Port Derivation
+///
+/// Auxiliary ports (metrics, dashboard, raft, gossip) default to 0, meaning
+/// "derive from listen_port + offset". Use the `effective*Port()` methods
+/// instead of accessing the port fields directly. This allows running multiple
+/// instances with a single `--port` flag:
+///
+///   --port 10000  →  metrics=10001, dashboard=10002, raft=10500, gossip=10600
+///
 pub const RuntimeConfig = struct {
+    // =========================================================================
+    // Port Offset Constants
+    // =========================================================================
+    // All auxiliary ports are derived from the base listen_port when set to 0.
+    // This allows running multiple instances with a single --port flag.
+    pub const PORT_OFFSET_METRICS: u16 = 1; // listen_port + 1
+    pub const PORT_OFFSET_DASHBOARD: u16 = 2; // listen_port + 2
+    pub const PORT_OFFSET_RAFT: u16 = 500; // listen_port + 500
+    pub const PORT_OFFSET_GOSSIP: u16 = 600; // listen_port + 600
+
     num_shards: u16 = 0,
     partition_count: u32 = 0,
     data_dir: []const u8 = "~/.flo/data",
+
+    /// TCP port for client connections (default: 9000)
     listen_port: u16 = 9000,
     listen_addr: []const u8 = "0.0.0.0",
+
     durability: Durability = .async_flush,
     cold_storage: ?ColdStorageConfig = null,
     tiered_log: TieredLogConfig = .{},
@@ -51,16 +74,23 @@ pub const RuntimeConfig = struct {
     ws_rate_limit_window_ms: i64 = 60000,
     ws_ping_interval_ms: i64 = 30000,
     ws_pong_timeout_ms: i64 = 10000,
+
     metrics_enabled: bool = true,
-    metrics_port: u16 = 9001,
+    /// Port for HTTP metrics server (0 = derive from listen_port + 1)
+    metrics_port: u16 = 0,
+
     dashboard_enabled: bool = true,
-    dashboard_port: u16 = 9002,
+    /// Port for dashboard HTTP server (0 = derive from listen_port + 2)
+    dashboard_port: u16 = 0,
     dashboard_bind: []const u8 = "0.0.0.0",
     dashboard_cors_origins: ?[]const u8 = null,
     dashboard_admin_token: ?[]const u8 = null,
+
     cluster_node_id: u32 = 0,
-    cluster_raft_port: u16 = 9500,
-    cluster_gossip_port: u16 = 9600,
+    /// Port for Raft RPC communication (0 = derive from listen_port + 500)
+    cluster_raft_port: u16 = 0,
+    /// Port for gossip UDP communication (0 = derive from listen_port + 600)
+    cluster_gossip_port: u16 = 0,
     cluster_seeds: []const []const u8 = &.{},
     cluster_replication_factor: u16 = 1,
     cluster_election_timeout_min_ms: u32 = 150,
@@ -71,6 +101,35 @@ pub const RuntimeConfig = struct {
     cluster_gossip_suspect_timeout_ms: u32 = 5000,
     namespace_deletion_interval_ms: i64 = 5000,
     expose_internal_keys: bool = false,
+
+    // =========================================================================
+    // Port Derivation Methods
+    // =========================================================================
+    // Use these instead of accessing port fields directly.
+
+    /// Get effective metrics port (derives from listen_port + 1 if set to 0)
+    pub fn effectiveMetricsPort(self: RuntimeConfig) u16 {
+        if (self.metrics_port > 0) return self.metrics_port;
+        return self.listen_port +| PORT_OFFSET_METRICS;
+    }
+
+    /// Get effective dashboard port (derives from listen_port + 2 if set to 0)
+    pub fn effectiveDashboardPort(self: RuntimeConfig) u16 {
+        if (self.dashboard_port > 0) return self.dashboard_port;
+        return self.listen_port +| PORT_OFFSET_DASHBOARD;
+    }
+
+    /// Get effective Raft RPC port (derives from listen_port + 500 if set to 0)
+    pub fn effectiveRaftPort(self: RuntimeConfig) u16 {
+        if (self.cluster_raft_port > 0) return self.cluster_raft_port;
+        return self.listen_port +| PORT_OFFSET_RAFT;
+    }
+
+    /// Get effective gossip port (derives from listen_port + 600 if set to 0)
+    pub fn effectiveGossipPort(self: RuntimeConfig) u16 {
+        if (self.cluster_gossip_port > 0) return self.cluster_gossip_port;
+        return self.listen_port +| PORT_OFFSET_GOSSIP;
+    }
 };
 
 /// Node runtime — manages shard threads, acceptor thread, and lifecycle.
@@ -153,6 +212,9 @@ pub const Runtime = struct {
             self.dashboard_server = null;
         }
         if (self.dashboard_ctx) |ctx| {
+            if (ctx.shard_ptrs) |ptrs| {
+                self.allocator.free(ptrs);
+            }
             self.allocator.destroy(ctx);
             self.dashboard_ctx = null;
         }
@@ -277,8 +339,8 @@ pub const Runtime = struct {
         }
 
         // 3.5 Create raft network if cluster is enabled
-        if (self.config.cluster_raft_port > 0 or self.config.cluster_seeds.len > 0) {
-            const raft_port = self.config.cluster_raft_port;
+        if (self.config.effectiveRaftPort() != self.config.listen_port or self.config.cluster_seeds.len > 0) {
+            const raft_port = self.config.effectiveRaftPort();
             const node_id = if (self.config.cluster_node_id > 0)
                 self.config.cluster_node_id
             else
@@ -323,11 +385,21 @@ pub const Runtime = struct {
 
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
+
+            // Wire shard references for read-only projection access
+            if (self.shards) |s| {
+                const ptrs = try self.allocator.alloc(*anyopaque, s.len);
+                for (s, 0..) |*shard, i| {
+                    ptrs[i] = @ptrCast(shard);
+                }
+                ctx.shard_ptrs = ptrs;
+            }
+
             self.dashboard_ctx = ctx;
 
             const server = try self.allocator.create(DashboardServer);
             server.* = DashboardServer.init(self.allocator, .{
-                .port = self.config.dashboard_port,
+                .port = self.config.effectiveDashboardPort(),
                 .bind = self.config.dashboard_bind,
                 .cors_origins = self.config.dashboard_cors_origins orelse "*",
                 .admin_token = self.config.dashboard_admin_token orelse "",
