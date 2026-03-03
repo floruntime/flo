@@ -113,8 +113,22 @@ pub const Acceptor = struct {
     }
 
     /// Peek at the first bytes using MSG_PEEK and determine the target shard.
+    /// Uses a brief poll() to wait for data — the client may not have sent
+    /// the request yet immediately after the TCP handshake completes.
     fn peekAndRoute(self: *Acceptor, fd: i32) u16 {
         var peek_buf: [128]u8 = undefined;
+
+        // Wait up to 10 ms for data to arrive before peeking.
+        // Typically resolves in < 1 ms; prevents round-robin mis-routing
+        // when the client's first write hasn't reached the kernel buffer
+        // by the time the acceptor runs.
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&fds, 10) catch {};
+
         const peeked = peekFd(fd, &peek_buf);
 
         if (peeked.len == 0) {
