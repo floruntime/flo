@@ -96,6 +96,23 @@ pub fn build(b: *std.Build) void {
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
 
+    // ── Integration Tests ──
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    integration_tests.root_module.addImport("src", src_module);
+    integration_tests.root_module.addImport("stdx", stdx_module);
+    integration_tests.root_module.addImport("zware", zware_module);
+    integration_tests.linkLibC();
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
     // ── Test Steps ──
 
     const test_step = b.step("test", "Run all tests");
@@ -106,6 +123,9 @@ pub fn build(b: *std.Build) void {
 
     const e2e_test_step = b.step("test-e2e", "Run end-to-end tests");
     e2e_test_step.dependOn(&run_e2e_tests.step);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
 
     // ── Documentation ──
 

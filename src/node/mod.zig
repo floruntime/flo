@@ -1,4 +1,6 @@
 // Node layer — Acceptor, Reactor, Shard, Dispatcher, Router, Inbox
 // See: NODE_NETWORK_DESIGN.md
-//
-// This module will export all node-layer components once implemented.
+
+pub const inbox = @import("inbox.zig");
+pub const reactor = @import("reactor.zig");
+pub const router = @import("router.zig");

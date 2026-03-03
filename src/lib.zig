@@ -19,12 +19,12 @@ pub const protocol = struct {
 // =============================================================================
 // Node Layer: Acceptor, Reactor, Shard, Dispatcher, Router, Inbox (NEW)
 // =============================================================================
-// pub const node = @import("node/mod.zig"); // TODO: Phase 1
+pub const node = @import("node/mod.zig");
 
 // =============================================================================
 // Storage Layer: UAL, Partition, Snapshot, Memory Controller (NEW)
 // =============================================================================
-// pub const storage = @import("storage/mod.zig"); // TODO: Phase 2
+pub const storage = @import("storage/mod.zig");
 
 // =============================================================================
 // Raft Consensus (NEW)
@@ -34,7 +34,7 @@ pub const protocol = struct {
 // =============================================================================
 // Projection Engines: KV, Queue, Stream, TimeSeries (NEW)
 // =============================================================================
-// pub const projection = @import("projection/mod.zig"); // TODO: Phase 4
+pub const projection = @import("projection/mod.zig");
 
 // =============================================================================
 // Cluster: Controller Raft, Partition Table, Gossip (NEW)
