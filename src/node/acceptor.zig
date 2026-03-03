@@ -317,8 +317,14 @@ test "Acceptor: listen and accept via TCP" {
     var connect_addr = std.net.Address.resolveIp("127.0.0.1", port) catch unreachable;
     try std.posix.connect(client, &connect_addr.any, connect_addr.getOsSockLen());
 
-    // Accept and route
-    const target = try acceptor.acceptOne();
+    // Accept and route — the listen socket is NONBLOCK so we poll briefly
+    // to allow the kernel TCP handshake to complete on the server side.
+    var target: ?u16 = null;
+    for (0..200) |_| {
+        target = try acceptor.acceptOne();
+        if (target != null) break;
+        std.Thread.sleep(1_000_000); // 1ms
+    }
     try std.testing.expect(target != null);
 
     // Read the handed-off fd from the target shard's pipe
