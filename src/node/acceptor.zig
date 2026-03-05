@@ -19,6 +19,7 @@
 //! the pipe becoming readable, reads the fd, and registers it.
 
 const std = @import("std");
+const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const Router = @import("router.zig").Router;
 const routing = @import("router.zig");
@@ -88,6 +89,7 @@ pub const Acceptor = struct {
         try std.posix.listen(fd, 128);
 
         self.listen_fd = fd;
+        log.debug("Acceptor listening on 0.0.0.0:{d} fd={d} shard_count={d}", .{ port, fd, self.shard_count });
     }
 
     /// Accept one connection and route it to the correct shard.
@@ -104,6 +106,7 @@ pub const Acceptor = struct {
 
         // Peek first bytes for routing
         const target = self.peekAndRoute(client_fd);
+        log.debug("Acceptor accepted fd={d} → shard {d} (total={d})", .{ client_fd, target, self.accepted_total + 1 });
 
         // Hand off fd to shard via pipe
         try self.handoff(client_fd, target);

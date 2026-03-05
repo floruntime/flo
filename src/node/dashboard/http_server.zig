@@ -22,6 +22,7 @@ const api = @import("api.zig");
 const assets = @import("assets.zig");
 const http = @import("../../util/http/mod.zig");
 const DashboardContext = api.DashboardContext;
+const log = @import("stdx").log;
 
 // =============================================================================
 // Server Configuration and Implementation
@@ -196,6 +197,7 @@ pub const DashboardServer = struct {
 
         // Route request
         if (parsed.pathStartsWith("/api/v1/")) {
+            log.debug("Dashboard: API request path={s}", .{parsed.path});
             self.handleApiRequest(client, parsed, body, cors_headers);
         } else if (std.mem.eql(u8, parsed.path, "/health")) {
             self.sendResponse(client, .ok, .json, "{\"status\":\"ok\"}", cors_headers);

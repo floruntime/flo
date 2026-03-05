@@ -25,6 +25,7 @@ const ts_mod = @import("../projection/ts.zig");
 const cold_mod = @import("cold/tier_manager.zig");
 const reader_mod = @import("ual/reader.zig");
 const memory_mod = @import("memory.zig");
+const log = @import("stdx").log;
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -173,6 +174,8 @@ pub const Partition = struct {
         if (e.header.index > self.committed_index) {
             self.committed_index = e.header.index;
         }
+
+        log.debug("Partition: applied entry, partition_id={d}, index={d}, type={d}", .{ self.id, e.header.index, e.header.entry_type });
 
         // Save payload to warm store (survives UAL hot ring eviction).
         // Uses the entry's own index as key.
@@ -341,6 +344,7 @@ pub const Partition = struct {
     pub fn snapshot(self: *Partition) ![]u8 {
         const applied = self.router.applied_index;
         const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        log.debug("Partition: taking snapshot, partition_id={d}, applied_index={d}", .{ self.id, applied });
 
         var builder = snapshot_mod.SnapshotBuilder.init(
             self.allocator,
@@ -382,6 +386,7 @@ pub const Partition = struct {
 
         // Restore metadata from snapshot header
         const snap_index = reader.snapshotIndex();
+        log.debug("Partition: recovering from snapshot, partition_id={d}, snap_index={d}, data_len={d}", .{ self.id, snap_index, snapshot_data.len });
         self.current_term = reader.snapshotTerm();
         self.router.applied_index = snap_index;
         self.committed_index = snap_index; // at snapshot time, committed == applied

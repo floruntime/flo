@@ -33,6 +33,7 @@ const RaftLog = raft_log.RaftLog;
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const Config = raft_node.Config;
+const log = @import("stdx").log;
 
 // =============================================================================
 // Constants
@@ -242,6 +243,7 @@ pub const Coordinator = struct {
 
     /// Bootstrap as single-node leader (for first node in cluster)
     pub fn bootstrap(self: *Coordinator) !void {
+        log.debug("Coordinator: bootstrapping as single-node leader, node_id={d}", .{self.node_id});
         try self.raft.bootstrap();
         self.is_leader = true;
     }
@@ -292,10 +294,10 @@ pub const Coordinator = struct {
         @memcpy(buf[6..][0..name.len], name);
 
         self.proposals_total += 1;
+        log.debug("Coordinator: proposing create namespace={s}, partitions={d}, repl_factor={d}", .{ name, partition_count, replication_factor });
         return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
-    /// Propose deleting a namespace
     pub fn proposeDeleteNamespace(self: *Coordinator, name: []const u8) !raft_node.ProposeResult {
         if (!self.is_leader) return error.NotLeader;
 
@@ -308,6 +310,7 @@ pub const Coordinator = struct {
         @memcpy(buf[3..][0..name.len], name);
 
         self.proposals_total += 1;
+        log.debug("Coordinator: proposing delete namespace={s}", .{name});
         return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
@@ -401,6 +404,9 @@ pub const Coordinator = struct {
             applied += 1;
             self.proposals_committed += 1;
         }
+        if (applied > 0) {
+            log.debug("Coordinator: applied {d} committed entries, last_applied={d}", .{ applied, self.last_applied });
+        }
         return applied;
     }
 
@@ -442,6 +448,7 @@ pub const Coordinator = struct {
             .created_at_ns = @as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000,
             .deleted = false,
         });
+        log.debug("Coordinator: created namespace={s}, partitions={d}", .{ name, partition_count });
     }
 
     fn applyDeleteNamespace(self: *Coordinator, data: []const u8) !void {
@@ -477,11 +484,13 @@ pub const Coordinator = struct {
         @memcpy(info.address[0..addr_len], data[8..][0..addr_len]);
 
         try self.nodes.put(self.allocator, nid, info);
+        log.debug("Coordinator: added node={d}, port={d}, shards={d}", .{ nid, port, shard_count });
     }
 
     fn applyRemoveNode(self: *Coordinator, data: []const u8) !void {
         if (data.len < 4) return;
         const nid = std.mem.readInt(u32, data[0..4], .little);
+        log.debug("Coordinator: removed node={d}", .{nid});
         _ = self.nodes.remove(nid);
     }
 

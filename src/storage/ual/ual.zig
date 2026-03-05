@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const entry_mod = @import("entry.zig");
+const log = @import("stdx").log;
 
 const Entry = entry_mod.Entry;
 const Header = entry_mod.Header;
@@ -171,6 +172,7 @@ pub const UAL = struct {
             cb(self.on_append_ctx.?, entry);
         }
 
+        log.debug("UAL: appended index={d}, entry_count={d}, used={d}/{d}", .{ entry.header.index, self.entry_count, self.used(), self.capacity });
         return entry.header.index;
     }
 
@@ -301,6 +303,7 @@ pub const UAL = struct {
 
         const hdr: *const Header = @ptrCast(@alignCast(&hdr_buf));
         const entry_size: u64 = HEADER_SIZE + hdr.payload_len;
+        log.debug("UAL: evicting oldest index={d}, size={d}, remaining={d}", .{ hdr.index, entry_size, self.entry_count - 1 });
 
         // Call eviction callback before removing
         if (self.on_evict) |cb| {

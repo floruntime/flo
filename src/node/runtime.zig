@@ -19,6 +19,7 @@
 //! 4. Clean up pipes and resources
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Shard = @import("shard.zig").Shard;
 const Acceptor = @import("acceptor.zig").Acceptor;
 const Inbox = @import("inbox.zig").Inbox;
@@ -267,6 +268,12 @@ pub const Runtime = struct {
 
     /// Start the runtime: create shards, spawn threads, start acceptor.
     pub fn start(self: *Runtime) !void {
+        log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
+            self.shard_count,
+            self.config.listen_port,
+            self.config.data_dir,
+        });
+
         // 1. Create per-shard pipes
         const pipes = try self.allocator.alloc([2]i32, self.shard_count);
         errdefer self.allocator.free(pipes);
@@ -293,6 +300,8 @@ pub const Runtime = struct {
             write_ends[i] = pipes[i][1];
         }
         self.pipe_write_ends = write_ends;
+
+        log.debug("Runtime.start: created {d} shard pipes", .{self.shard_count});
 
         // 2. Create shards
         const shards = try self.allocator.alloc(Shard, self.shard_count);
@@ -330,12 +339,15 @@ pub const Runtime = struct {
             shards[i].registerBackgroundTasks();
         }
 
+        log.debug("Runtime.start: {d} shards initialized", .{shards_created});
+
         // 3. Spawn shard threads
         const threads = try self.allocator.alloc(std.Thread, self.shard_count);
         self.shard_threads = threads;
 
         for (0..self.shard_count) |i| {
             threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
+            log.debug("Runtime.start: spawned shard thread {d}", .{i});
         }
 
         // 3.5 Create raft network if cluster is enabled
@@ -373,9 +385,11 @@ pub const Runtime = struct {
         var acceptor = Acceptor.init(write_ends, shards[0].router);
         try acceptor.listen(self.config.listen_port);
         self.acceptor = acceptor;
+        log.debug("Runtime.start: acceptor listening on port {d}", .{self.config.listen_port});
 
         // 5. Spawn acceptor thread
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
+        log.debug("Runtime.start: acceptor thread spawned", .{});
 
         // 6. Start dashboard HTTP server if enabled
         if (self.config.dashboard_enabled) {
@@ -409,6 +423,7 @@ pub const Runtime = struct {
         }
 
         self.started = true;
+        log.debug("Runtime.start: all components started, node is ready", .{});
     }
 
     /// Wire cross-shard walk contexts for all walk-registered opcodes.
@@ -457,6 +472,7 @@ pub const Runtime = struct {
     /// Graceful shutdown in reverse order.
     pub fn stop(self: *Runtime) void {
         if (!self.started) return;
+        log.debug("Runtime.stop: initiating graceful shutdown", .{});
 
         // 0. Stop dashboard HTTP server first
         if (self.dashboard_server) |server| {
@@ -509,6 +525,7 @@ pub const Runtime = struct {
         }
 
         self.started = false;
+        log.debug("Runtime.stop: shutdown complete", .{});
     }
 };
 

@@ -43,6 +43,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
+const log = @import("stdx").log;
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -194,6 +195,7 @@ pub const KVHandler = struct {
         // Normal non-blocking GET.
         const cmd_result = shard.kv_handler.*.handleCommand(req);
         defer shard.kv_handler.*.freeResult(cmd_result);
+        log.debug("KV GET: key={s}, hit={}", .{ req.key, cmd_result != .kv_not_found });
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -240,6 +242,7 @@ pub const KVHandler = struct {
 
         // Build response from the committed version (the propose index IS the version)
         const cmd_result = CommandResult{ .kv_put_ok = .{ .version = propose_result.index } };
+        log.debug("KV PUT: key={s}, value_len={d}, version={d}", .{ req.key, req.value.len, propose_result.index });
 
         // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace);
@@ -294,6 +297,7 @@ pub const KVHandler = struct {
         // Notify any blocking GET waiters for this key via unified pool (qualified key)
         shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
+        log.debug("KV DELETE: key={s}", .{req.key});
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 

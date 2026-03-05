@@ -35,10 +35,6 @@ function formatNumber(n: number): string {
     return n.toLocaleString();
 }
 
-function formatRate(n: number): string {
-    return `${formatNumber(n)}/s`;
-}
-
 function parseOperatorCount(operators?: string): number {
     if (!operators) return 0;
     return operators.split(',').filter(s => s.trim()).length;

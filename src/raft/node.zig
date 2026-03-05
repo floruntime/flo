@@ -25,6 +25,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const RaftLog = raft_log.RaftLog;
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
+const log = @import("stdx").log;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Types
@@ -161,8 +162,8 @@ pub const RaftNode = struct {
         log_capacity: usize,
         config: Config,
     ) !RaftNode {
-        var log = try RaftLog.init(allocator, log_capacity);
-        errdefer log.deinit();
+        var raft_log_inst = try RaftLog.init(allocator, log_capacity);
+        errdefer raft_log_inst.deinit();
 
         return .{
             .id = node_id,
@@ -180,7 +181,7 @@ pub const RaftNode = struct {
             .peer_count = 0,
             .votes_received = 0,
             .votes_needed = 0,
-            .log = log,
+            .log = raft_log_inst,
             .config = config,
             .allocator = allocator,
             .elections_started = 0,
@@ -221,6 +222,7 @@ pub const RaftNode = struct {
 
     /// Bootstrap as a single-node cluster. Self-elects as leader.
     pub fn bootstrap(self: *RaftNode) !void {
+        log.debug("Raft: bootstrapping single-node, node_id={d}, group_id={d}", .{ self.id, self.group_id });
         self.current_term = 1;
         self.voted_for = self.id;
         self.role = .leader;
@@ -240,6 +242,7 @@ pub const RaftNode = struct {
         noop.header.crc32c = noop.computeCrc();
         const idx = try self.log.append(&noop);
         self.commit_index = idx;
+        log.debug("Raft: bootstrap complete, leader at term=1, commit_index={d}", .{idx});
     }
 
     // ── Tick (Timer) ────────────────────────────────────────────────────
@@ -281,6 +284,7 @@ pub const RaftNode = struct {
     pub fn startElection(self: *RaftNode) VoteRequest {
         self.current_term += 1;
         self.role = .candidate;
+        log.debug("Raft: starting election, node_id={d}, new_term={d}", .{ self.id, self.current_term });
         self.voted_for = self.id;
         self.leader_id = NO_VOTE;
         self.votes_received = 1; // vote for self
@@ -321,6 +325,7 @@ pub const RaftNode = struct {
 
         // Grant vote
         self.voted_for = req.candidate_id;
+        log.debug("Raft: vote granted to node={d}, term={d}", .{ req.candidate_id, self.current_term });
         return .{ .term = self.current_term, .vote_granted = true, .from = self.id };
     }
 
@@ -339,6 +344,7 @@ pub const RaftNode = struct {
             self.votes_received += 1;
             if (self.votes_received >= self.votes_needed) {
                 self.becomeLeader();
+                log.debug("Raft: won election, node_id={d}, term={d}, votes={d}", .{ self.id, self.current_term, self.votes_received });
                 return true;
             }
         }
@@ -464,12 +470,14 @@ pub const RaftNode = struct {
             self.commit_index = idx;
         }
 
+        log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @intFromEnum(entry_type), payload.len });
         return .{ .index = idx, .term = self.current_term };
     }
 
     // ── Internal ────────────────────────────────────────────────────────
 
     fn stepDown(self: *RaftNode, new_term: u64) void {
+        log.debug("Raft: stepping down, node_id={d}, old_term={d}, new_term={d}", .{ self.id, self.current_term, new_term });
         self.current_term = new_term;
         self.role = .follower;
         self.voted_for = NO_VOTE;
@@ -478,6 +486,7 @@ pub const RaftNode = struct {
     }
 
     fn becomeLeader(self: *RaftNode) void {
+        log.debug("Raft: becoming leader, node_id={d}, term={d}", .{ self.id, self.current_term });
         self.role = .leader;
         self.leader_id = self.id;
         self.elections_won += 1;

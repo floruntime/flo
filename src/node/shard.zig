@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const log = @import("stdx").log;
 const reactor_mod = @import("reactor.zig");
 const Reactor = reactor_mod.Reactor;
 const ReactorEvent = reactor_mod.Event;
@@ -350,6 +351,14 @@ pub const Shard = struct {
         // Register ping handler
         dispatcher.register(.ping, handlePing);
 
+        log.debug("Shard {d} initializing: shard_count={d} partition_count={d} handlers={d} data_dir={s}", .{
+            shard_id,
+            shard_count,
+            partition_count,
+            dispatcher.handler_count,
+            data_dir orelse "(ephemeral)",
+        });
+
         return .{
             .id = shard_id,
             .allocator = allocator,
@@ -515,6 +524,7 @@ pub const Shard = struct {
     pub fn addConnection(self: *Shard, fd: i32) !*Connection {
         const conn = try self.allocator.create(Connection);
         conn.* = try Connection.init(self.allocator, fd, self.next_conn_id);
+        log.debug("Shard {d} new connection: fd={d} conn_id={d}", .{ self.id, fd, self.next_conn_id });
         self.next_conn_id += 1;
 
         try self.connections.put(self.allocator, fd, conn);
@@ -531,6 +541,7 @@ pub const Shard = struct {
 
     /// Remove connection, unregister from reactor, and close the fd.
     pub fn closeConnection(self: *Shard, fd: i32) void {
+        log.debug("Shard {d} closing connection: fd={d}", .{ self.id, fd });
         // Clean up any pending waiters for this connection
         self.waiter_pool.removeByFd(fd);
         self.reactor.removeSource(fd);
@@ -736,12 +747,15 @@ pub const Shard = struct {
     /// Enter the main reactor loop. Blocks until `shutdown()` is called.
     pub fn run(self: *Shard) !void {
         self.running = true;
+        log.debug("Shard {d} entering reactor loop", .{self.id});
 
         while (self.running) {
             _ = self.tick(100) catch {
                 continue;
             };
         }
+
+        log.debug("Shard {d} reactor loop exited", .{self.id});
     }
 
     /// Signal the shard to stop.

@@ -14,6 +14,7 @@ const std = @import("std");
 const segment = @import("segment.zig");
 const entry_mod = @import("entry.zig");
 const checksum_mod = @import("../../util/checksum.zig");
+const log = @import("stdx").log;
 
 const Entry = entry_mod.Entry;
 const ENTRY_HEADER_SIZE = entry_mod.HEADER_SIZE;
@@ -183,6 +184,8 @@ pub const SegmentWriter = struct {
             std.fs.cwd().deleteFile(tmp_path) catch {};
             return err;
         };
+
+        log.debug("UAL Writer: segment written, path={s}, entries={d}, data_size={d}", .{ path, self.entry_count, sealed.len });
     }
 };
 

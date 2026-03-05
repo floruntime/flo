@@ -221,7 +221,7 @@ run:
             zig build run -- {{cmd}}
         fi
 
-## Install zflo to system PATH
+## Install flo to system PATH
 install:
     arch: macos
     flag: --dir|-d [string="/opt/homebrew/bin"] "Install directory"
@@ -230,7 +230,7 @@ install:
         @rm -rf {{dir}}/flo
         @zig build install-system -Dinstall_dir={{dir}}
 
-## Install zflo to system PATH (Linux)
+## Install flo to system PATH (Linux)
 install:
     arch: linux
     flag: --dir|-d [string="$HOME/.local/bin"] "Install directory"
