@@ -118,7 +118,7 @@ export function KeyDetail() {
 
     // ---- SSE: live updates for the selected key ----
     const { status: sseStatus } = useKVWatch(ns, selectedKey, {
-        onUpdate: useCallback((evt) => {
+        onUpdate: useCallback((evt: { key: string; version?: number; value?: string }) => {
             // Push the new value/version into the inspector without a full reload.
             setSelectedKeyData(prev => {
                 if (!prev || prev.key !== evt.key) return prev;

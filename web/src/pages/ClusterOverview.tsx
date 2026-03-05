@@ -15,8 +15,8 @@ export function ClusterOverview() {
     if (statsError) return <ErrorState message={statsError} onRetry={refetchStats} />;
 
     const totalIngestRate = streams?.reduce((acc, s) => acc + s.ingest_rate, 0) ?? 0;
-    const totalInvocations = actions?.reduce((acc, a) => acc + a.invocations, 0) ?? 0;
-    const totalErrors = actions?.reduce((acc, a) => acc + a.errors, 0) ?? 0;
+    const totalInvocations = actions?.reduce((acc, a) => acc + a.runs.total, 0) ?? 0;
+    const totalErrors = actions?.reduce((acc, a) => acc + a.runs.failed, 0) ?? 0;
     const activeWorkflows = Array.isArray(workflows) ? workflows.filter(w => w.status === 'running').length : 0;
 
     return (
@@ -158,17 +158,17 @@ export function ClusterOverview() {
                         {totalErrors} issue{totalErrors !== 1 ? 's' : ''} need <span className="text-error">attention</span>
                     </h3>
                     <div className="grid gap-4 md:grid-cols-2">
-                        {actions?.filter(a => a.errors > 0).map(a => (
+                        {actions?.filter(a => a.runs.failed > 0).map(a => (
                             <Card key={a.name} className="bg-surface border-surface-border">
                                 <CardHeader className="flex flex-row items-center justify-between py-3 border-b border-surface-border">
                                     <div className="flex items-center gap-2">
                                         <Activity className="w-3 h-3 text-error" />
                                         <span className="text-xs font-bold text-text-secondary uppercase tracking-wider">{a.name}</span>
-                                        <span className="bg-error text-white text-xs px-1.5 rounded">{a.errors}</span>
+                                        <span className="bg-error text-white text-xs px-1.5 rounded">{a.runs.failed}</span>
                                     </div>
                                 </CardHeader>
                                 <CardContent className="p-4">
-                                    <p className="text-sm text-text-secondary">{a.errors} errors detected - Avg latency {a.avg_latency}ms</p>
+                                    <p className="text-sm text-text-secondary">{a.runs.failed} errors detected</p>
                                 </CardContent>
                             </Card>
                         ))}

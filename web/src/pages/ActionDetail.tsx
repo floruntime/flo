@@ -25,18 +25,6 @@ function formatDate(ms: number): string {
     return new Date(ms).toLocaleString();
 }
 
-function StatusDot({ status }: { status: ActionRunInfo['status'] }) {
-    const colors: Record<string, string> = {
-        pending: "bg-yellow-400",
-        running: "bg-blue-400 animate-pulse",
-        completed: "bg-emerald-400",
-        failed: "bg-red-400",
-        cancelled: "bg-zinc-400",
-        timed_out: "bg-orange-400",
-    };
-    return <span className={cn("w-2 h-2 rounded-full inline-block", colors[status] || "bg-zinc-400")} />;
-}
-
 function StatusBadge({ status }: { status: ActionRunInfo['status'] }) {
     const styles: Record<string, string> = {
         pending: "bg-yellow-400/10 text-yellow-400",

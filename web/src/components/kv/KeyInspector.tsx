@@ -26,12 +26,12 @@ interface KeyInspectorProps {
     isLive?: boolean;
 }
 
-export function KeyInspector({ kvKey, className, onClose, onRefresh, onDeleted, fullPage, isLive }: KeyInspectorProps) {
+export function KeyInspector({ kvKey, className, onClose, onRefresh, onDeleted, fullPage: _fullPage, isLive }: KeyInspectorProps) {
     const [selectedVersion, setSelectedVersionNum] = useState<number>(kvKey.current_version);
     const [diffVersion, setDiffVersionNum] = useState<number | undefined>(undefined);
     const [showVersions, setShowVersions] = useState(false);
     const [editing, setEditing] = useState(false);
-    const [saving, setSaving] = useState(false);
+    const [_saving, setSaving] = useState(false);
     const [copied, setCopied] = useState(false);
     const [deleting, setDeleting] = useState(false);
 

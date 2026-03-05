@@ -119,7 +119,7 @@ export function WorkflowSidebar({ activeViewId, onSelectView, collapsed, onToggl
           <PanelLeft className="w-4 h-4" />
         </button>
         {SYSTEM_VIEWS.map(view => {
-          const Icon = VIEW_ICONS[view.icon] || Layers;
+          const Icon = VIEW_ICONS[view.icon ?? 'layers'] || Layers;
           return (
             <button
               key={view.id}
@@ -137,7 +137,7 @@ export function WorkflowSidebar({ activeViewId, onSelectView, collapsed, onToggl
         {customViews.length > 0 && (
           <div className="border-t border-surface-border my-1 pt-1">
             {customViews.map(view => {
-              const Icon = VIEW_ICONS[view.icon] || Bookmark;
+              const Icon = VIEW_ICONS[view.icon ?? 'bookmark'] || Bookmark;
               return (
                 <button
                   key={view.id}
@@ -174,7 +174,7 @@ export function WorkflowSidebar({ activeViewId, onSelectView, collapsed, onToggl
       <div className="px-2 py-2 space-y-0.5">
         <p className="text-[10px] uppercase tracking-wider text-text-secondary/60 font-medium px-2 mb-1">System</p>
         {SYSTEM_VIEWS.map(view => {
-          const Icon = VIEW_ICONS[view.icon] || Layers;
+          const Icon = VIEW_ICONS[view.icon ?? 'layers'] || Layers;
           const isActive = activeViewId === view.id;
           const count = viewCounts[view.id] || 0;
           return (
@@ -243,7 +243,7 @@ export function WorkflowSidebar({ activeViewId, onSelectView, collapsed, onToggl
           </div>
         )}
         {customViews.map(view => {
-          const Icon = VIEW_ICONS[view.icon] || Bookmark;
+          const Icon = VIEW_ICONS[view.icon ?? 'bookmark'] || Bookmark;
           const isActive = activeViewId === view.id;
           const count = viewCounts[view.id] || 0;
           return (

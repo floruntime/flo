@@ -237,6 +237,7 @@ export const generateMockVersions = (key: string, count: number): KVVersion[] =>
         };
 
         versions.push({
+            version: count - i,
             lsn: currentLsn,
             timestamp: currentTime,
             value: isDeleted ? "(tombstone)" : JSON.stringify(valueObj, null, 2),
@@ -282,6 +283,7 @@ export const generateMockKeys = (count: number, namespace: string): KVKey[] => {
         keys.push({
             key: keyName,
             namespace,
+            current_version: versionCount,
             current_lsn: latest.lsn,
             version_count: versionCount,
             size: JSON.stringify(latest.value).length,
@@ -327,14 +329,14 @@ import type {
 } from "./api";
 
 export const MOCK_QUEUES: QueueInfo[] = [
-    { name: "order-processing", namespace: "production", pending: 23, available: 1450, enqueued: 89420, dequeued: 87947, dlq_count: 12 },
-    { name: "email-notifications", namespace: "production", pending: 5, available: 320, enqueued: 45000, dequeued: 44675, dlq_count: 3 },
-    { name: "image-resize", namespace: "production", pending: 142, available: 8900, enqueued: 125000, dequeued: 115958, dlq_count: 0 },
-    { name: "payment-webhooks", namespace: "production", pending: 0, available: 0, enqueued: 12300, dequeued: 12300, dlq_count: 0 },
-    { name: "analytics-events", namespace: "analytics", pending: 3, available: 52000, enqueued: 980000, dequeued: 927997, dlq_count: 45 },
-    { name: "video-transcode", namespace: "media", pending: 87, available: 234, enqueued: 4500, dequeued: 4179, dlq_count: 8 },
-    { name: "user-signup-flow", namespace: "production", pending: 0, available: 15, enqueued: 3200, dequeued: 3185, dlq_count: 1 },
-    { name: "inventory-sync", namespace: "production", pending: 12, available: 890, enqueued: 67000, dequeued: 66098, dlq_count: 6 },
+    { name: "order-processing", namespace: "production", pending: 23, available: 1450, enqueued: 89420, dequeued: 87947, acked: 87900, nacked: 47, dlq_count: 12, bytes_total: 1024 * 1024 * 230 },
+    { name: "email-notifications", namespace: "production", pending: 5, available: 320, enqueued: 45000, dequeued: 44675, acked: 44670, nacked: 5, dlq_count: 3, bytes_total: 1024 * 1024 * 95 },
+    { name: "image-resize", namespace: "production", pending: 142, available: 8900, enqueued: 125000, dequeued: 115958, acked: 115900, nacked: 58, dlq_count: 0, bytes_total: 1024 * 1024 * 1500 },
+    { name: "payment-webhooks", namespace: "production", pending: 0, available: 0, enqueued: 12300, dequeued: 12300, acked: 12300, nacked: 0, dlq_count: 0, bytes_total: 1024 * 1024 * 18 },
+    { name: "analytics-events", namespace: "analytics", pending: 3, available: 52000, enqueued: 980000, dequeued: 927997, acked: 927900, nacked: 97, dlq_count: 45, bytes_total: 1024 * 1024 * 4200 },
+    { name: "video-transcode", namespace: "media", pending: 87, available: 234, enqueued: 4500, dequeued: 4179, acked: 4170, nacked: 9, dlq_count: 8, bytes_total: 1024 * 1024 * 850 },
+    { name: "user-signup-flow", namespace: "production", pending: 0, available: 15, enqueued: 3200, dequeued: 3185, acked: 3184, nacked: 1, dlq_count: 1, bytes_total: 1024 * 1024 * 6 },
+    { name: "inventory-sync", namespace: "production", pending: 12, available: 890, enqueued: 67000, dequeued: 66098, acked: 66090, nacked: 8, dlq_count: 6, bytes_total: 1024 * 1024 * 310 },
 ];
 
 export const MOCK_QUEUE_DETAIL: Record<string, QueueDetail> = {

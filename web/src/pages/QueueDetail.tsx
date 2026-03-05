@@ -2,10 +2,10 @@ import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
     ChevronLeft, MessageSquare, Inbox, Clock, Activity,
-    ArrowDownRight, ArrowUpRight, SkullIcon, CheckCircle,
+    ArrowDownRight, ArrowUpRight, CheckCircle,
     XCircle, AlertTriangle, Package, Timer, RefreshCw,
-    Trash2, RotateCcw, Eye, Copy, ChevronDown, ChevronRight,
-    Gauge, Shield, Tag, Hash
+    Trash2, RotateCcw, Copy, ChevronRight,
+    Shield, Tag, Hash
 } from "lucide-react";
 import { Card, CardContent } from "../components/ui/Card";
 import { PageTabs } from "../components/ui/PageTabs";
@@ -454,7 +454,7 @@ function MessageRow({ message, isExpanded, onToggle }: {
 // Tab: Dead Letter Queue
 // =============================================================================
 
-function DLQTab({ queueName, dlqCount }: { queueName: string; dlqCount: number }) {
+function DLQTab({ queueName, dlqCount: _dlqCount }: { queueName: string; dlqCount: number }) {
     const [expandedEntry, setExpandedEntry] = useState<number | null>(null);
 
     // Fetch DLQ entries from API
@@ -646,7 +646,7 @@ export function QueueDetail() {
     const [activeTab, setActiveTab] = useState('overview');
 
     // Try real API, fall back to mock
-    const { data: apiDetail, loading, error, refetch } = useApi(
+    const { data: apiDetail, loading, error: _error, refetch } = useApi(
         () => api.getQueueDetail(queueName || ''),
         [queueName],
         5000
