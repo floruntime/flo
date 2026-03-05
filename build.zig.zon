@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .zware = .{
-            .url = "https://github.com/malcolmstill/zware/archive/master.tar.gz",
-            .hash = "zware-0.0.1-ZA7j6QwqBQA3LRAg37cZYusj_JRPY-rMAMOSQAOs_7Hh",
+            .url = "https://github.com/malcolmstill/zware/archive/7ad2536b7c30b9e4229ce67c53dbf11d29a23c2c.tar.gz",
+            .hash = "zware-0.0.1-ZA7j6egqBQAl3S23jLKjfPkZmD2jKY_uyczBl_crrebU",
         },
     },
     .paths = .{
