@@ -145,7 +145,7 @@ pub const ColdTierManager = struct {
         // upload() uses the key transiently; manifest.addEntry() dupes it.
         const basename = std.fs.path.basename(source_name);
         var key_buf: [512]u8 = undefined;
-        const cold_key = std.fmt.bufPrint(&key_buf, "{s}shard-{d}/partition-{d}/{s}", .{
+        const cold_key = std.fmt.bufPrint(&key_buf, "{s}{d:0>5}/partition-{d}/{s}", .{
             self.config.key_prefix,
             self.config.shard_id,
             self.config.partition_id,

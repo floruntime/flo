@@ -267,8 +267,8 @@ pub const Shard = struct {
 
         var shard_data_dir: ?[]const u8 = null;
         if (data_dir) |dir| {
-            // Build shard-specific data directory: data_dir/shard-N/
-            const shard_dir = try std.fmt.allocPrint(allocator, "{s}/shard-{d}", .{ dir, shard_id });
+            // Build shard-specific data directory: data_dir/00000/
+            const shard_dir = try std.fmt.allocPrint(allocator, "{s}/{d:0>5}", .{ dir, shard_id });
             errdefer allocator.free(shard_dir);
 
             // Ensure directory exists
