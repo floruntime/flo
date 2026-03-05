@@ -32,7 +32,7 @@ pub const SystemManifest = struct {
     version: []const u8,
 
     const FILENAME = "SYSTEM";
-    const CURRENT_VERSION = "2.0.0";
+    const CURRENT_VERSION = "1.0.0";
 
     /// Load manifest from data directory. Returns null if SYSTEM file not found.
     pub fn load(allocator: Allocator, data_path: []const u8) !?SystemManifest {

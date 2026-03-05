@@ -383,7 +383,7 @@ test "ColdTierManager: archive and download round-trip" {
 
     // Write segment to a local file (simulating warm tier)
     std.fs.cwd().makePath(test_dir) catch {};
-    const seg_path = try std.fmt.allocPrint(allocator, "{s}/seg-1.flseg", .{test_dir});
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/0000000001.flseg", .{test_dir});
     defer allocator.free(seg_path);
     {
         const file = try std.fs.cwd().createFile(seg_path, .{});
@@ -442,7 +442,7 @@ test "ColdTierManager: manifest save and load persistence" {
         const seg_data = try makeTestSegment(allocator);
         defer allocator.free(seg_data);
 
-        try manager.archiveSegmentData(seg_data, "seg-1.flseg");
+        try manager.archiveSegmentData(seg_data, "0000000001.flseg");
         try testing.expectEqual(@as(usize, 1), manager.segmentCount());
 
         // Persist the manifest

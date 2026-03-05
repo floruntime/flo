@@ -135,7 +135,7 @@ pub const BatchHeader = extern struct {
 
 /// Generate a segment filename from the first index.
 pub fn segmentFilename(buf: []u8, first_index: u64) ?[]const u8 {
-    const result = std.fmt.bufPrint(buf, "seg-{d}.flseg", .{first_index}) catch return null;
+    const result = std.fmt.bufPrint(buf, "{d:0>10}.flseg", .{first_index}) catch return null;
     return result;
 }
 
@@ -173,7 +173,7 @@ test "segment: filename generation" {
     var buf: [64]u8 = undefined;
     const name = segmentFilename(&buf, 12345);
     try std.testing.expect(name != null);
-    try std.testing.expectEqualStrings("seg-12345.flseg", name.?);
+    try std.testing.expectEqualStrings("0000012345.flseg", name.?);
 }
 
 test "segment: entry type bitmap" {

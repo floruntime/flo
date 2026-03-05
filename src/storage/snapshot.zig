@@ -203,7 +203,7 @@ pub const SnapshotBuilder = struct {
     }
 
     /// Seal and write atomically to a directory.
-    /// Writes `snap-{index}-{timestamp}.fsnap` and updates MANIFEST.
+    /// Writes `{index:0>10}-{timestamp}.fsnap` and updates MANIFEST.
     pub fn writeToDir(self: *SnapshotBuilder, dir: std.fs.Dir) !void {
         const data = try self.seal();
         defer self.allocator.free(data);
@@ -328,16 +328,16 @@ pub const SnapshotReader = struct {
 // Filename / MANIFEST Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Format a snapshot filename: `snap-{index}-{timestamp_ns}.fsnap`
+/// Format a snapshot filename: `{index:0>10}-{timestamp_ns}.fsnap`
 pub fn snapshotFilename(buf: []u8, index: u64, timestamp_ns: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "snap-{d}-{d}.fsnap", .{ index, timestamp_ns }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{d:0>10}-{d}.fsnap", .{ index, timestamp_ns }) catch buf[0..0];
 }
 
 /// Parse index and timestamp from a snapshot filename.
 pub fn parseSnapshotFilename(name: []const u8) ?SnapshotInfo {
-    if (!std.mem.startsWith(u8, name, "snap-")) return null;
     if (!std.mem.endsWith(u8, name, ".fsnap")) return null;
-    const inner = name[5 .. name.len - 6];
+    if (name.len < 7) return null; // minimum: "0-0.fsnap"
+    const inner = name[0 .. name.len - 6];
     const dash = std.mem.indexOf(u8, inner, "-") orelse return null;
     const index = std.fmt.parseInt(u64, inner[0..dash], 10) catch return null;
     const ts = std.fmt.parseInt(u64, inner[dash + 1 ..], 10) catch return null;
@@ -580,7 +580,7 @@ test "snapshot: version mismatch" {
 test "snapshot filename: format and parse" {
     var buf: [128]u8 = undefined;
     const name = snapshotFilename(&buf, 1000, 1234567890);
-    try testing.expectEqualStrings("snap-1000-1234567890.fsnap", name);
+    try testing.expectEqualStrings("0000001000-1234567890.fsnap", name);
 
     const info = parseSnapshotFilename(name).?;
     try testing.expectEqual(@as(u64, 1000), info.index);
@@ -588,10 +588,10 @@ test "snapshot filename: format and parse" {
 }
 
 test "snapshot filename: parse invalid" {
-    try testing.expect(parseSnapshotFilename("not-a-snapshot.fsnap") == null);
-    try testing.expect(parseSnapshotFilename("snap-abc-123.fsnap") == null);
-    try testing.expect(parseSnapshotFilename("snap-100-200.txt") == null);
+    try testing.expect(parseSnapshotFilename("abc-123.fsnap") == null);
+    try testing.expect(parseSnapshotFilename("100-200.txt") == null);
     try testing.expect(parseSnapshotFilename("") == null);
+    try testing.expect(parseSnapshotFilename("short") == null);
 }
 
 test "snapshot: recovery — load latest snapshot index" {
@@ -652,7 +652,7 @@ test "snapshot: MANIFEST write and read" {
     try testing.expect(nothing == null);
 
     // Write MANIFEST
-    const filename = "snap-500-100000.fsnap";
+    const filename = "0000000500-100000.fsnap";
     try writeManifest(tmp.dir, filename);
 
     // Read back
@@ -660,7 +660,7 @@ test "snapshot: MANIFEST write and read" {
     try testing.expectEqualStrings(filename, result.?);
 
     // Overwrite MANIFEST
-    const filename2 = "snap-1000-200000.fsnap";
+    const filename2 = "0000001000-200000.fsnap";
     try writeManifest(tmp.dir, filename2);
 
     const result2 = try readManifest(tmp.dir, &read_buf);
