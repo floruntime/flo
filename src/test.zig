@@ -37,6 +37,7 @@ test {
     _ = @import("node/shard_walker.zig");
     _ = @import("node/task_scheduler.zig");
     _ = @import("node/ws_handler.zig");
+    _ = @import("node/manifest.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");

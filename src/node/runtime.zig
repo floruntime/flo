@@ -30,6 +30,7 @@ const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfi
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const generateNodeId = @import("../raft/network.zig").generateNodeId;
+const manifest = @import("manifest.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
@@ -273,6 +274,14 @@ pub const Runtime = struct {
             self.config.listen_port,
             self.config.data_dir,
         });
+
+        // 0. Topology safety — validate shard/partition count against SYSTEM manifest
+        try manifest.ensureTopology(
+            self.allocator,
+            self.config.data_dir,
+            self.shard_count,
+            self.config.partition_count,
+        );
 
         // 1. Create per-shard pipes
         const pipes = try self.allocator.alloc([2]i32, self.shard_count);
