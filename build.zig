@@ -170,8 +170,8 @@ pub fn build(b: *std.Build) void {
         bench_exe.root_module.addImport("src", src_module);
         bench_exe.root_module.addImport("stdx", stdx_module);
         bench_exe.linkLibC();
-        b.installArtifact(bench_exe);
-        bench_step.dependOn(&bench_exe.step);
+        const install_bench = b.addInstallArtifact(bench_exe, .{});
+        bench_step.dependOn(&install_bench.step);
     }
 
     // ── Documentation ──
