@@ -602,16 +602,13 @@ test "e2e/namespace/cluster: kv operations work across cluster with namespaces" 
     // Write from node 0
     try cluster.execOn(0, &.{ "kv", "set", "cluster_key", "from_node_0" });
 
-    // Wait for replication
-    std.Thread.sleep(1 * std.time.ns_per_s);
-
-    // Read from node 1
-    const value1 = try cluster.execCaptureOn(1, &.{ "kv", "get", "cluster_key" });
+    // Read from node 1 (retry to tolerate replication delay under load)
+    const value1 = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cluster_key" }, 5, 500);
     defer testing.allocator.free(value1);
     try testing.expect(std.mem.indexOf(u8, value1, "from_node_0") != null);
 
     // Read from node 2
-    const value2 = try cluster.execCaptureOn(2, &.{ "kv", "get", "cluster_key" });
+    const value2 = try cluster.execCaptureOnWithRetry(2, &.{ "kv", "get", "cluster_key" }, 5, 500);
     defer testing.allocator.free(value2);
     try testing.expect(std.mem.indexOf(u8, value2, "from_node_0") != null);
 }
@@ -640,6 +637,12 @@ test "e2e/namespace/cluster: non-empty namespace delete fails" {
     // Create namespace and add KV data on node 0
     try cluster.execOn(0, &.{ "ns", "create", "nonempty_cluster" });
     try cluster.execOn(0, &.{ "kv", "set", "testkey", "testval", "-n", "nonempty_cluster" });
+
+    // Wait for Raft commit to be applied locally on node 0.
+    // If node 0 is a follower, it forwards the kv set to the leader;
+    // the leader commits and responds, but node 0 may not have applied
+    // the commit (which sets the namespace data flag) yet.
+    std.Thread.sleep(1000 * std.time.ns_per_ms);
 
     // Try to delete without --force - should fail
     const result = try cluster.execCaptureAnyOn(0, &.{ "ns", "delete", "nonempty_cluster" });

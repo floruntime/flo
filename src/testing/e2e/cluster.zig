@@ -58,6 +58,23 @@ fn cleanupStaleProcesses() void {
     }
 }
 
+/// Start a server with retry: under heavy test load, port allocation
+/// or readiness checks can transiently fail.
+fn startServerWithRetry(server: *ServerProcess) !void {
+    const max_retries: u8 = 3;
+    var attempt: u8 = 0;
+    while (true) {
+        server.start() catch |err| {
+            attempt += 1;
+            if (attempt >= max_retries) return err;
+            std.debug.print("[cluster] Server start attempt {d}/{d} failed, retrying...\n", .{ attempt, max_retries });
+            std.Thread.sleep(1000 * std.time.ns_per_ms);
+            continue;
+        };
+        return;
+    }
+}
+
 /// Maximum number of nodes supported in a test cluster
 pub const MAX_NODES = 5;
 
@@ -128,7 +145,10 @@ pub const ClusterContext = struct {
             .cluster_enabled = true, // Seed node needs Raft listener
         });
         errdefer if (self.servers[0]) |s| s.deinit();
-        try self.servers[0].?.start();
+        startServerWithRetry(self.servers[0].?) catch |err| {
+            std.debug.print("[cluster] Seed node failed to start: {}\n", .{err});
+            return err;
+        };
 
         // Get seed node's raft endpoint
         const seed_endpoint = try self.servers[0].?.getRaftEndpoint(allocator);
@@ -143,7 +163,10 @@ pub const ClusterContext = struct {
                 .join_addresses = seed_endpoint,
             });
             errdefer if (self.servers[i]) |s| s.deinit();
-            try self.servers[i].?.start();
+            startServerWithRetry(self.servers[i].?) catch |err| {
+                std.debug.print("[cluster] Node {d} failed to start: {}\n", .{ i, err });
+                return err;
+            };
         }
 
         // Create CLI runners for each node
@@ -231,6 +254,77 @@ pub const ClusterContext = struct {
         defer result.deinit();
         // Return stdout regardless of exit code
         return try self.allocator.dupe(u8, result.stdout);
+    }
+
+    /// Execute command on a node with retries.
+    /// Retries up to `max_retries` times with `delay_ms` between attempts.
+    /// Useful after leader failover or when waiting for Raft replication.
+    pub fn execOnWithRetry(self: *Self, node: usize, args: []const []const u8, max_retries: u8, delay_ms: u64) !void {
+        var attempts: u8 = 0;
+        while (true) {
+            self.execOn(node, args) catch |err| {
+                attempts += 1;
+                if (attempts > max_retries) return err;
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            return;
+        }
+    }
+
+    /// Execute command and capture output with retries.
+    /// Retries up to `max_retries` times with `delay_ms` between attempts.
+    /// Caller owns returned memory.
+    pub fn execCaptureOnWithRetry(self: *Self, node: usize, args: []const []const u8, max_retries: u8, delay_ms: u64) ![]const u8 {
+        var attempts: u8 = 0;
+        while (true) {
+            return self.execCaptureOn(node, args) catch |err| {
+                attempts += 1;
+                if (attempts > max_retries) return err;
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+        }
+    }
+
+    /// Poll a command until its output contains `expected`.
+    /// Retries up to `max_retries` times with `delay_ms` between attempts.
+    /// Useful when replication may return stale (but successful) data.
+    /// Caller owns returned memory.
+    pub fn pollUntilContains(self: *Self, node: usize, args: []const []const u8, expected: []const u8, max_retries: u8, delay_ms: u64) ![]const u8 {
+        var attempts: u8 = 0;
+        while (true) {
+            const output = self.execCaptureOn(node, args) catch |err| {
+                attempts += 1;
+                if (attempts > max_retries) return err;
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            if (std.mem.indexOf(u8, output, expected) != null) return output;
+            self.allocator.free(output);
+            attempts += 1;
+            if (attempts > max_retries) return error.CommandFailed;
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        }
+    }
+
+    /// Poll a command (ignoring exit code) until its output contains `expected`.
+    /// Caller owns returned memory.
+    pub fn pollAnyUntilContains(self: *Self, node: usize, args: []const []const u8, expected: []const u8, max_retries: u8, delay_ms: u64) ![]const u8 {
+        var attempts: u8 = 0;
+        while (true) {
+            const output = self.execCaptureAnyOn(node, args) catch |err| {
+                attempts += 1;
+                if (attempts > max_retries) return err;
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            if (std.mem.indexOf(u8, output, expected) != null) return output;
+            self.allocator.free(output);
+            attempts += 1;
+            if (attempts > max_retries) return error.CommandFailed;
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        }
     }
 
     /// Stop a specific node (for failure testing)

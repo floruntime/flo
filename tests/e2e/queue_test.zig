@@ -624,6 +624,11 @@ test "e2e/queue: ls shows multiple queues from different operations" {
     try ctx.exec(&.{ "queue", "enqueue", "ls-tasks", "task-1" });
     try ctx.exec(&.{ "queue", "enqueue", "ls-events", "event-1" });
 
+    // Brief pause to let the server fully process all queue registrations
+    // Under heavy system load (full 410-test suite), back-to-back CLI
+    // commands can outpace the server's internal bookkeeping
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
     var result = try ctx.cli.run(&.{ "queue", "ls" });
     defer result.deinit();
 

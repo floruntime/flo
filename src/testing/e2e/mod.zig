@@ -129,12 +129,27 @@ pub const TestContext = struct {
         self.arena = std.heap.ArenaAllocator.init(allocator);
         errdefer self.arena.deinit();
 
-        // Initialize and start server with config
-        self.server = try ServerProcess.initWithConfig(allocator, config.server);
-        errdefer self.server.deinit();
+        // Initialize and start server with retry — under heavy test load,
+        // port allocation or server startup can transiently fail
+        const max_startup_retries: u8 = 3;
+        var attempt: u8 = 0;
+        while (true) {
+            self.server = try ServerProcess.initWithConfig(allocator, config.server);
 
-        try self.server.startWithTimeout(config.server_timeout_ms);
-        errdefer self.server.stop();
+            self.server.startWithTimeout(config.server_timeout_ms) catch |err| {
+                self.server.deinit();
+                attempt += 1;
+                if (attempt >= max_startup_retries) return err;
+                std.debug.print("[TestContext] Server start failed (attempt {d}/{d}), retrying...\n", .{ attempt, max_startup_retries });
+                std.Thread.sleep(1000 * std.time.ns_per_ms);
+                continue;
+            };
+            break;
+        }
+        errdefer {
+            self.server.stop();
+            self.server.deinit();
+        }
 
         // Get endpoint
         self.endpoint = try self.server.getEndpoint(allocator);

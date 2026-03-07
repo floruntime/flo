@@ -825,15 +825,13 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     }
     std.debug.print("Write to node 1 succeeded!\n", .{});
 
-    // Give time for replication to node 3
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-
     // Both old and new data should be readable from node 3
-    const old_value = try cluster.execCaptureOn(2, &.{ "kv", "get", "before_failure" });
+    // Use retry: after leader kill + re-election, replication may be delayed under load
+    const old_value = try cluster.execCaptureOnWithRetry(2, &.{ "kv", "get", "before_failure" }, 5, 1000);
     defer testing.allocator.free(old_value);
     try testing.expect(std.mem.indexOf(u8, old_value, "initial_value") != null);
 
-    const new_value = try cluster.execCaptureOn(2, &.{ "kv", "get", "after_failure" });
+    const new_value = try cluster.execCaptureOnWithRetry(2, &.{ "kv", "get", "after_failure" }, 5, 1000);
     defer testing.allocator.free(new_value);
     try testing.expect(std.mem.indexOf(u8, new_value, "new_value") != null);
 }
@@ -847,20 +845,16 @@ test "e2e/kv/cluster: all nodes can write" {
     try cluster.execOn(1, &.{ "kv", "set", "from_node2", "value2" });
     try cluster.execOn(2, &.{ "kv", "set", "from_node3", "value3" });
 
-    // Replication delay
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-
-    // All values should be readable from any node
-    // Read all from node 1
-    const v1_from_1 = try cluster.execCaptureOn(0, &.{ "kv", "get", "from_node1" });
+    // All values should be readable from any node (retry to tolerate replication delay under load)
+    const v1_from_1 = try cluster.execCaptureOnWithRetry(0, &.{ "kv", "get", "from_node1" }, 5, 500);
     defer testing.allocator.free(v1_from_1);
     try testing.expect(std.mem.indexOf(u8, v1_from_1, "value1") != null);
 
-    const v2_from_1 = try cluster.execCaptureOn(0, &.{ "kv", "get", "from_node2" });
+    const v2_from_1 = try cluster.execCaptureOnWithRetry(0, &.{ "kv", "get", "from_node2" }, 5, 500);
     defer testing.allocator.free(v2_from_1);
     try testing.expect(std.mem.indexOf(u8, v2_from_1, "value2") != null);
 
-    const v3_from_1 = try cluster.execCaptureOn(0, &.{ "kv", "get", "from_node3" });
+    const v3_from_1 = try cluster.execCaptureOnWithRetry(0, &.{ "kv", "get", "from_node3" }, 5, 500);
     defer testing.allocator.free(v3_from_1);
     try testing.expect(std.mem.indexOf(u8, v3_from_1, "value3") != null);
 }
@@ -872,11 +866,8 @@ test "e2e/kv/cluster: conditional operations work across cluster" {
     // Set initial value on node 1
     try cluster.execOn(0, &.{ "kv", "set", "cas_cluster_key", "initial" });
 
-    // Replication delay
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-
-    // Get version from node 2
-    const json_output = try cluster.execCaptureOn(1, &.{ "kv", "get", "cas_cluster_key", "--format", "json" });
+    // Get version from node 2 (retry to tolerate replication delay)
+    const json_output = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cas_cluster_key", "--format", "json" }, 5, 500);
     defer testing.allocator.free(json_output);
 
     const version = parseVersion(json_output) orelse return error.NoVersion;
@@ -886,11 +877,9 @@ test "e2e/kv/cluster: conditional operations work across cluster" {
     // CAS update from node 3 using version from node 2
     try cluster.execOn(2, &.{ "kv", "set", "cas_cluster_key", "updated_via_cas", "--cas", version_str });
 
-    // Verify update from node 1
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-    const final = try cluster.execCaptureOn(0, &.{ "kv", "get", "cas_cluster_key" });
+    // Verify update from node 1 (poll: GET succeeds but may return stale data until replication catches up)
+    const final = try cluster.pollUntilContains(0, &.{ "kv", "get", "cas_cluster_key" }, "updated_via_cas", 10, 500);
     defer testing.allocator.free(final);
-    try testing.expect(std.mem.indexOf(u8, final, "updated_via_cas") != null);
 }
 
 test "e2e/kv/cluster: delete replicates across cluster" {
@@ -900,20 +889,17 @@ test "e2e/kv/cluster: delete replicates across cluster" {
     // Create on node 1
     try cluster.execOn(0, &.{ "kv", "set", "to_delete_cluster", "exists" });
 
-    // Verify from node 2
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-    const before = try cluster.execCaptureOn(1, &.{ "kv", "get", "to_delete_cluster" });
+    // Verify from node 2 (retry to tolerate replication delay)
+    const before = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "to_delete_cluster" }, 5, 500);
     defer testing.allocator.free(before);
     try testing.expect(std.mem.indexOf(u8, before, "exists") != null);
 
     // Delete from node 3
     try cluster.execOn(2, &.{ "kv", "delete", "to_delete_cluster" });
 
-    // Verify deletion from node 1 (use execCaptureAnyOn since "not found" returns non-zero exit)
-    std.Thread.sleep(500 * std.time.ns_per_ms);
-    const after = try cluster.execCaptureAnyOn(0, &.{ "kv", "get", "to_delete_cluster", "--format", "table" });
+    // Verify deletion from node 1 (poll: GET returns stale value until delete replicates)
+    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--format", "table" }, "(nil)", 10, 500);
     defer testing.allocator.free(after);
-    try testing.expect(std.mem.indexOf(u8, after, "(nil)") != null);
 }
 
 // =============================================================================

@@ -595,6 +595,10 @@ fn findFreePort() !u16 {
     const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(sock);
 
+    // Allow reuse of TIME_WAIT ports — critical when running hundreds of tests
+    // back-to-back, each spawning/stopping server processes
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
     var addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     try std.posix.bind(sock, &addr.any, @sizeOf(std.posix.sockaddr.in));
 
