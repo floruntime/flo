@@ -1359,8 +1359,8 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             shard.flushToClient(waiter.fd);
         },
         .worker_await => {
-            // Worker await timeout → not_found (no task available)
-            shard.sendErrorResponse(conn, waiter.request_id, .not_found, "no task available");
+            // Worker await timeout → empty response (no task available)
+            shard.sendOkResponse(conn, waiter.request_id, "");
             shard.flushToClient(waiter.fd);
         },
     }

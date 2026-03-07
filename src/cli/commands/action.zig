@@ -363,9 +363,103 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     }
 
     ctx.print("Run: {s}\n", .{run_id});
-    if (result.asString()) |data| {
-        ctx.print("{s}\n", .{data});
+    if (result.asRawData()) |data| {
+        printActionRunStatus(ctx, data);
     }
+}
+
+/// Parse and print the binary action_run_status wire format.
+/// Format: [run_id_len:u32][run_id][status:u8][created_at:i64]
+///         [has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
+///         [has_output:u8][output_len?:u32][output?][has_error:u8][error_len?:u32][error?]
+///         [retry_count:u32]
+fn printActionRunStatus(ctx: *commander.Context, data: []const u8) void {
+    var off: usize = 0;
+
+    // run_id
+    const rid = readSlice(data, &off) orelse {
+        ctx.print("{s}\n", .{data});
+        return;
+    };
+    _ = rid; // already printed by caller as "Run: <run_id>"
+
+    // status
+    if (off >= data.len) return;
+    const status_byte = data[off];
+    off += 1;
+    const status_str: []const u8 = switch (status_byte) {
+        0 => "pending",
+        1 => "running",
+        2 => "completed",
+        3 => "failed",
+        4 => "cancelled",
+        5 => "timed_out",
+        else => "unknown",
+    };
+    ctx.print("status: {s}\n", .{status_str});
+
+    // created_at
+    if (off + 8 > data.len) return;
+    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
+    off += 8;
+    ctx.print("created_at: {d}\n", .{created_at});
+
+    // started_at (optional)
+    if (readOptionalI64(data, &off)) |started| {
+        ctx.print("started_at: {d}\n", .{started});
+    }
+
+    // completed_at (optional)
+    if (readOptionalI64(data, &off)) |completed| {
+        ctx.print("completed_at: {d}\n", .{completed});
+    }
+
+    // output (optional slice)
+    if (readOptionalSlice(data, &off)) |output| {
+        ctx.print("output: {s}\n", .{output});
+    }
+
+    // error_message (optional slice)
+    if (readOptionalSlice(data, &off)) |err_msg| {
+        ctx.print("error: {s}\n", .{err_msg});
+    }
+
+    // retry_count
+    if (off + 4 <= data.len) {
+        const retries = std.mem.readInt(u32, data[off..][0..4], .little);
+        if (retries > 0) {
+            ctx.print("retry_count: {d}\n", .{retries});
+        }
+    }
+}
+
+fn readSlice(data: []const u8, off: *usize) ?[]const u8 {
+    if (off.* + 4 > data.len) return null;
+    const len = std.mem.readInt(u32, data[off.*..][0..4], .little);
+    off.* += 4;
+    if (off.* + len > data.len) return null;
+    const slice = data[off.* .. off.* + len];
+    off.* += len;
+    return slice;
+}
+
+fn readOptionalI64(data: []const u8, off: *usize) ?i64 {
+    if (off.* >= data.len) return null;
+    const has = data[off.*];
+    off.* += 1;
+    if (has == 0) return null;
+    if (off.* + 8 > data.len) return null;
+    const val = std.mem.readInt(i64, data[off.*..][0..8], .little);
+    off.* += 8;
+    return val;
+}
+
+fn readOptionalSlice(data: []const u8, off: *usize) ?[]const u8 {
+    if (off.* >= data.len) return null;
+    const has = data[off.*];
+    off.* += 1;
+    if (has == 0) return null;
+    return readSlice(data, off);
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
