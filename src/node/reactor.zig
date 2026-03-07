@@ -8,7 +8,7 @@
 //   - Timer (Raft tick, TTL sweep, etc.)
 //
 // On macOS/FreeBSD: kqueue
-// On Linux: epoll + timerfd
+// On Linux: io_uring (multi-shot poll, native async I/O)
 //
 // See: NODE_NETWORK_DESIGN.md §5 — The Reactor
 
@@ -16,10 +16,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const linux = if (is_linux) std.os.linux else void;
 
 const is_linux = builtin.os.tag == .linux;
 const is_bsd = builtin.os.tag == .macos or builtin.os.tag == .freebsd or
     builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
+
+/// Sentinel user_data for poll timeout SQEs — filtered out from results.
+const TIMEOUT_SENTINEL: u64 = std.math.maxInt(u64);
+
+/// High bit flag for internal operations (poll_update, poll_remove results).
+/// CQEs with this flag set in user_data are filtered out — not real poll events.
+const INTERNAL_FLAG: u64 = 1 << 63;
 
 /// Tags for event source identification.
 /// Each registered fd carries a tag so the shard loop can dispatch correctly.
@@ -75,20 +83,23 @@ pub const Event = struct {
 const MAX_EVENTS = 256;
 
 pub const Reactor = struct {
-    /// Backend fd: kqueue on BSD, epoll on Linux.
-    poll_fd: i32,
+    /// Backend fd: kqueue on BSD (unused on Linux — io_uring handles it).
+    poll_fd: if (is_bsd) i32 else void,
     allocator: Allocator,
 
     // Map fd → EventSource metadata for dispatch
     sources: std.AutoHashMap(i32, EventSource),
 
-    // Timer bookkeeping — on Linux we create timerfd per timer,
-    // on BSD kqueue handles timers natively.
+    // io_uring ring instance (Linux only)
+    ring: if (is_linux) linux.IoUring else void,
+
+    // Timer bookkeeping — timerfd per timer on Linux,
+    // kqueue handles timers natively on BSD.
     timer_fds: if (is_linux) std.AutoHashMap(usize, i32) else void,
 
     // Reusable event buffers (platform-specific)
     kqueue_buf: if (is_bsd) [MAX_EVENTS]posix.Kevent else void,
-    epoll_buf: if (is_linux) [MAX_EVENTS]std.os.linux.epoll_event else void,
+    cqe_buf: if (is_linux) [MAX_EVENTS]linux.io_uring_cqe else void,
 
     // Internal result cache to hold converted events between poll calls
     result_cache: [MAX_EVENTS]Event = undefined,
@@ -102,22 +113,24 @@ pub const Reactor = struct {
                 .poll_fd = kq,
                 .allocator = allocator,
                 .sources = std.AutoHashMap(i32, EventSource).init(allocator),
+                .ring = {},
                 .timer_fds = {},
                 .kqueue_buf = undefined,
-                .epoll_buf = {},
+                .cqe_buf = {},
             };
         } else if (comptime is_linux) {
-            const epfd = try posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+            const ring = try linux.IoUring.init(256, 0);
             return .{
-                .poll_fd = epfd,
+                .poll_fd = {},
                 .allocator = allocator,
                 .sources = std.AutoHashMap(i32, EventSource).init(allocator),
+                .ring = ring,
                 .timer_fds = std.AutoHashMap(usize, i32).init(allocator),
                 .kqueue_buf = {},
-                .epoll_buf = undefined,
+                .cqe_buf = undefined,
             };
         } else {
-            @compileError("Unsupported OS — Reactor requires macOS/FreeBSD (kqueue) or Linux (epoll)");
+            @compileError("Unsupported OS — Reactor requires macOS/FreeBSD (kqueue) or Linux (io_uring)");
         }
     }
 
@@ -129,9 +142,12 @@ pub const Reactor = struct {
                 posix.close(tfd_ptr.*);
             }
             self.timer_fds.deinit();
+            self.ring.deinit();
         }
         self.sources.deinit();
-        posix.close(self.poll_fd);
+        if (comptime is_bsd) {
+            posix.close(self.poll_fd);
+        }
     }
 
     /// Register an event source (fd + interests).
@@ -139,7 +155,7 @@ pub const Reactor = struct {
         if (comptime is_bsd) {
             try self.kqueueAddSource(source);
         } else if (comptime is_linux) {
-            try self.epollAddSource(source);
+            try self.iouringAddSource(source);
         }
         try self.sources.put(source.fd, source);
     }
@@ -149,7 +165,7 @@ pub const Reactor = struct {
         if (comptime is_bsd) {
             self.kqueueRemoveSource(fd);
         } else if (comptime is_linux) {
-            self.epollRemoveSource(fd);
+            self.iouringRemoveSource(fd);
         }
         _ = self.sources.remove(fd);
     }
@@ -160,7 +176,7 @@ pub const Reactor = struct {
             if (comptime is_bsd) {
                 try self.kqueueModifyInterests(fd, interests, source);
             } else if (comptime is_linux) {
-                try self.epollModifyInterests(fd, interests, source);
+                try self.iouringModifyInterests(fd, interests, source);
             }
             source.interests = interests;
         }
@@ -175,12 +191,10 @@ pub const Reactor = struct {
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
                     _ = try posix.kevent(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
-                    const events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.OUT | std.os.linux.EPOLL.RDHUP;
-                    var ev = std.os.linux.epoll_event{
-                        .events = events,
-                        .data = .{ .u64 = @intCast(source.user_data) },
-                    };
-                    try posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &ev);
+                    const mask = linux.POLL.IN | linux.POLL.OUT;
+                    const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
+                    const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+                    _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
                 }
                 source.interests.writable = true;
             }
@@ -196,16 +210,15 @@ pub const Reactor = struct {
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0);
                     _ = try posix.kevent(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
-                    // Keep readable, remove writable
-                    const events = if (source.interests.readable) std.os.linux.EPOLL.IN | std.os.linux.EPOLL.RDHUP else @as(u32, 0);
-                    var ev = std.os.linux.epoll_event{
-                        .events = events,
-                        .data = .{ .u64 = @intCast(source.user_data) },
-                    };
-                    if (events == 0) {
-                        posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null) catch {};
+                    const mask = if (source.interests.readable) linux.POLL.IN else @as(u32, 0);
+                    if (mask == 0) {
+                        // No interests left — remove the poll entirely
+                        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+                        _ = try self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64);
                     } else {
-                        try posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &ev);
+                        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+                        const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
+                        _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
                     }
                 }
                 source.interests.writable = false;
@@ -234,18 +247,24 @@ pub const Reactor = struct {
             // Convert interval_ms to itimerspec (repeating timer)
             const secs: i64 = @intCast(interval_ms / 1000);
             const nsecs: i64 = @intCast((@as(u64, interval_ms) % 1000) * 1_000_000);
-            const spec = std.os.linux.itimerspec{
+            const spec = linux.itimerspec{
                 .it_interval = .{ .sec = secs, .nsec = nsecs },
                 .it_value = .{ .sec = secs, .nsec = nsecs },
             };
             try posix.timerfd_settime(tfd, .{}, &spec, null);
 
-            // Register timerfd with epoll — store ident in user_data
-            var ev = std.os.linux.epoll_event{
-                .events = std.os.linux.EPOLL.IN,
-                .data = .{ .u64 = @intCast(ident) },
-            };
-            try posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_ADD, tfd, &ev);
+            // Register timerfd as a source with .timer tag so poll identifies it
+            try self.sources.put(tfd, .{
+                .fd = tfd,
+                .tag = .timer,
+                .interests = .{ .readable = true },
+                .user_data = ident,
+            });
+
+            // Register timerfd with io_uring multi-shot poll
+            const tfd_u64: u64 = @intCast(@as(u32, @bitCast(tfd)));
+            const sqe = try self.ring.poll_add(tfd_u64, tfd, linux.POLL.IN);
+            sqe.len = linux.IORING_POLL_ADD_MULTI;
 
             // Track timerfd so we can close it in deinit
             try self.timer_fds.put(ident, tfd);
@@ -258,7 +277,7 @@ pub const Reactor = struct {
         if (comptime is_bsd) {
             return self.kqueuePoll(timeout_ms);
         } else if (comptime is_linux) {
-            return self.epollPoll(timeout_ms);
+            return self.iouringPoll(timeout_ms);
         }
     }
 
@@ -385,110 +404,115 @@ pub const Reactor = struct {
     }
 
     // ───────────────────────────────────────────────────────────────
-    //  epoll backend (Linux)
+    //  io_uring backend (Linux)
+    //  Multi-shot poll for network/timer fds, native async I/O.
     // ───────────────────────────────────────────────────────────────
 
-    fn epollAddSource(self: *Self, source: EventSource) !void {
-        var events: u32 = std.os.linux.EPOLL.RDHUP;
-        if (source.interests.readable) events |= std.os.linux.EPOLL.IN;
-        if (source.interests.writable) events |= std.os.linux.EPOLL.OUT;
+    fn iouringAddSource(self: *Self, source: EventSource) !void {
+        var mask: u32 = 0;
+        if (source.interests.readable) mask |= linux.POLL.IN;
+        if (source.interests.writable) mask |= linux.POLL.OUT;
 
-        var ev = std.os.linux.epoll_event{
-            .events = events,
-            .data = .{ .u64 = @intCast(source.user_data) },
-        };
-        try posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_ADD, source.fd, &ev);
-    }
-
-    fn epollRemoveSource(self: *Self, fd: i32) void {
-        if (comptime is_linux) {
-            posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null) catch {};
+        if (mask != 0) {
+            const fd_u64: u64 = @intCast(@as(u32, @bitCast(source.fd)));
+            const sqe = try self.ring.poll_add(fd_u64, source.fd, mask);
+            sqe.len = linux.IORING_POLL_ADD_MULTI;
         }
     }
 
-    fn epollModifyInterests(self: *Self, fd: i32, interests: Interests, source: *EventSource) !void {
-        var events: u32 = std.os.linux.EPOLL.RDHUP;
-        if (interests.readable) events |= std.os.linux.EPOLL.IN;
-        if (interests.writable) events |= std.os.linux.EPOLL.OUT;
-
-        var ev = std.os.linux.epoll_event{
-            .events = events,
-            .data = .{ .u64 = @intCast(source.user_data) },
-        };
-        try posix.epoll_ctl(self.poll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &ev);
+    fn iouringRemoveSource(self: *Self, fd: i32) void {
+        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+        _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {};
     }
 
-    fn epollPoll(self: *Self, timeout_ms: ?u32) ![]const Event {
-        const timeout_i32: i32 = if (timeout_ms) |ms| @intCast(ms) else -1;
+    fn iouringModifyInterests(self: *Self, fd: i32, interests: Interests, _: *EventSource) !void {
+        var mask: u32 = 0;
+        if (interests.readable) mask |= linux.POLL.IN;
+        if (interests.writable) mask |= linux.POLL.OUT;
 
-        const nready = posix.epoll_wait(self.poll_fd, &self.epoll_buf, timeout_i32);
+        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
 
-        // Build a reverse map: timerfd → ident (only needed if we have timers)
+        if (mask == 0) {
+            _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {};
+        } else {
+            const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
+            _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
+        }
+    }
+
+    fn iouringPoll(self: *Self, timeout_ms: ?u32) ![]const Event {
+        // Submit any pending SQEs (new registrations, poll_updates, etc.)
+        _ = try self.ring.submit();
+
+        if (timeout_ms) |ms| {
+            if (ms == 0) {
+                // Non-blocking: just check for available completions
+                const n = try self.ring.copy_cqes(&self.cqe_buf, 0);
+                return self.iouringProcessCqes(n);
+            }
+            // Timed wait: submit a timeout SQE, then block until an event or timeout
+            var ts = linux.kernel_timespec{
+                .sec = @intCast(ms / 1000),
+                .nsec = @intCast((@as(u64, ms) % 1000) * 1_000_000),
+            };
+            _ = try self.ring.timeout(TIMEOUT_SENTINEL, &ts, 0, 0);
+            _ = try self.ring.submit_and_wait(1);
+            const n = try self.ring.copy_cqes(&self.cqe_buf, 0);
+            return self.iouringProcessCqes(n);
+        } else {
+            // Block indefinitely until at least one event
+            const n = try self.ring.copy_cqes(&self.cqe_buf, 1);
+            return self.iouringProcessCqes(n);
+        }
+    }
+
+    fn iouringProcessCqes(self: *Self, n: u32) ![]const Event {
         var count: usize = 0;
-        for (self.epoll_buf[0..nready]) |eev| {
-            // Check if this is a timerfd event
-            const udata = eev.data.u64;
+        for (self.cqe_buf[0..n]) |cqe| {
+            // Skip timeout sentinel CQEs
+            if (cqe.user_data == TIMEOUT_SENTINEL) continue;
 
-            // Check timerfds — if the user_data matches a timer ident, it's a timer
-            var is_timer = false;
-            if (comptime is_linux) {
-                var tfd_it = self.timer_fds.iterator();
-                while (tfd_it.next()) |entry| {
-                    if (entry.value_ptr.* != 0 and udata == @as(u64, entry.key_ptr.*)) {
-                        // Drain the timerfd counter to prevent re-triggering
-                        var buf: [8]u8 = undefined;
-                        _ = posix.read(entry.value_ptr.*, &buf) catch {};
-                        self.result_cache[count] = .{
-                            .fd = entry.value_ptr.*,
-                            .tag = .timer,
-                            .user_data = @intCast(udata),
-                            .readable = false,
-                            .writable = false,
-                            .err = false,
-                            .hangup = false,
-                        };
-                        count += 1;
-                        is_timer = true;
-                        break;
-                    }
-                }
-            }
-            if (is_timer) continue;
+            // Skip internal CQEs (poll_update/poll_remove results)
+            if (cqe.user_data & INTERNAL_FLAG != 0) continue;
 
-            // Find the fd that corresponds to this user_data
-            // For epoll we need to reverse-lookup from user_data → fd
-            var found_fd: i32 = -1;
-            var found_source: ?EventSource = null;
-            var src_it = self.sources.iterator();
-            while (src_it.next()) |entry| {
-                if (entry.value_ptr.user_data == udata) {
-                    found_fd = entry.key_ptr.*;
-                    found_source = entry.value_ptr.*;
-                    break;
-                }
+            // Skip error CQEs (e.g., cancelled operations)
+            if (cqe.res < 0) continue;
+
+            const fd: i32 = @bitCast(@as(u32, @intCast(cqe.user_data & 0xFFFFFFFF)));
+
+            const source = self.sources.get(fd) orelse continue;
+
+            // Timer: drain the timerfd counter to prevent re-triggering
+            if (source.tag == .timer) {
+                var buf: [8]u8 = undefined;
+                _ = posix.read(fd, &buf) catch {};
             }
 
-            if (found_fd == -1) continue; // Unknown event, skip
-
-            const source = found_source.?;
-            const has_in = (eev.events & std.os.linux.EPOLL.IN) != 0;
-            const has_out = (eev.events & std.os.linux.EPOLL.OUT) != 0;
-            const has_err = (eev.events & std.os.linux.EPOLL.ERR) != 0;
-            const has_hup = (eev.events & std.os.linux.EPOLL.HUP) != 0 or
-                (eev.events & std.os.linux.EPOLL.RDHUP) != 0;
-
+            const revents: u32 = @intCast(cqe.res);
             self.result_cache[count] = .{
-                .fd = found_fd,
+                .fd = fd,
                 .tag = source.tag,
-                .user_data = @intCast(udata),
-                .readable = has_in,
-                .writable = has_out,
-                .err = has_err,
-                .hangup = has_hup,
+                .user_data = source.user_data,
+                .readable = (revents & linux.POLL.IN) != 0,
+                .writable = (revents & linux.POLL.OUT) != 0,
+                .err = (revents & linux.POLL.ERR) != 0,
+                .hangup = (revents & linux.POLL.HUP) != 0,
             };
             count += 1;
-        }
 
+            // If multi-shot poll was dropped (IORING_CQE_F_MORE not set),
+            // re-arm the poll for this fd.
+            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                var mask: u32 = 0;
+                if (source.interests.readable) mask |= linux.POLL.IN;
+                if (source.interests.writable) mask |= linux.POLL.OUT;
+                if (mask != 0) {
+                    const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
+                    const sqe = self.ring.poll_add(fd_u64, fd, mask) catch continue;
+                    sqe.len = linux.IORING_POLL_ADD_MULTI;
+                }
+            }
+        }
         return self.result_cache[0..count];
     }
 
