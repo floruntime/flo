@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -26,12 +27,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
     }.run;
 }
 
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
+
 
 /// Create the processing command tree
 pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
@@ -156,7 +152,7 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
 fn runSubmit(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getPositional("file").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Read the YAML file
     const yaml = std.fs.cwd().readFileAlloc(ctx.allocator, file_path, 1024 * 1024) catch |err| {
@@ -194,7 +190,7 @@ fn runSubmit(ctx: *commander.Context) commander.Error!void {
 fn runStop(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -226,7 +222,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
 fn runCancel(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -258,7 +254,7 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -293,7 +289,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 fn runList(ctx: *commander.Context) commander.Error!void {
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -328,7 +324,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 fn runSavepoint(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -365,7 +361,7 @@ fn runRestore(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const savepoint_id = ctx.getPositional("savepoint_id").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -398,7 +394,7 @@ fn runRescale(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const parallelism_str = ctx.getPositional("parallelism").?;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     const parallelism = std.fmt.parseInt(u32, parallelism_str, 10) catch {
         ctx.printErr("Invalid parallelism: {s} (must be a positive integer)\n", .{parallelism_str});

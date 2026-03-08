@@ -40,6 +40,7 @@ pub const ServerProcess = struct {
     flo_binary: []const u8,
     started: bool,
     config: ServerConfig,
+    log_thread: ?std.Thread = null,
 
     /// Default timeout for server readiness (ms)
     pub const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
@@ -48,10 +49,10 @@ pub const ServerProcess = struct {
     /// Timeout for graceful shutdown before SIGKILL (ms)
     pub const SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
     /// Wait time between SIGTERM and SIGKILL (ms)
-    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 2_000;
+    pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 500;
     /// Wait time after SIGKILL before proceeding (ms)
-    /// Increased from 500ms to ensure OS fully releases ports/resources between tests
-    pub const POST_KILL_WAIT_MS: u64 = 1_000;
+    /// Each test uses unique ports (findFreePort) and data dirs, so minimal wait suffices
+    pub const POST_KILL_WAIT_MS: u64 = 100;
 
     /// Durability mode for persistence
     pub const Durability = enum {
@@ -348,9 +349,11 @@ pub const ServerProcess = struct {
         // Store process immediately so we can kill it if readiness check fails
         self.process = child;
 
-        // Spawn thread to copy stdout/stderr to log file
-        const log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, &self.process.?.stdout.?, &self.process.?.stderr.? });
-        log_thread.detach();
+        // Extract fds by value before spawning thread — avoids dangling
+        // pointers when stop() sets self.process = null
+        const stdout_fd = self.process.?.stdout.?.handle;
+        const stderr_fd = self.process.?.stderr.?.handle;
+        self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd });
         log_file_handed_off = true; // Thread now owns the fd
 
         // Wait for server to be ready
@@ -369,9 +372,6 @@ pub const ServerProcess = struct {
 
         if (self.process) |*proc| {
             const pid = proc.id;
-            const stop_start = std.time.milliTimestamp();
-
-            std.debug.print("  [stop] Sending SIGTERM to pid {d}\n", .{pid});
 
             // Send SIGTERM for graceful shutdown
             _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
@@ -385,7 +385,6 @@ pub const ServerProcess = struct {
                 const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
                 if (result.pid == pid) {
                     gracefully_exited = true;
-                    std.debug.print("  [stop] Process gracefully exited after {d}ms\n", .{std.time.milliTimestamp() - grace_start});
                     break;
                 }
                 std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -393,10 +392,8 @@ pub const ServerProcess = struct {
 
             // Force kill if not gracefully exited
             if (!gracefully_exited) {
-                std.debug.print("  [stop] No graceful exit, sending SIGKILL\n", .{});
                 // Server didn't respond to SIGTERM, force kill
-                _ = std.posix.kill(pid, std.posix.SIG.KILL) catch |err| {
-                    std.debug.print("Failed to SIGKILL pid {d}: {}\n", .{ pid, err });
+                _ = std.posix.kill(pid, std.posix.SIG.KILL) catch {
                     return; // Can't kill process, abandon cleanup
                 };
 
@@ -405,17 +402,23 @@ pub const ServerProcess = struct {
                 while (std.time.milliTimestamp() - kill_start < 1000) { // 1 second max
                     const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
                     if (result.pid == pid) {
-                        std.debug.print("  [stop] Process killed after SIGKILL\n", .{});
                         break;
                     }
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                 }
             }
 
-            // Additional wait to ensure OS releases resources (ports, file locks)
-            std.Thread.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
+            // Brief wait for OS resource release (only needed after forced kill;
+            // each test uses unique ports via findFreePort, so minimal delay suffices)
+            if (!gracefully_exited) {
+                std.Thread.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
+            }
 
-            std.debug.print("  [stop] Total stop time: {d}ms\n", .{std.time.milliTimestamp() - stop_start});
+            // Join the log thread — process kill closes pipes, unblocking reads
+            if (self.log_thread) |thread| {
+                thread.join();
+                self.log_thread = null;
+            }
 
             self.process = null;
         }
@@ -493,6 +496,12 @@ pub const ServerProcess = struct {
 
             // Wait for OS to release resources
             std.Thread.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
+
+            // Join log thread after process is dead
+            if (self.log_thread) |thread| {
+                thread.join();
+                self.log_thread = null;
+            }
 
             self.process = null;
         }
@@ -664,24 +673,45 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-/// Copy server output streams to log file (runs in background thread)
-fn logServerOutput(log_file: std.fs.File, stdout: *std.fs.File, stderr: *std.fs.File) void {
+/// Copy server output streams to log file (runs in background thread).
+/// Uses poll() to read both stdout and stderr concurrently, preventing
+/// the classic pipe deadlock where the server blocks writing to one pipe
+/// while we're blocked reading the other.
+fn logServerOutput(log_file: std.fs.File, stdout_fd: std.posix.fd_t, stderr_fd: std.posix.fd_t) void {
     defer log_file.close();
 
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = stdout_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = stderr_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+
     var buf: [4096]u8 = undefined;
+    var open_count: usize = 2;
 
-    // Read and write stdout
-    while (true) {
-        const n = stdout.read(&buf) catch break;
-        if (n == 0) break;
-        _ = log_file.write(buf[0..n]) catch {};
-    }
+    while (open_count > 0) {
+        const ready = std.posix.poll(&fds, -1) catch break;
+        if (ready == 0) continue;
 
-    // Read and write stderr
-    while (true) {
-        const n = stderr.read(&buf) catch break;
-        if (n == 0) break;
-        _ = log_file.write(buf[0..n]) catch {};
+        for (&fds) |*pfd| {
+            if (pfd.fd < 0) continue;
+
+            if (pfd.revents & std.posix.POLL.IN != 0) {
+                const n = std.posix.read(pfd.fd, &buf) catch {
+                    pfd.fd = -1;
+                    open_count -= 1;
+                    continue;
+                };
+                if (n == 0) {
+                    pfd.fd = -1;
+                    open_count -= 1;
+                    continue;
+                }
+                _ = log_file.write(buf[0..n]) catch {};
+            } else if (pfd.revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+                pfd.fd = -1;
+                open_count -= 1;
+            }
+        }
     }
 }
 

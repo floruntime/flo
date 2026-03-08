@@ -181,23 +181,53 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 
 /// GET /kv/namespaces/:ns/keys/:key/history - Version history
 /// Query params: ?limit=N (default: 10)
+/// NOTE: The KV projection currently stores only the latest version per key.
+/// This endpoint returns the current version as a single-entry history.
+/// Full MVCC version chains will be added when the projection supports them.
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
     _ = h.parseQueryParam(u32, query_string, "limit");
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
-    // TODO: MVCC history not yet exposed at projection level
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
+
     var arr = try obj.arrayField("versions");
     try arr.begin();
+
+    // Search shard projections for current version
+    var version_count: i64 = 0;
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getKVProjection(ctx, i)) |kv| {
+            if (kv.get(key)) |entry_val| {
+                try arr.next();
+                var vobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try vobj.begin();
+                try vobj.intField("version", entry_val.lsn);
+                try vobj.intField("term", entry_val.term);
+                const ts_ms = @as(i64, @intCast(entry_val.timestamp_ns / std.time.ns_per_ms));
+                try vobj.intField("timestamp_ms", ts_ms);
+                try vobj.intField("size", @as(i64, @intCast(entry_val.value.len)));
+                try vobj.boolField("tombstone", entry_val.tombstone);
+                if (entry_val.expiry_ns > 0) {
+                    try vobj.intField("ttl_ms", @as(i64, @intCast(entry_val.expiry_ns / std.time.ns_per_ms)));
+                } else {
+                    try vobj.nullField("ttl_ms");
+                }
+                try vobj.end();
+                version_count = 1;
+                break;
+            }
+        }
+    }
+
     try arr.end();
-    try obj.intField("version_count", 0);
+    try obj.intField("version_count", version_count);
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }

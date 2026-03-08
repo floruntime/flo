@@ -18,6 +18,7 @@ const Client = client_mod.Client;
 const output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -169,21 +170,7 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
 // Helpers
 // ========================================================================
 
-/// Get namespace from flags or default
-fn getNamespace(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("namespace")) |ns| {
-        if (ns.len > 0 and !std.mem.eql(u8, ns, "default")) return ns;
-    }
-    return "default";
-}
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
 
 /// Parse a relative time string like "-1h", "-30m", "-7d" to epoch ms offset from now.
 /// Also accepts raw epoch ms (positive integers).
@@ -233,8 +220,8 @@ fn parseDuration(s: []const u8) ?i64 {
 // ========================================================================
 
 fn runWrite(ctx: *commander.Context) commander.Error!void {
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const is_batch = ctx.getBool("batch");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -411,8 +398,8 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
 
 fn runRead(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const format_str = ctx.getString("format") orelse "table";
     const format = output.Format.fromString(format_str);
     const tags = ctx.getString("tags") orelse "";
@@ -523,8 +510,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
 
 fn runQuery(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const format_str = ctx.getString("format") orelse "table";
     const format = output.Format.fromString(format_str);
     const tags = ctx.getString("tags") orelse "";
@@ -662,8 +649,8 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
 
 fn runList(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement") orelse "";
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 1000;
     const format_str = ctx.getString("format") orelse "table";
     const format = output.Format.fromString(format_str);
@@ -769,8 +756,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
 fn runDelete(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const tags = ctx.getString("tags") orelse "";
     const confirm = ctx.getBool("confirm");
 
@@ -804,8 +791,8 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
 fn runRetention(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const raw_ttl_str = ctx.getString("raw-ttl") orelse "";
     const downsample_str = ctx.getString("downsample") orelse "";
     const show = ctx.getBool("show");
@@ -858,8 +845,8 @@ fn runRetention(ctx: *commander.Context) commander.Error!void {
 // ========================================================================
 
 fn runFloql(ctx: *commander.Context) commander.Error!void {
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     const query_str = ctx.getPositional("query") orelse {
         ctx.printErr("Error: query argument is required\n", .{});

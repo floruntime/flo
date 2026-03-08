@@ -16,6 +16,7 @@ const Client = client_mod.Client;
 const output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -150,22 +151,7 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-/// Get namespace from flags or default
-fn getNamespace(ctx: *commander.Context) []const u8 {
-    // Check flag (inherited from parent)
-    if (ctx.getString("namespace")) |ns| {
-        if (ns.len > 0 and !std.mem.eql(u8, ns, "default")) return ns;
-    }
-    return "default";
-}
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
 
 fn runEnqueue(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
@@ -174,8 +160,8 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
     const priority_val = ctx.getUint("priority") orelse 0;
     const priority: u8 = if (priority_val > 255) 255 else @intCast(priority_val);
     const delay = ctx.getUint("delay");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -213,8 +199,8 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
     const count = ctx.getUint("count") orelse 1;
     const timeout = ctx.getUint("timeout") orelse 30000;
     const block = ctx.getChangedUint("block");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -269,12 +255,12 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
 fn runWatch(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
-    const namespace = getNamespace(ctx);
+    const namespace = cli_config.getNamespace(ctx);
     ctx.print("Watching queue: {s}\n", .{queue});
     ctx.print("Press Ctrl+C to stop.\n\n", .{});
 
     // Continuous polling loop
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
@@ -316,8 +302,8 @@ fn runPeek(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
     const count = ctx.getUint("count") orelse 1;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -358,8 +344,8 @@ fn runTouch(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const extend_ms: u32 = @intCast(ctx.getUint("extend").?);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -394,8 +380,8 @@ fn runAck(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -429,8 +415,8 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
     };
 
     const to_dlq = ctx.getBool("dlq");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -458,8 +444,8 @@ fn runDlqList(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
     const limit = ctx.getUint("limit") orelse 100;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -501,8 +487,8 @@ fn runDlqRequeue(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -551,8 +537,8 @@ const QueueListEntry = struct {
 };
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 100;
     const json_output = ctx.getBool("json");
 

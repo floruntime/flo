@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -176,13 +177,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
 // Command Handlers
 // =============================================================================
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
+
 
 fn runCreate(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
@@ -192,7 +187,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     }
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Read definition from file or stdin
     var definition: []const u8 = undefined;
@@ -283,7 +278,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const idempotency_key = ctx.getString("idempotency-key");
     const run_id = ctx.getString("run-id");
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Validate idempotency_key is not empty string
     const idem_key: ?[]const u8 = if (idempotency_key) |k| if (k.len > 0) k else null else null;
@@ -331,7 +326,7 @@ fn runSignal(ctx: *commander.Context) commander.Error!void {
     const payload_val: ?[]const u8 = if (payload) |p| if (p.len > 0) p else null else null;
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -362,7 +357,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     };
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -402,7 +397,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -451,7 +446,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -494,7 +489,7 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
     const reason_val: ?[]const u8 = if (reason) |r| if (r.len > 0) r else null else null;
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -533,7 +528,7 @@ fn runGetDefinition(ctx: *commander.Context) commander.Error!void {
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -580,7 +575,7 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -618,7 +613,7 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

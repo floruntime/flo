@@ -13,6 +13,7 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
+const cli_config = @import("../config.zig");
 const WireReader = wire.WireReader;
 
 /// Wrapper to cast *anyopaque to *Context
@@ -115,24 +116,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-/// Get namespace from flags or default
-fn getNamespace(ctx: *commander.Context) []const u8 {
-    // First check flag (inherited from parent)
-    if (ctx.getString("namespace")) |ns| {
-        if (ns.len > 0 and !std.mem.eql(u8, ns, "default")) return ns;
-    }
-    // TODO: Check config file for default namespace
-    return "default";
-}
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    // TODO: Check config file for default endpoint
-    return "127.0.0.1:9000";
-}
 
 fn runGet(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
@@ -142,7 +126,7 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
     const wait_ms = ctx.getChangedUint("wait");
     const block_ms = ctx.getChangedUint("block");
     const format_str = ctx.getString("format") orelse "raw";
-    const namespace = getNamespace(ctx);
+    const namespace = cli_config.getNamespace(ctx);
 
     // --routing-key: explicit shard co-location (same routing as {tag} in key name)
     const routing_key: ?[]const u8 = blk: {
@@ -160,7 +144,7 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
 
     const format = output.Format.fromString(format_str);
 
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -201,7 +185,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     const nx = ctx.getBool("nx");
     const xx = ctx.getBool("xx");
     const cas = ctx.getChangedUint64("cas");
-    const namespace = getNamespace(ctx);
+    const namespace = cli_config.getNamespace(ctx);
 
     // --routing-key: explicit shard co-location (same routing as {tag} in key name)
     const routing_key: ?[]const u8 = blk: {
@@ -219,7 +203,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -263,8 +247,8 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
 fn runDelete(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // --routing-key: explicit shard co-location (same routing as {tag} in key name)
     const routing_key: ?[]const u8 = blk: {
@@ -297,8 +281,8 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 fn runList(ctx: *commander.Context) commander.Error!void {
     const prefix = ctx.getString("prefix") orelse "";
     const limit = ctx.getUint("limit") orelse 100;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -399,8 +383,8 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
 
     const limit = ctx.getUint("limit") orelse 10;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

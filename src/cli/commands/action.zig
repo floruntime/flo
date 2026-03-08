@@ -14,6 +14,7 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -209,13 +210,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
+
 
 fn runRegister(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
@@ -226,7 +221,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     const timeout = ctx.getUint("timeout") orelse 30000;
     const retries = ctx.getUint("retries") orelse 0;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Convert type string to enum value
     var action_type: u8 = if (std.mem.eql(u8, action_type_str, "wasm")) 1 else 0;
@@ -300,7 +295,7 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
     const labels_str = ctx.getString("labels") orelse "";
     const required_labels: ?[]const u8 = if (labels_str.len > 0) labels_str else null;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -335,7 +330,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id").?; // validated by commander
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -465,7 +460,7 @@ fn readOptionalSlice(data: []const u8, off: *usize) ?[]const u8 {
 fn runList(ctx: *commander.Context) commander.Error!void {
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -565,7 +560,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
 
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     _ = ctx.getBool("force"); // Not yet used
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -615,7 +610,7 @@ fn runWorkerRegister(ctx: *commander.Context) commander.Error!void {
     const namespace = ctx.getString("namespace") orelse "default";
     const labels_str = ctx.getString("labels") orelse "";
     const labels: ?[]const u8 = if (labels_str.len > 0) labels_str else null;
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -651,7 +646,7 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
     const block = ctx.getUint("block") orelse 5000;
     const timeout = ctx.getUint("timeout") orelse 30000;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -717,7 +712,7 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
     const action_name = ctx.getString("action") orelse "";
     const result_payload = ctx.getString("result") orelse "";
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -754,7 +749,7 @@ fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
     const error_msg = ctx.getString("error") orelse "";
     const allow_retry = ctx.getBool("retry");
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -789,7 +784,7 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
     const action_name = ctx.getString("action") orelse "";
     const extend = ctx.getUint("extend") orelse 30000;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -817,7 +812,7 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
 fn runWorkerList(ctx: *commander.Context) commander.Error!void {
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

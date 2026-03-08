@@ -12,6 +12,7 @@ const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -88,17 +89,11 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
+
 
 fn runCreate(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Validate namespace name
     if (name.len == 0) {
@@ -144,7 +139,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
 fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const force = ctx.getBool("force");
 
     // Prevent deletion of reserved namespaces
@@ -179,7 +174,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 fn runList(ctx: *commander.Context) commander.Error!void {
     const include_all = ctx.getBool("all");
     const format_str = ctx.getString("format") orelse "table";
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -249,7 +244,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
 fn runInfo(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
-    const endpoint = getEndpoint(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

@@ -29,7 +29,7 @@
 //! └─────────┘
 //! ```
 //!
-//! NOTE: Tests for list/assertContains are skipped pending list output format fix.
+//! TODO: WASM execution tests need a compiled .wasm fixture — skipped for now.
 
 const std = @import("std");
 const testing = std.testing;

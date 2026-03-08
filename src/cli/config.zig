@@ -4,6 +4,35 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const commander = @import("commander/mod.zig");
+
+/// Default endpoint for CLI commands.
+/// Precedence: FLO_ENDPOINT env → "127.0.0.1:9000"
+pub fn getDefaultEndpoint() []const u8 {
+    return std.posix.getenv("FLO_ENDPOINT") orelse "127.0.0.1:9000";
+}
+
+/// Default namespace for CLI commands.
+/// Precedence: FLO_NAMESPACE env → "default"
+pub fn getDefaultNamespace() []const u8 {
+    return std.posix.getenv("FLO_NAMESPACE") orelse "default";
+}
+
+/// Get endpoint from command flags, falling back to env/default.
+pub fn getEndpoint(ctx: *commander.Context) []const u8 {
+    if (ctx.getString("endpoint")) |ep| {
+        if (ep.len > 0) return ep;
+    }
+    return getDefaultEndpoint();
+}
+
+/// Get namespace from command flags, falling back to env/default.
+pub fn getNamespace(ctx: *commander.Context) []const u8 {
+    if (ctx.getString("namespace")) |ns| {
+        if (ns.len > 0 and !std.mem.eql(u8, ns, "default")) return ns;
+    }
+    return getDefaultNamespace();
+}
 
 /// A context represents a connection to a Flo server
 pub const Context = struct {

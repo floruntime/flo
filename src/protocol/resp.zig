@@ -549,9 +549,11 @@ pub fn translateResult(result: CommandResult) RespValue {
 
         .stream_append_ok => |a| .{ .integer = @intCast(a.sequence) },
         .stream_messages => |m| blk: {
-            // Return array of messages
-            _ = m;
-            break :blk .{ .null_array = {} }; // TODO: proper serialization
+            // Return pre-serialized message data as bulk string.
+            // Wire format: [count:u32]([sequence:u64][timestamp_ms:i64][tier:u8]
+            // [partition:u32][key_present:u8][payload_len:u32][payload][header_count:u32])*
+            if (m.data.len == 0) break :blk .{ .null_array = {} };
+            break :blk .{ .bulk_string = m.data };
         },
 
         else => .{ .null_bulk = {} },

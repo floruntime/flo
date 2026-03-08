@@ -26,6 +26,7 @@ const Client = client_mod.Client;
 const wire = @import("../../util/wire.zig");
 const StreamID = @import("../../stream/stream_id.zig").StreamID;
 const output = @import("../output.zig");
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -326,21 +327,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-/// Get namespace from flags or default
-fn getNamespace(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("namespace")) |ns| {
-        if (ns.len > 0) return ns;
-    }
-    return "default";
-}
 
-/// Get endpoint from flags or config
-fn getEndpoint(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) return ep;
-    }
-    return "127.0.0.1:9000";
-}
 
 fn runAppend(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
@@ -351,8 +338,8 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
     const partition_opt = ctx.getChangedUint("partition");
     const pk_raw = ctx.getString("partition-key");
@@ -413,8 +400,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const read_partition = ctx.getChangedUint("partition");
     const pk_raw = ctx.getString("partition-key");
     const partition_key: ?[]const u8 = if (pk_raw) |pk| (if (pk.len > 0) pk else null) else null;
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     // Parse StreamID from start string
@@ -587,8 +574,8 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
     const partitions = ctx.getUint("partitions") orelse 1;
     const retention = ctx.getUint("retention");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -623,8 +610,8 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 fn runInfo(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -695,8 +682,8 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 100;
     const json_output = ctx.getBool("json");
 
@@ -827,8 +814,8 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     const maxage = ctx.getUint64("maxage");
     const maxbytes = ctx.getUint64("maxbytes");
     const dry_run = ctx.getBool("dry-run");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     // Parse --before StreamID if provided
@@ -897,8 +884,8 @@ fn runGroupJoin(ctx: *commander.Context) commander.Error!void {
     const group = ctx.getPositional("group").?; // validated by commander
     const consumer = ctx.getPositional("consumer").?; // validated by commander
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -939,8 +926,8 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
 
     const limit = ctx.getUint("limit") orelse 1;
     const block = ctx.getChangedUint("block");
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     // Parse consumer group options
@@ -1086,8 +1073,8 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     // Parse comma-separated StreamIDs
@@ -1150,8 +1137,8 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -1191,8 +1178,8 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -1301,8 +1288,8 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
     const delay = ctx.getChangedUint("delay");
 
@@ -1386,8 +1373,8 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
     const extend_ms = ctx.getChangedUint("extend");
 
@@ -1452,8 +1439,8 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     // Parse mode string to enum value
@@ -1525,8 +1512,8 @@ fn runGroupLeave(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -1564,8 +1551,8 @@ fn runGroupDelete(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
 
-    const namespace = getNamespace(ctx);
-    const endpoint = getEndpoint(ctx);
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
