@@ -576,7 +576,8 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Generate a secure secret: openssl rand -base64 32
     \\# jwt_secret = "your-256-bit-secret-key-here"
     \\
-    \\# JWKS URL for RS256 signature verification (not yet implemented)
+    \\# JWKS URL for RS256 signature verification
+    \\# Keys are fetched and cached with 1-hour TTL, supporting key rotation
     \\# jwks_url = "https://your-auth-server/.well-known/jwks.json"
     \\
     \\[websocket]

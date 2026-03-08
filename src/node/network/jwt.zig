@@ -1,10 +1,14 @@
 //! JWT Parsing and Verification
 //!
 //! Shared JWT handling for WebSocket authentication.
-//! Supports HS256 signature verification with constant-time comparison.
+//! Supports HS256 (symmetric) and RS256 (asymmetric via JWKS) verification.
 //!
 //! ## Token Format
 //! Standard JWT: header.payload.signature (base64url encoded)
+//!
+//! ## Supported Algorithms
+//! - HS256: HMAC-SHA256 with shared secret
+//! - RS256: RSASSA-PKCS1-v1_5 with SHA-256 (keys from JWKS endpoint)
 //!
 //! ## Supported Claims
 //! - `sub`: User ID
@@ -14,6 +18,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const JwksClient = @import("jwks.zig").JwksClient;
+
+/// Detected JWT algorithm
+pub const Algorithm = enum {
+    hs256,
+    rs256,
+    unknown,
+};
 
 /// JWT verification errors
 pub const JwtError = error{
@@ -24,6 +36,8 @@ pub const JwtError = error{
     MalformedHeader,
     MalformedPayload,
     OutOfMemory,
+    KeyNotFound,
+    JwksFetchFailed,
 };
 
 /// Parsed JWT claims
@@ -80,6 +94,60 @@ pub fn verifyAndParse(allocator: Allocator, token: []const u8, secret: ?[]const 
 
     // Parse claims from JSON
     return parseClaimsFromJson(allocator, payload_json);
+}
+
+/// Verify JWT with RS256 signature using JWKS public keys.
+/// Automatically extracts `kid` from the JWT header for key selection.
+pub fn verifyAndParseRs256(allocator: Allocator, token: []const u8, jwks: *const JwksClient) JwtError!JwtClaims {
+    var parts = std.mem.splitScalar(u8, token, '.');
+
+    const header_b64 = parts.next() orelse return JwtError.InvalidToken;
+    const payload_b64 = parts.next() orelse return JwtError.InvalidToken;
+    const signature_b64 = parts.next() orelse return JwtError.InvalidToken;
+
+    if (parts.next() != null) return JwtError.InvalidToken;
+
+    // Decode header to extract algorithm and kid
+    const header_json = decodeBase64Url(allocator, header_b64) catch return JwtError.MalformedHeader;
+    defer allocator.free(header_json);
+
+    const alg = detectAlgorithm(header_json);
+    if (alg != .rs256) return JwtError.InvalidAlgorithm;
+
+    // Extract kid from header for key selection
+    const kid = extractJsonString(header_json, "\"kid\"");
+
+    // Verify RS256 signature via JWKS
+    jwks.verifyRs256(header_b64, payload_b64, signature_b64, kid) catch |err| {
+        return switch (err) {
+            error.KeyNotFound => JwtError.KeyNotFound,
+            error.InvalidSignature => JwtError.InvalidSignature,
+            error.InvalidKey => JwtError.InvalidSignature,
+            error.UnsupportedModulusLength => JwtError.InvalidSignature,
+            else => JwtError.InvalidSignature,
+        };
+    };
+
+    // Decode and parse payload
+    const payload_json = decodeBase64Url(allocator, payload_b64) catch return JwtError.MalformedPayload;
+    defer allocator.free(payload_json);
+
+    return parseClaimsFromJson(allocator, payload_json);
+}
+
+/// Detect the algorithm from a decoded JWT header JSON
+pub fn detectAlgorithm(header_json: []const u8) Algorithm {
+    if (std.mem.indexOf(u8, header_json, "\"RS256\"") != null or
+        std.mem.indexOf(u8, header_json, "\"rs256\"") != null)
+    {
+        return .rs256;
+    }
+    if (std.mem.indexOf(u8, header_json, "\"HS256\"") != null or
+        std.mem.indexOf(u8, header_json, "\"hs256\"") != null)
+    {
+        return .hs256;
+    }
+    return .unknown;
 }
 
 /// Parse JWT without signature verification
