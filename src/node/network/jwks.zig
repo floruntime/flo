@@ -1,6 +1,6 @@
 //! JWKS (JSON Web Key Set) Client
 //!
-//! Fetches and caches RSA public keys from a JWKS endpoint for RS256
+//! Fetches and caches public keys from a JWKS endpoint for RS256 and ES256
 //! JWT signature verification. Implements key rotation via TTL-based
 //! cache refresh.
 //!
@@ -8,7 +8,9 @@
 //! ```json
 //! { "keys": [
 //!     { "kty": "RSA", "use": "sig", "kid": "key-1",
-//!       "n": "<base64url modulus>", "e": "<base64url exponent>" }
+//!       "n": "<base64url modulus>", "e": "<base64url exponent>" },
+//!     { "kty": "EC", "use": "sig", "kid": "key-2", "crv": "P-256",
+//!       "x": "<base64url x-coord>", "y": "<base64url y-coord>" }
 //! ]}
 //! ```
 
@@ -17,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const Certificate = std.crypto.Certificate;
 const rsa = Certificate.rsa;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 pub const JwksError = error{
     FetchFailed,
@@ -26,6 +29,7 @@ pub const JwksError = error{
     InvalidSignature,
     OutOfMemory,
     UnsupportedModulusLength,
+    UnsupportedCurve,
 };
 
 /// A cached RSA public key parsed from JWKS
@@ -37,11 +41,19 @@ pub const CachedKey = struct {
     exponent: []const u8,
 };
 
+/// A cached EC public key parsed from JWKS (P-256 curve)
+pub const CachedEcKey = struct {
+    kid: []const u8,
+    /// Uncompressed SEC1 point: 0x04 || x(32) || y(32) = 65 bytes
+    sec1_point: [65]u8,
+};
+
 /// JWKS client with key caching
 pub const JwksClient = struct {
     allocator: Allocator,
     jwks_url: []const u8,
     keys: std.ArrayListUnmanaged(CachedKey),
+    ec_keys: std.ArrayListUnmanaged(CachedEcKey),
     last_fetch_ms: i64,
     cache_ttl_ms: i64,
 
@@ -53,6 +65,7 @@ pub const JwksClient = struct {
             .allocator = allocator,
             .jwks_url = jwks_url,
             .keys = .empty,
+            .ec_keys = .empty,
             .last_fetch_ms = 0,
             .cache_ttl_ms = DEFAULT_TTL_MS,
         };
@@ -69,9 +82,13 @@ pub const JwksClient = struct {
             self.allocator.free(key.exponent);
         }
         self.keys.deinit(self.allocator);
+        for (self.ec_keys.items) |key| {
+            self.allocator.free(key.kid);
+        }
+        self.ec_keys.deinit(self.allocator);
     }
 
-    /// Find a key by kid. Returns null if not found.
+    /// Find an RSA key by kid. Returns null if not found.
     pub fn findKey(self: *const JwksClient, kid: []const u8) ?*const CachedKey {
         for (self.keys.items) |*key| {
             if (std.mem.eql(u8, key.kid, kid)) return key;
@@ -79,9 +96,17 @@ pub const JwksClient = struct {
         return null;
     }
 
+    /// Find an EC key by kid. Returns null if not found.
+    pub fn findEcKey(self: *const JwksClient, kid: []const u8) ?*const CachedEcKey {
+        for (self.ec_keys.items) |*key| {
+            if (std.mem.eql(u8, key.kid, kid)) return key;
+        }
+        return null;
+    }
+
     /// Check if cache needs refresh
     pub fn needsRefresh(self: *const JwksClient, now_ms: i64) bool {
-        return self.keys.items.len == 0 or
+        return (self.keys.items.len == 0 and self.ec_keys.items.len == 0) or
             (now_ms - self.last_fetch_ms) > self.cache_ttl_ms;
     }
 
@@ -108,11 +133,12 @@ pub const JwksClient = struct {
         self.last_fetch_ms = std.time.milliTimestamp();
     }
 
-    /// Parse JWKS JSON and extract RSA signing keys.
+    /// Parse JWKS JSON and extract signing keys (RSA and EC).
     /// Public for testing — normally called by fetch().
     pub fn parseJwks(self: *JwksClient, json: []const u8) !void {
         self.clearKeys();
         self.keys = .empty;
+        self.ec_keys = .empty;
 
         // Find "keys" array
         const keys_start = std.mem.indexOf(u8, json, "\"keys\"") orelse return JwksError.InvalidJwks;
@@ -129,11 +155,17 @@ pub const JwksClient = struct {
                 const obj_end = findMatchingBrace(json, pos) orelse break;
                 const obj = json[pos .. obj_end + 1];
 
+                // Try RSA key first, then EC key
                 if (tryParseRsaKey(self.allocator, obj)) |key| {
                     self.keys.append(self.allocator, key) catch {
                         self.allocator.free(key.kid);
                         self.allocator.free(key.modulus);
                         self.allocator.free(key.exponent);
+                        return JwksError.OutOfMemory;
+                    };
+                } else if (tryParseEcKey(self.allocator, obj)) |key| {
+                    self.ec_keys.append(self.allocator, key) catch {
+                        self.allocator.free(key.kid);
                         return JwksError.OutOfMemory;
                     };
                 }
@@ -144,7 +176,7 @@ pub const JwksClient = struct {
             }
         }
 
-        if (self.keys.items.len == 0) return JwksError.InvalidJwks;
+        if (self.keys.items.len == 0 and self.ec_keys.items.len == 0) return JwksError.InvalidJwks;
     }
 
     /// Verify RS256 signature using cached keys.
@@ -172,6 +204,41 @@ pub const JwksClient = struct {
         } else {
             return JwksError.UnsupportedModulusLength;
         }
+    }
+
+    /// Verify ES256 (ECDSA P-256 + SHA-256) signature using cached EC keys.
+    /// `kid` selects the key; if null, tries the first EC key.
+    pub fn verifyEs256(
+        self: *const JwksClient,
+        header_b64: []const u8,
+        payload_b64: []const u8,
+        signature_b64: []const u8,
+        kid: ?[]const u8,
+    ) JwksError!void {
+        const key = if (kid) |k| (self.findEcKey(k) orelse return JwksError.KeyNotFound) else if (self.ec_keys.items.len > 0) &self.ec_keys.items[0] else return JwksError.KeyNotFound;
+
+        // Decode signature from base64url — ES256 signature is r(32) || s(32) = 64 bytes
+        const sig_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(signature_b64) catch return JwksError.InvalidSignature;
+        if (sig_len != 64) return JwksError.InvalidSignature;
+
+        var sig_bytes: [64]u8 = undefined;
+        std.base64.url_safe_no_pad.Decoder.decode(&sig_bytes, signature_b64) catch return JwksError.InvalidSignature;
+
+        // Construct public key from cached SEC1 uncompressed point
+        const public_key = EcdsaP256.PublicKey.fromSec1(&key.sec1_point) catch return JwksError.InvalidKey;
+
+        // Parse signature from raw r || s bytes
+        const signature = EcdsaP256.Signature.fromBytes(sig_bytes);
+
+        // ES256 signs SHA-256(header_b64 + "." + payload_b64)
+        // Use verifyPrehashed to avoid allocating a concatenated message
+        var hasher = Sha256.init(.{});
+        hasher.update(header_b64);
+        hasher.update(".");
+        hasher.update(payload_b64);
+        const msg_hash = hasher.finalResult();
+
+        signature.verifyPrehashed(msg_hash, public_key) catch return JwksError.InvalidSignature;
     }
 };
 
@@ -247,6 +314,53 @@ fn tryParseRsaKey(allocator: Allocator, obj: []const u8) ?CachedKey {
         .kid = kid,
         .modulus = modulus_trimmed,
         .exponent = exponent,
+    };
+}
+
+/// Try to parse a single EC P-256 signing key from a JSON object
+fn tryParseEcKey(allocator: Allocator, obj: []const u8) ?CachedEcKey {
+    // Must be EC key type
+    const kty = extractJsonString(obj, "\"kty\"") orelse return null;
+    if (!std.mem.eql(u8, kty, "EC")) return null;
+
+    // Must be signing key (use=sig) or no use specified
+    if (extractJsonString(obj, "\"use\"")) |use| {
+        if (!std.mem.eql(u8, use, "sig")) return null;
+    }
+
+    // Must be P-256 curve
+    const crv = extractJsonString(obj, "\"crv\"") orelse return null;
+    if (!std.mem.eql(u8, crv, "P-256")) return null;
+
+    // Must have x and y coordinates
+    const x_b64 = extractJsonString(obj, "\"x\"") orelse return null;
+    const y_b64 = extractJsonString(obj, "\"y\"") orelse return null;
+
+    // kid is optional but strongly recommended
+    const kid_str = extractJsonString(obj, "\"kid\"") orelse "default";
+
+    // Decode x and y from base64url — each should be 32 bytes for P-256
+    var x_bytes: [32]u8 = undefined;
+    var y_bytes: [32]u8 = undefined;
+
+    const x_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(x_b64) catch return null;
+    const y_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(y_b64) catch return null;
+    if (x_len != 32 or y_len != 32) return null;
+
+    std.base64.url_safe_no_pad.Decoder.decode(&x_bytes, x_b64) catch return null;
+    std.base64.url_safe_no_pad.Decoder.decode(&y_bytes, y_b64) catch return null;
+
+    // Build uncompressed SEC1 point: 0x04 || x(32) || y(32)
+    var sec1_point: [65]u8 = undefined;
+    sec1_point[0] = 0x04;
+    @memcpy(sec1_point[1..33], &x_bytes);
+    @memcpy(sec1_point[33..65], &y_bytes);
+
+    const kid = allocator.dupe(u8, kid_str) catch return null;
+
+    return .{
+        .kid = kid,
+        .sec1_point = sec1_point,
     };
 }
 
@@ -332,8 +446,9 @@ test "parseJwks extracts RSA signing keys" {
 
     try client.parseJwks(jwks_json);
 
-    // Should have 1 RSA key (EC key filtered out)
+    // Should have 1 RSA key (EC key has invalid coords so filtered out)
     try std.testing.expectEqual(@as(usize, 1), client.keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.ec_keys.items.len);
     try std.testing.expectEqualStrings("test-key-1", client.keys.items[0].kid);
 
     // findKey should work
@@ -426,4 +541,97 @@ test "findMatchingBrace" {
     try std.testing.expectEqual(@as(?usize, 8), findMatchingBrace("{\"a\":\"b\"}", 0));
     try std.testing.expectEqual(@as(?usize, 12), findMatchingBrace("{\"a\":{\"b\":1}}", 0));
     try std.testing.expect(findMatchingBrace("{unclosed", 0) == null);
+}
+
+test "parseJwks extracts EC P-256 signing keys" {
+    const allocator = std.testing.allocator;
+    // Valid P-256 x/y: 32 bytes each, base64url encoded (43 chars each)
+    const jwks_json =
+        \\{"keys":[
+        \\  {"kty":"EC","use":"sig","kid":"supabase-key-1","crv":"P-256",
+        \\   "x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\   "y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}
+        \\]}
+    ;
+
+    var client = JwksClient.init(allocator, "https://example.supabase.co/.well-known/jwks.json");
+    defer client.deinit();
+
+    try client.parseJwks(jwks_json);
+
+    try std.testing.expectEqual(@as(usize, 0), client.keys.items.len);
+    try std.testing.expectEqual(@as(usize, 1), client.ec_keys.items.len);
+    try std.testing.expectEqualStrings("supabase-key-1", client.ec_keys.items[0].kid);
+
+    // SEC1 uncompressed point starts with 0x04
+    try std.testing.expectEqual(@as(u8, 0x04), client.ec_keys.items[0].sec1_point[0]);
+
+    // findEcKey should work
+    try std.testing.expect(client.findEcKey("supabase-key-1") != null);
+    try std.testing.expect(client.findEcKey("nonexistent") == null);
+}
+
+test "parseJwks mixed RSA and EC keys" {
+    const allocator = std.testing.allocator;
+    const jwks_json =
+        \\{"keys":[
+        \\  {"kty":"RSA","use":"sig","kid":"rsa-key-1",
+        \\   "n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+        \\   "e":"AQAB"},
+        \\  {"kty":"EC","use":"sig","kid":"ec-key-1","crv":"P-256",
+        \\   "x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\   "y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}
+        \\]}
+    ;
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    try client.parseJwks(jwks_json);
+    try std.testing.expectEqual(@as(usize, 1), client.keys.items.len);
+    try std.testing.expectEqual(@as(usize, 1), client.ec_keys.items.len);
+    try std.testing.expectEqualStrings("rsa-key-1", client.keys.items[0].kid);
+    try std.testing.expectEqualStrings("ec-key-1", client.ec_keys.items[0].kid);
+}
+
+test "parseJwks rejects EC key with wrong curve" {
+    const allocator = std.testing.allocator;
+    // P-384 curve, not P-256
+    const jwks_json =
+        \\{"keys":[
+        \\  {"kty":"EC","use":"sig","kid":"p384-key","crv":"P-384",
+        \\   "x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\   "y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}
+        \\]}
+    ;
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    // Should fail — only P-256 supported, P-384 filtered out = no keys
+    try std.testing.expectError(JwksError.InvalidJwks, client.parseJwks(jwks_json));
+}
+
+test "needsRefresh considers EC keys" {
+    const allocator = std.testing.allocator;
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    // Empty cache needs refresh
+    try std.testing.expect(client.needsRefresh(1000));
+
+    // EC-only JWKS should not need refresh within TTL
+    const jwks_json =
+        \\{"keys":[
+        \\  {"kty":"EC","use":"sig","kid":"ec-1","crv":"P-256",
+        \\   "x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\   "y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}
+        \\]}
+    ;
+    try client.parseJwks(jwks_json);
+    client.last_fetch_ms = 50000;
+
+    try std.testing.expect(!client.needsRefresh(50000 + 1000));
+    try std.testing.expect(client.needsRefresh(50000 + JwksClient.DEFAULT_TTL_MS + 1));
 }

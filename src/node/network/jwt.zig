@@ -1,7 +1,7 @@
 //! JWT Parsing and Verification
 //!
 //! Shared JWT handling for WebSocket authentication.
-//! Supports HS256 (symmetric) and RS256 (asymmetric via JWKS) verification.
+//! Supports HS256 (symmetric), RS256 (RSA via JWKS), and ES256 (ECDSA P-256 via JWKS).
 //!
 //! ## Token Format
 //! Standard JWT: header.payload.signature (base64url encoded)
@@ -9,6 +9,7 @@
 //! ## Supported Algorithms
 //! - HS256: HMAC-SHA256 with shared secret
 //! - RS256: RSASSA-PKCS1-v1_5 with SHA-256 (keys from JWKS endpoint)
+//! - ES256: ECDSA P-256 with SHA-256 (keys from JWKS endpoint, used by Supabase)
 //!
 //! ## Supported Claims
 //! - `sub`: User ID
@@ -24,6 +25,7 @@ const JwksClient = @import("jwks.zig").JwksClient;
 pub const Algorithm = enum {
     hs256,
     rs256,
+    es256,
     unknown,
 };
 
@@ -135,12 +137,56 @@ pub fn verifyAndParseRs256(allocator: Allocator, token: []const u8, jwks: *const
     return parseClaimsFromJson(allocator, payload_json);
 }
 
+/// Verify JWT with ES256 (ECDSA P-256) signature using JWKS public keys.
+/// Used by Supabase and other providers that sign with ECC.
+pub fn verifyAndParseEs256(allocator: Allocator, token: []const u8, jwks: *const JwksClient) JwtError!JwtClaims {
+    var parts = std.mem.splitScalar(u8, token, '.');
+
+    const header_b64 = parts.next() orelse return JwtError.InvalidToken;
+    const payload_b64 = parts.next() orelse return JwtError.InvalidToken;
+    const signature_b64 = parts.next() orelse return JwtError.InvalidToken;
+
+    if (parts.next() != null) return JwtError.InvalidToken;
+
+    // Decode header to extract algorithm and kid
+    const header_json = decodeBase64Url(allocator, header_b64) catch return JwtError.MalformedHeader;
+    defer allocator.free(header_json);
+
+    const alg = detectAlgorithm(header_json);
+    if (alg != .es256) return JwtError.InvalidAlgorithm;
+
+    // Extract kid from header for key selection
+    const kid = extractJsonString(header_json, "\"kid\"");
+
+    // Verify ES256 signature via JWKS
+    jwks.verifyEs256(header_b64, payload_b64, signature_b64, kid) catch |err| {
+        return switch (err) {
+            error.KeyNotFound => JwtError.KeyNotFound,
+            error.InvalidSignature => JwtError.InvalidSignature,
+            error.InvalidKey => JwtError.InvalidSignature,
+            error.UnsupportedCurve => JwtError.InvalidSignature,
+            else => JwtError.InvalidSignature,
+        };
+    };
+
+    // Decode and parse payload
+    const payload_json = decodeBase64Url(allocator, payload_b64) catch return JwtError.MalformedPayload;
+    defer allocator.free(payload_json);
+
+    return parseClaimsFromJson(allocator, payload_json);
+}
+
 /// Detect the algorithm from a decoded JWT header JSON
 pub fn detectAlgorithm(header_json: []const u8) Algorithm {
     if (std.mem.indexOf(u8, header_json, "\"RS256\"") != null or
         std.mem.indexOf(u8, header_json, "\"rs256\"") != null)
     {
         return .rs256;
+    }
+    if (std.mem.indexOf(u8, header_json, "\"ES256\"") != null or
+        std.mem.indexOf(u8, header_json, "\"es256\"") != null)
+    {
+        return .es256;
     }
     if (std.mem.indexOf(u8, header_json, "\"HS256\"") != null or
         std.mem.indexOf(u8, header_json, "\"hs256\"") != null)
@@ -453,4 +499,11 @@ test "matchScope exact" {
 
 test "matchScope action mismatch" {
     try std.testing.expect(!matchScope("read:kv:*", "write", "kv", "anything"));
+}
+
+test "detectAlgorithm identifies ES256" {
+    try std.testing.expectEqual(Algorithm.es256, detectAlgorithm("{\"alg\":\"ES256\",\"typ\":\"JWT\"}"));
+    try std.testing.expectEqual(Algorithm.rs256, detectAlgorithm("{\"alg\":\"RS256\",\"typ\":\"JWT\"}"));
+    try std.testing.expectEqual(Algorithm.hs256, detectAlgorithm("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"));
+    try std.testing.expectEqual(Algorithm.unknown, detectAlgorithm("{\"alg\":\"PS256\",\"typ\":\"JWT\"}"));
 }

@@ -576,9 +576,10 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Generate a secure secret: openssl rand -base64 32
     \\# jwt_secret = "your-256-bit-secret-key-here"
     \\
-    \\# JWKS URL for RS256 signature verification
+    \\# JWKS URL for RS256/ES256 signature verification (supports RSA and ECC P-256 keys)
     \\# Keys are fetched and cached with 1-hour TTL, supporting key rotation
-    \\# jwks_url = "https://your-auth-server/.well-known/jwks.json"
+    \\# Works with Supabase, Auth0, Okta, Azure AD, Keycloak, etc.
+    \\# jwks_url = "https://your-project.supabase.co/.well-known/jwks.json"
     \\
     \\[websocket]
     \\# Rate limiting for WebSocket connections (browser clients)
