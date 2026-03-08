@@ -6,7 +6,7 @@
 //!
 //! 1. Detect CPU count (or use configured shard count)
 //! 2. Create per-shard pipes (acceptor → shard hand-off)
-//! 3. Spawn N Shard threads (CPU-pinned on Linux, QoS on macOS)
+//! 3. Spawn N Shard threads
 //! 4. Wait for all shards to be ready
 //! 5. Spawn Acceptor thread → bind + listen
 //! 6. Enter steady state
@@ -560,12 +560,15 @@ fn acceptorThread(acc: *Acceptor) void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Detect number of shards. If configured > 0, use that; else auto-detect CPUs.
+///
+/// On 4+ cores, reserves 1 core for the OS kernel (ksoftirqd, kworker, etc.).
+/// The acceptor, dashboard, and metrics threads are I/O-bound and lightweight
+/// enough to share cores with shard reactor threads.
 fn detectShardCount(configured: u16) u16 {
     if (configured > 0) return configured;
     const cpus = std.Thread.getCpuCount() catch 1;
-    // Reserve 1 core for acceptor, 1 for OS. Min 1 shard.
-    const shards = if (cpus > 2) cpus - 2 else 1;
-    return @intCast(@min(shards, 256));
+    const shards = if (cpus >= 4) cpus - 1 else cpus;
+    return @intCast(@max(1, @min(shards, 256)));
 }
 
 /// Parse port from a seed address like "127.0.0.1:9500" or "localhost:9500".
