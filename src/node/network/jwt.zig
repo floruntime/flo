@@ -507,3 +507,49 @@ test "detectAlgorithm identifies ES256" {
     try std.testing.expectEqual(Algorithm.hs256, detectAlgorithm("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"));
     try std.testing.expectEqual(Algorithm.unknown, detectAlgorithm("{\"alg\":\"PS256\",\"typ\":\"JWT\"}"));
 }
+
+test "verifyAndParseEs256 full token flow" {
+    const allocator = std.testing.allocator;
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const Encoder = std.base64.url_safe_no_pad.Encoder;
+
+    // Generate key pair and build a JwksClient with the EC key
+    const kp = EcdsaP256.KeyPair.generate();
+    const sec1 = kp.public_key.toUncompressedSec1();
+
+    var jwks = JwksClient.init(allocator, "https://example.supabase.co/.well-known/jwks.json");
+    defer jwks.deinit();
+
+    const kid = try allocator.dupe(u8, "es256-key");
+    try jwks.ec_keys.append(allocator, .{ .kid = kid, .sec1_point = sec1 });
+
+    // Construct JWT header and payload
+    const header = "{\"alg\":\"ES256\",\"kid\":\"es256-key\",\"typ\":\"JWT\"}";
+    const payload = "{\"sub\":\"supabase-user\",\"flo_namespace\":\"prod\",\"exp\":9999999999}";
+    var h_buf: [256]u8 = undefined;
+    var p_buf: [256]u8 = undefined;
+    const header_b64 = Encoder.encode(&h_buf, header);
+    const payload_b64 = Encoder.encode(&p_buf, payload);
+
+    // Sign the JWT
+    var signer = try kp.signer(null);
+    signer.update(header_b64);
+    signer.update(".");
+    signer.update(payload_b64);
+    const sig = try signer.finalize();
+    const sig_bytes = sig.toBytes();
+    var s_buf: [256]u8 = undefined;
+    const sig_b64 = Encoder.encode(&s_buf, &sig_bytes);
+
+    // Assemble full JWT: header.payload.signature
+    var token_buf: [1024]u8 = undefined;
+    const token = try std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header_b64, payload_b64, sig_b64 });
+
+    // Verify and parse — should succeed and return correct claims
+    var claims = try verifyAndParseEs256(allocator, token, &jwks);
+    defer claims.deinit(allocator);
+
+    try std.testing.expectEqualStrings("supabase-user", claims.user_id.?);
+    try std.testing.expectEqualStrings("prod", claims.namespace.?);
+    try std.testing.expectEqual(@as(i64, 9999999999), claims.exp.?);
+}

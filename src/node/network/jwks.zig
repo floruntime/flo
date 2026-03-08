@@ -635,3 +635,105 @@ test "needsRefresh considers EC keys" {
     try std.testing.expect(!client.needsRefresh(50000 + 1000));
     try std.testing.expect(client.needsRefresh(50000 + JwksClient.DEFAULT_TTL_MS + 1));
 }
+
+test "verifyEs256 accepts valid signature" {
+    const allocator = std.testing.allocator;
+    const Encoder = std.base64.url_safe_no_pad.Encoder;
+
+    // Generate an ECDSA P-256 key pair and extract public key
+    const kp = EcdsaP256.KeyPair.generate();
+    const sec1 = kp.public_key.toUncompressedSec1();
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    const kid = try allocator.dupe(u8, "test-ec-key");
+    try client.ec_keys.append(allocator, .{ .kid = kid, .sec1_point = sec1 });
+
+    // Base64url-encode header and payload
+    const header = "{\"alg\":\"ES256\",\"kid\":\"test-ec-key\",\"typ\":\"JWT\"}";
+    const payload = "{\"sub\":\"user-123\",\"exp\":9999999999}";
+    var h_buf: [256]u8 = undefined;
+    var p_buf: [256]u8 = undefined;
+    const header_b64 = Encoder.encode(&h_buf, header);
+    const payload_b64 = Encoder.encode(&p_buf, payload);
+
+    // Sign: ECDSA-P256(SHA-256(header_b64 || "." || payload_b64))
+    var signer = try kp.signer(null);
+    signer.update(header_b64);
+    signer.update(".");
+    signer.update(payload_b64);
+    const sig = try signer.finalize();
+    const sig_bytes = sig.toBytes();
+    var s_buf: [256]u8 = undefined;
+    const sig_b64 = Encoder.encode(&s_buf, &sig_bytes);
+
+    // Should verify without error
+    try client.verifyEs256(header_b64, payload_b64, sig_b64, "test-ec-key");
+}
+
+test "verifyEs256 rejects tampered signature" {
+    const allocator = std.testing.allocator;
+    const Encoder = std.base64.url_safe_no_pad.Encoder;
+
+    const kp = EcdsaP256.KeyPair.generate();
+    const sec1 = kp.public_key.toUncompressedSec1();
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    const kid = try allocator.dupe(u8, "test-ec-key");
+    try client.ec_keys.append(allocator, .{ .kid = kid, .sec1_point = sec1 });
+
+    const header = "{\"alg\":\"ES256\",\"kid\":\"test-ec-key\",\"typ\":\"JWT\"}";
+    const payload = "{\"sub\":\"user-123\",\"exp\":9999999999}";
+    var h_buf: [256]u8 = undefined;
+    var p_buf: [256]u8 = undefined;
+    const header_b64 = Encoder.encode(&h_buf, header);
+    const payload_b64 = Encoder.encode(&p_buf, payload);
+
+    var signer = try kp.signer(null);
+    signer.update(header_b64);
+    signer.update(".");
+    signer.update(payload_b64);
+    const sig = try signer.finalize();
+    var sig_bytes = sig.toBytes();
+    sig_bytes[0] ^= 0xFF; // corrupt first byte
+
+    var s_buf: [256]u8 = undefined;
+    const sig_b64 = Encoder.encode(&s_buf, &sig_bytes);
+
+    try std.testing.expectError(JwksError.InvalidSignature, client.verifyEs256(header_b64, payload_b64, sig_b64, "test-ec-key"));
+}
+
+test "verifyEs256 rejects unknown kid" {
+    const allocator = std.testing.allocator;
+    const Encoder = std.base64.url_safe_no_pad.Encoder;
+
+    const kp = EcdsaP256.KeyPair.generate();
+    const sec1 = kp.public_key.toUncompressedSec1();
+
+    var client = JwksClient.init(allocator, "https://example.com/jwks");
+    defer client.deinit();
+
+    const kid = try allocator.dupe(u8, "test-ec-key");
+    try client.ec_keys.append(allocator, .{ .kid = kid, .sec1_point = sec1 });
+
+    const header = "{\"alg\":\"ES256\",\"kid\":\"unknown\",\"typ\":\"JWT\"}";
+    const payload = "{\"sub\":\"user-123\"}";
+    var h_buf: [256]u8 = undefined;
+    var p_buf: [256]u8 = undefined;
+    const header_b64 = Encoder.encode(&h_buf, header);
+    const payload_b64 = Encoder.encode(&p_buf, payload);
+
+    var signer = try kp.signer(null);
+    signer.update(header_b64);
+    signer.update(".");
+    signer.update(payload_b64);
+    const sig = try signer.finalize();
+    const sig_bytes = sig.toBytes();
+    var s_buf: [256]u8 = undefined;
+    const sig_b64 = Encoder.encode(&s_buf, &sig_bytes);
+
+    try std.testing.expectError(JwksError.KeyNotFound, client.verifyEs256(header_b64, payload_b64, sig_b64, "wrong-kid"));
+}
