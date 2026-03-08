@@ -25,6 +25,7 @@ test "integration: router distributes keys across shards" {
             .shard => |t| {
                 per_shard[t.shard_id] += 1;
             },
+            .remote => unreachable,
         }
     }
 
@@ -53,6 +54,7 @@ test "integration: router distributes keys across shards" {
             .shard => |t| {
                 try testing.expectEqual(t.shard_id, @as(u16, @intCast(t.partition_id % shard_count)));
             },
+            .remote => unreachable,
         }
     }
 }
@@ -67,10 +69,12 @@ test "integration: router same key always routes same" {
     const first_partition = switch (first_target) {
         .local => |t| t.partition_id,
         .shard => |t| t.partition_id,
+        .remote => unreachable,
     };
     const first_shard = switch (first_target) {
         .local => @as(u16, 0), // local means shard 0 (our local shard)
         .shard => |t| t.shard_id,
+        .remote => unreachable,
     };
 
     for (1..100) |_| {
@@ -78,10 +82,12 @@ test "integration: router same key always routes same" {
         const partition = switch (target) {
             .local => |t| t.partition_id,
             .shard => |t| t.partition_id,
+            .remote => unreachable,
         };
         const shard = switch (target) {
             .local => @as(u16, 0),
             .shard => |t| t.shard_id,
+            .remote => unreachable,
         };
 
         try testing.expectEqual(first_partition, partition);
@@ -99,10 +105,12 @@ test "integration: router same key always routes same" {
         const p1 = switch (t1) {
             .local => |t| t.partition_id,
             .shard => |t| t.partition_id,
+            .remote => unreachable,
         };
         const p2 = switch (t2) {
             .local => |t| t.partition_id,
             .shard => |t| t.partition_id,
+            .remote => unreachable,
         };
 
         try testing.expectEqual(p1, p2);
