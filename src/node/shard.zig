@@ -80,6 +80,9 @@ const Partition = @import("../storage/partition.zig").Partition;
 const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
+const Forwarder = @import("../cluster/forwarder.zig").Forwarder;
+const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
+const NodeId = @import("../raft/node.zig").NodeId;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -183,6 +186,12 @@ pub const Shard = struct {
 
     /// Maximum age of entries in the hot ring (seconds). 0 = disabled.
     hot_flush_seconds: u64,
+
+    /// Cross-node request forwarder (null in single-node mode).
+    forwarder: ?*Forwarder,
+
+    /// Cluster partition table (null in single-node mode).
+    partition_table: ?*PartitionTable,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -416,7 +425,21 @@ pub const Shard = struct {
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
+            .forwarder = null,
+            .partition_table = null,
         };
+    }
+
+    // ─── Cluster wiring ──────────────────────────────────────────────────
+
+    /// Wire a cross-node forwarder (enables cluster mode forwarding).
+    pub fn setForwarder(self: *Shard, fwd: *Forwarder) void {
+        self.forwarder = fwd;
+    }
+
+    /// Wire a cluster partition table (enables cluster-aware routing).
+    pub fn setPartitionTable(self: *Shard, pt: *PartitionTable) void {
+        self.partition_table = pt;
     }
 
     pub fn deinit(self: *Shard) void {
@@ -586,6 +609,8 @@ pub const Shard = struct {
     /// Dispatch a parsed request through the Dispatcher.
     /// Walk opcodes (list/scan) are routed to executeWalk() for cross-shard
     /// aggregation when walk contexts are wired (multi-shard mode).
+    /// In cluster mode (partition_table != null), routable requests are checked
+    /// against the partition table and forwarded to remote nodes when needed.
     pub fn dispatchRequest(self: *Shard, conn: *Connection, req: proto.Request) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
@@ -604,8 +629,58 @@ pub const Shard = struct {
                 }
             }
             self.executeWalk(conn, req);
+        } else if (self.partition_table) |pt| {
+            // Cluster mode: check if the request should be forwarded to another node
+            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
+                if (pre_route_fn(req)) |hash| {
+                    const ns_hash = node_router.namespaceHash(req.namespace);
+                    const target = self.router.routeCluster(hash, ns_hash, pt);
+                    switch (target) {
+                        .remote => |remote| {
+                            self.forwardToRemote(conn, req, remote.node_id);
+                            return;
+                        },
+                        .local, .shard => {},
+                    }
+                }
+            }
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
         } else {
             self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+        }
+    }
+
+    /// Forward a request to a remote node via the cluster forwarder.
+    fn forwardToRemote(self: *Shard, conn: *Connection, req: proto.Request, node_id: NodeId) void {
+        const fwd = self.forwarder orelse {
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "no forwarder configured");
+            return;
+        };
+        const now_ms = std.time.milliTimestamp();
+        const result = fwd.forward(
+            node_id,
+            req.header.request_id,
+            @as(u64, conn.id),
+            req.header.payload_length,
+            now_ms,
+        ) catch {
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "forward failed");
+            return;
+        };
+        switch (result) {
+            .queued => {
+                log.debug("Forwarded request {d} to node {d}", .{ req.header.request_id, node_id });
+            },
+            .no_route => {
+                self.sendErrorResponse(conn, req.header.request_id, .internal_error, "no route to node");
+            },
+            .overloaded => {
+                self.sendErrorResponse(conn, req.header.request_id, .overloaded, "forward queue full");
+            },
+            .local => {
+                // Shouldn't happen — routeCluster already checked. Dispatch locally.
+                self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            },
         }
     }
 

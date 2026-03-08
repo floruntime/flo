@@ -28,6 +28,8 @@
 //! extraction, same two-level mapping.
 
 const std = @import("std");
+const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
+const NodeId = @import("../raft/node.zig").NodeId;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -55,7 +57,8 @@ pub const RouteTarget = union(enum) {
     local: LocalTarget,
     /// Partition lives on a different shard on the same node — forward via inbox.
     shard: ShardTarget,
-    // TODO Phase 5 (cluster): remote: RemoteTarget (other node)
+    /// Partition lives on a different node — forward via cluster forwarder.
+    remote: RemoteTarget,
 
     pub const LocalTarget = struct {
         partition_id: u32,
@@ -64,6 +67,11 @@ pub const RouteTarget = union(enum) {
     pub const ShardTarget = struct {
         partition_id: u32,
         shard_id: u16,
+    };
+
+    pub const RemoteTarget = struct {
+        partition_id: u32,
+        node_id: NodeId,
     };
 };
 
@@ -98,9 +106,31 @@ pub const Router = struct {
         return @intCast(partition_id % self.shard_count);
     }
 
-    /// Full route: hash → partition → local-or-forward decision.
+    /// Full route: hash → partition → local-or-forward decision (single-node).
     pub fn route(self: Router, hash: u64) RouteTarget {
         const partition_id = self.hashToPartition(hash);
+        const shard_id = self.partitionToShard(partition_id);
+        if (shard_id == self.local_shard_id) {
+            return .{ .local = .{ .partition_id = partition_id } };
+        }
+        return .{ .shard = .{ .partition_id = partition_id, .shard_id = shard_id } };
+    }
+
+    /// Cluster-aware route: hash → partition → check partition table → local/shard/remote.
+    /// Falls back to single-node routing when the partition table has no assignment.
+    pub fn routeCluster(self: Router, hash: u64, namespace_hash: u32, table: *const PartitionTable) RouteTarget {
+        const partition_id = self.hashToPartition(hash);
+
+        // Consult the partition table for cross-node ownership
+        if (table.lookup(namespace_hash, @intCast(@as(u32, partition_id) & 0xFFFF))) |result| {
+            if (!result.is_local) {
+                return .{ .remote = .{
+                    .partition_id = partition_id,
+                    .node_id = result.leader,
+                } };
+            }
+        }
+        // Local to this node — resolve which shard
         const shard_id = self.partitionToShard(partition_id);
         if (shard_id == self.local_shard_id) {
             return .{ .local = .{ .partition_id = partition_id } };
@@ -306,6 +336,7 @@ test "Router: route local vs shard" {
                 try std.testing.expectEqual(t.shard_id, @as(u16, @intCast(t.partition_id % 4)));
                 remote_count += 1;
             },
+            .remote => unreachable, // single-node route never returns remote
         }
     }
     // With 4 shards, ~25% should be local
@@ -376,4 +407,68 @@ test "Router: namespaceHash and nameHash" {
     // Different namespace + same name → different hash (isolated)
     const ns_hash3 = nameHash(ns_b, "events");
     try std.testing.expect(ns_hash != ns_hash3);
+}
+
+test "Router: routeCluster local fallback" {
+    // When partition table has no assignment, routeCluster falls back to single-node routing
+    const router = Router.init(4096, 4, 0);
+    var table = PartitionTable.init(std.testing.allocator, 1); // local node = 1
+    defer table.deinit();
+
+    const target = router.routeCluster(hashKey("mykey"), namespaceHash("default"), &table);
+    // Should resolve as local or shard (never remote without assignments)
+    switch (target) {
+        .local => {},
+        .shard => {},
+        .remote => return error.TestUnexpectedResult,
+    }
+}
+
+test "Router: routeCluster remote target" {
+    const router = Router.init(4096, 4, 0);
+    const ns_hash = namespaceHash("default");
+
+    // This node is node 1
+    var table = PartitionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+
+    // Find a partition that the router maps to and assign it to node 2 (remote)
+    const hash = hashKey("remote-test-key");
+    const partition_id = router.hashToPartition(hash);
+    const partition_id_u16: u16 = @intCast(partition_id & 0xFFFF);
+
+    try table.assign(ns_hash, partition_id_u16, 2, &.{});
+
+    const target = router.routeCluster(hash, ns_hash, &table);
+    switch (target) {
+        .remote => |r| {
+            try std.testing.expectEqual(@as(u32, partition_id), r.partition_id);
+            try std.testing.expectEqual(@as(NodeId, 2), r.node_id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Router: routeCluster local with assignment" {
+    const router = Router.init(4096, 4, 0);
+    const ns_hash = namespaceHash("default");
+
+    // This node is node 1
+    var table = PartitionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+
+    // Assign a partition to node 1 (local)
+    const hash = hashKey("local-test-key");
+    const partition_id = router.hashToPartition(hash);
+    const partition_id_u16: u16 = @intCast(partition_id & 0xFFFF);
+
+    try table.assign(ns_hash, partition_id_u16, 1, &.{});
+
+    const target = router.routeCluster(hash, ns_hash, &table);
+    // Should be local or shard (same node), never remote
+    switch (target) {
+        .local => {},
+        .shard => {},
+        .remote => return error.TestUnexpectedResult,
+    }
 }
