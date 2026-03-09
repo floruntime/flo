@@ -7,8 +7,10 @@ import {
     Sun,
     Moon,
     Database,
+    Shield,
 } from "lucide-react";
 import { useNamespace } from "../lib/NamespaceContext";
+import { useAuth } from "../lib/AuthContext";
 
 /*
  * NOTE: The "weaved" project selector and cloud/cluster mode toggle have been
@@ -19,6 +21,7 @@ import { useNamespace } from "../lib/NamespaceContext";
 
 export function Header() {
     const { namespaces, selected, setSelected } = useNamespace();
+    const { auth, logout } = useAuth();
     const [isNamespaceOpen, setIsNamespaceOpen] = useState(false);
     const [isProfileOpen, setIsProfileOpen] = useState(false);
     const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -119,8 +122,11 @@ export function Header() {
                             <div className="absolute top-full right-0 mt-2 w-56 bg-surface/95 backdrop-blur-sm border border-surface-border rounded-lg shadow-xl z-50 overflow-hidden">
                                 {/* User Info */}
                                 <div className="px-3 py-2 border-b border-surface-border/50">
-                                    <div className="font-medium text-text-primary text-sm">oreofeolurin</div>
-                                    <div className="text-[11px] text-text-secondary mt-0.5">oreofeolurin@gmail.com</div>
+                                    <div className="font-medium text-text-primary text-sm flex items-center gap-1.5">
+                                        <Shield className="w-3.5 h-3.5 text-primary" />
+                                        {auth?.role ?? "unknown"}
+                                    </div>
+                                    <div className="text-[11px] text-text-secondary mt-0.5">Flo Dashboard Session</div>
                                 </div>
 
                                 {/* Menu Items */}
@@ -160,7 +166,13 @@ export function Header() {
 
                                 {/* Log out */}
                                 <div className="border-t border-surface-border/50">
-                                    <button className="w-full px-3 py-1.5 text-left text-xs text-text-secondary hover:text-error hover:bg-surface-hover/50 transition-colors">
+                                    <button
+                                        onClick={() => {
+                                            setIsProfileOpen(false);
+                                            logout();
+                                        }}
+                                        className="w-full px-3 py-1.5 text-left text-xs text-text-secondary hover:text-error hover:bg-surface-hover/50 transition-colors"
+                                    >
                                         Log out
                                     </button>
                                 </div>

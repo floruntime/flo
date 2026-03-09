@@ -24,7 +24,7 @@ test {
     _ = @import("protocol/resp.zig");
 }
 
-// Node layer — Phase 1
+// Node layer
 test {
     _ = @import("node/reactor.zig");
     _ = @import("node/inbox.zig");
@@ -62,7 +62,7 @@ test {
     _ = @import("storage/cold/tier_manager.zig");
 }
 
-// Raft consensus — Phase 3
+// Raft consensus
 test {
     _ = @import("raft/log.zig");
     _ = @import("raft/node.zig");
@@ -72,7 +72,7 @@ test {
     _ = @import("raft/snapshot.zig");
 }
 
-// Projections — Phase 4
+// Projections
 test {
     _ = @import("projection/router.zig");
     _ = @import("projection/kv.zig");
@@ -81,7 +81,7 @@ test {
     _ = @import("projection/ts.zig");
 }
 
-// Handlers — Phase 5
+// Handlers
 test {
     _ = @import("kv/handler.zig");
     _ = @import("stream/handler.zig");
@@ -136,7 +136,7 @@ test {
     _ = @import("processing/parser.zig");
 }
 
-// Dashboard — Phase 6.1
+// Dashboard
 test {
     _ = @import("node/dashboard/api/helpers.zig");
     _ = @import("node/dashboard/api/system.zig");
@@ -152,11 +152,16 @@ test {
     _ = @import("node/dashboard/http_server.zig");
 }
 
-// Cluster — Phase 7
+// Cluster
 test {
     _ = @import("cluster/coordinator.zig");
     _ = @import("cluster/partition_table.zig");
     _ = @import("cluster/forwarder.zig");
     _ = @import("cluster/gossip.zig");
     _ = @import("cluster/membership.zig");
+}
+
+// Auth
+test {
+    _ = @import("auth/mod.zig");
 }

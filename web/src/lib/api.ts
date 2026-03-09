@@ -9,6 +9,8 @@
  * Namespaces are first-class resources that can contain streams, queues, and KV keys.
  */
 
+import { getAuthToken } from './AuthContext';
+
 // API base URL - configurable via environment variable for production deployments
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1';
 
@@ -505,7 +507,22 @@ class FloApiClient {
   }
 
   private async fetch<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(`${this.baseUrl}/${path}`, options);
+    const headers = new Headers(options?.headers);
+    const token = getAuthToken();
+    if (token && !headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+
+    const response = await fetch(`${this.baseUrl}/${path}`, { ...options, headers });
+
+    if (response.status === 401) {
+      // Clear stale auth and redirect to login
+      localStorage.removeItem('flo:auth');
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+      throw new Error('Session expired');
+    }
 
     if (!response.ok) {
       const error: ApiError = await response.json().catch(() => ({

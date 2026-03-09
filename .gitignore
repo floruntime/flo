@@ -32,18 +32,9 @@ Thumbs.db
 
 *.txt
 
-# Benchmark data
-.data/
-data/
-profiling-results/
-#docs/from-gemini.md
-old-code/
-src/old_storage/
-tests/old_storage/
-
 # Dashboard build artifacts
 src/node/dashboard/dist/
 
 # Dashboard generated files
 src/node/dashboard/dist/
-src/node/dashboard/assets.zig
+src/node/dashboard/assets.zigAUTH_DESIGN.md

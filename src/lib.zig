@@ -83,3 +83,8 @@ pub const processing = struct {
     pub const parser = @import("processing/parser.zig");
     pub const definition = @import("processing/definition.zig");
 };
+
+// =============================================================================
+// Auth: API keys, session tokens, key store
+// =============================================================================
+pub const auth = @import("auth/mod.zig");

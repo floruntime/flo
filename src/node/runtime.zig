@@ -86,7 +86,6 @@ pub const RuntimeConfig = struct {
     dashboard_port: u16 = 0,
     dashboard_bind: []const u8 = "0.0.0.0",
     dashboard_cors_origins: ?[]const u8 = null,
-    dashboard_admin_token: ?[]const u8 = null,
 
     cluster_node_id: u32 = 0,
     /// Port for Raft RPC communication (0 = derive from listen_port + 500)
@@ -425,7 +424,6 @@ pub const Runtime = struct {
                 .port = self.config.effectiveDashboardPort(),
                 .bind = self.config.dashboard_bind,
                 .cors_origins = self.config.dashboard_cors_origins orelse "*",
-                .admin_token = self.config.dashboard_admin_token orelse "",
             }, ctx);
             self.dashboard_server = server;
             try server.start();

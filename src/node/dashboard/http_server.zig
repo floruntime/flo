@@ -3,16 +3,16 @@
 //! Lightweight HTTP server for the Flo web dashboard.
 //! Serves the REST API and embedded static assets (React SPA).
 //!
-//! Security Model: Network-level (like Redis/Nomad)
+//! Security Model: API key + session token
 //! - Default bind to localhost for safe out-of-box experience
-//! - Optional admin_token for basic protection behind VPN/proxy
+//! - Requires `flo server bootstrap` to generate root API key
 //!
 //! Endpoints:
 //! - GET /health         - Health check (always public)
-//! - GET /api/v1/*       - REST API for dashboard data (requires admin_token if set)
+//! - GET /api/v1/*       - REST API for dashboard data (requires auth)
 //! - GET /api/v1/kv/namespaces/:ns/keys/:key/watch — SSE live updates (stub)
 //! - GET /api/v1/workflow/namespaces/:ns/runs/:run_id/watch — SSE workflow run updates (stub)
-//! - GET /*              - Embedded static files (requires admin_token if set)
+//! - GET /*              - Embedded static files (requires auth)
 //!
 //! The dashboard assets are embedded at compile time from web/dist/
 
@@ -23,6 +23,8 @@ const assets = @import("assets.zig");
 const http = @import("../../util/http/mod.zig");
 const DashboardContext = api.DashboardContext;
 const log = @import("stdx").log;
+const auth = @import("../../auth/mod.zig");
+const auth_session = @import("../../auth/session.zig");
 
 // =============================================================================
 // Server Configuration and Implementation
@@ -33,7 +35,7 @@ pub const DashboardServerConfig = struct {
     port: u16 = 9080,
     bind: []const u8 = "127.0.0.1", // Localhost only by default (safe)
     cors_origins: []const u8 = "*",
-    admin_token: []const u8 = "", // Empty = no auth required
+    key_store: ?*auth.KeyStore = null,
 };
 
 pub const DashboardServer = struct {
@@ -92,7 +94,7 @@ pub const DashboardServer = struct {
         // Start server thread
         self.thread = try std.Thread.spawn(.{}, serverLoop, .{self});
 
-        const auth_status = if (self.config.admin_token.len > 0) " (admin_token required)" else " (no auth)";
+        const auth_status = if (self.config.key_store != null) " (auth enabled)" else " (no auth — run flo server bootstrap)";
         std.log.info("Dashboard server listening on {s}:{d}{s}", .{ self.config.bind, self.config.port, auth_status });
     }
 
@@ -178,9 +180,27 @@ pub const DashboardServer = struct {
 
         // Check admin token for protected paths (skip /health which is always public)
         if (!std.mem.eql(u8, parsed.path, "/health")) {
-            if (!self.validateAdminToken(request)) {
-                self.sendError(client, .unauthorized, "Unauthorized: invalid or missing admin token");
-                return;
+            // Auth session endpoints are accessible with API key (not session token)
+            if (parsed.pathAfter("/api/v1/auth/")) |auth_path| {
+                if (std.mem.eql(u8, auth_path, "session")) {
+                    self.handleAuthSession(client, parsed.method, request, body, cors_headers);
+                    return;
+                }
+            }
+
+            if (self.config.key_store) |ks| {
+                const auth_result = auth.authenticateHttpRequest(ks, request);
+                switch (auth_result) {
+                    .api_key, .session_token => {},
+                    .none => {
+                        self.sendError(client, .unauthorized, "Authentication required");
+                        return;
+                    },
+                    .denied => |msg| {
+                        self.sendError(client, .unauthorized, msg);
+                        return;
+                    },
+                }
             }
         }
 
@@ -299,38 +319,68 @@ pub const DashboardServer = struct {
         _ = std.posix.write(client, response) catch return;
     }
 
-    /// Validate admin token if configured.
-    /// Returns true if:
-    /// - No admin_token is configured (empty string)
-    /// - Token matches via query param ?token=xxx
-    /// - Token matches via header X-Admin-Token: xxx
-    fn validateAdminToken(self: *Self, request: []const u8) bool {
-        // No token configured = allow all
-        if (self.config.admin_token.len == 0) return true;
+    /// Handle POST/DELETE /api/v1/auth/session — exchange API key for session token.
+    fn handleAuthSession(self: *Self, client: std.posix.socket_t, method: http.Method, request: []const u8, body: []const u8, cors_headers: ?[]const u8) void {
+        const ks = self.config.key_store orelse {
+            self.sendError(client, .internal_server_error, "Auth not configured");
+            return;
+        };
 
-        // Check query param: ?token=xxx
-        if (std.mem.indexOf(u8, request, "?token=")) |pos| {
-            const token_start = pos + 7;
-            // Find end of token (space, &, or newline)
-            var token_end = token_start;
-            while (token_end < request.len) : (token_end += 1) {
-                const c = request[token_end];
-                if (c == ' ' or c == '&' or c == '\r' or c == '\n') break;
-            }
-            const token = request[token_start..token_end];
-            if (std.mem.eql(u8, token, self.config.admin_token)) return true;
+        if (method == .DELETE) {
+            // Logout — client clears token, server acknowledges
+            self.sendResponse(client, .ok, .json, "{\"status\":\"logged_out\"}", cors_headers);
+            return;
         }
 
-        // Check header: X-Admin-Token: xxx
-        var lines = std.mem.splitSequence(u8, request, "\r\n");
-        while (lines.next()) |line| {
-            if (std.ascii.startsWithIgnoreCase(line, "x-admin-token:")) {
-                const token = std.mem.trim(u8, line[14..], " ");
-                if (std.mem.eql(u8, token, self.config.admin_token)) return true;
-            }
+        if (method != .POST) {
+            self.sendError(client, .method_not_allowed, "Method not allowed");
+            return;
         }
 
-        return false;
+        // Extract API key from X-Api-Key header or body {"api_key":"..."}
+        const api_key = auth.extractHeader(request, "x-api-key: ") orelse
+            extractJsonField(body, "api_key") orelse
+            {
+                self.sendError(client, .unauthorized, "API key required");
+                return;
+            };
+
+        // Validate the key
+        const found = ks.validateKey(api_key) orelse {
+            self.sendError(client, .unauthorized, "Invalid API key");
+            return;
+        };
+
+        // Issue session token
+        const secret = ks.getSigningSecret() orelse {
+            self.sendError(client, .internal_server_error, "Server not bootstrapped");
+            return;
+        };
+
+        const token = auth_session.issueSessionToken(
+            self.allocator,
+            found.getId(),
+            found.role,
+            secret,
+            auth_session.default_ttl_seconds,
+        ) catch {
+            self.sendError(client, .internal_server_error, "Failed to create session");
+            return;
+        };
+        defer self.allocator.free(token);
+
+        // Build response JSON
+        var resp_buf: [2048]u8 = undefined;
+        const resp = std.fmt.bufPrint(&resp_buf, "{{\"token\":\"{s}\",\"role\":\"{s}\",\"expires_in\":{d}}}", .{
+            token,
+            found.role.toString(),
+            auth_session.default_ttl_seconds,
+        }) catch {
+            self.sendError(client, .internal_server_error, "Response too large");
+            return;
+        };
+
+        self.sendResponse(client, .ok, .json, resp, cors_headers);
     }
 
     /// Get the actual bound port (useful when port was 0)
@@ -342,6 +392,37 @@ pub const DashboardServer = struct {
         return std.mem.bigToNative(u16, addr.port);
     }
 };
+
+// =============================================================================
+// JSON Field Extraction (for auth endpoint body parsing)
+// =============================================================================
+
+/// Extract a string value from a JSON body given a field name.
+/// Finds `"field":"value"` and returns the value (slice into input).
+fn extractJsonField(json: []const u8, field: []const u8) ?[]const u8 {
+    // Search for "field"
+    var i: usize = 0;
+    while (i + field.len + 2 < json.len) : (i += 1) {
+        if (json[i] == '"' and
+            i + 1 + field.len < json.len and
+            std.mem.eql(u8, json[i + 1 ..][0..field.len], field) and
+            json[i + 1 + field.len] == '"')
+        {
+            // Found the key, skip to value
+            var j = i + 1 + field.len + 1; // past closing quote
+            // Skip colon and whitespace
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) : (j += 1) {}
+            // Expect opening quote
+            if (j < json.len and json[j] == '"') {
+                j += 1;
+                const start = j;
+                while (j < json.len and json[j] != '"') : (j += 1) {}
+                if (j > start) return json[start..j];
+            }
+        }
+    }
+    return null;
+}
 
 // =============================================================================
 // SSE Path Parsers (path detection only — watch loops will be added
@@ -471,5 +552,22 @@ test "DashboardServerConfig defaults" {
     try std.testing.expectEqual(@as(u16, 9080), config.port);
     try std.testing.expectEqualStrings("127.0.0.1", config.bind);
     try std.testing.expectEqualStrings("*", config.cors_origins);
-    try std.testing.expectEqualStrings("", config.admin_token);
+    try std.testing.expect(config.key_store == null);
+}
+
+test "extractJsonField basic" {
+    const body = "{\"api_key\":\"flo_sk_admin_abc123\",\"other\":\"value\"}";
+    const result = extractJsonField(body, "api_key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("flo_sk_admin_abc123", result.?);
+}
+
+test "extractJsonField missing" {
+    const body = "{\"other\":\"value\"}";
+    try std.testing.expect(extractJsonField(body, "api_key") == null);
+}
+
+test "extractJsonField empty body" {
+    try std.testing.expect(extractJsonField("", "api_key") == null);
+    try std.testing.expect(extractJsonField("{}", "api_key") == null);
 }

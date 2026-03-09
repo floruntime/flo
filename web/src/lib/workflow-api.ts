@@ -6,6 +6,8 @@
 // Proxied: Vite dev → port 9000 (main server)
 // =============================================================================
 
+import { getAuthToken } from './AuthContext';
+
 const API_BASE = '/api/v1/workflow';
 const DEFAULT_NS = 'default';
 
@@ -102,11 +104,26 @@ export class WorkflowApiError extends Error {
 // ---------------------------------------------------------------------------
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  });
+  const headers = new Headers(init?.headers);
+  if (!headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const token = getAuthToken();
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const res = await fetch(path, { ...init, headers });
   const text = await res.text();
+
+  if (res.status === 401) {
+    localStorage.removeItem('flo:auth');
+    if (window.location.pathname !== '/login') {
+      window.location.href = '/login';
+    }
+    throw new WorkflowApiError(401, text);
+  }
+
   if (!res.ok) {
     throw new WorkflowApiError(res.status, text);
   }

@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppLayout } from "./layouts/AppLayout";
 import { NamespaceProvider } from "./lib/NamespaceContext";
+import { AuthProvider, useAuth } from "./lib/AuthContext";
+import { LoginPage } from "./pages/LoginPage";
 import { ClusterOverview } from "./pages/ClusterOverview";
 import { StreamsList } from "./pages/StreamsList";
 import { ActionsList } from "./pages/ActionsList";
@@ -18,13 +20,21 @@ import { WorkflowDefinitionsPage } from "./pages/WorkflowDefinitionsPage";
 import { WorkflowLayout } from "./layouts/WorkflowLayout";
 import { TimeSeriesList } from "./pages/TimeSeriesList";
 import { TimeSeriesDetail } from "./pages/TimeSeriesDetail";
+import type { ReactNode } from "react";
+
+function RequireAuth({ children }: { children: ReactNode }) {
+  const { isAuthenticated } = useAuth();
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
 
 function App() {
   return (
     <BrowserRouter>
-      <NamespaceProvider>
+      <AuthProvider>
       <Routes>
-        <Route element={<AppLayout />}>
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<RequireAuth><NamespaceProvider><AppLayout /></NamespaceProvider></RequireAuth>}>
           <Route path="/" element={<ClusterOverview />} />
           <Route path="/streams" element={<StreamsList />} />
           <Route path="/streams/:streamId" element={<StreamDetail />} />
@@ -55,7 +65,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
-      </NamespaceProvider>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

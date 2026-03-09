@@ -20,6 +20,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ws = @import("network/websocket.zig");
 const proto = @import("../protocol/proto.zig");
+const auth = @import("../auth/mod.zig");
+const auth_session = @import("../auth/session.zig");
 
 // =============================================================================
 // Opcode Whitelist
@@ -234,6 +236,31 @@ pub fn parseUpgrade(allocator: Allocator, request: []const u8) !?UpgradeResult {
         .response = response,
         .auth_token = auth_token,
     };
+}
+
+/// Authenticate a WebSocket session using the token extracted during upgrade.
+/// If key_store is available, validates the token as an API key or session token.
+/// Returns the auth result for role/scope enforcement.
+pub fn authenticateSession(key_store: ?*const auth.KeyStore, token: ?[]const u8) auth.AuthResult {
+    const ks = key_store orelse return .none;
+    const tok = token orelse return .none;
+
+    // Try as session token first (Bearer JWT)
+    if (ks.getSigningSecret()) |secret| {
+        if (auth_session.verifySessionToken(secret, tok)) |claims| {
+            return .{ .session_token = claims };
+        } else |_| {}
+    }
+
+    // Try as API key
+    if (ks.validateKey(tok)) |key| {
+        return .{ .api_key = .{
+            .role = key.role,
+            .key_id = key.getId(),
+        } };
+    }
+
+    return .{ .denied = "Invalid token" };
 }
 
 // =============================================================================

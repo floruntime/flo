@@ -41,6 +41,8 @@ pub const ServerProcess = struct {
     started: bool,
     config: ServerConfig,
     log_thread: ?std.Thread = null,
+    /// Root admin API key from bootstrap (set when config.auth_enabled = true)
+    api_key: ?[]const u8 = null,
 
     /// Default timeout for server readiness (ms)
     pub const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
@@ -137,6 +139,9 @@ pub const ServerProcess = struct {
         /// Expose internal keys (prefixed with '_') in kv scan for testing
         /// When true, kv list/scan will show _proc:, _action:, etc. keys
         expose_internal_keys: bool = false,
+        /// Enable auth bootstrapping — server will run `flo server bootstrap` on start
+        /// and expose the root API key via ServerProcess.api_key
+        auth_enabled: bool = false,
     };
 
     /// Initialize a new server process manager with default config
@@ -190,6 +195,7 @@ pub const ServerProcess = struct {
             self.stop();
         }
 
+        if (self.api_key) |k| self.allocator.free(k);
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.config_file);
         self.allocator.free(self.log_file_path);
@@ -364,6 +370,11 @@ pub const ServerProcess = struct {
         };
 
         self.started = true;
+
+        // Run auth bootstrap if auth is enabled
+        if (self.config.auth_enabled) {
+            self.api_key = try self.runBootstrap();
+        }
     }
 
     /// Stop the server gracefully
@@ -486,6 +497,64 @@ pub const ServerProcess = struct {
         defer self.allocator.free(logs);
 
         std.debug.print("\n=== SERVER LOGS ({s}) ===\n{s}\n=== END SERVER LOGS ===\n", .{ self.log_file_path, logs });
+    }
+
+    /// Run `flo server bootstrap` against this server and return the API key.
+    /// Caller owns the returned slice.
+    fn runBootstrap(self: *Self) ![]const u8 {
+        const bootstrap_file = try std.fmt.allocPrint(self.allocator, "{s}/bootstrap.key", .{self.data_dir});
+        defer self.allocator.free(bootstrap_file);
+
+        const argv = &[_][]const u8{
+            self.flo_binary,
+            "server",
+            "bootstrap",
+            "--data-dir",
+            self.data_dir,
+            "--out",
+            bootstrap_file,
+        };
+
+        var child = std.process.Child.init(argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        try child.spawn();
+
+        var stdout_list: std.ArrayList(u8) = .empty;
+        var stderr_list: std.ArrayList(u8) = .empty;
+        defer stdout_list.deinit(self.allocator);
+        defer stderr_list.deinit(self.allocator);
+
+        try child.collectOutput(self.allocator, &stdout_list, &stderr_list, 64 * 1024);
+        const term = try child.wait();
+        const exit_code: u8 = switch (term) {
+            .Exited => |code| code,
+            else => 255,
+        };
+
+        if (exit_code != 0) {
+            std.debug.print("[e2e] bootstrap failed (exit {d}): {s}\n", .{ exit_code, stderr_list.items });
+            return error.BootstrapFailed;
+        }
+
+        // Read the key from the output file
+        const key_raw = std.fs.cwd().readFileAlloc(self.allocator, bootstrap_file, 1024) catch |err| {
+            // Fall back to parsing stdout if file read fails
+            _ = err;
+            const out = std.mem.trim(u8, stdout_list.items, &std.ascii.whitespace);
+            // Extract the key token starting with "flo_sk_"
+            if (std.mem.indexOf(u8, out, "flo_sk_")) |pos| {
+                const key_start = out[pos..];
+                const end = std.mem.indexOfAny(u8, key_start, &std.ascii.whitespace) orelse key_start.len;
+                return try self.allocator.dupe(u8, key_start[0..end]);
+            }
+            return error.BootstrapKeyNotFound;
+        };
+        defer self.allocator.free(key_raw);
+
+        const key = std.mem.trim(u8, key_raw, &std.ascii.whitespace);
+        return try self.allocator.dupe(u8, key);
     }
 
     /// Force kill the server process

@@ -153,6 +153,8 @@ pub const CliRunner = struct {
     allocator: Allocator,
     flo_binary: []const u8,
     endpoint: []const u8,
+    /// API key injected as --api-key flag on every command (set when auth is enabled)
+    api_key: ?[]const u8 = null,
 
     /// Initialize CLI runner
     pub fn init(allocator: Allocator, flo_binary: []const u8, endpoint: []const u8) !*Self {
@@ -167,16 +169,24 @@ pub const CliRunner = struct {
 
     /// Clean up resources
     pub fn deinit(self: *Self) void {
+        if (self.api_key) |k| self.allocator.free(k);
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.endpoint);
         self.allocator.destroy(self);
     }
 
+    /// Set the API key to inject into every command (takes ownership of a duped copy)
+    pub fn setApiKey(self: *Self, key: []const u8) !void {
+        if (self.api_key) |old| self.allocator.free(old);
+        self.api_key = try self.allocator.dupe(u8, key);
+    }
+
     /// Run a CLI command asynchronously (returns handle to wait on)
     /// Useful for testing blocking operations like `kv get --block`
     pub fn runAsync(self: *Self, args: []const []const u8) !*AsyncCommand {
-        // Build full argument list, inserting --endpoint before any "--" separator
-        const total_args = 1 + args.len + 2;
+        // Build full argument list, inserting --endpoint (and --api-key if set) before any "--" separator
+        const extra_flags: usize = 2 + if (self.api_key != null) @as(usize, 2) else @as(usize, 0);
+        const total_args = 1 + args.len + extra_flags;
 
         var argv = try self.allocator.alloc([]const u8, total_args);
         var owned_argv = try self.allocator.alloc([]const u8, args.len);
@@ -197,20 +207,27 @@ pub const CliRunner = struct {
 
         argv[0] = self.flo_binary;
         if (dashdash_pos) |dd| {
-            for (0..dd) |i| {
-                argv[1 + i] = owned_argv[i];
+            for (0..dd) |i| argv[1 + i] = owned_argv[i];
+            var inject_at: usize = 1 + dd;
+            argv[inject_at] = "--endpoint";
+            argv[inject_at + 1] = self.endpoint;
+            inject_at += 2;
+            if (self.api_key) |key| {
+                argv[inject_at] = "--api-key";
+                argv[inject_at + 1] = key;
+                inject_at += 2;
             }
-            argv[1 + dd] = "--endpoint";
-            argv[1 + dd + 1] = self.endpoint;
-            for (dd..args.len) |i| {
-                argv[1 + dd + 2 + i - dd] = owned_argv[i];
-            }
+            for (dd..args.len) |i| argv[inject_at + (i - dd)] = owned_argv[i];
         } else {
-            for (args, 0..) |_, i| {
-                argv[1 + i] = owned_argv[i];
+            for (args, 0..) |_, i| argv[1 + i] = owned_argv[i];
+            var inject_at: usize = 1 + args.len;
+            argv[inject_at] = "--endpoint";
+            argv[inject_at + 1] = self.endpoint;
+            inject_at += 2;
+            if (self.api_key) |key| {
+                argv[inject_at] = "--api-key";
+                argv[inject_at + 1] = key;
             }
-            argv[total_args - 2] = "--endpoint";
-            argv[total_args - 1] = self.endpoint;
         }
 
         const async_cmd = try self.allocator.create(AsyncCommand);
@@ -275,12 +292,13 @@ pub const CliRunner = struct {
         async_cmd.completed.store(true, .release);
     }
 
-    /// Run a CLI command (automatically inserts --endpoint before any `--` separator)
+    /// Run a CLI command (automatically inserts --endpoint and --api-key before any `--` separator)
     pub fn run(self: *Self, args: []const []const u8) !CommandResult {
-        // Build full argument list: [flo_binary] + args_before_-- + [--endpoint, endpoint] + args_from_--
-        // We must insert --endpoint BEFORE "--" because commander treats everything
+        // Build full argument list: [flo_binary] + args_before_-- + [--endpoint, endpoint, (--api-key, key)] + args_from_--
+        // We must insert flags BEFORE "--" because commander treats everything
         // after "--" as positional (no flag parsing).
-        const total_args = 1 + args.len + 2;
+        const extra_flags: usize = 2 + if (self.api_key != null) @as(usize, 2) else @as(usize, 0);
+        const total_args = 1 + args.len + extra_flags;
 
         var argv = try self.allocator.alloc([]const u8, total_args);
         defer self.allocator.free(argv);
@@ -296,22 +314,29 @@ pub const CliRunner = struct {
 
         argv[0] = self.flo_binary;
         if (dashdash_pos) |dd| {
-            // Insert args before --, then --endpoint, then -- and rest
-            for (args[0..dd], 0..) |arg, i| {
-                argv[1 + i] = arg;
+            // Insert args before --, then flags, then -- and rest
+            for (args[0..dd], 0..) |arg, i| argv[1 + i] = arg;
+            var inject_at: usize = 1 + dd;
+            argv[inject_at] = "--endpoint";
+            argv[inject_at + 1] = self.endpoint;
+            inject_at += 2;
+            if (self.api_key) |key| {
+                argv[inject_at] = "--api-key";
+                argv[inject_at + 1] = key;
+                inject_at += 2;
             }
-            argv[1 + dd] = "--endpoint";
-            argv[1 + dd + 1] = self.endpoint;
-            for (args[dd..], 0..) |arg, i| {
-                argv[1 + dd + 2 + i] = arg;
-            }
+            for (args[dd..], 0..) |arg, i| argv[inject_at + i] = arg;
         } else {
-            // No -- separator, append at end as before
-            for (args, 0..) |arg, i| {
-                argv[1 + i] = arg;
+            // No -- separator, append at end
+            for (args, 0..) |arg, i| argv[1 + i] = arg;
+            var inject_at: usize = 1 + args.len;
+            argv[inject_at] = "--endpoint";
+            argv[inject_at + 1] = self.endpoint;
+            inject_at += 2;
+            if (self.api_key) |key| {
+                argv[inject_at] = "--api-key";
+                argv[inject_at + 1] = key;
             }
-            argv[total_args - 2] = "--endpoint";
-            argv[total_args - 1] = self.endpoint;
         }
 
         // Execute command

@@ -10,6 +10,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { getAuthToken } from "./AuthContext";
 
 const API_BASE = import.meta.env.VITE_API_URL || "/api/v1";
 
@@ -55,7 +56,10 @@ export function useKVWatch(
     }
 
     const url = `${API_BASE}/kv/namespaces/${encodeURIComponent(namespace)}/keys/${encodeURIComponent(key)}/watch`;
-    const es = new EventSource(url);
+    // EventSource doesn't support custom headers — pass token as query param
+    const token = getAuthToken();
+    const sseUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
+    const es = new EventSource(sseUrl);
     setStatus("connecting");
 
     es.onopen = () => {

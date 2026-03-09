@@ -106,6 +106,8 @@ pub const TestContext = struct {
     server: *ServerProcess,
     cli: *CliRunner,
     endpoint: []const u8,
+    /// Root admin API key from auth bootstrap (set when server.config.auth_enabled = true)
+    api_key: ?[]const u8 = null,
 
     /// Initialize test context with defaults (no dashboard/metrics)
     pub fn init(allocator: Allocator) !*Self {
@@ -159,6 +161,12 @@ pub const TestContext = struct {
         self.cli = try CliRunner.init(allocator, self.server.flo_binary, self.endpoint);
         errdefer self.cli.deinit();
 
+        // Wire API key from bootstrap into CLI runner so every command is authenticated
+        if (self.server.api_key) |key| {
+            try self.cli.setApiKey(key);
+            self.api_key = try allocator.dupe(u8, key);
+        }
+
         self.allocator = allocator;
 
         return self;
@@ -168,6 +176,7 @@ pub const TestContext = struct {
     pub fn deinit(self: *Self) void {
         self.arena.deinit();
         self.cli.deinit();
+        if (self.api_key) |k| self.allocator.free(k);
         self.allocator.free(self.endpoint);
         self.server.stop();
         self.server.deinit();
@@ -191,6 +200,17 @@ pub const TestContext = struct {
             return error.DashboardNotEnabled;
         }
         return self.createHttp(self.server.getDashboardPort());
+    }
+
+    /// Create an authenticated HTTP runner for the dashboard.
+    /// If auth is enabled, logs in with the bootstrap API key and stores the session token.
+    /// Returns error if dashboard is not enabled.
+    pub fn createDashboardHttpAuthed(self: *Self) !*HttpRunner {
+        const http = try self.createDashboardHttp();
+        if (self.api_key) |key| {
+            try http.loginWithApiKey(key);
+        }
+        return http;
     }
 
     /// Create an HTTP runner for metrics endpoint (convenience)

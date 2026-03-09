@@ -44,6 +44,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const workflow = try commands.createWorkflowCommand(allocator);
     const processing = try commands.createProcessingCommand(allocator);
     const ts = try commands.createTsCommand(allocator);
+    const auth = try commands.createAuthCommand(allocator);
 
     var root = try commander.newBuilder(allocator)
         .name("flo")
@@ -89,6 +90,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         // Admin Commands (pre-built)
         .addCommand(namespace)
+
+        // Auth Commands (pre-built)
+        .addCommand(auth)
 
         // Config Commands
         .subcommand(

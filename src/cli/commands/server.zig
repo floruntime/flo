@@ -109,6 +109,28 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("format", 'f', "text", "Output format: text, json, prometheus")
                 .action(wrapHandler(runMetrics)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("bootstrap")
+                .about("Generate the root API key (one-time)")
+                .longAbout(
+                    \\Bootstrap server authentication by generating the root admin API key
+                    \\and internal signing secret. This must be run once before any
+                    \\authenticated operations.
+                    \\
+                    \\The root key is printed to stdout (or written to --out file).
+                    \\It is NEVER stored in plaintext by Flo — save it immediately.
+                    \\Bootstrap fails if already performed.
+                )
+                .examples(&.{
+                    "flo server bootstrap",
+                    "flo server bootstrap --out flo.key",
+                    "flo server bootstrap --data-dir /var/lib/flo",
+                })
+                .stringFlag("data-dir", 'd', "", "Data directory (to find bootstrap state)")
+                .stringFlag("out", 'o', "", "Write root key to file instead of stdout")
+                .action(wrapHandler(runBootstrap)),
+        )
         .build();
 }
 
@@ -662,6 +684,130 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.print("{s}\n", .{buf[0..total]});
     }
+}
+
+// ==================== Bootstrap ====================
+
+const auth_keys = @import("../../auth/keys.zig");
+const auth_store = @import("../../auth/store.zig");
+
+const BOOTSTRAP_FILENAME = "auth.bootstrap";
+
+fn runBootstrap(ctx: *commander.Context) commander.Error!void {
+    const allocator = ctx.allocator;
+    const data_dir_raw = ctx.getString("data-dir");
+    const out_path = ctx.getString("out");
+
+    // Resolve data directory
+    const data_dir = blk: {
+        if (data_dir_raw) |dd| {
+            if (dd.len > 0) break :blk expandTilde(allocator, dd) catch {
+                ctx.printErr("Error: cannot expand data-dir path\n", .{});
+                return error.CommandFailed;
+            };
+        }
+        break :blk allocator.dupe(u8, "./data") catch return error.CommandFailed;
+    };
+    defer allocator.free(data_dir);
+
+    // Ensure data directory exists
+    std.fs.cwd().makePath(data_dir) catch |err| {
+        ctx.printErr("Error creating data directory: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    // Check if already bootstrapped
+    var marker_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const marker_path = std.fmt.bufPrint(&marker_path_buf, "{s}/{s}", .{ data_dir, BOOTSTRAP_FILENAME }) catch {
+        ctx.printErr("Error: path too long\n", .{});
+        return error.CommandFailed;
+    };
+
+    if (std.fs.cwd().access(marker_path, .{})) |_| {
+        ctx.printErr("Error: server already bootstrapped\n", .{});
+        ctx.printErr("  Marker file: {s}\n", .{marker_path});
+        ctx.printErr("  Bootstrap can only be performed once.\n", .{});
+        return error.CommandFailed;
+    } else |_| {
+        // File doesn't exist — good, we can proceed
+    }
+
+    // Generate root key + signing secret
+    var store = auth_store.KeyStore.init(allocator);
+    defer store.deinit();
+
+    const root_key = store.bootstrap() catch |err| {
+        ctx.printErr("Error during bootstrap: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer allocator.free(root_key);
+
+    // Persist signing secret alongside the marker
+    const signing_secret = store.getSigningSecret() orelse {
+        ctx.printErr("Error: signing secret not generated\n", .{});
+        return error.CommandFailed;
+    };
+
+    // Write the key hash + signing secret to the bootstrap marker file
+    // Format: first 32 bytes = key hash, next 32 bytes = signing secret
+    const keys_list = store.listKeys(allocator) catch {
+        ctx.printErr("Error: cannot list keys\n", .{});
+        return error.CommandFailed;
+    };
+    defer allocator.free(keys_list);
+
+    const marker_file = std.fs.cwd().createFile(marker_path, .{ .exclusive = true }) catch |err| {
+        ctx.printErr("Error creating bootstrap marker: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer marker_file.close();
+
+    // Write serialized key + signing secret
+    if (keys_list.len > 0) {
+        var key_buf: [auth_keys.ApiKey.serialized_size]u8 = undefined;
+        const key_data = keys_list[0].serialize(&key_buf) catch {
+            ctx.printErr("Error serializing key\n", .{});
+            return error.CommandFailed;
+        };
+        marker_file.writeAll(key_data) catch |err| {
+            ctx.printErr("Error writing bootstrap data: {}\n", .{err});
+            return error.CommandFailed;
+        };
+    }
+    marker_file.writeAll(signing_secret) catch |err| {
+        ctx.printErr("Error writing signing secret: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    // Output the root key
+    if (out_path) |op| {
+        if (op.len > 0) {
+            const expanded = expandTilde(allocator, op) catch {
+                ctx.printErr("Error: cannot expand output path\n", .{});
+                return error.CommandFailed;
+            };
+            defer allocator.free(expanded);
+
+            const out_file = std.fs.cwd().createFile(expanded, .{ .exclusive = true }) catch |err| {
+                ctx.printErr("Error creating output file '{s}': {}\n", .{ expanded, err });
+                return error.CommandFailed;
+            };
+            defer out_file.close();
+            out_file.writeAll(root_key) catch |err| {
+                ctx.printErr("Error writing key: {}\n", .{err});
+                return error.CommandFailed;
+            };
+            out_file.writeAll("\n") catch {};
+
+            ctx.print("Bootstrap complete.\n", .{});
+            ctx.print("  Root key written to: {s}\n", .{expanded});
+            ctx.print("  WARNING: Save this key — it cannot be retrieved again.\n", .{});
+            return;
+        }
+    }
+
+    // Print to stdout
+    ctx.print("{s}\n", .{root_key});
 }
 
 // ==================== Testing ====================

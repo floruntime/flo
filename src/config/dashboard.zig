@@ -2,9 +2,9 @@
 //!
 //! Configuration types for the web dashboard.
 //!
-//! Security Model: Network-level (like Redis/Nomad)
+//! Security Model: API key + session token (M.8 auth)
 //! - Default bind to localhost for safe out-of-box experience
-//! - Optional admin_token for basic protection behind VPN/proxy
+//! - Requires `flo server bootstrap` to generate root API key
 //! - Operators firewall/VPN to secure access
 
 /// Dashboard configuration
@@ -19,8 +19,4 @@ pub const DashboardConfig = struct {
     bind: []const u8 = "127.0.0.1",
     /// CORS origins (comma-separated, or "*" for all)
     cors_origins: []const u8 = "*",
-    /// Optional admin token for basic authentication
-    /// If set, requires ?token=xxx query param or X-Admin-Token header
-    /// Empty string means no authentication required
-    admin_token: []const u8 = "",
 };
