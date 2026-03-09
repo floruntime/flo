@@ -43,8 +43,11 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
-const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
+const coordinator_mod = @import("../cluster/coordinator.zig");
+const Coordinator = coordinator_mod.Coordinator;
+const NamespaceConfig = coordinator_mod.NamespaceConfig;
 const connection_mod = @import("../node/connection.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
 
 const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -174,6 +177,8 @@ pub const NamespaceHandler = struct {
         /// Tracks whether data has been written to this namespace.
         /// Incremented by markNamespaceHasData(), used for non-empty delete check.
         data_count: u32 = 0,
+        /// Per-namespace settings (synced from coordinator)
+        config: NamespaceConfig = .{},
     };
 
     pub fn init(allocator: Allocator) NamespaceHandler {
@@ -251,6 +256,8 @@ pub const NamespaceHandler = struct {
         dispatcher.register(.namespace_delete, dispatchNamespace);
         dispatcher.registerWalk(.namespace_list, dispatchNamespace, localScanNamespaces);
         dispatcher.register(.namespace_info, dispatchNamespace);
+        dispatcher.register(.namespace_config_set, dispatchNamespace);
+        dispatcher.register(.namespace_config_get, dispatchNamespace);
     }
 
     /// ShardWalker LocalScanFn for namespace_list — returns namespace names
@@ -283,138 +290,209 @@ pub const NamespaceHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @enumFromInt(req.header.op_code);
 
-        // Reads (list, info) always go to local handler
-        if (op == .namespace_list or op == .namespace_info) {
-            const result = shard.namespace_handler.handleCommand(req);
-            defer shard.namespace_handler.freeResult(result);
-            sendNamespaceResponse(shard, conn, req.header.request_id, result);
+        // Reads (list, info, config_get) always go to local handler
+        if (op == .namespace_list or op == .namespace_info or op == .namespace_config_get) {
+            const cmd_result = shard.namespace_handler.handleCommand(req);
+            defer shard.namespace_handler.freeResult(cmd_result);
+            sendNamespaceResponse(shard, conn, req.header.request_id, cmd_result);
             return;
         }
 
-        // Mutations (create, delete): route through Coordinator Raft if available
-        if (shard.coordinator) |coord| {
-            dispatchNamespaceViaRaft(shard, conn, req, op, coord);
-            return;
+        // Mutations (create, delete, config_set): validate then persist via UAL
+        switch (op) {
+            .namespace_create => dispatchCreate(shard, conn, req),
+            .namespace_delete => dispatchDelete(shard, conn, req),
+            .namespace_config_set => dispatchConfigSet(shard, conn, req),
+            else => shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown namespace mutation"),
         }
-
-        // No coordinator — fall back to local-only (single-node mode)
-        const result = shard.namespace_handler.handleCommand(req);
-        handleDeleteCleanup(shard, op, result, req);
-        defer shard.namespace_handler.freeResult(result);
-        sendNamespaceResponse(shard, conn, req.header.request_id, result);
     }
 
-    /// Route create/delete through Controller Raft for consistent replication.
-    fn dispatchNamespaceViaRaft(shard: *Shard, conn: *Connection, req: Request, op: OpCode, coord: *Coordinator) void {
+    /// Max payload for a namespace UAL entry: command prefix(10) + name(128) + settings TLV
+    const MAX_NS_PAYLOAD: usize = entry_mod.COMMAND_PREFIX_SIZE + MAX_NAMESPACE_LEN + NamespaceConfig.MAX_SETTINGS_SIZE;
+
+    fn dispatchCreate(shard: *Shard, conn: *Connection, req: Request) void {
         const name = req.key;
 
-        // Validate before proposing
         if (name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name is required");
             return;
         }
-
-        if (op == .namespace_create) {
-            // Validation checks that don't need Raft
-            if (name.len > MAX_NAMESPACE_LEN) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name too long");
-                return;
-            }
-            if (!isValidName(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
-                return;
-            }
-            if (isReserved(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved namespace name");
-                return;
-            }
-            if (shard.namespace_handler.namespaces.contains(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists");
-                return;
-            }
-
-            // Default partition count and replication factor
-            const partition_count: u16 = 32;
-            const replication_factor: u8 = 1;
-
-            _ = coord.proposeCreateNamespace(name, partition_count, replication_factor) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
-                return;
-            };
-
-            // In single-node mode, commit is synchronous — apply now
-            _ = coord.applyCommitted() catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft apply failed");
-                return;
-            };
-
-            // Sync to local NamespaceHandler
-            shard.namespace_handler.applyCreate(name);
-            shard.sendOkResponse(conn, req.header.request_id, "");
-        } else if (op == .namespace_delete) {
-            if (isReserved(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete reserved namespace");
-                return;
-            }
-            if (std.mem.eql(u8, name, "default")) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete default namespace");
-                return;
-            }
-
-            const force = req.value.len > 0 and req.value[0] != 0;
-            if (!force and shard.namespace_handler.namespaceHasData(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace is not empty; use --force to delete");
-                return;
-            }
-
-            if (!shard.namespace_handler.namespaces.contains(name)) {
-                shard.sendErrorResponse(conn, req.header.request_id, .not_found, "namespace not found");
-                return;
-            }
-
-            _ = coord.proposeDeleteNamespace(name) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
-                return;
-            };
-
-            _ = coord.applyCommitted() catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft apply failed");
-                return;
-            };
-
-            // Sync to local NamespaceHandler (removes from local map)
-            shard.namespace_handler.applyDelete(name);
-
-            // Clean up projection data on force-delete
-            if (force and name.len > 0) {
-                var prefix_buf: [256]u8 = undefined;
-                @memcpy(prefix_buf[0..name.len], name);
-                prefix_buf[name.len] = 0;
-                _ = shard.defaultPartition().kv.clearByPrefix(prefix_buf[0 .. name.len + 1]);
-                shard.defaultPartition().stream.reset();
-                shard.defaultPartition().queue.reset();
-            }
-
-            shard.sendOkResponse(conn, req.header.request_id, "");
+        if (name.len > MAX_NAMESPACE_LEN) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name too long");
+            return;
         }
+        if (!isValidName(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
+            return;
+        }
+        if (isReserved(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "reserved namespace name");
+            return;
+        }
+        if (shard.namespace_handler.namespaces.contains(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists");
+            return;
+        }
+        if (shard.namespace_handler.namespaces.count() >= MAX_NAMESPACES) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace limit reached");
+            return;
+        }
+
+        // Propose namespace_create entry through Raft → UAL (persists via segment writer)
+        _ = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            return;
+        };
+
+        // Apply in-memory state directly (Raft propose already persisted the entry)
+        shard.namespace_handler.applyCreate(name);
+
+        // Also propagate to coordinator if wired (cluster metadata)
+        if (shard.coordinator) |coord| {
+            _ = coord.proposeCreateNamespace(name, 32, 1) catch {};
+            _ = coord.applyCommitted() catch {};
+        }
+
+        shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
-    /// Handle force-delete cleanup for non-Raft path.
-    fn handleDeleteCleanup(shard: *Shard, op: OpCode, cmd_result: CommandResult, req: Request) void {
-        if (op != .namespace_delete) return;
-        switch (cmd_result) {
-            .namespace_deleted => {
-                const is_force = req.value.len > 0 and req.value[0] != 0;
-                if (is_force) {
-                    const ns = req.key;
-                    if (ns.len > 0) {
-                        var prefix_buf: [256]u8 = undefined;
-                        @memcpy(prefix_buf[0..ns.len], ns);
-                        prefix_buf[ns.len] = 0;
-                        _ = shard.defaultPartition().kv.clearByPrefix(prefix_buf[0 .. ns.len + 1]);
-                    }
-                    shard.defaultPartition().stream.reset();
-                    shard.defaultPartition().queue.reset();
+    fn dispatchDelete(shard: *Shard, conn: *Connection, req: Request) void {
+        const name = req.key;
+
+        if (name.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name is required");
+            return;
+        }
+        if (isReserved(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete reserved namespace");
+            return;
+        }
+        if (std.mem.eql(u8, name, "default")) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "cannot delete default namespace");
+            return;
+        }
+
+        const force = req.value.len > 0 and req.value[0] != 0;
+        if (!force and shard.namespace_handler.namespaceHasData(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace is not empty; use --force to delete");
+            return;
+        }
+        if (!shard.namespace_handler.namespaces.contains(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "namespace not found");
+            return;
+        }
+
+        // Propose namespace_delete entry through Raft → UAL (persists via segment writer)
+        _ = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            return;
+        };
+
+        // Apply in-memory state directly
+        shard.namespace_handler.applyDelete(name);
+
+        // Also propagate to coordinator if wired
+        if (shard.coordinator) |coord| {
+            _ = coord.proposeDeleteNamespace(name) catch {};
+            _ = coord.applyCommitted() catch {};
+        }
+
+        // Clean up projection data on force-delete
+        if (force and name.len > 0) {
+            var prefix_buf: [256]u8 = undefined;
+            @memcpy(prefix_buf[0..name.len], name);
+            prefix_buf[name.len] = 0;
+            _ = shard.defaultPartition().kv.clearByPrefix(prefix_buf[0 .. name.len + 1]);
+            shard.defaultPartition().stream.reset();
+            shard.defaultPartition().queue.reset();
+        }
+
+        shard.sendOkResponse(conn, req.header.request_id, "");
+    }
+
+    fn dispatchConfigSet(shard: *Shard, conn: *Connection, req: Request) void {
+        const name = req.key;
+
+        if (name.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name is required");
+            return;
+        }
+        if (!shard.namespace_handler.namespaces.contains(name)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "namespace not found");
+            return;
+        }
+        if (req.value.len == 0) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "settings payload is required");
+            return;
+        }
+
+        const parsed = NamespaceConfig.deserializeSettings(req.value);
+        if (parsed.config.settingsEmpty()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "no valid settings provided");
+            return;
+        }
+
+        // Serialize settings as the value portion of the UAL entry
+        var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
+        const settings_len = parsed.config.serializeSettings(&settings_buf);
+
+        _ = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            return;
+        };
+
+        // Apply in-memory state directly
+        shard.namespace_handler.applyConfigUpdate(name, parsed.config);
+
+        // Also propagate to coordinator if wired
+        if (shard.coordinator) |coord| {
+            _ = coord.proposeUpdateNamespaceConfig(name, parsed.config) catch {};
+            _ = coord.applyCommitted() catch {};
+        }
+
+        shard.sendOkResponse(conn, req.header.request_id, "");
+    }
+
+    // ── UAL Persistence ─────────────────────────────────────────────────
+
+    /// Propose a namespace mutation as a UAL entry through Raft.
+    /// The entry uses CommandPayload format: key = namespace name, value = payload.
+    /// Persistence happens via the segment writer callback on UAL append.
+    /// In-memory state is applied directly by the caller after propose succeeds.
+    fn proposeNamespaceEntry(
+        shard: *Shard,
+        entry_type: entry_mod.EntryType,
+        name: []const u8,
+        value: []const u8,
+    ) !@import("../raft/node.zig").ProposeResult {
+        var payload_buf: [MAX_NS_PAYLOAD]u8 = undefined;
+        const cmd = entry_mod.CommandPayload{
+            .namespace_hash = 0, // namespaces are global, no namespace-hash needed
+            .key_length = @intCast(name.len),
+            .value_length = @intCast(value.len),
+            .key = name,
+            .value = value,
+        };
+        const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        return shard.raft_node.propose(entry_type, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..payload_len]);
+    }
+
+    /// Replay a namespace UAL entry to rebuild in-memory state.
+    /// Called during segment replay on startup and after Raft commit.
+    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry) void {
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        const name = cmd.key;
+        if (name.len == 0) return;
+
+        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        switch (etype) {
+            .namespace_create => self.applyCreate(name),
+            .namespace_delete => self.applyDelete(name),
+            .namespace_config => {
+                if (cmd.value.len > 0) {
+                    const parsed = NamespaceConfig.deserializeSettings(cmd.value);
+                    self.applyConfigUpdate(name, parsed.config);
                 }
             },
             else => {},
@@ -430,6 +508,8 @@ pub const NamespaceHandler = struct {
             .namespace_delete => self.handleDelete(req),
             .namespace_list => self.handleList(req),
             .namespace_info => self.handleInfo(req),
+            .namespace_config_get => self.handleConfigGet(req),
+            .namespace_config_set => self.handleConfigSet(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown namespace opcode" } },
         };
     }
@@ -551,6 +631,72 @@ pub const NamespaceHandler = struct {
         } };
     }
 
+    // ── CONFIG GET ──────────────────────────────────────────────────────
+
+    fn handleConfigGet(self: *NamespaceHandler, req: Request) CommandResult {
+        const name = req.key;
+
+        if (name.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
+        }
+
+        if (self.namespaces.get(name)) |meta| {
+            var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
+            const len = meta.config.serializeSettings(&buf);
+            const data = self.allocator.dupe(u8, buf[0..len]) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
+            };
+            return .{ .namespace_config_get = .{
+                .data = data,
+                .allocated = true,
+            } };
+        }
+
+        return .{ .err = .{ .code = .not_found, .message = "namespace not found" } };
+    }
+
+    // ── CONFIG SET (local-only path, no Raft) ───────────────────────────
+
+    pub fn handleConfigSet(self: *NamespaceHandler, req: Request) CommandResult {
+        const name = req.key;
+
+        if (name.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
+        }
+
+        if (!self.namespaces.contains(name)) {
+            return .{ .err = .{ .code = .not_found, .message = "namespace not found" } };
+        }
+
+        if (req.value.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "settings payload is required" } };
+        }
+
+        const parsed = NamespaceConfig.deserializeSettings(req.value);
+        if (parsed.config.settingsEmpty()) {
+            return .{ .err = .{ .code = .invalid_request, .message = "no valid settings provided" } };
+        }
+
+        self.applyConfigUpdate(name, parsed.config);
+        return .{ .namespace_config_set = {} };
+    }
+
+    /// Apply a config update to the local namespace registry.
+    pub fn applyConfigUpdate(self: *NamespaceHandler, name: []const u8, config: NamespaceConfig) void {
+        if (self.namespaces.getPtr(name)) |meta| {
+            meta.config.mergeSettings(config);
+        }
+    }
+
+    /// Get namespace settings for a given namespace name.
+    /// Returns default config if namespace not found.
+    pub fn getSettings(self: *NamespaceHandler, name: []const u8) NamespaceConfig {
+        if (self.namespaces.get(name)) |meta| {
+            return meta.config;
+        }
+        return .{};
+    }
+
     // ── Serialization ───────────────────────────────────────────────────
 
     /// Wire format: [count:u32] ([name_len:u16][name:bytes])*
@@ -621,6 +767,9 @@ pub const NamespaceHandler = struct {
             .namespace_info => |r| {
                 if (r.allocated) self.allocator.free(r.name);
             },
+            .namespace_config_get => |r| {
+                if (r.allocated) self.allocator.free(r.data);
+            },
             else => {},
         }
     }
@@ -633,7 +782,7 @@ pub const NamespaceHandler = struct {
 /// Map namespace CommandResult variants to wire responses.
 fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
     switch (cmd_result) {
-        .ok, .namespace_created, .namespace_deleted => {
+        .ok, .namespace_created, .namespace_deleted, .namespace_config_set => {
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
@@ -651,6 +800,9 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
                 @memcpy(buf[3 .. 3 + n.name.len], n.name);
             }
             shard.sendOkResponse(conn, request_id, buf[0 .. 3 + n.name.len]);
+        },
+        .namespace_config_get => |n| {
+            shard.sendOkResponse(conn, request_id, n.data);
         },
         else => {
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled namespace response");
@@ -706,8 +858,10 @@ test "namespace handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_delete)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_list)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_info)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_config_set)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_config_get)] != null);
 
-    try testing.expectEqual(@as(u16, 4), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
 }
 
 test "namespace handler: create" {
@@ -1120,4 +1274,100 @@ test "namespace handler: applyDelete non-existent is no-op" {
 
     handler.applyDelete("does-not-exist"); // should not crash
     try testing.expectEqual(@as(usize, 0), handler.namespaces.count());
+}
+
+test "namespace handler: config set and get" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("myapp");
+
+    const settings = NamespaceConfig{ .kv_max_hot_versions = 50, .stream_retention_s = 3600 };
+    handler.applyConfigUpdate("myapp", settings);
+
+    const retrieved = handler.getSettings("myapp");
+    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions);
+    try testing.expectEqual(@as(?u64, 3600), retrieved.stream_retention_s);
+    try testing.expectEqual(@as(?u64, null), retrieved.kv_version_ttl_s);
+}
+
+test "namespace handler: config merge preserves unset fields" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("myapp");
+
+    // First update
+    handler.applyConfigUpdate("myapp", .{ .kv_max_hot_versions = 50 });
+    // Second update — should merge, not replace
+    handler.applyConfigUpdate("myapp", .{ .queue_max_dlq_size = 200 });
+
+    const retrieved = handler.getSettings("myapp");
+    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions); // preserved
+    try testing.expectEqual(@as(?u32, 200), retrieved.queue_max_dlq_size); // added
+}
+
+test "namespace handler: config on nonexistent namespace is no-op" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    // Should not crash — namespace doesn't exist
+    handler.applyConfigUpdate("nonexistent", .{ .kv_max_hot_versions = 50 });
+
+    const retrieved = handler.getSettings("nonexistent");
+    try testing.expect(retrieved.settingsEmpty());
+}
+
+test "namespace handler: getSettings defaults for new namespace" {
+    var handler = NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("fresh");
+    const settings = handler.getSettings("fresh");
+    try testing.expect(settings.settingsEmpty());
+}
+
+test "namespace handler: handleConfigGet returns TLV" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("myapp");
+    handler.applyConfigUpdate("myapp", .{ .kv_max_hot_versions = 42 });
+
+    const result = handler.handleCommand(makeRequest(.namespace_config_get, "myapp", ""));
+    switch (result) {
+        .namespace_config_get => |payload| {
+            // Deserialize the returned TLV
+            const de = NamespaceConfig.deserializeSettings(payload.data);
+            try testing.expectEqual(@as(?u32, 42), de.config.kv_max_hot_versions);
+            if (payload.allocated) {
+                allocator.free(payload.data);
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "namespace handler: handleConfigSet via command" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("myapp");
+
+    // Build TLV for settings
+    const config = NamespaceConfig{ .memory_budget_bytes = 1_073_741_824 };
+    var tlv_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
+    const tlv_len = config.serializeSettings(&tlv_buf);
+
+    const result = handler.handleCommand(makeRequest(.namespace_config_set, "myapp", tlv_buf[0..tlv_len]));
+    switch (result) {
+        .namespace_config_set => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Verify it was applied
+    const retrieved = handler.getSettings("myapp");
+    try testing.expectEqual(@as(?u64, 1_073_741_824), retrieved.memory_budget_bytes);
 }

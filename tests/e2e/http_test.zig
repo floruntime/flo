@@ -133,3 +133,58 @@ test "e2e/http: unknown endpoint handled by SPA" {
     // SPA serves HTML for unknown routes
     try testing.expectEqual(@as(u16, 200), resp.status);
 }
+
+// =============================================================================
+// Auth Enforcement Tests
+// =============================================================================
+
+test "e2e/http: health endpoint accessible with auth enabled" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .auth_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // Health should always be publicly accessible regardless of auth config
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    var resp = try http.get("/health");
+    defer resp.deinit();
+
+    try testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+test "e2e/http: auth bootstrap produces api key" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .auth_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // When auth_enabled = true, bootstrap runs and ctx.api_key is set
+    try testing.expect(ctx.api_key != null);
+    const key = ctx.api_key.?;
+    // Bootstrap keys start with "flo_sk_"
+    try testing.expect(std.mem.startsWith(u8, key, "flo_sk_"));
+    try testing.expect(key.len > 10);
+}
+
+test "e2e/http: api endpoints accessible with auth enabled" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .auth_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // Authed HTTP client (uses bootstrap key)
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    if (ctx.api_key) |key| {
+        try http.setApiKey(key);
+    }
+
+    var resp = try http.get("/api/v1/cluster/stats");
+    defer resp.deinit();
+
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expect(resp.isJson());
+}

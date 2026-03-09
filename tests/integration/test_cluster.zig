@@ -634,3 +634,203 @@ test "integration: forwarder reject forward to self" {
     }
     try testing.expectEqual(@as(u32, 0), fwd.pendingCount());
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 13. Forwarder — circuit breaker trips after repeated failures
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "integration: forwarder circuit breaker trips after failures" {
+    const alloc = testing.allocator;
+    const CB = src.cluster.forwarder;
+
+    var fwd = Forwarder.init(alloc, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "127.0.0.1", 4002);
+
+    // Initially circuit is closed
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.closed, fwd.peerCircuitState(2).?);
+
+    // Send CIRCUIT_BREAKER_THRESHOLD requests and fail them all
+    var req_id: u64 = 1000;
+    var i: u32 = 0;
+    while (i < CB.CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        const r = try fwd.forward(2, req_id, 1, 64, 1000);
+        switch (r) {
+            .queued => {},
+            else => return error.TestUnexpectedResult,
+        }
+        _ = fwd.fail(req_id, 1000);
+        req_id += 1;
+    }
+
+    // Circuit should now be open
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+
+    // Next forward should be rejected with circuit_open
+    const rejected = try fwd.forward(2, req_id, 1, 64, 1000);
+    switch (rejected) {
+        .circuit_open => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(fwd.circuit_open_rejections > 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 14. Forwarder — circuit breaker half-open recovery
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "integration: forwarder circuit breaker recovers through half-open" {
+    const alloc = testing.allocator;
+    const CB = src.cluster.forwarder;
+
+    var fwd = Forwarder.init(alloc, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "127.0.0.1", 4002);
+
+    // Trip the circuit breaker
+    var req_id: u64 = 2000;
+    var i: u32 = 0;
+    while (i < CB.CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        _ = try fwd.forward(2, req_id, 1, 64, 1000);
+        _ = fwd.fail(req_id, 1000);
+        req_id += 1;
+    }
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+
+    // After open duration, circuit transitions to half-open
+    const after_open = 1000 + CB.CIRCUIT_BREAKER_OPEN_DURATION_MS;
+    const probe = try fwd.forward(2, req_id, 1, 64, after_open);
+    switch (probe) {
+        .queued => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.half_open, fwd.peerCircuitState(2).?);
+
+    // Complete enough successes to close the circuit
+    _ = fwd.complete(req_id, after_open + 1);
+    req_id += 1;
+
+    i = 1;
+    while (i < CB.CIRCUIT_BREAKER_HALF_OPEN_SUCCESSES) : (i += 1) {
+        _ = try fwd.forward(2, req_id, 1, 64, after_open + 10);
+        _ = fwd.complete(req_id, after_open + 11);
+        req_id += 1;
+    }
+
+    // Circuit should be closed again
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.closed, fwd.peerCircuitState(2).?);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 15. Forwarder — circuit breaker reset
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "integration: forwarder circuit breaker manual reset" {
+    const alloc = testing.allocator;
+    const CB = src.cluster.forwarder;
+
+    var fwd = Forwarder.init(alloc, 1, 0);
+    defer fwd.deinit();
+
+    try fwd.addPeer(2, "127.0.0.1", 4002);
+
+    // Trip the circuit
+    var req_id: u64 = 3000;
+    var i: u32 = 0;
+    while (i < CB.CIRCUIT_BREAKER_THRESHOLD) : (i += 1) {
+        _ = try fwd.forward(2, req_id, 1, 64, 1000);
+        _ = fwd.fail(req_id, 1000);
+        req_id += 1;
+    }
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.open, fwd.peerCircuitState(2).?);
+
+    // Manual reset returns to closed
+    fwd.resetCircuit(2);
+    try testing.expectEqual(CB.CircuitBreaker.CircuitState.closed, fwd.peerCircuitState(2).?);
+
+    // Should be able to forward again immediately
+    const r = try fwd.forward(2, req_id, 1, 64, 1000);
+    switch (r) {
+        .queued => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 16. Partition table — node failure marks partitions unavailable
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "integration: partition table node failure marks unavailable" {
+    const alloc = testing.allocator;
+
+    var pt = PartitionTable.init(alloc, 0); // local_node_id = 0
+    defer pt.deinit();
+
+    const ns_hash: u32 = 0x1234;
+    const no_replicas: []const NodeId = &.{};
+
+    // Assign 4 partitions across 2 nodes
+    try pt.assign(ns_hash, 0, 1, no_replicas); // partition 0 → node 1
+    try pt.assign(ns_hash, 1, 1, no_replicas); // partition 1 → node 1
+    try pt.assign(ns_hash, 2, 2, no_replicas); // partition 2 → node 2
+    try pt.assign(ns_hash, 3, 2, no_replicas); // partition 3 → node 2
+
+    // All partitions start available
+    try testing.expect(pt.isAvailable(ns_hash, 0));
+    try testing.expect(pt.isAvailable(ns_hash, 1));
+    try testing.expect(pt.isAvailable(ns_hash, 2));
+    try testing.expect(pt.isAvailable(ns_hash, 3));
+
+    // Node 1 fails — mark all its partitions unavailable
+    const marked = pt.markNodePartitionsUnavailable(1);
+    try testing.expectEqual(@as(u32, 2), marked);
+
+    // Node 1 partitions are unavailable, node 2 still fine
+    try testing.expect(!pt.isAvailable(ns_hash, 0));
+    try testing.expect(!pt.isAvailable(ns_hash, 1));
+    try testing.expect(pt.isAvailable(ns_hash, 2));
+    try testing.expect(pt.isAvailable(ns_hash, 3));
+
+    // Node 1 recovers — restore availability
+    const restored = pt.markNodePartitionsAvailable(1);
+    try testing.expectEqual(@as(u32, 2), restored);
+
+    try testing.expect(pt.isAvailable(ns_hash, 0));
+    try testing.expect(pt.isAvailable(ns_hash, 1));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 17. Gossip dead-node propagation
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "integration: gossip dead node ids propagated for partition marking" {
+    const alloc = testing.allocator;
+
+    // Create 2 nodes: 1 and 2
+    var n1 = Gossip.init(alloc, 1, testAddr(1));
+    defer n1.deinit();
+    var n2 = Gossip.init(alloc, 2, testAddr(2));
+    defer n2.deinit();
+
+    // Seed: n1 knows n2
+    try n1.addMember(2, testAddr(2), 1000);
+
+    // Tick n1 repeatedly without delivering messages — n2 becomes suspect then dead
+    var time_ms: i64 = 2000;
+    var tick_result = try n1.tick(time_ms);
+    n1.clearOutbound();
+
+    // Advance time to move through suspect to dead
+    while (tick_result.newly_dead == 0) {
+        time_ms += 1000;
+        tick_result = try n1.tick(time_ms);
+        n1.clearOutbound();
+        if (time_ms > 60_000) return error.TestTimeout; // safety
+    }
+
+    // newly_dead_ids should contain node 2
+    try testing.expectEqual(@as(u32, 1), tick_result.newly_dead);
+    try testing.expectEqual(@as(NodeId, 2), tick_result.newly_dead_ids[0]);
+}

@@ -653,3 +653,34 @@ test "e2e/namespace/cluster: non-empty namespace delete fails" {
     defer testing.allocator.free(list);
     try testing.expect(std.mem.indexOf(u8, list, "nonempty_cluster") != null);
 }
+
+// =============================================================================
+// Persistence / Restart
+// =============================================================================
+
+test "e2e/namespace: create survives server restart" {
+    // Use sync durability to ensure namespace state is on disk before response
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // Create a namespace
+    try ctx.exec(&.{ "ns", "create", "restart_test" });
+
+    // Verify it exists before restart
+    const before = try ctx.execCapture(&.{ "ns", "ls" });
+    try testing.expect(std.mem.indexOf(u8, before, "restart_test") != null);
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // Verify namespace still exists after restart
+    const after = try ctx.execCapture(&.{ "ns", "ls" });
+    try testing.expect(std.mem.indexOf(u8, after, "restart_test") != null);
+
+    // Verify namespace is fully functional — KV ops should work
+    try ctx.exec(&.{ "kv", "set", "mykey", "myval", "-n", "restart_test" });
+    const val = try ctx.execCapture(&.{ "kv", "get", "mykey", "-n", "restart_test" });
+    try testing.expect(std.mem.indexOf(u8, val, "myval") != null);
+}

@@ -675,7 +675,7 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         // Fetch version history from projection
-        var hist_buf: [kv_mod.MAX_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
+        var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
         const n = self.kv.getHistory(qkey, &hist_buf);
 
         if (n == 0) return .kv_not_found;

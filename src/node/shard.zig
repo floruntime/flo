@@ -356,7 +356,7 @@ pub const Shard = struct {
             // Replay existing segment files from segs/ into partition.
             // If a snapshot was loaded, skip entries at or below replay_from.
             var max_index: u64 = replay_from;
-            replaySegments(allocator, segs_dir_path, partition, &max_index, workflow_handler, replay_from);
+            replaySegments(allocator, segs_dir_path, partition, &max_index, workflow_handler, namespace_handler, replay_from);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -1819,6 +1819,7 @@ fn replaySegments(
     partition: *Partition,
     max_index: *u64,
     workflow_handler: *WorkflowHandler,
+    namespace_handler: *NamespaceHandler,
     replay_from: u64,
 ) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
@@ -1864,14 +1865,9 @@ fn replaySegments(
             // the StreamProjection offset→ual_index mapping.
             const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
             if (etype == .stream_append) {
-                // Extract stream name hash from command payload for per-stream filtering.
-                // Must use namespace_hash as Wyhash seed (matches router.nameHash).
                 if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd| {
                     const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
                     _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
-                    // Re-register stream name for listing (bare — namespace string
-                    // isn't stored in entries, so post-restart ls won't filter by
-                    // namespace; acceptable since restart ls isn't tested yet).
                     partition.stream.registerStream(cmd.key) catch {};
                 }
             }
@@ -1880,6 +1876,12 @@ fn replaySegments(
             // the WorkflowHandler in-memory definition and run maps.
             if (etype == .workflow_create or etype == .workflow_start) {
                 workflow_handler.replayEntry(&seg_entry);
+            }
+
+            // Namespace entries: router skips them (.none), so manually rebuild
+            // the NamespaceHandler in-memory registry.
+            if (etype == .namespace_create or etype == .namespace_delete or etype == .namespace_config) {
+                namespace_handler.replayEntry(&seg_entry);
             }
 
             // Track max index for LSN restoration

@@ -60,8 +60,9 @@ pub const ScanEntry = struct {
 // KV Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Maximum number of historical versions retained per key.
-pub const MAX_VERSION_CHAIN_LEN: usize = 8;
+/// Default version chain length when no namespace setting is configured.
+/// Acts as a sensible default; the memory controller is the true backstop.
+pub const DEFAULT_VERSION_CHAIN_LEN: usize = 64;
 
 /// A historical version entry — stores previous value and metadata.
 pub const VersionEntry = struct {
@@ -85,6 +86,9 @@ pub const KVProjection = struct {
     memory_used: usize,
     /// Last applied UAL index.
     applied_index: u64,
+    /// Max versions per key in the hot chain. Configurable via namespace settings.
+    /// 0 = unlimited (memory controller is the backstop).
+    max_version_chain_len: usize,
 
     /// Stats.
     stats: Stats,
@@ -106,6 +110,7 @@ pub const KVProjection = struct {
             .memory_limit = memory_limit,
             .memory_used = 0,
             .applied_index = 0,
+            .max_version_chain_len = DEFAULT_VERSION_CHAIN_LEN,
             .stats = .{},
         };
     }
@@ -348,7 +353,7 @@ pub const KVProjection = struct {
     // ─── Version Chain (MVCC History) ──────────────────────────────────────
 
     /// Push the current entry's state onto the version chain.
-    /// Evicts the oldest version if chain exceeds MAX_VERSION_CHAIN_LEN.
+    /// Evicts the oldest version if chain exceeds max_version_chain_len.
     fn pushVersionChain(self: *KVProjection, existing: *KVEntry) !void {
         // Duplicate value for the historical entry
         const hist_value = if (existing.value.len > 0 and !existing.tombstone)
@@ -374,8 +379,8 @@ pub const KVProjection = struct {
         }
         var chain = gop.value_ptr;
 
-        // Evict oldest if at capacity
-        if (chain.items.len >= MAX_VERSION_CHAIN_LEN) {
+        // Evict oldest if at capacity (0 = unlimited, memory controller is backstop)
+        if (self.max_version_chain_len > 0 and chain.items.len >= self.max_version_chain_len) {
             const oldest = chain.orderedRemove(0);
             if (oldest.value.len > 0) {
                 self.memory_used -|= oldest.value.len;
@@ -387,7 +392,7 @@ pub const KVProjection = struct {
     }
 
     /// Get version history for a key (newest first).
-    /// Returns current entry + up to MAX_VERSION_CHAIN_LEN previous versions.
+    /// Returns current entry + previous versions from the chain.
     /// Caller does NOT own the returned data — references are borrowed.
     pub fn getHistory(self: *KVProjection, key: []const u8, out: []VersionEntry) usize {
         var n: usize = 0;
@@ -958,18 +963,18 @@ test "kv: version chain bounded at max length" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    // Write MAX_VERSION_CHAIN_LEN + 2 versions (current + chain)
-    const total = MAX_VERSION_CHAIN_LEN + 2;
+    // Write DEFAULT_VERSION_CHAIN_LEN + 2 versions (current + chain)
+    const total = DEFAULT_VERSION_CHAIN_LEN + 2;
     for (0..total) |i| {
         var buf: [8]u8 = undefined;
         const val = std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable;
         try kv.put("k", val, @intCast(i + 1), 1, @intCast((i + 1) * 100), 0);
     }
 
-    var hist: [MAX_VERSION_CHAIN_LEN + 1]VersionEntry = undefined;
+    var hist: [DEFAULT_VERSION_CHAIN_LEN + 1]VersionEntry = undefined;
     const n = kv.getHistory("k", &hist);
-    // Current + MAX_VERSION_CHAIN_LEN historical
-    try testing.expectEqual(MAX_VERSION_CHAIN_LEN + 1, n);
+    // Current + DEFAULT_VERSION_CHAIN_LEN historical
+    try testing.expectEqual(DEFAULT_VERSION_CHAIN_LEN + 1, n);
 
     // Oldest versions should have been evicted
     try testing.expectEqual(@as(u64, total), hist[0].version); // current

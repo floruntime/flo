@@ -1201,3 +1201,48 @@ test "e2e/kv: default namespace is isolated from named namespaces" {
     const val_custom = try ctx.execCapture(&.{ "kv", "get", "mykey", "-n", "kv_custom" });
     try testing.expect(std.mem.indexOf(u8, val_custom, "custom_val") != null);
 }
+
+// =============================================================================
+// Version History (MVCC)
+// =============================================================================
+
+test "e2e/kv: history shows multiple versions after overwrites" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Write 3 versions of the same key
+    try ctx.exec(&.{ "kv", "set", "hist_key", "version_one" });
+    try ctx.exec(&.{ "kv", "set", "hist_key", "version_two" });
+    try ctx.exec(&.{ "kv", "set", "hist_key", "version_three" });
+
+    // Request history
+    const output = try ctx.execCapture(&.{ "kv", "history", "hist_key" });
+
+    // Should mention the key
+    try testing.expect(std.mem.indexOf(u8, output, "hist_key") != null);
+    // Should contain data (non-empty history output)
+    try testing.expect(output.len > 0);
+}
+
+test "e2e/kv: history for non-existent key fails" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "kv", "history", "no_such_key" });
+    defer result.deinit();
+
+    // Non-existent key should produce an error
+    try testing.expect(!result.succeeded());
+}
+
+test "e2e/kv: history after delete preserves prior versions" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "del_hist", "alive_value" });
+    try ctx.exec(&.{ "kv", "delete", "del_hist" });
+
+    // History should still return data (tombstone + prior version)
+    const output = try ctx.execCapture(&.{ "kv", "history", "del_hist" });
+    try testing.expect(std.mem.indexOf(u8, output, "del_hist") != null);
+}

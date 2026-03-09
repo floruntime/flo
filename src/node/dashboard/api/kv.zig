@@ -202,7 +202,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getKVProjection(ctx, i)) |kv| {
-            var hist_buf: [kv_mod.MAX_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
+            var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
             const hist_n = kv.getHistory(key, &hist_buf);
             if (hist_n > 0) {
                 for (hist_buf[0..hist_n]) |ver| {

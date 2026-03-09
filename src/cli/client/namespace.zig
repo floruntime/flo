@@ -32,3 +32,13 @@ pub fn info(client: *Client, name: []const u8) !Response {
     // namespace_info uses the namespace name in the key field
     return client.sendRequest(.namespace_info, "", name, "");
 }
+
+/// Set namespace configuration settings
+pub fn configSet(client: *Client, name: []const u8, settings_tlv: []const u8) !Response {
+    return client.sendRequest(.namespace_config_set, "", name, settings_tlv);
+}
+
+/// Get namespace configuration settings
+pub fn configGet(client: *Client, name: []const u8) !Response {
+    return client.sendRequest(.namespace_config_get, "", name, "");
+}

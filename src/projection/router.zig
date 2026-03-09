@@ -256,6 +256,9 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Workflow — restored in replaySegments, no live projection
         .workflow_create, .workflow_start => .none,
 
+        // Namespace — restored in replaySegments, no live projection
+        .namespace_create, .namespace_delete, .namespace_config => .none,
+
         // Checkpoint — processing runtime
         .checkpoint => .none,
     };

@@ -90,6 +90,11 @@ pub const EntryType = enum(u8) {
     workflow_create = 0x50,
     workflow_start = 0x51,
 
+    // ── Namespace ──
+    namespace_create = 0x60,
+    namespace_delete = 0x61,
+    namespace_config = 0x62,
+
     // ── Checkpoint ──
     checkpoint = 0xE0,
 
@@ -102,6 +107,7 @@ pub const EntryType = enum(u8) {
             .ts_write, .ts_write_batch => true,
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start => true,
+            .namespace_create, .namespace_delete, .namespace_config => true,
             .raft_config, .raft_noop, .raft_snapshot, .checkpoint => false,
         };
     }
