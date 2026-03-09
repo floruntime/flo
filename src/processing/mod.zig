@@ -28,9 +28,6 @@ pub const StreamElement = record.StreamElement;
 pub const Header = record.Header;
 pub const SourceRef = record.SourceRef;
 
-// Key schema for KV persistence
-pub const keys = @import("keys.zig");
-
 // Operator interface
 pub const operator = @import("operator.zig");
 pub const Operator = operator.Operator;
@@ -228,8 +225,6 @@ test {
     _ = @import("metrics.zig");
     _ = @import("window/session.zig");
     _ = @import("window/lateness.zig");
-    // Keys
-    _ = @import("keys.zig");
     // Handler/Job Manager
     _ = @import("handler.zig");
     // Definition & Parser

@@ -100,7 +100,6 @@ test {
     _ = @import("processing/endpoints/sink.zig");
     // Processing: keyed state
     _ = @import("processing/state.zig");
-    _ = @import("processing/keys.zig");
     // Processing: declarative operators
     _ = @import("processing/operators/expr_filter.zig");
     _ = @import("processing/operators/passthrough.zig");
