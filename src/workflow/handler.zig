@@ -286,7 +286,11 @@ pub const WorkflowHandler = struct {
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: OpCode = @enumFromInt(req.header.op_code);
         shard.workflow_handler.handleCommand(shard, conn, req);
+        if (op == .workflow_create or op == .workflow_start) {
+            shard.namespace_handler.markNamespaceHasData(req.namespace);
+        }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────

@@ -156,6 +156,10 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.actions_handler.handleCommand(req);
         defer shard.actions_handler.freeResult(result);
+        switch (result) {
+            .action_registered => shard.namespace_handler.markNamespaceHasData(req.namespace),
+            else => {},
+        }
         sendActionResponse(shard, conn, req.header.request_id, result);
     }
 
@@ -170,6 +174,7 @@ pub const ActionsHandler = struct {
         // Use notifyAny because waiter keys are compound (action_name + worker_id).
         switch (result) {
             .action_invoked => {
+                shard.namespace_handler.markNamespaceHasData(req.namespace);
                 shard.waiter_pool.notifyAny(.worker_await, resolveWorkerAwait, @ptrCast(shard));
             },
             else => {},

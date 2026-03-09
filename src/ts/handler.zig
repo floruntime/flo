@@ -108,6 +108,10 @@ pub const TSHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.ts_handler.handleCommand(req);
         defer shard.ts_handler.freeResult(result);
+        switch (result) {
+            .ts_write_ok => shard.namespace_handler.markNamespaceHasData(req.namespace),
+            else => {},
+        }
         sendTSResponse(shard, conn, req.header.request_id, result);
     }
 

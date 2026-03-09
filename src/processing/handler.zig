@@ -267,7 +267,11 @@ pub const ProcessingHandler = struct {
     fn dispatchProcessing(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: OpCode = @enumFromInt(req.header.op_code);
         shard.processing_handler.handleCommand(shard, conn, req);
+        if (op == .processing_submit) {
+            shard.namespace_handler.markNamespaceHasData(req.namespace);
+        }
     }
 
     // ── Command Routing ─────────────────────────────────────────────────
