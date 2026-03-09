@@ -48,6 +48,23 @@ pub const Format = enum {
         return .table; // default
     }
 };
+
+/// Get the output format from the global --format flag.
+/// Also checks --json boolean flag for backward compatibility (stream/queue commands).
+pub fn getFormat(ctx: *Context) Format {
+    if (ctx.flagChanged("format")) {
+        return Format.fromString(ctx.getString("format") orelse "table");
+    }
+    // Backward compat: --json boolean flag used by stream/queue commands
+    if (ctx.getBool("json")) return .json;
+    return .table;
+}
+
+/// Check if --verbose was set globally.
+pub fn isVerbose(ctx: *Context) bool {
+    return ctx.getBool("verbose");
+}
+
 /// Column alignment
 pub const Alignment = enum {
     left,

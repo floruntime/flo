@@ -56,7 +56,6 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .arg("key", "Key to retrieve")
                 .uintFlag("wait", 'w', 0, "Wait until key exists (ms, 0=forever)")
                 .uintFlag("block", 'b', 0, "Block for changes (ms, 0=forever)")
-                .stringFlag("format", 'f', "raw", "Output format: json, table, raw")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
                 .action(wrapHandler(runGet)),
         )
@@ -125,7 +124,6 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
     // --block: Block for changes (waits for NEXT version even if key exists) - like stream/queue --block
     const wait_ms = ctx.getChangedUint("wait");
     const block_ms = ctx.getChangedUint("block");
-    const format_str = ctx.getString("format") orelse "raw";
     const namespace = cli_config.getNamespace(ctx);
 
     // --routing-key: explicit shard co-location (same routing as {tag} in key name)
@@ -142,9 +140,13 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    const format = output.Format.fromString(format_str);
+    const format = output.getFormat(ctx);
 
     const endpoint = cli_config.getEndpoint(ctx);
+
+    if (output.isVerbose(ctx)) {
+        ctx.printErr("[verbose] GET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, endpoint });
+    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -204,6 +206,10 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     }
 
     const endpoint = cli_config.getEndpoint(ctx);
+
+    if (output.isVerbose(ctx)) {
+        ctx.printErr("[verbose] SET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, endpoint });
+    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

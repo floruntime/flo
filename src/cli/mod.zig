@@ -67,6 +67,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             },
         })
         .flag("verbose", .{ .short = 'v', .desc = "Enable verbose output", .persistent = true })
+        .persistentFlag("format", .{ .short = 'f', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw" })
 
         // Server Commands (pre-built)
         .addCommand(server)

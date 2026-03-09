@@ -84,7 +84,6 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("from", 0, "-1h", "Start time: -Nh, -Nd, -Nm, or epoch ms")
                 .stringFlag("to", 0, "", "End time (default: now)")
                 .uintFlag("limit", 'l', 10000, "Maximum points to return")
-                .stringFlag("format", 0, "table", "Output format: table, json, raw")
                 .action(wrapHandler(runRead)),
         )
         .subcommand(
@@ -103,7 +102,6 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("to", 0, "", "End time (default: now)")
                 .stringFlag("window", 'w', "1m", "Aggregation window: Ns, Nm, Nh, Nd")
                 .stringFlag("agg", 'a', "avg", "Aggregation function: avg, sum, count, min, max")
-                .stringFlag("format", 0, "table", "Output format: table, json, raw")
                 .action(wrapHandler(runQuery)),
         )
         .subcommand(
@@ -119,7 +117,6 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .optionalArg("measurement", "Measurement to inspect (omit to list all)")
                 .boolFlag("fields", 0, "Show field names for measurement")
                 .uintFlag("limit", 'l', 1000, "Maximum items to return")
-                .stringFlag("format", 0, "table", "Output format: table, json, raw")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -400,8 +397,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const format_str = ctx.getString("format") orelse "table";
-    const format = output.Format.fromString(format_str);
+    const format = output.getFormat(ctx);
     const tags = ctx.getString("tags") orelse "";
     const field = ctx.getString("field") orelse "";
     const from_str = ctx.getString("from") orelse "-1h";
@@ -410,6 +406,10 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
 
     const from_ms = parseTimeArg(from_str) orelse 0;
     const to_ms = parseTimeArg(to_str) orelse 0;
+
+    if (output.isVerbose(ctx)) {
+        ctx.printErr("[verbose] READ measurement={s} namespace={s} endpoint={s}\n", .{ measurement, namespace, endpoint });
+    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -512,8 +512,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const format_str = ctx.getString("format") orelse "table";
-    const format = output.Format.fromString(format_str);
+    const format = output.getFormat(ctx);
     const tags = ctx.getString("tags") orelse "";
     const field = ctx.getString("field") orelse "";
     const from_str = ctx.getString("from") orelse "-1h";
@@ -652,8 +651,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 1000;
-    const format_str = ctx.getString("format") orelse "table";
-    const format = output.Format.fromString(format_str);
+    const format = output.getFormat(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

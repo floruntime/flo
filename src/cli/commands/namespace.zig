@@ -73,7 +73,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo ns ls --all",
                 })
                 .boolFlag("all", 'a', "Include system namespaces")
-                .stringFlag("format", 'f', "table", "Output format: json, table")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -173,8 +172,12 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
 fn runList(ctx: *commander.Context) commander.Error!void {
     const include_all = ctx.getBool("all");
-    const format_str = ctx.getString("format") orelse "table";
+    const format = output.getFormat(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
+
+    if (output.isVerbose(ctx)) {
+        ctx.printErr("[verbose] LIST namespaces endpoint={s} all={}\n", .{ endpoint, include_all });
+    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -204,7 +207,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     const count = std.mem.readInt(u32, data[0..4], .little);
 
-    if (std.mem.eql(u8, format_str, "json")) {
+    if (format == .json) {
         // JSON output
         ctx.print("{{\n  \"namespaces\": [\n", .{});
         var offset: usize = 4;

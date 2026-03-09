@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const cli_config = @import("../config.zig");
+const output = @import("../output.zig");
 
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
     return struct {
@@ -71,7 +72,6 @@ pub fn createAuthCommand(allocator: Allocator) !*commander.Command {
                 .name("list-keys")
                 .about("List all API keys")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
-                .stringFlag("format", 'f', "", "Output format: table, json")
                 .action(wrapHandler(runListKeys)),
         )
         .subcommand(
@@ -181,8 +181,8 @@ fn runCreateKey(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runListKeys(ctx: *commander.Context) commander.Error!void {
-    const format = ctx.getString("format") orelse "table";
-    ctx.print("list-keys: format={s}\n", .{format});
+    const format = output.getFormat(ctx);
+    ctx.print("list-keys: format={s}\n", .{@tagName(format)});
     ctx.print("Note: key listing requires a running server with admin credentials\n", .{});
 }
 
