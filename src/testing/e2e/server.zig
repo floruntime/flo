@@ -184,6 +184,7 @@ pub const ServerProcess = struct {
         self.metrics_port = 0;
         self.raft_port = 0;
         self.started = false;
+        self.api_key = null;
 
         return self;
     }
@@ -539,9 +540,8 @@ pub const ServerProcess = struct {
         }
 
         // Read the key from the output file
-        const key_raw = std.fs.cwd().readFileAlloc(self.allocator, bootstrap_file, 1024) catch |err| {
+        const key_raw = std.fs.cwd().readFileAlloc(self.allocator, bootstrap_file, 1024) catch {
             // Fall back to parsing stdout if file read fails
-            _ = err;
             const out = std.mem.trim(u8, stdout_list.items, &std.ascii.whitespace);
             // Extract the key token starting with "flo_sk_"
             if (std.mem.indexOf(u8, out, "flo_sk_")) |pos| {

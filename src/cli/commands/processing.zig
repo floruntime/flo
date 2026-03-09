@@ -287,7 +287,6 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -299,7 +298,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.processing.list(&client, namespace, @intCast(limit), null) catch |err| {
+    var result = client_mod.processing.list(&client, namespace, null) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };

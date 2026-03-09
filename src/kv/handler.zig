@@ -160,7 +160,7 @@ pub const KVHandler = struct {
         if (block_ms) |bms| {
             // Wait-until-exists semantics: if key exists, return immediately.
             if (shard.kv_handler.*.kv.get(qkey)) |entry| {
-                const result = CommandResult{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
+                const result = CommandResult{ .kv_value = .{ .value = entry.value, .version = entry.version } };
                 sendKVResponse(shard, conn, req.header.request_id, result);
                 return;
             }
@@ -179,7 +179,7 @@ pub const KVHandler = struct {
 
         if (wait_ms) |wms| {
             // Watch-for-changes semantics: wait for version > current.
-            const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.lsn else 0;
+            const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 0;
             _ = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .fd = conn.fd,
@@ -225,7 +225,7 @@ pub const KVHandler = struct {
         }
 
         // Build CommandPayload and propose through Raft (uses qualified key)
-        const propose_result = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| {
+        _ = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| {
             const result: CommandResult = switch (err) {
                 error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
                 else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
@@ -240,9 +240,10 @@ pub const KVHandler = struct {
         // Notify any blocking GET waiters for this key via unified pool (qualified key)
         shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
-        // Build response from the committed version (the propose index IS the version)
-        const cmd_result = CommandResult{ .kv_put_ok = .{ .version = propose_result.index } };
-        log.debug("KV PUT: key={s}, value_len={d}, version={d}", .{ req.key, req.value.len, propose_result.index });
+        // Build response from the committed version
+        const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
+        const cmd_result = CommandResult{ .kv_put_ok = .{ .version = version } };
+        log.debug("KV PUT: key={s}, value_len={d}, version={d}", .{ req.key, req.value.len, version });
 
         // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace);
@@ -468,7 +469,7 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         const entry = self.kv.get(qkey) orelse return .kv_not_found;
-        return .{ .kv_value = .{ .value = entry.value, .version = entry.lsn } };
+        return .{ .kv_value = .{ .value = entry.value, .version = entry.version } };
     }
 
     // ── PUT direct (used by handleCommand — test/internal path) ─────────
@@ -492,8 +493,8 @@ pub const KVHandler = struct {
         if (req.getCasVersion()) |expected_version| {
             const current = self.kv.get(qkey);
             if (current) |entry| {
-                if (entry.lsn != expected_version) {
-                    return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
+                if (entry.version != expected_version) {
+                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
                 }
             } else {
                 if (expected_version != 0) {
@@ -520,7 +521,8 @@ pub const KVHandler = struct {
         self.kv.put(qkey, req.value, lsn, 0, timestamp, expiry_ns) catch {
             return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
         };
-        return .{ .kv_put_ok = .{ .version = lsn } };
+        const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
+        return .{ .kv_put_ok = .{ .version = version } };
     }
 
     // ── DELETE direct (used by handleCommand — test/internal path) ───────
@@ -568,8 +570,8 @@ pub const KVHandler = struct {
         if (req.getCasVersion()) |expected_version| {
             const current = self.kv.get(qkey);
             if (current) |entry| {
-                if (entry.lsn != expected_version) {
-                    return .{ .kv_cas_failed = .{ .current_version = entry.lsn } };
+                if (entry.version != expected_version) {
+                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
                 }
             } else {
                 if (expected_version != 0) {

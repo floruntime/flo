@@ -755,6 +755,8 @@ pub const Shard = struct {
             // processing_list and workflow_list_definitions use JSON format
             .processing_list => serializeWalkProcessingJobs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
             .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
+            // action_list uses scan wire format with action metadata
+            .action_list => serializeWalkActionEntries(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
             // Default: name-list format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
             else => serializeWalkNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
         } catch {
@@ -1383,6 +1385,49 @@ fn serializeWalkQueueEntries(
     return buf;
 }
 
+/// Serialize walk results for action_list in scan wire format.
+///
+/// Produces: [count:u32]([key_len:u16][key][value_len:u32][value])*[has_more:u8][cursor_len:u16][cursor]?
+/// The CLI parses this format and extracts action names from the key field.
+fn serializeWalkActionEntries(
+    allocator: std.mem.Allocator,
+    names: []const []const u8,
+    _: []const *anyopaque,
+    _: []const u8,
+) ![]u8 {
+    // Calculate total buffer size
+    var total_size: usize = 4; // count:u32
+    for (names) |name| {
+        total_size += 2 + name.len + 4; // key_len:u16 + key + value_len:u32
+    }
+    total_size += 1 + 2; // has_more:u8 + cursor_len:u16
+
+    const buf = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buf);
+    var pos: usize = 0;
+
+    // count
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(names.len), .little);
+    pos += 4;
+
+    // entries
+    for (names) |name| {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(name.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..name.len], name);
+        pos += name.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], 0, .little); // value_len = 0
+        pos += 4;
+    }
+
+    // has_more = 0, cursor_len = 0
+    buf[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
+
+    return buf;
+}
+
 /// Serialize walk results as a JSON array of processing jobs.
 ///
 /// Looks up each job name across all shard contexts to produce full JSON
@@ -1639,11 +1684,11 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
 pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const entry = shard.defaultPartition().kv.get(waiter.key()) orelse return false;
-    if (entry.lsn <= waiter.min_version) return false;
+    if (entry.version <= waiter.min_version) return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone, remove waiter
     var resp = proto.Response.init(waiter.request_id, .ok, entry.value);
-    resp.prefix = entry.lsn;
+    resp.prefix = entry.version;
     const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
     var buf: [MAX_BUF]u8 = undefined;
     if (resp.serialize(&buf)) |serialized| {

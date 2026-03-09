@@ -157,7 +157,7 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
                 found = true;
                 try obj.boolField("found", true);
                 try obj.stringField("value", entry.value);
-                try obj.intField("version", entry.lsn);
+                try obj.intField("version", entry.version);
                 try obj.intField("size", @as(i64, @intCast(entry.value.len)));
                 const ts_ms = @as(i64, @intCast(entry.timestamp_ns / std.time.ns_per_ms));
                 try obj.intField("updated_at", ts_ms);

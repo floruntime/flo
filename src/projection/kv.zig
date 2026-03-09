@@ -34,6 +34,8 @@ pub const KVEntry = struct {
     value: []const u8,
     /// UAL index that last modified this entry.
     lsn: u64,
+    /// Per-key monotonic version (1 on first write, incremented on each update/delete).
+    version: u64,
     /// Raft term of the write.
     term: u64,
     /// Wall clock timestamp (nanoseconds) of the write.
@@ -124,16 +126,6 @@ pub const KVProjection = struct {
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
 
-        const new_entry = KVEntry{
-            .key = owned_key,
-            .value = owned_value,
-            .lsn = lsn,
-            .term = term,
-            .timestamp_ns = timestamp_ns,
-            .expiry_ns = expiry_ns,
-            .tombstone = false,
-        };
-
         if (self.map.getPtr(key)) |existing| {
             // Key already in map — don't replace it (map references old key ptr).
             // Free the newly allocated key since we don't need it.
@@ -145,13 +137,23 @@ pub const KVProjection = struct {
             }
             existing.value = owned_value;
             existing.lsn = lsn;
+            existing.version += 1;
             existing.term = term;
             existing.timestamp_ns = timestamp_ns;
             existing.expiry_ns = expiry_ns;
             existing.tombstone = false;
             self.memory_used += owned_value.len;
         } else {
-            try self.map.put(owned_key, new_entry);
+            try self.map.put(owned_key, .{
+                .key = owned_key,
+                .value = owned_value,
+                .lsn = lsn,
+                .version = 1,
+                .term = term,
+                .timestamp_ns = timestamp_ns,
+                .expiry_ns = expiry_ns,
+                .tombstone = false,
+            });
             self.memory_used += owned_key.len + owned_value.len;
         }
         self.stats.puts += 1;
@@ -183,6 +185,7 @@ pub const KVProjection = struct {
             self.allocator.free(@constCast(existing.value));
             existing.value = "";
             existing.lsn = lsn;
+            existing.version += 1;
             existing.term = term;
             existing.timestamp_ns = timestamp_ns;
             existing.tombstone = true;
@@ -193,6 +196,7 @@ pub const KVProjection = struct {
                 .key = owned_key,
                 .value = "",
                 .lsn = lsn,
+                .version = 1,
                 .term = term,
                 .timestamp_ns = timestamp_ns,
                 .expiry_ns = 0,
@@ -440,7 +444,7 @@ pub const KVProjection = struct {
 
     /// Serialize the full KV projection state to a byte buffer.
     /// Format: [entry_count: u64] then per entry:
-    ///   [key_len: u32][value_len: u32][lsn: u64][term: u64]
+    ///   [key_len: u32][value_len: u32][lsn: u64][version: u64][term: u64]
     ///   [timestamp_ns: u64][expiry_ns: u64][flags: u8]
     ///   [key bytes][value bytes]
     /// Caller owns the returned slice.
@@ -451,8 +455,8 @@ pub const KVProjection = struct {
         var it = self.map.iterator();
         while (it.next()) |kv| {
             const entry = kv.value_ptr;
-            // key_len(4) + value_len(4) + lsn(8) + term(8) + timestamp_ns(8) + expiry_ns(8) + flags(1)
-            total_size += 41 + entry.key.len + entry.value.len;
+            // key_len(4) + value_len(4) + lsn(8) + version(8) + term(8) + timestamp_ns(8) + expiry_ns(8) + flags(1)
+            total_size += 49 + entry.key.len + entry.value.len;
         }
 
         const buf = try allocator.alloc(u8, total_size);
@@ -474,6 +478,8 @@ pub const KVProjection = struct {
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.value.len), .little);
             offset += 4;
             std.mem.writeInt(u64, buf[offset..][0..8], entry.lsn, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], entry.version, .little);
             offset += 8;
             std.mem.writeInt(u64, buf[offset..][0..8], entry.term, .little);
             offset += 8;
@@ -514,13 +520,15 @@ pub const KVProjection = struct {
 
         var i: u64 = 0;
         while (i < entry_count) : (i += 1) {
-            if (offset + 41 > data.len) return error.InvalidPayload;
+            if (offset + 49 > data.len) return error.InvalidPayload;
 
             const key_len = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
             const value_len = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
             const lsn = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const version = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
             const term = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
@@ -552,6 +560,7 @@ pub const KVProjection = struct {
                 .key = owned_key,
                 .value = owned_value,
                 .lsn = lsn,
+                .version = version,
                 .term = term,
                 .timestamp_ns = timestamp_ns,
                 .expiry_ns = expiry_ns,

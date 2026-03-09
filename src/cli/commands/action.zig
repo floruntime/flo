@@ -485,7 +485,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Walk all shards until no more data
     while (all_names.items.len < limit) {
-        var result = client_mod.action.list(&client, namespace, @intCast(limit), null, cursor) catch |err| {
+        var result = client_mod.action.list(&client, namespace, null, cursor) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
             return;
         };

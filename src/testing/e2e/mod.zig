@@ -165,6 +165,8 @@ pub const TestContext = struct {
         if (self.server.api_key) |key| {
             try self.cli.setApiKey(key);
             self.api_key = try allocator.dupe(u8, key);
+        } else {
+            self.api_key = null;
         }
 
         self.allocator = allocator;

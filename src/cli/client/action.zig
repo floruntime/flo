@@ -147,28 +147,14 @@ pub fn status(client: *Client, namespace: []const u8, run_id: []const u8) !Respo
 
 /// List registered actions
 /// key = prefix (or empty)
-/// value = [limit:u32][cursor...]
+/// value = cursor bytes (empty on first call)
 pub fn list(
     client: *Client,
     namespace: []const u8,
-    limit: ?u32,
     prefix: ?[]const u8,
     cursor: ?[]const u8,
 ) !Response {
-    var value_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
-
-    // Write limit
-    try writer.writeInt(u32, limit orelse 100, .little);
-
-    // Write cursor if provided (for shard walking)
-    if (cursor) |c| {
-        _ = writer.write(c) catch return error.BufferOverflow;
-    }
-
-    const value = fbs.getWritten();
-    return client.sendRequest(.action_list, namespace, prefix orelse "", value);
+    return client.sendRequest(.action_list, namespace, prefix orelse "", cursor orelse "");
 }
 
 /// Delete an action

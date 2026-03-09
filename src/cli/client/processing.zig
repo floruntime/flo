@@ -73,24 +73,13 @@ pub fn status(
 /// Wire format:
 ///   - namespace: req.namespace
 ///   - key: (unused)
-///   - value: [limit:u32][cursor...]?
+///   - value: cursor bytes (empty on first call)
 pub fn list(
     client: *Client,
     namespace: []const u8,
-    limit: u32,
     cursor: ?[]const u8,
 ) !Response {
-    var value_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
-
-    try writer.writeInt(u32, limit, .little);
-    if (cursor) |c| {
-        try writer.writeAll(c);
-    }
-
-    const written = fbs.getWritten();
-    return client.sendRequest(.processing_list, namespace, "", written);
+    return client.sendRequest(.processing_list, namespace, "", cursor orelse "");
 }
 
 /// Trigger a savepoint for a processing job
