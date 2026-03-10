@@ -186,6 +186,12 @@ pub const DashboardServer = struct {
                     self.handleAuthSession(client, parsed.method, request, body, cors_headers);
                     return;
                 }
+                if (std.mem.eql(u8, auth_path, "status")) {
+                    const required = self.config.key_store != null;
+                    const resp = if (required) "{\"required\":true}" else "{\"required\":false}";
+                    self.sendResponse(client, .ok, .json, resp, cors_headers);
+                    return;
+                }
             }
 
             if (self.config.key_store) |ks| {

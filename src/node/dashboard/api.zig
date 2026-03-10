@@ -18,6 +18,7 @@ pub const timeseries = @import("api/timeseries.zig");
 pub const workflows = @import("api/workflows.zig");
 pub const processing = @import("api/processing.zig");
 pub const actions = @import("api/actions.zig");
+pub const workers = @import("api/worker.zig");
 pub const system = @import("api/system.zig");
 
 pub const DashboardContext = helpers.DashboardContext;
@@ -119,7 +120,11 @@ pub fn handleRequest(
 
     // ── workers ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "workers")) {
-        return actions.getWorkers(allocator, ctx);
+        return workers.getWorkers(allocator, ctx);
+    }
+    if (std.mem.startsWith(u8, path, "workers/")) {
+        const worker_id = path["workers/".len..];
+        return workers.getWorkerDetail(allocator, worker_id, ctx);
     }
 
     // ── cluster / metrics ────────────────────────────────────

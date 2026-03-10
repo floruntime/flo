@@ -4,7 +4,6 @@
 //! - GET  /actions/:name                — Action detail (metadata, trigger info)
 //! - GET  /actions/:name/runs           — Execution history
 //! - POST /actions/:name/invoke         — Invoke action (async)
-//! - GET  /workers                      — List WASM workers
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +12,8 @@ const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
+const WorkerHandler = @import("../../../worker/handler.zig").WorkerHandler;
+const workers = @import("worker.zig");
 
 // ── Helpers ──
 
@@ -50,14 +51,69 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                 const rec = entry.value_ptr;
                 const gop = try seen.getOrPut(rec.name_owned);
                 if (!gop.found_existing) {
+                    // Count runs for this action across all shards
+                    var counts = h.RunCounts{};
+                    var worker_count: u64 = 0;
+                    for (0..n) |si| {
+                        if (getShard(ctx, si)) |s| {
+                            var rit = s.actions_handler.runs.iterator();
+                            while (rit.next()) |re| {
+                                if (std.mem.eql(u8, re.value_ptr.action_name_owned, rec.name_owned)) {
+                                    counts.total += 1;
+                                    switch (re.value_ptr.status) {
+                                        .pending => counts.pending += 1,
+                                        .running => counts.running += 1,
+                                        .completed => counts.completed += 1,
+                                        .failed => counts.failed += 1,
+                                        .cancelled => counts.cancelled += 1,
+                                        .timed_out => counts.timed_out += 1,
+                                    }
+                                }
+                            }
+                            // Count workers that handle this action
+                            var wit = s.worker_handler.workers.iterator();
+                            while (wit.next()) |we| {
+                                for (we.value_ptr.processes.items) |p| {
+                                    if (p.kind == .action and std.mem.eql(u8, p.name_owned, rec.name_owned)) {
+                                        worker_count += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     try arr.next();
                     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try obj.begin();
                     try obj.stringField("name", rec.name_owned);
+                    try obj.stringField("namespace", "default");
                     try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
+                    try obj.stringField("owner", "");
+                    try obj.stringField("description", "");
                     try obj.intField("version", @as(i64, @intCast(rec.version)));
                     try obj.boolField("enabled", rec.enabled);
+                    try obj.intField("timeout_ms", 30000);
+                    try obj.intField("max_retries", 3);
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
+                    try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
+                    try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
+                    if (rec.action_type == 1) {
+                        const wasm_size: u64 = if (rec.wasm_blob_owned) |b| b.len else 0;
+                        try obj.intField("wasm_module_size", @as(i64, @intCast(wasm_size)));
+                    }
+                    {
+                        var runs_obj = try obj.objectField("runs");
+                        try runs_obj.begin();
+                        try runs_obj.intField("total", @as(i64, @intCast(counts.total)));
+                        try runs_obj.intField("pending", @as(i64, @intCast(counts.pending)));
+                        try runs_obj.intField("running", @as(i64, @intCast(counts.running)));
+                        try runs_obj.intField("completed", @as(i64, @intCast(counts.completed)));
+                        try runs_obj.intField("failed", @as(i64, @intCast(counts.failed)));
+                        try runs_obj.intField("cancelled", @as(i64, @intCast(counts.cancelled)));
+                        try runs_obj.intField("timed_out", @as(i64, @intCast(counts.timed_out)));
+                        try runs_obj.end();
+                    }
                     try obj.end();
                 }
             }
@@ -68,7 +124,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     return try json_buf.toOwnedSlice(allocator);
 }
 
-/// GET /actions/:name — Action detail (metadata, trigger info)
+/// GET /actions/:name — Action detail (metadata, trigger info, run counts, workers, recent runs)
 pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = h.parseQueryParam([]const u8, query_string, "namespace");
 
@@ -78,14 +134,11 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 
     // Search shards for this action
     var found_rec: ?*const ActionsHandler.ActionRecord = null;
-    var found_handler: ?*const ActionsHandler = null;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
-            const ah = shard.actions_handler;
-            if (ah.actions.getPtr(name)) |rec| {
+            if (shard.actions_handler.actions.getPtr(name)) |rec| {
                 found_rec = rec;
-                found_handler = ah;
                 break;
             }
         }
@@ -96,43 +149,155 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     try obj.stringField("name", name);
 
     if (found_rec) |rec| {
-        try obj.stringField("status", if (rec.enabled) "active" else "disabled");
+        try obj.stringField("namespace", "default");
         try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
+        try obj.stringField("owner", "");
+        try obj.stringField("description", "");
         try obj.intField("version", @as(i64, @intCast(rec.version)));
+        try obj.boolField("enabled", rec.enabled);
+        try obj.intField("timeout_ms", 30000);
+        try obj.intField("max_retries", 3);
+        try obj.intField("retry_delay_ms", 1000);
         try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
+        try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
+        if (rec.action_type == 1) {
+            const wasm_size: u64 = if (rec.wasm_blob_owned) |b| b.len else 0;
+            try obj.intField("wasm_module_size", @as(i64, @intCast(wasm_size)));
+        }
 
         // Count runs for this action across all shards
-        var total_runs: u64 = 0;
-        var successful: u64 = 0;
-        var failed: u64 = 0;
+        var counts = h.RunCounts{};
         for (0..n) |i| {
             if (getShard(ctx, i)) |shard| {
                 var rit = shard.actions_handler.runs.iterator();
                 while (rit.next()) |re| {
                     if (std.mem.eql(u8, re.value_ptr.action_name_owned, name)) {
-                        total_runs += 1;
-                        if (re.value_ptr.status == .completed) successful += 1;
-                        if (re.value_ptr.status == .failed) failed += 1;
+                        counts.total += 1;
+                        switch (re.value_ptr.status) {
+                            .pending => counts.pending += 1,
+                            .running => counts.running += 1,
+                            .completed => counts.completed += 1,
+                            .failed => counts.failed += 1,
+                            .cancelled => counts.cancelled += 1,
+                            .timed_out => counts.timed_out += 1,
+                        }
                     }
                 }
             }
         }
-        try obj.intField("total_runs", @as(i64, @intCast(total_runs)));
-        try obj.intField("successful_runs", @as(i64, @intCast(successful)));
-        try obj.intField("failed_runs", @as(i64, @intCast(failed)));
+
+        // runs object
+        {
+            var runs_obj = try obj.objectField("runs");
+            try runs_obj.begin();
+            try runs_obj.intField("total", @as(i64, @intCast(counts.total)));
+            try runs_obj.intField("pending", @as(i64, @intCast(counts.pending)));
+            try runs_obj.intField("running", @as(i64, @intCast(counts.running)));
+            try runs_obj.intField("completed", @as(i64, @intCast(counts.completed)));
+            try runs_obj.intField("failed", @as(i64, @intCast(counts.failed)));
+            try runs_obj.intField("cancelled", @as(i64, @intCast(counts.cancelled)));
+            try runs_obj.intField("timed_out", @as(i64, @intCast(counts.timed_out)));
+            try runs_obj.end();
+        }
+
+        // recent_runs — last 20 runs for this action
+        {
+            var recent_arr = try obj.arrayField("recent_runs");
+            try recent_arr.begin();
+            var rcount: u32 = 0;
+            for (0..n) |i| {
+                if (rcount >= 20) break;
+                if (getShard(ctx, i)) |shard| {
+                    var rit = shard.actions_handler.runs.iterator();
+                    while (rit.next()) |re| {
+                        if (rcount >= 20) break;
+                        const run = re.value_ptr;
+                        if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                        try recent_arr.next();
+                        var robj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                        try robj.begin();
+                        try robj.stringField("run_id", run.run_id_owned);
+                        try robj.stringField("status", @tagName(run.status));
+                        try robj.intField("attempt", 1);
+                        try robj.intField("created_at", run.created_at_ms);
+                        if (run.started_at_ms) |t| {
+                            try robj.intField("started_at", t);
+                        } else {
+                            try robj.nullField("started_at");
+                        }
+                        if (run.completed_at_ms) |t| {
+                            try robj.intField("completed_at", t);
+                        } else {
+                            try robj.nullField("completed_at");
+                        }
+                        try robj.nullField("worker_id");
+                        try robj.nullField("error");
+                        try robj.nullField("outcome");
+                        try robj.end();
+                        rcount += 1;
+                    }
+                }
+            }
+            try recent_arr.end();
+        }
+
+        // workers — workers that handle this action
+        {
+            var workers_arr = try obj.arrayField("workers");
+            try workers_arr.begin();
+            for (0..n) |i| {
+                if (getShard(ctx, i)) |shard| {
+                    var wit = shard.worker_handler.workers.iterator();
+                    while (wit.next()) |we| {
+                        const w = we.value_ptr;
+                        for (w.processes.items) |p| {
+                            if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) {
+                                try workers_arr.next();
+                                try workers.writeWorkerJson(writer, w);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            try workers_arr.end();
+        }
     } else {
-        try obj.stringField("status", "unknown");
-        try obj.stringField("type", "wasm");
-        try obj.intField("total_runs", 0);
-        try obj.intField("successful_runs", 0);
-        try obj.intField("failed_runs", 0);
+        try obj.stringField("namespace", "default");
+        try obj.stringField("type", "user");
+        try obj.stringField("owner", "");
+        try obj.stringField("description", "");
+        try obj.intField("version", 0);
+        try obj.boolField("enabled", false);
+        try obj.intField("timeout_ms", 0);
+        try obj.intField("max_retries", 0);
+        try obj.intField("retry_delay_ms", 0);
+        try obj.intField("created_at", 0);
+        try obj.intField("updated_at", 0);
+        {
+            var runs_obj = try obj.objectField("runs");
+            try runs_obj.begin();
+            try runs_obj.intField("total", 0);
+            try runs_obj.intField("pending", 0);
+            try runs_obj.intField("running", 0);
+            try runs_obj.intField("completed", 0);
+            try runs_obj.intField("failed", 0);
+            try runs_obj.intField("cancelled", 0);
+            try runs_obj.intField("timed_out", 0);
+            try runs_obj.end();
+        }
+        {
+            var recent_arr = try obj.arrayField("recent_runs");
+            try recent_arr.begin();
+            try recent_arr.end();
+        }
+        {
+            var workers_arr = try obj.arrayField("workers");
+            try workers_arr.begin();
+            try workers_arr.end();
+        }
     }
 
-    {
-        var triggers_arr = try obj.arrayField("triggers");
-        try triggers_arr.begin();
-        try triggers_arr.end();
-    }
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }
@@ -204,14 +369,6 @@ pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, ct
     return try json_buf.toOwnedSlice(allocator);
 }
 
-/// GET /workers — List WASM workers
-pub fn getWorkers(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-
-    // No worker tracking at handler level yet
-    return try allocator.dupe(u8, "[]");
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -236,16 +393,5 @@ test "getActionDetail returns stub" {
     const result = try getActionDetail(allocator, "my_action", null, &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"my_action\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"type\":\"wasm\"") != null);
-}
-
-test "getWorkers returns empty array" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try getWorkers(allocator, &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"type\":\"user\"") != null);
 }

@@ -354,6 +354,7 @@ export interface ActionInfo {
   trigger_group?: string;
   runs: ActionRunCounts;
   worker_count: number;
+  wasm_module_size?: number;
 }
 
 /** Action run info */
@@ -385,22 +386,35 @@ export interface ActionDetail {
   updated_at: number;
   trigger_stream?: string;
   trigger_group?: string;
+  wasm_module_size?: number;
   runs: ActionRunCounts;
   recent_runs: ActionRunInfo[];
   workers: WorkerInfo[];
 }
 
+/** Process info within a worker */
+export interface ProcessInfo {
+  name: string;
+  kind: 'action' | 'stream_consumer';
+  run_count: number;
+  fail_count: number;
+  last_run_at: number;
+}
+
 /** Worker info from GET /workers */
 export interface WorkerInfo {
   worker_id: string;
-  namespace: string;
-  task_types: string;
-  healthy: boolean;
+  status: 'active' | 'idle' | 'draining' | 'unhealthy';
+  worker_type: 'action' | 'stream';
+  machine_id: string | null;
   current_load: number;
   max_concurrent: number;
-  active_tasks: number;
+  tasks_completed: number;
+  tasks_failed: number;
   last_seen: number;
   registered_at: number;
+  metadata: string | null;
+  processes: ProcessInfo[];
 }
 
 /** Action invoke response */
@@ -823,6 +837,13 @@ class FloApiClient {
    */
   async getWorkers(): Promise<WorkerInfo[]> {
     return this.fetch<WorkerInfo[]>('workers');
+  }
+
+  /**
+   * Get a single worker by ID
+   */
+  async getWorkerDetail(workerId: string): Promise<WorkerInfo> {
+    return this.fetch<WorkerInfo>(`workers/${encodeURIComponent(workerId)}`);
   }
 
   /**

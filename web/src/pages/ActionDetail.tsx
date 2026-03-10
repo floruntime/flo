@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
     Cpu, Zap, Play, ArrowLeft, Users, CheckCircle2,
-    Settings, RefreshCw, Activity
+    Settings, RefreshCw, Activity, HardDrive, Box
 } from "lucide-react";
 import { Card, CardContent } from "../components/ui/Card";
 import { api, type ActionRunInfo, type WorkerInfo } from "../lib/api";
@@ -161,6 +161,18 @@ export function ActionDetailPage() {
     const [invokeResult, setInvokeResult] = useState<string | null>(null);
     const [tab, setTab] = useState<'runs' | 'workers' | 'config'>('runs');
 
+    const tabs = action?.type === 'wasm'
+        ? [
+            { key: 'runs' as const, label: 'Recent Runs', icon: Activity, count: action?.recent_runs.length },
+            { key: 'workers' as const, label: 'WASM Module', icon: Box },
+            { key: 'config' as const, label: 'Configuration', icon: Settings },
+        ]
+        : [
+            { key: 'runs' as const, label: 'Recent Runs', icon: Activity, count: action?.recent_runs.length },
+            { key: 'workers' as const, label: 'Workers', icon: Users, count: action?.workers.length },
+            { key: 'config' as const, label: 'Configuration', icon: Settings },
+        ];
+
     const handleInvoke = async () => {
         if (!actionName) return;
         try {
@@ -270,12 +282,29 @@ export function ActionDetailPage() {
                         <p className={cn("text-xl font-bold", action.runs.failed > 0 ? "text-red-400" : "")}>{action.runs.failed}</p>
                     </CardContent>
                 </Card>
-                <Card>
-                    <CardContent className="pt-4 pb-4">
-                        <p className="text-xs text-text-secondary mb-1">Workers</p>
-                        <p className="text-xl font-bold">{action.workers.length}</p>
-                    </CardContent>
-                </Card>
+                {action.type === 'wasm' ? (
+                    <Card>
+                        <CardContent className="pt-4 pb-4">
+                            <p className="text-xs text-text-secondary mb-1">Module Size</p>
+                            <p className="text-xl font-bold text-purple-400">
+                                {action.wasm_module_size != null
+                                    ? action.wasm_module_size > 1024 * 1024
+                                        ? `${(action.wasm_module_size / (1024 * 1024)).toFixed(1)}MB`
+                                        : action.wasm_module_size > 1024
+                                            ? `${(action.wasm_module_size / 1024).toFixed(1)}KB`
+                                            : `${action.wasm_module_size}B`
+                                    : "—"}
+                            </p>
+                        </CardContent>
+                    </Card>
+                ) : (
+                    <Card>
+                        <CardContent className="pt-4 pb-4">
+                            <p className="text-xs text-text-secondary mb-1">Workers</p>
+                            <p className="text-xl font-bold">{action.workers.length}</p>
+                        </CardContent>
+                    </Card>
+                )}
             </div>
 
             {/* Run status breakdown bar */}
@@ -334,11 +363,7 @@ export function ActionDetailPage() {
 
             {/* Tabs */}
             <div className="flex items-center gap-1 border-b border-surface-border">
-                {[
-                    { key: 'runs' as const, label: 'Recent Runs', icon: Activity, count: action.recent_runs.length },
-                    { key: 'workers' as const, label: 'Workers', icon: Users, count: action.workers.length },
-                    { key: 'config' as const, label: 'Configuration', icon: Settings },
-                ].map(t => (
+                {tabs.map(t => (
                     <button
                         key={t.key}
                         onClick={() => setTab(t.key)}
@@ -361,7 +386,62 @@ export function ActionDetailPage() {
             {/* Tab Content */}
             <Card>
                 {tab === 'runs' && <RunsTable runs={action.recent_runs} />}
-                {tab === 'workers' && (
+                {tab === 'workers' && action.type === 'wasm' && (
+                    <CardContent className="pt-4">
+                        <div className="space-y-4">
+                            <div className="flex items-center gap-3 p-4 rounded-lg bg-purple-400/5 border border-purple-400/20">
+                                <div className="p-2 rounded-lg bg-purple-400/10">
+                                    <HardDrive className="w-5 h-5 text-purple-400" />
+                                </div>
+                                <div>
+                                    <p className="text-sm font-medium">Server-Side Execution</p>
+                                    <p className="text-xs text-text-secondary">
+                                        This action runs inline on the Flo server via WebAssembly. No external workers needed.
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="space-y-2 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">Module Size</span>
+                                        <span>
+                                            {action.wasm_module_size != null
+                                                ? action.wasm_module_size > 1024 * 1024
+                                                    ? `${(action.wasm_module_size / (1024 * 1024)).toFixed(1)} MB`
+                                                    : action.wasm_module_size > 1024
+                                                        ? `${(action.wasm_module_size / 1024).toFixed(1)} KB`
+                                                        : `${action.wasm_module_size} bytes`
+                                                : "No module deployed"}
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">Execution Model</span>
+                                        <span>Synchronous (inline)</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">Concurrency Limit</span>
+                                        <span>4 per shard</span>
+                                    </div>
+                                </div>
+                                <div className="space-y-2 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">Runtime</span>
+                                        <span>zware (WASM 2.0)</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">ABI</span>
+                                        <span className="font-mono text-xs">handle / alloc / dealloc</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-text-secondary">Host Functions</span>
+                                        <span>log, kv_get, kv_set, kv_delete</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </CardContent>
+                )}
+                {tab === 'workers' && action.type !== 'wasm' && (
                     <CardContent className="pt-4">
                         <WorkersPanel workers={action.workers} />
                     </CardContent>

@@ -28,6 +28,10 @@ interface AuthContextValue {
   logout: () => void;
   /** True if the user has a valid (non-expired) session */
   isAuthenticated: boolean;
+  /** Whether the server requires authentication (false when auth not configured) */
+  authRequired: boolean;
+  /** Whether the auth status check has completed */
+  authChecked: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,8 +77,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [auth, setAuth] = useState<AuthState | null>(loadPersistedAuth);
   const [loggingIn, setLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(true);
+  const [authChecked, setAuthChecked] = useState(false);
 
   const isAuthenticated = auth !== null && auth.expiresAt * 1000 > Date.now();
+
+  // Check server auth status on mount
+  useEffect(() => {
+    fetch(`${API_BASE}/auth/status`)
+      .then((res) => res.json())
+      .then((data: { required: boolean }) => {
+        setAuthRequired(data.required);
+      })
+      .catch(() => {
+        // If status check fails, assume auth is required (safe default)
+        setAuthRequired(true);
+      })
+      .finally(() => setAuthChecked(true));
+  }, []);
 
   // Periodic expiry check — log out when token expires
   useEffect(() => {
@@ -141,7 +161,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [auth]);
 
   return (
-    <AuthContext.Provider value={{ auth, loggingIn, loginError, login, logout, isAuthenticated }}>
+    <AuthContext.Provider value={{ auth, loggingIn, loginError, login, logout, isAuthenticated, authRequired, authChecked }}>
       {children}
     </AuthContext.Provider>
   );

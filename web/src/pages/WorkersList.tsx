@@ -1,4 +1,5 @@
-import { Users, Activity, Heart, RefreshCw, Cpu } from "lucide-react";
+import { Users, Activity, Heart, RefreshCw, Cpu, AlertTriangle } from "lucide-react";
+import { Link } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api } from "../lib/api";
 import { useApi, LoadingState, ErrorState, EmptyState } from "../lib/useApi";
@@ -38,6 +39,31 @@ function LoadBar({ value, max }: { value: number; max: number }) {
     );
 }
 
+function StatusBadge({ status }: { status: string }) {
+    const styles: Record<string, string> = {
+        active: "bg-emerald-500/20 text-emerald-400",
+        idle: "bg-gray-500/20 text-gray-400",
+        draining: "bg-yellow-500/20 text-yellow-400",
+        unhealthy: "bg-red-500/20 text-red-400",
+    };
+    return (
+        <span className={cn("text-xs px-2 py-0.5 rounded-full font-medium", styles[status] ?? styles.idle)}>
+            {status}
+        </span>
+    );
+}
+
+function TypeBadge({ type }: { type: string }) {
+    return (
+        <span className={cn(
+            "text-xs px-2 py-0.5 rounded font-mono",
+            type === "action" ? "bg-blue-500/15 text-blue-400" : "bg-purple-500/15 text-purple-400"
+        )}>
+            {type}
+        </span>
+    );
+}
+
 export function WorkersListPage() {
     const { data: workers, loading, error, refetch } = useApi(
         () => api.getWorkers(),
@@ -51,9 +77,10 @@ export function WorkersListPage() {
         return <EmptyState title="No Workers" description="No workers are currently registered." />;
     }
 
-    const healthyCount = workers.filter(w => w.healthy).length;
-    const unhealthyCount = workers.length - healthyCount;
-    const totalActiveTasks = workers.reduce((sum, w) => sum + w.active_tasks, 0);
+    const activeCount = workers.filter(w => w.status === "active" || w.status === "idle").length;
+    const drainingCount = workers.filter(w => w.status === "draining").length;
+    const unhealthyCount = workers.filter(w => w.status === "unhealthy").length;
+    const totalLoad = workers.reduce((sum, w) => sum + w.current_load, 0);
     const totalCapacity = workers.reduce((sum, w) => sum + w.max_concurrent, 0);
 
     return (
@@ -90,9 +117,12 @@ export function WorkersListPage() {
                     <CardContent className="pt-4 pb-4">
                         <div className="flex items-center gap-2 mb-1">
                             <Heart className="w-4 h-4 text-emerald-400" />
-                            <span className="text-xs text-text-secondary">Healthy</span>
+                            <span className="text-xs text-text-secondary">Active</span>
                         </div>
-                        <p className="text-xl font-bold text-emerald-400">{healthyCount}</p>
+                        <p className="text-xl font-bold text-emerald-400">{activeCount}</p>
+                        {drainingCount > 0 && (
+                            <p className="text-xs text-yellow-400 mt-1">{drainingCount} draining</p>
+                        )}
                         {unhealthyCount > 0 && (
                             <p className="text-xs text-red-400 mt-1">{unhealthyCount} unhealthy</p>
                         )}
@@ -102,9 +132,9 @@ export function WorkersListPage() {
                     <CardContent className="pt-4 pb-4">
                         <div className="flex items-center gap-2 mb-1">
                             <Activity className="w-4 h-4 text-blue-400" />
-                            <span className="text-xs text-text-secondary">Active Tasks</span>
+                            <span className="text-xs text-text-secondary">Current Load</span>
                         </div>
-                        <p className="text-xl font-bold">{totalActiveTasks}</p>
+                        <p className="text-xl font-bold">{totalLoad}</p>
                     </CardContent>
                 </Card>
                 <Card>
@@ -113,7 +143,7 @@ export function WorkersListPage() {
                             <Cpu className="w-4 h-4 text-text-secondary" />
                             <span className="text-xs text-text-secondary">Cluster Utilization</span>
                         </div>
-                        <LoadBar value={totalActiveTasks} max={totalCapacity} />
+                        <LoadBar value={totalLoad} max={totalCapacity} />
                     </CardContent>
                 </Card>
             </div>
@@ -127,50 +157,66 @@ export function WorkersListPage() {
                     <table className="w-full text-left text-sm">
                         <thead className="bg-surface-hover/50 text-text-secondary font-medium border-b border-surface-border">
                             <tr>
-                                <th className="px-4 py-2.5">Health</th>
+                                <th className="px-4 py-2.5">Status</th>
                                 <th className="px-4 py-2.5">Worker ID</th>
-                                <th className="px-4 py-2.5">Namespace</th>
-                                <th className="px-4 py-2.5">Task Types</th>
+                                <th className="px-4 py-2.5">Type</th>
+                                <th className="px-4 py-2.5">Machine</th>
                                 <th className="px-4 py-2.5">Load</th>
-                                <th className="px-4 py-2.5">Tasks</th>
+                                <th className="px-4 py-2.5">Completed</th>
+                                <th className="px-4 py-2.5">Failed</th>
+                                <th className="px-4 py-2.5">Processes</th>
                                 <th className="px-4 py-2.5">Last Seen</th>
-                                <th className="px-4 py-2.5">Registered</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-surface-border">
                             {workers.map((w) => (
                                 <tr key={w.worker_id} className="hover:bg-surface-hover/30 transition-colors">
                                     <td className="px-4 py-3">
-                                        {w.healthy ? (
-                                            <span className="flex items-center gap-1.5 text-emerald-400">
-                                                <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                                                <span className="text-xs">Healthy</span>
+                                        <StatusBadge status={w.status} />
+                                    </td>
+                                    <td className="px-4 py-3">
+                                        <Link
+                                            to={`/workers/${encodeURIComponent(w.worker_id)}`}
+                                            className="font-mono text-xs text-accent hover:underline"
+                                        >
+                                            {w.worker_id}
+                                        </Link>
+                                    </td>
+                                    <td className="px-4 py-3">
+                                        <TypeBadge type={w.worker_type} />
+                                    </td>
+                                    <td className="px-4 py-3 text-text-secondary text-xs">
+                                        {w.machine_id ?? "—"}
+                                    </td>
+                                    <td className="px-4 py-3">
+                                        <LoadBar value={w.current_load} max={w.max_concurrent} />
+                                    </td>
+                                    <td className="px-4 py-3 text-text-secondary">{w.tasks_completed}</td>
+                                    <td className="px-4 py-3">
+                                        {w.tasks_failed > 0 ? (
+                                            <span className="flex items-center gap-1 text-red-400">
+                                                <AlertTriangle className="w-3 h-3" />
+                                                {w.tasks_failed}
                                             </span>
                                         ) : (
-                                            <span className="flex items-center gap-1.5 text-red-400">
-                                                <span className="w-2 h-2 rounded-full bg-red-400" />
-                                                <span className="text-xs">Unhealthy</span>
-                                            </span>
+                                            <span className="text-text-secondary">0</span>
                                         )}
                                     </td>
-                                    <td className="px-4 py-3 font-mono text-xs">{w.worker_id}</td>
-                                    <td className="px-4 py-3 text-text-secondary">{w.namespace || "default"}</td>
                                     <td className="px-4 py-3">
-                                        <span className="text-xs bg-surface-hover px-2 py-0.5 rounded">
-                                            {w.task_types || "—"}
-                                        </span>
-                                    </td>
-                                    <td className="px-4 py-3">
-                                        <LoadBar value={w.current_load} max={100} />
-                                    </td>
-                                    <td className="px-4 py-3 text-text-secondary">
-                                        {w.active_tasks} / {w.max_concurrent}
+                                        {w.processes.length > 0 ? (
+                                            <div className="flex flex-wrap gap-1">
+                                                {w.processes.map((p) => (
+                                                    <span key={p.name} className="text-xs bg-surface-hover px-1.5 py-0.5 rounded">
+                                                        {p.name}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <span className="text-text-secondary text-xs">—</span>
+                                        )}
                                     </td>
                                     <td className="px-4 py-3 text-text-secondary" title={formatDate(w.last_seen)}>
                                         {formatTimeAgo(w.last_seen)}
-                                    </td>
-                                    <td className="px-4 py-3 text-text-secondary" title={formatDate(w.registered_at)}>
-                                        {formatTimeAgo(w.registered_at)}
                                     </td>
                                 </tr>
                             ))}

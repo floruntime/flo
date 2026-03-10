@@ -181,16 +181,21 @@ pub fn workerRegister(
     var fbs = std.io.fixedBufferStream(&value_buf);
     const writer = fbs.writer();
 
-    // Write task_types count
-    try writer.writeInt(u32, @intCast(task_types.len), .little);
+    // Worker type: 0 = action
+    try writer.writeByte(0);
 
-    // Write each task type
+    // Max concurrency (default 10)
+    try writer.writeInt(u32, 10, .little);
+
+    // Process list — each task_type becomes an action process
+    try writer.writeInt(u16, @intCast(task_types.len), .little);
     for (task_types) |tt| {
         try writer.writeInt(u16, @intCast(tt.len), .little);
         try writer.writeAll(tt);
+        try writer.writeByte(0); // kind = action
     }
 
-    // Write labels (optional JSON string)
+    // Optional metadata (labels JSON)
     if (labels) |l| {
         try writer.writeByte(1);
         try writer.writeInt(u16, @intCast(l.len), .little);
@@ -198,6 +203,9 @@ pub fn workerRegister(
     } else {
         try writer.writeByte(0);
     }
+
+    // No machine_id from CLI (server auto-generates)
+    try writer.writeByte(0);
 
     const value = fbs.getWritten();
     return client.sendRequest(.worker_register, namespace, worker_id, value);
@@ -249,7 +257,7 @@ pub fn workerAwait(
         try builder.addU32(.timeout_ms, t);
     }
 
-    return client.sendRequestWithOptions(.worker_await, namespace, worker_id, value, builder.getOptions());
+    return client.sendRequestWithOptions(.action_await, namespace, worker_id, value, builder.getOptions());
 }
 
 /// Touch task (extend lease)
@@ -279,7 +287,7 @@ pub fn workerTouch(
     try writer.writeInt(u32, extend_ms orelse 30_000, .little);
 
     const value = fbs.getWritten();
-    return client.sendRequest(.worker_touch, namespace, worker_id, value);
+    return client.sendRequest(.action_touch, namespace, worker_id, value);
 }
 
 /// Complete task successfully
@@ -315,11 +323,11 @@ pub fn workerComplete(
     try writer.writeAll(result);
 
     const value = fbs.getWritten();
-    return client.sendRequest(.worker_complete, namespace, worker_id, value);
+    return client.sendRequest(.action_complete, namespace, worker_id, value);
 }
 
 /// Fail task
-/// key = worker_id  
+/// key = worker_id
 /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
 pub fn workerFail(
     client: *Client,
@@ -349,7 +357,7 @@ pub fn workerFail(
     try writer.writeAll(error_message);
 
     const value = fbs.getWritten();
-    return client.sendRequest(.worker_fail, namespace, worker_id, value);
+    return client.sendRequest(.action_fail, namespace, worker_id, value);
 }
 
 /// List workers in namespace
@@ -375,4 +383,25 @@ pub fn workerList(
 
     const value = fbs.getWritten();
     return client.sendRequest(.worker_list, namespace, "", value);
+}
+
+/// Drain a worker (mark as draining — stops new task assignments)
+/// key = worker_id
+/// value = empty
+pub fn workerDrain(
+    client: *Client,
+    namespace: []const u8,
+    worker_id: []const u8,
+) !Response {
+    return client.sendRequest(.worker_drain, namespace, worker_id, "");
+}
+
+/// Get worker details
+/// key = worker_id
+pub fn workerInfo(
+    client: *Client,
+    namespace: []const u8,
+    worker_id: []const u8,
+) !Response {
+    return client.sendRequest(.worker_info, namespace, worker_id, "");
 }

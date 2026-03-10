@@ -12,6 +12,7 @@ pub const stream_test = @import("stream_test.zig");
 pub const queue_test = @import("queue_test.zig");
 pub const namespace_test = @import("namespace_test.zig");
 pub const action_test = @import("action_test.zig");
+pub const worker_test = @import("worker_test.zig");
 pub const workflow_test = @import("workflow_test.zig");
 pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");

@@ -58,6 +58,7 @@ const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
+const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
 const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
@@ -156,6 +157,9 @@ pub const Shard = struct {
     /// Actions handler instance.
     actions_handler: *ActionsHandler,
 
+    /// Worker registry — tracks physical worker health.
+    worker_handler: *WorkerHandler,
+
     /// Workflow handler instance.
     workflow_handler: *WorkflowHandler,
 
@@ -179,7 +183,7 @@ pub const Shard = struct {
     raft_node: *RaftNode,
 
     /// Unified waiter pool — handles blocking GET, blocking dequeue,
-    /// stream long-poll, and worker_await across all subsystems.
+    /// stream long-poll, and action_await across all subsystems.
     waiter_pool: WaiterPool,
 
     /// Cooperative periodic background tasks (hot_flush, TTL sweep, etc.).
@@ -256,6 +260,11 @@ pub const Shard = struct {
         const actions_handler = try allocator.create(ActionsHandler);
         errdefer allocator.destroy(actions_handler);
         actions_handler.* = ActionsHandler.init(allocator);
+
+        // Create Worker handler (worker registry)
+        const worker_handler = try allocator.create(WorkerHandler);
+        errdefer allocator.destroy(worker_handler);
+        worker_handler.* = WorkerHandler.init(allocator);
 
         // Create Workflow handler
         const workflow_handler = try allocator.create(WorkflowHandler);
@@ -384,6 +393,7 @@ pub const Shard = struct {
         TSHandler.register(&dispatcher);
         NamespaceHandler.register(&dispatcher);
         ActionsHandler.register(&dispatcher);
+        WorkerHandler.register(&dispatcher);
         WorkflowHandler.register(&dispatcher);
         ProcessingHandler.register(&dispatcher);
 
@@ -420,6 +430,7 @@ pub const Shard = struct {
             .ts_handler = ts_handler,
             .namespace_handler = namespace_handler,
             .actions_handler = actions_handler,
+            .worker_handler = worker_handler,
             .workflow_handler = workflow_handler,
             .processing_handler = processing_handler,
             .raft_node = raft_node,
@@ -505,6 +516,8 @@ pub const Shard = struct {
         self.allocator.destroy(self.namespace_handler);
         self.actions_handler.deinit();
         self.allocator.destroy(self.actions_handler);
+        self.worker_handler.deinit();
+        self.allocator.destroy(self.worker_handler);
         self.workflow_handler.deinit();
         self.allocator.destroy(self.workflow_handler);
         self.processing_handler.deinit();
@@ -1686,8 +1699,8 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             shard.sendOkResponse(conn, waiter.request_id, &buf);
             shard.flushToClient(waiter.fd);
         },
-        .worker_await => {
-            // Worker await timeout → empty response (no task available)
+        .action_await => {
+            // Action await timeout — empty response (no task available)
             shard.sendOkResponse(conn, waiter.request_id, "");
             shard.flushToClient(waiter.fd);
         },

@@ -250,6 +250,8 @@ pub const CommandResult = union(enum) {
         run_id: []const u8,
         /// Estimated queue position (if queued)
         queue_position: ?u32 = null,
+        /// WASM output bytes (populated inline for wasm actions, null for user actions)
+        output: ?[]const u8 = null,
         allocated: bool = false,
     },
 
@@ -409,6 +411,15 @@ pub const CommandResult = union(enum) {
     namespace_info: struct {
         exists: bool,
         name: []const u8,
+        allocated: bool = false,
+    },
+
+    /// Namespace config set succeeded
+    namespace_config_set: void,
+
+    /// Namespace config get response (pre-serialized settings TLV)
+    namespace_config_get: struct {
+        data: []const u8,
         allocated: bool = false,
     },
 
@@ -708,6 +719,9 @@ pub const CommandResult = union(enum) {
             .namespace_info => |n| {
                 if (n.allocated and n.name.len > 0) allocator.free(n.name);
             },
+            .namespace_config_get => |n| {
+                if (n.allocated and n.data.len > 0) allocator.free(n.data);
+            },
             .action_list_result => |a| {
                 if (a.data.len > 0) allocator.free(a.data);
                 if (a.cursor) |c| allocator.free(c);
@@ -721,6 +735,7 @@ pub const CommandResult = union(enum) {
             .action_invoked => |a| {
                 if (a.allocated) {
                     allocator.free(a.run_id);
+                    if (a.output) |o| allocator.free(o);
                 }
             },
             .action_run_status => |a| {
@@ -872,7 +887,7 @@ pub const CommandResult = union(enum) {
             .action_deleted => .ok,
 
             .worker_registered => .worker_register_response,
-            .task_assignment => .worker_task_assignment,
+            .task_assignment => .action_task_assignment,
             .workers_listed => .worker_list_response,
 
             .workflow_created => .workflow_create_response,
@@ -897,6 +912,8 @@ pub const CommandResult = union(enum) {
             .namespace_deleted => .namespace_delete_response,
             .namespace_list => .namespace_list_response,
             .namespace_info => .namespace_info_response,
+            .namespace_config_set => .namespace_config_set_response,
+            .namespace_config_get => .namespace_config_get_response,
 
             // Processing results
             .processing_submitted => .processing_submit_response,
@@ -956,7 +973,13 @@ pub const CommandResult = union(enum) {
             .queues_listed => |s| 1 + 4 + s.data.len, // tag + len + data
 
             .action_registered => |a| 1 + 4 + a.name.len + 4 + a.version.len,
-            .action_invoked => |a| 1 + 4 + a.run_id.len + 1 + if (a.queue_position != null) @as(usize, 4) else 0,
+            .action_invoked => |a| blk: {
+                var size: usize = 1 + 4 + a.run_id.len + 1;
+                if (a.queue_position != null) size += 4;
+                size += 1; // has_output
+                if (a.output) |o| size += 4 + o.len;
+                break :blk size;
+            },
             .action_run_status => |s| blk: {
                 var size: usize = 1 + 4 + s.run_id.len + 1 + 8 + 9 + 9 + 4; // tag + run_id + status + created_at + has_started + has_completed + retry_count
                 if (s.started_at != null) size += 8;
@@ -995,9 +1018,10 @@ pub const CommandResult = union(enum) {
             .cluster_join_ok => 1 + 4 + 4, // tag + assigned_node_id + leader_id
 
             // Namespace results
-            .namespace_created, .namespace_deleted => 1, // just tag
+            .namespace_created, .namespace_deleted, .namespace_config_set => 1, // just tag
             .namespace_list => |n| 1 + 4 + n.data.len, // tag + len + data
             .namespace_info => |n| 1 + 1 + 2 + n.name.len, // tag + exists + name_len + name
+            .namespace_config_get => |n| 1 + 4 + n.data.len, // tag + len + data
 
             // Processing results
             .processing_submitted => |p| 1 + 4 + p.job_id.len, // tag + len + job_id
@@ -1172,6 +1196,13 @@ pub const CommandResult = union(enum) {
                 } else {
                     try writer.writeByte(0);
                 }
+                if (a.output) |o| {
+                    try writer.writeByte(1);
+                    try writer.writeInt(u32, @intCast(o.len), .little);
+                    try writer.writeAll(o);
+                } else {
+                    try writer.writeByte(0);
+                }
             },
             .action_run_status => |s| {
                 try writeSlice(writer, s.run_id);
@@ -1254,7 +1285,7 @@ pub const CommandResult = union(enum) {
             },
 
             // Namespace results
-            .namespace_created, .namespace_deleted => {},
+            .namespace_created, .namespace_deleted, .namespace_config_set => {},
             .namespace_list => |n| {
                 try writeSlice(writer, n.data);
             },
@@ -1262,6 +1293,9 @@ pub const CommandResult = union(enum) {
                 try writer.writeByte(if (n.exists) 1 else 0);
                 try writer.writeInt(u16, @intCast(n.name.len), .little);
                 try writer.writeAll(n.name);
+            },
+            .namespace_config_get => |n| {
+                try writeSlice(writer, n.data);
             },
 
             // Processing results
@@ -1494,9 +1528,13 @@ pub const CommandResult = union(enum) {
             .action_invoked => blk: {
                 const run_id = try readSlice(reader, allocator);
                 const has_pos = try reader.readByte() != 0;
+                const queue_pos = if (has_pos) try reader.readInt(u32, .little) else null;
+                const has_output = (reader.readByte() catch 0) != 0;
+                const output = if (has_output) try readSlice(reader, allocator) else null;
                 break :blk .{ .action_invoked = .{
                     .run_id = run_id,
-                    .queue_position = if (has_pos) try reader.readInt(u32, .little) else null,
+                    .queue_position = queue_pos,
+                    .output = output,
                     .allocated = true,
                 } };
             },
@@ -1605,6 +1643,11 @@ pub const CommandResult = union(enum) {
                     .allocated = true,
                 } };
             },
+            .namespace_config_set => .{ .namespace_config_set = {} },
+            .namespace_config_get => .{ .namespace_config_get = .{
+                .data = try readSlice(reader, allocator),
+                .allocated = true,
+            } },
 
             // Processing results
             .processing_submitted => .{ .processing_submitted = .{

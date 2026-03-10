@@ -112,27 +112,32 @@ pub const OpCode = enum(u8) {
     queue_list = 0x58, // List all queues in namespace
     queue_list_response = 0x59,
 
-    // Actions & Workers (0x60 - 0x7F)
+    // Actions (0x60 - 0x6F) — action definitions + task dispatch
     action_register = 0x60, // Register an action (user or WASM)
-    action_invoke = 0x61, // Invoke an action
+    action_invoke = 0x61, // Invoke an action (create run)
     action_status = 0x62, // Get action run status
     action_list = 0x63, // List registered actions
     action_delete = 0x64, // Delete/disable an action
-    action_register_response = 0x65,
-    action_invoke_response = 0x66,
-    action_status_response = 0x67,
-    action_list_response = 0x68,
+    action_await = 0x65, // Worker blocks waiting for task assignment
+    action_complete = 0x66, // Worker completes a task
+    action_fail = 0x67, // Worker fails a task (with optional retry)
+    action_touch = 0x68, // Extend task lease
+    action_register_response = 0x69,
+    action_invoke_response = 0x6A,
+    action_status_response = 0x6B,
+    action_list_response = 0x6C,
+    action_task_assignment = 0x6D, // Push task to worker
 
-    // Workers (0x69 - 0x7F)
-    worker_register = 0x69,
-    worker_touch = 0x6A, // Extend task visibility timeout
-    worker_await = 0x6B, // Blocking wait for task (not polling!)
-    worker_complete = 0x6C,
-    worker_fail = 0x6D,
-    worker_list = 0x6E, // List registered workers
-    worker_register_response = 0x70,
-    worker_task_assignment = 0x71,
-    worker_list_response = 0x72, // Response for worker_list
+    // Workers (0x70 - 0x7F) — physical worker tracking & health
+    worker_register = 0x70, // Register worker with type + metadata
+    worker_heartbeat = 0x71, // Worker heartbeat / health ping
+    worker_deregister = 0x72, // Remove worker from registry
+    worker_list = 0x73, // List all workers (with health)
+    worker_info = 0x74, // Get single worker details
+    worker_register_response = 0x75,
+    worker_list_response = 0x76,
+    worker_info_response = 0x77,
+    worker_drain = 0x78, // Drain a worker (stop new task assignments)
 
     // Workflows (0x80 - 0x8F)
     workflow_create = 0x80, // Create workflow from YAML definition
@@ -177,6 +182,10 @@ pub const OpCode = enum(u8) {
     namespace_delete_response = 0xB5,
     namespace_list_response = 0xB6,
     namespace_info_response = 0xB7,
+    namespace_config_set = 0xB8, // Set namespace configuration (admin-only)
+    namespace_config_get = 0xB9, // Get namespace configuration
+    namespace_config_set_response = 0xBA,
+    namespace_config_get_response = 0xBB,
 
     // Processing / Stream Processing (0xC0 - 0xCF)
     processing_submit = 0xC0, // Submit a processing job

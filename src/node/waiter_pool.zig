@@ -27,7 +27,7 @@
 //! | `kv_get`      | KV put/delete on matching key | Value response (with version)     |
 //! | `stream_read` | Stream append on matching key | Messages from last offset         |
 //! | `queue_dequeue`| Queue enqueue on matching key| Dequeued message                  |
-//! | `worker_await`| Action invoked matching key   | Task payload                      |
+//! | `action_await`| Action invoked matching key   | Task payload                      |
 //!
 //! ## Wire Protocol Mapping
 //!
@@ -78,8 +78,8 @@ pub const WaiterKind = enum(u8) {
     /// Queue blocking dequeue — waits for a message to become available.
     queue_dequeue,
 
-    /// Worker await — blocks until an action task is dispatched.
-    worker_await,
+    /// Action await — blocks until an action task is dispatched.
+    action_await,
 };
 
 /// A single pending waiter registration.
@@ -216,7 +216,7 @@ pub const WaiterPool = struct {
     }
 
     /// Wake ALL waiters of a given kind (no key filter).
-    /// Used for worker_await where any pending task should wake the first waiter.
+    /// Used for action_await where any pending task should wake the first waiter.
     pub fn notifyAny(self: *WaiterPool, kind: WaiterKind, resolver: ResolverFn, ctx: *anyopaque) void {
         var i: u16 = 0;
         while (i < self.count) {

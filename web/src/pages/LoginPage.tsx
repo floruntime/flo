@@ -1,11 +1,26 @@
-import { useState, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { Zap, AlertCircle, Eye, EyeOff } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/AuthContext";
 
 export function LoginPage() {
-  const { login, loggingIn, loginError } = useAuth();
+  const { login, loggingIn, loginError, isAuthenticated, authRequired, authChecked } = useAuth();
+  const navigate = useNavigate();
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
+
+  // Redirect away from login if auth isn't required or already authenticated
+  useEffect(() => {
+    if (authChecked && (!authRequired || isAuthenticated)) {
+      navigate("/", { replace: true });
+    }
+  }, [authChecked, authRequired, isAuthenticated, navigate]);
+
+  // Apply saved theme so login page matches the user's preference
+  useEffect(() => {
+    const saved = localStorage.getItem("theme") as "dark" | "light" | null;
+    document.documentElement.dataset.theme = saved || "dark";
+  }, []);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -64,7 +79,7 @@ export function LoginPage() {
           <button
             type="submit"
             disabled={loggingIn || !apiKey.trim()}
-            className="w-full py-2.5 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
+            className="w-full py-2.5 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2"
           >
             {loggingIn ? (
               <>

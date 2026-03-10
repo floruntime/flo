@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Cpu, Zap, Play, ChevronRight, Users, Clock, RotateCcw, AlertTriangle, CheckCircle2, XCircle, Timer, Ban } from "lucide-react";
+import { Cpu, Zap, Play, ChevronRight, Users, Clock, RotateCcw, AlertTriangle, CheckCircle2, XCircle, Timer, Ban, HardDrive } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api, type ActionInfo } from "../lib/api";
 import { useApi, LoadingState, ErrorState, EmptyState } from "../lib/useApi";
@@ -103,11 +103,27 @@ function ActionCard({ action, onInvoke }: { action: ActionInfo; onInvoke: (name:
                         </p>
                     </div>
                     <div>
-                        <p className="text-xs text-text-secondary">Workers</p>
-                        <p className="text-lg font-bold flex items-center gap-1">
-                            <Users className="w-3.5 h-3.5 text-text-secondary" />
-                            {action.worker_count}
-                        </p>
+                        {action.type === 'wasm' ? (
+                            <>
+                                <p className="text-xs text-text-secondary">Module</p>
+                                <p className="text-lg font-bold flex items-center gap-1">
+                                    <HardDrive className="w-3.5 h-3.5 text-purple-400" />
+                                    {action.wasm_module_size != null
+                                        ? action.wasm_module_size > 1024
+                                            ? `${(action.wasm_module_size / 1024).toFixed(0)}KB`
+                                            : `${action.wasm_module_size}B`
+                                        : "—"}
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <p className="text-xs text-text-secondary">Workers</p>
+                                <p className="text-lg font-bold flex items-center gap-1">
+                                    <Users className="w-3.5 h-3.5 text-text-secondary" />
+                                    {action.worker_count}
+                                </p>
+                            </>
+                        )}
                     </div>
                     <div>
                         <p className="text-xs text-text-secondary">Timeout</p>

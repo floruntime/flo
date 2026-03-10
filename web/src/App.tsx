@@ -8,6 +8,7 @@ import { StreamsList } from "./pages/StreamsList";
 import { ActionsList } from "./pages/ActionsList";
 import { ActionDetailPage } from "./pages/ActionDetail";
 import { WorkersListPage } from "./pages/WorkersList";
+import { WorkerDetailPage } from "./pages/WorkerDetail";
 import { StreamDetail } from "./pages/StreamDetail.tsx";
 import { KeyDetail } from "./pages/KeyDetail";
 import { QueuesList } from "./pages/QueuesList";
@@ -23,7 +24,9 @@ import { TimeSeriesDetail } from "./pages/TimeSeriesDetail";
 import type { ReactNode } from "react";
 
 function RequireAuth({ children }: { children: ReactNode }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, authRequired, authChecked } = useAuth();
+  if (!authChecked) return null; // Wait for auth status check
+  if (!authRequired) return <>{children}</>; // Server has no auth configured
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
@@ -51,6 +54,7 @@ function App() {
           <Route path="/actions" element={<ActionsList />} />
           <Route path="/actions/:actionName" element={<ActionDetailPage />} />
           <Route path="/workers" element={<WorkersListPage />} />
+          <Route path="/workers/:workerId" element={<WorkerDetailPage />} />
           <Route path="/processing" element={<ProcessingList />} />
           <Route path="/processing/:jobId" element={<ProcessingDetail />} />
 

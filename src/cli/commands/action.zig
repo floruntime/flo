@@ -207,10 +207,33 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerList)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("drain")
+                .about("Drain a worker (stop new task assignments)")
+                .examples(&.{
+                    "flo worker drain worker-1",
+                    "flo worker drain worker-1 -n my-namespace",
+                })
+                .arg("worker_id", "Worker identifier to drain")
+                .stringFlag("namespace", 'n', "default", "Namespace to use")
+                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
+                .action(wrapHandler(runWorkerDrain)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("info")
+                .about("Show worker details")
+                .examples(&.{
+                    "flo worker info worker-1",
+                })
+                .arg("worker_id", "Worker identifier")
+                .stringFlag("namespace", 'n', "default", "Namespace to use")
+                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
+                .action(wrapHandler(runWorkerInfo)),
+        )
         .build();
 }
-
-
 
 fn runRegister(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
@@ -810,7 +833,6 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runWorkerList(ctx: *commander.Context) commander.Error!void {
-    const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -822,89 +844,220 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    // Collect all worker IDs across shards using cursor-based shard walking
-    var all_workers: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (all_workers.items) |w| {
-            ctx.allocator.free(w);
-        }
-        all_workers.deinit(ctx.allocator);
+    var result = client_mod.action.workerList(&client, namespace, 100, null) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return;
     }
 
-    var cursor: ?[]const u8 = null;
-    var cursor_owned: ?[]u8 = null;
-    defer if (cursor_owned) |c| ctx.allocator.free(c);
-
-    // Walk all shards until no more data
-    while (all_workers.items.len < limit) {
-        var result = client_mod.action.workerList(&client, namespace, @intCast(limit), cursor) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return;
-        };
-        defer result.deinit();
-
-        if (result.isError()) {
-            ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-            return;
-        }
-
-        // worker_list returns scan format:
-        // [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16][cursor]?
-        const data = result.asRawData() orelse break;
-        if (data.len < 4) break;
-
-        var reader = WireReader.init(data);
-        const count = reader.readU32() orelse break;
-
-        // Parse entries
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            const key_len = reader.readU16() orelse break;
-            const key = reader.readSlice(key_len) orelse break;
-            // Skip value (keys_only but value field still present)
-            const val_len = reader.readU32() orelse break;
-            _ = reader.readSlice(val_len);
-
-            // Extract worker ID from key (format: _worker:{worker_id})
-            const worker_id = if (std.mem.startsWith(u8, key, "_worker:"))
-                key["_worker:".len..]
-            else
-                key;
-
-            const id_copy = ctx.allocator.dupe(u8, worker_id) catch break;
-            all_workers.append(ctx.allocator, id_copy) catch {
-                ctx.allocator.free(id_copy);
-                break;
-            };
-
-            if (all_workers.items.len >= limit) break;
-        }
-
-        // Read has_more flag
-        const has_more = (reader.readU8() orelse 0) != 0;
-
-        // Read next cursor
-        const cursor_len = reader.readU16() orelse 0;
-        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
-
-        // Free previous cursor and copy new one
-        if (cursor_owned) |c| ctx.allocator.free(c);
-        cursor_owned = null;
-
-        if (!has_more or next_cursor == null) break;
-
-        // Copy cursor for next iteration
-        cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
-        cursor = cursor_owned;
-    }
-
-    // Output results
-    if (all_workers.items.len == 0) {
+    // Wire format: [count:u32](worker_record)*[has_more:u8][cursor_len:u16]
+    const data = result.asRawData() orelse {
         ctx.print("(no workers)\n", .{});
-    } else {
-        for (all_workers.items) |w| {
-            ctx.print("{s}\n", .{w});
+        return;
+    };
+    if (data.len < 4) {
+        ctx.print("(no workers)\n", .{});
+        return;
+    }
+
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse {
+        ctx.print("(no workers)\n", .{});
+        return;
+    };
+
+    if (count == 0) {
+        ctx.print("(no workers)\n", .{});
+        return;
+    }
+
+    // Table header
+    ctx.print("{s:<24} {s:<10} {s:<8} {s:<20} {s:<6} {s:<10} {s:<10}\n", .{
+        "WORKER ID", "STATUS", "TYPE", "MACHINE", "LOAD", "COMPLETED", "FAILED",
+    });
+    ctx.print("{s}\n", .{"-" ** 90});
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        // Parse worker_record: [id_len:u16][id][type:u8][status:u8]...
+        const id_len = reader.readU16() orelse break;
+        const id = reader.readSlice(id_len) orelse break;
+        const wtype = reader.readU8() orelse break;
+        const wstatus = reader.readU8() orelse break;
+        const tasks_completed = reader.readU64() orelse break;
+        const tasks_failed = reader.readU64() orelse break;
+        const current_load = reader.readU32() orelse break;
+        _ = reader.readU32(); // max_concurrency
+        _ = reader.readI64(); // registered_at
+        _ = reader.readI64(); // last_heartbeat
+
+        // Skip processes
+        const proc_count = reader.readU16() orelse break;
+        var pi: u16 = 0;
+        while (pi < proc_count) : (pi += 1) {
+            const nlen = reader.readU16() orelse break;
+            _ = reader.readSlice(nlen); // name
+            _ = reader.readU8(); // kind
+            _ = reader.readU64(); // run_count
+            _ = reader.readU64(); // fail_count
+            _ = reader.readI64(); // last_run_at
         }
+
+        // Skip metadata
+        const has_meta = reader.readU8() orelse break;
+        if (has_meta == 1) {
+            const mlen = reader.readU16() orelse break;
+            _ = reader.readSlice(mlen);
+        }
+
+        // Skip machine_id but capture it
+        var machine: []const u8 = "—";
+        const has_mid = reader.readU8() orelse break;
+        if (has_mid == 1) {
+            const midlen = reader.readU16() orelse break;
+            machine = reader.readSlice(midlen) orelse "—";
+        }
+
+        const type_str: []const u8 = if (wtype == 0) "action" else "stream";
+        const status_str: []const u8 = switch (wstatus) {
+            0 => "active",
+            1 => "idle",
+            2 => "draining",
+            3 => "unhealthy",
+            else => "unknown",
+        };
+
+        ctx.print("{s:<24} {s:<10} {s:<8} {s:<20} {d:<6} {d:<10} {d:<10}\n", .{
+            id, status_str, type_str, machine, current_load, tasks_completed, tasks_failed,
+        });
+    }
+}
+
+fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
+    const worker_id = ctx.getPositional("worker_id").?; // validated by commander
+    const namespace = ctx.getString("namespace") orelse "default";
+    const endpoint = cli_config.getEndpoint(ctx);
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return;
+    };
+
+    var result = client_mod.action.workerDrain(&client, namespace, worker_id) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return;
+    }
+
+    ctx.print("Draining worker: {s}\n", .{worker_id});
+}
+
+fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
+    const worker_id = ctx.getPositional("worker_id").?;
+    const namespace = ctx.getString("namespace") orelse "default";
+    const endpoint = cli_config.getEndpoint(ctx);
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return;
+    };
+
+    var result = client_mod.action.workerInfo(&client, namespace, worker_id) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return;
+    }
+
+    const data = result.asRawData() orelse {
+        ctx.printErr("No data returned\n", .{});
+        return;
+    };
+
+    // Parse worker_record wire format
+    var reader = WireReader.init(data);
+    const id_len = reader.readU16() orelse return;
+    const id = reader.readSlice(id_len) orelse return;
+    const wtype = reader.readU8() orelse return;
+    const wstatus = reader.readU8() orelse return;
+    const tasks_completed = reader.readU64() orelse return;
+    const tasks_failed = reader.readU64() orelse return;
+    const current_load = reader.readU32() orelse return;
+    const max_concurrency = reader.readU32() orelse return;
+    const registered_at = reader.readI64() orelse return;
+    const last_heartbeat = reader.readI64() orelse return;
+
+    const type_str: []const u8 = if (wtype == 0) "action" else "stream";
+    const status_str: []const u8 = switch (wstatus) {
+        0 => "active",
+        1 => "idle",
+        2 => "draining",
+        3 => "unhealthy",
+        else => "unknown",
+    };
+
+    ctx.print("Worker ID:       {s}\n", .{id});
+    ctx.print("Status:          {s}\n", .{status_str});
+    ctx.print("Type:            {s}\n", .{type_str});
+    ctx.print("Current Load:    {d} / {d}\n", .{ current_load, max_concurrency });
+    ctx.print("Tasks Completed: {d}\n", .{tasks_completed});
+    ctx.print("Tasks Failed:    {d}\n", .{tasks_failed});
+    ctx.print("Registered:      {d}\n", .{registered_at});
+    ctx.print("Last Heartbeat:  {d}\n", .{last_heartbeat});
+
+    // Processes
+    const proc_count = reader.readU16() orelse return;
+    if (proc_count > 0) {
+        ctx.print("\nProcesses ({d}):\n", .{proc_count});
+        var pi: u16 = 0;
+        while (pi < proc_count) : (pi += 1) {
+            const nlen = reader.readU16() orelse break;
+            const name = reader.readSlice(nlen) orelse break;
+            const kind = reader.readU8() orelse break;
+            const run_count = reader.readU64() orelse break;
+            const fail_count = reader.readU64() orelse break;
+            const last_run = reader.readI64() orelse break;
+            const kind_str: []const u8 = if (kind == 0) "action" else "stream_consumer";
+            ctx.print("  {s} ({s}) — runs: {d}, fails: {d}, last_run: {d}\n", .{
+                name, kind_str, run_count, fail_count, last_run,
+            });
+        }
+    }
+
+    // Metadata
+    const has_meta = reader.readU8() orelse return;
+    if (has_meta == 1) {
+        const mlen = reader.readU16() orelse return;
+        const meta = reader.readSlice(mlen) orelse return;
+        ctx.print("Metadata:        {s}\n", .{meta});
+    }
+
+    // Machine ID
+    const has_mid = reader.readU8() orelse return;
+    if (has_mid == 1) {
+        const midlen = reader.readU16() orelse return;
+        const mid = reader.readSlice(midlen) orelse return;
+        ctx.print("Machine ID:      {s}\n", .{mid});
     }
 }
 
