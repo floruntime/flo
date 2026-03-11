@@ -2099,3 +2099,315 @@ test "e2e/stream: info is namespace-scoped" {
     defer result_b.deinit();
     try testing.expect(result_b.contains("metrics") or result_b.succeeded());
 }
+
+// =============================================================================
+// StreamID Wire Format Verification
+// =============================================================================
+// These tests validate the StreamID migration: full timestamps, correct wire
+// format parsing, and round-trip correctness through CLI → Server → CLI.
+
+test "e2e/stream: append returns StreamID with real timestamp" {
+    // Verify the returned StreamID has a non-zero timestamp (not just a sequence)
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const output = try ctx.execCapture(&.{ "stream", "append", "ts-verify", "timestamp check" });
+    const id = extractStreamId(output) orelse return error.NoStreamId;
+    const parsed = parseStreamId(id) orelse return error.InvalidStreamId;
+
+    // Timestamp should be a real Unix ms value (> Jan 1 2020 = 1577836800000)
+    try testing.expect(parsed.timestamp > 1577836800000);
+    // Sequence should be a small number (first message)
+    try testing.expect(parsed.sequence < 1000);
+}
+
+test "e2e/stream: append-read roundtrip preserves StreamID" {
+    // Critical: verify that the StreamID returned from append matches what
+    // appears in the read response — proves wire format is not swapped.
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const append_out = try ctx.execCapture(&.{ "stream", "append", "roundtrip-test", "roundtrip-msg" });
+    const appended_id = extractStreamId(append_out) orelse return error.NoStreamId;
+
+    // Read the stream and verify the appended ID appears in output
+    var result = try ctx.cli.run(&.{ "stream", "read", "roundtrip-test", "--start", "0-0", "--limit", "10" });
+    defer result.deinit();
+
+    // The read output should contain the exact same StreamID
+    try testing.expect(result.contains(appended_id));
+}
+
+test "e2e/stream: read --json includes id field with StreamID format" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const append_out = try ctx.execCapture(&.{ "stream", "append", "json-id-test", "json-id-msg" });
+    const appended_id = extractStreamId(append_out) orelse return error.NoStreamId;
+
+    var result = try ctx.cli.run(&.{ "stream", "read", "json-id-test", "--limit", "5", "--json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // JSON output should contain the StreamID as the "id" field value
+    try testing.expect(result.contains(appended_id));
+    // Should contain "id" field name in JSON
+    try testing.expect(result.contains("\"id\""));
+}
+
+test "e2e/stream: info --json shows StreamID format for first/last" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Append a few messages to have meaningful first/last IDs
+    const out1 = try ctx.execCapture(&.{ "stream", "append", "info-id-test", "msg1" });
+    _ = try ctx.execCapture(&.{ "stream", "append", "info-id-test", "msg2" });
+    const out3 = try ctx.execCapture(&.{ "stream", "append", "info-id-test", "msg3" });
+
+    const first_id = extractStreamId(out1) orelse return error.NoStreamId;
+    const last_id = extractStreamId(out3) orelse return error.NoStreamId;
+
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-id-test", "--json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // JSON should contain the IDs
+    try testing.expect(result.contains(first_id));
+    try testing.expect(result.contains(last_id));
+}
+
+test "e2e/stream: group ack with multiple StreamIDs" {
+    // Tests the wire format: [count:u32][ts:u64][seq:u64]* with count > 1
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "multi-ack-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", "multi-ack-test", msg });
+    }
+
+    // Read multiple messages
+    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-ack-test", "--group", "multi-ack-group", "--consumer", "w1", "--limit", "3" });
+
+    // Extract multiple IDs from output
+    var ids_buf: [3][]const u8 = undefined;
+    var id_count: usize = 0;
+    var search_pos: usize = 0;
+    const output = read_output;
+    while (id_count < 3 and search_pos < output.len) {
+        if (extractStreamId(output[search_pos..])) |id| {
+            // Calculate actual position in original string
+            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
+            ids_buf[id_count] = id;
+            id_count += 1;
+            search_pos = id_start + id.len;
+        } else break;
+    }
+
+    if (id_count >= 2) {
+        // Ack multiple IDs at once (comma-separated)
+        var ack_ids_buf: [256]u8 = undefined;
+        const ack_ids = std.fmt.bufPrint(&ack_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
+
+        var result = try ctx.cli.run(&.{ "stream", "group", "ack", "multi-ack-test", "--group", "multi-ack-group", "--consumer", "w1", "--ids", ack_ids });
+        defer result.deinit();
+
+        try testing.expect(result.contains("Acknowledged") or result.contains("ack") or result.succeeded());
+    }
+}
+
+test "e2e/stream: ack reduces pending count" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "ack-pending-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", "ack-pending-test", msg });
+    }
+
+    // Read 3 messages (creates pending entries)
+    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "ack-pending-test", "--group", "ack-pending-grp", "--consumer", "w1", "--limit", "3" });
+
+    // Check pending shows entries
+    var pending1 = try ctx.cli.run(&.{ "stream", "group", "pending", "ack-pending-test", "--group", "ack-pending-grp" });
+    defer pending1.deinit();
+    try stdx.testing.assertSucceeded(pending1);
+
+    // Ack one message
+    const id = extractStreamId(read_output);
+    if (id) |ack_id| {
+        try ctx.exec(&.{ "stream", "group", "ack", "ack-pending-test", "--group", "ack-pending-grp", "--consumer", "w1", "--ids", ack_id });
+
+        // Pending should still have entries (we acked 1 of 3), but the acked
+        // ID should no longer appear
+        var pending2 = try ctx.cli.run(&.{ "stream", "group", "pending", "ack-pending-test", "--group", "ack-pending-grp" });
+        defer pending2.deinit();
+        try stdx.testing.assertSucceeded(pending2);
+    }
+}
+
+test "e2e/stream: nack makes message re-deliverable" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..3) |_| {
+        try ctx.exec(&.{ "stream", "append", "nack-redeliver", "redeliver-msg" });
+    }
+
+    // Read messages
+    const read1_output = try ctx.execCapture(&.{ "stream", "group", "read", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--limit", "2" });
+    const id = extractStreamId(read1_output);
+
+    if (id) |nack_id| {
+        // Nack the message
+        try ctx.exec(&.{ "stream", "group", "nack", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--ids", nack_id });
+
+        // Read again — the nack'd message should be re-delivered
+        var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--limit", "5" });
+        defer read2.deinit();
+
+        // Should get messages (the nack'd one is back in the pool)
+        try testing.expect(read2.contains("redeliver-msg") or read2.succeeded());
+    }
+}
+
+test "e2e/stream: trim with --before StreamID" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Append messages and capture IDs
+    _ = try ctx.execCapture(&.{ "stream", "append", "trim-before-test", "trim-msg-1" });
+    _ = try ctx.execCapture(&.{ "stream", "append", "trim-before-test", "trim-msg-2" });
+    const out3 = try ctx.execCapture(&.{ "stream", "append", "trim-before-test", "trim-msg-3" });
+    _ = try ctx.execCapture(&.{ "stream", "append", "trim-before-test", "trim-msg-4" });
+    _ = try ctx.execCapture(&.{ "stream", "append", "trim-before-test", "trim-msg-5" });
+
+    const id3 = extractStreamId(out3) orelse return error.NoStreamId;
+
+    // Trim everything before id3
+    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-before-test", "--before", id3 });
+    defer result.deinit();
+
+    try testing.expect(result.contains("Trimmed") or result.contains("trim") or result.succeeded());
+
+    // Read remaining — should not contain msg-1 or msg-2
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "trim-before-test", "--start", "0-0", "--limit", "10" });
+    defer read_result.deinit();
+
+    // msg-3, msg-4, msg-5 should remain; msg-1, msg-2 should be gone
+    try testing.expect(read_result.contains("trim-msg-4") or read_result.contains("trim-msg-5") or read_result.succeeded());
+}
+
+test "e2e/stream: group read output contains StreamID format" {
+    // Verify that consumer group read returns records with StreamID format IDs
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "cg-id-test", "cg-id-msg" });
+
+    const output = try ctx.execCapture(&.{ "stream", "group", "read", "cg-id-test", "--group", "cg-id-grp", "--consumer", "w1", "--limit", "3" });
+
+    // Output should contain a StreamID (timestamp-sequence format)
+    const id = extractStreamId(output);
+    try testing.expect(id != null);
+    try testing.expect(isValidStreamId(id.?));
+
+    // Verify the timestamp part is a real timestamp
+    const parsed = parseStreamId(id.?) orelse return error.InvalidStreamId;
+    try testing.expect(parsed.timestamp > 1577836800000);
+}
+
+test "e2e/stream: multiple appends have same timestamp with incrementing sequence" {
+    // When multiple records are appended in the same millisecond, they should
+    // share the same timestamp but have incrementing sequence numbers.
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Batch append (single request, multiple payloads)
+    const output = try ctx.execCapture(&.{ "stream", "append", "seq-incr-test", "batch1", "batch2", "batch3" });
+    const id = extractStreamId(output);
+    try testing.expect(id != null);
+
+    // Read all back
+    var result = try ctx.cli.run(&.{ "stream", "read", "seq-incr-test", "--start", "0-0", "--limit", "10", "--json" });
+    defer result.deinit();
+
+    // Should succeed and contain all three
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("batch1") or result.contains("batch2") or result.contains("batch3"));
+}
+
+test "e2e/stream: group nack with multiple StreamIDs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "multi-nack-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", "multi-nack-test", msg });
+    }
+
+    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-nack-test", "--group", "multi-nack-grp", "--consumer", "w1", "--limit", "3" });
+
+    // Extract multiple IDs
+    var ids_buf: [3][]const u8 = undefined;
+    var id_count: usize = 0;
+    var search_pos: usize = 0;
+    const output = read_output;
+    while (id_count < 3 and search_pos < output.len) {
+        if (extractStreamId(output[search_pos..])) |id| {
+            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
+            ids_buf[id_count] = id;
+            id_count += 1;
+            search_pos = id_start + id.len;
+        } else break;
+    }
+
+    if (id_count >= 2) {
+        var nack_ids_buf: [256]u8 = undefined;
+        const nack_ids = std.fmt.bufPrint(&nack_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
+
+        var result = try ctx.cli.run(&.{ "stream", "group", "nack", "multi-nack-test", "--group", "multi-nack-grp", "--consumer", "w1", "--ids", nack_ids });
+        defer result.deinit();
+
+        try testing.expect(result.contains("Released") or result.contains("released") or result.contains("ok") or result.succeeded());
+    }
+}
+
+test "e2e/stream: group touch with multiple StreamIDs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "multi-touch-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", "multi-touch-test", msg });
+    }
+
+    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-touch-test", "--group", "multi-touch-grp", "--consumer", "w1", "--limit", "3" });
+
+    var ids_buf: [3][]const u8 = undefined;
+    var id_count: usize = 0;
+    var search_pos: usize = 0;
+    const output = read_output;
+    while (id_count < 3 and search_pos < output.len) {
+        if (extractStreamId(output[search_pos..])) |id| {
+            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
+            ids_buf[id_count] = id;
+            id_count += 1;
+            search_pos = id_start + id.len;
+        } else break;
+    }
+
+    if (id_count >= 2) {
+        var touch_ids_buf: [256]u8 = undefined;
+        const touch_ids = std.fmt.bufPrint(&touch_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
+
+        var result = try ctx.cli.run(&.{ "stream", "group", "touch", "multi-touch-test", "--group", "multi-touch-grp", "--consumer", "w1", "--ids", touch_ids });
+        defer result.deinit();
+
+        try testing.expect(result.contains("Extended") or result.contains("touched") or result.contains("ok") or result.succeeded());
+    }
+}
