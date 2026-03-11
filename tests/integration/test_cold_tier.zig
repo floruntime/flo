@@ -196,7 +196,7 @@ test "integration: cold tier — UAL segment archival round-trip" {
 
     // Verify cold files actually exist on the FileBackend's disk
     {
-        const cold_fs_dir = try std.fmt.allocPrint(allocator, "{s}/ual/shard-0/partition-1", .{cold_dir});
+        const cold_fs_dir = try std.fmt.allocPrint(allocator, "{s}/ual/00000", .{cold_dir});
         defer allocator.free(cold_fs_dir);
 
         var cold_file_count: usize = 0;
