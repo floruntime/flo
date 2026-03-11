@@ -24,4 +24,5 @@ test {
     _ = @import("test_router.zig");
     _ = @import("test_reactor.zig");
     _ = @import("test_cold_tier.zig");
+    _ = @import("test_raft_failover.zig");
 }

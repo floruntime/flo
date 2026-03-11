@@ -1,4 +1,7 @@
 // Cluster — Controller Raft, Partition Table, Forwarding, Gossip, Membership
-// See: NODE_NETWORK_DESIGN.md §12
-//
-// This module will export cluster-layer components once implemented.
+
+pub const coordinator = @import("coordinator.zig");
+pub const partition_table = @import("partition_table.zig");
+pub const forwarder = @import("forwarder.zig");
+pub const gossip = @import("gossip.zig");
+pub const membership = @import("membership.zig");

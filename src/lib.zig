@@ -29,7 +29,7 @@ pub const storage = @import("storage/mod.zig");
 // =============================================================================
 // Raft Consensus (NEW)
 // =============================================================================
-// pub const raft = @import("raft/mod.zig"); // TODO: Phase 3
+pub const raft = @import("raft/mod.zig");
 
 // =============================================================================
 // Projection Engines: KV, Queue, Stream, TimeSeries (NEW)
@@ -39,7 +39,7 @@ pub const projection = @import("projection/mod.zig");
 // =============================================================================
 // Cluster: Controller Raft, Partition Table, Gossip (NEW)
 // =============================================================================
-// pub const cluster = @import("cluster/mod.zig"); // TODO: Phase 7
+pub const cluster = @import("cluster/mod.zig");
 
 // =============================================================================
 // Configuration (ADAPT)

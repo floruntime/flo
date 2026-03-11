@@ -176,7 +176,6 @@ test "integration: cold tier — UAL segment archival round-trip" {
 
     var manager = ColdTierManager.init(allocator, cb, .{
         .shard_id = 0,
-        .partition_id = 1,
         .key_prefix = "ual/",
         .verify_checksums = true,
     });
@@ -275,7 +274,6 @@ test "integration: cold tier — on-demand stream read from cold" {
 
     var manager = ColdTierManager.init(allocator, cb, .{
         .shard_id = 0,
-        .partition_id = 0,
         .verify_checksums = true,
     });
     defer manager.deinit();
@@ -385,7 +383,6 @@ test "integration: cold tier — KV MVCC version lookup from cold" {
 
     var manager = ColdTierManager.init(allocator, cb, .{
         .shard_id = 0,
-        .partition_id = 0,
         .verify_checksums = true,
     });
     defer manager.deinit();
@@ -456,7 +453,6 @@ test "integration: cold tier — normal recovery does NOT touch cold" {
     {
         var mgr = ColdTierManager.init(allocator, cb, .{
             .shard_id = 0,
-            .partition_id = 0,
         });
         defer mgr.deinit();
 
@@ -477,7 +473,6 @@ test "integration: cold tier — normal recovery does NOT touch cold" {
     {
         var mgr = ColdTierManager.init(allocator, cb, .{
             .shard_id = 0,
-            .partition_id = 0,
         });
         defer mgr.deinit();
 
@@ -572,7 +567,6 @@ test "integration: cold tier — manifest persists across restarts" {
     {
         var mgr = ColdTierManager.init(allocator, cb, .{
             .shard_id = 2,
-            .partition_id = 7,
         });
         defer mgr.deinit();
 
@@ -598,7 +592,6 @@ test "integration: cold tier — manifest persists across restarts" {
     {
         var mgr = ColdTierManager.init(allocator, cb, .{
             .shard_id = 2,
-            .partition_id = 7,
         });
         defer mgr.deinit();
 
