@@ -13,7 +13,7 @@ interface InfiniteTapeProps {
 
 interface TooltipData {
     name: string;
-    seq: number;
+    id: string;
     lag: number;
     x: number;
     y: number;
@@ -71,9 +71,12 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
     useEffect(() => {
         const timer = setTimeout(() => {
             if (groups && groups.length > 0) {
-                const groupSeqs = groups.map(g => g.current_seq).sort((a, b) => a - b);
+                const groupSeqs = groups.map(g => {
+                    const parts = g.current_id.split('-');
+                    return parseInt(parts[1] || '0', 10);
+                }).sort((a, b) => a - b);
                 const medianSeq = groupSeqs[Math.floor(groupSeqs.length / 2)];
-                const targetIndex = messages.findIndex(m => m.seq >= medianSeq);
+                const targetIndex = messages.findIndex(m => m.id_seq >= medianSeq);
 
                 if (targetIndex !== -1) {
                     virtuosoRef.current?.scrollToIndex({ index: targetIndex, align: "center" });
@@ -146,7 +149,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
     const jumpToGroup = (groupName: string) => {
         const group = groups.find(g => g.name === groupName);
         if (group) {
-            const msgIndex = messages.findIndex(m => m.seq === group.current_seq);
+            const msgIndex = messages.findIndex(m => m.id === group.current_id);
             if (msgIndex !== -1) {
                 virtuosoRef.current?.scrollToIndex({ index: msgIndex, align: "center", behavior: "smooth" });
             }
@@ -167,10 +170,12 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
     const focusedGroup = groups ? groups.find(g => g.name === focusedGroupName) : null;
 
     // Calculate seeker positions
-    const getSeekerPosition = (seq: number) => {
+    const getSeekerPosition = (id: string) => {
         if (messages.length === 0) return 0;
-        const minSeq = messages[0].seq;
-        const maxSeq = messages[messages.length - 1].seq;
+        const minSeq = messages[0].id_seq;
+        const maxSeq = messages[messages.length - 1].id_seq;
+        const parts = id.split('-');
+        const seq = parseInt(parts[1] || '0', 10);
         if (maxSeq === minSeq) return 50;
         return ((seq - minSeq) / (maxSeq - minSeq)) * 100;
     };
@@ -281,12 +286,12 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                     rangeChanged={(range) => setCurrentRange({ start: range.startIndex, end: range.endIndex })}
                     itemContent={(index) => {
                         const msg = messages[index];
-                        const activeGroups = groups.filter(g => g.current_seq === msg.seq);
+                        const activeGroups = groups.filter(g => g.current_id === msg.id);
 
                         const width = Math.max(50, Math.min(150, msg.size / 4));
 
                         const waveformBars = Array.from({ length: 8 }, (_, i) => {
-                            const seed = (msg.seq * 7 + i * 13) % 100;
+                            const seed = (msg.id_seq * 7 + i * 13) % 100;
                             return Math.max(20, seed % 80);
                         });
 
@@ -308,7 +313,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                                     onClick={() => setSelectedMessage(msg)}
                                 >
                                     <span className="text-[9px] text-text-secondary font-mono font-bold opacity-60 z-10">
-                                        {msg.seq}
+                                        {msg.id_seq}
                                     </span>
 
                                     <div className="flex-1 w-full flex items-end justify-around gap-[1px] px-1 opacity-30">
@@ -400,7 +405,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                     <div className="absolute inset-0 bg-gradient-to-r from-surface-border/50 to-surface-border/20" />
                     {/* Consumer group positions as interactive indicators */}
                     {groups && groups.length > 0 && groups.map(g => {
-                        const pos = getSeekerPosition(g.current_seq);
+                        const pos = getSeekerPosition(g.current_id);
                         return (
                             <div
                                 key={g.name}
@@ -419,7 +424,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                                     const rect = e.currentTarget.getBoundingClientRect();
                                     setHoveredTooltip({
                                         name: g.name,
-                                        seq: g.current_seq,
+                                        id: g.current_id,
                                         lag: g.lag,
                                         x: rect.left + rect.width / 2,
                                         y: rect.top
@@ -463,7 +468,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                             e.stopPropagation();
                             setIsDragging('start');
                         }}
-                        title={`Start: ${new Date(messages[seekerRange.start]?.timestamp || Date.now()).toLocaleString('en-GB', {
+                        title={`Start: ${new Date(messages[seekerRange.start]?.id_ms || Date.now()).toLocaleString('en-GB', {
                             hour: '2-digit',
                             minute: '2-digit',
                             second: '2-digit',
@@ -485,7 +490,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                             e.stopPropagation();
                             setIsDragging('end');
                         }}
-                        title={`End: ${new Date(messages[seekerRange.end]?.timestamp || Date.now()).toLocaleString('en-GB', {
+                        title={`End: ${new Date(messages[seekerRange.end]?.id_ms || Date.now()).toLocaleString('en-GB', {
                             hour: '2-digit',
                             minute: '2-digit',
                             second: '2-digit',
@@ -552,7 +557,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                 >
                     <div className="px-3 py-2 bg-background border border-surface-border rounded-lg shadow-2xl whitespace-nowrap">
                         <div className="text-xs font-bold text-text-primary mb-1">{hoveredTooltip.name}</div>
-                        <div className="text-[10px] text-text-secondary">Seq: {hoveredTooltip.seq}</div>
+                        <div className="text-[10px] text-text-secondary">ID: {hoveredTooltip.id}</div>
                         <div className="text-[10px] text-text-secondary">Lag: {hoveredTooltip.lag}</div>
                         <div className="text-[9px] text-text-secondary/70 mt-1 italic">Click to jump</div>
 
@@ -606,7 +611,7 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                                     <span className="text-xs font-medium text-text-primary truncate">{group.name}</span>
                                 </div>
                                 <div className="flex items-center gap-2 flex-shrink-0 ml-2">
-                                    <span className="text-[10px] text-text-secondary">Seq: {group.current_seq}</span>
+                                    <span className="text-[10px] text-text-secondary">ID: {group.current_id}</span>
                                     <span className="text-[10px] text-text-secondary">
                                         Lag: {group.lag}
                                     </span>

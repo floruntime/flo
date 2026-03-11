@@ -89,7 +89,7 @@ export function TriageWard({ pendingMessages: initialMessages, onReclaimNow, onT
                                     <td className="px-4 py-3">
                                         <div className="flex flex-col">
                                             <span className="text-xs font-mono text-text-primary">{msg.id}</span>
-                                            <span className="text-[10px] text-text-secondary">Seq: {msg.seq}</span>
+                                            <span className="text-[10px] text-text-secondary">ID: {msg.id}</span>
                                         </div>
                                     </td>
                                     <td className="px-4 py-3">

@@ -57,8 +57,8 @@ export const generateMockPartitions = (count: number): PartitionStat[] => {
 
 export interface StreamMessage {
     id: string;
-    seq: number;
-    timestamp: number;
+    id_ms: number;
+    id_seq: number;
     key: string;
     size: number; // bytes
     payload: string;
@@ -66,7 +66,7 @@ export interface StreamMessage {
 
 export interface ConsumerGroup {
     name: string;
-    current_seq: number;
+    current_id: string;
     lag: number;
     color: string;
 }
@@ -74,10 +74,11 @@ export interface ConsumerGroup {
 export const generateMockMessages = (count: number, startSeq: number = 10000): StreamMessage[] => {
     return Array.from({ length: count }).map((_, i) => {
         const seq = startSeq + i;
+        const ts = Date.now() - (count - i) * 1000;
         return {
-            id: `msg-${seq}`,
-            seq: seq,
-            timestamp: Date.now() - (count - i) * 1000, // 1 sec apart
+            id: `${ts}-${seq}`,
+            id_ms: ts,
+            id_seq: seq,
             key: `user:${Math.floor(Math.random() * 1000)}`,
             size: Math.floor(Math.random() * 500) + 50,
             payload: `{"event": "click", "x": ${Math.random()}, "y": ${Math.random()}}`
@@ -87,27 +88,27 @@ export const generateMockMessages = (count: number, startSeq: number = 10000): S
 
 export const MOCK_CONSUMER_GROUPS: ConsumerGroup[] = [
     // Critical lag (> 1000)
-    { name: "audit-log", current_seq: 12000, lag: 3000, color: "#EF4444" }, // Red
-    { name: "data-warehouse", current_seq: 11500, lag: 3500, color: "#DC2626" }, // Dark Red
-    { name: "backup-service", current_seq: 12800, lag: 2200, color: "#F87171" }, // Light Red
+    { name: "audit-log", current_id: "0-12000", lag: 3000, color: "#EF4444" }, // Red
+    { name: "data-warehouse", current_id: "0-11500", lag: 3500, color: "#DC2626" }, // Dark Red
+    { name: "backup-service", current_id: "0-12800", lag: 2200, color: "#F87171" }, // Light Red
 
     // Warning lag (100-1000)
-    { name: "analytics-batch", current_seq: 14200, lag: 800, color: "#F59E0B" }, // Yellow
-    { name: "reporting-engine", current_seq: 13900, lag: 1100, color: "#FBBF24" }, // Light Yellow
-    { name: "ml-pipeline", current_seq: 14100, lag: 900, color: "#F97316" }, // Orange
-    { name: "search-indexer", current_seq: 14500, lag: 500, color: "#FB923C" }, // Light Orange
+    { name: "analytics-batch", current_id: "0-14200", lag: 800, color: "#F59E0B" }, // Yellow
+    { name: "reporting-engine", current_id: "0-13900", lag: 1100, color: "#FBBF24" }, // Light Yellow
+    { name: "ml-pipeline", current_id: "0-14100", lag: 900, color: "#F97316" }, // Orange
+    { name: "search-indexer", current_id: "0-14500", lag: 500, color: "#FB923C" }, // Light Orange
 
     // Healthy lag (< 100)
-    { name: "payment-processor", current_seq: 14995, lag: 5, color: "#10B981" }, // Green
-    { name: "notification-sender", current_seq: 14990, lag: 10, color: "#34D399" }, // Light Green
-    { name: "fraud-detector", current_seq: 14980, lag: 20, color: "#059669" }, // Dark Green
-    { name: "cache-warmer", current_seq: 14970, lag: 30, color: "#6EE7B7" }, // Very Light Green
-    { name: "webhook-dispatcher", current_seq: 14960, lag: 40, color: "#14B8A6" }, // Teal
+    { name: "payment-processor", current_id: "0-14995", lag: 5, color: "#10B981" }, // Green
+    { name: "notification-sender", current_id: "0-14990", lag: 10, color: "#34D399" }, // Light Green
+    { name: "fraud-detector", current_id: "0-14980", lag: 20, color: "#059669" }, // Dark Green
+    { name: "cache-warmer", current_id: "0-14970", lag: 30, color: "#6EE7B7" }, // Very Light Green
+    { name: "webhook-dispatcher", current_id: "0-14960", lag: 40, color: "#14B8A6" }, // Teal
 ];
 
 export interface PendingMessage {
     id: string;
-    seq: number;
+    id_seq: number;
     key: string;
     consumer: string;
     groupName: string;
@@ -130,8 +131,8 @@ export const generateMockPendingMessages = (count: number = 15): PendingMessage[
         const reclaimIn = Math.max(1000, maxReclaimTime - idleTime + Math.random() * 5000);
 
         return {
-            id: `msg-${seq}`,
-            seq,
+            id: `0-${seq}`,
+            id_seq: seq,
             key: `${keys[Math.floor(Math.random() * keys.length)]}:${Math.floor(Math.random() * 10000)}`,
             consumer: consumers[Math.floor(Math.random() * consumers.length)],
             groupName: groups[Math.floor(Math.random() * groups.length)],

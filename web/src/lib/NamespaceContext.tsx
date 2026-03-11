@@ -10,6 +10,8 @@ interface NamespaceContextValue {
   setSelected: (name: string) => void;
   /** Whether namespaces are still loading */
   loading: boolean;
+  /** Create a new namespace and select it */
+  createNamespace: (name: string) => Promise<void>;
 }
 
 const NamespaceContext = createContext<NamespaceContextValue | null>(null);
@@ -27,6 +29,21 @@ export function NamespaceProvider({ children }: { children: ReactNode }) {
   const setSelected = (name: string) => {
     setSelectedRaw(name);
     localStorage.setItem(STORAGE_KEY, name);
+  };
+
+  const refetch = async () => {
+    try {
+      const ns = await api.getNamespaces();
+      setNamespaces(ns);
+    } catch {
+      // ignore
+    }
+  };
+
+  const createNamespace = async (name: string) => {
+    await api.createNamespace(name);
+    await refetch();
+    setSelected(name);
   };
 
   useEffect(() => {
@@ -58,7 +75,7 @@ export function NamespaceProvider({ children }: { children: ReactNode }) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <NamespaceContext.Provider value={{ namespaces, selected, setSelected, loading }}>
+    <NamespaceContext.Provider value={{ namespaces, selected, setSelected, loading, createNamespace }}>
       {children}
     </NamespaceContext.Provider>
   );

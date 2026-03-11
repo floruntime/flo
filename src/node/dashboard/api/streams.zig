@@ -105,18 +105,19 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, ctx: *Dash
     try obj.intField("total_count", total_appends);
     try obj.intField("total_bytes", total_bytes);
 
-    // Partitions — read HWM from shard 0's stream projection
+    // Partitions — read record count from shard 0's stream projection
     {
         var parts_arr = try obj.arrayField("partitions");
         try parts_arr.begin();
         if (getStreamProjection(ctx, 0)) |sp| {
-            const hwm = sp.highWaterMark();
-            if (hwm > 0 or sp.streamCount() > 0) {
+            const name_hash = std.hash.Wyhash.hash(0, stream_name);
+            const record_count = sp.streamRecordCount(name_hash);
+            if (record_count > 0 or sp.streamCount() > 0) {
                 try parts_arr.next();
                 var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                 try pobj.begin();
                 try pobj.intField("id", 0);
-                try pobj.intField("high_water_mark", hwm);
+                try pobj.intField("record_count", record_count);
                 try pobj.intField("stored_bytes", total_bytes);
                 try pobj.end();
             }
@@ -138,7 +139,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, ctx: *Dash
                     try gobj.begin();
                     try gobj.stringField("name", ge.key_ptr.*);
                     try gobj.intField("members", ge.value_ptr.members.count());
-                    try gobj.intField("committed_offset", ge.value_ptr.committed_offset);
+                    try gobj.intField("pending_count", ge.value_ptr.pelCount());
                     try gobj.end();
                 }
             }
@@ -151,11 +152,21 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, ctx: *Dash
 }
 
 /// GET /streams/:name/messages - Paginated messages
-/// Query params: ?offset=&limit=&partition=
+/// Query params: ?cursor=<ts>-<seq>&limit=&partition=
+/// cursor format: "<timestamp_ms>-<sequence>" — omit for start of stream
 pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = stream_name;
-    const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
     const limit = h.parseQueryParam(u32, query_string, "limit") orelse 2000;
+
+    // Parse cursor "ts-seq" into StreamID
+    const StreamID = @import("../../../projection/stream.zig").StreamID;
+    const cursor_str = h.parseQueryParam([]const u8, query_string, "cursor");
+    const start_id = if (cursor_str) |cs| blk: {
+        // Find the '-' separator
+        const sep_pos = std.mem.indexOfScalar(u8, cs, '-') orelse break :blk StreamID.MIN;
+        const ts = std.fmt.parseInt(u64, cs[0..sep_pos], 10) catch break :blk StreamID.MIN;
+        const seq = std.fmt.parseInt(u64, cs[sep_pos + 1 ..], 10) catch break :blk StreamID.MIN;
+        break :blk StreamID{ .timestamp_ms = ts, .sequence = seq };
+    } else StreamID.MIN;
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -166,35 +177,34 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
 
     var msg_count: u64 = 0;
     var total_count: u64 = 0;
+    var last_id: StreamID = StreamID.MIN;
 
     {
         var msgs_arr = try obj.arrayField("messages");
         try msgs_arr.begin();
 
-        // Read from shard 0's stream projection
+        // Read from shard 0's stream projection using StreamRecord
         if (getStreamProjection(ctx, 0)) |sp| {
-            const hwm = sp.highWaterMark();
-            total_count = hwm;
-            const from = if (offset == 0) @as(u64, 1) else offset;
+            const name_hash = std.hash.Wyhash.hash(0, stream_name);
+            total_count = sp.streamRecordCount(name_hash);
             const cap: usize = @min(@as(usize, @intCast(limit)), 1000);
-            const to = @min(from +| @as(u64, @intCast(cap)), hwm + 1);
 
-            if (from <= hwm) {
-                const OffsetEntry = @import("../../../projection/stream.zig").OffsetEntry;
-                const buf = allocator.alloc(OffsetEntry, cap) catch null;
-                defer if (buf) |b| allocator.free(b);
-                if (buf) |b| {
-                    const count = sp.readRange(from, to, b);
-                    for (b[0..count]) |oe| {
-                        try msgs_arr.next();
-                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try mobj.begin();
-                        try mobj.intField("offset", @as(i64, @intCast(oe.ual_index)));
-                        try mobj.intField("timestamp", @as(i64, @intCast(oe.timestamp_ns / std.time.ns_per_ms)));
-                        try mobj.intField("size", 0);
-                        try mobj.end();
-                        msg_count += 1;
-                    }
+            const StreamRecord = @import("../../../projection/stream.zig").StreamRecord;
+            const buf = allocator.alloc(StreamRecord, cap) catch null;
+            defer if (buf) |b| allocator.free(b);
+            if (buf) |b| {
+                const read_count = sp.readStreamAfter(name_hash, start_id, null, b);
+                for (b[0..read_count]) |rec| {
+                    try msgs_arr.next();
+                    var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                    try mobj.begin();
+                    try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
+                    try mobj.intField("id_seq", @as(i64, @intCast(rec.id.sequence)));
+                    try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
+                    try mobj.intField("size", 0);
+                    try mobj.end();
+                    last_id = rec.id;
+                    msg_count += 1;
                 }
             }
         }
@@ -202,7 +212,14 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
         try msgs_arr.end();
     }
 
-    try obj.intField("offset", @as(i64, @intCast(offset)));
+    // Next cursor — only present if we returned records
+    if (msg_count > 0) {
+        // Format as "ts-seq"
+        var cursor_buf: [64]u8 = undefined;
+        const cursor_slice = std.fmt.bufPrint(&cursor_buf, "{d}-{d}", .{ last_id.timestamp_ms, last_id.sequence }) catch "";
+        try obj.stringField("next_cursor", cursor_slice);
+    }
+
     try obj.intField("limit", @as(i64, @intCast(limit)));
     try obj.intField("count", msg_count);
     try obj.intField("total_count", total_count);
@@ -243,7 +260,6 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
                         var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                         try mobj.begin();
                         try mobj.stringField("id", me.value_ptr.id);
-                        try mobj.intField("committed_offset", me.value_ptr.committed_offset);
                         try mobj.stringField("state", if (me.value_ptr.state == .active) "active" else "leaving");
                         try mobj.end();
                     }
@@ -256,7 +272,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
                     try assignments_arr.end();
                 }
 
-                try obj.intField("pending_count", 0);
+                try obj.intField("pending_count", group.pelCount());
                 break;
             }
         }
@@ -300,7 +316,6 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
                     var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try mobj.begin();
                     try mobj.stringField("id", me.value_ptr.id);
-                    try mobj.intField("committed_offset", me.value_ptr.committed_offset);
                     try mobj.stringField("state", if (me.value_ptr.state == .active) "active" else "leaving");
                     try mobj.intField("joined_at", @as(i64, @intCast(me.value_ptr.joined_at_ns / std.time.ns_per_ms)));
                     try mobj.end();
@@ -317,20 +332,48 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
 /// GET /streams/:name/groups/:group/pending - Pending messages
 pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = stream_name;
-    _ = group_name;
-    _ = ctx;
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
-    // Pending tracking not yet implemented at projection level
+    const PendingEntry = @import("../../../projection/stream.zig").PendingEntry;
+
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     var pending_arr = try obj.arrayField("pending");
     try pending_arr.begin();
+
+    var pel_count: usize = 0;
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getStreamProjection(ctx, i)) |sp| {
+            if (sp.getGroup(group_name)) |group| {
+                pel_count = group.pelCount();
+                const cap: usize = @min(pel_count, 1000);
+                const buf = allocator.alloc(PendingEntry, cap) catch null;
+                defer if (buf) |b| allocator.free(b);
+                if (buf) |b| {
+                    const count = group.getPending(null, b);
+                    for (b[0..count]) |pe| {
+                        try pending_arr.next();
+                        var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                        try pobj.begin();
+                        try pobj.intField("id_ms", @as(i64, @intCast(pe.id.timestamp_ms)));
+                        try pobj.intField("id_seq", @as(i64, @intCast(pe.id.sequence)));
+                        try pobj.stringField("consumer", pe.consumer);
+                        try pobj.intField("delivered_at_ms", @as(i64, @intCast(pe.delivered_at_ms)));
+                        try pobj.intField("delivery_count", @as(i64, @intCast(pe.delivery_count)));
+                        try pobj.end();
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     try pending_arr.end();
-    try obj.intField("count", 0);
+    try obj.intField("count", pel_count);
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }

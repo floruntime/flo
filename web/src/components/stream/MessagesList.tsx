@@ -115,7 +115,7 @@ export function MessagesList({ messages, seekerRange }: MessagesListProps) {
                                 >
                                     <td className="w-48 px-4 py-3 text-xs text-text-secondary font-mono">
                                         <div>{msg.id}</div>
-                                        <div className="text-[10px] text-text-secondary/70 mt-1">{formatTime(msg.timestamp)}</div>
+                                        <div className="text-[10px] text-text-secondary/70 mt-1">{formatTime(msg.id_ms)}</div>
                                     </td>
                                     <td className="px-4 py-3 text-xs text-text-secondary">{msg.size}b</td>
                                     <td className="px-4 py-3 text-xs text-text-primary font-mono">

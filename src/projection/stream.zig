@@ -1,28 +1,30 @@
-//! Stream Projection — offset tracking + consumer groups.
+//! Stream Projection — per-stream record tracking + consumer groups with PEL.
 //!
-//! A stream is an append-only log of records. The StreamProjection tracks:
-//!   - High water mark (HWM): the latest appended offset
-//!   - Consumer groups: named groups of consumers with offset tracking
-//!
-//! Records themselves are NOT stored here — they live in the UAL.
-//! The projection only maintains offsets and consumer group state.
+//! Each stream has its own StreamID space (timestamp-sequence, like Redis).
+//! Consumer groups use a Pending Entry List (PEL) for per-message ack/nack/claim.
 //!
 //! Data flow:
-//!   stream_append → increment HWM, record UAL index for offset
-//!   commitOffset  → update consumer group's committed offset
-//!   stream_trim   → advance trim offset (records below are GC'd)
+//!   stream_append → per-stream ID gen → record StreamID → UAL index mapping
+//!   group_read    → deliver from last_delivered_id → add to PEL
+//!   group_ack     → remove from PEL by StreamID
+//!   group_nack    → mark for redelivery in PEL
+//!   group_claim   → transfer PEL entry to new consumer
+//!   stream_trim   → remove records with IDs below threshold
 //!
 //! Consumer group lifecycle:
-//!   create → join member → read (tracked per-member) → commit → leave → delete
+//!   create → join member → read (adds to PEL) → ack/nack → claim → leave → delete
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
+const stream_id_mod = @import("../stream/stream_id.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const CommandPayload = entry_mod.CommandPayload;
+pub const StreamID = stream_id_mod.StreamID;
+pub const StreamIdGenerator = stream_id_mod.StreamIdGenerator;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Consumer Group Member
@@ -36,12 +38,190 @@ pub const MemberState = enum(u8) {
 pub const Member = struct {
     /// Member identifier (e.g., consumer instance ID).
     id: []const u8,
-    /// This member's last committed offset.
-    committed_offset: u64,
     /// Timestamp when joined.
     joined_at_ns: u64,
     /// Current state.
     state: MemberState,
+    /// Number of PEL entries assigned to this consumer.
+    pending_count: u32 = 0,
+    /// Last time this consumer was active (ms since epoch).
+    last_active_ms: u64 = 0,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PEL (Pending Entry List) — tracks delivered-but-unacked messages
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const PendingEntry = struct {
+    /// The StreamID of this pending message.
+    id: StreamID,
+    /// Consumer currently owning this entry.
+    consumer: []const u8,
+    /// When first delivered (ms since epoch).
+    delivered_at_ms: u64,
+    /// Most recent delivery/claim time (ms since epoch).
+    last_delivery_ms: u64,
+    /// How many times delivered.
+    delivery_count: u32,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-Stream Record — maps StreamID → UAL index
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const StreamRecord = struct {
+    /// The StreamID assigned to this record.
+    id: StreamID,
+    /// UAL index where the record's data lives.
+    ual_index: u64,
+    /// User partition index (for multi-partition streams).
+    partition_index: u32,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-Stream State
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const StreamState = struct {
+    /// Per-stream ID generator for monotonic StreamIDs.
+    id_gen: StreamIdGenerator,
+    /// Records sorted by StreamID (append-only, trimmed from front).
+    records: std.ArrayList(StreamRecord),
+    /// First record ID (or MIN if empty).
+    first_id: StreamID,
+    /// Last record ID (or MIN if empty).
+    last_id: StreamID,
+    /// Trim threshold — records at or below this are considered trimmed.
+    trim_id: StreamID,
+    /// Stream name hash (for cross-referencing).
+    name_hash: u64,
+
+    pub fn init(name_hash: u64) StreamState {
+        return .{
+            .id_gen = StreamIdGenerator.init(),
+            .records = .empty,
+            .first_id = StreamID.MIN,
+            .last_id = StreamID.MIN,
+            .trim_id = StreamID.MIN,
+            .name_hash = name_hash,
+        };
+    }
+
+    pub fn deinit(self: *StreamState, allocator: Allocator) void {
+        self.records.deinit(allocator);
+    }
+
+    /// Append a record. Generates a new StreamID and returns it.
+    pub fn append(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32) !StreamID {
+        const id = self.id_gen.next();
+        try self.records.append(allocator, .{
+            .id = id,
+            .ual_index = ual_index,
+            .partition_index = partition_index,
+        });
+        if (self.first_id.eql(StreamID.MIN)) {
+            self.first_id = id;
+        }
+        self.last_id = id;
+        return id;
+    }
+
+    /// Read records with IDs in [from_id, to_id] inclusive.
+    pub fn readRange(self: *const StreamState, from_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const items = self.records.items;
+        if (items.len == 0) return 0;
+        const start_idx = self.lowerBound(from_id);
+        if (start_idx >= items.len) return 0;
+        var n: usize = 0;
+        var i = start_idx;
+        while (i < items.len and n < buf.len) : (i += 1) {
+            const rec = &items[i];
+            if (rec.id.greaterThan(to_id)) break;
+            if (rec.id.lessThan(from_id)) continue;
+            if (filter_partition) |fp| {
+                if (rec.partition_index != fp) continue;
+            }
+            buf[n] = rec.*;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Read records after a given ID (exclusive).
+    pub fn readAfter(self: *const StreamState, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const items = self.records.items;
+        if (items.len == 0) return 0;
+        // Find first record strictly after after_id
+        var start_idx = self.lowerBound(after_id);
+        // Skip records equal to after_id
+        while (start_idx < items.len and items[start_idx].id.eql(after_id)) : (start_idx += 1) {}
+        if (start_idx >= items.len) return 0;
+        var n: usize = 0;
+        var i = start_idx;
+        while (i < items.len and n < buf.len) : (i += 1) {
+            if (filter_partition) |fp| {
+                if (items[i].partition_index != fp) continue;
+            }
+            buf[n] = items[i];
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Number of live records.
+    pub fn count(self: *const StreamState) usize {
+        return self.records.items.len;
+    }
+
+    /// Trim records with IDs <= up_to_id. Returns count trimmed.
+    pub fn trim(self: *StreamState, allocator: Allocator, up_to_id: StreamID) u64 {
+        _ = allocator;
+        const items = self.records.items;
+        if (items.len == 0) return 0;
+
+        // Find the first record that is strictly greater than up_to_id
+        var cut: usize = 0;
+        while (cut < items.len) : (cut += 1) {
+            if (items[cut].id.greaterThan(up_to_id)) break;
+        }
+
+        if (cut == 0) {
+            self.trim_id = up_to_id;
+            return 0;
+        }
+
+        // Shift remaining records to front
+        const remaining = items.len - cut;
+        if (remaining > 0) {
+            std.mem.copyForwards(StreamRecord, items[0..remaining], items[cut..items.len]);
+        }
+        self.records.items.len = remaining;
+
+        self.trim_id = up_to_id;
+        if (remaining > 0) {
+            self.first_id = self.records.items[0].id;
+        } else {
+            self.first_id = StreamID.MIN;
+            self.last_id = StreamID.MIN;
+        }
+        return @intCast(cut);
+    }
+
+    /// Binary search: find first index where record.id >= target.
+    fn lowerBound(self: *const StreamState, target: StreamID) usize {
+        const items = self.records.items;
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].id.lessThan(target)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -53,31 +233,34 @@ pub const ConsumerGroup = struct {
     name: []const u8,
     /// Members by ID.
     members: std.StringHashMap(Member),
-    /// Group-level committed offset (min of all member offsets, or explicit).
-    committed_offset: u64,
     /// When the group was created.
     created_at_ns: u64,
     /// Allocator for member management.
     allocator: Allocator,
+    /// PEL — StreamID.order() → PendingEntry. Tracks delivered-but-unacked messages.
+    pel: std.AutoHashMap(u128, PendingEntry),
+    /// Highest StreamID delivered to any consumer in this group.
+    last_delivered_id: StreamID,
 
     pub fn init(allocator: Allocator, name: []const u8, created_at_ns: u64) !ConsumerGroup {
         const owned_name = try allocator.dupe(u8, name);
         return .{
             .name = owned_name,
             .members = std.StringHashMap(Member).init(allocator),
-            .committed_offset = 0,
             .created_at_ns = created_at_ns,
             .allocator = allocator,
+            .pel = std.AutoHashMap(u128, PendingEntry).init(allocator),
+            .last_delivered_id = StreamID.MIN,
         };
     }
 
     pub fn deinit(self: *ConsumerGroup) void {
-        // Free member IDs
         var it = self.members.iterator();
         while (it.next()) |kv| {
             self.allocator.free(@constCast(kv.value_ptr.id));
         }
         self.members.deinit();
+        self.pel.deinit();
         self.allocator.free(@constCast(self.name));
     }
 
@@ -85,12 +268,10 @@ pub const ConsumerGroup = struct {
     pub fn join(self: *ConsumerGroup, member_id: []const u8, now_ns: u64) !bool {
         const gop = try self.members.getOrPut(member_id);
         if (gop.found_existing) return false;
-
         const owned_id = try self.allocator.dupe(u8, member_id);
         gop.key_ptr.* = owned_id;
         gop.value_ptr.* = .{
             .id = owned_id,
-            .committed_offset = 0,
             .joined_at_ns = now_ns,
             .state = .active,
         };
@@ -106,57 +287,161 @@ pub const ConsumerGroup = struct {
         return false;
     }
 
-    /// Commit offset for a specific member.
-    pub fn commitMemberOffset(self: *ConsumerGroup, member_id: []const u8, offset: u64) bool {
-        if (self.members.getPtr(member_id)) |member| {
-            if (offset > member.committed_offset) {
-                member.committed_offset = offset;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    /// Commit offset at the group level (not per-member).
-    pub fn commitGroupOffset(self: *ConsumerGroup, offset: u64) void {
-        if (offset > self.committed_offset) {
-            self.committed_offset = offset;
-        }
-    }
-
-    /// Get the minimum committed offset across all active members.
-    /// Returns group-level committed_offset if no members.
-    pub fn minCommittedOffset(self: *const ConsumerGroup) u64 {
-        var min: u64 = std.math.maxInt(u64);
-        var has_any = false;
-        var it = self.members.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.state == .active) {
-                min = @min(min, kv.value_ptr.committed_offset);
-                has_any = true;
-            }
-        }
-        return if (has_any) min else self.committed_offset;
-    }
-
     pub fn memberCount(self: *const ConsumerGroup) usize {
         return self.members.count();
     }
-};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Offset Entry — maps stream offset → UAL index
-// ═══════════════════════════════════════════════════════════════════════════════
+    // ── PEL Operations ──────────────────────────────────────────────────
 
-pub const OffsetEntry = struct {
-    /// UAL index where this record's data lives.
-    ual_index: u64,
-    /// Timestamp when appended.
-    timestamp_ns: u64,
-    /// Hash of the stream name this entry belongs to (for per-stream filtering).
-    stream_name_hash: u64,
-    /// User partition index (for multi-partition streams).
-    partition_index: u32 = 0,
+    /// Deliver records to a consumer — adds them to the PEL.
+    /// `records` are the StreamRecords being delivered. Returns count added to PEL.
+    pub fn deliver(self: *ConsumerGroup, consumer_id: []const u8, records: []const StreamRecord, now_ms: u64) !u32 {
+        var added: u32 = 0;
+        for (records) |rec| {
+            const key = rec.id.order();
+            const gop = try self.pel.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .id = rec.id,
+                    .consumer = consumer_id,
+                    .delivered_at_ms = now_ms,
+                    .last_delivery_ms = now_ms,
+                    .delivery_count = 1,
+                };
+                added += 1;
+                if (self.members.getPtr(consumer_id)) |m| {
+                    m.pending_count += 1;
+                    m.last_active_ms = now_ms;
+                }
+            }
+        }
+        // Advance last_delivered_id
+        if (records.len > 0) {
+            const last = records[records.len - 1].id;
+            if (last.greaterThan(self.last_delivered_id)) {
+                self.last_delivered_id = last;
+            }
+        }
+        return added;
+    }
+
+    /// Acknowledge messages — remove from PEL. Returns count acked.
+    pub fn ack(self: *ConsumerGroup, ids: []const StreamID) u32 {
+        var acked: u32 = 0;
+        for (ids) |id| {
+            const key = id.order();
+            if (self.pel.fetchRemove(key)) |kv| {
+                if (self.members.getPtr(kv.value.consumer)) |m| {
+                    if (m.pending_count > 0) m.pending_count -= 1;
+                }
+                acked += 1;
+            }
+        }
+        return acked;
+    }
+
+    /// Negative-acknowledge messages — mark for redelivery (increment delivery_count, reset timer).
+    pub fn nack(self: *ConsumerGroup, ids: []const StreamID, now_ms: u64) u32 {
+        var nacked: u32 = 0;
+        for (ids) |id| {
+            const key = id.order();
+            if (self.pel.getPtr(key)) |pe| {
+                pe.delivery_count += 1;
+                pe.last_delivery_ms = now_ms;
+                nacked += 1;
+            }
+        }
+        return nacked;
+    }
+
+    /// Claim specific PEL entries for a new consumer. Returns count claimed.
+    pub fn claim(self: *ConsumerGroup, ids: []const StreamID, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64) u32 {
+        var claimed: u32 = 0;
+        for (ids) |id| {
+            const key = id.order();
+            if (self.pel.getPtr(key)) |pe| {
+                const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
+                if (idle >= min_idle_ms) {
+                    // Decrement old consumer count
+                    if (self.members.getPtr(pe.consumer)) |m| {
+                        if (m.pending_count > 0) m.pending_count -= 1;
+                    }
+                    pe.consumer = new_consumer;
+                    pe.last_delivery_ms = now_ms;
+                    pe.delivery_count += 1;
+                    // Increment new consumer count
+                    if (self.members.getPtr(new_consumer)) |m| {
+                        m.pending_count += 1;
+                    }
+                    claimed += 1;
+                }
+            }
+        }
+        return claimed;
+    }
+
+    /// Auto-claim idle PEL entries for a consumer. Returns count claimed and fills `out` with claimed IDs.
+    pub fn autoclaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) u32 {
+        var result_count: u32 = 0;
+        const start_order = start_id.order();
+        var it = self.pel.iterator();
+        while (it.next()) |kv| {
+            if (result_count >= max_count or result_count >= out.len) break;
+            if (kv.key_ptr.* < start_order) continue;
+            const pe = kv.value_ptr;
+            // Skip entries already owned by the target consumer
+            if (std.mem.eql(u8, pe.consumer, new_consumer)) continue;
+            const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
+            if (idle >= min_idle_ms) {
+                if (self.members.getPtr(pe.consumer)) |m| {
+                    if (m.pending_count > 0) m.pending_count -= 1;
+                }
+                pe.consumer = new_consumer;
+                pe.last_delivery_ms = now_ms;
+                pe.delivery_count += 1;
+                if (self.members.getPtr(new_consumer)) |m| {
+                    m.pending_count += 1;
+                }
+                out[result_count] = pe.id;
+                result_count += 1;
+            }
+        }
+        return result_count;
+    }
+
+    /// Touch pending entries — reset their idle timer.
+    pub fn touch(self: *ConsumerGroup, ids: []const StreamID, now_ms: u64) u32 {
+        var touched: u32 = 0;
+        for (ids) |id| {
+            const key = id.order();
+            if (self.pel.getPtr(key)) |pe| {
+                pe.last_delivery_ms = now_ms;
+                touched += 1;
+            }
+        }
+        return touched;
+    }
+
+    /// Get pending entries, optionally for a specific consumer.
+    pub fn getPending(self: *const ConsumerGroup, consumer_id: ?[]const u8, buf: []PendingEntry) usize {
+        var n: usize = 0;
+        var it = self.pel.iterator();
+        while (it.next()) |kv| {
+            if (n >= buf.len) break;
+            const pe = kv.value_ptr;
+            if (consumer_id) |cid| {
+                if (!std.mem.eql(u8, pe.consumer, cid)) continue;
+            }
+            buf[n] = pe.*;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Number of entries in the PEL.
+    pub fn pelCount(self: *const ConsumerGroup) usize {
+        return self.pel.count();
+    }
 };
 
 /// Stream metadata — partition count and other per-stream config.
@@ -171,9 +456,6 @@ pub const StreamMetadata = struct {
 pub const StreamProjection = struct {
     allocator: Allocator,
 
-    /// Offset → UAL index mapping. Offsets are 1-based.
-    offsets: std.AutoHashMap(u64, OffsetEntry),
-
     /// Consumer groups by name.
     groups: std.StringHashMap(ConsumerGroup),
 
@@ -183,11 +465,8 @@ pub const StreamProjection = struct {
     /// Stream metadata (partition count, etc.).
     stream_metadata: std.StringHashMap(StreamMetadata),
 
-    /// High water mark — the latest appended offset.
-    hwm: u64,
-
-    /// Trim offset — records at or below this are considered trimmed.
-    trim_offset: u64,
+    /// Per-stream state — each stream has its own StreamID space.
+    streams: std.AutoHashMap(u64, StreamState),
 
     /// Last applied UAL index.
     applied_index: u64,
@@ -207,12 +486,10 @@ pub const StreamProjection = struct {
     pub fn init(allocator: Allocator) StreamProjection {
         return .{
             .allocator = allocator,
-            .offsets = std.AutoHashMap(u64, OffsetEntry).init(allocator),
             .groups = std.StringHashMap(ConsumerGroup).init(allocator),
             .stream_names = std.StringHashMap(void).init(allocator),
             .stream_metadata = std.StringHashMap(StreamMetadata).init(allocator),
-            .hwm = 0,
-            .trim_offset = 0,
+            .streams = std.AutoHashMap(u64, StreamState).init(allocator),
             .applied_index = 0,
             .stats = .{},
         };
@@ -225,7 +502,12 @@ pub const StreamProjection = struct {
             kv.value_ptr.deinit();
         }
         self.groups.deinit();
-        self.offsets.deinit();
+        // Free per-stream state
+        var sit = self.streams.iterator();
+        while (sit.next()) |kv| {
+            kv.value_ptr.deinit(self.allocator);
+        }
+        self.streams.deinit();
         // Free stream name keys
         var nit = self.stream_names.keyIterator();
         while (nit.next()) |key| {
@@ -249,7 +531,12 @@ pub const StreamProjection = struct {
             kv.value_ptr.deinit();
         }
         self.groups.clearAndFree();
-        self.offsets.clearAndFree();
+        // Free per-stream state
+        var sit = self.streams.iterator();
+        while (sit.next()) |kv| {
+            kv.value_ptr.deinit(self.allocator);
+        }
+        self.streams.clearAndFree();
         // Free stream name keys
         var nit = self.stream_names.keyIterator();
         while (nit.next()) |key| {
@@ -262,130 +549,8 @@ pub const StreamProjection = struct {
             self.allocator.free(@constCast(key.*));
         }
         self.stream_metadata.clearAndFree();
-        self.hwm = 0;
-        self.trim_offset = 0;
         self.applied_index = 0;
         self.stats = .{};
-    }
-
-    // ─── Core operations ───────────────────────────────────────────────────
-
-    /// Append a record to the stream. Returns the assigned offset.
-    /// The record payload is stored in the UAL at `ual_index`.
-    pub fn append(self: *StreamProjection, ual_index: u64, timestamp_ns: u64, stream_name_hash: u64, partition_index: u32) !u64 {
-        self.hwm += 1;
-        const offset = self.hwm;
-
-        try self.offsets.put(offset, .{
-            .ual_index = ual_index,
-            .timestamp_ns = timestamp_ns,
-            .stream_name_hash = stream_name_hash,
-            .partition_index = partition_index,
-        });
-
-        self.stats.appended += 1;
-        return offset;
-    }
-
-    /// Read the UAL index for a given stream offset.
-    /// Returns null if the offset doesn't exist or has been trimmed.
-    pub fn read(self: *StreamProjection, offset: u64) ?OffsetEntry {
-        if (offset <= self.trim_offset) return null;
-        self.stats.reads += 1;
-        return self.offsets.get(offset);
-    }
-
-    /// Read a range of offsets [from_offset, to_offset] inclusive.
-    /// Returns entries that exist and are not trimmed.
-    pub fn readRange(self: *StreamProjection, from_offset: u64, to_offset: u64, buf: []OffsetEntry) usize {
-        const start = @max(from_offset, self.trim_offset + 1);
-        if (start > to_offset) return 0;
-        if (start > self.hwm) return 0;
-
-        const end = @min(to_offset, self.hwm);
-        var count: usize = 0;
-
-        var offset = start;
-        while (offset <= end and count < buf.len) : (offset += 1) {
-            if (self.offsets.get(offset)) |entry| {
-                buf[count] = entry;
-                count += 1;
-            }
-        }
-
-        self.stats.reads += count;
-        return count;
-    }
-
-    /// Read a range of offsets filtered by stream name hash.
-    /// Only returns entries belonging to the specified stream.
-    pub fn readRangeForStream(self: *StreamProjection, from_offset: u64, to_offset: u64, stream_name_hash: u64, buf: []OffsetEntry) usize {
-        const start = @max(from_offset, self.trim_offset + 1);
-        if (start > to_offset) return 0;
-        if (start > self.hwm) return 0;
-
-        const end = @min(to_offset, self.hwm);
-        var count: usize = 0;
-
-        var offset = start;
-        while (offset <= end and count < buf.len) : (offset += 1) {
-            if (self.offsets.get(offset)) |entry| {
-                if (entry.stream_name_hash == stream_name_hash) {
-                    buf[count] = entry;
-                    count += 1;
-                }
-            }
-        }
-
-        self.stats.reads += count;
-        return count;
-    }
-
-    /// Read a range of offsets filtered by stream name hash AND partition index.
-    /// For multi-partition reads with explicit --partition flag.
-    pub fn readRangeForStreamPartition(self: *StreamProjection, from_offset: u64, to_offset: u64, stream_name_hash: u64, partition_index: u32, buf: []OffsetEntry) usize {
-        const start = @max(from_offset, self.trim_offset + 1);
-        if (start > to_offset) return 0;
-        if (start > self.hwm) return 0;
-
-        const end = @min(to_offset, self.hwm);
-        var count: usize = 0;
-
-        var offset = start;
-        while (offset <= end and count < buf.len) : (offset += 1) {
-            if (self.offsets.get(offset)) |entry| {
-                if (entry.stream_name_hash == stream_name_hash and entry.partition_index == partition_index) {
-                    buf[count] = entry;
-                    count += 1;
-                }
-            }
-        }
-
-        self.stats.reads += count;
-        return count;
-    }
-
-    /// Get the current high water mark (latest offset).
-    pub fn highWaterMark(self: *const StreamProjection) u64 {
-        return self.hwm;
-    }
-
-    /// Trim records up to and including the given offset.
-    /// Removes offset entries from the mapping.
-    pub fn trim(self: *StreamProjection, up_to_offset: u64) u64 {
-        if (up_to_offset <= self.trim_offset) return 0;
-
-        var trimmed: u64 = 0;
-        var offset = self.trim_offset + 1;
-        while (offset <= up_to_offset) : (offset += 1) {
-            if (self.offsets.remove(offset)) {
-                trimmed += 1;
-            }
-        }
-
-        self.trim_offset = up_to_offset;
-        self.stats.trimmed += trimmed;
-        return trimmed;
     }
 
     // ─── Consumer Group operations ─────────────────────────────────────────
@@ -434,36 +599,140 @@ pub const StreamProjection = struct {
         return error.GroupNotFound;
     }
 
-    /// Commit offset for a consumer group (group-level).
-    pub fn commitOffset(self: *StreamProjection, group_name: []const u8, offset: u64) !void {
-        if (self.groups.getPtr(group_name)) |group| {
-            group.commitGroupOffset(offset);
-            self.stats.commits += 1;
-            return;
-        }
-        return error.GroupNotFound;
-    }
-
-    /// Commit offset for a specific member in a group.
-    pub fn commitMemberOffset(self: *StreamProjection, group_name: []const u8, member_id: []const u8, offset: u64) !void {
-        if (self.groups.getPtr(group_name)) |group| {
-            if (group.commitMemberOffset(member_id, offset)) {
-                self.stats.commits += 1;
-                return;
-            }
-            return error.MemberNotFound;
-        }
-        return error.GroupNotFound;
-    }
-
-    /// Count of consumer groups.
+    /// Count of consumer groups.   
     pub fn groupCount(self: *const StreamProjection) usize {
         return self.groups.count();
     }
 
-    /// Total offsets currently tracked (not trimmed).
-    pub fn trackedOffsets(self: *const StreamProjection) usize {
-        return self.offsets.count();
+    // ─── PEL-aware Stream Operations ───────────────────────────────────────
+
+    /// Get or create per-stream state for a given name hash.
+    pub fn getOrCreateStream(self: *StreamProjection, name_hash: u64) !*StreamState {
+        const gop = try self.streams.getOrPut(name_hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = StreamState.init(name_hash);
+        }
+        return gop.value_ptr;
+    }
+
+    /// Append a record to a named stream. Returns the assigned StreamID.
+    pub fn appendToStream(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32) !StreamID {
+        const ss = try self.getOrCreateStream(name_hash);
+        const id = try ss.append(self.allocator, ual_index, partition_index);
+        self.stats.appended += 1;
+        return id;
+    }
+
+    /// Read records from a stream by ID range [from_id, to_id] inclusive.
+    pub fn readStreamRange(self: *StreamProjection, name_hash: u64, from_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const n = ss.readRange(from_id, to_id, filter_partition, buf);
+        self.stats.reads += n;
+        return n;
+    }
+
+    /// Read records from a stream after a given ID (exclusive).
+    pub fn readStreamAfter(self: *StreamProjection, name_hash: u64, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const n = ss.readAfter(after_id, filter_partition, buf);
+        self.stats.reads += n;
+        return n;
+    }
+
+    /// Get the last StreamID for a stream.
+    pub fn streamLastId(self: *const StreamProjection, name_hash: u64) StreamID {
+        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+        return ss.last_id;
+    }
+
+    /// Get the first StreamID for a stream.
+    pub fn streamFirstId(self: *const StreamProjection, name_hash: u64) StreamID {
+        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+        return ss.first_id;
+    }
+
+    /// Get the record count for a stream.
+    pub fn streamRecordCount(self: *const StreamProjection, name_hash: u64) usize {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        return ss.count();
+    }
+
+    /// Trim a stream — remove records with IDs <= up_to_id.
+    pub fn trimStream(self: *StreamProjection, name_hash: u64, up_to_id: StreamID) u64 {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const trimmed = ss.trim(self.allocator, up_to_id);
+        self.stats.trimmed += trimmed;
+        return trimmed;
+    }
+
+    /// Trim the first `count` records from a named stream.
+    /// Returns the number of records actually removed.
+    pub fn trimStreamByCount(self: *StreamProjection, name_hash: u64, count: u64) u64 {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const records = ss.records.items;
+        if (records.len == 0 or count == 0) return 0;
+        // Find the ID of the Nth record (or last if count >= len)
+        const idx = @min(count, records.len) - 1;
+        const up_to_id = records[idx].id;
+        const trimmed = ss.trim(self.allocator, up_to_id);
+        self.stats.trimmed += trimmed;
+        return trimmed;
+    }
+
+    /// Deliver records from a named stream to a consumer group.
+    /// Reads `count` records after the group's last_delivered_id, adds to PEL.
+    /// Returns the StreamRecords delivered (fills buf, returns count).
+    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+
+        const n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
+        if (n > 0) {
+            _ = try group.deliver(consumer_id, buf[0..n], now_ms);
+        }
+        return n;
+    }
+
+    /// Acknowledge messages in a consumer group by StreamID.
+    pub fn groupAck(self: *StreamProjection, group_name: []const u8, ids: []const StreamID) !u32 {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.ack(ids);
+    }
+
+    /// Negative-acknowledge messages in a consumer group (mark for redelivery).
+    pub fn groupNack(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, now_ms: u64) !u32 {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.nack(ids, now_ms);
+    }
+
+    /// Claim specific PEL entries for a new consumer.
+    pub fn groupClaim(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, min_idle_ms: u64, now_ms: u64) !u32 {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.claim(ids, consumer, min_idle_ms, now_ms);
+    }
+
+    /// Auto-claim idle PEL entries in a consumer group.
+    pub fn groupAutoclaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !u32 {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.autoclaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
+    }
+
+    /// Touch (reset idle timer) for PEL entries.
+    pub fn groupTouch(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, now_ms: u64) !u32 {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.touch(ids, now_ms);
+    }
+
+    /// Get pending entries for a consumer group (optionally filtered by consumer).
+    pub fn groupPending(self: *StreamProjection, group_name: []const u8, consumer_id: ?[]const u8, buf: []PendingEntry) !usize {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.getPending(consumer_id, buf);
+    }
+
+    /// Get the PEL count for a consumer group.
+    pub fn groupPelCount(self: *StreamProjection, group_name: []const u8) !usize {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.pelCount();
     }
 
     // ─── Stream Name Registry ──────────────────────────────────────────────
@@ -520,26 +789,24 @@ pub const StreamProjection = struct {
 
         switch (entry_type) {
             .stream_append => {
-                // Extract stream name hash from command payload, incorporating
-                // namespace_hash as the Wyhash seed for namespace isolation.
-                // This matches the live path: router.nameHash(ns_hash, key).
                 const name_hash = if (CommandPayload.deserialize(ual_entry.payload)) |cmd|
                     std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key)
                 else
                     0;
-                _ = try self.append(ual_entry.header.index, ual_entry.header.timestamp_ns, name_hash, 0);
+                _ = try self.appendToStream(name_hash, ual_entry.header.index, 0);
             },
             .stream_trim => {
-                // Trim offset encoded in command payload key as u64
+                // Trim target encoded as StreamID (timestamp_ms + sequence) in command payload key
                 if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len >= 8) {
-                        const trim_to = std.mem.readInt(u64, cmd.key[0..8], .little);
-                        _ = self.trim(trim_to);
+                    if (cmd.key.len >= 16) {
+                        const ts = std.mem.readInt(u64, cmd.key[0..8], .little);
+                        const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
+                        const name_hash = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
+                        _ = self.trimStream(name_hash, .{ .timestamp_ms = ts, .sequence = seq });
                     }
                 }
             },
             .cg_create => {
-                // Consumer group name in command payload key
                 if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
                     if (cmd.key.len > 0) {
                         self.createGroup(cmd.key, ual_entry.header.timestamp_ns) catch |err| {
@@ -552,17 +819,6 @@ pub const StreamProjection = struct {
                 if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
                     if (cmd.key.len > 0) {
                         _ = self.deleteGroup(cmd.key);
-                    }
-                }
-            },
-            .cg_commit => {
-                // Key = group name, Value = offset as u64
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len > 0 and cmd.value.len >= 8) {
-                        const offset = std.mem.readInt(u64, cmd.value[0..8], .little);
-                        self.commitOffset(cmd.key, offset) catch |err| {
-                            if (err != error.GroupNotFound) return err;
-                        };
                     }
                 }
             },
@@ -595,12 +851,18 @@ pub const StreamProjection = struct {
 
     pub fn memoryUsage(self: *const StreamProjection) usize {
         var mem: usize = @sizeOf(StreamProjection);
-        mem += self.offsets.count() * (@sizeOf(u64) + @sizeOf(OffsetEntry));
 
         var git = self.groups.iterator();
         while (git.next()) |kv| {
             mem += kv.value_ptr.name.len;
             mem += kv.value_ptr.members.count() * @sizeOf(Member);
+            mem += kv.value_ptr.pel.count() * (@sizeOf(u128) + @sizeOf(PendingEntry));
+        }
+
+        // Per-stream state
+        var sit = self.streams.iterator();
+        while (sit.next()) |kv| {
+            mem += kv.value_ptr.records.items.len * @sizeOf(StreamRecord);
         }
 
         // Stream names
@@ -615,24 +877,19 @@ pub const StreamProjection = struct {
     // ─── Snapshot Serialization ────────────────────────────────────────────
 
     /// Serialize the full stream projection state.
-    /// Format: [hwm: u64][trim_offset: u64]
-    ///   [offset_count: u32] then per offset:
-    ///     [offset: u64][ual_index: u64][timestamp_ns: u64][stream_name_hash: u64][partition_index: u32]
+    /// Format:
     ///   [stream_name_count: u32] then per stream name:
     ///     [name_len: u16][name bytes]
     ///   [metadata_count: u32] then per stream metadata:
     ///     [name_len: u16][name bytes][partition_count: u32]
     ///   [group_count: u32] then per consumer group:
-    ///     [name_len: u16][name bytes][committed_offset: u64][created_at_ns: u64]
+    ///     [name_len: u16][name bytes][pel_count: u32][created_at_ns: u64]
     ///     [member_count: u32] then per member:
-    ///       [id_len: u16][id bytes][committed_offset: u64][joined_at_ns: u64][state: u8]
+    ///       [id_len: u16][id bytes][joined_at_ns: u64][state: u8]
     /// Caller owns returned slice.
     pub fn serialize(self: *StreamProjection, allocator: Allocator) ![]u8 {
         // Calculate total size
-        var total_size: usize = 8 + 8; // hwm + trim_offset
-
-        // Offsets: count(4) + entries(8+8+8+8+4=36 each)
-        total_size += 4 + self.offsets.count() * 36;
+        var total_size: usize = 0;
 
         // Stream names: count(4) + per name(len_u16 + bytes)
         total_size += 4;
@@ -653,43 +910,18 @@ pub const StreamProjection = struct {
         var g_it = self.groups.iterator();
         while (g_it.next()) |kv| {
             const group = kv.value_ptr;
-            // name_len(2) + name + committed_offset(8) + created_at_ns(8) + member_count(4)
-            total_size += 2 + group.name.len + 8 + 8 + 4;
+            // name_len(2) + name + pel_count(4) + created_at_ns(8) + member_count(4)
+            total_size += 2 + group.name.len + 4 + 8 + 4;
             var m_it = group.members.iterator();
             while (m_it.next()) |mkv| {
-                // id_len(2) + id + committed_offset(8) + joined_at_ns(8) + state(1)
-                total_size += 2 + mkv.value_ptr.id.len + 8 + 8 + 1;
+                // id_len(2) + id + joined_at_ns(8) + state(1)
+                total_size += 2 + mkv.value_ptr.id.len + 8 + 1;
             }
         }
 
         const buf = try allocator.alloc(u8, total_size);
         errdefer allocator.free(buf);
         var offset: usize = 0;
-
-        // hwm + trim_offset
-        std.mem.writeInt(u64, buf[offset..][0..8], self.hwm, .little);
-        offset += 8;
-        std.mem.writeInt(u64, buf[offset..][0..8], self.trim_offset, .little);
-        offset += 8;
-
-        // Offsets
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.offsets.count()), .little);
-        offset += 4;
-        var off_it = self.offsets.iterator();
-        while (off_it.next()) |kv| {
-            const off_key = kv.key_ptr.*;
-            const entry = kv.value_ptr;
-            std.mem.writeInt(u64, buf[offset..][0..8], off_key, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], entry.ual_index, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], entry.timestamp_ns, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], entry.stream_name_hash, .little);
-            offset += 8;
-            std.mem.writeInt(u32, buf[offset..][0..4], entry.partition_index, .little);
-            offset += 4;
-        }
 
         // Stream names
         sn_it = self.stream_names.keyIterator();
@@ -726,8 +958,8 @@ pub const StreamProjection = struct {
             offset += 2;
             @memcpy(buf[offset..][0..group.name.len], group.name);
             offset += group.name.len;
-            std.mem.writeInt(u64, buf[offset..][0..8], group.committed_offset, .little);
-            offset += 8;
+            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(group.pelCount()), .little);
+            offset += 4;
             std.mem.writeInt(u64, buf[offset..][0..8], group.created_at_ns, .little);
             offset += 8;
 
@@ -741,8 +973,6 @@ pub const StreamProjection = struct {
                 offset += 2;
                 @memcpy(buf[offset..][0..member.id.len], member.id);
                 offset += member.id.len;
-                std.mem.writeInt(u64, buf[offset..][0..8], member.committed_offset, .little);
-                offset += 8;
                 std.mem.writeInt(u64, buf[offset..][0..8], member.joined_at_ns, .little);
                 offset += 8;
                 buf[offset] = @intFromEnum(member.state);
@@ -758,41 +988,8 @@ pub const StreamProjection = struct {
     pub fn deserialize(self: *StreamProjection, data: []const u8) !void {
         self.reset();
 
-        if (data.len < 16) return; // minimum: hwm + trim_offset
+        if (data.len < 4) return;
         var offset: usize = 0;
-
-        // hwm + trim_offset
-        self.hwm = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
-        self.trim_offset = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
-
-        // Offsets
-        if (offset + 4 > data.len) return;
-        const off_count = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
-
-        var oi: u32 = 0;
-        while (oi < off_count) : (oi += 1) {
-            if (offset + 36 > data.len) return;
-            const off_key = std.mem.readInt(u64, data[offset..][0..8], .little);
-            offset += 8;
-            const ual_index = std.mem.readInt(u64, data[offset..][0..8], .little);
-            offset += 8;
-            const timestamp_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
-            offset += 8;
-            const stream_name_hash = std.mem.readInt(u64, data[offset..][0..8], .little);
-            offset += 8;
-            const partition_index = std.mem.readInt(u32, data[offset..][0..4], .little);
-            offset += 4;
-
-            try self.offsets.put(off_key, .{
-                .ual_index = ual_index,
-                .timestamp_ns = timestamp_ns,
-                .stream_name_hash = stream_name_hash,
-                .partition_index = partition_index,
-            });
-        }
 
         // Stream names
         if (offset + 4 > data.len) return;
@@ -838,16 +1035,16 @@ pub const StreamProjection = struct {
             if (offset + 2 > data.len) return;
             const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
             offset += 2;
-            if (offset + name_len + 20 > data.len) return;
+            if (offset + name_len + 12 > data.len) return;
             const group_name = data[offset..][0..name_len];
             offset += name_len;
-            const committed_offset = std.mem.readInt(u64, data[offset..][0..8], .little);
-            offset += 8;
+            const _pel_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+            _ = _pel_count; // PEL is not serialized, rebuilt from UAL replay
+            offset += 4;
             const created_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
 
             var group = try ConsumerGroup.init(self.allocator, group_name, created_at_ns);
-            group.committed_offset = committed_offset;
 
             // Members
             if (offset + 4 > data.len) {
@@ -865,14 +1062,12 @@ pub const StreamProjection = struct {
                 }
                 const id_len = std.mem.readInt(u16, data[offset..][0..2], .little);
                 offset += 2;
-                if (offset + id_len + 17 > data.len) {
+                if (offset + id_len + 9 > data.len) {
                     group.deinit();
                     return;
                 }
                 const member_id = try self.allocator.dupe(u8, data[offset..][0..id_len]);
                 offset += id_len;
-                const member_committed = std.mem.readInt(u64, data[offset..][0..8], .little);
-                offset += 8;
                 const joined_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
                 offset += 8;
                 const state: MemberState = @enumFromInt(data[offset]);
@@ -880,13 +1075,11 @@ pub const StreamProjection = struct {
 
                 try group.members.put(member_id, .{
                     .id = member_id,
-                    .committed_offset = member_committed,
                     .joined_at_ns = joined_at_ns,
                     .state = state,
                 });
             }
 
-            // Use group_name as key (group.name is the owned copy)
             try self.groups.put(group.name, group);
         }
     }
@@ -897,64 +1090,6 @@ pub const StreamProjection = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-
-test "stream: basic append and read" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const off1 = try s.append(100, 1000, 0, 0);
-    const off2 = try s.append(101, 2000, 0, 0);
-
-    try testing.expectEqual(@as(u64, 1), off1);
-    try testing.expectEqual(@as(u64, 2), off2);
-    try testing.expectEqual(@as(u64, 2), s.highWaterMark());
-
-    const e1 = s.read(1).?;
-    try testing.expectEqual(@as(u64, 100), e1.ual_index);
-    try testing.expectEqual(@as(u64, 1000), e1.timestamp_ns);
-
-    const e2 = s.read(2).?;
-    try testing.expectEqual(@as(u64, 101), e2.ual_index);
-
-    try testing.expect(s.read(3) == null); // beyond HWM
-}
-
-test "stream: read range" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    _ = try s.append(100, 1000, 0, 0);
-    _ = try s.append(101, 2000, 0, 0);
-    _ = try s.append(102, 3000, 0, 0);
-    _ = try s.append(103, 4000, 0, 0);
-
-    var buf: [10]OffsetEntry = undefined;
-    const count = s.readRange(2, 3, &buf);
-    try testing.expectEqual(@as(usize, 2), count);
-    try testing.expectEqual(@as(u64, 101), buf[0].ual_index);
-    try testing.expectEqual(@as(u64, 102), buf[1].ual_index);
-}
-
-test "stream: trim removes old offsets" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    _ = try s.append(100, 1000, 0, 0);
-    _ = try s.append(101, 2000, 0, 0);
-    _ = try s.append(102, 3000, 0, 0);
-
-    const trimmed = s.trim(2);
-    try testing.expectEqual(@as(u64, 2), trimmed);
-    try testing.expectEqual(@as(u64, 2), s.trim_offset);
-
-    // Offsets 1 and 2 should be gone
-    try testing.expect(s.read(1) == null);
-    try testing.expect(s.read(2) == null);
-
-    // Offset 3 still readable
-    try testing.expect(s.read(3) != null);
-    try testing.expectEqual(@as(usize, 1), s.trackedOffsets());
-}
 
 test "stream: consumer group lifecycle" {
     var s = StreamProjection.init(testing.allocator);
@@ -989,63 +1124,24 @@ test "stream: consumer group lifecycle" {
     try testing.expectEqual(@as(usize, 0), s.groupCount());
 }
 
-test "stream: commit offset" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    _ = try s.append(100, 1000, 0, 0);
-    _ = try s.append(101, 2000, 0, 0);
-
-    try s.createGroup("grp", 1000);
-    _ = try s.joinGroup("grp", "c1", 2000);
-
-    // Commit group-level offset
-    try s.commitOffset("grp", 2);
-    const group = s.getGroup("grp").?;
-    try testing.expectEqual(@as(u64, 2), group.committed_offset);
-
-    // Commit member offset
-    try s.commitMemberOffset("grp", "c1", 1);
-
-    try testing.expectEqual(@as(u64, 1), group.minCommittedOffset());
-}
-
-test "stream: commit to non-existent group" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    try testing.expectError(error.GroupNotFound, s.commitOffset("nonexistent", 1));
-}
-
 test "stream: stats tracking" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000, 0, 0);
-    _ = try s.append(101, 2000, 0, 0);
-    _ = s.read(1);
-    _ = s.trim(1);
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
     try s.createGroup("g", 1000);
 
     try testing.expectEqual(@as(u64, 2), s.stats.appended);
-    try testing.expectEqual(@as(u64, 1), s.stats.reads);
-    try testing.expectEqual(@as(u64, 1), s.stats.trimmed);
     try testing.expectEqual(@as(u64, 1), s.stats.groups_created);
-}
-
-test "stream: empty read returns null" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    try testing.expect(s.read(1) == null);
-    try testing.expectEqual(@as(u64, 0), s.highWaterMark());
 }
 
 test "stream: memory usage estimate" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.append(100, 1000, 0, 0);
+    _ = try s.appendToStream(42, 100, 0);
     try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);
@@ -1069,7 +1165,6 @@ test "stream: apply entry for stream_append" {
     const ual_entry = entry_mod.buildEntry(.stream_append, 0, 1, 1, 1000, "data");
     try s.applyEntry(&ual_entry);
 
-    try testing.expectEqual(@as(u64, 1), s.highWaterMark());
     try testing.expectEqual(@as(u64, 1), s.stats.appended);
 }
 
@@ -1077,26 +1172,20 @@ test "stream: serialize/deserialize round-trip" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    // Append records with different stream name hashes
-    _ = try s.append(100, 1000, 42, 0);
-    _ = try s.append(101, 2000, 42, 0);
-    _ = try s.append(102, 3000, 99, 1);
-
-    // Register stream names
+    // Register stream names and metadata
     try s.registerStream("events");
     try s.registerStream("logs");
-
-    // Set stream metadata
     try s.registerStreamMetadata("events", 4);
+
+    // Append records to a stream
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
 
     // Create consumer group with members
     try s.createGroup("my-group", 5000);
     _ = try s.joinGroup("my-group", "consumer-1", 6000);
     _ = try s.joinGroup("my-group", "consumer-2", 7000);
-    try s.commitOffset("my-group", 2);
-
-    // Trim
-    _ = s.trim(1);
 
     // Serialize
     const data = try s.serialize(testing.allocator);
@@ -1105,20 +1194,7 @@ test "stream: serialize/deserialize round-trip" {
     // Deserialize into fresh projection
     var s2 = StreamProjection.init(testing.allocator);
     defer s2.deinit();
-
     try s2.deserialize(data);
-
-    // Verify HWM and trim offset
-    try testing.expectEqual(@as(u64, 3), s2.highWaterMark());
-    try testing.expectEqual(@as(u64, 1), s2.trim_offset);
-
-    // Verify offsets (offset 1 is trimmed, so read(1) should be null)
-    try testing.expect(s2.read(1) == null);
-    const o2 = s2.read(2).?;
-    try testing.expectEqual(@as(u64, 101), o2.ual_index);
-    const o3 = s2.read(3).?;
-    try testing.expectEqual(@as(u64, 102), o3.ual_index);
-    try testing.expectEqual(@as(u64, 99), o3.stream_name_hash);
 
     // Verify stream names restored
     try testing.expect(s2.stream_names.contains("events"));
@@ -1131,7 +1207,6 @@ test "stream: serialize/deserialize round-trip" {
 
     // Verify consumer group
     const group = s2.getGroup("my-group").?;
-    try testing.expectEqual(@as(u64, 2), group.committed_offset);
     try testing.expectEqual(@as(usize, 2), group.memberCount());
 }
 
@@ -1144,8 +1219,287 @@ test "stream: serialize empty projection" {
 
     var s2 = StreamProjection.init(testing.allocator);
     defer s2.deinit();
-
     try s2.deserialize(data);
-    try testing.expectEqual(@as(u64, 0), s2.highWaterMark());
     try testing.expectEqual(@as(usize, 0), s2.streamCount());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PEL + StreamState Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "stream: StreamState append and read" {
+    var ss = StreamState.init(42);
+    defer ss.deinit(testing.allocator);
+
+    const id1 = try ss.append(testing.allocator, 100, 0);
+    const id2 = try ss.append(testing.allocator, 101, 0);
+    const id3 = try ss.append(testing.allocator, 102, 1);
+
+    try testing.expectEqual(@as(usize, 3), ss.count());
+    try testing.expect(ss.first_id.eql(id1));
+    try testing.expect(ss.last_id.eql(id3));
+
+    // readRange: all records
+    var buf: [10]StreamRecord = undefined;
+    const n = ss.readRange(StreamID.MIN, StreamID.MAX, null, &buf);
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // readRange: filtered by partition
+    const n2 = ss.readRange(StreamID.MIN, StreamID.MAX, 1, &buf);
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expectEqual(@as(u64, 102), buf[0].ual_index);
+
+    // readAfter
+    const n3 = ss.readAfter(id1, null, &buf);
+    try testing.expectEqual(@as(usize, 2), n3);
+    try testing.expect(buf[0].id.eql(id2));
+}
+
+test "stream: StreamState trim" {
+    var ss = StreamState.init(42);
+    defer ss.deinit(testing.allocator);
+
+    const id1 = try ss.append(testing.allocator, 100, 0);
+    const id2 = try ss.append(testing.allocator, 101, 0);
+    _ = try ss.append(testing.allocator, 102, 0);
+
+    const trimmed = ss.trim(testing.allocator, id2);
+    try testing.expectEqual(@as(u64, 2), trimmed);
+    try testing.expectEqual(@as(usize, 1), ss.count());
+    try testing.expect(!ss.first_id.eql(id1));
+    try testing.expect(!ss.first_id.eql(id2));
+}
+
+test "stream: appendToStream creates stream and returns StreamID" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 12345;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    const id2 = try s.appendToStream(hash, 101, 0);
+
+    // StreamIDs are monotonically increasing
+    try testing.expect(id2.greaterThan(id1));
+
+    // Per-stream state recorded
+    try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash));
+    try testing.expect(s.streamFirstId(hash).eql(id1));
+    try testing.expect(s.streamLastId(hash).eql(id2));
+}
+
+test "stream: readStreamRange and readStreamAfter" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
+    const id3 = try s.appendToStream(hash, 102, 1);
+
+    // readStreamRange: all
+    var buf: [10]StreamRecord = undefined;
+    const n = s.readStreamRange(hash, StreamID.MIN, StreamID.MAX, null, &buf);
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // readStreamRange: filtered by partition 1
+    const n2 = s.readStreamRange(hash, StreamID.MIN, StreamID.MAX, 1, &buf);
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expect(buf[0].id.eql(id3));
+
+    // readStreamAfter
+    const n3 = s.readStreamAfter(hash, id1, null, &buf);
+    try testing.expectEqual(@as(usize, 2), n3);
+
+    // Non-existent stream returns 0
+    const n4 = s.readStreamRange(999, StreamID.MIN, StreamID.MAX, null, &buf);
+    try testing.expectEqual(@as(usize, 0), n4);
+}
+
+test "stream: trimStream" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+    const id2 = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStream(hash, 102, 0);
+
+    const trimmed = s.trimStream(hash, id2);
+    try testing.expectEqual(@as(u64, 2), trimmed);
+    try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash));
+}
+
+test "stream: groupDeliver adds to PEL" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStream(hash, 102, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "consumer-1", 1000);
+
+    var buf: [10]StreamRecord = undefined;
+    const delivered = try s.groupDeliver("mygroup", hash, "consumer-1", 2, 5000, &buf);
+    try testing.expectEqual(@as(usize, 2), delivered);
+
+    // PEL should have 2 entries
+    const pel_count = try s.groupPelCount("mygroup");
+    try testing.expectEqual(@as(usize, 2), pel_count);
+
+    // Deliver more — should get the remaining 1
+    const delivered2 = try s.groupDeliver("mygroup", hash, "consumer-1", 10, 5001, &buf);
+    try testing.expectEqual(@as(usize, 1), delivered2);
+}
+
+test "stream: groupAck removes from PEL" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    const id2 = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStream(hash, 102, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "c1", 1000);
+
+    var buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("mygroup", hash, "c1", 3, 5000, &buf);
+    try testing.expectEqual(@as(usize, 3), try s.groupPelCount("mygroup"));
+
+    // Ack 2 messages
+    const ids = [_]StreamID{ id1, id2 };
+    const acked = try s.groupAck("mygroup", &ids);
+    try testing.expectEqual(@as(u32, 2), acked);
+    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("mygroup"));
+}
+
+test "stream: groupNack marks for redelivery" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "c1", 1000);
+
+    var buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 5000, &buf);
+
+    // Nack
+    const ids = [_]StreamID{id1};
+    const nacked = try s.groupNack("mygroup", &ids, 6000);
+    try testing.expectEqual(@as(u32, 1), nacked);
+
+    // Still in PEL (delivery_count incremented)
+    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("mygroup"));
+
+    // Verify delivery count via getPending
+    var pel_buf: [10]PendingEntry = undefined;
+    const n = try s.groupPending("mygroup", null, &pel_buf);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(u32, 2), pel_buf[0].delivery_count);
+}
+
+test "stream: groupClaim transfers ownership" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "c1", 1000);
+    _ = try s.joinGroup("mygroup", "c2", 1000);
+
+    var buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 5000, &buf);
+
+    // Claim with 0 min_idle so it always matches
+    const ids = [_]StreamID{id1};
+    const claimed = try s.groupClaim("mygroup", &ids, "c2", 0, 6000);
+    try testing.expectEqual(@as(u32, 1), claimed);
+
+    // Verify consumer changed via getPending
+    var pel_buf: [10]PendingEntry = undefined;
+    const n = try s.groupPending("mygroup", "c2", &pel_buf);
+    try testing.expectEqual(@as(usize, 1), n);
+}
+
+test "stream: groupAutoclaim auto-transfers idle entries" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "c1", 1000);
+    _ = try s.joinGroup("mygroup", "c2", 1000);
+
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("mygroup", hash, "c1", 2, 1000, &rec_buf);
+
+    // Autoclaim after enough idle time (entries delivered at t=1000, now=5000, idle=4000ms)
+    var out: [10]StreamID = undefined;
+    const claimed = try s.groupAutoclaim("mygroup", "c2", 3000, 5000, StreamID.MIN, 10, &out);
+    try testing.expectEqual(@as(u32, 2), claimed);
+}
+
+test "stream: groupTouch resets idle timer" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+
+    try s.createGroup("mygroup", 1000);
+    _ = try s.joinGroup("mygroup", "c1", 1000);
+
+    var buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 1000, &buf);
+
+    // Touch at t=5000
+    const ids = [_]StreamID{id1};
+    const touched = try s.groupTouch("mygroup", &ids, 5000);
+    try testing.expectEqual(@as(u32, 1), touched);
+
+    // Verify last_delivery_ms updated via getPending
+    var pel_buf: [10]PendingEntry = undefined;
+    _ = try s.groupPending("mygroup", null, &pel_buf);
+    try testing.expectEqual(@as(u64, 5000), pel_buf[0].last_delivery_ms);
+}
+
+test "stream: groupDeliver to non-existent group" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    var buf: [10]StreamRecord = undefined;
+    try testing.expectError(error.GroupNotFound, s.groupDeliver("nope", 42, "c1", 1, 1000, &buf));
+}
+
+test "stream: multiple streams are independent" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash_a: u64 = 1;
+    const hash_b: u64 = 2;
+
+    const a1 = try s.appendToStream(hash_a, 100, 0);
+    const a2 = try s.appendToStream(hash_a, 101, 0);
+    _ = try s.appendToStream(hash_b, 200, 0);
+
+    try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash_a));
+    try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash_b));
+
+    // Reading stream A returns only A's records
+    var buf: [10]StreamRecord = undefined;
+    const n = s.readStreamAfter(hash_a, a1, null, &buf);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(buf[0].id.eql(a2));
 }

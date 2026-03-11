@@ -20,10 +20,13 @@ import { useAuth } from "../lib/AuthContext";
  */
 
 export function Header() {
-    const { namespaces, selected, setSelected } = useNamespace();
+    const { namespaces, selected, setSelected, createNamespace } = useNamespace();
     const { auth, logout } = useAuth();
     const [isNamespaceOpen, setIsNamespaceOpen] = useState(false);
     const [isProfileOpen, setIsProfileOpen] = useState(false);
+    const [isCreating, setIsCreating] = useState(false);
+    const [newName, setNewName] = useState("");
+    const [createError, setCreateError] = useState("");
     const [theme, setTheme] = useState<'dark' | 'light'>(() => {
         const saved = localStorage.getItem('theme');
         return (saved as 'dark' | 'light') || 'dark';
@@ -60,7 +63,7 @@ export function Header() {
 
                     {isNamespaceOpen && (
                         <>
-                            <div className="fixed inset-0 z-40" onClick={() => setIsNamespaceOpen(false)} />
+                            <div className="fixed inset-0 z-40" onClick={() => { setIsNamespaceOpen(false); setIsCreating(false); setNewName(""); setCreateError(""); }} />
                             <div className="absolute top-full left-0 mt-1 w-64 bg-surface border border-surface-border rounded-md shadow-xl z-50 overflow-hidden">
                                 <div className="p-2 border-b border-surface-border">
                                     <div className="text-[10px] font-bold text-text-secondary uppercase">Select Namespace</div>
@@ -86,10 +89,49 @@ export function Header() {
                                     ))}
                                 </div>
                                 <div className="p-2 border-t border-surface-border">
-                                    <button className="flex items-center gap-2 text-xs text-text-secondary hover:text-text-primary transition-colors w-full">
-                                        <Plus className="w-3.5 h-3.5" />
-                                        New namespace
-                                    </button>
+                                    {isCreating ? (
+                                        <form
+                                            onSubmit={async (e) => {
+                                                e.preventDefault();
+                                                const trimmed = newName.trim();
+                                                if (!trimmed) return;
+                                                setCreateError("");
+                                                try {
+                                                    await createNamespace(trimmed);
+                                                    setNewName("");
+                                                    setIsCreating(false);
+                                                    setIsNamespaceOpen(false);
+                                                } catch (err) {
+                                                    setCreateError(err instanceof Error ? err.message : "Failed to create namespace");
+                                                }
+                                            }}
+                                            className="flex flex-col gap-1.5"
+                                        >
+                                            <div className="flex items-center gap-1.5">
+                                                <input
+                                                    autoFocus
+                                                    type="text"
+                                                    value={newName}
+                                                    onChange={(e) => { setNewName(e.target.value); setCreateError(""); }}
+                                                    onKeyDown={(e) => { if (e.key === "Escape") { setIsCreating(false); setNewName(""); setCreateError(""); } }}
+                                                    placeholder="namespace-name"
+                                                    className="flex-1 text-xs bg-surface-hover border border-surface-border rounded px-2 py-1 text-text-primary placeholder:text-text-secondary/50 outline-none focus:border-primary"
+                                                />
+                                                <button type="submit" className="text-xs bg-primary text-white px-2 py-1 rounded hover:bg-primary/80 transition-colors">
+                                                    Create
+                                                </button>
+                                            </div>
+                                            {createError && <span className="text-[10px] text-red-400">{createError}</span>}
+                                        </form>
+                                    ) : (
+                                        <button
+                                            onClick={() => setIsCreating(true)}
+                                            className="flex items-center gap-2 text-xs text-text-secondary hover:text-text-primary transition-colors w-full"
+                                        >
+                                            <Plus className="w-3.5 h-3.5" />
+                                            New namespace
+                                        </button>
+                                    )}
                                 </div>
                             </div>
                         </>

@@ -101,16 +101,15 @@ export interface ConsumerGroupInfo {
 }
 
 export interface StreamMessage {
-  sequence: number;
-  timestamp_ms: number;
-  tier: 'hot' | 'warm' | 'cold';
-  partition: number;
-  payload: string;
+  id_ms: number;
+  id_seq: number;
+  ual_index: number;
+  size: number;
 }
 
 export interface StreamMessagesResponse {
   messages: StreamMessage[];
-  offset: number;
+  next_cursor?: string;
   limit: number;
   count: number;
   total_count: number;
@@ -138,9 +137,10 @@ export interface GroupDetail {
 }
 
 export interface PendingEntry {
-  id: string;
+  id_ms: number;
+  id_seq: number;
   consumer: string;
-  delivered_at: number;
+  delivered_at_ms: number;
   delivery_count: number;
 }
 
@@ -561,6 +561,17 @@ class FloApiClient {
   }
 
   /**
+   * Create a new namespace.
+   */
+  async createNamespace(name: string): Promise<{ name: string; ok: boolean }> {
+    return this.fetch<{ name: string; ok: boolean }>('namespaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  /**
    * Get detailed information about a specific namespace.
    * Includes lists of all resources (streams, queues, KV keys) in the namespace.
    */
@@ -700,11 +711,15 @@ class FloApiClient {
   }
 
   /**
-   * Get messages from a stream with pagination
+   * Get messages from a stream with cursor-based pagination
+   * @param cursor - StreamID cursor "ts-seq" (omit for start of stream)
    * @param partition - optional partition number (omit for partition 0)
    */
-  async getStreamMessages(name: string, offset = 0, limit = 2000, partition?: number): Promise<StreamMessagesResponse> {
-    let url = `streams/${encodeURIComponent(name)}/messages?offset=${offset}&limit=${limit}`;
+  async getStreamMessages(name: string, cursor?: string, limit = 2000, partition?: number): Promise<StreamMessagesResponse> {
+    let url = `streams/${encodeURIComponent(name)}/messages?limit=${limit}`;
+    if (cursor) {
+      url += `&cursor=${encodeURIComponent(cursor)}`;
+    }
     if (partition !== undefined && partition > 0) {
       url += `&partition=${partition}`;
     }

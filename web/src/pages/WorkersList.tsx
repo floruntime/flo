@@ -2,7 +2,7 @@ import { Users, Activity, Heart, RefreshCw, Cpu, AlertTriangle } from "lucide-re
 import { Link } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api } from "../lib/api";
-import { useApi, LoadingState, ErrorState, EmptyState } from "../lib/useApi";
+import { useApi, LoadingState, ErrorState } from "../lib/useApi";
 import { cn } from "../lib/utils";
 
 function formatTimeAgo(ms: number): string {
@@ -73,15 +73,13 @@ export function WorkersListPage() {
 
     if (loading && !workers) return <LoadingState />;
     if (error) return <ErrorState message={error} onRetry={refetch} />;
-    if (!workers || workers.length === 0) {
-        return <EmptyState title="No Workers" description="No workers are currently registered." />;
-    }
 
-    const activeCount = workers.filter(w => w.status === "active" || w.status === "idle").length;
-    const drainingCount = workers.filter(w => w.status === "draining").length;
-    const unhealthyCount = workers.filter(w => w.status === "unhealthy").length;
-    const totalLoad = workers.reduce((sum, w) => sum + w.current_load, 0);
-    const totalCapacity = workers.reduce((sum, w) => sum + w.max_concurrent, 0);
+    const allWorkers = workers || [];
+    const activeCount = allWorkers.filter(w => w.status === "active" || w.status === "idle").length;
+    const drainingCount = allWorkers.filter(w => w.status === "draining").length;
+    const unhealthyCount = allWorkers.filter(w => w.status === "unhealthy").length;
+    const totalLoad = allWorkers.reduce((sum, w) => sum + w.current_load, 0);
+    const totalCapacity = allWorkers.reduce((sum, w) => sum + w.max_concurrent, 0);
 
     return (
         <div className="space-y-6">
@@ -90,7 +88,7 @@ export function WorkersListPage() {
                 <div>
                     <h1 className="text-2xl font-semibold text-text-primary">Workers</h1>
                     <p className="text-sm text-text-secondary mt-1">
-                        {workers.length} worker{workers.length !== 1 ? 's' : ''} registered
+                        {allWorkers.length} worker{allWorkers.length !== 1 ? 's' : ''} registered
                     </p>
                 </div>
                 <button
@@ -110,7 +108,7 @@ export function WorkersListPage() {
                             <Users className="w-4 h-4 text-text-secondary" />
                             <span className="text-xs text-text-secondary">Total Workers</span>
                         </div>
-                        <p className="text-xl font-bold">{workers.length}</p>
+                        <p className="text-xl font-bold">{allWorkers.length}</p>
                     </CardContent>
                 </Card>
                 <Card>
@@ -169,7 +167,14 @@ export function WorkersListPage() {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-surface-border">
-                            {workers.map((w) => (
+                            {allWorkers.length === 0 ? (
+                                <tr>
+                                    <td colSpan={9} className="px-4 py-12 text-center text-text-secondary text-sm">
+                                        No workers registered yet. Workers connect automatically when started.
+                                    </td>
+                                </tr>
+                            ) : (
+                            allWorkers.map((w) => (
                                 <tr key={w.worker_id} className="hover:bg-surface-hover/30 transition-colors">
                                     <td className="px-4 py-3">
                                         <StatusBadge status={w.status} />
@@ -219,7 +224,8 @@ export function WorkersListPage() {
                                         {formatTimeAgo(w.last_seen)}
                                     </td>
                                 </tr>
-                            ))}
+                            ))
+                            )}
                         </tbody>
                     </table>
                 </div>

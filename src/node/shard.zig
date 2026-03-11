@@ -1726,29 +1726,28 @@ pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     return true;
 }
 
-/// Stream waiter resolver: read new messages starting from min_version (last offset).
+/// Stream waiter resolver: read new messages starting after min_version (UAL index).
 /// Returns true if there are new messages to send.
 pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const partition = shard.defaultPartition();
 
-    const hwm = partition.stream.highWaterMark();
-    if (hwm <= waiter.min_version) return false; // no new messages
+    // min_version tracks the UAL max_index at the time of waiter registration
+    if (partition.ual.max_index <= waiter.min_version) return false; // no new writes
 
-    // Read from (min_version+1) to hwm
-    const start = waiter.min_version + 1;
-    const end = start + 100; // cap batch size
-    var entries: [100]@import("../projection/stream.zig").OffsetEntry = undefined;
-    const count = partition.stream.readRange(start, end, &entries);
+    const router = @import("router.zig");
+    const ns_hash = router.namespaceHash("default");
+    const name_hash = router.nameHash(ns_hash, waiter.key());
+
+    // Read all records from the stream (the handler already checked for data before registering)
+    var records: [100]@import("../projection/stream.zig").StreamRecord = undefined;
+    const count = partition.stream.readStreamAfter(name_hash, @import("../projection/stream.zig").StreamID.MIN, null, &records);
     if (count == 0) return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true;
 
-    // Compute actual start (readRange clamps to max(start, trim_offset+1))
-    const actual_start = @max(start, partition.stream.trim_offset + 1);
-
     // Serialize with full message format including payloads
-    const data = shard.stream_handler.serializeMessagesWithPayloads(entries[0..count], actual_start) catch return false;
+    const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count]) catch return false;
     defer shard.stream_handler.allocator.free(data);
     shard.sendOkResponse(conn, waiter.request_id, data);
     shard.flushToClient(waiter.fd);
@@ -1880,7 +1879,7 @@ fn replaySegments(
             if (etype == .stream_append) {
                 if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd| {
                     const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                    _ = partition.stream.append(ual_index, seg_entry.header.timestamp_ns, name_hash, 0) catch {};
+                    _ = partition.stream.appendToStream(name_hash, ual_index, 0) catch {};
                     partition.stream.registerStream(cmd.key) catch {};
                 }
             }

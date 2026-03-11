@@ -26,9 +26,8 @@ pub const Header = struct {
 /// Result from appending records
 pub const AppendResult = struct {
     count: usize,
-    first_sequence: u64,
-    last_sequence: u64,
-    timestamp_ms: i64,
+    first_id: StreamID,
+    last_id: StreamID,
 };
 
 /// Append records to a stream as a single batch request.
@@ -98,19 +97,20 @@ pub fn appendEx(
 
     var result = AppendResult{
         .count = payloads.len,
-        .first_sequence = 0,
-        .last_sequence = 0,
-        .timestamp_ms = 0,
+        .first_id = .{ .timestamp_ms = 0, .sequence = 0 },
+        .last_id = .{ .timestamp_ms = 0, .sequence = 0 },
     };
 
     // Parse response: [sequence:u64][timestamp_ms:i64] - 16 bytes
     // Note: Tag byte is NOT included in client response (only in cross-core messages)
     if (response.data.len >= 16) {
         var reader = WireReader.init(response.data);
-        result.first_sequence = reader.readU64() orelse 0;
-        result.timestamp_ms = reader.readI64() orelse 0;
-        // Last sequence = first_sequence + count - 1
-        result.last_sequence = result.first_sequence + payloads.len - 1;
+        const first_seq = reader.readU64() orelse 0;
+        const ts_raw = reader.readI64() orelse 0;
+        const ts: u64 = @intCast(@max(ts_raw, 0));
+        result.first_id = .{ .timestamp_ms = ts, .sequence = first_seq };
+        // Last ID: same timestamp, sequence = first + count - 1
+        result.last_id = .{ .timestamp_ms = ts, .sequence = first_seq + payloads.len - 1 };
     }
 
     return result;
@@ -200,13 +200,13 @@ pub fn info(
 }
 
 /// Trim stream using retention policies
-/// Supports: max_len (count), min_seq, max_age_seconds, max_bytes, dry_run
+/// Supports: max_len (count), min_id (StreamID), max_age_seconds, max_bytes, dry_run
 pub fn trim(
     client: *Client,
     namespace: []const u8,
     stream: []const u8,
     max_len: ?u64,
-    min_seq: ?u64,
+    min_id: ?StreamID,
     max_age_seconds: ?u64,
     max_bytes: ?u64,
     dry_run: bool,
@@ -218,9 +218,8 @@ pub fn trim(
         try builder.addU64(.limit, len);
     }
 
-    if (min_seq) |seq| {
-        // Use stream_start with StreamID (timestamp=0, sequence=seq)
-        try builder.addStreamId(.stream_start, 0, seq);
+    if (min_id) |sid| {
+        try builder.addStreamId(.stream_start, sid.timestamp_ms, sid.sequence);
     }
 
     if (max_age_seconds) |age| {
@@ -384,13 +383,17 @@ pub fn groupAck(
     stream: []const u8,
     group: []const u8,
     consumer: []const u8,
-    seqs: []const u64,
+    ids: []const StreamID,
 ) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
     var writer = FixedWireWriter(4096).init();
     try writer.writeLengthPrefixed(u16, group);
     try writer.writeLengthPrefixed(u16, consumer);
-    try writer.writeU64ArrayWithCount(seqs);
+    try writer.writeU32(@intCast(ids.len));
+    for (ids) |id| {
+        try writer.writeU64(id.timestamp_ms);
+        try writer.writeU64(id.sequence);
+    }
 
     return client.sendRequest(.stream_group_ack, namespace, stream, writer.bytes());
 }
@@ -417,9 +420,9 @@ pub fn groupNack(
     stream: []const u8,
     group: []const u8,
     consumer: []const u8,
-    seqs: []const u64,
+    ids: []const StreamID,
 ) !Response {
-    return groupNackWithDelay(client, namespace, stream, group, consumer, seqs, null);
+    return groupNackWithDelay(client, namespace, stream, group, consumer, ids, null);
 }
 
 /// Nack messages with optional redelivery delay
@@ -429,14 +432,18 @@ pub fn groupNackWithDelay(
     stream: []const u8,
     group: []const u8,
     consumer: []const u8,
-    seqs: []const u64,
+    ids: []const StreamID,
     redelivery_delay_ms: ?u32,
 ) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
     var writer = FixedWireWriter(4096).init();
     try writer.writeLengthPrefixed(u16, group);
     try writer.writeLengthPrefixed(u16, consumer);
-    try writer.writeU64ArrayWithCount(seqs);
+    try writer.writeU32(@intCast(ids.len));
+    for (ids) |id| {
+        try writer.writeU64(id.timestamp_ms);
+        try writer.writeU64(id.sequence);
+    }
 
     if (redelivery_delay_ms) |ms| {
         var options_buf: [16]u8 = undefined;
@@ -550,13 +557,17 @@ pub fn groupTouch(
     stream: []const u8,
     group: []const u8,
     consumer: []const u8,
-    seqs: []const u64,
+    ids: []const StreamID,
     extend_ms: ?u32,
 ) !TouchResult {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
     var writer = FixedWireWriter(4096).init();
     try writer.writePair(u16, u16, group, consumer);
-    try writer.writeU64ArrayWithCount(seqs);
+    try writer.writeU32(@intCast(ids.len));
+    for (ids) |id| {
+        try writer.writeU64(id.timestamp_ms);
+        try writer.writeU64(id.sequence);
+    }
 
     var response: Response = undefined;
     if (extend_ms) |ms| {

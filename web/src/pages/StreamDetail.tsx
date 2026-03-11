@@ -12,14 +12,14 @@ import type { StreamMessage, ConsumerGroup, PendingMessage } from "../lib/types"
 
 /** Map API stream message to the component's StreamMessage shape */
 function toStreamMessage(msg: StreamMessagesResponse['messages'][0]): StreamMessage {
-    const streamId = `${msg.timestamp_ms}-${msg.sequence}`;
+    const streamId = `${msg.id_ms}-${msg.id_seq}`;
     return {
         id: streamId,
-        seq: msg.sequence,
-        timestamp: msg.timestamp_ms,
-        key: `P${msg.partition}`,
-        size: new TextEncoder().encode(msg.payload).length,
-        payload: msg.payload,
+        id_ms: msg.id_ms,
+        id_seq: msg.id_seq,
+        key: '',
+        size: msg.size,
+        payload: '',
     };
 }
 
@@ -27,13 +27,13 @@ function toStreamMessage(msg: StreamMessagesResponse['messages'][0]): StreamMess
 function toPendingMessage(entry: GroupPendingResponse['pending'][0], groupName: string): PendingMessage {
     const now = Date.now();
     return {
-        id: entry.id,
-        seq: 0,
+        id: `${entry.id_ms}-${entry.id_seq}`,
+        id_seq: entry.id_seq,
         key: '',
         consumer: entry.consumer,
         groupName,
         deliveryCount: entry.delivery_count,
-        idleTime: now - entry.delivered_at,
+        idleTime: now - entry.delivered_at_ms,
         reclaimIn: 0,
         payload: '',
     };
@@ -47,7 +47,7 @@ export function StreamDetail() {
         () => api.getStreamDetail(streamId || ''), [streamId], 5000
     );
     const { data: messagesResp } = useApi(
-        () => api.getStreamMessages(streamId || '', 0, 2000, selectedPartition),
+        () => api.getStreamMessages(streamId || '', undefined, 2000, selectedPartition),
         [streamId, selectedPartition], 5000
     );
 
@@ -82,7 +82,7 @@ export function StreamDetail() {
 
     const groups: ConsumerGroup[] = detail.consumer_groups.map((g, i) => ({
         name: g.name,
-        current_seq: 0,
+        current_id: '0-0',
         lag: g.lag,
         color: ['#10B981', '#3B82F6', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899'][i % 6],
     }));

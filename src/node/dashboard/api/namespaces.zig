@@ -38,10 +38,22 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // Collect namespace names from metrics registry
+    // Collect namespace names from multiple sources
     var ns_set = std.StringHashMap(void).init(allocator);
     defer ns_set.deinit();
 
+    // 1. From shard 0's namespace handler (explicit namespace registry)
+    if (ctx.shard_ptrs) |ptrs| {
+        if (ptrs.len > 0) {
+            const shard: *Shard = @ptrCast(@alignCast(ptrs[0]));
+            var ns_it = shard.namespace_handler.namespaces.iterator();
+            while (ns_it.next()) |entry| {
+                try ns_set.put(entry.key_ptr.*, {});
+            }
+        }
+    }
+
+    // 2. From metrics registry (implicit namespaces from data writes)
     {
         ctx.metrics.mutex.lock();
         defer ctx.metrics.mutex.unlock();
@@ -86,6 +98,84 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
 
     try arr.end();
     return try json_buf.toOwnedSlice(allocator);
+}
+
+/// POST /namespaces — Create a new namespace (direct integration with shard 0 namespace handler)
+pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+    // Parse the name from JSON body: {"name": "..."}
+    const name = extractName(body) orelse {
+        return h.jsonError(allocator, "missing or invalid \"name\" field");
+    };
+
+    // Validate
+    if (name.len == 0) return h.jsonError(allocator, "namespace name is required");
+    if (name.len > 128) return h.jsonError(allocator, "namespace name too long (max 128)");
+    if (!isValidNamespaceName(name)) return h.jsonError(allocator, "invalid namespace name: must start with letter/underscore, contain only [a-zA-Z0-9_.-]");
+    if (isReservedNamespace(name)) return h.jsonError(allocator, "reserved namespace name");
+
+    // Access shard 0 (namespace commands are controller-only)
+    const ptrs = ctx.shard_ptrs orelse return h.jsonError(allocator, "shards not initialized");
+    if (ptrs.len == 0) return h.jsonError(allocator, "no shards available");
+    const shard: *Shard = @ptrCast(@alignCast(ptrs[0]));
+
+    // Check if already exists
+    if (std.mem.eql(u8, name, "default")) return h.jsonError(allocator, "namespace already exists");
+    if (shard.namespace_handler.namespaces.contains(name)) return h.jsonError(allocator, "namespace already exists");
+
+    // Apply creation to shard 0's namespace handler (in-memory registration)
+    shard.namespace_handler.applyCreate(name);
+
+    // Return success
+    var json_buf: std.ArrayList(u8) = .empty;
+    errdefer json_buf.deinit(allocator);
+    const writer = json_buf.writer(allocator);
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("name", name);
+    try obj.boolField("ok", true);
+    try obj.end();
+    return try json_buf.toOwnedSlice(allocator);
+}
+
+fn extractName(body: []const u8) ?[]const u8 {
+    // Simple JSON extraction: find "name":"..." or "name": "..."
+    const needle = "\"name\"";
+    const idx = std.mem.indexOf(u8, body, needle) orelse return null;
+    const after = body[idx + needle.len ..];
+    // Skip whitespace and colon
+    var i: usize = 0;
+    while (i < after.len and (after[i] == ' ' or after[i] == ':' or after[i] == '\t')) : (i += 1) {}
+    if (i >= after.len or after[i] != '"') return null;
+    i += 1; // skip opening quote
+    const start = i;
+    while (i < after.len and after[i] != '"') : (i += 1) {}
+    if (i >= after.len) return null;
+    return after[start..i];
+}
+
+fn isValidNamespaceName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+            else => return false,
+        }
+    }
+    return switch (name[0]) {
+        'a'...'z', 'A'...'Z', '_' => true,
+        else => false,
+    };
+}
+
+fn isReservedNamespace(name: []const u8) bool {
+    const reserved = [_][]const u8{ "__system", "__internal", "__meta", "_flo" };
+    for (reserved) |prefix| {
+        if (name.len >= prefix.len and std.mem.eql(u8, name[0..prefix.len], prefix)) {
+            if (name.len == prefix.len) return true;
+            if (name[prefix.len] == ':' or name[prefix.len] == '.') return true;
+        }
+    }
+    return false;
 }
 
 /// GET /namespaces/:name - Namespace detail with resource arrays

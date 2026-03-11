@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { Cpu, Zap, Play, ChevronRight, Users, Clock, RotateCcw, AlertTriangle, CheckCircle2, XCircle, Timer, Ban, HardDrive } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api, type ActionInfo } from "../lib/api";
-import { useApi, LoadingState, ErrorState, EmptyState } from "../lib/useApi";
+import { useApi, LoadingState, ErrorState } from "../lib/useApi";
 import { cn } from "../lib/utils";
 
 function StatusBadge({ enabled }: { enabled: boolean }) {
@@ -191,20 +191,15 @@ export function ActionsList() {
 
     if (loading && !actions) return <LoadingState />;
     if (error) return <ErrorState message={error} onRetry={refetch} />;
-    if (!actions || actions.length === 0) return (
-        <EmptyState
-            title="No actions registered"
-            description="Register an action via the CLI: flo action register <name> --type user --owner you@example.com"
-        />
-    );
 
-    const filtered = filter === 'all' ? actions : actions.filter(a => a.type === filter);
+    const allActions = actions || [];
+    const filtered = filter === 'all' ? allActions : allActions.filter(a => a.type === filter);
 
     // Summary stats
-    const totalRuns = actions.reduce((sum, a) => sum + a.runs.total, 0);
-    const totalFailed = actions.reduce((sum, a) => sum + a.runs.failed, 0);
-    const totalRunning = actions.reduce((sum, a) => sum + a.runs.running, 0);
-    const totalWorkers = actions.reduce((sum, a) => sum + a.worker_count, 0);
+    const totalRuns = allActions.reduce((sum, a) => sum + a.runs.total, 0);
+    const totalFailed = allActions.reduce((sum, a) => sum + a.runs.failed, 0);
+    const totalRunning = allActions.reduce((sum, a) => sum + a.runs.running, 0);
+    const totalWorkers = allActions.reduce((sum, a) => sum + a.worker_count, 0);
 
     return (
         <div className="space-y-6">
@@ -230,7 +225,7 @@ export function ActionsList() {
                         <div className="flex items-center justify-between">
                             <div>
                                 <p className="text-xs text-text-secondary font-medium uppercase tracking-wider">Actions</p>
-                                <p className="text-2xl font-bold">{actions.length}</p>
+                                <p className="text-2xl font-bold">{allActions.length}</p>
                             </div>
                             <div className="p-2 rounded-lg bg-primary/10">
                                 <Zap className="w-5 h-5 text-primary" />
@@ -300,7 +295,7 @@ export function ActionsList() {
                                 : "bg-surface-hover text-text-secondary hover:text-text-primary"
                         )}
                     >
-                        {f === 'all' ? `All (${actions.length})` : f === 'user' ? `User (${actions.filter(a => a.type === 'user').length})` : `WASM (${actions.filter(a => a.type === 'wasm').length})`}
+                        {f === 'all' ? `All (${allActions.length})` : f === 'user' ? `User (${allActions.filter(a => a.type === 'user').length})` : `WASM (${allActions.filter(a => a.type === 'wasm').length})`}
                     </button>
                 ))}
                 {totalFailed > 0 && (
@@ -322,9 +317,13 @@ export function ActionsList() {
                 ))}
             </div>
             {filtered.length === 0 && (
-                <div className="text-center py-12 text-text-secondary text-sm">
-                    No {filter} actions found.
-                </div>
+                <Card>
+                    <div className="text-center py-12 text-text-secondary text-sm">
+                        {allActions.length === 0
+                            ? 'No actions registered yet. Register one via CLI: flo action register <name> --type user'
+                            : `No ${filter} actions found.`}
+                    </div>
+                </Card>
             )}
         </div>
     );

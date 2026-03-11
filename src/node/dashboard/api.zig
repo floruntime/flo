@@ -35,6 +35,7 @@ pub fn handleRequest(
 ) ![]const u8 {
     // ── namespaces ──────────────────────────────────────────
     if (std.mem.eql(u8, path, "namespaces")) {
+        if (method == .POST) return namespaces.createNamespace(allocator, body, ctx);
         return namespaces.getNamespaces(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "namespaces/")) {

@@ -122,6 +122,9 @@ pub const SystemManifest = struct {
     }
 
     fn printMismatchError(comptime what: []const u8, existing: anytype, requested: anytype) void {
+        // Suppress visual banner in test builds — the structured log.err above is sufficient
+        if (@import("builtin").is_test) return;
+
         std.debug.print(
             "\n" ++
                 "╔═══════════════════════════════════════════════════════════════╗\n" ++

@@ -367,7 +367,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
     };
 
     // Construct StreamID from the append response
-    const stream_id = StreamID{ .timestamp_ms = @intCast(result.timestamp_ms), .sequence = result.first_sequence };
+    const stream_id = result.first_id;
     var id_buf: [64]u8 = undefined;
     const id_str = stream_id.format(&id_buf) catch "0-0";
 
@@ -375,7 +375,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         if (payloads.len == 1) {
             ctx.print("{{\"stream_id\":\"{s}\",\"count\":1}}\n", .{id_str});
         } else {
-            const last_id = StreamID{ .timestamp_ms = @intCast(result.timestamp_ms), .sequence = result.last_sequence };
+            const last_id = result.last_id;
             var last_buf: [64]u8 = undefined;
             const last_str = last_id.format(&last_buf) catch "0-0";
             ctx.print("{{\"first_id\":\"{s}\",\"last_id\":\"{s}\",\"count\":{d}}}\n", .{ id_str, last_str, payloads.len });
@@ -819,18 +819,18 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     const json_output = ctx.getBool("json");
 
     // Parse --before StreamID if provided
-    var min_seq: ?u64 = null;
+    var min_id: ?StreamID = null;
     if (before_str) |bs| {
         if (bs.len > 0) {
             const before_id = StreamID.parse(bs) catch {
                 ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{bs});
                 return error.CommandFailed;
             };
-            min_seq = before_id.sequence;
+            min_id = before_id;
         }
     }
 
-    if (maxlen == null and min_seq == null and maxage == null and maxbytes == null) {
+    if (maxlen == null and min_id == null and maxage == null and maxbytes == null) {
         ctx.printErr("Error: Specify at least one of --before, --maxlen, --maxage, or --maxbytes\n", .{});
         return;
     }
@@ -843,8 +843,8 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    // trim(client, namespace, stream, max_len, min_seq, max_age_seconds, max_bytes, dry_run)
-    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_seq, maxage, maxbytes, dry_run) catch |err| {
+    // trim(client, namespace, stream, max_len, min_id, max_age_seconds, max_bytes, dry_run)
+    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_id, maxage, maxbytes, dry_run) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };
@@ -1078,8 +1078,8 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
     const json_output = ctx.getBool("json");
 
     // Parse comma-separated StreamIDs
-    var seqs: std.ArrayList(u64) = .empty;
-    defer seqs.deinit(ctx.allocator);
+    var ids: std.ArrayList(StreamID) = .empty;
+    defer ids.deinit(ctx.allocator);
 
     var iter = std.mem.splitScalar(u8, ids_str, ',');
     while (iter.next()) |id_str| {
@@ -1090,13 +1090,13 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
             return error.CommandFailed;
         };
-        seqs.append(ctx.allocator, stream_id.sequence) catch {
+        ids.append(ctx.allocator, stream_id) catch {
             ctx.printErr("Error: Out of memory\n", .{});
             return error.CommandFailed;
         };
     }
 
-    if (seqs.items.len == 0) {
+    if (ids.items.len == 0) {
         ctx.printErr("Error: No valid StreamIDs provided\n", .{});
         return error.MissingRequiredArg;
     }
@@ -1109,8 +1109,8 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // groupAck(client, namespace, stream, group, consumer, seqs)
-    var response = client_mod.stream.groupAck(&client, namespace, stream, group, consumer, seqs.items) catch |err| {
+    // groupAck(client, namespace, stream, group, consumer, ids)
+    var response = client_mod.stream.groupAck(&client, namespace, stream, group, consumer, ids.items) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -1122,9 +1122,9 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
     }
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"acknowledged\":{d}}}\n", .{seqs.items.len});
+        ctx.print("{{\"status\":\"ok\",\"acknowledged\":{d}}}\n", .{ids.items.len});
     } else {
-        ctx.print("Acknowledged {d} message(s)\n", .{seqs.items.len});
+        ctx.print("Acknowledged {d} message(s)\n", .{ids.items.len});
     }
 }
 
@@ -1293,9 +1293,9 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
     const json_output = ctx.getBool("json");
     const delay = ctx.getChangedUint("delay");
 
-    // Parse StreamIDs and convert to sequences for the wire protocol
-    var seqs: std.ArrayList(u64) = .empty;
-    defer seqs.deinit(ctx.allocator);
+    // Parse StreamIDs for the wire protocol
+    var ids: std.ArrayList(StreamID) = .empty;
+    defer ids.deinit(ctx.allocator);
 
     var it = std.mem.splitScalar(u8, ids_str, ',');
     while (it.next()) |id_str| {
@@ -1306,13 +1306,13 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
             return error.CommandFailed;
         };
-        seqs.append(ctx.allocator, stream_id.sequence) catch {
+        ids.append(ctx.allocator, stream_id) catch {
             ctx.printErr("Error: Out of memory\n", .{});
             return error.CommandFailed;
         };
     }
 
-    if (seqs.items.len == 0) {
+    if (ids.items.len == 0) {
         ctx.printErr("Error: No valid StreamIDs provided\n", .{});
         return error.MissingRequiredArg;
     }
@@ -1332,7 +1332,7 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
         stream,
         group,
         consumer,
-        seqs.items,
+        ids.items,
         if (delay) |d| @intCast(d) else null,
     ) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
@@ -1346,9 +1346,9 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
     }
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"released\":{d}}}\n", .{seqs.items.len});
+        ctx.print("{{\"status\":\"ok\",\"released\":{d}}}\n", .{ids.items.len});
     } else {
-        ctx.print("Released {d} messages for redelivery\n", .{seqs.items.len});
+        ctx.print("Released {d} messages for redelivery\n", .{ids.items.len});
     }
 }
 
@@ -1378,9 +1378,9 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
     const json_output = ctx.getBool("json");
     const extend_ms = ctx.getChangedUint("extend");
 
-    // Parse StreamIDs and convert to sequences for the wire protocol
-    var seqs: std.ArrayList(u64) = .empty;
-    defer seqs.deinit(ctx.allocator);
+    // Parse StreamIDs for the wire protocol
+    var ids: std.ArrayList(StreamID) = .empty;
+    defer ids.deinit(ctx.allocator);
 
     var it = std.mem.splitScalar(u8, ids_str, ',');
     while (it.next()) |id_str| {
@@ -1391,13 +1391,13 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
             return error.CommandFailed;
         };
-        seqs.append(ctx.allocator, stream_id.sequence) catch {
+        ids.append(ctx.allocator, stream_id) catch {
             ctx.printErr("Error: Out of memory\n", .{});
             return error.CommandFailed;
         };
     }
 
-    if (seqs.items.len == 0) {
+    if (ids.items.len == 0) {
         ctx.printErr("Error: No valid StreamIDs provided\n", .{});
         return error.MissingRequiredArg;
     }
@@ -1416,7 +1416,7 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
         stream,
         group,
         consumer,
-        seqs.items,
+        ids.items,
         if (extend_ms) |ms| @intCast(ms) else null,
     ) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});

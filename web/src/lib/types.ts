@@ -58,8 +58,8 @@ export interface PartitionStat {
 
 export interface StreamMessage {
     id: string;
-    seq: number;
-    timestamp: number;
+    id_ms: number;
+    id_seq: number;
     key: string;
     size: number;
     payload: string;
@@ -67,14 +67,14 @@ export interface StreamMessage {
 
 export interface ConsumerGroup {
     name: string;
-    current_seq: number;
+    current_id: string;
     lag: number;
     color: string;
 }
 
 export interface PendingMessage {
     id: string;
-    seq: number;
+    id_seq: number;
     key: string;
     consumer: string;
     groupName: string;

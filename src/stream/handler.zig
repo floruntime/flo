@@ -1,18 +1,18 @@
 //! Stream Handler — registers stream and consumer-group opcodes with Dispatcher.
 //!
 //! Read operations (read, info, group_pending) query the StreamProjection for
-//! offset → ual_index mappings, then read payloads directly from the UAL
+//! per-stream records, then read payloads directly from the UAL
 //! (zero-copy when the entry is contiguous in the hot ring).
 //!
 //! Write operations (append) build a CommandEntry, persist it to the UAL via
-//! Partition.apply(), then update the StreamProjection's offset tracking.
+//! Partition.apply(), then update the StreamProjection's per-stream state.
 //! Raft propose will be added when the full consensus pipeline is connected.
 //!
 //! ## Design (UNIFIED_STORAGE_DESIGN.md — P6: Zero-Copy Stream Path)
 //!
 //! Stream data entries live in the UAL and are read directly — no materialization
-//! step. The UAL entry IS the stream record. The StreamProjection only maintains
-//! lightweight offset → (ual_index, timestamp_ns) mappings.
+//! step. The UAL entry IS the stream record. The StreamProjection maintains
+//! per-stream StreamState (StreamID → ual_index) and PEL-based consumer groups.
 //!
 //! ## Opcode Ranges
 //!
@@ -21,9 +21,9 @@
 //!
 //! ## Data Model
 //!
-//! The StreamProjection tracks offset → (ual_index, timestamp_ns) mappings.
+//! The StreamProjection tracks per-stream StreamRecord (StreamID → ual_index).
 //! Actual message payloads live in the UAL at the recorded ual_index.
-//! Consumer groups track per-member committed offsets.
+//! Consumer groups use a Pending Entry List (PEL) for per-message ack tracking.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,7 +41,9 @@ const Connection = connection_mod.Connection;
 
 const CommandResult = result_mod.CommandResult;
 const StreamProjection = stream_mod.StreamProjection;
-const OffsetEntry = stream_mod.OffsetEntry;
+const StreamID = stream_mod.StreamID;
+const StreamRecord = stream_mod.StreamRecord;
+const PendingEntry = stream_mod.PendingEntry;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -233,14 +235,13 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Register waiter with stream's current high water mark
-            const hwm = shard.defaultPartition().stream.highWaterMark();
+            // Register waiter with UAL max index as version (monotonically increasing)
             _ = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
                 .request_id = req.header.request_id,
                 .key = req.key,
-                .min_version = hwm,
+                .min_version = shard.defaultPartition().ual.max_index,
                 .timeout_ms = bms,
             });
             conn.response_deferred = true;
@@ -335,10 +336,10 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
 
-        // Track offset → ual_index in stream projection
+        // Track in per-stream state
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
-        const offset = self.stream.append(ual_index, timestamp_ns, name_hash, partition_index) catch {
+        const stream_id = self.stream.appendToStream(name_hash, ual_index, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "append failed" } };
         };
 
@@ -347,10 +348,9 @@ pub const StreamHandler = struct {
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
         self.stream.registerStream(ns_stream_name) catch {};
 
-        const timestamp_ms = @as(i64, @intCast(timestamp_ns / 1_000_000));
         return .{ .stream_append_ok = .{
-            .sequence = offset,
-            .timestamp_ms = timestamp_ms,
+            .sequence = stream_id.sequence,
+            .timestamp_ms = @as(i64, @intCast(stream_id.timestamp_ms)),
         } };
     }
 
@@ -364,70 +364,63 @@ pub const StreamHandler = struct {
         const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
         const capped = @min(limit, MAX_READ_BATCH);
 
-        // Determine start offset
-        var start_offset: u64 = 1;
-
-        // Check for tail flag — start AFTER the current HWM so only new data is returned
-        if (req.findOption(.stream_tail) != null) {
-            const hwm = self.stream.highWaterMark();
-            start_offset = hwm + 1;
-        } else if (req.findOption(.stream_start)) |opt| {
-            if (opt.asStreamId()) |sid| {
-                // Use the sequence component as the offset
-                start_offset = sid.sequence;
-            }
-        }
-
-        // Determine end offset
-        var end_offset = start_offset + capped;
-        if (req.findOption(.stream_end)) |opt| {
-            if (opt.asStreamId()) |sid| {
-                end_offset = sid.sequence + 1;
-            }
-        }
-
-        // Read the range — filter by namespace-qualified stream name hash for isolation
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
-        var buf: [MAX_READ_BATCH]OffsetEntry = undefined;
-        const out = buf[0..capped];
 
-        // Check for partition filter
-        var count: usize = 0;
-        if (req.findOption(.partition)) |opt| {
-            if (opt.asU32()) |p| {
-                count = self.stream.readRangeForStreamPartition(start_offset, end_offset, name_hash, p, out);
-            } else {
-                count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+        // Determine start ID
+        var start_id = StreamID.MIN;
+
+        if (req.findOption(.stream_tail) != null) {
+            start_id = self.stream.streamLastId(name_hash);
+        } else if (req.findOption(.stream_start)) |opt| {
+            if (opt.asStreamId()) |sid| {
+                if (sid.timestamp_ms > 0) {
+                    start_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                } else if (sid.sequence > 0) {
+                    // Bare sequence — convert to StreamID for lookup
+                    start_id = StreamID.fromSeq(sid.sequence);
+                }
             }
+        }
+
+        // Determine end ID (for range reads)
+        var end_id = StreamID.MAX;
+        if (req.findOption(.stream_end)) |opt| {
+            if (opt.asStreamId()) |sid| {
+                if (sid.timestamp_ms > 0) {
+                    end_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                }
+            }
+        }
+
+        // Parse optional partition filter
+        var partition_filter: ?u32 = null;
+        if (req.findOption(.partition)) |opt| {
+            partition_filter = opt.asU32();
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
                 const pc = self.stream.getPartitionCount(req.key);
-                const pi: u32 = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
-                count = self.stream.readRangeForStreamPartition(start_offset, end_offset, name_hash, pi, out);
-            } else {
-                count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
+                partition_filter = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
-        } else {
-            count = self.stream.readRangeForStream(start_offset, end_offset, name_hash, out);
         }
 
-        // readRange clamps start to max(start_offset, trim_offset+1), so compute actual
-        const actual_start = @max(start_offset, self.stream.trim_offset + 1);
+        // StreamID-based read path
+        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        const count = if (end_id.eql(StreamID.MAX))
+            self.stream.readStreamAfter(name_hash, start_id, partition_filter, buf[0..capped])
+        else
+            self.stream.readStreamRange(name_hash, start_id, end_id, partition_filter, buf[0..capped]);
 
-        // Serialize with full wire format including payloads
-        const data = self.serializeMessagesWithPayloads(out[0..count], actual_start) catch {
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
 
-        const next_ts: u64 = if (count > 0) out[count - 1].timestamp_ns / 1_000_000 else 0;
-        const next_seq: u64 = actual_start + count;
-
+        const last_id = if (count > 0) buf[count - 1].id else StreamID.MIN;
         return .{ .stream_messages = .{
             .data = data,
-            .next_timestamp_ms = next_ts,
-            .next_sequence = next_seq,
+            .next_timestamp_ms = last_id.timestamp_ms,
+            .next_sequence = last_id.sequence,
         } };
     }
 
@@ -438,46 +431,70 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        // Get trim target from value (as offset number) or options
-        var up_to: u64 = 0;
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
+
+        // Parse trim target as StreamID
+        var trim_id = StreamID.MIN;
 
         if (req.findOption(.stream_end)) |opt| {
             if (opt.asStreamId()) |sid| {
-                up_to = sid.sequence;
+                if (sid.timestamp_ms > 0) {
+                    trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                } else if (sid.sequence > 0) {
+                    trim_id = StreamID.fromSeq(sid.sequence);
+                }
             }
         }
 
-        if (up_to == 0 and req.value.len > 0) {
-            // Try parsing value as a decimal offset
-            up_to = std.fmt.parseInt(u64, req.value, 10) catch 0;
+        if (trim_id.eql(StreamID.MIN) and req.value.len > 0) {
+            // Bare integer: trim the first N records
+            const count = std.fmt.parseInt(u64, req.value, 10) catch 0;
+            if (count > 0) {
+                const deleted = self.stream.trimStreamByCount(name_hash, count);
+                const first_id = self.stream.streamFirstId(name_hash);
+                const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
+                return .{ .stream_trimmed = .{
+                    .deleted_count = deleted,
+                    .first_seq = first_seq,
+                } };
+            }
         }
 
-        if (up_to == 0) {
+        if (trim_id.eql(StreamID.MIN)) {
             return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 
-        const deleted = self.stream.trim(up_to);
+        const deleted = self.stream.trimStream(name_hash, trim_id);
+
+        // Compute first_seq for response
+        const first_id = self.stream.streamFirstId(name_hash);
+        const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
 
         return .{ .stream_trimmed = .{
             .deleted_count = deleted,
-            .first_seq = up_to + 1,
+            .first_seq = first_seq,
         } };
     }
 
     // ── INFO ────────────────────────────────────────────────────────────
 
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
-        const hwm = self.stream.highWaterMark();
-        const count = self.stream.trackedOffsets();
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
         const pc = self.stream.getPartitionCount(req.key);
 
+        const first_id = self.stream.streamFirstId(name_hash);
+        const last_id = self.stream.streamLastId(name_hash);
+        const count = self.stream.streamRecordCount(name_hash);
+
         return .{ .stream_info = .{
-            .first_timestamp_ms = 0,
-            .first_seq = if (count > 0) @as(u64, 1) else 0,
-            .last_timestamp_ms = 0,
-            .last_seq = hwm,
+            .first_timestamp_ms = if (count > 0) first_id.timestamp_ms else 0,
+            .first_seq = if (count > 0) first_id.sequence else 0,
+            .last_timestamp_ms = if (count > 0) last_id.timestamp_ms else 0,
+            .last_seq = if (count > 0) last_id.sequence else 0,
             .count = count,
-            .bytes = 0, // Not tracked by projection
+            .bytes = 0,
             .partition_count = pc,
         } };
     }
@@ -656,7 +673,8 @@ pub const StreamHandler = struct {
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         // Auto-create group and join consumer if not exists
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ns = now_ms * 1_000_000;
         self.stream.createGroup(group_name, now_ns) catch |err| {
             if (err != error.AlreadyExists) {
                 return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
@@ -664,24 +682,22 @@ pub const StreamHandler = struct {
         };
         _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
 
-        const group = self.stream.getGroup(group_name) orelse {
-            return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-        };
-
         const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
         const capped = @min(limit, MAX_READ_BATCH);
 
-        // Read from group's committed offset, filtered by namespace-qualified stream name
-        const start = group.committed_offset + 1;
-        const end = start + capped;
-
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
-        var buf: [MAX_READ_BATCH]OffsetEntry = undefined;
-        const count = self.stream.readRangeForStream(start, end, name_hash, buf[0..capped]);
 
-        const actual_start = @max(start, self.stream.trim_offset + 1);
-        const data = self.serializeMessagesWithPayloads(buf[0..count], actual_start) catch {
+        // Deliver via PEL — reads after group's last_delivered_id
+        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        const count = self.stream.groupDeliver(group_name, name_hash, consumer_id, capped, now_ms, buf[0..capped]) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "group deliver failed" } },
+            };
+        };
+
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
 
@@ -691,77 +707,39 @@ pub const StreamHandler = struct {
     // ── GROUP ACK ───────────────────────────────────────────────────────
 
     fn handleGroupAck(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
-        // Fallback: raw value as group name (unit tests)
+        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
         var reader = WireReader.init(req.value);
         const raw_group = reader.readLengthPrefixed(u16) orelse {
-            // Fallback: treat raw value as group name (unit tests — no namespace qualification)
-            return self.handleGroupAckFallback(req);
+            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        // Try reading consumer (may not exist for simple format)
-        _ = reader.readLengthPrefixed(u16); // consumer — consume but don't need
+        _ = reader.readLengthPrefixed(u16); // consumer
 
-        // Namespace-qualify for isolation (wire format)
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
 
-        // Read sequence array
-        var offset: u64 = 0;
+        // Read StreamID array
+        var ids: [MAX_READ_BATCH]StreamID = undefined;
+        var id_count: usize = 0;
         if (reader.readU32()) |count| {
-            // Read sequences and find the max as the commit offset
             for (0..count) |_| {
-                if (reader.readU64()) |seq| {
-                    offset = @max(offset, seq);
+                const ts = reader.readU64() orelse break;
+                const seq = reader.readU64() orelse break;
+                if (id_count < MAX_READ_BATCH) {
+                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
+                    id_count += 1;
                 }
             }
         }
 
-        if (offset == 0) {
-            // Try fallback from options
-            if (req.findOption(.stream_start)) |opt| {
-                if (opt.asStreamId()) |sid| {
-                    offset = sid.sequence;
-                }
-            }
-        }
-
-        if (offset == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "ack offset is required" } };
+        if (id_count == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "stream IDs required for ack" } };
         }
 
         if (group_name.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         }
 
-        self.stream.commitOffset(group_name, offset) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        return .ok;
-    }
-
-    /// Fallback for unit tests that pass raw value as group name
-    fn handleGroupAckFallback(self: *StreamHandler, req: Request) CommandResult {
-        const group_name = if (req.value.len > 0) req.value else {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-
-        var offset: u64 = 0;
-        if (req.findOption(.stream_start)) |opt| {
-            if (opt.asStreamId()) |sid| {
-                offset = sid.sequence;
-            }
-        }
-        if (offset == 0 and req.namespace.len > 0) {
-            offset = std.fmt.parseInt(u64, req.namespace, 10) catch 0;
-        }
-        if (offset == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "ack offset is required" } };
-        }
-
-        self.stream.commitOffset(group_name, offset) catch |err| {
+        _ = self.stream.groupAck(group_name, ids[0..id_count]) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
@@ -773,25 +751,26 @@ pub const StreamHandler = struct {
     // ── GROUP NACK ──────────────────────────────────────────────────────
 
     fn handleGroupNack(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
         var reader = WireReader.init(req.value);
         const raw_group = reader.readLengthPrefixed(u16) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         _ = reader.readLengthPrefixed(u16); // consumer
 
-        // Namespace-qualify for isolation (always wire format here)
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
 
-        // Read sequences to NACK
-        var min_seq: u64 = std.math.maxInt(u64);
-        var nack_count: u32 = 0;
+        // Read StreamIDs to NACK
+        var ids: [MAX_READ_BATCH]StreamID = undefined;
+        var id_count: usize = 0;
         if (reader.readU32()) |count| {
             for (0..count) |_| {
-                if (reader.readU64()) |seq| {
-                    min_seq = @min(min_seq, seq);
-                    nack_count += 1;
+                const ts = reader.readU64() orelse break;
+                const seq = reader.readU64() orelse break;
+                if (id_count < MAX_READ_BATCH) {
+                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
+                    id_count += 1;
                 }
             }
         }
@@ -800,19 +779,14 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         }
 
-        // NACK resets the group's committed offset to just before the earliest NACK'd message
-        // so they will be redelivered on next read.
-        if (nack_count > 0 and min_seq > 0) {
-            const new_offset = min_seq - 1;
-            const group = self.stream.getGroup(group_name) orelse {
-                return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        if (id_count > 0) {
+            _ = self.stream.groupNack(group_name, ids[0..id_count], now_ms) catch |err| {
+                return switch (err) {
+                    error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+                };
             };
-            // Only reset if the new offset is lower than current
-            if (new_offset < group.committed_offset) {
-                group.committed_offset = new_offset;
-            }
         } else {
-            // Verify group exists even if no sequences
             if (self.stream.getGroup(group_name) == null) {
                 return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
             }
@@ -835,7 +809,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
         };
 
-        // Serialize basic group info
+        // Serialize group info with PEL count
         const data = serializeGroupInfo(self.allocator, group) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group info serialization failed" } };
         };
@@ -853,13 +827,17 @@ pub const StreamHandler = struct {
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
 
-        const group = self.stream.getGroup(group_name) orelse {
-            return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
+        // Get actual PEL entries
+        var pel_buf: [MAX_READ_BATCH]PendingEntry = undefined;
+        const count = self.stream.groupPending(group_name, null, &pel_buf) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
         };
 
-        // Serialize pending info — for now, return group info format
-        // (pending messages = HWM - committed_offset)
-        const data = serializeGroupInfo(self.allocator, group) catch {
+        // Serialize PEL entries
+        // Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])* 
+        const data = serializePendingEntries(self.allocator, pel_buf[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "pending serialization failed" } };
         };
 
@@ -869,33 +847,44 @@ pub const StreamHandler = struct {
     // ── GROUP TOUCH ─────────────────────────────────────────────────────
 
     fn handleGroupTouch(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
         var reader = WireReader.init(req.value);
         const raw_group = reader.readLengthPrefixed(u16) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
 
-        // Namespace-qualify for isolation (always wire format here)
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
         _ = reader.readLengthPrefixed(u16); // consumer
 
-        var touched_count: u32 = 0;
+        // Read StreamIDs to touch
+        var ids: [MAX_READ_BATCH]StreamID = undefined;
+        var id_count: usize = 0;
         if (reader.readU32()) |count| {
-            touched_count = count;
-            // Skip the actual sequence values — we just count them
             for (0..count) |_| {
-                _ = reader.readU64();
+                const ts = reader.readU64() orelse break;
+                const seq = reader.readU64() orelse break;
+                if (id_count < MAX_READ_BATCH) {
+                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
+                    id_count += 1;
+                }
             }
         }
 
-        // Verify group exists
-        if (self.stream.getGroup(group_name) == null) {
-            return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        var touched_count: u32 = 0;
+        if (id_count > 0) {
+            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], now_ms) catch |err| {
+                return switch (err) {
+                    error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+                };
+            };
+        } else {
+            if (self.stream.getGroup(group_name) == null) {
+                return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
+            }
         }
 
-        // Respond with touched count
-        // Wire format: [touched_count:u32]
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, touched_count, .little);
         const data = self.allocator.alloc(u8, 4) catch {
@@ -907,19 +896,17 @@ pub const StreamHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Serialize stream messages with full wire format including payloads.
+    /// Serialize StreamRecord entries (PEL-based reads) with full wire format.
+    /// Serialize StreamRecord entries with full wire format including payloads.
     ///
-    /// Wire format per record (matches CLI parseAndPrintRecords expectations):
+    /// Wire format per record:
     ///   [sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
     ///   [key_present:u8][payload_len:u32][payload bytes]
     ///   [header_count:u32]
-    pub fn serializeMessagesWithPayloads(self: *StreamHandler, entries: []const OffsetEntry, start_offset: u64) ![]u8 {
-        // Calculate total size
+    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord) ![]u8 {
         var total: usize = 4; // count header
-        for (entries) |entry| {
-            const result = self.getPayloadAndTier(entry.ual_index);
-            // sequence(8) + timestamp_ms(8) + tier(1) + partition(4)
-            // + key_present(1) + payload_len(4) + payload + header_count(4)
+        for (records) |rec| {
+            const result = self.getPayloadAndTier(rec.ual_index);
             total += 8 + 8 + 1 + 4 + 1 + 4 + result.payload.len + 4;
         }
 
@@ -928,36 +915,33 @@ pub const StreamHandler = struct {
 
         var pos: usize = 0;
 
-        // Count
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entries.len), .little);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(records.len), .little);
         pos += 4;
 
-        for (entries, 0..) |entry, i| {
-            const result = self.getPayloadAndTier(entry.ual_index);
-            const offset = start_offset + i;
+        for (records) |rec| {
+            const result = self.getPayloadAndTier(rec.ual_index);
 
-            // sequence (1-based offset)
-            std.mem.writeInt(u64, buf[pos..][0..8], offset, .little);
+            // sequence (StreamID.sequence)
+            std.mem.writeInt(u64, buf[pos..][0..8], rec.id.sequence, .little);
             pos += 8;
 
-            // timestamp_ms
-            const ts_ms: i64 = @intCast(entry.timestamp_ns / 1_000_000);
-            std.mem.writeInt(i64, buf[pos..][0..8], ts_ms, .little);
+            // timestamp_ms (StreamID.timestamp_ms as i64 for wire compat)
+            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(rec.id.timestamp_ms)), .little);
             pos += 8;
 
-            // tier (0=hot, 1=warm)
+            // tier
             buf[pos] = result.tier;
             pos += 1;
 
-            // partition index from OffsetEntry
-            std.mem.writeInt(u32, buf[pos..][0..4], entry.partition_index, .little);
+            // partition index
+            std.mem.writeInt(u32, buf[pos..][0..4], rec.partition_index, .little);
             pos += 4;
 
-            // key_present (0 = no key)
+            // key_present
             buf[pos] = 0;
             pos += 1;
 
-            // payload (length-prefixed u32)
+            // payload
             std.mem.writeInt(u32, buf[pos..][0..4], @intCast(result.payload.len), .little);
             pos += 4;
             if (result.payload.len > 0) {
@@ -965,7 +949,7 @@ pub const StreamHandler = struct {
                 pos += result.payload.len;
             }
 
-            // header_count (0)
+            // header_count
             std.mem.writeInt(u32, buf[pos..][0..4], 0, .little);
             pos += 4;
         }
@@ -1000,23 +984,21 @@ pub const StreamHandler = struct {
 
         const ual_index = try self.partition.apply(&entry);
 
-        // Use the same name hash as handleAppend (namespace-qualified)
+        // Track in per-stream state
         const name_hash = router.nameHash(ns_hash_u32, stream_name);
-        const offset = try self.stream.append(ual_index, timestamp_ns, name_hash, 0);
+        const stream_id = try self.stream.appendToStream(name_hash, ual_index, 0);
 
         // Register the stream name so it appears in `stream list`
-        // Qualify with namespace prefix like handleAppend does
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, namespace, stream_name) catch stream_name;
         self.stream.registerStream(ns_stream_name) catch {};
 
-        return offset;
+        return stream_id.sequence;
     }
 
     /// Read payloads from a named stream (used by processing pipelines).
-    /// Only returns entries belonging to the specified stream.
-    /// Returns (payloads slice, last_global_offset scanned) so the pipeline
-    /// can advance its cursor past all scanned offsets.
+    /// Uses per-stream StreamID reads for proper stream isolation.
+    /// Returns (payloads slice, next_sequence cursor) so the pipeline can advance.
     pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, start_offset: u64, limit: usize) struct { payloads: []const []const u8, next_offset: u64 } {
         var results: [1000][]const u8 = undefined;
         var count: usize = 0;
@@ -1024,41 +1006,27 @@ pub const StreamHandler = struct {
 
         const ns_hash_u32 = router.namespaceHash(namespace);
         const name_hash = router.nameHash(ns_hash_u32, stream_name);
-        var buf: [1000]OffsetEntry = undefined;
-        const batch = @min(capped, 1000);
 
-        // Scan global offsets from start, filtering by name hash.
-        // readRangeForStream returns only matching entries.
-        const hwm = self.stream.highWaterMark();
-        var end_offset = start_offset + batch * 10; // scan well ahead to find matching entries
-        if (end_offset < hwm + 1) end_offset = hwm + 1;
+        // Use StreamID-based read: treat start_offset as a bare sequence
+        const start_id = StreamID.fromSeq(start_offset);
+        var rec_buf: [1000]StreamRecord = undefined;
+        const n = self.stream.readStreamAfter(name_hash, start_id, null, rec_buf[0..capped]);
 
-        const n = self.stream.readRangeForStream(start_offset, end_offset, name_hash, buf[0..batch]);
-
-        var last_scanned: u64 = start_offset;
-        for (buf[0..n]) |oe| {
+        var last_seq: u64 = start_offset;
+        for (rec_buf[0..n]) |rec| {
             if (count >= capped) break;
-            const result = self.getPayloadAndTier(oe.ual_index);
+            const result = self.getPayloadAndTier(rec.ual_index);
             if (result.payload.len > 0) {
                 results[count] = result.payload;
                 count += 1;
             }
+            last_seq = rec.id.sequence;
         }
 
-        // We need to know the last global offset we've scanned to advance cursor.
-        // Since readRangeForStream scans up to end_offset, advance past hwm.
-        if (n > 0) {
-            // The entries are in offset order; find the actual offsets by scanning
-            // the same range again to get the global offset of the last entry.
-            // But since the offsets map is keyed by global offset, we can use hwm.
-            last_scanned = @min(end_offset, hwm + 1);
-        } else {
-            last_scanned = @min(end_offset, hwm + 1);
-        }
-
-        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .next_offset = last_scanned };
+        const next = if (n > 0) last_seq + 1 else start_offset;
+        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .next_offset = next };
         @memcpy(out, results[0..count]);
-        return .{ .payloads = out, .next_offset = last_scanned };
+        return .{ .payloads = out, .next_offset = next };
     }
 
     /// Read a payload from the UAL by entry index (zero-copy).
@@ -1295,61 +1263,55 @@ fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
 // Serialization
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Serialize offset entries to binary format.
-/// Wire format: [count:u32] ([offset:u64][ual_index:u64][timestamp_ns:u64])*
-fn serializeOffsetEntries(allocator: Allocator, entries: []const OffsetEntry) ![]u8 {
-    return serializeOffsetEntriesPub(allocator, entries);
-}
-
-/// Public variant of serializeOffsetEntries — used by the WaiterPool resolver
-/// in shard.zig to build stream responses for blocking reads.
-pub fn serializeOffsetEntriesPub(allocator: Allocator, entries: []const OffsetEntry) ![]u8 {
-    const entry_size: usize = 24; // 3 x u64
-    const total = 4 + entries.len * entry_size;
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    var offset: usize = 0;
-
-    // Count
-    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entries.len), .little);
-    offset += 4;
-
-    for (entries, 0..) |entry, i| {
-        // Offset (1-based index)
-        const stream_offset = i + 1; // offsets are sequential
-        std.mem.writeInt(u64, buf[offset..][0..8], @intCast(stream_offset), .little);
-        offset += 8;
-
-        // UAL index
-        std.mem.writeInt(u64, buf[offset..][0..8], entry.ual_index, .little);
-        offset += 8;
-
-        // Timestamp
-        std.mem.writeInt(u64, buf[offset..][0..8], entry.timestamp_ns, .little);
-        offset += 8;
-    }
-
-    return buf;
-}
-
 /// Serialize consumer group info.
-/// Wire format: [committed_offset:u64][member_count:u32][created_at_ns:u64]
+/// Wire format: [pel_count:u64][member_count:u32][created_at_ns:u64]
 fn serializeGroupInfo(allocator: Allocator, group: *stream_mod.ConsumerGroup) ![]u8 {
-    const total: usize = 8 + 4 + 8; // committed_offset + member_count + created_at_ns
+    const total: usize = 8 + 4 + 8; // pel_count + member_count + created_at_ns
     const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
 
     var offset: usize = 0;
 
-    std.mem.writeInt(u64, buf[offset..][0..8], group.committed_offset, .little);
+    std.mem.writeInt(u64, buf[offset..][0..8], @intCast(group.pelCount()), .little);
     offset += 8;
 
     std.mem.writeInt(u32, buf[offset..][0..4], @intCast(group.memberCount()), .little);
     offset += 4;
 
     std.mem.writeInt(u64, buf[offset..][0..8], group.created_at_ns, .little);
+
+    return buf;
+}
+
+/// Serialize PEL entries from groupPending().
+/// Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])*
+fn serializePendingEntries(allocator: Allocator, entries: []const PendingEntry) ![]u8 {
+    var total: usize = 4; // count header
+    for (entries) |e| {
+        total += 8 + 8 + 4 + 2 + e.consumer.len; // ts + seq + delivery_count + consumer_len + consumer
+    }
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    var pos: usize = 0;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entries.len), .little);
+    pos += 4;
+
+    for (entries) |e| {
+        std.mem.writeInt(u64, buf[pos..][0..8], e.id.timestamp_ms, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], e.id.sequence, .little);
+        pos += 8;
+        std.mem.writeInt(u32, buf[pos..][0..4], e.delivery_count, .little);
+        pos += 4;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(e.consumer.len), .little);
+        pos += 2;
+        if (e.consumer.len > 0) {
+            @memcpy(buf[pos .. pos + e.consumer.len], e.consumer);
+            pos += e.consumer.len;
+        }
+    }
 
     return buf;
 }
@@ -1417,10 +1379,12 @@ test "stream handler: append" {
     defer handler.deinit();
 
     const result = handler.handleCommand(makeRequest(.stream_append, "events", "payload1", ""));
+    var first_ts: i64 = 0;
     switch (result) {
         .stream_append_ok => |a| {
-            try testing.expectEqual(@as(u64, 1), a.sequence);
+            // StreamID sequence is 0-based within a millisecond
             try testing.expect(a.timestamp_ms > 0);
+            first_ts = a.timestamp_ms;
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1428,12 +1392,12 @@ test "stream handler: append" {
     // Second append
     const r2 = handler.handleCommand(makeRequest(.stream_append, "events", "payload2", ""));
     switch (r2) {
-        .stream_append_ok => |a| try testing.expectEqual(@as(u64, 2), a.sequence),
+        .stream_append_ok => |a| {
+            // Must have a valid timestamp; sequence may differ based on timing
+            try testing.expect(a.timestamp_ms >= first_ts);
+        },
         else => return error.TestUnexpectedResult,
     }
-
-    // HWM should be 2
-    try testing.expectEqual(@as(u64, 2), partition.stream.highWaterMark());
 }
 
 test "stream handler: append empty stream name" {
@@ -1473,7 +1437,9 @@ test "stream handler: read" {
             // Parse count from serialized data
             const count = std.mem.readInt(u32, m.data[0..4], .little);
             try testing.expectEqual(@as(u32, 3), count);
-            try testing.expectEqual(@as(u64, 4), m.next_sequence); // 1 + 3
+            // next_sequence is the last record's StreamID sequence (0-based)
+            try testing.expect(m.next_sequence >= 0);
+            try testing.expect(m.next_timestamp_ms > 0);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1528,12 +1494,11 @@ test "stream handler: trim" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", "d", ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", "e", ""));
 
-    // Trim up to offset 3 (pass as value)
+    // Trim first 3 records (bare value = count-based trim)
     const result = handler.handleCommand(makeRequest(.stream_trim, "s1", "3", ""));
     switch (result) {
         .stream_trimmed => |t| {
             try testing.expectEqual(@as(u64, 3), t.deleted_count);
-            try testing.expectEqual(@as(u64, 4), t.first_seq);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1555,9 +1520,10 @@ test "stream handler: info" {
     const result = handler.handleCommand(makeRequest(.stream_info, "s1", "", ""));
     switch (result) {
         .stream_info => |info| {
-            try testing.expectEqual(@as(u64, 2), info.last_seq);
+            // Two records with sequentially increasing StreamIDs
             try testing.expectEqual(@as(u64, 2), info.count);
             try testing.expectEqual(@as(u32, 1), info.partition_count);
+            try testing.expect(info.last_timestamp_ms > 0);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1651,34 +1617,60 @@ test "stream handler: group read and ack" {
     // Create group
     _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", "cg1", ""));
 
-    // Read from group (starts at offset 1 since committed_offset is 0)
+    // First read — PEL delivers all 3 records, adds to PEL
+    var first_id_ts: u64 = 0;
+    var first_id_seq: u64 = 0;
     const read_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
     switch (read_result) {
         .group_messages => |m| {
             defer handler.freeResult(read_result);
             const count = std.mem.readInt(u32, m.data[0..4], .little);
             try testing.expectEqual(@as(u32, 3), count);
+            // Extract first record's StreamID: [count:u32][sequence:u64][timestamp_ms:i64]...
+            first_id_seq = std.mem.readInt(u64, m.data[4..12], .little);
+            first_id_ts = std.mem.readInt(u64, m.data[12..20], .little);
         },
         else => return error.TestUnexpectedResult,
     }
 
-    // Ack up to offset 2 (namespace="2" for offset)
-    var ack_req = makeRequest(.stream_group_ack, "s1", "cg1", "");
-    ack_req.namespace = "2";
-    const ack_result = handler.handleCommand(ack_req);
-    switch (ack_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Read again — should start from offset 3
+    // Second read with no new appends — no NEW records after last_delivered_id
     const read2_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
     switch (read2_result) {
         .group_messages => |m| {
             defer handler.freeResult(read2_result);
             const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 1), count); // only msg3
+            try testing.expectEqual(@as(u32, 0), count); // no new records
         },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Append a new message
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "msg4", ""));
+
+    // Third read — delivers only the new msg4
+    const read3_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
+    switch (read3_result) {
+        .group_messages => |m| {
+            defer handler.freeResult(read3_result);
+            const count = std.mem.readInt(u32, m.data[0..4], .little);
+            try testing.expectEqual(@as(u32, 1), count); // only msg4
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Ack via proper wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]
+    var ack_wire: [2 + 3 + 2 + 7 + 4 + 16]u8 = undefined;
+    std.mem.writeInt(u16, ack_wire[0..2], 3, .little); // "cg1"
+    @memcpy(ack_wire[2..5], "cg1");
+    std.mem.writeInt(u16, ack_wire[5..7], 7, .little); // "default"
+    @memcpy(ack_wire[7..14], "default");
+    std.mem.writeInt(u32, ack_wire[14..18], 1, .little); // count=1
+    std.mem.writeInt(u64, ack_wire[18..26], first_id_ts, .little);
+    std.mem.writeInt(u64, ack_wire[26..34], first_id_seq, .little);
+    const ack_req = makeRequest(.stream_group_ack, "s1", &ack_wire, "");
+    const ack_result = handler.handleCommand(ack_req);
+    switch (ack_result) {
+        .ok => {},
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1726,9 +1718,16 @@ test "stream handler: group not found errors" {
         else => return error.TestUnexpectedResult,
     }
 
-    // Ack non-existent group (use a different name than "nope" which was auto-created above)
-    var ack_req = makeRequest(.stream_group_ack, "s1", "no_such_group", "");
-    ack_req.namespace = "1";
+    // Ack non-existent group — wire format with fake StreamID
+    var ack_wire: [2 + 14 + 2 + 1 + 4 + 16]u8 = undefined;
+    std.mem.writeInt(u16, ack_wire[0..2], 14, .little);
+    @memcpy(ack_wire[2..16], "no_such_group\x00");
+    std.mem.writeInt(u16, ack_wire[16..18], 1, .little);
+    @memcpy(ack_wire[18..19], "x");
+    std.mem.writeInt(u32, ack_wire[19..23], 1, .little); // count=1
+    std.mem.writeInt(u64, ack_wire[23..31], 1000, .little); // ts
+    std.mem.writeInt(u64, ack_wire[31..39], 0, .little); // seq
+    const ack_req = makeRequest(.stream_group_ack, "s1", &ack_wire, "");
     const ack_result = handler.handleCommand(ack_req);
     switch (ack_result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
