@@ -95,7 +95,7 @@ export function useWorkflowRuns(params?: {
     setError(null);
     try {
       const entries = await api.listRuns(paramsRef.current);
-      setRuns(entries.map(mapRunEntry));
+      setRuns(Array.isArray(entries) ? entries.map(mapRunEntry) : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -286,7 +286,7 @@ export function useWorkflowDefinitions(): UseWorkflowDefinitionsResult {
     setError(null);
     try {
       const entries = await api.listDefinitions();
-      setDefinitions(entries);
+      setDefinitions(Array.isArray(entries) ? entries : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

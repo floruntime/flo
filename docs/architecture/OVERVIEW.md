@@ -40,7 +40,7 @@ Connections have **shard affinity** — once assigned, a connection stays on its
 
 ### Shard
 
-Each shard is a CPU-pinned OS thread that owns:
+Each shard is a dedicated OS thread that owns:
 
 - **Reactor** — Single kqueue/io_uring event loop handling all I/O, timers, and inbox draining
 - **Dispatcher** — Opcode→handler table for request routing
@@ -193,13 +193,14 @@ Payloads are allocated from the slab allocator, not embedded in the envelope. Th
 
 ## Performance
 
-Benchmarked on the new architecture (single-core, debug build):
+Benchmarked on the new architecture (Apple M-series, single core, ReleaseFast):
 
-| Benchmark | Throughput |
-|-----------|-----------|
-| UAL append | 10M+ ops/sec |
-| KV put | 5.9M ops/sec |
-| KV get | 20M+ ops/sec |
-| Inbox SPSC | 16M+ msgs/sec |
+| Benchmark | Throughput | Latency |
+|-----------|-----------|--------|
+| UAL append | 12.9M ops/sec | 77 ns/op |
+| KV put | 4.4M ops/sec | 225 ns/op |
+| KV get | 11.9M ops/sec | 84 ns/op |
+| KV scan | 6.0M ops/sec | 165 ns/op |
+| Inbox SPSC | 28.5M msg/sec | 35 ns/msg |
 
 See [bench/RESULTS.md](../../bench/RESULTS.md) for detailed results and comparisons with the old architecture.

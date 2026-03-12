@@ -181,14 +181,15 @@ All writes go through the **Unified Append Log (UAL)**. The Raft consensus log a
 
 ### Performance
 
-Benchmarked on the new architecture (single-core, debug build):
+Benchmarked on the new architecture (Apple M-series, single core, ReleaseFast):
 
-| Benchmark | Throughput |
-|-----------|-----------|
-| UAL append | 10M+ ops/sec |
-| KV put | 5.9M ops/sec |
-| KV get | 20M+ ops/sec |
-| Inbox SPSC | 16M+ msgs/sec |
+| Benchmark | Throughput | Latency |
+|-----------|-----------|--------|
+| UAL append | 12.9M ops/sec | 77 ns/op |
+| KV put | 4.4M ops/sec | 225 ns/op |
+| KV get | 11.9M ops/sec | 84 ns/op |
+| KV scan | 6.0M ops/sec | 165 ns/op |
+| Inbox SPSC | 28.5M msg/sec | 35 ns/msg |
 
 ## SDK Examples
 
@@ -549,21 +550,22 @@ git clone https://github.com/floruntime/flo.git
 cd flo
 
 # Build
-zake build              # Debug build
-zake build.release      # Release build (ReleaseFast)
+zig build                              # Debug build
+zig build -Doptimize=ReleaseFast       # Release build
 
 # Run
 ./zig-out/bin/flo server start
 
 # Test
-zake test               # All tests
-zake test.unit          # Unit tests
-zake test.integration   # Integration tests
-zake test e2e           # E2E acceptance tests
+zig build test --summary all               # Unit tests (1040 tests)
+zig build test-integration --summary all   # Integration tests
+zig build test-e2e --summary all           # E2E acceptance tests
 
 # Benchmarks
-zake bench.write        # Write throughput
-zake bench.mt.write     # Multi-threaded write
+zig build bench                        # Build benchmarks (ReleaseFast)
+./zig-out/bin/bench-ual                # UAL throughput
+./zig-out/bin/bench-kv                 # KV projection ops/sec
+./zig-out/bin/bench-inbox              # Inbox MPSC throughput
 ```
 
 ## SDKs
@@ -605,7 +607,7 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Web Dashboard | ✅ Complete |
 | SWIM gossip + cluster membership | ✅ Complete |
 | Cross-node request forwarding | ✅ Complete |
-| Cold Storage (S3/GCS) | 📋 Planned |
+| Cold Storage (S3/GCS) | � Local backend complete, remote planned |
 
 ## Contributing
 
@@ -613,10 +615,10 @@ Contributions are welcome! Please see the [architecture docs](docs/architecture/
 
 ```bash
 # Run tests
-zake test
+zig build test --summary all
 
 # Run benchmarks
-zake bench.write
+zig build bench && ./zig-out/bin/bench-ual
 
 # Format code
 zig fmt src/
