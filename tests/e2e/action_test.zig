@@ -564,6 +564,256 @@ test "e2e/action/worker: worker fails task permanently" {
     // The status indicates the task has failed permanently
 }
 // =============================================================================
+// Persistence / Restart
+// =============================================================================
+
+test "e2e/action: registered action survives restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // Register an action
+    try ctx.exec(&.{ "action", "register", "persist-test-action" });
+
+    // Verify it exists before restart
+    var before = try ctx.cli.run(&.{ "action", "list" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    const before_output = std.mem.trim(u8, before.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, before_output, "persist-test-action") != null);
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, action should still exist
+    var after = try ctx.cli.run(&.{ "action", "list" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+
+    const after_output = std.mem.trim(u8, after.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, after_output, "persist-test-action") != null);
+}
+
+test "e2e/action/runs: runs survive restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // Register, invoke, verify run exists
+    try ctx.exec(&.{ "action", "register", "persist-runs-action" });
+    try ctx.exec(&.{ "action", "invoke", "persist-runs-action", "{}" });
+
+    var before = try ctx.cli.run(&.{ "action", "runs", "persist-runs-action" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    const before_output = std.mem.trim(u8, before.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, before_output, "pending") != null);
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, action and runs should still exist
+    var after_list = try ctx.cli.run(&.{ "action", "list" });
+    defer after_list.deinit();
+    try stdx.testing.assertSucceeded(after_list);
+    const after_list_output = std.mem.trim(u8, after_list.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, after_list_output, "persist-runs-action") != null);
+
+    var after = try ctx.cli.run(&.{ "action", "runs", "persist-runs-action" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+
+    const after_output = std.mem.trim(u8, after.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, after_output, "pending") != null);
+}
+
+// =============================================================================
+// Action Runs Listing
+// =============================================================================
+
+test "e2e/action/runs: empty runs returns no runs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Register an action but don't invoke it
+    try ctx.exec(&.{ "action", "register", "no-runs-action" });
+
+    // List runs — should show (no runs) or empty table
+    var result = try ctx.cli.run(&.{ "action", "runs", "no-runs-action" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.eql(u8, output, "(no runs)"));
+}
+
+test "e2e/action/runs: shows pending run after invoke" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-pending-test";
+
+    // Register and invoke
+    try ctx.exec(&.{ "action", "register", action_name });
+    try ctx.exec(&.{ "action", "invoke", action_name, "{\"x\":1}" });
+
+    // List runs
+    var result = try ctx.cli.run(&.{ "action", "runs", action_name });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+
+    // Should contain table header and at least one row with "pending"
+    try testing.expect(std.mem.indexOf(u8, output, "RUN ID") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "pending") != null);
+    try testing.expect(std.mem.indexOf(u8, output, action_name) != null);
+}
+
+test "e2e/action/runs: shows multiple runs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-multi-test";
+
+    // Register and invoke 3 times
+    try ctx.exec(&.{ "action", "register", action_name });
+    try ctx.exec(&.{ "action", "invoke", action_name, "{\"n\":1}" });
+    try ctx.exec(&.{ "action", "invoke", action_name, "{\"n\":2}" });
+    try ctx.exec(&.{ "action", "invoke", action_name, "{\"n\":3}" });
+
+    // List runs
+    var result = try ctx.cli.run(&.{ "action", "runs", action_name });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+
+    // Count occurrences of "pending" — should be at least 3
+    var pending_count: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search_pos, "pending")) |pos| {
+        pending_count += 1;
+        search_pos = pos + 7;
+    }
+    try testing.expect(pending_count >= 3);
+}
+
+test "e2e/action/runs: completed run shows completed status" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-completed-test";
+    const worker_id = "runs-complete-worker";
+
+    // 1. Register action and worker
+    try ctx.exec(&.{ "action", "register", action_name });
+    try ctx.exec(&.{ "worker", "register", worker_id, action_name });
+
+    // 2. Invoke
+    const invoke_output = try ctx.execCapture(&.{
+        "action", "invoke", action_name, "{\"data\":\"test\"}",
+    });
+
+    const run_id = extractRunId(invoke_output) orelse {
+        std.debug.print("\nFailed to extract run_id from: '{s}'\n", .{invoke_output});
+        return error.TestFailed;
+    };
+
+    // 3. Worker awaits and gets task
+    var await_result = try ctx.cli.run(&.{
+        "worker",      "await",   action_name,
+        "--worker-id", worker_id, "--block",
+        "5000",
+    });
+    defer await_result.deinit();
+
+    if (!await_result.succeeded()) {
+        std.debug.print("\nWorker await failed\n", .{});
+        return error.TestFailed;
+    }
+
+    const await_output = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
+    if (await_output.len == 0 or std.mem.eql(u8, await_output, "(no tasks)")) {
+        std.debug.print("\nWorker did not receive task\n", .{});
+        return error.TestFailed;
+    }
+
+    // 4. Worker completes the task
+    var complete_result = try ctx.cli.run(&.{
+        "worker",      "complete", run_id,
+        "--worker-id", worker_id,  "--action",
+        action_name,   "--result", "{\"done\":true}",
+    });
+    defer complete_result.deinit();
+    try stdx.testing.assertSucceeded(complete_result);
+
+    // 5. List runs — should show "completed"
+    var runs_result = try ctx.cli.run(&.{ "action", "runs", action_name });
+    defer runs_result.deinit();
+
+    try stdx.testing.assertSucceeded(runs_result);
+    const runs_output = std.mem.trim(u8, runs_result.stdout, &std.ascii.whitespace);
+    try testing.expect(std.mem.indexOf(u8, runs_output, "completed") != null);
+}
+
+test "e2e/action/runs: limit flag restricts output" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const action_name = "runs-limit-test";
+
+    // Register and invoke 5 times
+    try ctx.exec(&.{ "action", "register", action_name });
+    for (0..5) |_| {
+        try ctx.exec(&.{ "action", "invoke", action_name, "{}" });
+    }
+
+    // List with --limit 2
+    var result = try ctx.cli.run(&.{ "action", "runs", action_name, "--limit", "2" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+
+    // Count "pending" rows — should be exactly 2
+    var pending_count: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search_pos, "pending")) |pos| {
+        pending_count += 1;
+        search_pos = pos + 7;
+    }
+    try testing.expect(pending_count == 2);
+}
+
+test "e2e/action/runs: only shows runs for specified action" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Register two different actions
+    try ctx.exec(&.{ "action", "register", "runs-filter-alpha" });
+    try ctx.exec(&.{ "action", "register", "runs-filter-beta" });
+
+    // Invoke both
+    try ctx.exec(&.{ "action", "invoke", "runs-filter-alpha", "{}" });
+    try ctx.exec(&.{ "action", "invoke", "runs-filter-beta", "{}" });
+
+    // List runs for alpha only
+    var result = try ctx.cli.run(&.{ "action", "runs", "runs-filter-alpha" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+
+    // Should contain alpha runs
+    try testing.expect(std.mem.indexOf(u8, output, "runs-filter-alpha") != null);
+    // Should NOT contain beta runs
+    try testing.expect(std.mem.indexOf(u8, output, "runs-filter-beta") == null);
+}
+
+// =============================================================================
 // Label-Based Worker Filtering
 // =============================================================================
 

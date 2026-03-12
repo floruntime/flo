@@ -163,6 +163,14 @@ pub fn delete(client: *Client, namespace: []const u8, action_name: []const u8) !
     return client.sendRequest(.action_delete, namespace, action_name, "");
 }
 
+/// List runs for an action (or all runs if action_name is empty)
+/// key = action_name
+pub fn listRuns(client: *Client, namespace: []const u8, action_name: []const u8, limit: u32) !Response {
+    var limit_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &limit_buf, limit, .little);
+    return client.sendRequest(.action_list_runs, namespace, action_name, &limit_buf);
+}
+
 // =============================================================================
 // Worker Operations
 // =============================================================================

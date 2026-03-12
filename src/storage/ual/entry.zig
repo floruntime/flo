@@ -95,6 +95,19 @@ pub const EntryType = enum(u8) {
     namespace_delete = 0x61,
     namespace_config = 0x62,
 
+    // ── Actions ──
+    action_register = 0x70,
+    action_delete = 0x71,
+    action_invoke = 0x72,
+    action_update_run = 0x73,
+
+    // ── Processing ──
+    processing_submit = 0x80,
+    processing_stop = 0x81,
+    processing_cancel = 0x82,
+    processing_savepoint = 0x83,
+    processing_rescale = 0x84,
+
     // ── Checkpoint ──
     checkpoint = 0xE0,
 
@@ -108,6 +121,8 @@ pub const EntryType = enum(u8) {
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start => true,
             .namespace_create, .namespace_delete, .namespace_config => true,
+            .action_register, .action_delete, .action_invoke, .action_update_run => true,
+            .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale => true,
             .raft_config, .raft_noop, .raft_snapshot, .checkpoint => false,
         };
     }

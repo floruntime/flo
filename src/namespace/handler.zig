@@ -48,6 +48,7 @@ const Coordinator = coordinator_mod.Coordinator;
 const NamespaceConfig = coordinator_mod.NamespaceConfig;
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const persistence_mod = @import("../storage/persistence.zig");
 
 const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -307,9 +308,6 @@ pub const NamespaceHandler = struct {
         }
     }
 
-    /// Max payload for a namespace UAL entry: command prefix(10) + name(128) + settings TLV
-    const MAX_NS_PAYLOAD: usize = entry_mod.COMMAND_PREFIX_SIZE + MAX_NAMESPACE_LEN + NamespaceConfig.MAX_SETTINGS_SIZE;
-
     fn dispatchCreate(shard: *Shard, conn: *Connection, req: Request) void {
         const name = req.key;
 
@@ -457,25 +455,28 @@ pub const NamespaceHandler = struct {
 
     /// Propose a namespace mutation as a UAL entry through Raft.
     /// The entry uses CommandPayload format: key = namespace name, value = payload.
-    /// Persistence happens via the segment writer callback on UAL append.
+    /// Namespace entries use empty namespace ("") to get namespace_hash=0
+    /// because namespaces are global, not scoped to a namespace.
     /// In-memory state is applied directly by the caller after propose succeeds.
     fn proposeNamespaceEntry(
         shard: *Shard,
         entry_type: entry_mod.EntryType,
         name: []const u8,
         value: []const u8,
-    ) !@import("../raft/node.zig").ProposeResult {
-        var payload_buf: [MAX_NS_PAYLOAD]u8 = undefined;
-        const cmd = entry_mod.CommandPayload{
-            .namespace_hash = 0, // namespaces are global, no namespace-hash needed
-            .key_length = @intCast(name.len),
-            .value_length = @intCast(value.len),
-            .key = name,
-            .value = value,
-        };
-        const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-        return shard.raft_node.propose(entry_type, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..payload_len]);
+    ) !u64 {
+        return persistence_mod.persistEntry(shard, entry_type, entry_mod.Flags.NONE, "", name, value);
+    }
+
+    /// Register this handler's entry types with the ReplayRegistry.
+    pub fn registerReplay(self: *NamespaceHandler, registry: *persistence_mod.ReplayRegistry) void {
+        registry.register(.namespace_create, @ptrCast(self), replayEntryThunk);
+        registry.register(.namespace_delete, @ptrCast(self), replayEntryThunk);
+        registry.register(.namespace_config, @ptrCast(self), replayEntryThunk);
+    }
+
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *NamespaceHandler = @ptrCast(@alignCast(ctx));
+        self.replayEntry(entry);
     }
 
     /// Replay a namespace UAL entry to rebuild in-memory state.

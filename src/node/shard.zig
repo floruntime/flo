@@ -78,6 +78,8 @@ const WaiterKind = waiter_pool_mod.WaiterKind;
 const stream_handler_mod = @import("../stream/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const Partition = @import("../storage/partition.zig").Partition;
+const persistence_mod = @import("../storage/persistence.zig");
+const ReplayRegistry = persistence_mod.ReplayRegistry;
 const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
@@ -365,7 +367,16 @@ pub const Shard = struct {
             // Replay existing segment files from segs/ into partition.
             // If a snapshot was loaded, skip entries at or below replay_from.
             var max_index: u64 = replay_from;
-            replaySegments(allocator, segs_dir_path, partition, &max_index, workflow_handler, namespace_handler, replay_from);
+
+            // Build replay registry — handlers register their entry types
+            // so replaySegments can dispatch without hardcoded type checks.
+            var replay_registry: ReplayRegistry = .{};
+            workflow_handler.registerReplay(&replay_registry);
+            namespace_handler.registerReplay(&replay_registry);
+            actions_handler.registerReplay(&replay_registry);
+            processing_handler.registerReplay(&replay_registry);
+
+            replaySegments(allocator, segs_dir_path, partition, &max_index, &replay_registry, replay_from);
 
             // Restore handler LSN counter to avoid index collisions
             if (max_index > 0) {
@@ -1830,8 +1841,7 @@ fn replaySegments(
     dir_path: []const u8,
     partition: *Partition,
     max_index: *u64,
-    workflow_handler: *WorkflowHandler,
-    namespace_handler: *NamespaceHandler,
+    replay_registry: *const ReplayRegistry,
     replay_from: u64,
 ) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
@@ -1884,17 +1894,10 @@ fn replaySegments(
                 }
             }
 
-            // Workflow entries: router skips them (.none), so manually rebuild
-            // the WorkflowHandler in-memory definition and run maps.
-            if (etype == .workflow_create or etype == .workflow_start) {
-                workflow_handler.replayEntry(&seg_entry);
-            }
-
-            // Namespace entries: router skips them (.none), so manually rebuild
-            // the NamespaceHandler in-memory registry.
-            if (etype == .namespace_create or etype == .namespace_delete or etype == .namespace_config) {
-                namespace_handler.replayEntry(&seg_entry);
-            }
+            // Dispatch to registered handlers (workflow, namespace, actions, etc.)
+            // Replaces hardcoded if/else chains — handlers register their entry
+            // types with the ReplayRegistry during init.
+            _ = replay_registry.dispatch(&seg_entry);
 
             // Track max index for LSN restoration
             if (seg_entry.header.index > max_index.*) {

@@ -110,14 +110,14 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("logs")
-                .about("View action execution logs")
+                .name("runs")
+                .about("List action runs/tasks")
+                .aliases(&.{"tasks"})
                 .arg("name", "Action name")
-                .uintFlag("limit", 'l', 50, "Maximum log entries")
-                .uintFlag("run", 'r', 0, "Specific run ID")
+                .uintFlag("limit", 'l', 50, "Maximum runs to show")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
-                .action(wrapHandler(runLogs)),
+                .action(wrapHandler(runRuns)),
         )
         .build();
 }
@@ -609,19 +609,127 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     ctx.print("Deleted action: {s}\n", .{name});
 }
 
-fn runLogs(ctx: *commander.Context) commander.Error!void {
+fn runRuns(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
-
-    const limit = ctx.getUint("limit") orelse 50;
-    const run_id = ctx.getUint("run");
     const namespace = ctx.getString("namespace") orelse "default";
-    _ = namespace;
-    _ = limit;
-    _ = run_id;
+    const limit: u32 = @intCast(ctx.getUint("limit") orelse 50);
+    const endpoint = cli_config.getEndpoint(ctx);
 
-    // Logs endpoint not yet in client API
-    ctx.print("Logs for action: {s}\n", .{name});
-    ctx.print("Note: Action logs not yet implemented in client API.\n", .{});
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    var result = client_mod.action.listRuns(&client, namespace, name, limit) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const data = result.asRawData() orelse {
+        ctx.print("(no runs)\n", .{});
+        return;
+    };
+    if (data.len < 4) {
+        ctx.print("(no runs)\n", .{});
+        return;
+    }
+
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse {
+        ctx.print("(no runs)\n", .{});
+        return;
+    };
+
+    if (count == 0) {
+        ctx.print("(no runs)\n", .{});
+        return;
+    }
+
+    // Table header
+    ctx.print("{s:<12} {s:<20} {s:<12} {s:<24} {s:<24} {s:<24}\n", .{
+        "RUN ID", "ACTION", "STATUS", "CREATED", "STARTED", "COMPLETED",
+    });
+    ctx.print("{s}\n", .{"-" ** 116});
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        // run_id
+        const rid_len = reader.readU16() orelse break;
+        const run_id = reader.readSlice(rid_len) orelse break;
+
+        // action_name
+        const aname_len = reader.readU16() orelse break;
+        const action_name = reader.readSlice(aname_len) orelse break;
+
+        // status
+        const status_byte = reader.readU8() orelse break;
+        const status_str: []const u8 = switch (status_byte) {
+            0 => "pending",
+            1 => "running",
+            2 => "completed",
+            3 => "failed",
+            4 => "cancelled",
+            5 => "timed_out",
+            else => "unknown",
+        };
+
+        // created_at
+        const created_at = reader.readI64() orelse break;
+
+        // started_at (optional)
+        const has_started = reader.readU8() orelse break;
+        var started_at: ?i64 = null;
+        if (has_started == 1) {
+            started_at = reader.readI64();
+        }
+
+        // completed_at (optional)
+        const has_completed = reader.readU8() orelse break;
+        var completed_at: ?i64 = null;
+        if (has_completed == 1) {
+            completed_at = reader.readI64();
+        }
+
+        // Format timestamps as relative durations or raw
+        var created_buf: [24]u8 = undefined;
+        const created_str = formatTimestamp(created_at, &created_buf);
+        var started_buf: [24]u8 = undefined;
+        const started_str = if (started_at) |s| formatTimestamp(s, &started_buf) else "—";
+        var completed_buf: [24]u8 = undefined;
+        const completed_str = if (completed_at) |c| formatTimestamp(c, &completed_buf) else "—";
+
+        ctx.print("{s:<12} {s:<20} {s:<12} {s:<24} {s:<24} {s:<24}\n", .{
+            run_id, action_name, status_str, created_str, started_str, completed_str,
+        });
+    }
+}
+
+fn formatTimestamp(ms: i64, buf: *[24]u8) []const u8 {
+    const now = std.time.milliTimestamp();
+    const diff = now - ms;
+
+    if (diff < 0) {
+        return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
+    }
+    if (diff < 1000) {
+        return std.fmt.bufPrint(buf, "{d}ms ago", .{diff}) catch "?";
+    }
+    if (diff < 60_000) {
+        return std.fmt.bufPrint(buf, "{d}s ago", .{@divTrunc(diff, 1000)}) catch "?";
+    }
+    if (diff < 3_600_000) {
+        return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(diff, 60_000)}) catch "?";
+    }
+    return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(diff, 3_600_000)}) catch "?";
 }
 
 // Worker handlers
@@ -692,7 +800,8 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    // task_assignment response format: [task_id_len:u16][task_id][payload]
+    // task_assignment response format:
+    //   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
     // Empty data means no tasks
     if (result.asRawData()) |data| {
         if (data.len == 0) {
@@ -706,16 +815,41 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
             return;
         }
 
+        var pos: usize = 0;
+
         const task_id_len = std.mem.readInt(u16, data[0..2], .little);
-        if (data.len < 2 + task_id_len) {
+        pos += 2;
+        if (data.len < pos + task_id_len) {
             ctx.printErr("Error: Invalid task assignment format\n", .{});
             return error.CommandFailed;
         }
 
-        const task_id = data[2..][0..task_id_len];
-        const payload = data[2 + task_id_len ..];
+        const task_id = data[pos..][0..task_id_len];
+        pos += task_id_len;
+
+        // task_type
+        var task_type: []const u8 = "";
+        if (pos + 2 <= data.len) {
+            const task_type_len = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            if (pos + task_type_len <= data.len) {
+                task_type = data[pos .. pos + task_type_len];
+                pos += task_type_len;
+            }
+        }
+
+        // created_at (i64) — skip for display
+        if (pos + 8 <= data.len) pos += 8;
+
+        // attempt (u32) — skip for display
+        if (pos + 4 <= data.len) pos += 4;
+
+        const payload = data[pos..];
 
         ctx.print("Task: {s}\n", .{task_id});
+        if (task_type.len > 0) {
+            ctx.print("Action: {s}\n", .{task_type});
+        }
         if (payload.len > 0) {
             ctx.print("Payload: {s}\n", .{payload});
         }

@@ -17,8 +17,9 @@
 //! - List scans the `_action:` prefix in KV.
 //! - Delete removes the action and its WASM blob if applicable.
 //!
-//! For now, this handler uses an in-memory store until the full KV + Queue
-//! composition pipeline is wired through the Dispatcher.
+//! Durable via the shared persistence interface: write mutations go through
+//! Raft propose (persistence.persistEntry), and in-memory state is rebuilt
+//! from UAL segments on startup via the ReplayRegistry.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,6 +36,12 @@ const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
+
+const entry_mod = @import("../storage/ual/entry.zig");
+const persistence = @import("../storage/persistence.zig");
+const EntryType = entry_mod.EntryType;
+const Entry = entry_mod.Entry;
+const Flags = entry_mod.Flags;
 
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
@@ -122,10 +129,11 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_await, dispatchActionAwait, preRouteByAction);
-        dispatcher.registerWithRoute(.action_complete, dispatchActionTaskCmd, preRouteByAction);
-        dispatcher.registerWithRoute(.action_fail, dispatchActionTaskCmd, preRouteByAction);
-        dispatcher.registerWithRoute(.action_touch, dispatchActionTaskCmd, preRouteByAction);
+        dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
+        dispatcher.registerWithRoute(.action_await, dispatchActionAwait, preRouteByActionAwait);
+        dispatcher.registerWithRoute(.action_complete, dispatchActionTaskCmd, preRouteByActionValue);
+        dispatcher.registerWithRoute(.action_fail, dispatchActionTaskCmd, preRouteByActionValue);
+        dispatcher.registerWithRoute(.action_touch, dispatchActionTaskCmd, preRouteByActionValue);
     }
 
     fn preRouteByAction(req: Request) ?u64 {
@@ -133,10 +141,28 @@ pub const ActionsHandler = struct {
         return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
+    /// Route action_await by the first action name in the value, not by worker_id key.
+    /// This ensures await lands on the same shard as invoke (which routes by action name).
+    fn preRouteByActionAwait(req: Request) ?u64 {
+        if (extractFirstTaskType(req.value)) |action_name| {
+            return router.hashKeyWithNamespace(req.namespace, action_name);
+        }
+        return 0;
+    }
+
+    /// Route complete/fail/touch by the leading action_name in the value.
+    /// Value format: [action_name_len:u16][action_name][rest...]
+    fn preRouteByActionValue(req: Request) ?u64 {
+        if (parseLeadingName(req.value)) |action_name| {
+            return router.hashKeyWithNamespace(req.namespace, action_name);
+        }
+        return 0;
+    }
+
     fn dispatchAction(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const result = shard.actions_handler.handleCommand(req);
+        const result = shard.actions_handler.handleCommand(shard, req);
         defer shard.actions_handler.freeResult(result);
         switch (result) {
             .action_registered => shard.namespace_handler.markNamespaceHasData(req.namespace),
@@ -149,7 +175,7 @@ pub const ActionsHandler = struct {
     fn dispatchInvoke(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const result = shard.actions_handler.handleCommand(req);
+        const result = shard.actions_handler.handleCommand(shard, req);
         defer shard.actions_handler.freeResult(result);
 
         // After a successful invoke, notify any action_await waiters.
@@ -172,7 +198,7 @@ pub const ActionsHandler = struct {
         const op: OpCode = @enumFromInt(req.header.op_code);
         switch (op) {
             .action_complete => {
-                const err_msg = shard.actions_handler.handleActionComplete(req);
+                const err_msg = shard.actions_handler.handleActionComplete(shard, req);
                 if (err_msg) |msg| {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
                 } else {
@@ -183,7 +209,7 @@ pub const ActionsHandler = struct {
                 }
             },
             .action_fail => {
-                const err_msg = shard.actions_handler.handleActionFail(req);
+                const err_msg = shard.actions_handler.handleActionFail(shard, req);
                 if (err_msg) |msg| {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
                 } else {
@@ -245,7 +271,7 @@ pub const ActionsHandler = struct {
         // Check if there's already a pending run to claim
         if (shard.actions_handler.claimPendingRun(action_name, worker_labels)) |task| {
             shard.worker_handler.recordTaskAssigned(worker_id);
-            sendTaskAssignment(shard, conn, req.header.request_id, task.run_id, task.input);
+            sendTaskAssignment(shard, conn, req.header.request_id, task);
             return;
         }
 
@@ -275,7 +301,9 @@ pub const ActionsHandler = struct {
     /// Claimed task info returned by claimPendingRun.
     const ClaimedTask = struct {
         run_id: []const u8,
+        action_name: []const u8,
         input: ?[]const u8,
+        created_at_ms: i64,
     };
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
@@ -299,28 +327,29 @@ pub const ActionsHandler = struct {
 
             run.status = .running;
             run.started_at_ms = std.time.milliTimestamp();
-            return .{ .run_id = run.run_id_owned, .input = run.input_owned };
+            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms };
         }
         return null;
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *ActionsHandler, req: Request) CommandResult {
+    pub fn handleCommand(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
-            .action_register => self.handleRegister(req),
-            .action_invoke => self.handleInvoke(req),
+            .action_register => self.handleRegister(shard, req),
+            .action_invoke => self.handleInvoke(shard, req),
             .action_status => self.handleStatus(req),
             .action_list => self.handleList(req),
-            .action_delete => self.handleDelete(req),
+            .action_list_runs => self.handleListRuns(req),
+            .action_delete => self.handleDelete(shard, req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown action opcode" } },
         };
     }
 
     // ── REGISTER ────────────────────────────────────────────────────────
 
-    fn handleRegister(self: *ActionsHandler, req: Request) CommandResult {
+    fn handleRegister(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const name = req.key;
 
         if (name.len == 0) {
@@ -368,6 +397,9 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
         };
 
+        // Persist through Raft: value = [version:u32][created_at_ns:u64][original_value...]
+        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, req.value);
+
         // Version string
         var ver_buf: [12]u8 = undefined;
         const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{version}) catch "1";
@@ -382,7 +414,7 @@ pub const ActionsHandler = struct {
 
     // ── INVOKE ──────────────────────────────────────────────────────────
 
-    fn handleInvoke(self: *ActionsHandler, req: Request) CommandResult {
+    fn handleInvoke(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const action_name = req.key;
 
         if (action_name.len == 0) {
@@ -441,6 +473,9 @@ pub const ActionsHandler = struct {
             if (owned_labels) |lbl| self.allocator.free(lbl);
             return .{ .err = .{ .code = .internal_error, .message = "run store failed" } };
         };
+
+        // Persist invoke through Raft
+        if (shard) |s| self.persistInvoke(s, req.namespace, owned_run_id, action_name, now_ms, parsed_value.input, parsed_value.labels);
 
         // For WASM actions, execute the module inline and update run status.
         // User-hosted actions remain .pending for action_await to claim.
@@ -574,6 +609,105 @@ pub const ActionsHandler = struct {
         } };
     }
 
+    // ── LIST RUNS ───────────────────────────────────────────────────────
+
+    /// List all runs for a specific action.
+    /// key = action_name (or empty for all runs on this shard)
+    /// Response: action_list_result with binary data:
+    ///   [count:u32] ([run_id_len:u16][run_id][action_name_len:u16][action_name]
+    ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
+    ///                [has_completed:u8][completed_at?:i64])*
+    fn handleListRuns(self: *ActionsHandler, req: Request) CommandResult {
+        const action_filter = req.key;
+
+        // Parse limit from value field (u32 LE, default 100)
+        const limit: u32 = if (req.value.len >= 4)
+            std.mem.readInt(u32, req.value[0..4], .little)
+        else
+            100;
+
+        // Calculate total size
+        var count: u32 = 0;
+        var total_size: usize = 4; // count header
+        var it = self.runs.iterator();
+        while (it.next()) |entry| {
+            const run = entry.value_ptr;
+            if (action_filter.len > 0 and !std.mem.eql(u8, run.action_name_owned, action_filter)) continue;
+            if (count >= limit) break;
+            count += 1;
+            total_size += 2 + run.run_id_owned.len; // run_id
+            total_size += 2 + run.action_name_owned.len; // action_name
+            total_size += 1; // status
+            total_size += 8; // created_at
+            total_size += 1 + if (run.started_at_ms != null) @as(usize, 8) else 0;
+            total_size += 1 + if (run.completed_at_ms != null) @as(usize, 8) else 0;
+        }
+
+        const buf = self.allocator.alloc(u8, total_size) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
+        };
+        var off: usize = 0;
+
+        std.mem.writeInt(u32, buf[off..][0..4], count, .little);
+        off += 4;
+
+        var emitted: u32 = 0;
+        var it2 = self.runs.iterator();
+        while (it2.next()) |entry| {
+            const run = entry.value_ptr;
+            if (action_filter.len > 0 and !std.mem.eql(u8, run.action_name_owned, action_filter)) continue;
+            if (emitted >= limit) break;
+            emitted += 1;
+
+            // run_id
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(run.run_id_owned.len), .little);
+            off += 2;
+            @memcpy(buf[off .. off + run.run_id_owned.len], run.run_id_owned);
+            off += run.run_id_owned.len;
+
+            // action_name
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(run.action_name_owned.len), .little);
+            off += 2;
+            @memcpy(buf[off .. off + run.action_name_owned.len], run.action_name_owned);
+            off += run.action_name_owned.len;
+
+            // status
+            buf[off] = @intFromEnum(run.status);
+            off += 1;
+
+            // created_at
+            std.mem.writeInt(i64, buf[off..][0..8], run.created_at_ms, .little);
+            off += 8;
+
+            // started_at (optional)
+            if (run.started_at_ms) |v| {
+                buf[off] = 1;
+                off += 1;
+                std.mem.writeInt(i64, buf[off..][0..8], v, .little);
+                off += 8;
+            } else {
+                buf[off] = 0;
+                off += 1;
+            }
+
+            // completed_at (optional)
+            if (run.completed_at_ms) |v| {
+                buf[off] = 1;
+                off += 1;
+                std.mem.writeInt(i64, buf[off..][0..8], v, .little);
+                off += 8;
+            } else {
+                buf[off] = 0;
+                off += 1;
+            }
+        }
+
+        return .{ .action_list_result = .{
+            .data = buf,
+            .cursor = null,
+        } };
+    }
+
     /// ShardWalker LocalScanFn for action_list — returns action names
     /// from one shard's ActionsHandler registry.
     fn localScanActions(
@@ -601,7 +735,7 @@ pub const ActionsHandler = struct {
 
     // ── DELETE ───────────────────────────────────────────────────────────
 
-    fn handleDelete(self: *ActionsHandler, req: Request) CommandResult {
+    fn handleDelete(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const name = req.key;
 
         if (name.len == 0) {
@@ -611,6 +745,10 @@ pub const ActionsHandler = struct {
         if (self.actions.fetchRemove(name)) |kv| {
             if (kv.value.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(kv.value.name_owned);
+
+            // Persist deletion through Raft
+            if (shard) |s| self.persistDelete(s, req.namespace, name);
+
             return .{ .action_deleted = {} };
         }
 
@@ -639,7 +777,7 @@ pub const ActionsHandler = struct {
     /// Complete a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
     ///         [outcome_len:u16][outcome][result_len:u16][result]
-    fn handleActionComplete(self: *ActionsHandler, req: Request) ?[]const u8 {
+    fn handleActionComplete(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
         const value = req.value;
         var offset: usize = 0;
 
@@ -680,6 +818,8 @@ pub const ActionsHandler = struct {
                 if (run.result_owned) |old| self.allocator.free(old);
                 run.result_owned = self.allocator.dupe(u8, result_data) catch null;
             }
+            // Persist run status update through Raft
+            if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .completed, run.completed_at_ms, result_data);
             return null; // success
         }
         return "run not found";
@@ -716,7 +856,7 @@ pub const ActionsHandler = struct {
 
     /// Fail a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
-    fn handleActionFail(self: *ActionsHandler, req: Request) ?[]const u8 {
+    fn handleActionFail(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
         const value = req.value;
         var offset: usize = 0;
 
@@ -744,9 +884,11 @@ pub const ActionsHandler = struct {
                 // Put back to pending for retry
                 run.status = .pending;
                 run.started_at_ms = null;
+                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "");
             } else {
                 run.status = .failed;
                 run.completed_at_ms = std.time.milliTimestamp();
+                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .failed, run.completed_at_ms, "");
             }
             return null; // success
         }
@@ -889,6 +1031,303 @@ pub const ActionsHandler = struct {
             .output = run.result_owned,
         };
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Persistence — write mutations through Raft via shared interface
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Persist an action registration.
+    /// Value format: [version:u32][created_at_ns:u64][original_req_value...]
+    fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, req_value: []const u8) void {
+        _ = self;
+        var value_buf: [65536]u8 = undefined;
+        if (4 + 8 + req_value.len > value_buf.len) return;
+        std.mem.writeInt(u32, value_buf[0..4], version, .little);
+        std.mem.writeInt(u64, value_buf[4..12], created_at_ns, .little);
+        if (req_value.len > 0) {
+            @memcpy(value_buf[12 .. 12 + req_value.len], req_value);
+        }
+        const value = value_buf[0 .. 12 + req_value.len];
+        _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, name, value) catch {};
+    }
+
+    /// Persist an action invocation (run creation).
+    /// Value format: [action_name_len:u16][action_name][status:u8][created_at_ms:i64]
+    ///              [input_len:u32][input][labels_len:u32][labels]
+    fn persistInvoke(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, action_name: []const u8, created_at_ms: i64, input: []const u8, labels: ?[]const u8) void {
+        _ = self;
+        var value_buf: [65536]u8 = undefined;
+        var off: usize = 0;
+
+        // action_name
+        if (off + 2 + action_name.len > value_buf.len) return;
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(action_name.len), .little);
+        off += 2;
+        @memcpy(value_buf[off .. off + action_name.len], action_name);
+        off += action_name.len;
+
+        // status = pending (0)
+        value_buf[off] = @intFromEnum(ActionRunStatus.pending);
+        off += 1;
+
+        // created_at_ms
+        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
+        off += 8;
+
+        // input
+        const input_len: u32 = @intCast(input.len);
+        std.mem.writeInt(u32, value_buf[off..][0..4], input_len, .little);
+        off += 4;
+        if (input.len > 0) {
+            if (off + input.len > value_buf.len) return;
+            @memcpy(value_buf[off .. off + input.len], input);
+            off += input.len;
+        }
+
+        // labels
+        const lbl = labels orelse "";
+        const labels_len: u32 = @intCast(lbl.len);
+        std.mem.writeInt(u32, value_buf[off..][0..4], labels_len, .little);
+        off += 4;
+        if (lbl.len > 0) {
+            if (off + lbl.len > value_buf.len) return;
+            @memcpy(value_buf[off .. off + lbl.len], lbl);
+            off += lbl.len;
+        }
+
+        _ = persistence.persistEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value_buf[0..off]) catch {};
+    }
+
+    /// Persist an action deletion.
+    fn persistDelete(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8) void {
+        _ = self;
+        _ = persistence.persistEntry(shard, .action_delete, Flags.TOMBSTONE, namespace, name, "") catch {};
+    }
+
+    /// Persist a run status update (complete, fail, retry).
+    /// Value format: [status:u8][has_timestamp:u8][timestamp_ms?:i64][result_len:u32][result]
+    fn persistRunUpdate(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, status: ActionRunStatus, timestamp_ms: ?i64, result_data: []const u8) void {
+        _ = self;
+        var value_buf: [65536]u8 = undefined;
+        var off: usize = 0;
+
+        value_buf[off] = @intFromEnum(status);
+        off += 1;
+
+        if (timestamp_ms) |ts| {
+            value_buf[off] = 1;
+            off += 1;
+            std.mem.writeInt(i64, value_buf[off..][0..8], ts, .little);
+            off += 8;
+        } else {
+            value_buf[off] = 0;
+            off += 1;
+        }
+
+        const rlen: u32 = @intCast(result_data.len);
+        std.mem.writeInt(u32, value_buf[off..][0..4], rlen, .little);
+        off += 4;
+        if (result_data.len > 0) {
+            if (off + result_data.len > value_buf.len) return;
+            @memcpy(value_buf[off .. off + result_data.len], result_data);
+            off += result_data.len;
+        }
+
+        _ = persistence.persistEntry(shard, .action_update_run, Flags.NONE, namespace, run_id, value_buf[0..off]) catch {};
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Replay — rebuild in-memory state from UAL entries on startup
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Register this handler's entry types with the ReplayRegistry.
+    pub fn registerReplay(self: *ActionsHandler, registry: *persistence.ReplayRegistry) void {
+        registry.register(.action_register, @ptrCast(self), replayEntryThunk);
+        registry.register(.action_delete, @ptrCast(self), replayEntryThunk);
+        registry.register(.action_invoke, @ptrCast(self), replayEntryThunk);
+        registry.register(.action_update_run, @ptrCast(self), replayEntryThunk);
+    }
+
+    /// Thunk for ReplayRegistry → ActionsHandler.replayEntry.
+    fn replayEntryThunk(ctx: *anyopaque, e: *const Entry) void {
+        const self: *ActionsHandler = @ptrCast(@alignCast(ctx));
+        self.replayEntry(e);
+    }
+
+    /// Dispatch a replayed entry to the appropriate replay handler.
+    pub fn replayEntry(self: *ActionsHandler, e: *const Entry) void {
+        const etype: EntryType = @enumFromInt(e.header.entry_type);
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
+        switch (etype) {
+            .action_register => self.replayRegister(cmd.key, cmd.value),
+            .action_delete => self.replayDelete(cmd.key),
+            .action_invoke => self.replayInvoke(cmd.key, cmd.value),
+            .action_update_run => self.replayUpdateRun(cmd.key, cmd.value),
+            else => {},
+        }
+    }
+
+    /// Rebuild an ActionRecord from a persisted register entry.
+    fn replayRegister(self: *ActionsHandler, name: []const u8, value: []const u8) void {
+        if (value.len < 12) return; // need version(4) + created_at_ns(8)
+        const version = std.mem.readInt(u32, value[0..4], .little);
+        const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
+        const req_value = value[12..];
+
+        const action_type: u8 = if (req_value.len > 0) req_value[0] else 0;
+        var wasm_blob: ?[]const u8 = null;
+        if (action_type == 1 and req_value.len > 1) {
+            wasm_blob = self.allocator.dupe(u8, req_value[1..]) catch null;
+        }
+
+        // Remove old entry if re-registering
+        if (self.actions.fetchRemove(name)) |old| {
+            if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(old.value.name_owned);
+        }
+
+        const owned_name = self.allocator.dupe(u8, name) catch return;
+        self.actions.put(owned_name, .{
+            .name_owned = owned_name,
+            .action_type = action_type,
+            .version = version,
+            .enabled = true,
+            .created_at_ns = created_at_ns,
+            .wasm_blob_owned = wasm_blob,
+        }) catch {
+            self.allocator.free(owned_name);
+        };
+    }
+
+    /// Remove an action on replay of a delete entry.
+    fn replayDelete(self: *ActionsHandler, name: []const u8) void {
+        if (self.actions.fetchRemove(name)) |old| {
+            if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(old.value.name_owned);
+        }
+    }
+
+    /// Rebuild a RunRecord from a persisted invoke entry.
+    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
+        var off: usize = 0;
+
+        // action_name
+        if (off + 2 > value.len) return;
+        const aname_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + aname_len > value.len) return;
+        const action_name = value[off .. off + aname_len];
+        off += aname_len;
+
+        // status
+        if (off >= value.len) return;
+        const status: ActionRunStatus = @enumFromInt(value[off]);
+        off += 1;
+
+        // created_at_ms
+        if (off + 8 > value.len) return;
+        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+        off += 8;
+
+        // input
+        if (off + 4 > value.len) return;
+        const input_len = std.mem.readInt(u32, value[off..][0..4], .little);
+        off += 4;
+        var input: ?[]const u8 = null;
+        if (input_len > 0) {
+            if (off + input_len > value.len) return;
+            input = self.allocator.dupe(u8, value[off .. off + input_len]) catch null;
+            off += input_len;
+        }
+
+        // labels
+        if (off + 4 > value.len) return;
+        const labels_len = std.mem.readInt(u32, value[off..][0..4], .little);
+        off += 4;
+        var labels: ?[]const u8 = null;
+        if (labels_len > 0) {
+            if (off + labels_len <= value.len) {
+                labels = self.allocator.dupe(u8, value[off .. off + labels_len]) catch null;
+            }
+        }
+
+        const owned_run_id = self.allocator.dupe(u8, run_id) catch return;
+        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
+            self.allocator.free(owned_run_id);
+            return;
+        };
+
+        // Update next_run_id to avoid collisions after restart
+        if (std.fmt.parseInt(u64, run_id, 10)) |id_num| {
+            if (id_num >= self.next_run_id) {
+                self.next_run_id = id_num + 1;
+            }
+        } else |_| {}
+
+        self.runs.put(owned_run_id, .{
+            .run_id_owned = owned_run_id,
+            .action_name_owned = owned_action_name,
+            .input_owned = input,
+            .labels_owned = labels,
+            .status = status,
+            .created_at_ms = created_at_ms,
+            .started_at_ms = null,
+            .completed_at_ms = null,
+        }) catch {
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_action_name);
+            if (input) |inp| self.allocator.free(inp);
+            if (labels) |lbl| self.allocator.free(lbl);
+        };
+    }
+
+    /// Apply a run status update from a replayed entry.
+    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
+        var off: usize = 0;
+
+        // status
+        if (off >= value.len) return;
+        const status: ActionRunStatus = @enumFromInt(value[off]);
+        off += 1;
+
+        // optional timestamp
+        if (off >= value.len) return;
+        const has_ts = value[off] == 1;
+        off += 1;
+        var timestamp_ms: ?i64 = null;
+        if (has_ts) {
+            if (off + 8 > value.len) return;
+            timestamp_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+            off += 8;
+        }
+
+        // result data
+        if (off + 4 > value.len) return;
+        const rlen = std.mem.readInt(u32, value[off..][0..4], .little);
+        off += 4;
+        var result_data: ?[]const u8 = null;
+        if (rlen > 0 and off + rlen <= value.len) {
+            result_data = self.allocator.dupe(u8, value[off .. off + rlen]) catch null;
+        }
+
+        // Apply to existing run
+        if (self.runs.getPtr(run_id)) |run| {
+            run.status = status;
+            if (status == .completed or status == .failed) {
+                run.completed_at_ms = timestamp_ms;
+            } else if (status == .pending) {
+                // Retry — reset started
+                run.started_at_ms = null;
+            }
+            if (result_data) |rd| {
+                if (run.result_owned) |old| self.allocator.free(old);
+                run.result_owned = rd;
+            }
+        } else {
+            // Run entry replayed before invoke entry (shouldn't happen with ordered log)
+            if (result_data) |rd| self.allocator.free(rd);
+        }
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -917,25 +1356,41 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const task = shard.actions_handler.claimPendingRun(action_name, worker_labels) orelse return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone
-    sendTaskAssignment(shard, conn, waiter.request_id, task.run_id, task.input);
+    sendTaskAssignment(shard, conn, waiter.request_id, task);
     shard.flushToClient(waiter.fd);
     return true;
 }
 
-/// Send a task assignment response in the wire format the CLI expects:
-///   [task_id_len:u16][task_id][payload]
-fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, run_id: []const u8, input: ?[]const u8) void {
-    const payload = input orelse "";
+/// Send a task assignment response in the full wire format:
+///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
+fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+    const payload = task.input orelse "";
     var buf: [8192]u8 = undefined;
-    const total = 2 + run_id.len + payload.len;
+    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + payload.len;
     if (total > buf.len) {
-        shard.sendOkResponse(conn, request_id, run_id);
+        shard.sendOkResponse(conn, request_id, task.run_id);
         return;
     }
-    std.mem.writeInt(u16, buf[0..2], @intCast(run_id.len), .little);
-    @memcpy(buf[2 .. 2 + run_id.len], run_id);
+    var pos: usize = 0;
+    // task_id
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(task.run_id.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + task.run_id.len], task.run_id);
+    pos += task.run_id.len;
+    // task_type (action name)
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(task.action_name.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + task.action_name.len], task.action_name);
+    pos += task.action_name.len;
+    // created_at
+    std.mem.writeInt(i64, buf[pos..][0..8], task.created_at_ms, .little);
+    pos += 8;
+    // attempt (always 1 for initial assignment)
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    // payload
     if (payload.len > 0) {
-        @memcpy(buf[2 + run_id.len .. 2 + run_id.len + payload.len], payload);
+        @memcpy(buf[pos .. pos + payload.len], payload);
     }
     shard.sendOkResponse(conn, request_id, buf[0..total]);
 }
@@ -1196,8 +1651,9 @@ test "actions handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_complete)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_fail)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_touch)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_list_runs)] != null);
 
-    try testing.expectEqual(@as(u16, 9), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 10), dispatcher.handler_count);
 }
 
 test "actions handler: register" {
@@ -1205,7 +1661,7 @@ test "actions handler: register" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_register, "my-action", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_register, "my-action", ""));
     switch (result) {
         .action_registered => |r| {
             try testing.expectEqualStrings("my-action", r.name);
@@ -1222,8 +1678,8 @@ test "actions handler: register re-register bumps version" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "my-action", ""));
-    const result = handler.handleCommand(makeRequest(.action_register, "my-action", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "my-action", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_register, "my-action", ""));
     switch (result) {
         .action_registered => |r| {
             try testing.expectEqualStrings("2", r.version);
@@ -1240,7 +1696,7 @@ test "actions handler: register with wasm type" {
     defer handler.deinit();
 
     // value[0] = 1 means wasm type
-    const result = handler.handleCommand(makeRequest(.action_register, "wasm-action", &[_]u8{1}));
+    const result = handler.handleCommand(null, makeRequest(.action_register, "wasm-action", &[_]u8{1}));
     switch (result) {
         .action_registered => {},
         else => return error.TestUnexpectedResult,
@@ -1255,7 +1711,7 @@ test "actions handler: register empty name" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_register, "", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_register, "", ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
@@ -1267,9 +1723,9 @@ test "actions handler: invoke" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "process", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "process", ""));
 
-    const result = handler.handleCommand(makeRequest(.action_invoke, "process", "input-data"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "process", "input-data"));
     switch (result) {
         .action_invoked => |r| {
             try testing.expect(r.run_id.len > 0);
@@ -1286,7 +1742,7 @@ test "actions handler: invoke non-existent action" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_invoke, "ghost", "data"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "ghost", "data"));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
         else => return error.TestUnexpectedResult,
@@ -1298,8 +1754,8 @@ test "actions handler: status" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "job", ""));
-    const invoke_result = handler.handleCommand(makeRequest(.action_invoke, "job", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "job", ""));
+    const invoke_result = handler.handleCommand(null, makeRequest(.action_invoke, "job", ""));
 
     // Get the run_id from invoke result
     var run_id: []const u8 = "";
@@ -1308,7 +1764,7 @@ test "actions handler: status" {
         else => return error.TestUnexpectedResult,
     }
 
-    const status_result = handler.handleCommand(makeRequest(.action_status, run_id, ""));
+    const status_result = handler.handleCommand(null, makeRequest(.action_status, run_id, ""));
     switch (status_result) {
         .action_run_status => |r| {
             try testing.expectEqual(ActionRunStatus.pending, r.status);
@@ -1323,7 +1779,7 @@ test "actions handler: status non-existent run" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_status, "9999", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_status, "9999", ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
         else => return error.TestUnexpectedResult,
@@ -1335,11 +1791,11 @@ test "actions handler: list" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "alpha", ""));
-    _ = handler.handleCommand(makeRequest(.action_register, "beta", ""));
-    _ = handler.handleCommand(makeRequest(.action_register, "gamma", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "alpha", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "beta", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "gamma", ""));
 
-    const result = handler.handleCommand(makeRequest(.action_list, "", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_list, "", ""));
     switch (result) {
         .action_list_result => |r| {
             defer handler.freeResult(result);
@@ -1356,7 +1812,7 @@ test "actions handler: list empty" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_list, "", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_list, "", ""));
     switch (result) {
         .action_list_result => |r| {
             defer handler.freeResult(result);
@@ -1372,10 +1828,10 @@ test "actions handler: delete" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "to-delete", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "to-delete", ""));
     try testing.expectEqual(@as(usize, 1), handler.actionCount());
 
-    const result = handler.handleCommand(makeRequest(.action_delete, "to-delete", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_delete, "to-delete", ""));
     switch (result) {
         .action_deleted => {},
         else => return error.TestUnexpectedResult,
@@ -1389,7 +1845,7 @@ test "actions handler: delete non-existent is idempotent" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.action_delete, "ghost", ""));
+    const result = handler.handleCommand(null, makeRequest(.action_delete, "ghost", ""));
     switch (result) {
         .action_deleted => {},
         else => return error.TestUnexpectedResult,
@@ -1418,10 +1874,10 @@ test "actions handler: multiple invocations" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    _ = handler.handleCommand(makeRequest(.action_register, "worker", ""));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "worker", ""));
 
     for (0..5) |_| {
-        const result = handler.handleCommand(makeRequest(.action_invoke, "worker", "task"));
+        const result = handler.handleCommand(null, makeRequest(.action_invoke, "worker", "task"));
         switch (result) {
             .action_invoked => {},
             else => return error.TestUnexpectedResult,
@@ -1448,7 +1904,7 @@ test "actions handler: wasm invoke with invalid blob fails gracefully" {
 
     // Register a WASM action: value[0]=1 (wasm), value[1..] = invalid WASM bytes
     const wasm_reg_value = [_]u8{ 1, 0x00, 0xDE, 0xAD }; // type=wasm + garbage
-    _ = handler.handleCommand(makeRequest(.action_register, "wasm-job", &wasm_reg_value));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "wasm-job", &wasm_reg_value));
 
     // Verify WASM blob was stored
     const rec = handler.actions.get("wasm-job").?;
@@ -1458,7 +1914,7 @@ test "actions handler: wasm invoke with invalid blob fails gracefully" {
 
     // Invoke — should succeed (returns run_id) but run status should be failed
     // because the WASM bytes are invalid and loadModule will fail
-    const result = handler.handleCommand(makeRequest(.action_invoke, "wasm-job", "input"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "wasm-job", "input"));
     var run_id: []const u8 = "";
     switch (result) {
         .action_invoked => |r| run_id = r.run_id,
@@ -1477,13 +1933,13 @@ test "actions handler: wasm invoke with no blob fails gracefully" {
     defer handler.deinit();
 
     // Register WASM action with only the type byte (no blob)
-    _ = handler.handleCommand(makeRequest(.action_register, "no-blob", &[_]u8{1}));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "no-blob", &[_]u8{1}));
 
     const rec = handler.actions.get("no-blob").?;
     try testing.expect(rec.wasm_blob_owned == null); // no blob stored
 
     // Invoke — should return action_invoked but run is failed (no blob)
-    const result = handler.handleCommand(makeRequest(.action_invoke, "no-blob", "input"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "no-blob", "input"));
     var run_id: []const u8 = "";
     switch (result) {
         .action_invoked => |r| run_id = r.run_id,
@@ -1501,13 +1957,13 @@ test "actions handler: wasm blob freed on re-register" {
 
     // Register with WASM blob
     const wasm_v1 = [_]u8{ 1, 0x01, 0x02, 0x03 };
-    _ = handler.handleCommand(makeRequest(.action_register, "evolve", &wasm_v1));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "evolve", &wasm_v1));
     try testing.expectEqual(@as(u32, 1), handler.actions.get("evolve").?.version);
     try testing.expect(handler.actions.get("evolve").?.wasm_blob_owned != null);
 
     // Re-register with a new blob — old blob should be freed (no leak)
     const wasm_v2 = [_]u8{ 1, 0x04, 0x05 };
-    _ = handler.handleCommand(makeRequest(.action_register, "evolve", &wasm_v2));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "evolve", &wasm_v2));
     try testing.expectEqual(@as(u32, 2), handler.actions.get("evolve").?.version);
     try testing.expectEqual(@as(usize, 2), handler.actions.get("evolve").?.wasm_blob_owned.?.len);
 }
@@ -1519,9 +1975,9 @@ test "actions handler: wasm invoke with valid magic completes" {
 
     // Register with valid WASM magic header: \0asm\1\0\0\0
     const wasm_value = [_]u8{ 1, 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-    _ = handler.handleCommand(makeRequest(.action_register, "valid-wasm", &wasm_value));
+    _ = handler.handleCommand(null, makeRequest(.action_register, "valid-wasm", &wasm_value));
 
-    const result = handler.handleCommand(makeRequest(.action_invoke, "valid-wasm", "input"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "valid-wasm", "input"));
     defer handler.freeResult(result);
     var run_id: []const u8 = "";
     switch (result) {

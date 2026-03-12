@@ -305,7 +305,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 /// GET /actions/:name/runs — Execution history
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = h.parseQueryParam(u64, query_string, "limit") orelse 100;
-    _ = h.parseQueryParam(u64, query_string, "offset");
+    const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -314,6 +314,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
+    var seen: u64 = 0;
     var count: u64 = 0;
     const n = shardCount(ctx);
     for (0..n) |i| {
@@ -324,6 +325,8 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
                 if (count >= limit) break;
                 const run = entry.value_ptr;
                 if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                seen += 1;
+                if (seen <= offset) continue;
                 try arr.next();
                 var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                 try obj.begin();

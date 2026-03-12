@@ -127,6 +127,7 @@ pub const OpCode = enum(u8) {
     action_status_response = 0x6B,
     action_list_response = 0x6C,
     action_task_assignment = 0x6D, // Push task to worker
+    action_list_runs = 0x6E, // List runs for an action
 
     // Workers (0x70 - 0x7F) — physical worker tracking & health
     worker_register = 0x70, // Register worker with type + metadata

@@ -946,9 +946,9 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
 
     for (0..max_attempts) |_| {
         var result = try ctx.cli.run(&.{
-            "ts",     "read",     measurement,
-            "-n",     ns,         "--from",
-            "0",      "--limit",  "100",
+            "ts",       "read",    measurement,
+            "-n",       ns,        "--from",
+            "0",        "--limit", "100",
             "--format", "json",
         });
         defer result.deinit();
@@ -962,9 +962,9 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
 
     // One final attempt
     var result = try ctx.cli.run(&.{
-        "ts",     "read",     measurement,
-        "-n",     ns,         "--from",
-        "0",      "--limit",  "100",
+        "ts",       "read",    measurement,
+        "-n",       ns,        "--from",
+        "0",        "--limit", "100",
         "--format", "json",
     });
     defer result.deinit();
@@ -1022,9 +1022,8 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
 
     // Step 4: Verify data via `flo ts read` with tag filter
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_cpu_metrics", "-n", "proc_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--limit",          "100",    "--format",
-        "json",
+        "ts",     "read", "proc_cpu_metrics", "-n",  "proc_tssink", "--tags", "host=web-01",
+        "--from", "0",    "--limit",          "100", "--format",    "json",
     });
     defer read_result.deinit();
 
@@ -1087,9 +1086,8 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
 
     // Read with sensor tag filter
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_temp", "-n", "proc_tsscal", "--tags", "sensor=A1",
-        "--from", "0",    "--limit",   "100",    "--format",
-        "json",
+        "ts",     "read", "proc_temp", "-n",  "proc_tsscal", "--tags", "sensor=A1",
+        "--from", "0",    "--limit",   "100", "--format",    "json",
     });
     defer read_result.deinit();
 
@@ -1144,9 +1142,8 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
 
     // Verify via read
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_late_metric", "-n", "proc_tslate", "--tags", "host=db-01",
-        "--from", "0",    "--limit",          "100",    "--format",
-        "json",
+        "ts",     "read", "proc_late_metric", "-n",  "proc_tslate", "--tags", "host=db-01",
+        "--from", "0",    "--limit",          "100", "--format",    "json",
     });
     defer read_result.deinit();
 
@@ -1196,9 +1193,9 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
 
     // Verify via `flo ts query` with aggregation
     var query_result = try ctx.cli.run(&.{
-        "ts",     "query",    "proc_requests", "-n", "proc_tsagg", "--tags", "region=us",
-        "--from", "0",        "--window",      "1h",     "--agg",
-        "sum",    "--format", "json",
+        "ts",     "query", "proc_requests", "-n", "proc_tsagg", "--tags", "region=us",
+        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--format",
+        "json",
     });
     defer query_result.deinit();
 
@@ -1428,9 +1425,9 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
 
     // Step 4: Verify data in derived measurement
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read",     "derived_temp",
-        "-n",     "proc_ts2ts", "--from",
-        "0",      "--limit",  "100",
+        "ts",       "read",       "derived_temp",
+        "-n",       "proc_ts2ts", "--from",
+        "0",        "--limit",    "100",
         "--format", "json",
     });
     defer read_result.deinit();
@@ -1798,6 +1795,260 @@ test "e2e/processing: multi-shard namespace isolation across shards" {
     try stdx.testing.assertContains(status_beta2, "RUNNING");
 
     try ctx.exec(&.{ "processing", "stop", job_id_beta, "-n", "proc_shard_beta" });
+}
+
+// =============================================================================
+// Processing Persistence Tests (restart survival)
+// =============================================================================
+
+test "e2e/processing: submitted job survives restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // Scope to dedicated namespace for isolation
+    try ctx.exec(&.{ "ns", "create", "proc_persist" });
+
+    // Submit a processing job
+    const job_def =
+        \\kind: Processing
+        \\name: persist-test-job
+        \\namespace: proc_persist
+        \\sources.[0].stream.name: persist-input
+        \\sinks.[0].stream.name: persist-output
+        \\parallelism: 1
+        \\batch_size: 50
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-submit.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_persist" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Verify it exists before restart
+    var before = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    try stdx.testing.assertContains(before, "persist-test-job");
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, job should still exist with same metadata
+    var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "persist-test-job");
+    try stdx.testing.assertContains(after, job_id);
+}
+
+test "e2e/processing: stopped job state survives restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_persist_stop" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: persist-stop-job
+        \\namespace: proc_persist_stop
+        \\sources.[0].stream.name: pstop-input
+        \\sinks.[0].stream.name: pstop-output
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-stop.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_persist_stop" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Stop the job
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_persist_stop" });
+
+    // Verify stopped state before restart
+    var before = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_stop" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    try stdx.testing.assertContains(before, "STOPPED");
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, job should still be stopped (not reset to running)
+    var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_stop" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "STOPPED");
+}
+
+test "e2e/processing: cancelled job state survives restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_persist_cancel" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: persist-cancel-job
+        \\namespace: proc_persist_cancel
+        \\sources.[0].stream.name: pcancel-input
+        \\sinks.[0].stream.name: pcancel-output
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-cancel.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_persist_cancel" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Cancel the job
+    try ctx.exec(&.{ "processing", "cancel", job_id, "-n", "proc_persist_cancel" });
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, job should still be cancelled
+    var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_cancel" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "CANCELLED");
+}
+
+test "e2e/processing: list shows jobs after restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_persist_list" });
+
+    // Submit two jobs
+    const job1_def =
+        \\kind: Processing
+        \\name: persist-list-alpha
+        \\namespace: proc_persist_list
+        \\sources.[0].stream.name: plist-in1
+        \\sinks.[0].stream.name: plist-out1
+    ;
+    const path1 = try writeDottedToTempYaml(testing.allocator, job1_def, "e2e-persist-list1.yaml");
+    defer cleanupTempFile(testing.allocator, path1);
+
+    const job2_def =
+        \\kind: Processing
+        \\name: persist-list-beta
+        \\namespace: proc_persist_list
+        \\sources.[0].stream.name: plist-in2
+        \\sinks.[0].stream.name: plist-out2
+    ;
+    const path2 = try writeDottedToTempYaml(testing.allocator, job2_def, "e2e-persist-list2.yaml");
+    defer cleanupTempFile(testing.allocator, path2);
+
+    _ = try ctx.execCapture(&.{ "processing", "submit", path1, "-n", "proc_persist_list" });
+    _ = try ctx.execCapture(&.{ "processing", "submit", path2, "-n", "proc_persist_list" });
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, list should show both jobs
+    var after = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_persist_list" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "persist-list-alpha");
+    try stdx.testing.assertContains(after, "persist-list-beta");
+}
+
+test "e2e/processing: rescaled parallelism survives restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_persist_rescale" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: persist-rescale-job
+        \\namespace: proc_persist_rescale
+        \\sources.[0].stream.name: prescale-input
+        \\sinks.[0].stream.name: prescale-output
+        \\parallelism: 1
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-rescale.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_persist_rescale" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Rescale to parallelism=4
+    try ctx.exec(&.{ "processing", "rescale", job_id, "4", "-n", "proc_persist_rescale" });
+
+    // Verify parallelism changed before restart
+    var before = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    try stdx.testing.assertContains(before, "\"parallelism\":4");
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // After restart, parallelism should still be 4 (not reset to 1)
+    var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "\"parallelism\":4");
+}
+
+test "e2e/processing: new job IDs don't collide after restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_persist_ids" });
+
+    // Submit a job before restart
+    const job1_def =
+        \\kind: Processing
+        \\name: id-collision-test
+        \\namespace: proc_persist_ids
+        \\sources.[0].stream.name: idtest-in
+        \\sinks.[0].stream.name: idtest-out
+    ;
+    const path1 = try writeDottedToTempYaml(testing.allocator, job1_def, "e2e-persist-ids1.yaml");
+    defer cleanupTempFile(testing.allocator, path1);
+
+    const submit1 = try ctx.execCapture(&.{ "processing", "submit", path1, "-n", "proc_persist_ids" });
+    const job_id_1 = extractJobId(submit1) orelse return error.NoJobId;
+
+    // Restart the server
+    try ctx.restartServer();
+
+    // Submit another job after restart
+    const job2_def =
+        \\kind: Processing
+        \\name: id-collision-test-2
+        \\namespace: proc_persist_ids
+        \\sources.[0].stream.name: idtest-in2
+        \\sinks.[0].stream.name: idtest-out2
+    ;
+    const path2 = try writeDottedToTempYaml(testing.allocator, job2_def, "e2e-persist-ids2.yaml");
+    defer cleanupTempFile(testing.allocator, path2);
+
+    const submit2 = try ctx.execCapture(&.{ "processing", "submit", path2, "-n", "proc_persist_ids" });
+    const job_id_2 = extractJobId(submit2) orelse return error.NoJobId;
+
+    // New job ID must be different from the pre-restart one
+    try testing.expect(!std.mem.eql(u8, job_id_1, job_id_2));
+
+    // Both jobs should be visible in list
+    var list = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_persist_ids" });
+    defer list.deinit();
+    try stdx.testing.assertSucceeded(list);
+    try stdx.testing.assertContains(list, "id-collision-test");
+    try stdx.testing.assertContains(list, "id-collision-test-2");
 }
 
 // =============================================================================

@@ -40,8 +40,8 @@ const StepOutputMap = wf_types.StepOutputMap;
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
-const router = @import("../node/router.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const persistence_mod = @import("../storage/persistence.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -1592,33 +1592,11 @@ pub const WorkflowHandler = struct {
     /// The key stored is "namespace:name" so replay can directly use it as the ns-qualified map key.
     fn persistCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) void {
         _ = self;
-        const partition = shard.defaultPartition();
-        const ns_hash = router.namespaceHash(namespace);
-        const next_index = partition.ual.max_index + 1;
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-
         // Build ns-qualified key: "namespace:name"
         var key_buf: [600]u8 = undefined;
         const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, name }) catch return;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + ns_key.len + yaml.len;
-        if (payload_size > 65536) return; // safety limit
-        var stack_buf: [65536]u8 = undefined;
-        const payload_buf = stack_buf[0..payload_size];
-
-        const entry = entry_mod.buildCommandEntry(
-            .workflow_create,
-            entry_mod.Flags.NONE,
-            partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            ns_key,
-            yaml,
-            payload_buf,
-        ) orelse return;
-
-        _ = partition.apply(&entry) catch {};
+        _ = persistence_mod.persistEntry(shard, .workflow_create, entry_mod.Flags.NONE, namespace, ns_key, yaml) catch {};
     }
 
     /// Persist a workflow_start entry to the UAL so the run survives restart.
@@ -1634,11 +1612,6 @@ pub const WorkflowHandler = struct {
         created_at_ms: i64,
     ) void {
         _ = self;
-        const partition = shard.defaultPartition();
-        const ns_hash = router.namespaceHash(namespace);
-        const next_index = partition.ual.max_index + 1;
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-
         // Build ns-qualified key: "namespace:run_id"
         var ns_key_buf: [600]u8 = undefined;
         const ns_key = std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id }) catch return;
@@ -1668,24 +1641,18 @@ pub const WorkflowHandler = struct {
         @memcpy(value_buf[off .. off + input.len], input);
         off += input.len;
 
-        const value = value_buf[0..off];
+        _ = persistence_mod.persistEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]) catch {};
+    }
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + ns_key.len + value.len;
-        var payload_buf: [65536]u8 = undefined;
+    /// Register this handler's entry types with the shared ReplayRegistry.
+    pub fn registerReplay(self: *WorkflowHandler, registry: *persistence_mod.ReplayRegistry) void {
+        registry.register(.workflow_create, @ptrCast(self), replayEntryThunk);
+        registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
+    }
 
-        const entry = entry_mod.buildCommandEntry(
-            .workflow_start,
-            entry_mod.Flags.NONE,
-            partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            ns_key,
-            value,
-            payload_buf[0..payload_size],
-        ) orelse return;
-
-        _ = partition.apply(&entry) catch {};
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *WorkflowHandler = @ptrCast(@alignCast(ctx));
+        self.replayEntry(entry);
     }
 
     /// Replay a persisted workflow entry (called during segment replay on startup).

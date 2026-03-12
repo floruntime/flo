@@ -42,6 +42,11 @@ const router = @import("../node/router.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
+const entry_mod = @import("../storage/ual/entry.zig");
+const persistence_mod = @import("../storage/persistence.zig");
+const EntryType = entry_mod.EntryType;
+const Flags = entry_mod.Flags;
+
 const native_registry = @import("operators/native_registry.zig");
 const operator_mod = @import("operator.zig");
 const Operator = operator_mod.Operator;
@@ -302,8 +307,9 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        // Parse the YAML/JSON definition
-        var def = parser.parseJobDefinition(self.allocator, yaml) catch {
+        // Parse the YAML/JSON definition, using the request namespace as fallback
+        const req_ns: ?[]const u8 = if (req.namespace.len > 0) req.namespace else null;
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, req_ns) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid job definition");
             return;
         };
@@ -372,6 +378,10 @@ pub const ProcessingHandler = struct {
             return;
         };
 
+        // Persist through Raft → UAL so the job survives restart.
+        // Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][yaml...]
+        self.persistSubmit(shard, req.namespace, owned_id, &record);
+
         // Create pipeline execution state from parsed definition.
         // For multi-source jobs, create one pipeline per source (all write to primary sink).
         if (def.primarySink()) |snk| {
@@ -403,6 +413,7 @@ pub const ProcessingHandler = struct {
 
         if (self.jobs.getPtr(job_id)) |job| {
             job.status = .stopped;
+            self.persistStatusChange(shard, req.namespace, job_id, .stopped);
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -420,6 +431,7 @@ pub const ProcessingHandler = struct {
 
         if (self.jobs.getPtr(job_id)) |job| {
             job.status = .cancelled;
+            self.persistStatusChange(shard, req.namespace, job_id, .cancelled);
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -571,6 +583,9 @@ pub const ProcessingHandler = struct {
                 return;
             };
 
+            // Persist savepoint through Raft → UAL
+            self.persistSavepoint(shard, req.namespace, owned_sp_id, job_id, job.records_processed, now);
+
             shard.sendOkResponse(conn, req.header.request_id, sp_id);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -639,9 +654,257 @@ pub const ProcessingHandler = struct {
 
         if (self.jobs.getPtr(job_id)) |job| {
             job.parallelism = parallelism;
+            self.persistRescale(shard, req.namespace, job_id, parallelism);
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
+        }
+    }
+
+    // ── UAL Persistence ─────────────────────────────────────────────────
+
+    /// Persist a processing_submit entry. Key = job_id.
+    /// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
+    fn persistSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, job: *const JobRecord) void {
+        _ = self;
+        var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+        var off: usize = 0;
+
+        value_buf[off] = @intFromEnum(job.status);
+        off += 1;
+        std.mem.writeInt(u32, value_buf[off..][0..4], job.parallelism, .little);
+        off += 4;
+        std.mem.writeInt(u32, value_buf[off..][0..4], job.batch_size, .little);
+        off += 4;
+        std.mem.writeInt(i64, value_buf[off..][0..8], job.created_at_ms, .little);
+        off += 8;
+
+        // Embed the effective namespace so replay can recover it without re-parsing quirks
+        const ns = job.namespace_owned;
+        const ns_len: u16 = @intCast(ns.len);
+        std.mem.writeInt(u16, value_buf[off..][0..2], ns_len, .little);
+        off += 2;
+        if (off + ns.len > value_buf.len) return;
+        @memcpy(value_buf[off .. off + ns.len], ns);
+        off += ns.len;
+
+        const yaml = job.yaml_owned;
+        if (off + yaml.len > value_buf.len) return;
+        @memcpy(value_buf[off .. off + yaml.len], yaml);
+        off += yaml.len;
+
+        _ = persistence_mod.persistEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]) catch {};
+    }
+
+    /// Persist a processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
+    fn persistStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) void {
+        _ = self;
+        const entry_type: EntryType = switch (status) {
+            .stopped => .processing_stop,
+            .cancelled => .processing_cancel,
+            else => return,
+        };
+        const value = &[_]u8{@intFromEnum(status)};
+        _ = persistence_mod.persistEntry(shard, entry_type, Flags.NONE, namespace, job_id, value) catch {};
+    }
+
+    /// Persist a processing_savepoint entry. Key = savepoint_id.
+    /// Value format: [job_id_len:u16][job_id][records_at:u64][created_at_ms:i64]
+    fn persistSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) void {
+        _ = self;
+        var value_buf: [512]u8 = undefined;
+        var off: usize = 0;
+
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(job_id.len), .little);
+        off += 2;
+        @memcpy(value_buf[off .. off + job_id.len], job_id);
+        off += job_id.len;
+        std.mem.writeInt(u64, value_buf[off..][0..8], records_at, .little);
+        off += 8;
+        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
+        off += 8;
+
+        _ = persistence_mod.persistEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]) catch {};
+    }
+
+    /// Persist a processing_rescale entry. Key = job_id, value = [parallelism:u32].
+    fn persistRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) void {
+        _ = self;
+        var value_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, value_buf[0..4], parallelism, .little);
+        _ = persistence_mod.persistEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf) catch {};
+    }
+
+    // ── Replay ──────────────────────────────────────────────────────────
+
+    /// Register this handler's entry types with the shared ReplayRegistry.
+    pub fn registerReplay(self: *ProcessingHandler, registry: *persistence_mod.ReplayRegistry) void {
+        registry.register(.processing_submit, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_stop, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_cancel, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_savepoint, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_rescale, @ptrCast(self), replayEntryThunk);
+    }
+
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
+        self.replayEntry(entry);
+    }
+
+    /// Replay a persisted processing entry to rebuild in-memory state.
+    pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) void {
+        const etype: EntryType = @enumFromInt(entry.header.entry_type);
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+
+        switch (etype) {
+            .processing_submit => self.replaySubmit(cmd.key, cmd.value),
+            .processing_stop => self.replayStatusChange(cmd.key, .stopped),
+            .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
+            .processing_savepoint => self.replaySavepoint(cmd.key, cmd.value),
+            .processing_rescale => self.replayRescale(cmd.key, cmd.value),
+            else => {},
+        }
+    }
+
+    /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
+    /// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
+    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
+        if (value.len < 19) return; // 1+4+4+8+2 minimum
+        const job_id = key;
+
+        var off: usize = 0;
+        const status: JobStatus = @enumFromInt(value[off]);
+        off += 1;
+        const parallelism = std.mem.readInt(u32, value[off..][0..4], .little);
+        off += 4;
+        const batch_size = std.mem.readInt(u32, value[off..][0..4], .little);
+        off += 4;
+        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+        off += 8;
+
+        // Read embedded namespace
+        const ns_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + ns_len > value.len) return;
+        const ns_raw = value[off .. off + ns_len];
+        off += ns_len;
+
+        const yaml = value[off..];
+
+        // Extract name from YAML by re-parsing
+        var def = parser.parseJobDefinition(self.allocator, yaml) catch return;
+        const name = self.allocator.dupe(u8, def.name) catch {
+            def.deinit(self.allocator);
+            return;
+        };
+        def.deinit(self.allocator);
+
+        // Use the embedded namespace (authoritative from original submit)
+        const namespace = self.allocator.dupe(u8, ns_raw) catch {
+            self.allocator.free(name);
+            return;
+        };
+
+        const owned_id = self.allocator.dupe(u8, job_id) catch {
+            self.allocator.free(name);
+            self.allocator.free(namespace);
+            return;
+        };
+        const owned_yaml = self.allocator.dupe(u8, yaml) catch {
+            self.allocator.free(owned_id);
+            self.allocator.free(name);
+            self.allocator.free(namespace);
+            return;
+        };
+
+        // Remove old entry if exists (idempotent replay)
+        if (self.jobs.fetchRemove(owned_id)) |old| {
+            self.freeJobRecord(@constCast(&old.value));
+        }
+
+        self.jobs.put(owned_id, .{
+            .job_id_owned = owned_id,
+            .name_owned = name,
+            .namespace_owned = namespace,
+            .status = status,
+            .parallelism = parallelism,
+            .batch_size = batch_size,
+            .yaml_owned = owned_yaml,
+            .created_at_ms = created_at_ms,
+            .records_processed = 0,
+        }) catch {
+            self.allocator.free(owned_id);
+            self.allocator.free(name);
+            self.allocator.free(namespace);
+            self.allocator.free(owned_yaml);
+            return;
+        };
+
+        // Update next_job_id counter to avoid collisions
+        // Parse numeric suffix from "job-N"
+        if (std.mem.startsWith(u8, job_id, "job-")) {
+            const num = std.fmt.parseInt(u64, job_id[4..], 10) catch 0;
+            if (num >= self.next_job_id) self.next_job_id = num + 1;
+        }
+    }
+
+    /// Replay a status change (stop/cancel).
+    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) void {
+        if (self.jobs.getPtr(key)) |job| {
+            job.status = status;
+        }
+    }
+
+    /// Replay a savepoint entry.
+    /// Value format: [job_id_len:u16][job_id][records_at:u64][created_at_ms:i64]
+    fn replaySavepoint(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
+        if (value.len < 2) return;
+        var off: usize = 0;
+
+        const job_id_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + job_id_len + 16 > value.len) return;
+        const job_id = value[off .. off + job_id_len];
+        off += job_id_len;
+        const records_at = std.mem.readInt(u64, value[off..][0..8], .little);
+        off += 8;
+        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+
+        const owned_sp_id = self.allocator.dupe(u8, key) catch return;
+        const owned_job_id = self.allocator.dupe(u8, job_id) catch {
+            self.allocator.free(owned_sp_id);
+            return;
+        };
+
+        // Remove old entry if exists (idempotent replay)
+        if (self.savepoints.fetchRemove(owned_sp_id)) |old| {
+            self.allocator.free(old.value.savepoint_id_owned);
+            self.allocator.free(old.value.job_id_owned);
+        }
+
+        self.savepoints.put(owned_sp_id, .{
+            .savepoint_id_owned = owned_sp_id,
+            .job_id_owned = owned_job_id,
+            .created_at_ms = created_at_ms,
+            .records_at_savepoint = records_at,
+        }) catch {
+            self.allocator.free(owned_sp_id);
+            self.allocator.free(owned_job_id);
+        };
+
+        // Update next_savepoint_id to avoid collisions
+        if (std.mem.startsWith(u8, key, "sp-")) {
+            const num = std.fmt.parseInt(u64, key[3..], 10) catch 0;
+            if (num >= self.next_savepoint_id) self.next_savepoint_id = num + 1;
+        }
+    }
+
+    /// Replay a rescale entry. Value = [parallelism:u32].
+    fn replayRescale(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
+        if (value.len < 4) return;
+        const parallelism = std.mem.readInt(u32, value[0..4], .little);
+        if (self.jobs.getPtr(key)) |job| {
+            job.parallelism = parallelism;
         }
     }
 
