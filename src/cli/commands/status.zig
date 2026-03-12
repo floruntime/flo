@@ -1,11 +1,17 @@
 //! Status command for Flo CLI
 //!
+//! Sends a binary ping over the wire protocol (port 9000 by default).
+//! Works even when the dashboard is disabled.
+//!
 //! Usage:
 //!   flo status [--endpoint <host:port>]   Check server health and status
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const client_mod = @import("../client/mod.zig");
+const Client = client_mod.Client;
+const cli_config = @import("../config.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -26,7 +32,7 @@ pub fn createStatusCommand(allocator: Allocator) !*commander.Command {
         .longAbout(
             \\Check the health and status of a running Flo server.
             \\
-            \\Makes an HTTP request to the server's health endpoint to verify
+            \\Sends a binary ping to the server's wire protocol port to verify
             \\the server is running and responding to requests.
             \\
             \\Exit codes:
@@ -35,107 +41,62 @@ pub fn createStatusCommand(allocator: Allocator) !*commander.Command {
         )
         .examples(&.{
             "flo status",
-            "flo status --endpoint localhost:9000",
+            "flo status --endpoint 127.0.0.1:9000",
             "flo status -e prod.example.com:9000",
         })
-        .stringFlag("endpoint", 'e', "localhost:9000", "Server endpoint (host:port)")
+        .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
         .boolFlag("json", 'j', "Output in JSON format")
         .action(wrapHandler(runStatus))
         .build();
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
-    const endpoint = ctx.getString("endpoint") orelse "localhost:9000";
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
-    // Parse host:port
-    const colon_pos = std.mem.indexOfScalar(u8, endpoint, ':');
-    const host = if (colon_pos) |pos| endpoint[0..pos] else endpoint;
-    const port_str = if (colon_pos) |pos| endpoint[pos + 1 ..] else "9000";
-    const port = std.fmt.parseInt(u16, port_str, 10) catch 9000;
-
-    const resolved_host = if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host;
-
     if (!json_output) {
-        ctx.print("Checking server at {s}:{d}...\n", .{ resolved_host, port });
+        ctx.print("Checking server at {s}...\n", .{endpoint});
     }
 
-    // Make HTTP request to /health endpoint
-    const address = std.net.Address.parseIp4(resolved_host, port) catch {
-        if (json_output) {
-            ctx.print("{{\"status\":\"error\",\"message\":\"Invalid address: {s}\"}}\n", .{resolved_host});
-        } else {
-            ctx.printErr("Error: Invalid address: {s}\n", .{resolved_host});
-        }
-        return error.CommandFailed;
-    };
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
 
-    const stream = std.net.tcpConnectToAddress(address) catch |err| {
+    client.connect() catch |err| {
         if (json_output) {
-            ctx.print("{{\"status\":\"down\",\"endpoint\":\"{s}:{d}\",\"error\":\"{}\"}}\n", .{ resolved_host, port, err });
+            ctx.print("{{\"status\":\"down\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
         } else {
-            ctx.printErr("✗ Server at {s}:{d} is DOWN\n", .{ resolved_host, port });
+            ctx.printErr("✗ Server at {s} is DOWN\n", .{endpoint});
             ctx.printErr("  Connection failed: {}\n", .{err});
         }
         return error.CommandFailed;
     };
-    defer stream.close();
 
-    // Send HTTP GET request to /health
-    var request_buf: [256]u8 = undefined;
-    const request = std.fmt.bufPrint(&request_buf, "GET /health HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{resolved_host}) catch {
-        ctx.printErr("Error: Request buffer too small\n", .{});
-        return error.CommandFailed;
-    };
-    _ = stream.write(request) catch |err| {
+    var result = client.sendRequest(.ping, "", "", "") catch |err| {
         if (json_output) {
-            ctx.print("{{\"status\":\"error\",\"message\":\"Write failed: {}\"}}\n", .{err});
+            ctx.print("{{\"status\":\"error\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
         } else {
-            ctx.printErr("Write failed: {}\n", .{err});
+            ctx.printErr("✗ Server at {s} is not responding\n", .{endpoint});
+            ctx.printErr("  Request failed: {}\n", .{err});
         }
         return error.CommandFailed;
     };
+    defer result.deinit();
 
-    // Read response
-    var buf: [4096]u8 = undefined;
-    const n = stream.read(&buf) catch |err| {
+    if (result.isError()) {
+        const err_msg = result.errorMessage();
         if (json_output) {
-            ctx.print("{{\"status\":\"error\",\"message\":\"Read failed: {}\"}}\n", .{err});
+            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":\"{s}\",\"error\":\"{s}\"}}\n", .{ endpoint, err_msg });
         } else {
-            ctx.printErr("Read failed: {}\n", .{err});
+            ctx.printErr("✗ Server is UNHEALTHY: {s}\n", .{err_msg});
         }
         return error.CommandFailed;
-    };
+    }
 
-    // Check for 200 OK
-    if (std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 200")) {
-        // Extract body (JSON from /health endpoint)
-        var body: []const u8 = "";
-        if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n")) |body_start| {
-            body = std.mem.trim(u8, buf[body_start + 4 .. n], " \r\n");
-        }
-
-        if (json_output) {
-            // Pass through the JSON body from /health
-            if (body.len > 0) {
-                ctx.print("{s}\n", .{body});
-            } else {
-                ctx.print("{{\"status\":\"healthy\",\"endpoint\":\"{s}:{d}\"}}\n", .{ resolved_host, port });
-            }
-        } else {
-            ctx.print("✓ Server is HEALTHY\n", .{});
-            ctx.print("  Endpoint: {s}:{d}\n", .{ resolved_host, port });
-            if (body.len > 0) {
-                ctx.print("  Response: {s}\n", .{body});
-            }
-        }
+    if (json_output) {
+        ctx.print("{{\"status\":\"healthy\",\"endpoint\":\"{s}\"}}\n", .{endpoint});
     } else {
-        if (json_output) {
-            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":\"{s}:{d}\"}}\n", .{ resolved_host, port });
-        } else {
-            ctx.print("✗ Server returned: {s}\n", .{buf[0..@min(n, 50)]});
-        }
-        return error.CommandFailed;
+        ctx.print("✓ Server is HEALTHY\n", .{});
+        ctx.print("  Endpoint: {s}\n", .{endpoint});
     }
 }
 
