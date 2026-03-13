@@ -43,9 +43,6 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
             \\windowed aggregation, and retention policies. Supports InfluxDB line
             \\protocol for batch ingestion.
         )
-        // Persistent flags - inherited by all subcommands
-        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })
-        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .subcommand(
             commander.newBuilder(allocator)
                 .name("write")

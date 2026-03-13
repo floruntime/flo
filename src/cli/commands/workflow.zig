@@ -51,8 +51,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                     "cat workflow.yaml | flo workflow create -f -",
                 })
                 .stringFlag("file", 'f', "", "YAML definition file (or - for stdin)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runCreate)),
         )
         .subcommand(
@@ -70,8 +68,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("version", 'v', "latest", "Workflow version")
                 .stringFlag("idempotency-key", 'k', "", "Idempotency key for dedup")
                 .stringFlag("run-id", 'r', "", "Custom run ID (optional)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runStart)),
         )
         .subcommand(
@@ -85,8 +81,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .arg("run_id", "Workflow run ID")
                 .stringFlag("type", 't', "", "Signal type (required)")
                 .stringFlag("payload", 'p', "", "Signal payload (JSON)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runSignal)),
         )
         .subcommand(
@@ -95,8 +89,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Get workflow run status")
                 .aliases(&.{"get"})
                 .arg("run_id", "Workflow run ID")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runStatus)),
         )
         .subcommand(
@@ -105,8 +97,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Get workflow run history (events)")
                 .arg("run_id", "Workflow run ID")
                 .uintFlag("limit", 'l', 100, "Maximum events to show")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runHistory)),
         )
         .subcommand(
@@ -117,8 +107,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .arg("name", "Workflow name")
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runListRuns)),
         )
         .subcommand(
@@ -127,8 +115,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Cancel a running workflow")
                 .arg("run_id", "Workflow run ID")
                 .stringFlag("reason", 'r', "", "Cancellation reason")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runCancel)),
         )
         .subcommand(
@@ -138,8 +124,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{ "def", "show" })
                 .arg("name", "Workflow name")
                 .stringFlag("version", 'v', "", "Specific version (default: latest)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runGetDefinition)),
         )
         .subcommand(
@@ -152,8 +136,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("name", "Workflow name")
                 .stringFlag("version", 'v', "", "Specific version (default: all versions)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runDisable)),
         )
         .subcommand(
@@ -166,8 +148,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("name", "Workflow name")
                 .stringFlag("version", 'v', "", "Specific version (default: all versions)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runEnable)),
         )
         .build();

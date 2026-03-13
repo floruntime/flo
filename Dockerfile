@@ -70,7 +70,7 @@ RUN mkdir -p /data/flo
 
 # Copy the binary and default config from builder
 COPY --from=zig-builder /build/zig-out/bin/flo /usr/local/bin/flo
-COPY docker/flo.toml /etc/flo/flo.toml
+COPY examples/docker-compose/flo.toml /etc/flo/flo.toml
 
 # Expose ports: 9000=API, 9001=Metrics (port+1), 9002=Dashboard (port+2)
 # Raft (port+500) and Gossip (port+600) only needed for clustering

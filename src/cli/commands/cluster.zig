@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const proto = @import("../../protocol/proto.zig");
 const output = @import("../output.zig");
+const cli_config = @import("../config.zig");
 const net = std.net;
 
 /// Wrapper to cast *anyopaque to *Context
@@ -43,7 +44,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     "flo cluster status --endpoint localhost:9000",
                     "flo cluster status --json",
                 })
-                .stringFlag("endpoint", 'e', "localhost:9000", "Server endpoint (host:port)")
                 .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runStatus)),
         )
@@ -56,7 +56,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     "flo cluster members --endpoint localhost:9000",
                     "flo cluster members --json",
                 })
-                .stringFlag("endpoint", 'e', "localhost:9000", "Server endpoint (host:port)")
                 .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runMembers)),
         )
@@ -68,7 +67,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     "flo cluster transfer-leader 2",
                     "flo cluster transfer-leader 2 --endpoint localhost:9000",
                 })
-                .stringFlag("endpoint", 'e', "localhost:9000", "Server endpoint (host:port)")
                 .action(wrapHandler(runTransferLeader)),
         )
         .build();
@@ -175,7 +173,7 @@ fn sendRequest(
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
-    const endpoint = ctx.getString("endpoint") orelse "localhost:9000";
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     const ep = parseEndpoint(endpoint) catch {
@@ -257,7 +255,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runMembers(ctx: *commander.Context) commander.Error!void {
-    const endpoint = ctx.getString("endpoint") orelse "localhost:9000";
+    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = ctx.getBool("json");
 
     const ep = parseEndpoint(endpoint) catch {
@@ -400,7 +398,7 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runTransferLeader(ctx: *commander.Context) commander.Error!void {
-    const endpoint = ctx.getString("endpoint") orelse "localhost:9000";
+    const endpoint = cli_config.getEndpoint(ctx);
     const args = ctx.args;
 
     if (args.len == 0) {

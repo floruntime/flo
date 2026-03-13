@@ -39,8 +39,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
             \\Namespaces provide logical separation between different
             \\applications or environments using the same Flo cluster.
         )
-        // Persistent flags - inherited by all subcommands
-        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .subcommand(
             commander.newBuilder(allocator)
                 .name("create")

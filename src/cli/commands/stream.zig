@@ -50,9 +50,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
             \\Streams are ordered, immutable sequences of records. They support
             \\consumer groups for distributed processing with at-least-once delivery.
         )
-        // Persistent flags - inherited by all subcommands
-        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace" })
-        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .subcommand(
             commander.newBuilder(allocator)
                 .name("append")

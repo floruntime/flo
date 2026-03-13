@@ -63,15 +63,13 @@ pub fn createAuthCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("name", 'n', "", "Human-readable key name")
                 .stringFlag("role", 'r', "", "Key role: admin, operator, viewer")
                 .stringFlag("out", 'o', "", "Write key to file instead of stdout")
-                .stringFlag("expires-in", 'e', "", "Key expiration (e.g., 30d, 90d, 365d)")
-                .stringFlag("endpoint", 0, "", "Server endpoint (host:port)")
+                .stringFlag("expires-in", 'x', "", "Key expiration (e.g., 30d, 90d, 365d)")
                 .action(wrapHandler(runCreateKey)),
         )
         .subcommand(
             commander.newBuilder(allocator)
                 .name("list-keys")
                 .about("List all API keys")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runListKeys)),
         )
         .subcommand(
@@ -79,7 +77,6 @@ pub fn createAuthCommand(allocator: Allocator) !*commander.Command {
                 .name("revoke-key")
                 .about("Revoke an API key")
                 .arg("key_id", "Key ID or prefix to revoke")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runRevokeKey)),
         )
         .subcommand(

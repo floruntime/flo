@@ -1,7 +1,7 @@
 //! KV (Key-Value) commands for Flo CLI using Commander framework
 //!
 //! Usage:
-//!   flo kv get <key> [--wait <ms>] [--block <ms>] [--format json|table|raw]
+//!   flo kv get <key> [--wait <ms>] [--block <ms>] [--output json|table|raw]
 //!   flo kv set <key> <value> [--ttl <seconds>] [--nx] [--xx]
 //!   flo kv delete <key>
 //!   flo kv list [--prefix <prefix>]
@@ -38,16 +38,13 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
             \\Provides commands for getting, setting, deleting, and listing
             \\key-value pairs with optional TTL and conditional operations.
         )
-        // Persistent flags - inherited by all subcommands
-        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })
-        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .subcommand(
             commander.newBuilder(allocator)
                 .name("get")
                 .about("Get a value by key")
                 .examples(&.{
                     "flo kv get mykey",
-                    "flo kv get mykey --format json",
+                    "flo kv get mykey --output json",
                     "flo kv get mykey --wait 5000",
                     "flo kv get mykey --block 5000",
                     "flo kv get user:123 --namespace users",

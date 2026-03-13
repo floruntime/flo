@@ -44,7 +44,6 @@ pub fn createStatusCommand(allocator: Allocator) !*commander.Command {
             "flo status --endpoint 127.0.0.1:9000",
             "flo status -e prod.example.com:9000",
         })
-        .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
         .boolFlag("json", 'j', "Output in JSON format")
         .action(wrapHandler(runStatus))
         .build();

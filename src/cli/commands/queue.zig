@@ -40,9 +40,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
             \\Provides commands for enqueueing, dequeueing, and managing
             \\messages with support for priority, delays, and acknowledgements.
         )
-        // Persistent flags - inherited by all subcommands
-        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })
-        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .subcommand(
             commander.newBuilder(allocator)
                 .name("enqueue")

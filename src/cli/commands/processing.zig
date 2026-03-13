@@ -50,8 +50,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing submit pipeline.yaml --namespace prod",
                 })
                 .arg("file", "YAML job definition file")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runSubmit)),
         )
         .subcommand(
@@ -62,8 +60,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing stop job-123",
                 })
                 .arg("job_id", "Job ID to stop")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runStop)),
         )
         .subcommand(
@@ -74,8 +70,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing cancel job-123",
                 })
                 .arg("job_id", "Job ID to cancel")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runCancel)),
         )
         .subcommand(
@@ -86,8 +80,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing status job-123",
                 })
                 .arg("job_id", "Job ID to query")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runStatus)),
         )
         .subcommand(
@@ -100,8 +92,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing list --limit 10",
                 })
                 .uintFlag("limit", 'l', 100, "Maximum jobs to show")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -112,8 +102,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                     "flo processing savepoint job-123",
                 })
                 .arg("job_id", "Job ID to savepoint")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runSavepoint)),
         )
         .subcommand(
@@ -125,8 +113,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("job_id", "Job ID to restore")
                 .arg("savepoint_id", "Savepoint ID to restore from")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runRestore)),
         )
         .subcommand(
@@ -138,8 +124,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("job_id", "Job ID to rescale")
                 .arg("parallelism", "New parallelism level")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runRescale)),
         )
         .build();

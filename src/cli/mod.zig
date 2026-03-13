@@ -55,7 +55,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             "flo server start --port 9000 --data-dir ./data",
             "flo status --endpoint localhost:9000",
             "flo kv set mykey \"hello world\"",
-            "flo kv get mykey --format json",
+            "flo kv get mykey --output json",
             "flo stream append events \"user clicked\" \"page loaded\"",
             "flo stream read events --limit 10",
             "flo cluster status",
@@ -67,7 +67,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             },
         })
         .flag("verbose", .{ .short = 'v', .desc = "Enable verbose output", .persistent = true })
-        .persistentFlag("format", .{ .short = 'f', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw" })
+        .persistentFlag("output", .{ .short = 'o', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw" })
+        .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
+        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "" }, .desc = "Namespace to use" })
 
         // Server Commands (pre-built)
         .addCommand(server)

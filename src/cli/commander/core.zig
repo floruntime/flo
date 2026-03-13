@@ -1483,6 +1483,13 @@ pub const Command = struct {
             }
         }
 
+        // Own persistent flags
+        for (self.persistent_flags.items) |*flag| {
+            if (!flag.hidden) {
+                all_flags.append(self.allocator, flag) catch {};
+            }
+        }
+
         // Inherited persistent flags
         var parent_ptr = self.parent;
         while (parent_ptr) |p| {

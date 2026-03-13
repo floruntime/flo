@@ -49,14 +49,11 @@ pub const Format = enum {
     }
 };
 
-/// Get the output format from the global --format flag.
-/// Also checks --json boolean flag for backward compatibility (stream/queue commands).
+/// Get the output format from the global --output flag.
 pub fn getFormat(ctx: *Context) Format {
-    if (ctx.flagChanged("format")) {
-        return Format.fromString(ctx.getString("format") orelse "table");
+    if (ctx.flagChanged("output")) {
+        return Format.fromString(ctx.getString("output") orelse "table");
     }
-    // Backward compat: --json boolean flag used by stream/queue commands
-    if (ctx.getBool("json")) return .json;
     return .table;
 }
 
