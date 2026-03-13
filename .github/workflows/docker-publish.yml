@@ -2,14 +2,8 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches:
-      - master
-      - dev
     tags:
       - 'v*'
-  pull_request:
-    branches:
-      - master
   workflow_dispatch:
 
 env:
@@ -44,12 +38,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-,enable=${{ github.ref_type == 'branch' }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
@@ -58,7 +49,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
