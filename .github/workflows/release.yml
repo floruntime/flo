@@ -62,7 +62,7 @@ jobs:
           cp -r dist/* ../src/node/dashboard/dist/
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build --release=safe -Dtarget=${{ matrix.target }}
 
       - name: Package
         run: |
