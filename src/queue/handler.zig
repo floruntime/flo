@@ -29,6 +29,8 @@ const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const Partition = @import("../storage/partition.zig").Partition;
+const persistence_mod = @import("../storage/persistence.zig");
+const ReplayRegistry = persistence_mod.ReplayRegistry;
 
 const CommandResult = result_mod.CommandResult;
 const QueueProjection = queue_mod.QueueProjection;
@@ -51,6 +53,10 @@ pub const QueueHandler = struct {
     partition: *Partition,
     allocator: Allocator,
 
+    /// Opaque pointer to owning Shard (avoids circular import).
+    /// Set after init by Shard.wireHandlerShardPtrs(). Required for Raft writes.
+    shard_ptr: ?*anyopaque,
+
     const MAX_DEQUEUE_BATCH: u32 = 100;
     const DEFAULT_DEQUEUE_COUNT: u32 = 1;
 
@@ -59,6 +65,7 @@ pub const QueueHandler = struct {
             .queue = &partition.queue,
             .partition = partition,
             .allocator = allocator,
+            .shard_ptr = null,
         };
     }
 
@@ -248,7 +255,15 @@ pub const QueueHandler = struct {
         };
         defer if (value_len > value_buf.len) self.allocator.free(value_slice);
 
-        // Build command entry
+        // Persist through Raft for durability and replication
+        if (self.shard_ptr) |sptr| {
+            const shard: *Shard = @ptrCast(@alignCast(sptr));
+            _ = persistence_mod.persistEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+        }
+
+        // Build command entry for local projection apply
         const next_index = self.partition.ual.max_index + 1;
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
         var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256 + 4 + 4096]u8 = undefined;
@@ -348,12 +363,20 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
-        // Build command entry: key = [seq:u64], value = empty
+        // Persist through Raft
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, seq, .little);
+        if (self.shard_ptr) |sptr| {
+            const shard: *Shard = @ptrCast(@alignCast(sptr));
+            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+        }
+
+        // Apply locally
         const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, seq, .little);
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8; // 8-byte seq key, no value
         var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
@@ -390,12 +413,20 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
-        // Build command entry: key = [seq:u64], value = empty
+        // Persist through Raft
+        var seq_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq_key, seq, .little);
+        if (self.shard_ptr) |sptr| {
+            const shard: *Shard = @ptrCast(@alignCast(sptr));
+            _ = persistence_mod.persistEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+        }
+
+        // Apply locally
         const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, seq, .little);
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
         var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
@@ -589,10 +620,18 @@ pub const QueueHandler = struct {
     /// Persist a queue_ack UAL entry for a dequeued message.
     /// Called automatically after dequeue so consumed messages don't reappear after restart.
     fn persistAck(self: *QueueHandler, ns_hash: u32, seq: u64) void {
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
+
+        // Persist through Raft
+        if (self.shard_ptr) |sptr| {
+            const shard: *Shard = @ptrCast(@alignCast(sptr));
+            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch {};
+        }
+
+        // Apply locally
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const next_index = self.partition.ual.max_index + 1;
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
         var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
@@ -618,6 +657,32 @@ pub const QueueHandler = struct {
             .queue_peek_messages => |r| self.allocator.free(r.data),
             .queue_dlq_messages => |r| self.allocator.free(r.data),
             else => {},
+        }
+    }
+
+    // ── Replay ──────────────────────────────────────────────────────────
+
+    /// Register queue entry types with the replay registry.
+    pub fn registerReplay(self: *QueueHandler, registry: *ReplayRegistry) void {
+        registry.register(.queue_enqueue, @ptrCast(self), replayEntry);
+        registry.register(.queue_ack, @ptrCast(self), replayEntry);
+        registry.register(.queue_nack, @ptrCast(self), replayEntry);
+    }
+
+    /// Replay a queue entry — rebuild queue name registration.
+    /// The projection router already routes queue entries to QueueProjection.applyEntry(),
+    /// which handles the actual enqueue/ack/nack. This callback just ensures
+    /// queue name metadata is restored for `queue list`.
+    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *QueueHandler = @ptrCast(@alignCast(ctx));
+        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+
+        if (etype == .queue_enqueue) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                const ns_hash = cmd.namespace_hash;
+                const q_name_hash = router.nameHash(ns_hash, cmd.key);
+                self.queue.registerQueue(q_name_hash, cmd.key, "") catch {};
+            }
         }
     }
 };

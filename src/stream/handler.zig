@@ -57,6 +57,8 @@ const Partition = partition_mod.Partition;
 const entry_mod = @import("../storage/ual/entry.zig");
 const EntryType = entry_mod.EntryType;
 const UAL = @import("../storage/ual/ual.zig").UAL;
+const persistence_mod = @import("../storage/persistence.zig");
+const ReplayRegistry = persistence_mod.ReplayRegistry;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // StreamHandler
@@ -67,6 +69,10 @@ pub const StreamHandler = struct {
     partition: *Partition,
     allocator: Allocator,
 
+    /// Opaque pointer to owning Shard (avoids circular import).
+    /// Set after init by Shard.init. Required for persistEntry() Raft writes.
+    shard_ptr: ?*anyopaque,
+
     /// Maximum number of messages in a single read response.
     const MAX_READ_BATCH: usize = 1000;
     const DEFAULT_READ_BATCH: usize = 100;
@@ -76,6 +82,7 @@ pub const StreamHandler = struct {
             .stream = &partition.stream,
             .partition = partition,
             .allocator = allocator,
+            .shard_ptr = null,
         };
     }
 
@@ -306,11 +313,20 @@ pub const StreamHandler = struct {
             }
         }
 
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
         const payload_value = if (req.value.len > 0) req.value else "";
 
-        // Build command entry: key = stream name, value = message payload
+        // Persist through Raft for durability and replication
+        if (self.shard_ptr) |sptr| {
+            const shard = shardFromPtr(sptr);
+            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+        }
+
+        // Apply locally: append to partition UAL (for stream reads) + projection router
+        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const next_index = self.partition.ual.max_index + 1;
+
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + payload_value.len;
         const payload_buf = self.allocator.alloc(u8, payload_size) catch {
             return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
@@ -331,7 +347,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
         };
 
-        // Persist to UAL (ring buffer) and route through projections
+        // Apply to partition UAL (for stream payload reads) + warm store
         const ual_index = self.partition.apply(&entry) catch {
             return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
@@ -960,10 +976,16 @@ pub const StreamHandler = struct {
     /// Append payload to a named stream (used by processing pipelines).
     /// Computes the namespace-qualified name hash for proper stream isolation.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !u64 {
+        // Persist through Raft for durability and replication
+        if (self.shard_ptr) |sptr| {
+            const shard = shardFromPtr(sptr);
+            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, payload) catch {};
+        }
+
+        // Apply locally: append to partition UAL + warm store
         const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
-        // Build command entry with stream name as key
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + payload.len;
         const payload_buf = try self.allocator.alloc(u8, payload_size);
         defer self.allocator.free(payload_buf);
@@ -1056,6 +1078,42 @@ pub const StreamHandler = struct {
             .group_pending => |r| self.allocator.free(r.data),
             else => {},
         }
+    }
+
+    // ── Replay ──────────────────────────────────────────────────────────
+
+    /// Register stream entry types with the replay registry.
+    /// Called during shard init so replaySegments and handleInboxMessage
+    /// can rebuild stream state without hardcoded type checks.
+    pub fn registerReplay(self: *StreamHandler, registry: *ReplayRegistry) void {
+        registry.register(.stream_append, @ptrCast(self), replayEntry);
+        registry.register(.stream_trim, @ptrCast(self), replayEntry);
+    }
+
+    /// Replay a stream entry — rebuild StreamProjection offset tracking
+    /// and stream name registration from a persisted entry.
+    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *StreamHandler = @ptrCast(@alignCast(ctx));
+        const etype: EntryType = @enumFromInt(entry.header.entry_type);
+
+        if (etype == .stream_append) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                const ns_hash: u64 = @as(u64, cmd.namespace_hash);
+                const name_hash = std.hash.Wyhash.hash(ns_hash, cmd.key);
+                // Use the entry's index as the UAL index for stream reads
+                _ = self.stream.appendToStream(name_hash, entry.header.index, 0) catch {};
+                self.stream.registerStream(cmd.key) catch {};
+            }
+        }
+        // stream_trim doesn't need replay — trimmed entries are simply absent
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    /// Cast opaque shard pointer to a Shard-like type for persistEntry().
+    /// Uses anytype to avoid circular import.
+    fn shardFromPtr(ptr: *anyopaque) *Shard {
+        return @ptrCast(@alignCast(ptr));
     }
 };
 

@@ -26,6 +26,9 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const persistence_mod = @import("../storage/persistence.zig");
+const entry_mod = @import("../storage/ual/entry.zig");
+const ReplayRegistry = @import("../storage/persistence.zig").ReplayRegistry;
 
 // FloQL pipeline
 const floql_parser = @import("floql/parser.zig");
@@ -50,14 +53,18 @@ pub const TSHandler = struct {
     ts: *TSProjection,
     allocator: Allocator,
 
-    /// Monotonic UAL index counter — stand-in for real UAL index.
+    /// Monotonic UAL index counter — fallback for test mode (no shard).
     next_ual_index: u64,
+
+    /// Set after init by Shard.wireHandlerShardPtrs(). Required for persistEntry() Raft writes.
+    shard_ptr: ?*anyopaque,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
         return .{
             .ts = ts,
             .allocator = allocator,
             .next_ual_index = 1,
+            .shard_ptr = null,
         };
     }
 
@@ -139,7 +146,6 @@ pub const TSHandler = struct {
         }
 
         const measurement = req.key;
-        const ual_index = self.nextUalIndex();
 
         // Parse field name from options, default to "value"
         const field_name = if (req.findOption(.ts_field)) |opt|
@@ -169,6 +175,21 @@ pub const TSHandler = struct {
             break :blk if (tags_str.len > 0) std.hash.Wyhash.hash(0, tags_str) else 0;
         } else 0;
 
+        // Persist through Raft for durability and replication
+        var ual_index: u64 = 0;
+        if (self.shard_ptr) |sptr| {
+            const shard = shardFromPtr(sptr);
+            // Encode value as f64 LE bytes for persistence
+            var val_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &val_buf, @as(u64, @bitCast(value)), .little);
+            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, &val_buf) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "ts write persistence failed" } };
+            };
+        } else {
+            ual_index = self.nextUalIndex();
+        }
+
+        // Insert into local TS projection (full fidelity: field_name + tag_hash)
         self.ts.insert(measurement, field_name, value, timestamp_ns, ual_index, tag_hash) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
         };
@@ -450,6 +471,39 @@ pub const TSHandler = struct {
             .ts_floql_result => |r| self.allocator.free(r.data),
             else => {},
         }
+    }
+
+    // ── Replay Registration ─────────────────────────────────────────────
+
+    /// Register TS entry types with the ReplayRegistry so persisted entries
+    /// are replayed back to the TS projection on startup.
+    pub fn registerReplay(self: *TSHandler, registry: *ReplayRegistry) void {
+        registry.register(.ts_write, self, replayEntry);
+        registry.register(.ts_write_batch, self, replayEntry);
+    }
+
+    /// Replay callback — rebuild TS projection from persisted UAL entries.
+    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+        const self: *TSHandler = @ptrCast(@alignCast(ctx));
+        if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+            var value: f64 = 0.0;
+            if (cmd.value.len >= 8) {
+                value = @bitCast(std.mem.readInt(u64, cmd.value[0..8], .little));
+            }
+            self.ts.insert(
+                cmd.key,
+                "value",
+                value,
+                entry.header.timestamp_ns,
+                entry.header.index,
+                0,
+            ) catch {};
+        }
+    }
+
+    /// Cast opaque shard pointer to Shard for persistEntry().
+    fn shardFromPtr(ptr: *anyopaque) *Shard {
+        return @ptrCast(@alignCast(ptr));
     }
 };
 

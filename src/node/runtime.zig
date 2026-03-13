@@ -343,8 +343,10 @@ pub const Runtime = struct {
 
         // 2.6 Register cooperative background tasks (hot_flush, etc.).
         // Must happen after shards are at final heap addresses.
+        // Also wire shard back-pointers for handlers that need Raft access.
         for (0..self.shard_count) |i| {
             shards[i].registerBackgroundTasks();
+            shards[i].wireHandlerShardPtrs();
         }
 
         log.debug("Runtime.start: {d} shards initialized", .{shards_created});

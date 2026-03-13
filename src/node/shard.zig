@@ -204,6 +204,10 @@ pub const Shard = struct {
     /// create/delete through Raft for multi-node consistency).
     coordinator: ?*Coordinator,
 
+    /// Replay registry — maps EntryType → handler replay callback.
+    /// Used during segment replay and for follower entry application.
+    replay_registry: ReplayRegistry,
+
     pub fn init(
         allocator: std.mem.Allocator,
         shard_id: u16,
@@ -293,6 +297,20 @@ pub const Shard = struct {
         try raft_node.bootstrap();
 
         var shard_data_dir: ?[]const u8 = null;
+
+        // Build replay registry — handlers register their entry types
+        // so replaySegments and handleInboxMessage can dispatch without
+        // hardcoded type checks. Created before data_dir block so it's
+        // always available for the Shard struct.
+        var replay_registry: ReplayRegistry = .{};
+        workflow_handler.registerReplay(&replay_registry);
+        namespace_handler.registerReplay(&replay_registry);
+        actions_handler.registerReplay(&replay_registry);
+        processing_handler.registerReplay(&replay_registry);
+        stream_handler.registerReplay(&replay_registry);
+        queue_handler.registerReplay(&replay_registry);
+        ts_handler.registerReplay(&replay_registry);
+
         if (data_dir) |dir| {
             // Build shard-specific data directory: data_dir/00000/
             const shard_dir = try std.fmt.allocPrint(allocator, "{s}/{d:0>5}", .{ dir, shard_id });
@@ -368,14 +386,6 @@ pub const Shard = struct {
             // If a snapshot was loaded, skip entries at or below replay_from.
             var max_index: u64 = replay_from;
 
-            // Build replay registry — handlers register their entry types
-            // so replaySegments can dispatch without hardcoded type checks.
-            var replay_registry: ReplayRegistry = .{};
-            workflow_handler.registerReplay(&replay_registry);
-            namespace_handler.registerReplay(&replay_registry);
-            actions_handler.registerReplay(&replay_registry);
-            processing_handler.registerReplay(&replay_registry);
-
             replaySegments(allocator, segs_dir_path, partition, &max_index, &replay_registry, replay_from);
 
             // Restore handler LSN counter to avoid index collisions
@@ -391,8 +401,8 @@ pub const Shard = struct {
         // Wire UAL persistence: entries auto-persist to SegmentWriter on append.
         // This is wired AFTER segment replay so replayed entries don't get
         // re-persisted (design: UAL → hot ring → flush to warm segments).
-        partition.ual.on_append_ctx = @ptrCast(seg_writer);
-        partition.ual.on_append = ualPersistCallback;
+        // Only the Raft log UAL persists — partition.ual is a read cache
+        // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = ualPersistCallback;
 
@@ -455,6 +465,7 @@ pub const Shard = struct {
             .forwarder = null,
             .partition_table = null,
             .coordinator = null,
+            .replay_registry = replay_registry,
         };
     }
 
@@ -474,6 +485,14 @@ pub const Shard = struct {
     /// Should only be called on Shard 0.
     pub fn setCoordinator(self: *Shard, coord: *Coordinator) void {
         self.coordinator = coord;
+    }
+
+    /// Wire shard back-pointers into handlers that need Raft access.
+    /// Must be called after shards are at their final heap addresses.
+    pub fn wireHandlerShardPtrs(self: *Shard) void {
+        self.stream_handler.shard_ptr = @ptrCast(self);
+        self.queue_handler.shard_ptr = @ptrCast(self);
+        self.ts_handler.shard_ptr = @ptrCast(self);
     }
 
     pub fn deinit(self: *Shard) void {
@@ -834,7 +853,7 @@ pub const Shard = struct {
             },
             .raft_message => {
                 // Received a replicated entry from a peer node.
-                // Deserialize and apply to KV projection.
+                // Deserialize and apply to ALL projections via partition.apply().
                 if (msg.payload_ptr) |ptr| {
                     const data: [*]u8 = @ptrCast(ptr);
                     const len = msg.payload_len;
@@ -842,8 +861,21 @@ pub const Shard = struct {
                         const payload = data[0..len];
                         // Try to deserialize as a UAL entry
                         if (entry_mod.Entry.deserialize(payload)) |entry| {
-                            // Apply to partition projections (idempotent)
-                            self.defaultPartition().kv.applyEntry(&entry) catch {};
+                            // Apply to partition (UAL + projection router: KV, Queue, TS)
+                            const ual_index = self.defaultPartition().apply(&entry) catch 0;
+
+                            // Stream entries need manual offset tracking (router routes to .none)
+                            const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+                            if (etype == .stream_append) {
+                                if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                                    const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
+                                    _ = self.defaultPartition().stream.appendToStream(name_hash, ual_index, 0) catch {};
+                                    self.defaultPartition().stream.registerStream(cmd.key) catch {};
+                                }
+                            }
+
+                            // Dispatch to handler replay (workflow, actions, namespace, etc.)
+                            _ = self.replay_registry.dispatch(&entry);
                         }
                         // Free the duplicated payload
                         self.allocator.free(payload);
@@ -1790,6 +1822,11 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
+
+        // Persist through Raft for durability and replication
+        _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch {};
+
+        // Apply locally
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
         var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
         if (entry_mod.buildCommandEntry(
@@ -1882,19 +1919,9 @@ fn replaySegments(
                 offset += seg_entry.totalSize();
                 continue;
             };
+            _ = ual_index;
 
-            // Stream entries: router skips them (.none), so manually rebuild
-            // the StreamProjection offset→ual_index mapping.
-            const etype: entry_mod.EntryType = @enumFromInt(seg_entry.header.entry_type);
-            if (etype == .stream_append) {
-                if (entry_mod.CommandPayload.deserialize(seg_entry.payload)) |cmd| {
-                    const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                    _ = partition.stream.appendToStream(name_hash, ual_index, 0) catch {};
-                    partition.stream.registerStream(cmd.key) catch {};
-                }
-            }
-
-            // Dispatch to registered handlers (workflow, namespace, actions, etc.)
+            // Dispatch to registered handlers (stream, queue, ts, workflow, namespace, actions, etc.)
             // Replaces hardcoded if/else chains — handlers register their entry
             // types with the ReplayRegistry during init.
             _ = replay_registry.dispatch(&seg_entry);
