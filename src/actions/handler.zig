@@ -85,6 +85,9 @@ pub const ActionsHandler = struct {
         input_owned: ?[]const u8,
         labels_owned: ?[]const u8 = null,
         result_owned: ?[]const u8 = null,
+        worker_id_owned: ?[]const u8 = null,
+        error_owned: ?[]const u8 = null,
+        source: u8 = 0, // 0 = direct, 1 = workflow, 2 = trigger
         status: ActionRunStatus,
         created_at_ms: i64,
         started_at_ms: ?i64,
@@ -117,6 +120,8 @@ pub const ActionsHandler = struct {
             if (entry.value_ptr.input_owned) |inp| self.allocator.free(inp);
             if (entry.value_ptr.labels_owned) |lbl| self.allocator.free(lbl);
             if (entry.value_ptr.result_owned) |res| self.allocator.free(res);
+            if (entry.value_ptr.worker_id_owned) |wid| self.allocator.free(wid);
+            if (entry.value_ptr.error_owned) |err_msg| self.allocator.free(err_msg);
         }
         self.runs.deinit();
     }
@@ -269,7 +274,7 @@ pub const ActionsHandler = struct {
             null;
 
         // Check if there's already a pending run to claim
-        if (shard.actions_handler.claimPendingRun(action_name, worker_labels)) |task| {
+        if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
             shard.worker_handler.recordTaskAssigned(worker_id);
             sendTaskAssignment(shard, conn, req.header.request_id, task);
             return;
@@ -308,7 +313,7 @@ pub const ActionsHandler = struct {
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
     /// If worker_labels is provided, only claims runs whose required labels match.
-    fn claimPendingRun(self: *ActionsHandler, action_name: []const u8, worker_labels: ?[]const u8) ?ClaimedTask {
+    fn claimPendingRun(self: *ActionsHandler, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
         var it = self.runs.iterator();
         while (it.next()) |entry| {
             const run = entry.value_ptr;
@@ -327,6 +332,10 @@ pub const ActionsHandler = struct {
 
             run.status = .running;
             run.started_at_ms = std.time.milliTimestamp();
+            if (worker_id.len > 0) {
+                if (run.worker_id_owned) |old| self.allocator.free(old);
+                run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
+            }
             return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms };
         }
         return null;
@@ -813,13 +822,18 @@ pub const ActionsHandler = struct {
         if (self.runs.getPtr(task_id)) |run| {
             run.status = .completed;
             run.completed_at_ms = std.time.milliTimestamp();
+            // Store worker_id from req.key
+            if (req.key.len > 0) {
+                if (run.worker_id_owned) |old| self.allocator.free(old);
+                run.worker_id_owned = self.allocator.dupe(u8, req.key) catch null;
+            }
             // Store result
             if (result_data.len > 0) {
                 if (run.result_owned) |old| self.allocator.free(old);
                 run.result_owned = self.allocator.dupe(u8, result_data) catch null;
             }
             // Persist run status update through Raft
-            if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .completed, run.completed_at_ms, result_data);
+            if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .completed, run.completed_at_ms, result_data, run.started_at_ms, run.worker_id_owned);
             return null; // success
         }
         return "run not found";
@@ -878,17 +892,30 @@ pub const ActionsHandler = struct {
         const retry = value[offset] == 1;
         offset += 1;
 
+        // Remaining bytes are error message
+        const error_message = if (offset < value.len) value[offset..] else "";
+
         // Find and update the run
         if (self.runs.getPtr(task_id)) |run| {
+            // Store worker_id from req.key
+            if (req.key.len > 0) {
+                if (run.worker_id_owned) |old| self.allocator.free(old);
+                run.worker_id_owned = self.allocator.dupe(u8, req.key) catch null;
+            }
+            // Store error message
+            if (error_message.len > 0) {
+                if (run.error_owned) |old| self.allocator.free(old);
+                run.error_owned = self.allocator.dupe(u8, error_message) catch null;
+            }
             if (retry) {
                 // Put back to pending for retry
                 run.status = .pending;
                 run.started_at_ms = null;
-                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "");
+                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "", null, run.worker_id_owned);
             } else {
                 run.status = .failed;
                 run.completed_at_ms = std.time.milliTimestamp();
-                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .failed, run.completed_at_ms, "");
+                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .failed, run.completed_at_ms, "", run.started_at_ms, run.worker_id_owned);
             }
             return null; // success
         }
@@ -1105,8 +1132,8 @@ pub const ActionsHandler = struct {
     }
 
     /// Persist a run status update (complete, fail, retry).
-    /// Value format: [status:u8][has_timestamp:u8][timestamp_ms?:i64][result_len:u32][result]
-    fn persistRunUpdate(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, status: ActionRunStatus, timestamp_ms: ?i64, result_data: []const u8) void {
+    /// Value format: [status:u8][started_at:u8+i64][completed_at:u8+i64][result_len:u32][result][wid_len:u16][worker_id]
+    fn persistRunUpdate(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, status: ActionRunStatus, timestamp_ms: ?i64, result_data: []const u8, started_at_ms: ?i64, worker_id: ?[]const u8) void {
         _ = self;
         var value_buf: [65536]u8 = undefined;
         var off: usize = 0;
@@ -1114,6 +1141,18 @@ pub const ActionsHandler = struct {
         value_buf[off] = @intFromEnum(status);
         off += 1;
 
+        // started_at_ms
+        if (started_at_ms) |sa| {
+            value_buf[off] = 1;
+            off += 1;
+            std.mem.writeInt(i64, value_buf[off..][0..8], sa, .little);
+            off += 8;
+        } else {
+            value_buf[off] = 0;
+            off += 1;
+        }
+
+        // completed_at_ms
         if (timestamp_ms) |ts| {
             value_buf[off] = 1;
             off += 1;
@@ -1124,6 +1163,7 @@ pub const ActionsHandler = struct {
             off += 1;
         }
 
+        // result
         const rlen: u32 = @intCast(result_data.len);
         std.mem.writeInt(u32, value_buf[off..][0..4], rlen, .little);
         off += 4;
@@ -1131,6 +1171,16 @@ pub const ActionsHandler = struct {
             if (off + result_data.len > value_buf.len) return;
             @memcpy(value_buf[off .. off + result_data.len], result_data);
             off += result_data.len;
+        }
+
+        // worker_id
+        const wid = worker_id orelse "";
+        const wid_len: u16 = @intCast(wid.len);
+        std.mem.writeInt(u16, value_buf[off..][0..2], wid_len, .little);
+        off += 2;
+        if (wid.len > 0) {
+            @memcpy(value_buf[off .. off + wid.len], wid);
+            off += wid.len;
         }
 
         _ = persistence.persistEntry(shard, .action_update_run, Flags.NONE, namespace, run_id, value_buf[0..off]) catch {};
@@ -1290,7 +1340,18 @@ pub const ActionsHandler = struct {
         const status: ActionRunStatus = @enumFromInt(value[off]);
         off += 1;
 
-        // optional timestamp
+        // started_at_ms
+        if (off >= value.len) return;
+        const has_started = value[off] == 1;
+        off += 1;
+        var started_at_ms: ?i64 = null;
+        if (has_started) {
+            if (off + 8 > value.len) return;
+            started_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+            off += 8;
+        }
+
+        // completed_at_ms
         if (off >= value.len) return;
         const has_ts = value[off] == 1;
         off += 1;
@@ -1308,6 +1369,17 @@ pub const ActionsHandler = struct {
         var result_data: ?[]const u8 = null;
         if (rlen > 0 and off + rlen <= value.len) {
             result_data = self.allocator.dupe(u8, value[off .. off + rlen]) catch null;
+            off += rlen;
+        }
+
+        // worker_id
+        var worker_id_data: ?[]const u8 = null;
+        if (off + 2 <= value.len) {
+            const wid_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (wid_len > 0 and off + wid_len <= value.len) {
+                worker_id_data = self.allocator.dupe(u8, value[off .. off + wid_len]) catch null;
+            }
         }
 
         // Apply to existing run
@@ -1316,8 +1388,14 @@ pub const ActionsHandler = struct {
             if (status == .completed or status == .failed) {
                 run.completed_at_ms = timestamp_ms;
             } else if (status == .pending) {
-                // Retry — reset started
                 run.started_at_ms = null;
+            }
+            if (started_at_ms) |sa| {
+                run.started_at_ms = sa;
+            }
+            if (worker_id_data) |wid| {
+                if (run.worker_id_owned) |old| self.allocator.free(old);
+                run.worker_id_owned = wid;
             }
             if (result_data) |rd| {
                 if (run.result_owned) |old| self.allocator.free(old);
@@ -1326,6 +1404,7 @@ pub const ActionsHandler = struct {
         } else {
             // Run entry replayed before invoke entry (shouldn't happen with ordered log)
             if (result_data) |rd| self.allocator.free(rd);
+            if (worker_id_data) |wid| self.allocator.free(wid);
         }
     }
 };
@@ -1353,7 +1432,7 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
         null;
 
     // Try to claim a pending run
-    const task = shard.actions_handler.claimPendingRun(action_name, worker_labels) orelse return false;
+    const task = shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id) orelse return false;
 
     const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone
     sendTaskAssignment(shard, conn, waiter.request_id, task);

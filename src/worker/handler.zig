@@ -64,6 +64,8 @@ pub const WorkerRecord = struct {
     id_owned: []const u8,
     worker_type: WorkerType,
     status: WorkerStatus,
+    /// Namespace this worker belongs to
+    namespace_owned: []const u8,
     /// JSON metadata: labels, extra user data
     metadata_owned: ?[]const u8 = null,
     /// Machine/host identifier — groups workers on the same machine
@@ -106,6 +108,7 @@ pub const WorkerHandler = struct {
         }
         w.processes.deinit(self.allocator);
         self.allocator.free(w.id_owned);
+        self.allocator.free(w.namespace_owned);
         if (w.metadata_owned) |m| self.allocator.free(m);
         if (w.machine_id_owned) |mid| self.allocator.free(mid);
     }
@@ -278,6 +281,12 @@ pub const WorkerHandler = struct {
             processes.deinit(self.allocator);
             return;
         };
+        const owned_namespace = self.allocator.dupe(u8, req.namespace) catch {
+            self.allocator.free(owned_id);
+            for (processes.items) |p| self.allocator.free(p.name_owned);
+            processes.deinit(self.allocator);
+            return;
+        };
         const owned_metadata: ?[]const u8 = if (metadata) |m|
             self.allocator.dupe(u8, m) catch null
         else
@@ -291,6 +300,7 @@ pub const WorkerHandler = struct {
             .id_owned = owned_id,
             .worker_type = worker_type,
             .status = .active,
+            .namespace_owned = owned_namespace,
             .metadata_owned = owned_metadata,
             .machine_id_owned = owned_machine_id,
             .processes = processes,
@@ -301,6 +311,7 @@ pub const WorkerHandler = struct {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
             self.allocator.free(owned_id);
+            self.allocator.free(owned_namespace);
             if (owned_metadata) |m| self.allocator.free(m);
             if (owned_machine_id) |mid| self.allocator.free(mid);
         };

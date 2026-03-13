@@ -254,14 +254,14 @@ export function InfiniteTape({ messages, groups, onSeekerRangeChange }: Infinite
                 <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-30 group/timerange">
                     {/* Default view: Timestamps */}
                     <div className="text-[10px] text-text-secondary/80 font-mono text-center whitespace-nowrap group-hover/timerange:hidden">
-                        {new Date(messages[seekerRange.start]?.timestamp || Date.now()).toLocaleString('en-GB', {
+                        {new Date(messages[seekerRange.start]?.id_ms || Date.now()).toLocaleString('en-GB', {
                             hour: '2-digit',
                             minute: '2-digit',
                             second: '2-digit',
                             day: '2-digit',
                             month: 'short',
                             year: 'numeric'
-                        })} → {new Date(messages[seekerRange.end]?.timestamp || Date.now()).toLocaleString('en-GB', {
+                        })} → {new Date(messages[seekerRange.end]?.id_ms || Date.now()).toLocaleString('en-GB', {
                             hour: '2-digit',
                             minute: '2-digit',
                             second: '2-digit',

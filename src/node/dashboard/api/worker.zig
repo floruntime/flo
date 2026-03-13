@@ -26,7 +26,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 }
 
 /// GET /workers — List registered workers across all shards
-pub fn getWorkers(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -45,6 +47,10 @@ pub fn getWorkers(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
             var it = wh.workers.iterator();
             while (it.next()) |entry| {
                 const w = entry.value_ptr;
+                // Filter by namespace if requested
+                if (ns_filter) |ns| {
+                    if (!std.mem.eql(u8, w.namespace_owned, ns)) continue;
+                }
                 const gop = try seen.getOrPut(w.id_owned);
                 if (!gop.found_existing) {
                     try arr.next();
@@ -82,6 +88,7 @@ pub fn writeWorkerJson(writer: anytype, w: *const WorkerRecord) !void {
     try obj.stringField("worker_id", w.id_owned);
     try obj.stringField("status", @tagName(w.status));
     try obj.stringField("worker_type", if (w.worker_type == .action) "action" else "stream");
+    try obj.stringField("namespace", w.namespace_owned);
     if (w.machine_id_owned) |mid| {
         try obj.stringField("machine_id", mid);
     } else {
@@ -130,7 +137,7 @@ test "getWorkers returns empty array" {
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try getWorkers(allocator, &ctx);
+    const result = try getWorkers(allocator, null, &ctx);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("[]", result);
 }

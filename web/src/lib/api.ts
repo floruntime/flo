@@ -368,6 +368,9 @@ export interface ActionRunInfo {
   worker_id?: string;
   error?: string;
   outcome?: string;
+  input?: string;
+  output?: string;
+  source?: 'direct' | 'workflow' | 'trigger';
 }
 
 /** Action detail returned from GET /actions/:name */
@@ -406,6 +409,7 @@ export interface WorkerInfo {
   worker_id: string;
   status: 'active' | 'idle' | 'draining' | 'unhealthy';
   worker_type: 'action' | 'stream';
+  namespace: string;
   machine_id: string | null;
   current_load: number;
   max_concurrent: number;
@@ -843,15 +847,20 @@ class FloApiClient {
   /**
    * Trigger an action from the dashboard
    */
-  async invokeAction(name: string): Promise<ActionInvokeResult> {
-    return this.fetch<ActionInvokeResult>(`actions/${encodeURIComponent(name)}/invoke`);
+  async invokeAction(name: string, input?: string): Promise<ActionInvokeResult> {
+    return this.fetch<ActionInvokeResult>(`actions/${encodeURIComponent(name)}/invoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: input || '{}',
+    });
   }
 
   /**
    * List all registered workers
    */
-  async getWorkers(): Promise<WorkerInfo[]> {
-    return this.fetch<WorkerInfo[]>('workers');
+  async getWorkers(namespace?: string): Promise<WorkerInfo[]> {
+    const qs = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<WorkerInfo[]>(`workers${qs}`);
   }
 
   /**

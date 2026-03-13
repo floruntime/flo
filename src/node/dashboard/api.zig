@@ -121,7 +121,7 @@ pub fn handleRequest(
 
     // ── workers ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "workers")) {
-        return workers.getWorkers(allocator, ctx);
+        return workers.getWorkers(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "workers/")) {
         const worker_id = path["workers/".len..];

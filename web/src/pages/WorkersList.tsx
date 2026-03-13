@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
+import { useNamespace } from "../lib/NamespaceContext";
 import { cn } from "../lib/utils";
 
 function formatTimeAgo(ms: number): string {
@@ -65,9 +66,10 @@ function TypeBadge({ type }: { type: string }) {
 }
 
 export function WorkersListPage() {
+    const { selected: namespace } = useNamespace();
     const { data: workers, loading, error, refetch } = useApi(
-        () => api.getWorkers(),
-        [],
+        () => api.getWorkers(namespace || undefined),
+        [namespace],
         5000
     );
 

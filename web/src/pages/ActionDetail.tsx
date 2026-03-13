@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
-    Cpu, Zap, Play, ArrowLeft, Users, CheckCircle2,
+    Play, ArrowLeft, Users, CheckCircle2,
     Settings, RefreshCw, Activity, HardDrive, Box
 } from "lucide-react";
 import { Card, CardContent } from "../components/ui/Card";
@@ -42,6 +42,8 @@ function StatusBadge({ status }: { status: ActionRunInfo['status'] }) {
 }
 
 function RunsTable({ runs }: { runs: ActionRunInfo[] }) {
+    const [expandedRun, setExpandedRun] = useState<string | null>(null);
+
     if (runs.length === 0) {
         return (
             <div className="text-center py-8 text-text-secondary text-sm">
@@ -57,8 +59,8 @@ function RunsTable({ runs }: { runs: ActionRunInfo[] }) {
                     <tr>
                         <th className="px-4 py-2.5">Status</th>
                         <th className="px-4 py-2.5">Run ID</th>
+                        <th className="px-4 py-2.5">Source</th>
                         <th className="px-4 py-2.5">Worker</th>
-                        <th className="px-4 py-2.5">Attempt</th>
                         <th className="px-4 py-2.5">Created</th>
                         <th className="px-4 py-2.5">Duration</th>
                         <th className="px-4 py-2.5">Outcome</th>
@@ -71,39 +73,74 @@ function RunsTable({ runs }: { runs: ActionRunInfo[] }) {
                             : run.started_at
                                 ? "running..."
                                 : "—";
+                        const isExpanded = expandedRun === run.run_id;
+                        const hasDetail = run.input || run.output || run.error;
 
                         return (
-                            <tr key={run.run_id} className="hover:bg-surface-hover/30 transition-colors">
-                                <td className="px-4 py-3">
-                                    <StatusBadge status={run.status} />
-                                </td>
-                                <td className="px-4 py-3 font-mono text-xs text-text-secondary">
-                                    {run.run_id.length > 30 ? run.run_id.slice(0, 30) + "…" : run.run_id}
-                                </td>
-                                <td className="px-4 py-3 text-text-secondary">
-                                    {run.worker_id || "—"}
-                                </td>
-                                <td className="px-4 py-3 text-text-secondary">{run.attempt}</td>
-                                <td className="px-4 py-3 text-text-secondary">{formatTimeAgo(run.created_at)}</td>
-                                <td className="px-4 py-3 text-text-secondary">{duration}</td>
-                                <td className="px-4 py-3">
-                                    {run.outcome ? (
-                                        <span className={cn(
-                                            "text-xs",
-                                            run.outcome === 'success' ? "text-emerald-400" :
-                                                run.outcome === 'failure' ? "text-red-400" :
-                                                    "text-text-secondary"
-                                        )}>
-                                            {run.outcome}
-                                        </span>
-                                    ) : "—"}
-                                    {run.error && (
-                                        <span className="block text-xs text-red-400/70 mt-0.5 truncate max-w-[200px]" title={run.error}>
-                                            {run.error}
-                                        </span>
+                            <>
+                                <tr
+                                    key={run.run_id}
+                                    className={cn(
+                                        "transition-colors",
+                                        hasDetail ? "cursor-pointer hover:bg-surface-hover/30" : "hover:bg-surface-hover/30"
                                     )}
-                                </td>
-                            </tr>
+                                    onClick={() => hasDetail && setExpandedRun(isExpanded ? null : run.run_id)}
+                                >
+                                    <td className="px-4 py-3">
+                                        <StatusBadge status={run.status} />
+                                    </td>
+                                    <td className="px-4 py-3 font-mono text-xs text-text-secondary">
+                                        {run.run_id.length > 20 ? run.run_id.slice(0, 20) + "…" : run.run_id}
+                                    </td>
+                                    <td className="px-4 py-3 text-text-secondary text-xs">
+                                        {run.source || "direct"}
+                                    </td>
+                                    <td className="px-4 py-3 text-text-secondary text-xs font-mono">
+                                        {run.worker_id
+                                            ? run.worker_id.length > 16
+                                                ? run.worker_id.slice(0, 16) + "…"
+                                                : run.worker_id
+                                            : "—"}
+                                    </td>
+                                    <td className="px-4 py-3 text-text-secondary">{formatTimeAgo(run.created_at)}</td>
+                                    <td className="px-4 py-3 text-text-secondary">{duration}</td>
+                                    <td className="px-4 py-3">
+                                        {run.outcome ? (
+                                            <span className="text-xs text-text-secondary">{run.outcome.slice(0, 60)}{run.outcome.length > 60 ? "…" : ""}</span>
+                                        ) : run.error ? (
+                                            <span className="text-xs text-red-400 truncate max-w-[200px]" title={run.error}>
+                                                {run.error.slice(0, 60)}{run.error.length > 60 ? "…" : ""}
+                                            </span>
+                                        ) : "—"}
+                                    </td>
+                                </tr>
+                                {isExpanded && (
+                                    <tr key={`${run.run_id}-detail`} className="bg-surface-hover/20">
+                                        <td colSpan={7} className="px-4 py-3">
+                                            <div className="space-y-2 text-xs">
+                                                {run.input && (
+                                                    <div>
+                                                        <span className="text-text-secondary font-medium">Input:</span>
+                                                        <pre className="mt-1 p-2 bg-background rounded text-text-secondary overflow-x-auto max-h-32 whitespace-pre-wrap break-all">{run.input}</pre>
+                                                    </div>
+                                                )}
+                                                {run.output && (
+                                                    <div>
+                                                        <span className="text-text-secondary font-medium">Output:</span>
+                                                        <pre className="mt-1 p-2 bg-background rounded text-text-secondary overflow-x-auto max-h-32 whitespace-pre-wrap break-all">{run.output}</pre>
+                                                    </div>
+                                                )}
+                                                {run.error && (
+                                                    <div>
+                                                        <span className="text-red-400 font-medium">Error:</span>
+                                                        <pre className="mt-1 p-2 bg-red-400/5 rounded text-red-400 overflow-x-auto max-h-32 whitespace-pre-wrap break-all">{run.error}</pre>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                            </>
                         );
                     })}
                 </tbody>
@@ -128,17 +165,17 @@ function WorkersPanel({ workers }: { workers: WorkerInfo[] }) {
                     <div className="flex items-center gap-3">
                         <div className={cn(
                             "w-2 h-2 rounded-full",
-                            w.healthy ? "bg-emerald-400" : "bg-red-400"
+                            w.status === "active" || w.status === "idle" ? "bg-emerald-400" : "bg-red-400"
                         )} />
                         <div>
                             <p className="text-sm font-medium">{w.worker_id}</p>
-                            <p className="text-xs text-text-secondary">{w.task_types}</p>
+                            <p className="text-xs text-text-secondary">{w.processes.map(p => p.name).join(', ') || w.worker_type}</p>
                         </div>
                     </div>
                     <div className="flex items-center gap-4 text-xs text-text-secondary">
                         <div className="text-right">
-                            <p>Load: {w.current_load}%</p>
-                            <p>Tasks: {w.active_tasks}/{w.max_concurrent}</p>
+                            <p>Load: {w.max_concurrent > 0 ? Math.round((w.current_load / w.max_concurrent) * 100) : 0}%</p>
+                            <p>Tasks: {w.current_load}/{w.max_concurrent}</p>
                         </div>
                         <div className="text-right">
                             <p>Last seen</p>
@@ -159,6 +196,10 @@ export function ActionDetailPage() {
         5000
     );
     const [invokeResult, setInvokeResult] = useState<string | null>(null);
+    const [showInvokeDialog, setShowInvokeDialog] = useState(false);
+    const [invokeInput, setInvokeInput] = useState('{}');
+    const [invokeError, setInvokeError] = useState<string | null>(null);
+    const [invoking, setInvoking] = useState(false);
     const [tab, setTab] = useState<'runs' | 'workers' | 'config'>('runs');
 
     const tabs = action?.type === 'wasm'
@@ -173,15 +214,33 @@ export function ActionDetailPage() {
             { key: 'config' as const, label: 'Configuration', icon: Settings },
         ];
 
-    const handleInvoke = async () => {
+    const handleInvokeOpen = () => {
+        setInvokeInput('{}');
+        setInvokeError(null);
+        setShowInvokeDialog(true);
+    };
+
+    const handleInvokeSubmit = async () => {
         if (!actionName) return;
+        // Validate JSON
         try {
-            const result = await api.invokeAction(actionName);
-            setInvokeResult(result.run_id);
-            setTimeout(() => setInvokeResult(null), 5000);
-            refetch();
+            JSON.parse(invokeInput);
         } catch {
-            // handled
+            setInvokeError('Invalid JSON. Please enter valid JSON input.');
+            return;
+        }
+        setInvoking(true);
+        setInvokeError(null);
+        try {
+            const result = await api.invokeAction(actionName, invokeInput);
+            setInvokeResult(result.run_id);
+            setTimeout(() => setInvokeResult(null), 8000);
+            setShowInvokeDialog(false);
+            refetch();
+        } catch (err) {
+            setInvokeError(err instanceof Error ? err.message : 'Invocation failed');
+        } finally {
+            setInvoking(false);
         }
     };
 
@@ -201,22 +260,19 @@ export function ActionDetailPage() {
                     <Link to="/actions" className="p-1.5 rounded-md hover:bg-surface-hover transition-colors">
                         <ArrowLeft className="w-5 h-5 text-text-secondary" />
                     </Link>
-                    <div className="flex items-center gap-3">
-                        {action.type === 'wasm' ? (
-                            <div className="p-2 rounded-lg bg-purple-400/10">
-                                <Cpu className="w-5 h-5 text-purple-400" />
-                            </div>
-                        ) : (
-                            <div className="p-2 rounded-lg bg-yellow-400/10">
-                                <Zap className="w-5 h-5 text-yellow-400" />
-                            </div>
-                        )}
-                        <div>
+                    <div>
+                        <div className="flex items-center gap-2">
                             <h1 className="text-2xl font-semibold text-text-primary">{action.name}</h1>
-                            <p className="text-sm text-text-secondary">
-                                {action.namespace} · v{action.version} · {action.type.toUpperCase()} · by {action.owner}
-                            </p>
+                            <span className={cn(
+                                "text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide",
+                                action.type === 'wasm' ? "bg-purple-400/10 text-purple-400" : "bg-zinc-400/10 text-zinc-400"
+                            )}>
+                                {action.type}
+                            </span>
                         </div>
+                        <p className="text-sm text-text-secondary">
+                            {action.namespace} · v{action.version}
+                        </p>
                     </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -229,11 +285,11 @@ export function ActionDetailPage() {
                     </button>
                     {action.enabled && (
                         <button
-                            onClick={handleInvoke}
-                            className="flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-background font-medium hover:bg-primary/90 transition-colors"
+                            onClick={handleInvokeOpen}
+                            className="flex items-center gap-2 px-4 py-2 rounded-md bg-surface border border-surface-border text-text-primary font-medium hover:bg-surface-hover transition-colors"
                         >
                             <Play className="w-4 h-4" />
-                            Trigger
+                            Invoke
                         </button>
                     )}
                 </div>
@@ -247,7 +303,49 @@ export function ActionDetailPage() {
             {invokeResult && (
                 <div className="rounded-md bg-emerald-400/10 border border-emerald-400/20 px-4 py-3 flex items-center gap-2 text-sm text-emerald-400">
                     <CheckCircle2 className="w-4 h-4" />
-                    Triggered. Run ID: <code className="text-xs bg-surface px-1 py-0.5 rounded">{invokeResult}</code>
+                    Invoked. Run ID: <code className="text-xs bg-surface px-1 py-0.5 rounded">{invokeResult}</code>
+                </div>
+            )}
+
+            {/* Invoke dialog */}
+            {showInvokeDialog && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowInvokeDialog(false)}>
+                    <div className="bg-surface border border-surface-border rounded-lg shadow-xl w-full max-w-lg mx-4" onClick={e => e.stopPropagation()}>
+                        <div className="px-5 py-4 border-b border-surface-border">
+                            <h2 className="text-lg font-semibold text-text-primary">Invoke {action.name}</h2>
+                            <p className="text-xs text-text-secondary mt-1">Provide JSON input for this action. This will create a new run.</p>
+                        </div>
+                        <div className="px-5 py-4 space-y-3">
+                            <label className="block text-xs font-medium text-text-secondary">Input (JSON)</label>
+                            <textarea
+                                value={invokeInput}
+                                onChange={e => { setInvokeInput(e.target.value); setInvokeError(null); }}
+                                rows={8}
+                                spellCheck={false}
+                                className="w-full px-3 py-2 text-sm font-mono bg-background border border-surface-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary text-text-primary placeholder:text-text-secondary/60 resize-y"
+                                placeholder='{"key": "value"}'
+                            />
+                            {invokeError && (
+                                <p className="text-xs text-red-400">{invokeError}</p>
+                            )}
+                        </div>
+                        <div className="px-5 py-3 border-t border-surface-border flex items-center justify-end gap-2">
+                            <button
+                                onClick={() => setShowInvokeDialog(false)}
+                                className="px-3 py-1.5 text-sm rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleInvokeSubmit}
+                                disabled={invoking}
+                                className="flex items-center gap-2 px-4 py-1.5 text-sm rounded-md bg-primary text-background font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
+                            >
+                                <Play className="w-3.5 h-3.5" />
+                                {invoking ? 'Invoking...' : 'Invoke Action'}
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
 

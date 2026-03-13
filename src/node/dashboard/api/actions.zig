@@ -230,9 +230,40 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
                         } else {
                             try robj.nullField("completed_at");
                         }
-                        try robj.nullField("worker_id");
-                        try robj.nullField("error");
-                        try robj.nullField("outcome");
+                        if (run.worker_id_owned) |wid| {
+                            try robj.stringField("worker_id", wid);
+                        } else {
+                            try robj.nullField("worker_id");
+                        }
+                        if (run.error_owned) |err_msg| {
+                            try robj.stringField("error", err_msg);
+                        } else {
+                            try robj.nullField("error");
+                        }
+                        if (run.result_owned) |res| {
+                            try robj.stringField("outcome", res);
+                        } else {
+                            try robj.nullField("outcome");
+                        }
+                        if (run.input_owned) |inp| {
+                            // Truncate input to 2KB for overview
+                            const max_len = @min(inp.len, 2048);
+                            try robj.stringField("input", inp[0..max_len]);
+                        } else {
+                            try robj.nullField("input");
+                        }
+                        if (run.result_owned) |res| {
+                            // Truncate output to 2KB for overview
+                            const max_len = @min(res.len, 2048);
+                            try robj.stringField("output", res[0..max_len]);
+                        } else {
+                            try robj.nullField("output");
+                        }
+                        try robj.stringField("source", switch (run.source) {
+                            1 => "workflow",
+                            2 => "trigger",
+                            else => "direct",
+                        });
                         try robj.end();
                         rcount += 1;
                     }
@@ -344,6 +375,38 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
                 } else {
                     try obj.nullField("completed_at");
                 }
+                if (run.worker_id_owned) |wid| {
+                    try obj.stringField("worker_id", wid);
+                } else {
+                    try obj.nullField("worker_id");
+                }
+                if (run.error_owned) |err_msg| {
+                    try obj.stringField("error", err_msg);
+                } else {
+                    try obj.nullField("error");
+                }
+                if (run.result_owned) |res| {
+                    try obj.stringField("outcome", res);
+                } else {
+                    try obj.nullField("outcome");
+                }
+                if (run.input_owned) |inp| {
+                    const max_len = @min(inp.len, 2048);
+                    try obj.stringField("input", inp[0..max_len]);
+                } else {
+                    try obj.nullField("input");
+                }
+                if (run.result_owned) |res| {
+                    const max_len = @min(res.len, 2048);
+                    try obj.stringField("output", res[0..max_len]);
+                } else {
+                    try obj.nullField("output");
+                }
+                try obj.stringField("source", switch (run.source) {
+                    1 => "workflow",
+                    2 => "trigger",
+                    else => "direct",
+                });
                 try obj.end();
                 count += 1;
             }
