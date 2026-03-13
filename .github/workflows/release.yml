@@ -24,15 +24,19 @@ jobs:
           - os: ubuntu-latest
             arch: x86_64
             platform: linux
+            target: x86_64-linux
           - os: ubuntu-24.04-arm
             arch: aarch64
             platform: linux
-          - os: macos-13
+            target: aarch64-linux
+          - os: macos-14
             arch: x86_64
             platform: macos
+            target: x86_64-macos
           - os: macos-14
             arch: aarch64
             platform: macos
+            target: aarch64-macos
 
     runs-on: ${{ matrix.os }}
 
@@ -58,7 +62,7 @@ jobs:
           cp -r dist/* ../src/node/dashboard/dist/
 
       - name: Build release binary
-        run: zig build -Drelease
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
       - name: Package
         run: |
