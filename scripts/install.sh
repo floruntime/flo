@@ -79,8 +79,10 @@ echo "Installing flo $VERSION ($ARCH-$OS) to $INSTALL_DIR..."
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+TARBALL="${ARTIFACT}.tar.gz"
+
 echo "Downloading $URL..."
-HTTP_CODE=$(curl -sL -w '%{http_code}' -o "$TMP_DIR/flo.tar.gz" "$URL")
+HTTP_CODE=$(curl -sL -w '%{http_code}' -o "$TMP_DIR/$TARBALL" "$URL")
 if [ "$HTTP_CODE" != "200" ]; then
   echo "Error: Download failed (HTTP $HTTP_CODE)"
   echo "Check that version $VERSION exists: https://github.com/$REPO/releases"
@@ -89,13 +91,13 @@ fi
 
 # --- Verify checksum ---
 echo "Verifying checksum..."
-if curl -sfL -o "$TMP_DIR/flo.tar.gz.sha256" "$CHECKSUM_URL" 2>/dev/null; then
+if curl -sfL -o "$TMP_DIR/${TARBALL}.sha256" "$CHECKSUM_URL" 2>/dev/null; then
   (
     cd "$TMP_DIR"
     if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c flo.tar.gz.sha256 >/dev/null
+      sha256sum -c "${TARBALL}.sha256" >/dev/null
     elif command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 -c flo.tar.gz.sha256 >/dev/null
+      shasum -a 256 -c "${TARBALL}.sha256" >/dev/null
     else
       echo "Warning: No SHA256 tool found, skipping verification"
     fi
@@ -106,7 +108,7 @@ else
 fi
 
 # --- Extract ---
-tar -xzf "$TMP_DIR/flo.tar.gz" -C "$TMP_DIR"
+tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"
 
 if [ ! -f "$TMP_DIR/$BINARY" ]; then
   echo "Error: Binary not found in archive"
