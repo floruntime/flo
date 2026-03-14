@@ -921,6 +921,9 @@ pub const Shard = struct {
         // Drive processing pipelines (poll sources → write sinks)
         self.processing_handler.tickPipelines(self);
 
+        // Drive workflow stream triggers (poll streams → start runs)
+        self.workflow_handler.tickStreamTriggers(self);
+
         return events.len;
     }
 

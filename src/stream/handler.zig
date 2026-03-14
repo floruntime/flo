@@ -1039,8 +1039,22 @@ pub const StreamHandler = struct {
             if (count >= capped) break;
             const result = self.getPayloadAndTier(rec.ual_index);
             if (result.payload.len > 0) {
-                results[count] = result.payload;
-                count += 1;
+                // CLI stream appends use batch wire format:
+                //   [record_count:u32][payload_len:u32][payload][header_count:u16]...
+                // Internal appends (e.g., processing sinks) store raw payloads.
+                // Try to unpack batch format; fall back to raw value.
+                var batch_buf: [100][]const u8 = undefined;
+                const batch_n = unpackBatchPayloads(result.payload, &batch_buf);
+                if (batch_n > 0) {
+                    for (batch_buf[0..batch_n]) |p| {
+                        if (count >= capped) break;
+                        results[count] = p;
+                        count += 1;
+                    }
+                } else {
+                    results[count] = result.payload;
+                    count += 1;
+                }
             }
             last_seq = rec.id.sequence;
         }
@@ -1049,6 +1063,58 @@ pub const StreamHandler = struct {
         const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .next_offset = next };
         @memcpy(out, results[0..count]);
         return .{ .payloads = out, .next_offset = next };
+    }
+
+    /// Try to unpack a batch-format stream value into individual record payloads.
+    /// Batch wire format: [count:u32] then per record: [len:u32][data][hdr_count:u16][headers...]
+    /// Returns 0 if value is not valid batch format (caller should use value as-is).
+    fn unpackBatchPayloads(value: []const u8, out: [][]const u8) usize {
+        // Minimum batch: 4 (count) + 4 (len) + 0 (data) + 2 (hdrs) = 10 bytes
+        if (value.len < 10) return 0;
+
+        const record_count = std.mem.readInt(u32, value[0..4], .little);
+        if (record_count == 0 or record_count > 10000) return 0;
+
+        var pos: usize = 4;
+        var count: usize = 0;
+
+        var i: u32 = 0;
+        while (i < record_count) : (i += 1) {
+            if (pos + 4 > value.len) return 0;
+            const payload_len = std.mem.readInt(u32, value[pos..][0..4], .little);
+            pos += 4;
+
+            if (pos + payload_len > value.len) return 0;
+            if (count < out.len) {
+                out[count] = value[pos .. pos + payload_len];
+                count += 1;
+            }
+            pos += payload_len;
+
+            // Skip header_count + headers
+            if (pos + 2 > value.len) return 0;
+            const hdr_count = std.mem.readInt(u16, value[pos..][0..2], .little);
+            pos += 2;
+
+            var h: u16 = 0;
+            while (h < hdr_count) : (h += 1) {
+                if (pos + 2 > value.len) return 0;
+                const hkey_len = std.mem.readInt(u16, value[pos..][0..2], .little);
+                pos += 2;
+                if (pos + hkey_len > value.len) return 0;
+                pos += hkey_len;
+                if (pos + 4 > value.len) return 0;
+                const hval_len = std.mem.readInt(u32, value[pos..][0..4], .little);
+                pos += 4;
+                if (pos + hval_len > value.len) return 0;
+                pos += hval_len;
+            }
+        }
+
+        // Exact match validates this was truly batch format
+        if (pos != value.len) return 0;
+
+        return count;
     }
 
     /// Read a payload from the UAL by entry index (zero-copy).

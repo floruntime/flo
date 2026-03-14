@@ -68,6 +68,10 @@ pub const WorkflowHandler = struct {
     /// Disabled workflows: "namespace:name" → void.
     disabled: std.StringHashMap(void),
 
+    /// Active stream triggers: "namespace:workflow_name" → StreamTriggerState.
+    /// Registered when a workflow with a `trigger:` block is created.
+    stream_triggers: std.StringHashMap(StreamTriggerState),
+
     /// Monotonic run counter.
     next_run_id: u64,
 
@@ -165,12 +169,25 @@ pub const WorkflowHandler = struct {
         timestamp_ms: i64,
     };
 
+    /// Per-trigger polling state for stream-triggered workflows.
+    pub const StreamTriggerState = struct {
+        workflow_name_owned: []const u8,
+        namespace_owned: []const u8,
+        stream_name_owned: []const u8,
+        stream_namespace_owned: []const u8,
+        batch_size: u32,
+        poll_interval_ms: u32,
+        stream_cursor: u64,
+        last_poll_ms: i64,
+    };
+
     pub fn init(allocator: Allocator) WorkflowHandler {
         return .{
             .allocator = allocator,
             .definitions = std.StringHashMap(DefinitionRecord).init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
             .disabled = std.StringHashMap(void).init(allocator),
+            .stream_triggers = std.StringHashMap(StreamTriggerState).init(allocator),
             .next_run_id = 1,
         };
     }
@@ -200,6 +217,14 @@ pub const WorkflowHandler = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.disabled.deinit();
+
+        // Free stream trigger state
+        var tit = self.stream_triggers.iterator();
+        while (tit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.freeTriggerState(entry.value_ptr);
+        }
+        self.stream_triggers.deinit();
     }
 
     fn freeRunRecord(self: *WorkflowHandler, run: *RunRecord) void {
@@ -231,6 +256,13 @@ pub const WorkflowHandler = struct {
             self.allocator.free(evt.detail_owned);
         }
         run.history.deinit(self.allocator);
+    }
+
+    fn freeTriggerState(self: *WorkflowHandler, state: *StreamTriggerState) void {
+        self.allocator.free(state.workflow_name_owned);
+        self.allocator.free(state.namespace_owned);
+        self.allocator.free(state.stream_name_owned);
+        self.allocator.free(state.stream_namespace_owned);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -413,6 +445,15 @@ pub const WorkflowHandler = struct {
 
         // Return the workflow name
         self.persistCreate(shard, req.namespace, name, owned_yaml);
+
+        // Register stream trigger if the definition has one
+        if (def.trigger) |trigger| {
+            self.registerStreamTrigger(req.namespace, name, trigger);
+        } else {
+            // Definition updated without trigger — remove any existing trigger
+            self.unregisterStreamTrigger(req.namespace, name);
+        }
+
         shard.sendOkResponse(conn, req.header.request_id, owned_name);
     }
 
@@ -1555,6 +1596,266 @@ pub const WorkflowHandler = struct {
     fn setCurrentStep(self: *WorkflowHandler, run: *RunRecord, step_name: []const u8) void {
         if (run.current_step_name_owned) |old| self.allocator.free(old);
         run.current_step_name_owned = self.allocator.dupe(u8, step_name) catch null;
+    }
+
+    // ── Stream Trigger Polling ─────────────────────────────────────────
+
+    /// Register a stream trigger for a workflow definition.
+    /// Called from handleCreate when the parsed definition has a `trigger:` block.
+    fn registerStreamTrigger(
+        self: *WorkflowHandler,
+        namespace: []const u8,
+        workflow_name: []const u8,
+        trigger: definition.StreamTriggerDef,
+    ) void {
+        const trigger_key = self.makeNsKey(namespace, workflow_name) orelse return;
+
+        // Remove old trigger if re-creating workflow
+        if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
+            self.allocator.free(old.key);
+            var state = old.value;
+            self.freeTriggerState(&state);
+        }
+
+        const owned_wf = self.allocator.dupe(u8, workflow_name) catch {
+            self.allocator.free(trigger_key);
+            return;
+        };
+        const owned_ns = self.allocator.dupe(u8, namespace) catch {
+            self.allocator.free(trigger_key);
+            self.allocator.free(owned_wf);
+            return;
+        };
+        const owned_stream = self.allocator.dupe(u8, trigger.stream) catch {
+            self.allocator.free(trigger_key);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ns);
+            return;
+        };
+        const stream_ns = trigger.namespace orelse namespace;
+        const owned_stream_ns = self.allocator.dupe(u8, stream_ns) catch {
+            self.allocator.free(trigger_key);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ns);
+            self.allocator.free(owned_stream);
+            return;
+        };
+
+        self.stream_triggers.put(trigger_key, .{
+            .workflow_name_owned = owned_wf,
+            .namespace_owned = owned_ns,
+            .stream_name_owned = owned_stream,
+            .stream_namespace_owned = owned_stream_ns,
+            .batch_size = trigger.batch_size,
+            .poll_interval_ms = trigger.batch_timeout_ms,
+            .stream_cursor = 0,
+            .last_poll_ms = 0,
+        }) catch {
+            self.allocator.free(trigger_key);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ns);
+            self.allocator.free(owned_stream);
+            self.allocator.free(owned_stream_ns);
+        };
+    }
+
+    /// Remove the stream trigger for a workflow definition.
+    fn unregisterStreamTrigger(self: *WorkflowHandler, namespace: []const u8, workflow_name: []const u8) void {
+        const trigger_key = self.makeNsKey(namespace, workflow_name) orelse return;
+        defer self.allocator.free(trigger_key);
+
+        if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
+            self.allocator.free(old.key);
+            var state = old.value;
+            self.freeTriggerState(&state);
+        }
+    }
+
+    /// Poll all active stream triggers and start workflow runs for new events.
+    /// Called from shard.tick() on every reactor cycle.
+    pub fn tickStreamTriggers(self: *WorkflowHandler, shard: *Shard) void {
+        const now_ms = std.time.milliTimestamp();
+
+        var it = self.stream_triggers.iterator();
+        while (it.next()) |entry| {
+            const trigger = entry.value_ptr;
+
+            // Enforce poll interval
+            const poll_ms: i64 = @intCast(trigger.poll_interval_ms);
+            if (now_ms - trigger.last_poll_ms < poll_ms) continue;
+            trigger.last_poll_ms = now_ms;
+
+            // Skip disabled workflows
+            if (self.disabled.contains(entry.key_ptr.*)) continue;
+
+            // Read from the source stream
+            const batch_limit: usize = @intCast(trigger.batch_size);
+            const result = shard.stream_handler.readPayloadsForStream(
+                trigger.stream_name_owned,
+                trigger.stream_namespace_owned,
+                trigger.stream_cursor + 1,
+                @max(batch_limit, 1) * 10, // read ahead for batching
+            );
+            if (result.payloads.len == 0) {
+                if (result.next_offset > trigger.stream_cursor + 1) {
+                    trigger.stream_cursor = result.next_offset - 1;
+                }
+                continue;
+            }
+            defer shard.stream_handler.allocator.free(result.payloads);
+
+            // Start one run per event (or per batch if batch_size > 1)
+            if (trigger.batch_size <= 1) {
+                // One run per event
+                for (result.payloads) |payload| {
+                    self.startRunFromTrigger(shard, trigger, payload);
+                }
+            } else {
+                // Batch mode: collect batch_size events into a JSON array per run
+                var i: usize = 0;
+                while (i < result.payloads.len) {
+                    const end = @min(i + batch_limit, result.payloads.len);
+                    const batch = result.payloads[i..end];
+                    const batch_json = self.buildBatchJson(batch) orelse {
+                        i = end;
+                        continue;
+                    };
+                    defer self.allocator.free(batch_json);
+                    self.startRunFromTrigger(shard, trigger, batch_json);
+                    i = end;
+                }
+            }
+
+            // Advance cursor
+            if (result.next_offset > trigger.stream_cursor) {
+                trigger.stream_cursor = result.next_offset - 1;
+            }
+        }
+    }
+
+    /// Build a JSON array from a batch of payloads: ["payload1","payload2",...]
+    fn buildBatchJson(self: *WorkflowHandler, payloads: []const []const u8) ?[]u8 {
+        // Estimate size: 2 (brackets) + payloads * (payload.len + 3 for quotes + comma)
+        var total: usize = 2;
+        for (payloads) |p| total += p.len + 3;
+        var buf = self.allocator.alloc(u8, total) catch return null;
+        var pos: usize = 0;
+        buf[pos] = '[';
+        pos += 1;
+        for (payloads, 0..) |p, idx| {
+            if (idx > 0) {
+                buf[pos] = ',';
+                pos += 1;
+            }
+            // If the payload already looks like JSON, embed it directly
+            if (p.len > 0 and (p[0] == '{' or p[0] == '[' or p[0] == '"')) {
+                @memcpy(buf[pos .. pos + p.len], p);
+                pos += p.len;
+            } else {
+                // Wrap as string
+                buf[pos] = '"';
+                pos += 1;
+                @memcpy(buf[pos .. pos + p.len], p);
+                pos += p.len;
+                buf[pos] = '"';
+                pos += 1;
+            }
+        }
+        buf[pos] = ']';
+        pos += 1;
+        // Shrink to actual size
+        if (pos < buf.len) {
+            const result = self.allocator.realloc(buf, pos) catch return buf[0..pos];
+            return result;
+        }
+        return buf;
+    }
+
+    /// Start a workflow run programmatically from a stream trigger event.
+    fn startRunFromTrigger(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        trigger: *const StreamTriggerState,
+        input: []const u8,
+    ) void {
+        const now_ms: i64 = std.time.milliTimestamp();
+
+        // Generate run ID
+        var run_id_buf: [32]u8 = undefined;
+        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch return;
+
+        // Build namespace-qualified run key
+        const run_ns_key = self.makeNsKey(trigger.namespace_owned, run_id_str) orelse return;
+
+        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        const owned_wf_name = self.allocator.dupe(u8, trigger.workflow_name_owned) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            return;
+        };
+        const owned_version = self.allocator.dupe(u8, "latest") catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            return;
+        };
+        const owned_input = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            self.allocator.free(owned_version);
+            return;
+        };
+
+        var run = RunRecord{
+            .run_id_owned = owned_run_id,
+            .workflow_name_owned = owned_wf_name,
+            .workflow_version_owned = owned_version,
+            .status = .running,
+            .input_owned = owned_input,
+            .created_at_ms = now_ms,
+            .started_at_ms = now_ms,
+            .completed_at_ms = null,
+            .idempotency_key_owned = null,
+            .signals = .empty,
+            .history = .empty,
+        };
+
+        // Add history event
+        const evt_type = self.allocator.dupe(u8, "trigger_started") catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        const evt_detail = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(evt_type);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        run.history.append(self.allocator, .{
+            .event_type_owned = evt_type,
+            .detail_owned = evt_detail,
+            .timestamp_ms = now_ms,
+        }) catch {
+            self.allocator.free(evt_type);
+            self.allocator.free(evt_detail);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+
+        self.runs.put(run_ns_key, run) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+
+        self.persistStart(shard, trigger.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
+        self.advanceWorkflow(shard, run_ns_key, trigger.namespace_owned);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
