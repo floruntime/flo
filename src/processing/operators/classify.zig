@@ -13,6 +13,7 @@
 //!   operators:
 //!     - type: classify
 //!       name: label-records
+//!       default_tag: unmatched     # optional: tag when no rules match
 //!       rules:
 //!         - condition: "value_contains:error"
 //!           tag: errors
@@ -48,14 +49,16 @@ pub const Rule = struct {
 pub const ClassifyOperator = struct {
     name: []const u8,
     rules: []Rule,
+    default_tag_bit: ?u5,
     allocator: Allocator,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, name: []const u8, rules: []Rule) Self {
+    pub fn init(allocator: Allocator, name: []const u8, rules: []Rule, default_tag_bit: ?u5) Self {
         return .{
             .name = name,
             .rules = rules,
+            .default_tag_bit = default_tag_bit,
             .allocator = allocator,
         };
     }
@@ -87,9 +90,17 @@ pub const ClassifyOperator = struct {
         // Evaluate every rule; set tag bits for matching conditions.
         // Record is always emitted — classify never drops.
         var tagged_rec = rec;
+        var any_matched = false;
         for (self.rules) |*rule| {
             if (rule.condition.evaluate(rec)) {
                 tagged_rec.addTag(rule.tag_bit);
+                any_matched = true;
+            }
+        }
+        // Apply default tag when no rules matched
+        if (!any_matched) {
+            if (self.default_tag_bit) |bit| {
+                tagged_rec.addTag(bit);
             }
         }
         try ctx.emit(tagged_rec);
@@ -120,7 +131,7 @@ test "ClassifyOperator single rule match" {
         .tag_bit = 0,
     };
 
-    var op = ClassifyOperator.init(allocator, "test-classify", rules);
+    var op = ClassifyOperator.init(allocator, "test-classify", rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -156,7 +167,7 @@ test "ClassifyOperator no rules match — record still emitted" {
         .tag_bit = 0,
     };
 
-    var op = ClassifyOperator.init(allocator, "test-classify", rules);
+    var op = ClassifyOperator.init(allocator, "test-classify", rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -199,7 +210,7 @@ test "ClassifyOperator multiple rules compose" {
         .tag_bit = 2,
     };
 
-    var op = ClassifyOperator.init(allocator, "multi-classify", rules);
+    var op = ClassifyOperator.init(allocator, "multi-classify", rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -230,6 +241,85 @@ test "ClassifyOperator multiple rules compose" {
     try std.testing.expectEqual(@as(usize, 2), out2.len); // both records in collector
     try std.testing.expectEqual(@as(u32, 7), out2[1].tags); // bits 0 + 1 + 2 = 7
     try std.testing.expect(out2[1].hasAllTags(0b111));
+}
+
+test "ClassifyOperator default tag on unmatched records" {
+    const allocator = std.testing.allocator;
+    const OutputCollector = @import("../collector.zig").OutputCollector;
+    const OperatorMetrics = @import("../context.zig").OperatorMetrics;
+
+    var rules = try allocator.alloc(Rule, 1);
+    rules[0] = .{
+        .condition = ExprFilterOperator.init("r0", "value_contains:error"),
+        .tag_bit = 0,
+    };
+
+    // default_tag_bit = 3 — applied when no rules match
+    var op = ClassifyOperator.init(allocator, "default-classify", rules, 3);
+    defer op.deinit();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test",
+    };
+
+    var iface = op.operator();
+
+    // Record matching a rule — default should NOT be applied
+    try iface.processElement(ProcessingRecord.init("k", "error occurred", 100), &ctx);
+    const out1 = collector.drain();
+    try std.testing.expect(out1[0].hasTag(0));
+    try std.testing.expect(!out1[0].hasTag(3));
+    try std.testing.expectEqual(@as(u32, 1), out1[0].tags);
+
+    // Record not matching any rule — default tag bit 3 applied
+    try iface.processElement(ProcessingRecord.init("k", "all good", 200), &ctx);
+    const out2 = collector.drain();
+    try std.testing.expect(!out2[1].hasTag(0));
+    try std.testing.expect(out2[1].hasTag(3));
+    try std.testing.expectEqual(@as(u32, 8), out2[1].tags); // bit 3 = 8
+}
+
+test "ClassifyOperator default tag null — unmatched gets no tags" {
+    const allocator = std.testing.allocator;
+    const OutputCollector = @import("../collector.zig").OutputCollector;
+    const OperatorMetrics = @import("../context.zig").OperatorMetrics;
+
+    var rules = try allocator.alloc(Rule, 1);
+    rules[0] = .{
+        .condition = ExprFilterOperator.init("r0", "value_contains:error"),
+        .tag_bit = 0,
+    };
+
+    // No default tag
+    var op = ClassifyOperator.init(allocator, "no-default", rules, null);
+    defer op.deinit();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test",
+    };
+
+    var iface = op.operator();
+
+    // Unmatched record — tags stay 0
+    try iface.processElement(ProcessingRecord.init("k", "all good", 100), &ctx);
+    const out = collector.drain();
+    try std.testing.expectEqual(@as(u32, 0), out[0].tags);
 }
 
 test "ProcessingRecord tag helpers" {

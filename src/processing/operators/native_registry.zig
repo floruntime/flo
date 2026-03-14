@@ -374,8 +374,23 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
         idx += 1;
     }
 
+    // Resolve optional default tag (applied when no rules match)
+    const default_tag_bit: ?u5 = if (spec.getConfig("default_tag")) |default_val| blk: {
+        if (tag_registry) |reg| {
+            break :blk reg.resolve(default_val) orelse {
+                log.err("Native operator '{s}' (type=classify) unknown default tag name '{s}'", .{ spec.name, default_val });
+                return CreateError.MissingConfig;
+            };
+        } else {
+            break :blk std.fmt.parseInt(u5, default_val, 10) catch {
+                log.err("Native operator '{s}' (type=classify) invalid default tag bit '{s}'", .{ spec.name, default_val });
+                return CreateError.MissingConfig;
+            };
+        }
+    } else null;
+
     const ptr = allocator.create(ClassifyOperator) catch return CreateError.OutOfMemory;
-    ptr.* = ClassifyOperator.init(allocator, spec.name, rules[0..idx]);
+    ptr.* = ClassifyOperator.init(allocator, spec.name, rules[0..idx], default_tag_bit);
 
     return .{
         .op = ptr.operator(),
