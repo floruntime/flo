@@ -35,7 +35,7 @@ export interface SinkSpec {
   kind: SinkKind;
   target: string;
   namespace?: string;
-  tags?: string[];
+  match?: string[];
   key_prefix?: string;
   separator?: string;
   write_mode?: WriteMode;

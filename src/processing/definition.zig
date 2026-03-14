@@ -279,7 +279,7 @@ pub const SinkSpec = struct {
     /// When set, this sink receives only records whose tag bitfield
     /// matches ALL listed tag names (AND logic). When null, the sink
     /// receives all records from the main operator chain output.
-    tags: ?[]const []const u8 = null,
+    match: ?[]const []const u8 = null,
 
     /// Pre-computed bitmask from tag names (resolved at pipeline init).
     /// `record.tags & required_tags == required_tags` → deliver.
@@ -426,9 +426,9 @@ pub const JobDefinition = struct {
             allocator.free(snk.key_prefix);
             allocator.free(snk.separator);
             allocator.free(snk.write_mode);
-            if (snk.tags) |tag_list| {
-                for (tag_list) |t| allocator.free(t);
-                allocator.free(tag_list);
+            if (snk.match) |match_list| {
+                for (match_list) |t| allocator.free(t);
+                allocator.free(match_list);
             }
             // TS-specific fields
             if (snk.ts_measurement.len > 0) allocator.free(snk.ts_measurement);

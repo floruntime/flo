@@ -2438,8 +2438,8 @@ test "e2e/processing: kv_lookup late KV write — records written after KV seed 
 
 test "e2e/processing: classify operator routes tagged records to filtered sink" {
     // Pipeline: source → classify (tags errors) → two sinks:
-    //   - firehose sink (no tags, gets ALL records)
-    //   - error sink (tags: [errors], gets ONLY error records)
+    //   - firehose sink (no match, gets ALL records)
+    //   - error sink (match: [errors], gets ONLY error records)
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2464,7 +2464,7 @@ test "e2e/processing: classify operator routes tagged records to filtered sink" 
         \\sinks.[0].stream.name: clf-all-out
         \\sinks.[1].name: error-events
         \\sinks.[1].stream.name: clf-err-out
-        \\sinks.[1].tags.[0]: errors
+        \\sinks.[1].match.[0]: errors
         \\parallelism: 1
         \\batch_size: 100
     ;
@@ -2518,9 +2518,9 @@ test "e2e/processing: classify operator routes tagged records to filtered sink" 
 
 test "e2e/processing: classify multi-tag routing with AND match" {
     // Pipeline: source → classify (tags: critical, errors) → three sinks:
-    //   - all-sink:      no tags (firehose — gets everything)
-    //   - error-sink:    tags: [errors] (gets errors + critical)
-    //   - critical-sink: tags: [critical, errors] (AND match — gets ONLY critical errors)
+    //   - all-sink:      no match (firehose — gets everything)
+    //   - error-sink:    match: [errors] (gets errors + critical)
+    //   - critical-sink: match: [critical, errors] (AND match — gets ONLY critical errors)
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2545,11 +2545,11 @@ test "e2e/processing: classify multi-tag routing with AND match" {
         \\sinks.[0].stream.name: clftag-all
         \\sinks.[1].name: error-sink
         \\sinks.[1].stream.name: clftag-errors
-        \\sinks.[1].tags.[0]: errors
+        \\sinks.[1].match.[0]: errors
         \\sinks.[2].name: critical-sink
         \\sinks.[2].stream.name: clftag-critical
-        \\sinks.[2].tags.[0]: critical
-        \\sinks.[2].tags.[1]: errors
+        \\sinks.[2].match.[0]: critical
+        \\sinks.[2].match.[1]: errors
         \\parallelism: 1
         \\batch_size: 100
     ;
@@ -2585,7 +2585,7 @@ test "e2e/processing: classify multi-tag routing with AND match" {
         return error.PipelineTimeout;
     }
 
-    // Verify critical sink has ONLY the critical error (requires both tags)
+    // Verify critical sink has ONLY the critical error (requires both match criteria)
     var crit_result = try ctx.cli.run(&.{ "stream", "read", "clftag-critical", "-n", "proc_clftag", "--start", "0-0", "--limit", "100" });
     defer crit_result.deinit();
     try stdx.testing.assertSucceeded(crit_result);

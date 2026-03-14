@@ -394,7 +394,7 @@ pub const ProcessingHandler = struct {
         // Build tag registry from all sinks and classify operators
         var tag_registry = definition.TagRegistry{};
         for (def.sinks.items) |snk| {
-            if (snk.tags) |tag_list| {
+            if (snk.match) |tag_list| {
                 for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
             }
         }
@@ -412,7 +412,7 @@ pub const ProcessingHandler = struct {
 
         // Resolve required_tags bitmask for each sink
         for (def.sinks.items) |*snk| {
-            if (snk.tags) |tag_list| {
+            if (snk.match) |tag_list| {
                 snk.required_tags = tag_registry.buildMask(tag_list);
             }
         }

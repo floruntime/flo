@@ -695,15 +695,15 @@ fn appendExpandedSource(
 ///   - `ts:` object present  → SinkKind.ts
 ///   - `stream:` object present → SinkKind.stream
 ///
-/// Optional `tags:` array maps this sink to tagged records only (AND match).
+/// Optional `match:` array maps this sink to tagged records only (AND match).
 fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
     if (item != .object) return;
 
     const sink_name = getString(item, "name") orelse "default-sink";
 
-    // Parse tags list — either a YAML array of strings, or a single string (sugar)
-    const sink_tags: ?[]const []const u8 = blk: {
-        if (getArray(item, "tags")) |arr| {
+    // Parse match list — either a YAML array of strings, or a single string (sugar)
+    const sink_match: ?[]const []const u8 = blk: {
+        if (getArray(item, "match")) |arr| {
             if (arr.len == 0) break :blk null;
             const list = allocator.alloc([]const u8, arr.len) catch return error.OutOfMemory;
             for (arr, 0..) |elem, i| {
@@ -717,8 +717,8 @@ fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []cons
                 }
             }
             break :blk list;
-        } else if (getString(item, "tags")) |single| {
-            // Sugar: `tags: late` → treated as `tags: [late]`
+        } else if (getString(item, "match")) |single| {
+            // Sugar: `match: late` → treated as `match: [late]`
             const list = allocator.alloc([]const u8, 1) catch return error.OutOfMemory;
             list[0] = allocator.dupe(u8, single) catch return error.OutOfMemory;
             break :blk list;
@@ -728,13 +728,13 @@ fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []cons
 
     // Detect sink kind
     if (getObject(item, "kv")) |kv_obj| {
-        try appendKvSink(allocator, sink_name, kv_obj, sink_tags, default_namespace, sinks);
+        try appendKvSink(allocator, sink_name, kv_obj, sink_match, default_namespace, sinks);
     } else if (getObject(item, "queue")) |q_obj| {
-        try appendQueueSink(allocator, sink_name, q_obj, sink_tags, default_namespace, sinks);
+        try appendQueueSink(allocator, sink_name, q_obj, sink_match, default_namespace, sinks);
     } else if (getObject(item, "ts")) |ts_obj| {
-        try appendTsSink(allocator, sink_name, ts_obj, sink_tags, default_namespace, sinks);
+        try appendTsSink(allocator, sink_name, ts_obj, sink_match, default_namespace, sinks);
     } else if (getObject(item, "stream")) |stream_obj| {
-        try appendStreamSink(allocator, sink_name, stream_obj, sink_tags, default_namespace, sinks);
+        try appendStreamSink(allocator, sink_name, stream_obj, sink_match, default_namespace, sinks);
     } else {
         return error.MissingSinkTarget;
     }
@@ -744,7 +744,7 @@ fn appendStreamSink(
     allocator: Allocator,
     sink_name: []const u8,
     stream_obj: JsonValue,
-    sink_tags: ?[]const []const u8,
+    sink_match: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -769,7 +769,7 @@ fn appendStreamSink(
         .kind = .stream,
         .target = target_d,
         .namespace = ns_d,
-        .tags = sink_tags,
+        .match = sink_match,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -784,7 +784,7 @@ fn appendKvSink(
     allocator: Allocator,
     sink_name: []const u8,
     kv_obj: JsonValue,
-    sink_tags: ?[]const []const u8,
+    sink_match: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -811,7 +811,7 @@ fn appendKvSink(
         .kind = .kv,
         .target = target_d,
         .namespace = ns_d,
-        .tags = sink_tags,
+        .match = sink_match,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -826,7 +826,7 @@ fn appendQueueSink(
     allocator: Allocator,
     sink_name: []const u8,
     q_obj: JsonValue,
-    sink_tags: ?[]const []const u8,
+    sink_match: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -863,7 +863,7 @@ fn appendQueueSink(
         .kind = .queue,
         .target = target_d,
         .namespace = ns_d,
-        .tags = sink_tags,
+        .match = sink_match,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -895,7 +895,7 @@ fn appendTsSink(
     allocator: Allocator,
     sink_name: []const u8,
     ts_obj: JsonValue,
-    sink_tags: ?[]const []const u8,
+    sink_match: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -971,7 +971,7 @@ fn appendTsSink(
         .kind = .ts,
         .target = target_d,
         .namespace = ns_d,
-        .tags = sink_tags,
+        .match = sink_match,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -1012,7 +1012,7 @@ fn freeSinkSpecs(allocator: Allocator, sinks_list: *std.ArrayList(SinkSpec)) voi
         allocator.free(snk.key_prefix);
         allocator.free(snk.separator);
         allocator.free(snk.write_mode);
-        if (snk.tags) |tag_list| {
+        if (snk.match) |tag_list| {
             for (tag_list) |t| allocator.free(t);
             allocator.free(tag_list);
         }
@@ -1825,7 +1825,7 @@ test "parser: partitions mixed with single partition source" {
 // Tag-Based Routing Tests
 // =============================================================================
 
-test "parser: sink with tags" {
+test "parser: sink with match" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1840,7 +1840,7 @@ test "parser: sink with tags" {
         \\  - name: late-events
         \\    stream:
         \\      name: late-data
-        \\    tags:
+        \\    match:
         \\      - late
     ;
 
@@ -1848,13 +1848,13 @@ test "parser: sink with tags" {
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sinks.items.len);
-    try std.testing.expect(def.sinks.items[0].tags == null);
-    const tag_list = def.sinks.items[1].tags.?;
+    try std.testing.expect(def.sinks.items[0].match == null);
+    const tag_list = def.sinks.items[1].match.?;
     try std.testing.expectEqual(@as(usize, 1), tag_list.len);
     try std.testing.expectEqualStrings("late", tag_list[0]);
 }
 
-test "parser: KV sink with tags" {
+test "parser: KV sink with match" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1866,7 +1866,7 @@ test "parser: KV sink with tags" {
         \\  - name: errors
         \\    kv:
         \\      namespace: error-store
-        \\    tags:
+        \\    match:
         \\      - error-records
     ;
 
@@ -1875,12 +1875,12 @@ test "parser: KV sink with tags" {
 
     const snk = def.primarySink().?;
     try std.testing.expect(snk.kind == .kv);
-    const tag_list = snk.tags.?;
+    const tag_list = snk.match.?;
     try std.testing.expectEqual(@as(usize, 1), tag_list.len);
     try std.testing.expectEqualStrings("error-records", tag_list[0]);
 }
 
-test "parser: queue sink with tags" {
+test "parser: queue sink with match" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1892,7 +1892,7 @@ test "parser: queue sink with tags" {
         \\  - name: dlq
         \\    queue:
         \\      name: dead-letter
-        \\    tags:
+        \\    match:
         \\      - failures
     ;
 
@@ -1901,13 +1901,13 @@ test "parser: queue sink with tags" {
 
     const snk = def.primarySink().?;
     try std.testing.expect(snk.kind == .queue);
-    const tag_list = snk.tags.?;
+    const tag_list = snk.match.?;
     try std.testing.expectEqual(@as(usize, 1), tag_list.len);
     try std.testing.expectEqualStrings("failures", tag_list[0]);
     try std.testing.expectEqualStrings("dead-letter", snk.target);
 }
 
-test "parser: sink with multiple tags (AND match)" {
+test "parser: sink with multiple match tags (AND match)" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1919,7 +1919,7 @@ test "parser: sink with multiple tags (AND match)" {
         \\  - name: urgent
         \\    stream:
         \\      name: urgent-stream
-        \\    tags:
+        \\    match:
         \\      - late
         \\      - high-value
     ;
@@ -1928,7 +1928,7 @@ test "parser: sink with multiple tags (AND match)" {
     defer def.deinit(allocator);
 
     const snk = def.primarySink().?;
-    const tag_list = snk.tags.?;
+    const tag_list = snk.match.?;
     try std.testing.expectEqual(@as(usize, 2), tag_list.len);
     try std.testing.expectEqualStrings("late", tag_list[0]);
     try std.testing.expectEqualStrings("high-value", tag_list[1]);
@@ -2203,7 +2203,7 @@ test "parser: classify operator with rules array" {
         \\sinks:
         \\  - stream:
         \\      name: errors
-        \\    tags:
+        \\    match:
         \\      - errors
         \\  - stream:
         \\      name: all-events
@@ -2238,12 +2238,12 @@ test "parser: classify operator with rules array" {
     try std.testing.expectEqualStrings("tag_1", cfg[3].key);
     try std.testing.expectEqualStrings("warnings", cfg[3].value);
 
-    // sinks: first sink should have tags, second should be firehose
+    // sinks: first sink should have match, second should be firehose
     try std.testing.expectEqual(@as(usize, 2), def.sinks.items.len);
-    try std.testing.expect(def.sinks.items[0].tags != null);
-    try std.testing.expectEqual(@as(usize, 1), def.sinks.items[0].tags.?.len);
-    try std.testing.expectEqualStrings("errors", def.sinks.items[0].tags.?[0]);
-    try std.testing.expect(def.sinks.items[1].tags == null);
+    try std.testing.expect(def.sinks.items[0].match != null);
+    try std.testing.expectEqual(@as(usize, 1), def.sinks.items[0].match.?.len);
+    try std.testing.expectEqualStrings("errors", def.sinks.items[0].match.?[0]);
+    try std.testing.expect(def.sinks.items[1].match == null);
 }
 
 test "parser: classify operator with rules array and inline config" {
@@ -2293,15 +2293,15 @@ test "parser: classify operator with json conditions" {
         \\sinks:
         \\  - stream:
         \\      name: payments
-        \\    tags:
+        \\    match:
         \\      - payments
         \\  - stream:
         \\      name: transfers
-        \\    tags:
+        \\    match:
         \\      - transfers
         \\  - stream:
         \\      name: high-value
-        \\    tags:
+        \\    match:
         \\      - high-value
         \\  - stream:
         \\      name: all-events
@@ -2341,11 +2341,56 @@ test "parser: classify operator with json conditions" {
 
     // 4 sinks: 3 tagged + 1 firehose
     try std.testing.expectEqual(@as(usize, 4), def.sinks.items.len);
-    try std.testing.expect(def.sinks.items[0].tags != null);
-    try std.testing.expectEqualStrings("payments", def.sinks.items[0].tags.?[0]);
-    try std.testing.expect(def.sinks.items[1].tags != null);
-    try std.testing.expectEqualStrings("transfers", def.sinks.items[1].tags.?[0]);
-    try std.testing.expect(def.sinks.items[2].tags != null);
-    try std.testing.expectEqualStrings("high-value", def.sinks.items[2].tags.?[0]);
-    try std.testing.expect(def.sinks.items[3].tags == null); // firehose
+    try std.testing.expect(def.sinks.items[0].match != null);
+    try std.testing.expectEqualStrings("payments", def.sinks.items[0].match.?[0]);
+    try std.testing.expect(def.sinks.items[1].match != null);
+    try std.testing.expectEqualStrings("transfers", def.sinks.items[1].match.?[0]);
+    try std.testing.expect(def.sinks.items[2].match != null);
+    try std.testing.expectEqualStrings("high-value", def.sinks.items[2].match.?[0]);
+    try std.testing.expect(def.sinks.items[3].match == null); // firehose
+}
+
+test "parser: classify operator with default tag" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: errors
+        \\    match:
+        \\      - errors
+        \\  - stream:
+        \\      name: other
+        \\    match:
+        \\      - other
+        \\operators:
+        \\  - type: classify
+        \\    name: route-default
+        \\    default_tag: other
+        \\    rules:
+        \\      - condition: "value_contains:error"
+        \\        tag: errors
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("classify", op.type_name);
+    try std.testing.expectEqualStrings("route-default", op.name);
+
+    const cfg = op.config.?;
+    // Should have: default_tag=other, condition_0, tag_0
+    var has_default = false;
+    for (cfg) |entry| {
+        if (std.mem.eql(u8, entry.key, "default_tag")) {
+            try std.testing.expectEqualStrings("other", entry.value);
+            has_default = true;
+        }
+    }
+    try std.testing.expect(has_default);
 }
