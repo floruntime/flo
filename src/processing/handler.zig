@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
@@ -984,6 +985,21 @@ pub const ProcessingHandler = struct {
             // Wire kv_lookup operators to the shard's KV projection
             if (result.backing == .kv_lookup) {
                 result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(shard));
+            }
+            // Wire wasm operators: read module bytes and load
+            if (result.backing == .wasm) {
+                const wasm_op = result.backing.wasm;
+                const wasm_bytes = std.fs.cwd().readFileAlloc(self.allocator, wasm_op.module_path, 16 * 1024 * 1024) catch |err| {
+                    log.err("WASM operator '{s}': failed to read module '{s}': {}", .{ wasm_op.name, wasm_op.module_path, err });
+                    result.deinit(self.allocator);
+                    continue;
+                };
+                defer self.allocator.free(wasm_bytes);
+                wasm_op.loadWasm(wasm_bytes) catch |err| {
+                    log.err("WASM operator '{s}': failed to load module: {}", .{ wasm_op.name, err });
+                    result.deinit(self.allocator);
+                    continue;
+                };
             }
             backings[count] = result;
             ops[count] = result.op;

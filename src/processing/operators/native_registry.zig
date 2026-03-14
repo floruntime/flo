@@ -60,6 +60,7 @@ const JsonFlatMapOperator = @import("json_flatmap.zig").JsonFlatMapOperator;
 const KvLookupOperator = @import("kv_lookup.zig").KvLookupOperator;
 const KvLookupMode = @import("kv_lookup.zig").Mode;
 const ClassifyOperator = @import("classify.zig").ClassifyOperator;
+const WasmOperator = @import("wasm.zig").WasmOperator;
 const ClassifyRule = @import("classify.zig").Rule;
 const TagRegistry = @import("../definition.zig").TagRegistry;
 const log = @import("stdx").log;
@@ -81,6 +82,7 @@ pub const CreateResult = struct {
         json_flatmap: *JsonFlatMapOperator,
         kv_lookup: *KvLookupOperator,
         classify: *ClassifyOperator,
+        wasm: *WasmOperator,
     };
 
     /// Clean up the backing operator storage.
@@ -112,6 +114,10 @@ pub const CreateResult = struct {
                 ptr.deinit();
                 allocator.destroy(ptr);
             },
+            .wasm => |ptr| {
+                ptr.deinit();
+                allocator.destroy(ptr);
+            },
         }
     }
 };
@@ -132,7 +138,8 @@ pub fn isNativeType(type_name: []const u8) bool {
         std.mem.eql(u8, type_name, "map") or
         std.mem.eql(u8, type_name, "flatmap") or
         std.mem.eql(u8, type_name, "kv_lookup") or
-        std.mem.eql(u8, type_name, "classify");
+        std.mem.eql(u8, type_name, "classify") or
+        std.mem.eql(u8, type_name, "wasm");
 }
 
 /// Create a native operator from an OperatorSpec.
@@ -159,6 +166,8 @@ pub fn create(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*c
         return createKvLookup(allocator, spec);
     } else if (std.mem.eql(u8, spec.type_name, "classify")) {
         return createClassify(allocator, spec, tag_registry);
+    } else if (std.mem.eql(u8, spec.type_name, "wasm")) {
+        return createWasm(allocator, spec);
     }
 
     return CreateError.UnknownOperatorType;
@@ -398,6 +407,21 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     };
 }
 
+fn createWasm(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
+    const module_path = spec.module orelse {
+        log.err("Native operator '{s}' (type=wasm) missing required 'module' path", .{spec.name});
+        return CreateError.MissingConfig;
+    };
+
+    const ptr = allocator.create(WasmOperator) catch return CreateError.OutOfMemory;
+    ptr.* = WasmOperator.init(allocator, spec.name, module_path);
+
+    return .{
+        .op = ptr.operator(),
+        .backing = .{ .wasm = ptr },
+    };
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -496,7 +520,7 @@ test "NativeOperatorRegistry — isNativeType" {
     try std.testing.expect(isNativeType("map"));
     try std.testing.expect(isNativeType("flatmap"));
     try std.testing.expect(isNativeType("classify"));
-    try std.testing.expect(!isNativeType("wasm"));
+    try std.testing.expect(isNativeType("wasm"));
     try std.testing.expect(!isNativeType("unknown"));
 }
 
