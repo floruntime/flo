@@ -16,7 +16,7 @@
 //! Checkpointing & Fault Tolerance: Chandy-Lamport protocol,
 //! checkpoint coordinator, barrier alignment, snapshot/restore, offsets.
 //!
-//! Advanced Features: Side outputs, processing metrics,
+//! Advanced Features: Tag-based routing, processing metrics,
 //! session windows, late data handling.
 
 // Core data model
@@ -138,6 +138,9 @@ pub const operators = struct {
     pub const json_flatmap = @import("operators/json_flatmap.zig");
     pub const JsonFlatMapOperator = json_flatmap.JsonFlatMapOperator;
 
+    pub const classify = @import("operators/classify.zig");
+    pub const ClassifyOperator = classify.ClassifyOperator;
+
     pub const native_registry = @import("operators/native_registry.zig");
 };
 
@@ -166,10 +169,8 @@ pub const checkpoint = struct {
     pub const RecoveryResult = recovery.RecoveryResult;
 };
 
-// Side outputs
-pub const side_output = @import("side_output.zig");
-pub const SideOutputManager = side_output.SideOutputManager;
-pub const OutputTag = side_output.OutputTag;
+// Side outputs replaced by tag-based routing on ProcessingRecord.
+// See ProcessingRecord.tags, addTag(), hasTag(), hasAllTags().
 
 // Processing metrics
 pub const metrics_mod = @import("metrics.zig");
@@ -202,6 +203,7 @@ test {
     _ = @import("operators/json_map.zig");
     _ = @import("operators/json_flatmap.zig");
     _ = @import("operators/native_registry.zig");
+    _ = @import("operators/classify.zig");
     // Keyed State
     _ = @import("state.zig");
     // Windowing
@@ -221,7 +223,6 @@ test {
     _ = @import("checkpoint/alignment.zig");
     _ = @import("checkpoint/recovery.zig");
     // Side outputs & Metrics
-    _ = @import("side_output.zig");
     _ = @import("metrics.zig");
     _ = @import("window/session.zig");
     _ = @import("window/lateness.zig");

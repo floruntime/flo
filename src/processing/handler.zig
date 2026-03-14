@@ -48,6 +48,7 @@ const EntryType = entry_mod.EntryType;
 const Flags = entry_mod.Flags;
 
 const native_registry = @import("operators/native_registry.zig");
+const kv_lookup_mod = @import("operators/kv_lookup.zig");
 const operator_mod = @import("operator.zig");
 const Operator = operator_mod.Operator;
 const collector_mod = @import("collector.zig");
@@ -86,6 +87,18 @@ pub const ProcessingHandler = struct {
 
     const MAX_JOBS: usize = 100_000;
 
+    /// Sink configuration for a single sink in the pipeline.
+    pub const SinkConfig = struct {
+        kind: SinkKind,
+        target: []const u8, // owned (stream/queue sink: target name)
+        namespace: []const u8, // owned (sink namespace)
+        measurement: []const u8, // owned (TS sink: measurement name)
+        value_field: []const u8, // owned (TS sink: value field name)
+        ts_tag_keys: []const u8, // owned (serialized flat pairs)
+        ts_field_keys: []const u8, // owned (serialized flat pairs)
+        required_tags: u32, // tag bitmask — 0 = firehose (receives all records)
+    };
+
     /// Per-job pipeline state: source/sink config + read cursor + operator chain.
     pub const PipelineState = struct {
         // Source configuration
@@ -97,17 +110,8 @@ pub const ProcessingHandler = struct {
         src_namespace: []const u8, // owned (source namespace, default "default")
         src_poll_ms: u32, // poll interval in milliseconds
 
-        // Sink configuration
-        sink_kind: SinkKind,
-        sink_target: []const u8, // owned (stream/queue sink: target name)
-        sink_namespace: []const u8, // owned (sink namespace, default "default")
-        sink_measurement: []const u8, // owned (TS sink: measurement name)
-        sink_value_field: []const u8, // owned (TS sink: value field name)
-
-        // TS sink: tag/field extraction config from JSON payloads
-        // Stored as flat pairs serialized to owned string: "tag1\0jsonkey1\0tag2\0jsonkey2\0"
-        sink_ts_tag_keys: []const u8, // owned
-        sink_ts_field_keys: []const u8, // owned
+        // Multi-sink configuration (tag-based routing)
+        sinks: []SinkConfig = &.{},
 
         // Read cursors — track what's been processed
         ts_cursor_ns: u64, // TS source: next timestamp_ns to read from
@@ -210,12 +214,17 @@ pub const ProcessingHandler = struct {
         if (pipe.src_field.len > 0) self.allocator.free(pipe.src_field);
         if (pipe.src_stream.len > 0) self.allocator.free(pipe.src_stream);
         if (pipe.src_namespace.len > 0) self.allocator.free(pipe.src_namespace);
-        if (pipe.sink_target.len > 0) self.allocator.free(pipe.sink_target);
-        if (pipe.sink_namespace.len > 0) self.allocator.free(pipe.sink_namespace);
-        if (pipe.sink_measurement.len > 0) self.allocator.free(pipe.sink_measurement);
-        if (pipe.sink_value_field.len > 0) self.allocator.free(pipe.sink_value_field);
-        if (pipe.sink_ts_tag_keys.len > 0) self.allocator.free(pipe.sink_ts_tag_keys);
-        if (pipe.sink_ts_field_keys.len > 0) self.allocator.free(pipe.sink_ts_field_keys);
+
+        // Free multi-sink configs
+        for (pipe.sinks) |snk| {
+            if (snk.target.len > 0) self.allocator.free(snk.target);
+            if (snk.namespace.len > 0) self.allocator.free(snk.namespace);
+            if (snk.measurement.len > 0) self.allocator.free(snk.measurement);
+            if (snk.value_field.len > 0) self.allocator.free(snk.value_field);
+            if (snk.ts_tag_keys.len > 0) self.allocator.free(snk.ts_tag_keys);
+            if (snk.ts_field_keys.len > 0) self.allocator.free(snk.ts_field_keys);
+        }
+        if (pipe.sinks.len > 0) self.allocator.free(pipe.sinks);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -382,18 +391,44 @@ pub const ProcessingHandler = struct {
         // Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][yaml...]
         self.persistSubmit(shard, req.namespace, owned_id, &record);
 
+        // Build tag registry from all sinks and classify operators
+        var tag_registry = definition.TagRegistry{};
+        for (def.sinks.items) |snk| {
+            if (snk.tags) |tag_list| {
+                for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
+            }
+        }
+        for (def.operators.items) |op_spec| {
+            if (std.mem.eql(u8, op_spec.type_name, "classify")) {
+                if (op_spec.config) |entries| {
+                    for (entries) |entry| {
+                        if (std.mem.startsWith(u8, entry.key, "tag_")) {
+                            _ = tag_registry.getOrCreate(entry.value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve required_tags bitmask for each sink
+        for (def.sinks.items) |*snk| {
+            if (snk.tags) |tag_list| {
+                snk.required_tags = tag_registry.buildMask(tag_list);
+            }
+        }
+
         // Create pipeline execution state from parsed definition.
-        // For multi-source jobs, create one pipeline per source (all write to primary sink).
-        if (def.primarySink()) |snk| {
+        // For multi-source jobs, create one pipeline per source (all sinks per pipeline).
+        if (def.sinks.items.len > 0) {
             for (def.sources.items, 0..) |*src, idx| {
                 if (idx == 0) {
-                    self.createPipeline(owned_id, src, snk, &def);
+                    self.createPipeline(owned_id, src, def.sinks.items, &def, &tag_registry, shard);
                 } else {
                     // Multi-source: create additional pipeline with suffixed key
                     var key_buf: [256]u8 = undefined;
                     const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ owned_id, idx }) catch continue;
                     const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
-                    self.createPipeline(ms_owned, src, snk, &def);
+                    self.createPipeline(ms_owned, src, def.sinks.items, &def, &tag_registry, shard);
                 }
             }
         }
@@ -912,7 +947,7 @@ pub const ProcessingHandler = struct {
 
     /// Create a pipeline execution state from parsed source/sink specifications.
     /// Instantiates the operator chain from the job definition.
-    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, snk: *const definition.SinkSpec, def: *const definition.JobDefinition) void {
+    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *const definition.TagRegistry, shard: *Shard) void {
         // Compute tag hash for TS source filtering (same algorithm as TSHandler)
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
             var tag_buf: [1024]u8 = undefined;
@@ -933,25 +968,29 @@ pub const ProcessingHandler = struct {
         const op_specs = def.operators.items;
         var ops = self.allocator.alloc(Operator, op_specs.len) catch {
             // Fall through — pipeline will operate with no operators (passthrough)
-            self.pipelines.put(job_id, makePipeState(self.allocator, src, snk, tag_hash)) catch {};
+            self.pipelines.put(job_id, makePipeState(self.allocator, src, sinks, tag_hash)) catch {};
             return;
         };
         var backings = self.allocator.alloc(native_registry.CreateResult, op_specs.len) catch {
             self.allocator.free(ops);
-            self.pipelines.put(job_id, makePipeState(self.allocator, src, snk, tag_hash)) catch {};
+            self.pipelines.put(job_id, makePipeState(self.allocator, src, sinks, tag_hash)) catch {};
             return;
         };
 
         var count: usize = 0;
         for (op_specs) |*spec| {
             if (!native_registry.isNativeType(spec.type_name)) continue;
-            const result = native_registry.create(self.allocator, spec) catch continue;
+            const result = native_registry.create(self.allocator, spec, tag_registry) catch continue;
+            // Wire kv_lookup operators to the shard's KV projection
+            if (result.backing == .kv_lookup) {
+                result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(shard));
+            }
             backings[count] = result;
             ops[count] = result.op;
             count += 1;
         }
 
-        var pipe_state = makePipeState(self.allocator, src, snk, tag_hash);
+        var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash);
         if (count > 0) {
             pipe_state.operators = ops[0..count];
             pipe_state.operator_backings = backings[0..count];
@@ -962,8 +1001,39 @@ pub const ProcessingHandler = struct {
         self.pipelines.put(job_id, pipe_state) catch {};
     }
 
+    /// KV lookup callback passed to KvLookupOperator.
+    /// Resolves a key against the shard's KV projection, namespace-qualified.
+    fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
+        const shard: *Shard = @ptrCast(@alignCast(ctx));
+        const ns_handler = @import("../namespace/handler.zig");
+        var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse return null;
+        return entry.value;
+    }
+
     /// Helper to build a PipelineState with source/sink config (no operators).
-    fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, snk: *const definition.SinkSpec, tag_hash: u64) PipelineState {
+    fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, tag_hash: u64) PipelineState {
+        // Build SinkConfig array from all sink specs
+        const sink_configs: []SinkConfig = if (sinks.len > 0)
+            allocator.alloc(SinkConfig, sinks.len) catch @as([]SinkConfig, &.{})
+        else
+            @as([]SinkConfig, &.{});
+
+        for (sink_configs, 0..) |*sc, i| {
+            const snk = sinks[i];
+            sc.* = .{
+                .kind = snk.kind,
+                .target = allocator.dupe(u8, snk.target) catch "",
+                .namespace = allocator.dupe(u8, if (snk.namespace.len > 0) snk.namespace else "default") catch "",
+                .measurement = allocator.dupe(u8, snk.ts_measurement) catch "",
+                .value_field = allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
+                .ts_tag_keys = serializeFlatPairs(allocator, snk.ts_tag_keys) catch "",
+                .ts_field_keys = serializeFlatPairs(allocator, snk.ts_field_keys) catch "",
+                .required_tags = snk.required_tags,
+            };
+        }
+
         return .{
             .source_kind = src.kind,
             .src_measurement = allocator.dupe(u8, src.ts_measurement) catch "",
@@ -972,13 +1042,7 @@ pub const ProcessingHandler = struct {
             .src_stream = allocator.dupe(u8, src.stream) catch "",
             .src_namespace = allocator.dupe(u8, if (src.namespace.len > 0) src.namespace else "default") catch "",
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
-            .sink_kind = snk.kind,
-            .sink_target = allocator.dupe(u8, snk.target) catch "",
-            .sink_namespace = allocator.dupe(u8, if (snk.namespace.len > 0) snk.namespace else "default") catch "",
-            .sink_measurement = allocator.dupe(u8, snk.ts_measurement) catch "",
-            .sink_value_field = allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
-            .sink_ts_tag_keys = serializeFlatPairs(allocator, snk.ts_tag_keys) catch "",
-            .sink_ts_field_keys = serializeFlatPairs(allocator, snk.ts_field_keys) catch "",
+            .sinks = sink_configs,
             .ts_cursor_ns = 0,
             .stream_cursor = 0,
             .last_poll_ms = 0,
@@ -1046,11 +1110,11 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer shard.allocator.free(records);
                 for (records) |rec| {
-                    writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash);
+                    writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash, rec.tags);
                 }
             } else {
                 // No operators or chain failed — direct passthrough
-                writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash);
+                writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash, 0);
             }
 
             // Advance cursor past this point
@@ -1081,10 +1145,10 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer shard.allocator.free(records);
                 for (records) |rec| {
-                    writeSinkRecordFromStream(pipe, shard, rec.value);
+                    writeSinkRecordFromStream(pipe, shard, rec.value, rec.tags);
                 }
             } else {
-                writeSinkRecordFromStream(pipe, shard, payload);
+                writeSinkRecordFromStream(pipe, shard, payload, 0);
             }
 
             job.records_processed += 1;
@@ -1141,54 +1205,58 @@ pub const ProcessingHandler = struct {
         return allocator.dupe(ProcessingRecord, final) catch &.{};
     }
 
-    /// Write a processed record to the configured sink (TS source variant).
-    fn writeSinkRecord(pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64) void {
-        switch (pipe.sink_kind) {
-            .stream => {
-                _ = shard.stream_handler.appendPayloadToStream(pipe.sink_target, pipe.sink_namespace, payload) catch return;
-            },
-            .ts => {
-                const ual_idx = shard.ts_handler.nextUalIndex();
-                shard.ts_handler.ts.insert(
-                    pipe.sink_measurement,
-                    pipe.sink_value_field,
-                    field_value,
-                    timestamp_ns,
-                    ual_idx,
-                    tag_hash,
-                ) catch return;
-            },
-            else => {},
+    /// Write a processed record to all matching sinks (TS source variant).
+    /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
+    /// sinks with required_tags set only get records where record_tags matches.
+    fn writeSinkRecord(pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64, record_tags: u32) void {
+        for (pipe.sinks) |snk| {
+            if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            switch (snk.kind) {
+                .stream => {
+                    _ = shard.stream_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                },
+                .ts => {
+                    const ual_idx = shard.ts_handler.nextUalIndex();
+                    shard.ts_handler.ts.insert(
+                        snk.measurement,
+                        snk.value_field,
+                        field_value,
+                        timestamp_ns,
+                        ual_idx,
+                        tag_hash,
+                    ) catch continue;
+                },
+                else => {},
+            }
         }
     }
 
-    /// Write a processed record to the configured sink (stream source variant).
-    fn writeSinkRecordFromStream(pipe: *PipelineState, shard: *Shard, payload: []const u8) void {
-        switch (pipe.sink_kind) {
-            .stream => {
-                _ = shard.stream_handler.appendPayloadToStream(pipe.sink_target, pipe.sink_namespace, payload) catch return;
-            },
-            .ts => {
-                // Extract value from JSON payload using the sink's value_field as source key.
-                // sink_value_field is the JSON key to extract from (e.g., "temperature").
-                // The TS projection stores under standard field name "value" so that
-                // `flo ts read <measurement>` (which defaults to field="value") finds the data.
-                const value = extractJsonFloat(payload, pipe.sink_value_field) orelse
-                    std.fmt.parseFloat(f64, payload) catch 0.0;
-                const ual_idx = shard.ts_handler.nextUalIndex();
-                const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
-                // Extract tag hash from JSON if tag mappings exist
-                const tag_hash = extractJsonTagHash(payload, pipe.sink_measurement);
-                shard.ts_handler.ts.insert(
-                    pipe.sink_measurement,
-                    "value", // Standard TS field name — matches `ts read` default
-                    value,
-                    now_ns,
-                    ual_idx,
-                    tag_hash,
-                ) catch return;
-            },
-            else => {},
+    /// Write a processed record to all matching sinks (stream source variant).
+    fn writeSinkRecordFromStream(pipe: *PipelineState, shard: *Shard, payload: []const u8, record_tags: u32) void {
+        for (pipe.sinks) |snk| {
+            if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            switch (snk.kind) {
+                .stream => {
+                    _ = shard.stream_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                },
+                .ts => {
+                    // Extract value from JSON payload using the sink's value_field as source key.
+                    const value = extractJsonFloat(payload, snk.value_field) orelse
+                        std.fmt.parseFloat(f64, payload) catch 0.0;
+                    const ual_idx = shard.ts_handler.nextUalIndex();
+                    const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
+                    const tag_hash_val = extractJsonTagHash(payload, snk.measurement);
+                    shard.ts_handler.ts.insert(
+                        snk.measurement,
+                        "value",
+                        value,
+                        now_ns,
+                        ual_idx,
+                        tag_hash_val,
+                    ) catch continue;
+                },
+                else => {},
+            }
         }
     }
 
@@ -1286,7 +1354,7 @@ test "ProcessingHandler: applyOperatorChain with passthrough operator" {
         .module = "",
         .config = null,
     };
-    var create_result = try native_registry.create(allocator, &spec);
+    var create_result = try native_registry.create(allocator, &spec, null);
     defer create_result.deinit(allocator);
 
     var ops = [_]Operator{create_result.op};
@@ -1314,7 +1382,7 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
         .module = "",
         .config = &config_entries,
     };
-    var create_result = try native_registry.create(allocator, &spec);
+    var create_result = try native_registry.create(allocator, &spec, null);
     defer create_result.deinit(allocator);
 
     // Feed a record with no key — filter should reject it

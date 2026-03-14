@@ -274,17 +274,17 @@ function OverviewTab({ job }: { job: ProcessingJobDetail }) {
                             } />
                         </dl>
 
-                        {/* Side Outputs */}
-                        {job.side_outputs && job.side_outputs.length > 0 && (
+                        {/* Tags */}
+                        {job.tags && job.tags.length > 0 && (
                             <div className="mt-6 pt-4 border-t border-surface-border">
                                 <h4 className="text-xs text-text-secondary uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                                    <Tag className="w-3 h-3" /> Side Outputs
+                                    <Tag className="w-3 h-3" /> Tags
                                 </h4>
                                 <div className="space-y-2">
-                                    {job.side_outputs.map(so => (
-                                        <div key={so.tag} className="flex items-center justify-between text-sm">
-                                            <span className="font-mono text-xs text-text-secondary">{so.tag}</span>
-                                            <span className="tabular-nums text-text-primary">{formatNumber(so.total_emitted)}</span>
+                                    {job.tags.map(t => (
+                                        <div key={t.name} className="flex items-center justify-between text-sm">
+                                            <span className="font-mono text-xs text-text-secondary">{t.name} (bit {t.bit})</span>
+                                            <span className="tabular-nums text-text-primary">{formatNumber(t.total_matched)}</span>
                                         </div>
                                     ))}
                                 </div>

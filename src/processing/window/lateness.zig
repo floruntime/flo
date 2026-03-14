@@ -14,7 +14,6 @@
 const std = @import("std");
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const SideOutputManager = @import("../side_output.zig").SideOutputManager;
 
 // =============================================================================
 // LateRecordClassification
@@ -38,8 +37,8 @@ pub const RecordTimeliness = enum {
 pub const LatenessTracker = struct {
     /// Maximum allowed lateness in ms (0 = no late data allowed)
     allowed_lateness_ms: i64,
-    /// Optional side output tag for late records
-    late_output_tag: ?[]const u8,
+    /// Optional tag bit to set on late records (null = no tagging)
+    late_tag_bit: ?u5,
     /// Counter: on-time records
     on_time_count: u64 = 0,
     /// Counter: late but accepted records
@@ -52,15 +51,15 @@ pub const LatenessTracker = struct {
     pub fn init(allowed_lateness_ms: i64) Self {
         return .{
             .allowed_lateness_ms = allowed_lateness_ms,
-            .late_output_tag = null,
+            .late_tag_bit = null,
         };
     }
 
-    /// Create a tracker with a side output for late records
-    pub fn initWithSideOutput(allowed_lateness_ms: i64, tag_name: []const u8) Self {
+    /// Create a tracker that tags late records with a specific bit
+    pub fn initWithTag(allowed_lateness_ms: i64, tag_bit: u5) Self {
         return .{
             .allowed_lateness_ms = allowed_lateness_ms,
-            .late_output_tag = tag_name,
+            .late_tag_bit = tag_bit,
         };
     }
 
@@ -92,16 +91,11 @@ pub const LatenessTracker = struct {
         return .dropped;
     }
 
-    /// Route a late record to the side output if configured.
-    /// Returns true if successfully routed, false if no side output configured.
-    pub fn routeToSideOutput(
-        self: *Self,
-        rec: ProcessingRecord,
-        side_outputs: ?*SideOutputManager,
-    ) !bool {
-        const tag = self.late_output_tag orelse return false;
-        const so = side_outputs orelse return false;
-        try so.emit(tag, rec);
+    /// Tag a record as late if a tag bit is configured.
+    /// Returns true if the record was tagged, false if no tag configured.
+    pub fn tagAsLate(self: *Self, rec: *ProcessingRecord) bool {
+        const bit = self.late_tag_bit orelse return false;
+        rec.addTag(bit);
         return true;
     }
 
@@ -176,7 +170,25 @@ test "LatenessTracker late ratio" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), tracker.lateRatio(), 0.001);
 }
 
-test "LatenessTracker with side output tag" {
-    const tracker = LatenessTracker.initWithSideOutput(5000, "late-events");
-    try std.testing.expectEqualStrings("late-events", tracker.late_output_tag.?);
+test "LatenessTracker with tag bit" {
+    const tracker = LatenessTracker.initWithTag(5000, 3);
+    try std.testing.expectEqual(@as(?u5, 3), tracker.late_tag_bit);
+}
+
+test "LatenessTracker tagAsLate sets bit" {
+    var tracker = LatenessTracker.initWithTag(5000, 2);
+    var rec = ProcessingRecord.init("k", "v", 100);
+    try std.testing.expectEqual(@as(u32, 0), rec.tags);
+    const tagged = tracker.tagAsLate(&rec);
+    try std.testing.expect(tagged);
+    try std.testing.expect(rec.hasTag(2));
+    try std.testing.expectEqual(@as(u32, 4), rec.tags); // 1 << 2 = 4
+}
+
+test "LatenessTracker tagAsLate no bit configured" {
+    var tracker = LatenessTracker.init(5000);
+    var rec = ProcessingRecord.init("k", "v", 100);
+    const tagged = tracker.tagAsLate(&rec);
+    try std.testing.expect(!tagged);
+    try std.testing.expectEqual(@as(u32, 0), rec.tags);
 }

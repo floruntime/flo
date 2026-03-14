@@ -76,6 +76,11 @@ pub const SourceRef = struct {
 /// Records are the primary data element that operators transform.
 /// Each record has an optional key (for partitioning), a value (payload),
 /// and an event timestamp used for windowing and watermark tracking.
+///
+/// Records carry a `tags` bitfield (u32) that operators can set to label
+/// records for downstream routing. Sinks declare which tags they require;
+/// a record reaches a sink only if `record.tags & sink_required == sink_required`.
+/// Up to 32 distinct tag names per pipeline. Zero-cost when unused.
 pub const ProcessingRecord = struct {
     /// Key for partitioning (empty = broadcast/non-keyed)
     key: []const u8,
@@ -89,6 +94,9 @@ pub const ProcessingRecord = struct {
     headers: []const Header,
     /// Whether this record owns its memory (and should free on deinit)
     owns_memory: bool,
+    /// Tag bitfield — operators set bits to label records for sink routing.
+    /// Bit positions are assigned by the pipeline's tag registry.
+    tags: u32 = 0,
 
     pub const EMPTY: ProcessingRecord = .{
         .key = &.{},
@@ -97,6 +105,7 @@ pub const ProcessingRecord = struct {
         .source = SourceRef.EMPTY,
         .headers = &.{},
         .owns_memory = false,
+        .tags = 0,
     };
 
     /// Create a record with key and value (borrows memory)
@@ -108,6 +117,7 @@ pub const ProcessingRecord = struct {
             .source = SourceRef.EMPTY,
             .headers = &.{},
             .owns_memory = false,
+            .tags = 0,
         };
     }
 
@@ -120,6 +130,7 @@ pub const ProcessingRecord = struct {
             .source = SourceRef.EMPTY,
             .headers = &.{},
             .owns_memory = false,
+            .tags = 0,
         };
     }
 
@@ -141,6 +152,7 @@ pub const ProcessingRecord = struct {
             .source = try self.source.clone(allocator),
             .headers = cloned_headers,
             .owns_memory = true,
+            .tags = self.tags,
         };
     }
 
@@ -160,6 +172,25 @@ pub const ProcessingRecord = struct {
     /// Check if this record has a key (is keyed)
     pub fn isKeyed(self: *const ProcessingRecord) bool {
         return self.key.len > 0;
+    }
+
+    // =========================================================================
+    // Tag helpers
+    // =========================================================================
+
+    /// Set a tag bit on this record.
+    pub fn addTag(self: *ProcessingRecord, bit: u5) void {
+        self.tags |= @as(u32, 1) << bit;
+    }
+
+    /// Check whether a specific tag bit is set.
+    pub fn hasTag(self: *const ProcessingRecord, bit: u5) bool {
+        return (self.tags & (@as(u32, 1) << bit)) != 0;
+    }
+
+    /// Check whether ALL bits in `mask` are set (AND match).
+    pub fn hasAllTags(self: *const ProcessingRecord, mask: u32) bool {
+        return (self.tags & mask) == mask;
     }
 };
 

@@ -265,11 +265,11 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else
                 null;
 
-            // Parse config entries — all keys except reserved ones (type, name, module)
-            const config: ?[]const OperatorSpec.ConfigEntry = blk: {
+            // Parse config entries — all keys except reserved ones (type, name, module, rules)
+            var config: ?[]const OperatorSpec.ConfigEntry = blk: {
                 const obj_map = item.object;
                 // Reserved keys that are not config
-                const reserved = [_][]const u8{ "type", "name", "module" };
+                const reserved = [_][]const u8{ "type", "name", "module", "rules" };
                 // Count non-reserved string entries
                 var config_count: usize = 0;
                 var it = obj_map.iterator();
@@ -323,6 +323,45 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 
                 break :blk entries[0..idx];
             };
+
+            // For classify operators, expand `rules:` array into indexed condition_N/tag_N pairs
+            if (std.mem.eql(u8, op_type, "classify")) {
+                if (getArray(item, "rules")) |rules_arr| {
+                    // Count valid rule objects
+                    var valid_rules: usize = 0;
+                    for (rules_arr) |rule_item| {
+                        if (rule_item == .object and getString(rule_item, "condition") != null and getString(rule_item, "tag") != null) {
+                            valid_rules += 1;
+                        }
+                    }
+                    if (valid_rules > 0) {
+                        const existing_count = if (config) |c| c.len else 0;
+                        const new_entries = allocator.alloc(OperatorSpec.ConfigEntry, existing_count + valid_rules * 2) catch return error.OutOfMemory;
+                        // Copy existing entries
+                        if (config) |c| {
+                            @memcpy(new_entries[0..c.len], c);
+                            allocator.free(c);
+                        }
+                        var write_idx = existing_count;
+                        var rule_idx: usize = 0;
+                        for (rules_arr) |rule_item| {
+                            if (rule_item != .object) continue;
+                            const cond = getString(rule_item, "condition") orelse continue;
+                            const tag = getString(rule_item, "tag") orelse continue;
+                            const cond_key = std.fmt.allocPrint(allocator, "condition_{d}", .{rule_idx}) catch return error.OutOfMemory;
+                            const tag_key = std.fmt.allocPrint(allocator, "tag_{d}", .{rule_idx}) catch return error.OutOfMemory;
+                            const cond_dup = allocator.dupe(u8, cond) catch return error.OutOfMemory;
+                            const tag_dup = allocator.dupe(u8, tag) catch return error.OutOfMemory;
+                            new_entries[write_idx] = .{ .key = cond_key, .value = cond_dup };
+                            write_idx += 1;
+                            new_entries[write_idx] = .{ .key = tag_key, .value = tag_dup };
+                            write_idx += 1;
+                            rule_idx += 1;
+                        }
+                        config = new_entries[0..write_idx];
+                    }
+                }
+            }
 
             operators.append(allocator, .{
                 .type_name = type_dup,
@@ -656,22 +695,46 @@ fn appendExpandedSource(
 ///   - `ts:` object present  → SinkKind.ts
 ///   - `stream:` object present → SinkKind.stream
 ///
-/// Optional `routes_from:` field maps this sink to a named side output tag.
+/// Optional `tags:` array maps this sink to tagged records only (AND match).
 fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
     if (item != .object) return;
 
     const sink_name = getString(item, "name") orelse "default-sink";
-    const routes_from = getString(item, "routes_from");
+
+    // Parse tags list — either a YAML array of strings, or a single string (sugar)
+    const sink_tags: ?[]const []const u8 = blk: {
+        if (getArray(item, "tags")) |arr| {
+            if (arr.len == 0) break :blk null;
+            const list = allocator.alloc([]const u8, arr.len) catch return error.OutOfMemory;
+            for (arr, 0..) |elem, i| {
+                if (elem == .string) {
+                    list[i] = allocator.dupe(u8, elem.string) catch return error.OutOfMemory;
+                } else {
+                    // Free already-allocated entries on error
+                    for (list[0..i]) |prev| allocator.free(prev);
+                    allocator.free(list);
+                    return error.InvalidFormat;
+                }
+            }
+            break :blk list;
+        } else if (getString(item, "tags")) |single| {
+            // Sugar: `tags: late` → treated as `tags: [late]`
+            const list = allocator.alloc([]const u8, 1) catch return error.OutOfMemory;
+            list[0] = allocator.dupe(u8, single) catch return error.OutOfMemory;
+            break :blk list;
+        }
+        break :blk null;
+    };
 
     // Detect sink kind
     if (getObject(item, "kv")) |kv_obj| {
-        try appendKvSink(allocator, sink_name, kv_obj, routes_from, default_namespace, sinks);
+        try appendKvSink(allocator, sink_name, kv_obj, sink_tags, default_namespace, sinks);
     } else if (getObject(item, "queue")) |q_obj| {
-        try appendQueueSink(allocator, sink_name, q_obj, routes_from, default_namespace, sinks);
+        try appendQueueSink(allocator, sink_name, q_obj, sink_tags, default_namespace, sinks);
     } else if (getObject(item, "ts")) |ts_obj| {
-        try appendTsSink(allocator, sink_name, ts_obj, routes_from, default_namespace, sinks);
+        try appendTsSink(allocator, sink_name, ts_obj, sink_tags, default_namespace, sinks);
     } else if (getObject(item, "stream")) |stream_obj| {
-        try appendStreamSink(allocator, sink_name, stream_obj, routes_from, default_namespace, sinks);
+        try appendStreamSink(allocator, sink_name, stream_obj, sink_tags, default_namespace, sinks);
     } else {
         return error.MissingSinkTarget;
     }
@@ -681,7 +744,7 @@ fn appendStreamSink(
     allocator: Allocator,
     sink_name: []const u8,
     stream_obj: JsonValue,
-    routes_from: ?[]const u8,
+    sink_tags: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -700,14 +763,13 @@ fn appendStreamSink(
     errdefer allocator.free(sep_d);
     const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
     errdefer allocator.free(wm_d);
-    const rf_d: ?[]const u8 = if (routes_from) |rf| allocator.dupe(u8, rf) catch return error.OutOfMemory else null;
 
     sinks.append(allocator, .{
         .name = name_d,
         .kind = .stream,
         .target = target_d,
         .namespace = ns_d,
-        .routes_from = rf_d,
+        .tags = sink_tags,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -722,7 +784,7 @@ fn appendKvSink(
     allocator: Allocator,
     sink_name: []const u8,
     kv_obj: JsonValue,
-    routes_from: ?[]const u8,
+    sink_tags: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -738,7 +800,6 @@ fn appendKvSink(
     errdefer allocator.free(sep_d);
     const wm_d = allocator.dupe(u8, getString(kv_obj, "write_mode") orelse "upsert") catch return error.OutOfMemory;
     errdefer allocator.free(wm_d);
-    const rf_d: ?[]const u8 = if (routes_from) |rf| allocator.dupe(u8, rf) catch return error.OutOfMemory else null;
 
     var ttl: ?u64 = null;
     if (getInt(kv_obj, "ttl_ms")) |v| {
@@ -750,7 +811,7 @@ fn appendKvSink(
         .kind = .kv,
         .target = target_d,
         .namespace = ns_d,
-        .routes_from = rf_d,
+        .tags = sink_tags,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -765,7 +826,7 @@ fn appendQueueSink(
     allocator: Allocator,
     sink_name: []const u8,
     q_obj: JsonValue,
-    routes_from: ?[]const u8,
+    sink_tags: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -781,7 +842,6 @@ fn appendQueueSink(
     errdefer allocator.free(sep_d);
     const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
     errdefer allocator.free(wm_d);
-    const rf_d: ?[]const u8 = if (routes_from) |rf| allocator.dupe(u8, rf) catch return error.OutOfMemory else null;
 
     var priority: u8 = 0;
     if (getInt(q_obj, "priority")) |v| {
@@ -803,7 +863,7 @@ fn appendQueueSink(
         .kind = .queue,
         .target = target_d,
         .namespace = ns_d,
-        .routes_from = rf_d,
+        .tags = sink_tags,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -835,7 +895,7 @@ fn appendTsSink(
     allocator: Allocator,
     sink_name: []const u8,
     ts_obj: JsonValue,
-    routes_from: ?[]const u8,
+    sink_tags: ?[]const []const u8,
     default_namespace: []const u8,
     sinks: *std.ArrayList(SinkSpec),
 ) ParseError!void {
@@ -858,7 +918,6 @@ fn appendTsSink(
     errdefer allocator.free(sep_d);
     const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
     errdefer allocator.free(wm_d);
-    const rf_d: ?[]const u8 = if (routes_from) |rf| allocator.dupe(u8, rf) catch return error.OutOfMemory else null;
 
     // Parse value_field (shorthand for single field)
     const vf_raw = getString(ts_obj, "value_field") orelse "value";
@@ -912,7 +971,7 @@ fn appendTsSink(
         .kind = .ts,
         .target = target_d,
         .namespace = ns_d,
-        .routes_from = rf_d,
+        .tags = sink_tags,
         .key_prefix = kp_d,
         .separator = sep_d,
         .write_mode = wm_d,
@@ -953,7 +1012,10 @@ fn freeSinkSpecs(allocator: Allocator, sinks_list: *std.ArrayList(SinkSpec)) voi
         allocator.free(snk.key_prefix);
         allocator.free(snk.separator);
         allocator.free(snk.write_mode);
-        if (snk.routes_from) |rf| allocator.free(rf);
+        if (snk.tags) |tag_list| {
+            for (tag_list) |t| allocator.free(t);
+            allocator.free(tag_list);
+        }
     }
     sinks_list.deinit(allocator);
 }
@@ -1760,10 +1822,10 @@ test "parser: partitions mixed with single partition source" {
 }
 
 // =============================================================================
-// Side-Output Routing Tests
+// Tag-Based Routing Tests
 // =============================================================================
 
-test "parser: sink with routes_from" {
+test "parser: sink with tags" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1778,18 +1840,21 @@ test "parser: sink with routes_from" {
         \\  - name: late-events
         \\    stream:
         \\      name: late-data
-        \\    routes_from: late
+        \\    tags:
+        \\      - late
     ;
 
     var def = try parseJobDefinition(allocator, text);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sinks.items.len);
-    try std.testing.expect(def.sinks.items[0].routes_from == null);
-    try std.testing.expectEqualStrings("late", def.sinks.items[1].routes_from.?);
+    try std.testing.expect(def.sinks.items[0].tags == null);
+    const tag_list = def.sinks.items[1].tags.?;
+    try std.testing.expectEqual(@as(usize, 1), tag_list.len);
+    try std.testing.expectEqualStrings("late", tag_list[0]);
 }
 
-test "parser: KV sink with routes_from" {
+test "parser: KV sink with tags" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1801,7 +1866,8 @@ test "parser: KV sink with routes_from" {
         \\  - name: errors
         \\    kv:
         \\      namespace: error-store
-        \\    routes_from: error-records
+        \\    tags:
+        \\      - error-records
     ;
 
     var def = try parseJobDefinition(allocator, text);
@@ -1809,10 +1875,12 @@ test "parser: KV sink with routes_from" {
 
     const snk = def.primarySink().?;
     try std.testing.expect(snk.kind == .kv);
-    try std.testing.expectEqualStrings("error-records", snk.routes_from.?);
+    const tag_list = snk.tags.?;
+    try std.testing.expectEqual(@as(usize, 1), tag_list.len);
+    try std.testing.expectEqualStrings("error-records", tag_list[0]);
 }
 
-test "parser: queue sink with routes_from" {
+test "parser: queue sink with tags" {
     const allocator = std.testing.allocator;
 
     const text =
@@ -1824,7 +1892,8 @@ test "parser: queue sink with routes_from" {
         \\  - name: dlq
         \\    queue:
         \\      name: dead-letter
-        \\    routes_from: failures
+        \\    tags:
+        \\      - failures
     ;
 
     var def = try parseJobDefinition(allocator, text);
@@ -1832,8 +1901,133 @@ test "parser: queue sink with routes_from" {
 
     const snk = def.primarySink().?;
     try std.testing.expect(snk.kind == .queue);
-    try std.testing.expectEqualStrings("failures", snk.routes_from.?);
+    const tag_list = snk.tags.?;
+    try std.testing.expectEqual(@as(usize, 1), tag_list.len);
+    try std.testing.expectEqualStrings("failures", tag_list[0]);
     try std.testing.expectEqualStrings("dead-letter", snk.target);
+}
+
+test "parser: sink with multiple tags (AND match)" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - name: urgent
+        \\    stream:
+        \\      name: urgent-stream
+        \\    tags:
+        \\      - late
+        \\      - high-value
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const snk = def.primarySink().?;
+    const tag_list = snk.tags.?;
+    try std.testing.expectEqual(@as(usize, 2), tag_list.len);
+    try std.testing.expectEqualStrings("late", tag_list[0]);
+    try std.testing.expectEqualStrings("high-value", tag_list[1]);
+}
+
+// =============================================================================
+// KV Lookup Operator Tests
+// =============================================================================
+
+test "parser: kv_lookup operator with all config" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: results
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: check-account
+        \\    lookup_key: "account:${$.account_id}"
+        \\    namespace: production
+        \\    mode: filter
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("kv_lookup", op.type_name);
+    try std.testing.expectEqualStrings("check-account", op.name);
+
+    // Verify config entries parsed correctly
+    try std.testing.expect(op.config != null);
+    try std.testing.expect(op.getConfig("lookup_key") != null);
+    try std.testing.expectEqualStrings("account:${$.account_id}", op.getConfig("lookup_key").?);
+    try std.testing.expectEqualStrings("production", op.getConfig("namespace").?);
+    try std.testing.expectEqualStrings("filter", op.getConfig("mode").?);
+}
+
+test "parser: kv_lookup operator with enrich mode" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: enriched
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: enrich-user
+        \\    lookup_key: "user/${$.user_id}"
+        \\    mode: enrich
+        \\    enrich_field: user_data
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("kv_lookup", op.type_name);
+    try std.testing.expectEqualStrings("user/${$.user_id}", op.getConfig("lookup_key").?);
+    try std.testing.expectEqualStrings("enrich", op.getConfig("mode").?);
+    try std.testing.expectEqualStrings("user_data", op.getConfig("enrich_field").?);
+}
+
+test "parser: kv_lookup operator minimal config" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: results
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: simple-lookup
+        \\    lookup_key: "${$.id}"
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("kv_lookup", op.type_name);
+    try std.testing.expectEqualStrings("${$.id}", op.getConfig("lookup_key").?);
+    // namespace and mode not specified — registry will use defaults
+    try std.testing.expect(op.getConfig("namespace") == null);
+    try std.testing.expect(op.getConfig("mode") == null);
 }
 
 // =============================================================================
@@ -1996,4 +2190,162 @@ test "parser: no namespace anywhere defaults to 'default'" {
     try std.testing.expectEqualStrings("default", def.namespace);
     try std.testing.expectEqualStrings("default", def.primarySource().?.namespace);
     try std.testing.expectEqualStrings("default", def.primarySink().?.namespace);
+}
+
+test "parser: classify operator with rules array" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: errors
+        \\    tags:
+        \\      - errors
+        \\  - stream:
+        \\      name: all-events
+        \\operators:
+        \\  - type: classify
+        \\    name: route-errors
+        \\    rules:
+        \\      - condition: value_contains:error
+        \\        tag: errors
+        \\      - condition: value_contains:warn
+        \\        tag: warnings
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("classify", op.type_name);
+    try std.testing.expectEqualStrings("route-errors", op.name);
+
+    // rules: array should be expanded to indexed config pairs
+    try std.testing.expect(op.config != null);
+    const cfg = op.config.?;
+    try std.testing.expectEqual(@as(usize, 4), cfg.len);
+    try std.testing.expectEqualStrings("condition_0", cfg[0].key);
+    try std.testing.expectEqualStrings("value_contains:error", cfg[0].value);
+    try std.testing.expectEqualStrings("tag_0", cfg[1].key);
+    try std.testing.expectEqualStrings("errors", cfg[1].value);
+    try std.testing.expectEqualStrings("condition_1", cfg[2].key);
+    try std.testing.expectEqualStrings("value_contains:warn", cfg[2].value);
+    try std.testing.expectEqualStrings("tag_1", cfg[3].key);
+    try std.testing.expectEqualStrings("warnings", cfg[3].value);
+
+    // sinks: first sink should have tags, second should be firehose
+    try std.testing.expectEqual(@as(usize, 2), def.sinks.items.len);
+    try std.testing.expect(def.sinks.items[0].tags != null);
+    try std.testing.expectEqual(@as(usize, 1), def.sinks.items[0].tags.?.len);
+    try std.testing.expectEqualStrings("errors", def.sinks.items[0].tags.?[0]);
+    try std.testing.expect(def.sinks.items[1].tags == null);
+}
+
+test "parser: classify operator with rules array and inline config" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: out
+        \\operators:
+        \\  - type: classify
+        \\    name: tagger
+        \\    default_tag: other
+        \\    rules:
+        \\      - condition: value_contains:critical
+        \\        tag: critical
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const op = def.operators.items[0];
+    try std.testing.expect(op.config != null);
+    const cfg = op.config.?;
+    // 1 inline config entry (default_tag) + 2 from rules (condition_0, tag_0)
+    try std.testing.expectEqual(@as(usize, 3), cfg.len);
+    try std.testing.expectEqualStrings("default_tag", cfg[0].key);
+    try std.testing.expectEqualStrings("other", cfg[0].value);
+    try std.testing.expectEqualStrings("condition_0", cfg[1].key);
+    try std.testing.expectEqualStrings("value_contains:critical", cfg[1].value);
+    try std.testing.expectEqualStrings("tag_0", cfg[2].key);
+    try std.testing.expectEqualStrings("critical", cfg[2].value);
+}
+
+test "parser: classify operator with json conditions" {
+    const allocator = std.testing.allocator;
+
+    const text =
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: events
+        \\sinks:
+        \\  - stream:
+        \\      name: payments
+        \\    tags:
+        \\      - payments
+        \\  - stream:
+        \\      name: transfers
+        \\    tags:
+        \\      - transfers
+        \\  - stream:
+        \\      name: high-value
+        \\    tags:
+        \\      - high-value
+        \\  - stream:
+        \\      name: all-events
+        \\operators:
+        \\  - type: classify
+        \\    name: route-json
+        \\    rules:
+        \\      - condition: "json:type^=payment"
+        \\        tag: payments
+        \\      - condition: "json:type*=transfer"
+        \\        tag: transfers
+        \\      - condition: "json:amount>10000"
+        \\        tag: high-value
+    ;
+
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    const op = def.operators.items[0];
+    try std.testing.expectEqualStrings("classify", op.type_name);
+    try std.testing.expectEqualStrings("route-json", op.name);
+
+    const cfg = op.config.?;
+    try std.testing.expectEqual(@as(usize, 6), cfg.len);
+    try std.testing.expectEqualStrings("condition_0", cfg[0].key);
+    try std.testing.expectEqualStrings("json:type^=payment", cfg[0].value);
+    try std.testing.expectEqualStrings("tag_0", cfg[1].key);
+    try std.testing.expectEqualStrings("payments", cfg[1].value);
+    try std.testing.expectEqualStrings("condition_1", cfg[2].key);
+    try std.testing.expectEqualStrings("json:type*=transfer", cfg[2].value);
+    try std.testing.expectEqualStrings("tag_1", cfg[3].key);
+    try std.testing.expectEqualStrings("transfers", cfg[3].value);
+    try std.testing.expectEqualStrings("condition_2", cfg[4].key);
+    try std.testing.expectEqualStrings("json:amount>10000", cfg[4].value);
+    try std.testing.expectEqualStrings("tag_2", cfg[5].key);
+    try std.testing.expectEqualStrings("high-value", cfg[5].value);
+
+    // 4 sinks: 3 tagged + 1 firehose
+    try std.testing.expectEqual(@as(usize, 4), def.sinks.items.len);
+    try std.testing.expect(def.sinks.items[0].tags != null);
+    try std.testing.expectEqualStrings("payments", def.sinks.items[0].tags.?[0]);
+    try std.testing.expect(def.sinks.items[1].tags != null);
+    try std.testing.expectEqualStrings("transfers", def.sinks.items[1].tags.?[0]);
+    try std.testing.expect(def.sinks.items[2].tags != null);
+    try std.testing.expectEqualStrings("high-value", def.sinks.items[2].tags.?[0]);
+    try std.testing.expect(def.sinks.items[3].tags == null); // firehose
 }

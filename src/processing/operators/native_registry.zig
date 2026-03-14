@@ -14,6 +14,7 @@
 //!   - `aggregate`    — JsonAggregateOperator (requires `function` config)
 //!   - `map`          — JsonMapOperator (config entries map output_field→JSONPath/constant)
 //!   - `flatmap`      — JsonFlatMapOperator (requires `array_field` config)
+//!   - `kv_lookup`    — KvLookupOperator (requires `lookup_key` config)
 //!
 //! YAML example:
 //!   ```yaml
@@ -39,6 +40,11 @@
 //!     - type: flatmap
 //!       name: explode-items
 //!       array_field: "$.items"
+//!     - type: kv_lookup
+//!       name: check-account
+//!       lookup_key: "account:${$.account_id}"
+//!       namespace: default
+//!       mode: filter
 //!   ```
 
 const std = @import("std");
@@ -51,6 +57,11 @@ const JsonKeyByOperator = @import("json_keyby.zig").JsonKeyByOperator;
 const JsonAggregateOperator = @import("json_aggregate.zig").JsonAggregateOperator;
 const JsonMapOperator = @import("json_map.zig").JsonMapOperator;
 const JsonFlatMapOperator = @import("json_flatmap.zig").JsonFlatMapOperator;
+const KvLookupOperator = @import("kv_lookup.zig").KvLookupOperator;
+const KvLookupMode = @import("kv_lookup.zig").Mode;
+const ClassifyOperator = @import("classify.zig").ClassifyOperator;
+const ClassifyRule = @import("classify.zig").Rule;
+const TagRegistry = @import("../definition.zig").TagRegistry;
 const log = @import("stdx").log;
 
 /// Result of a native operator creation attempt.
@@ -68,6 +79,8 @@ pub const CreateResult = struct {
         json_aggregate: *JsonAggregateOperator,
         json_map: *JsonMapOperator,
         json_flatmap: *JsonFlatMapOperator,
+        kv_lookup: *KvLookupOperator,
+        classify: *ClassifyOperator,
     };
 
     /// Clean up the backing operator storage.
@@ -91,6 +104,14 @@ pub const CreateResult = struct {
             },
             .expr_filter => |ptr| allocator.destroy(ptr),
             .passthrough => |ptr| allocator.destroy(ptr),
+            .kv_lookup => |ptr| {
+                ptr.deinit(allocator);
+                allocator.destroy(ptr);
+            },
+            .classify => |ptr| {
+                ptr.deinit();
+                allocator.destroy(ptr);
+            },
         }
     }
 };
@@ -109,7 +130,9 @@ pub fn isNativeType(type_name: []const u8) bool {
         std.mem.eql(u8, type_name, "keyby") or
         std.mem.eql(u8, type_name, "aggregate") or
         std.mem.eql(u8, type_name, "map") or
-        std.mem.eql(u8, type_name, "flatmap");
+        std.mem.eql(u8, type_name, "flatmap") or
+        std.mem.eql(u8, type_name, "kv_lookup") or
+        std.mem.eql(u8, type_name, "classify");
 }
 
 /// Create a native operator from an OperatorSpec.
@@ -119,7 +142,7 @@ pub fn isNativeType(type_name: []const u8) bool {
 ///
 /// Returns `CreateError.UnknownOperatorType` if the type name is not recognized.
 /// Returns `CreateError.MissingConfig` if required config (e.g., "condition" for filter) is absent.
-pub fn create(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
+pub fn create(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*const TagRegistry) CreateError!CreateResult {
     if (std.mem.eql(u8, spec.type_name, "filter")) {
         return createExprFilter(allocator, spec);
     } else if (std.mem.eql(u8, spec.type_name, "passthrough")) {
@@ -132,6 +155,10 @@ pub fn create(allocator: Allocator, spec: *const OperatorSpec) CreateError!Creat
         return createJsonMap(allocator, spec);
     } else if (std.mem.eql(u8, spec.type_name, "flatmap")) {
         return createJsonFlatMap(allocator, spec);
+    } else if (std.mem.eql(u8, spec.type_name, "kv_lookup")) {
+        return createKvLookup(allocator, spec);
+    } else if (std.mem.eql(u8, spec.type_name, "classify")) {
+        return createClassify(allocator, spec, tag_registry);
     }
 
     return CreateError.UnknownOperatorType;
@@ -271,6 +298,91 @@ fn createJsonFlatMap(allocator: Allocator, spec: *const OperatorSpec) CreateErro
     };
 }
 
+fn createKvLookup(allocator: Allocator, spec: *const OperatorSpec) CreateError!CreateResult {
+    const lookup_key = spec.getConfig("lookup_key") orelse {
+        log.err("Native operator '{s}' (type=kv_lookup) missing required 'lookup_key' config (e.g., \"account:${{$.account_id}}\")", .{spec.name});
+        return CreateError.MissingConfig;
+    };
+
+    const namespace = spec.getConfig("namespace") orelse "default";
+    const mode_str = spec.getConfig("mode") orelse "filter";
+    const mode = KvLookupMode.fromString(mode_str) orelse {
+        log.err("Native operator '{s}' (type=kv_lookup) unknown mode '{s}' — expected filter|enrich", .{ spec.name, mode_str });
+        return CreateError.MissingConfig;
+    };
+    const enrich_field = spec.getConfig("enrich_field") orelse "_kv";
+
+    const ptr = allocator.create(KvLookupOperator) catch return CreateError.OutOfMemory;
+    ptr.* = KvLookupOperator.init(allocator, spec.name, lookup_key, namespace, mode, enrich_field) catch return CreateError.OutOfMemory;
+
+    return .{
+        .op = ptr.operator(),
+        .backing = .{ .kv_lookup = ptr },
+    };
+}
+
+fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry: ?*const TagRegistry) CreateError!CreateResult {
+    const entries = spec.config orelse {
+        log.err("Native operator '{s}' (type=classify) missing rules config", .{spec.name});
+        return CreateError.MissingConfig;
+    };
+
+    // Count rule pairs: condition_0/tag_0, condition_1/tag_1, ...
+    var rule_count: usize = 0;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "condition_")) {
+            rule_count += 1;
+        }
+    }
+
+    if (rule_count == 0) {
+        log.err("Native operator '{s}' (type=classify) no rules found — expected condition_0/tag_0 pairs", .{spec.name});
+        return CreateError.MissingConfig;
+    }
+
+    const rules = allocator.alloc(ClassifyRule, rule_count) catch return CreateError.OutOfMemory;
+    errdefer allocator.free(rules);
+
+    var idx: usize = 0;
+    for (0..rule_count) |i| {
+        // Build key strings for lookup
+        var cond_key_buf: [32]u8 = undefined;
+        var tag_key_buf: [32]u8 = undefined;
+        const cond_key = std.fmt.bufPrint(&cond_key_buf, "condition_{d}", .{i}) catch return CreateError.OutOfMemory;
+        const tag_key = std.fmt.bufPrint(&tag_key_buf, "tag_{d}", .{i}) catch return CreateError.OutOfMemory;
+
+        const condition = spec.getConfig(cond_key) orelse continue;
+        const tag_val = spec.getConfig(tag_key) orelse continue;
+
+        // Resolve tag value: with a registry, treat as tag name; without, as numeric bit position
+        const tag_bit: u5 = if (tag_registry) |reg| blk: {
+            break :blk reg.resolve(tag_val) orelse {
+                log.err("Native operator '{s}' (type=classify) unknown tag name '{s}' for rule {d}", .{ spec.name, tag_val, i });
+                return CreateError.MissingConfig;
+            };
+        } else blk: {
+            break :blk std.fmt.parseInt(u5, tag_val, 10) catch {
+                log.err("Native operator '{s}' (type=classify) invalid tag bit '{s}' for rule {d}", .{ spec.name, tag_val, i });
+                return CreateError.MissingConfig;
+            };
+        };
+
+        rules[idx] = .{
+            .condition = ExprFilterOperator.init(spec.name, condition),
+            .tag_bit = tag_bit,
+        };
+        idx += 1;
+    }
+
+    const ptr = allocator.create(ClassifyOperator) catch return CreateError.OutOfMemory;
+    ptr.* = ClassifyOperator.init(allocator, spec.name, rules[0..idx]);
+
+    return .{
+        .op = ptr.operator(),
+        .backing = .{ .classify = ptr },
+    };
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -287,7 +399,7 @@ test "NativeOperatorRegistry — create filter" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("test-filter", result.op.getName());
@@ -301,7 +413,7 @@ test "NativeOperatorRegistry — create passthrough" {
         .name = "debug-tap",
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("debug-tap", result.op.getName());
@@ -319,7 +431,7 @@ test "NativeOperatorRegistry — create keyby" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("by-user", result.op.getName());
@@ -333,7 +445,7 @@ test "NativeOperatorRegistry — unknown type" {
         .name = "test",
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.UnknownOperatorType, result);
 }
 
@@ -345,7 +457,7 @@ test "NativeOperatorRegistry — filter missing condition" {
         .name = "no-condition",
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }
 
@@ -357,7 +469,7 @@ test "NativeOperatorRegistry — keyby missing key_expression" {
         .name = "no-expression",
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }
 
@@ -368,6 +480,7 @@ test "NativeOperatorRegistry — isNativeType" {
     try std.testing.expect(isNativeType("aggregate"));
     try std.testing.expect(isNativeType("map"));
     try std.testing.expect(isNativeType("flatmap"));
+    try std.testing.expect(isNativeType("classify"));
     try std.testing.expect(!isNativeType("wasm"));
     try std.testing.expect(!isNativeType("unknown"));
 }
@@ -385,7 +498,7 @@ test "NativeOperatorRegistry — create aggregate sum" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("total-amount", result.op.getName());
@@ -403,7 +516,7 @@ test "NativeOperatorRegistry — create aggregate count (no field)" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("event-counter", result.op.getName());
@@ -424,7 +537,7 @@ test "NativeOperatorRegistry — create aggregate with tumbling window" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("avg-latency", result.op.getName());
@@ -438,7 +551,7 @@ test "NativeOperatorRegistry — aggregate missing function" {
         .name = "bad-agg",
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }
 
@@ -454,7 +567,7 @@ test "NativeOperatorRegistry — aggregate sum missing field" {
         .config = &config_entries,
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }
 
@@ -471,7 +584,7 @@ test "NativeOperatorRegistry — create map with field projections" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("extract-user", result.op.getName());
@@ -485,7 +598,7 @@ test "NativeOperatorRegistry — create map with no config" {
         .name = "empty-map",
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("empty-map", result.op.getName());
@@ -503,7 +616,7 @@ test "NativeOperatorRegistry — create flatmap" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("explode-items", result.op.getName());
@@ -522,7 +635,7 @@ test "NativeOperatorRegistry — create flatmap with element_key" {
         .config = &config_entries,
     };
 
-    const result = try create(allocator, &spec);
+    const result = try create(allocator, &spec, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("keyed-explode", result.op.getName());
@@ -536,6 +649,94 @@ test "NativeOperatorRegistry — flatmap missing array_field" {
         .name = "bad-flatmap",
     };
 
-    const result = create(allocator, &spec);
+    const result = create(allocator, &spec, null);
+    try std.testing.expectError(CreateError.MissingConfig, result);
+}
+
+test "NativeOperatorRegistry — create kv_lookup" {
+    const allocator = std.testing.allocator;
+
+    const config_entries = [_]OperatorSpec.ConfigEntry{
+        .{ .key = "lookup_key", .value = "account:${$.account_id}" },
+        .{ .key = "namespace", .value = "prod" },
+        .{ .key = "mode", .value = "filter" },
+    };
+    const spec = OperatorSpec{
+        .type_name = "kv_lookup",
+        .name = "check-account",
+        .config = &config_entries,
+    };
+
+    const result = try create(allocator, &spec, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("check-account", result.op.getName());
+}
+
+test "NativeOperatorRegistry — kv_lookup missing lookup_key" {
+    const allocator = std.testing.allocator;
+
+    const spec = OperatorSpec{
+        .type_name = "kv_lookup",
+        .name = "no-key",
+    };
+
+    const result = create(allocator, &spec, null);
+    try std.testing.expectError(CreateError.MissingConfig, result);
+}
+
+test "NativeOperatorRegistry — kv_lookup defaults" {
+    const allocator = std.testing.allocator;
+
+    const config_entries = [_]OperatorSpec.ConfigEntry{
+        .{ .key = "lookup_key", .value = "${$.id}" },
+    };
+    const spec = OperatorSpec{
+        .type_name = "kv_lookup",
+        .name = "default-lookup",
+        .config = &config_entries,
+    };
+
+    const result = try create(allocator, &spec, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("default-lookup", result.op.getName());
+}
+
+test "NativeOperatorRegistry — isNativeType includes kv_lookup" {
+    try std.testing.expect(isNativeType("kv_lookup"));
+}
+
+test "NativeOperatorRegistry — create classify" {
+    const allocator = std.testing.allocator;
+
+    const config_entries = [_]OperatorSpec.ConfigEntry{
+        .{ .key = "condition_0", .value = "value_contains:error" },
+        .{ .key = "tag_0", .value = "0" },
+        .{ .key = "condition_1", .value = "json:amount>10000" },
+        .{ .key = "tag_1", .value = "1" },
+    };
+    const spec = OperatorSpec{
+        .type_name = "classify",
+        .name = "label-records",
+        .config = &config_entries,
+    };
+
+    const result = try create(allocator, &spec, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("label-records", result.op.getName());
+}
+
+test "NativeOperatorRegistry — classify no rules" {
+    const allocator = std.testing.allocator;
+
+    const spec = OperatorSpec{
+        .type_name = "classify",
+        .name = "empty-classify",
+    };
+
+    // classify with no config returns MissingConfig
+    const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }

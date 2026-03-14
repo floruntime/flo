@@ -1,0 +1,19 @@
+kind: Processing
+name: transfer-router
+namespace: default
+
+sources:
+  - name: raw-txns
+    stream:
+      name: raw-transactions
+      partitions: all
+
+operators:
+  - type: filter
+    name: is-transfer
+    condition: "value_contains:transfer"
+
+sinks:
+  - name: output
+    stream:
+      name: transfers-stream

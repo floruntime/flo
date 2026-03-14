@@ -1,0 +1,19 @@
+kind: Processing
+name: payment-router
+namespace: default
+
+sources:
+  - name: raw-txns
+    stream:
+      name: raw-transactions
+      partitions: all
+
+operators:
+  - type: filter
+    name: is-payment
+    condition: "value_contains:payment"
+
+sinks:
+  - name: output
+    stream:
+      name: payments-stream

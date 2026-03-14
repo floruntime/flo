@@ -834,9 +834,9 @@ test "e2e/processing: multi-source pipeline merges two input streams" {
 }
 
 test "e2e/processing: multi-sink declaration uses primary sink" {
-    // NOTE: Multi-sink fan-out is not yet wired — the handler only builds
-    // the primary (first) sink. This test verifies that declaring multiple
-    // sinks doesn't break submission, and data flows through the primary sink.
+    // Multi-sink fan-out is wired — all sinks receive records.
+    // This test verifies data flows through the primary (stream) sink;
+    // the secondary KV sink is a no-op (KV write not yet implemented in sink dispatch).
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2131,4 +2131,475 @@ test "e2e/processing: stream source definition is default kind" {
     try testing.expectEqual(@as(usize, 1), def.sources.items.len);
     try testing.expectEqual(parser.SourceKind.stream, def.sources.items[0].kind);
     try testing.expectEqualStrings("events", def.sources.items[0].stream);
+}
+
+// =============================================================================
+// KV Lookup Operator Pipeline E2E Tests
+// =============================================================================
+
+test "e2e/processing: kv_lookup filter mode — only records with matching KV keys pass through" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvfilt" });
+
+    // Step 1: Seed KV store with known accounts
+    try ctx.exec(&.{ "kv", "set", "account:alice", "active", "-n", "proc_kvfilt" });
+    try ctx.exec(&.{ "kv", "set", "account:bob", "active", "-n", "proc_kvfilt" });
+
+    // Step 2: Append JSON records to source stream — mix of known and unknown accounts
+    try ctx.exec(&.{ "stream", "append", "kvf-input", "{\"account_id\":\"alice\",\"amount\":100}", "-n", "proc_kvfilt" });
+    try ctx.exec(&.{ "stream", "append", "kvf-input", "{\"account_id\":\"charlie\",\"amount\":200}", "-n", "proc_kvfilt" });
+    try ctx.exec(&.{ "stream", "append", "kvf-input", "{\"account_id\":\"bob\",\"amount\":300}", "-n", "proc_kvfilt" });
+    try ctx.exec(&.{ "stream", "append", "kvf-input", "{\"account_id\":\"dave\",\"amount\":400}", "-n", "proc_kvfilt" });
+
+    // Step 3: Submit pipeline with kv_lookup operator in filter mode
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-filter
+        \\namespace: proc_kvfilt
+        \\sources.[0].stream.name: kvf-input
+        \\sinks.[0].stream.name: kvf-output
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: check-account
+        \\operators.[0].lookup_key: account:${$.account_id}
+        \\operators.[0].namespace: proc_kvfilt
+        \\operators.[0].mode: filter
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-filter.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvfilt" });
+    const job_id = extractJobId(submit_output) orelse {
+        std.debug.print("\n[FAILED] Could not extract job ID from: '{s}'\n", .{submit_output});
+        return error.NoJobId;
+    };
+
+    // Step 4: Wait for data to flow through
+    const found = try readStreamBlocking(ctx, "kvf-output", "proc_kvfilt", "alice", "5000");
+
+    if (!found) {
+        std.debug.print("\n[FAILED] kv_lookup filter pipeline did not produce output within timeout\n", .{});
+        ctx.dumpServerLogs();
+        return error.TimeoutWaitingForData;
+    }
+
+    // Step 5: Verify only alice and bob records passed through (charlie and dave should be filtered out)
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "kvf-output", "-n", "proc_kvfilt", "--start", "0-0", "--limit", "20" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+    try stdx.testing.assertContains(read_result, "alice");
+    try stdx.testing.assertContains(read_result, "bob");
+    // charlie and dave should NOT be in the output
+    try testing.expect(!read_result.stdoutContains("charlie"));
+    try testing.expect(!read_result.stdoutContains("dave"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvfilt" });
+}
+
+test "e2e/processing: kv_lookup enrich mode — records are enriched with KV values" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvenr" });
+
+    // Step 1: Seed KV with user profiles
+    try ctx.exec(&.{ "kv", "set", "user:u1", "premium", "-n", "proc_kvenr" });
+    try ctx.exec(&.{ "kv", "set", "user:u2", "basic", "-n", "proc_kvenr" });
+
+    // Step 2: Append records referencing user IDs
+    try ctx.exec(&.{ "stream", "append", "kve-input", "{\"user_id\":\"u1\",\"action\":\"purchase\"}", "-n", "proc_kvenr" });
+    try ctx.exec(&.{ "stream", "append", "kve-input", "{\"user_id\":\"u2\",\"action\":\"browse\"}", "-n", "proc_kvenr" });
+    try ctx.exec(&.{ "stream", "append", "kve-input", "{\"user_id\":\"u3\",\"action\":\"signup\"}", "-n", "proc_kvenr" });
+
+    // Step 3: Submit pipeline with kv_lookup in enrich mode
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-enrich
+        \\namespace: proc_kvenr
+        \\sources.[0].stream.name: kve-input
+        \\sinks.[0].stream.name: kve-output
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: enrich-user
+        \\operators.[0].lookup_key: user:${$.user_id}
+        \\operators.[0].namespace: proc_kvenr
+        \\operators.[0].mode: enrich
+        \\operators.[0].enrich_field: tier
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-enrich.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvenr" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Step 4: Wait for data to flow through
+    const found = try readStreamBlocking(ctx, "kve-output", "proc_kvenr", "u1", "5000");
+
+    if (!found) {
+        std.debug.print("\n[FAILED] kv_lookup enrich pipeline did not produce output within timeout\n", .{});
+        return error.TimeoutWaitingForData;
+    }
+
+    // Step 5: Verify enriched records
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "kve-output", "-n", "proc_kvenr", "--start", "0-0", "--limit", "20" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+
+    // ALL 3 records should pass through (enrich mode passes everything)
+    try stdx.testing.assertContains(read_result, "u1");
+    try stdx.testing.assertContains(read_result, "u2");
+    try stdx.testing.assertContains(read_result, "u3");
+
+    // u1 and u2 should be enriched with their KV values
+    try stdx.testing.assertContains(read_result, "premium");
+    try stdx.testing.assertContains(read_result, "basic");
+
+    // u3 has no KV entry — should pass through unchanged (no "tier" field)
+    // We just verify it's there (already checked above)
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvenr" });
+}
+
+test "e2e/processing: kv_lookup filter with composite key template" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvcomp" });
+
+    // Step 1: Seed KV with org-scoped accounts
+    try ctx.exec(&.{ "kv", "set", "org.acme.alice", "admin", "-n", "proc_kvcomp" });
+    try ctx.exec(&.{ "kv", "set", "org.acme.bob", "member", "-n", "proc_kvcomp" });
+
+    // Step 2: Append records with org + user fields
+    try ctx.exec(&.{ "stream", "append", "kvc-input", "{\"org\":\"acme\",\"user\":\"alice\",\"event\":\"login\"}", "-n", "proc_kvcomp" });
+    try ctx.exec(&.{ "stream", "append", "kvc-input", "{\"org\":\"acme\",\"user\":\"charlie\",\"event\":\"login\"}", "-n", "proc_kvcomp" });
+    try ctx.exec(&.{ "stream", "append", "kvc-input", "{\"org\":\"acme\",\"user\":\"bob\",\"event\":\"logout\"}", "-n", "proc_kvcomp" });
+
+    // Step 3: Submit pipeline — composite key: org.${$.org}.${$.user}
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-composite
+        \\namespace: proc_kvcomp
+        \\sources.[0].stream.name: kvc-input
+        \\sinks.[0].stream.name: kvc-output
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: org-account-check
+        \\operators.[0].lookup_key: org.${$.org}.${$.user}
+        \\operators.[0].namespace: proc_kvcomp
+        \\operators.[0].mode: filter
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-composite.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvcomp" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Step 4: Wait for output
+    const found = try readStreamBlocking(ctx, "kvc-output", "proc_kvcomp", "alice", "5000");
+
+    if (!found) {
+        std.debug.print("\n[FAILED] kv_lookup composite key pipeline did not produce output within timeout\n", .{});
+        return error.TimeoutWaitingForData;
+    }
+
+    // Step 5: Verify — alice and bob pass, charlie is filtered
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "kvc-output", "-n", "proc_kvcomp", "--start", "0-0", "--limit", "20" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+    try stdx.testing.assertContains(read_result, "alice");
+    try stdx.testing.assertContains(read_result, "bob");
+    try testing.expect(!read_result.stdoutContains("charlie"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvcomp" });
+}
+
+test "e2e/processing: kv_lookup filter drops all when no matching keys exist" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvnone" });
+
+    // No KV entries seeded — all lookups will miss
+
+    // Append records
+    try ctx.exec(&.{ "stream", "append", "kvn-input", "{\"id\":\"a1\",\"data\":\"hello\"}", "-n", "proc_kvnone" });
+    try ctx.exec(&.{ "stream", "append", "kvn-input", "{\"id\":\"a2\",\"data\":\"world\"}", "-n", "proc_kvnone" });
+
+    // Submit pipeline with kv_lookup in filter mode
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-nomatch
+        \\namespace: proc_kvnone
+        \\sources.[0].stream.name: kvn-input
+        \\sinks.[0].stream.name: kvn-output
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: check-missing
+        \\operators.[0].lookup_key: item:${$.id}
+        \\operators.[0].namespace: proc_kvnone
+        \\operators.[0].mode: filter
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-nomatch.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvnone" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait a bit for the pipeline to process the records
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
+
+    // Verify the job is RUNNING and has processed records (even if filtered)
+    var status_result = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_kvnone" });
+    defer status_result.deinit();
+
+    try stdx.testing.assertSucceeded(status_result);
+    try stdx.testing.assertContains(status_result, "RUNNING");
+
+    // The output stream should be empty — all records were filtered out
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "kvn-output", "-n", "proc_kvnone", "--start", "0-0", "--limit", "10" });
+    defer read_result.deinit();
+
+    // Output should have no data records (empty or not containing our test data)
+    if (read_result.succeeded()) {
+        try testing.expect(!read_result.stdoutContains("hello"));
+        try testing.expect(!read_result.stdoutContains("world"));
+    }
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvnone" });
+}
+
+test "e2e/processing: kv_lookup late KV write — records written after KV seed are filtered correctly" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvlate" });
+
+    // Step 1: Submit pipeline FIRST (no KV entries yet)
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-late
+        \\namespace: proc_kvlate
+        \\sources.[0].stream.name: kvl-input
+        \\sinks.[0].stream.name: kvl-output
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: check-late
+        \\operators.[0].lookup_key: acct:${$.account_id}
+        \\operators.[0].namespace: proc_kvlate
+        \\operators.[0].mode: filter
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-late.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvlate" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Step 2: Now seed KV with an account
+    try ctx.exec(&.{ "kv", "set", "acct:eve", "verified", "-n", "proc_kvlate" });
+
+    // Step 3: Wait briefly for KV to be available, then append stream data
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    try ctx.exec(&.{ "stream", "append", "kvl-input", "{\"account_id\":\"eve\",\"event\":\"deposit\"}", "-n", "proc_kvlate" });
+    try ctx.exec(&.{ "stream", "append", "kvl-input", "{\"account_id\":\"mallory\",\"event\":\"withdraw\"}", "-n", "proc_kvlate" });
+
+    // Step 4: Wait for eve's record to appear
+    const found = try readStreamBlocking(ctx, "kvl-output", "proc_kvlate", "eve", "5000");
+
+    if (!found) {
+        std.debug.print("\n[FAILED] kv_lookup late-KV pipeline did not produce output within timeout\n", .{});
+        return error.TimeoutWaitingForData;
+    }
+
+    // Step 5: Verify — only eve passes, mallory is filtered
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "kvl-output", "-n", "proc_kvlate", "--start", "0-0", "--limit", "20" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+    try stdx.testing.assertContains(read_result, "eve");
+    try testing.expect(!read_result.stdoutContains("mallory"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvlate" });
+}
+
+// =============================================================================
+// Classify + Tag-Based Routing E2E Tests
+// =============================================================================
+
+test "e2e/processing: classify operator routes tagged records to filtered sink" {
+    // Pipeline: source → classify (tags errors) → two sinks:
+    //   - firehose sink (no tags, gets ALL records)
+    //   - error sink (tags: [errors], gets ONLY error records)
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_classify" });
+
+    // Write mixed records — some with "error", some without
+    try ctx.exec(&.{ "stream", "append", "clf-input", "login succeeded", "-n", "proc_classify" });
+    try ctx.exec(&.{ "stream", "append", "clf-input", "error: disk full", "-n", "proc_classify" });
+    try ctx.exec(&.{ "stream", "append", "clf-input", "all systems normal", "-n", "proc_classify" });
+    try ctx.exec(&.{ "stream", "append", "clf-input", "error: timeout exceeded", "-n", "proc_classify" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-classify-route
+        \\namespace: proc_classify
+        \\sources.[0].stream.name: clf-input
+        \\operators.[0].type: classify
+        \\operators.[0].name: error-tagger
+        \\operators.[0].condition_0: value_contains:error
+        \\operators.[0].tag_0: errors
+        \\sinks.[0].name: all-events
+        \\sinks.[0].stream.name: clf-all-out
+        \\sinks.[1].name: error-events
+        \\sinks.[1].stream.name: clf-err-out
+        \\sinks.[1].tags.[0]: errors
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-classify-route.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_classify" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait for error records in the tagged sink
+    const found_errors = try readStreamBlocking(ctx, "clf-err-out", "proc_classify", "error:", "8000");
+
+    if (!found_errors) {
+        std.debug.print("\n[TIMEOUT] Classify tagged sink did not receive error records\n", .{});
+        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_classify" });
+        defer status.deinit();
+        std.debug.print("Job status: {s}\n", .{status.stdout});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // Wait for all records in the firehose sink
+    const found_all = try readStreamBlocking(ctx, "clf-all-out", "proc_classify", "login succeeded", "5000");
+
+    if (!found_all) {
+        std.debug.print("\n[TIMEOUT] Classify firehose sink did not receive all records\n", .{});
+        return error.PipelineTimeout;
+    }
+
+    // Verify firehose sink has ALL records (error + non-error)
+    var all_result = try ctx.cli.run(&.{ "stream", "read", "clf-all-out", "-n", "proc_classify", "--start", "0-0", "--limit", "100" });
+    defer all_result.deinit();
+    try stdx.testing.assertSucceeded(all_result);
+    try stdx.testing.assertContains(all_result, "login succeeded");
+    try stdx.testing.assertContains(all_result, "error: disk full");
+    try stdx.testing.assertContains(all_result, "all systems normal");
+    try stdx.testing.assertContains(all_result, "error: timeout exceeded");
+
+    // Verify error sink ONLY has error records
+    var err_result = try ctx.cli.run(&.{ "stream", "read", "clf-err-out", "-n", "proc_classify", "--start", "0-0", "--limit", "100" });
+    defer err_result.deinit();
+    try stdx.testing.assertSucceeded(err_result);
+    try stdx.testing.assertContains(err_result, "error: disk full");
+    try stdx.testing.assertContains(err_result, "error: timeout exceeded");
+    // Non-error records should NOT be in the error sink
+    try testing.expect(!err_result.stdoutContains("login succeeded"));
+    try testing.expect(!err_result.stdoutContains("all systems normal"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_classify" });
+}
+
+test "e2e/processing: classify multi-tag routing with AND match" {
+    // Pipeline: source → classify (tags: critical, errors) → three sinks:
+    //   - all-sink:      no tags (firehose — gets everything)
+    //   - error-sink:    tags: [errors] (gets errors + critical)
+    //   - critical-sink: tags: [critical, errors] (AND match — gets ONLY critical errors)
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_clftag" });
+
+    try ctx.exec(&.{ "stream", "append", "clftag-in", "info: all good", "-n", "proc_clftag" });
+    try ctx.exec(&.{ "stream", "append", "clftag-in", "error: minor glitch", "-n", "proc_clftag" });
+    try ctx.exec(&.{ "stream", "append", "clftag-in", "critical error: system down", "-n", "proc_clftag" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-classify-and
+        \\namespace: proc_clftag
+        \\sources.[0].stream.name: clftag-in
+        \\operators.[0].type: classify
+        \\operators.[0].name: severity-tagger
+        \\operators.[0].condition_0: value_contains:error
+        \\operators.[0].tag_0: errors
+        \\operators.[0].condition_1: value_contains:critical
+        \\operators.[0].tag_1: critical
+        \\sinks.[0].name: all-sink
+        \\sinks.[0].stream.name: clftag-all
+        \\sinks.[1].name: error-sink
+        \\sinks.[1].stream.name: clftag-errors
+        \\sinks.[1].tags.[0]: errors
+        \\sinks.[2].name: critical-sink
+        \\sinks.[2].stream.name: clftag-critical
+        \\sinks.[2].tags.[0]: critical
+        \\sinks.[2].tags.[1]: errors
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-classify-and.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_clftag" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait for critical record in the AND-matched sink
+    const found_crit = try readStreamBlocking(ctx, "clftag-critical", "proc_clftag", "critical error", "8000");
+
+    if (!found_crit) {
+        std.debug.print("\n[TIMEOUT] Classify AND-match sink did not receive critical records\n", .{});
+        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_clftag" });
+        defer status.deinit();
+        std.debug.print("Job status: {s}\n", .{status.stdout});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // Firehose sink should have all 3 records
+    const found_all = try readStreamBlocking(ctx, "clftag-all", "proc_clftag", "info: all good", "5000");
+    if (!found_all) {
+        std.debug.print("\n[TIMEOUT] Firehose sink did not receive all records\n", .{});
+        return error.PipelineTimeout;
+    }
+
+    // Error sink: gets "error: minor glitch" + "critical error: system down" (both have "error")
+    const found_err = try readStreamBlocking(ctx, "clftag-errors", "proc_clftag", "minor glitch", "5000");
+    if (!found_err) {
+        std.debug.print("\n[TIMEOUT] Error sink did not receive error records\n", .{});
+        return error.PipelineTimeout;
+    }
+
+    // Verify critical sink has ONLY the critical error (requires both tags)
+    var crit_result = try ctx.cli.run(&.{ "stream", "read", "clftag-critical", "-n", "proc_clftag", "--start", "0-0", "--limit", "100" });
+    defer crit_result.deinit();
+    try stdx.testing.assertSucceeded(crit_result);
+    try stdx.testing.assertContains(crit_result, "critical error: system down");
+    try testing.expect(!crit_result.stdoutContains("minor glitch"));
+    try testing.expect(!crit_result.stdoutContains("all good"));
+
+    // Verify error sink has both errors but NOT info
+    var err_result = try ctx.cli.run(&.{ "stream", "read", "clftag-errors", "-n", "proc_clftag", "--start", "0-0", "--limit", "100" });
+    defer err_result.deinit();
+    try stdx.testing.assertSucceeded(err_result);
+    try stdx.testing.assertContains(err_result, "minor glitch");
+    try stdx.testing.assertContains(err_result, "critical error");
+    try testing.expect(!err_result.stdoutContains("all good"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_clftag" });
 }

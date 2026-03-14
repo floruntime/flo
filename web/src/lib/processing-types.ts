@@ -35,7 +35,7 @@ export interface SinkSpec {
   kind: SinkKind;
   target: string;
   namespace?: string;
-  routes_from?: string[];
+  tags?: string[];
   key_prefix?: string;
   separator?: string;
   write_mode?: WriteMode;
@@ -76,7 +76,7 @@ export interface PipelineDefinition {
 // Operator Types (from native registry)
 // =============================================================================
 
-export type OperatorType = 'filter' | 'passthrough' | 'keyby' | 'aggregate' | 'map' | 'flatmap' | 'wasm';
+export type OperatorType = 'filter' | 'passthrough' | 'keyby' | 'aggregate' | 'map' | 'flatmap' | 'kv_lookup' | 'classify' | 'wasm';
 
 export interface OperatorInfo {
   name: string;
@@ -175,12 +175,13 @@ export interface WatermarkInfo {
 }
 
 // =============================================================================
-// Side Outputs
+// Tags
 // =============================================================================
 
-export interface SideOutputInfo {
-  tag: string;
-  total_emitted: number;
+export interface TagInfo {
+  name: string;
+  bit: number;
+  total_matched: number;
 }
 
 // =============================================================================
@@ -212,7 +213,7 @@ export interface ProcessingJobDetail {
   metrics: PipelineMetrics;
   checkpoints: CheckpointMeta[];
   watermark?: WatermarkInfo;
-  side_outputs?: SideOutputInfo[];
+  tags?: TagInfo[];
   savepoint_id?: string;
 }
 

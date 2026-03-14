@@ -1,0 +1,19 @@
+kind: Processing
+name: refund-router
+namespace: default
+
+sources:
+  - name: raw-txns
+    stream:
+      name: raw-transactions
+      partitions: all
+
+operators:
+  - type: filter
+    name: is-refund
+    condition: "value_contains:refund"
+
+sinks:
+  - name: output
+    stream:
+      name: refunds-stream

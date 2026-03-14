@@ -5,6 +5,8 @@
 //! configured from YAML job definitions via the NativeOperatorRegistry.
 //!
 //! Supported condition expressions:
+//!
+//!   Record-level:
 //!   - `value_contains:<substring>`  — value contains the substring
 //!   - `key_contains:<substring>`    — key contains the substring
 //!   - `key_equals:<exact>`          — key equals the exact string
@@ -12,15 +14,35 @@
 //!   - `value_prefix:<prefix>`       — value starts with the prefix
 //!   - `not_empty`                   — value is non-empty
 //!   - `key_not_empty`               — key is non-empty
-//!   - `json_field:<path>=<value>`   — JSON field at path equals value
 //!   - `min_length:<n>`              — value length >= n
 //!
-//! YAML example:
+//!   JSON field — `json:<path><op><value>`:
+//!   - `json:<path>=<value>`         — field equals value
+//!   - `json:<path>!=<value>`        — field does not equal value
+//!   - `json:<path>^=<value>`        — field starts with value (prefix)
+//!   - `json:<path>*=<value>`        — field contains value (substring)
+//!   - `json:<path>!^=<value>`       — field does not start with value
+//!   - `json:<path>!*=<value>`       — field does not contain value
+//!   - `json:<path>><value>`         — field > value (numeric)
+//!   - `json:<path>>=<value>`        — field >= value (numeric)
+//!   - `json:<path><<value>`         — field < value (numeric)
+//!   - `json:<path><=<value>`        — field <= value (numeric)
+//!
+//! YAML examples:
 //!   ```yaml
 //!   operators:
 //!     - type: filter
 //!       name: keep-important
 //!       condition: "value_contains:important"
+//!     - type: classify
+//!       name: route-payments
+//!       rules:
+//!         - condition: "json:type^=payment"
+//!           tag: payments
+//!         - condition: "json:type*=transfer"
+//!           tag: transfers
+//!         - condition: "json:amount>10000"
+//!           tag: high-value
 //!   ```
 
 const std = @import("std");
@@ -50,10 +72,31 @@ pub const ExprFilterOperator = struct {
         value_prefix: []const u8,
         not_empty,
         key_not_empty,
-        json_field: struct { path: []const u8, expected: []const u8 },
+        json_expr: JsonExpr,
         min_length: usize,
         /// Unparseable condition — always passes (with warning logged at init)
         always_true,
+    };
+
+    /// JSON comparison operator
+    const JsonOp = enum {
+        eq, // =
+        neq, // !=
+        prefix, // ^=
+        contains, // *=
+        not_prefix, // !^=
+        not_contains, // !*=
+        gt, // >
+        gte, // >=
+        lt, // <
+        lte, // <=
+    };
+
+    /// A parsed JSON field expression: path + operator + value
+    const JsonExpr = struct {
+        path: []const u8,
+        op: JsonOp,
+        value: []const u8,
     };
 
     /// Create an expression-based filter operator.
@@ -115,7 +158,7 @@ pub const ExprFilterOperator = struct {
             .value_prefix => |prefix| std.mem.startsWith(u8, rec.value, prefix),
             .not_empty => rec.value.len > 0,
             .key_not_empty => rec.key.len > 0,
-            .json_field => |f| evaluateJsonField(rec.value, f.path, f.expected),
+            .json_expr => |expr| evaluateJsonExpr(rec.value, expr),
             .min_length => |n| rec.value.len >= n,
             .always_true => true,
         };
@@ -129,6 +172,11 @@ pub const ExprFilterOperator = struct {
         // Simple keyword conditions
         if (std.mem.eql(u8, cond, "not_empty")) return .not_empty;
         if (std.mem.eql(u8, cond, "key_not_empty")) return .key_not_empty;
+
+        // JSON expression: json:<path><op><value> or json_field:<path><op><value> (legacy)
+        if (std.mem.startsWith(u8, cond, "json:")) {
+            if (parseJsonExpr(cond[5..])) |expr| return .{ .json_expr = expr };
+        }
 
         // Prefix:arg conditions
         if (splitOnce(cond, ':')) |parts| {
@@ -144,15 +192,48 @@ pub const ExprFilterOperator = struct {
                 const n = std.fmt.parseInt(usize, arg, 10) catch return .always_true;
                 return .{ .min_length = n };
             }
-            if (std.mem.eql(u8, prefix, "json_field")) {
-                // json_field:path=value
-                if (splitOnce(arg, '=')) |kv| {
-                    return .{ .json_field = .{ .path = kv[0], .expected = kv[1] } };
-                }
-            }
         }
 
         return .always_true;
+    }
+
+    /// Parse a JSON expression after the `json:` prefix.
+    /// Scans for the first operator character to split path from op+value.
+    fn parseJsonExpr(expr: []const u8) ?JsonExpr {
+        // Find the start of the operator: first occurrence of = ! ^ * > <
+        var i: usize = 0;
+        while (i < expr.len) : (i += 1) {
+            const c = expr[i];
+            if (c == '=' or c == '!' or c == '^' or c == '*' or c == '>' or c == '<') break;
+        }
+        if (i == 0 or i >= expr.len) return null;
+
+        const path = expr[0..i];
+        const rest = expr[i..];
+
+        // Match operators longest-first to avoid ambiguity
+        const ops = [_]struct { text: []const u8, op: JsonOp }{
+            .{ .text = "!^=", .op = .not_prefix },
+            .{ .text = "!*=", .op = .not_contains },
+            .{ .text = "!=", .op = .neq },
+            .{ .text = "^=", .op = .prefix },
+            .{ .text = "*=", .op = .contains },
+            .{ .text = ">=", .op = .gte },
+            .{ .text = "<=", .op = .lte },
+            .{ .text = "=", .op = .eq },
+            .{ .text = ">", .op = .gt },
+            .{ .text = "<", .op = .lt },
+        };
+
+        for (ops) |entry| {
+            if (std.mem.startsWith(u8, rest, entry.text)) {
+                const value = rest[entry.text.len..];
+                if (value.len == 0) return null; // operator with no value
+                return .{ .path = path, .op = entry.op, .value = value };
+            }
+        }
+
+        return null;
     }
 
     /// Split a string on the first occurrence of `sep`. Returns [before, after] or null.
@@ -161,31 +242,65 @@ pub const ExprFilterOperator = struct {
         return .{ s[0..idx], s[idx + 1 ..] };
     }
 
-    /// Evaluate a simple JSON field lookup: extract key from top-level JSON object.
-    /// Supports dotted paths (e.g., "status" or "user.role") — single-level for now.
-    fn evaluateJsonField(value: []const u8, path: []const u8, expected: []const u8) bool {
-        // Try to parse value as JSON
+    // =========================================================================
+    // JSON expression evaluation
+    // =========================================================================
+
+    /// Evaluate a JSON field expression against a record value.
+    fn evaluateJsonExpr(value: []const u8, expr: JsonExpr) bool {
         const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return false;
         defer parsed.deinit();
 
         const root = parsed.value;
         if (root != .object) return false;
 
-        // Simple single-level lookup
-        const field_val = root.object.get(path) orelse return false;
-        switch (field_val) {
-            .string => |s| return std.mem.eql(u8, s, expected),
-            .integer => |n| {
-                const expected_n = std.fmt.parseInt(i64, expected, 10) catch return false;
-                return n == expected_n;
-            },
-            .bool => |b| {
-                if (std.mem.eql(u8, expected, "true")) return b;
-                if (std.mem.eql(u8, expected, "false")) return !b;
-                return false;
-            },
-            else => return false,
-        }
+        const field = root.object.get(expr.path) orelse return false;
+
+        return switch (field) {
+            .string => |s| evalStringOp(s, expr.op, expr.value),
+            .integer => |n| evalNumericOp(n, expr.op, expr.value),
+            .bool => |b| evalBoolOp(b, expr.op, expr.value),
+            else => false,
+        };
+    }
+
+    fn evalStringOp(s: []const u8, op: JsonOp, value: []const u8) bool {
+        return switch (op) {
+            .eq => std.mem.eql(u8, s, value),
+            .neq => !std.mem.eql(u8, s, value),
+            .prefix => std.mem.startsWith(u8, s, value),
+            .contains => std.mem.indexOf(u8, s, value) != null,
+            .not_prefix => !std.mem.startsWith(u8, s, value),
+            .not_contains => std.mem.indexOf(u8, s, value) == null,
+            .gt, .gte, .lt, .lte => false, // numeric ops on strings → false
+        };
+    }
+
+    fn evalNumericOp(n: i64, op: JsonOp, value: []const u8) bool {
+        const expected = std.fmt.parseInt(i64, value, 10) catch return false;
+        return switch (op) {
+            .eq => n == expected,
+            .neq => n != expected,
+            .gt => n > expected,
+            .gte => n >= expected,
+            .lt => n < expected,
+            .lte => n <= expected,
+            .prefix, .contains, .not_prefix, .not_contains => false,
+        };
+    }
+
+    fn evalBoolOp(b: bool, op: JsonOp, value: []const u8) bool {
+        const expected = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return false;
+        return switch (op) {
+            .eq => b == expected,
+            .neq => b != expected,
+            else => false,
+        };
     }
 };
 
@@ -242,17 +357,6 @@ test "ExprFilterOperator — min_length" {
     try std.testing.expect(!op.evaluate(rec_short));
 }
 
-test "ExprFilterOperator — json_field" {
-    var op = ExprFilterOperator.init("json-filter", "json_field:status=approved");
-    const rec_match = ProcessingRecord.init("k", "{\"status\":\"approved\",\"amount\":100}", 0);
-    const rec_miss = ProcessingRecord.init("k", "{\"status\":\"pending\",\"amount\":50}", 0);
-    const rec_bad = ProcessingRecord.init("k", "not-json", 0);
-
-    try std.testing.expect(op.evaluate(rec_match));
-    try std.testing.expect(!op.evaluate(rec_miss));
-    try std.testing.expect(!op.evaluate(rec_bad));
-}
-
 test "ExprFilterOperator — always_true for unknown condition" {
     var op = ExprFilterOperator.init("unknown", "something_weird");
     const rec = ProcessingRecord.init("k", "v", 0);
@@ -266,4 +370,119 @@ test "ExprFilterOperator — value_prefix" {
 
     try std.testing.expect(op.evaluate(rec_match));
     try std.testing.expect(!op.evaluate(rec_miss));
+}
+
+test "ExprFilterOperator — json equals (new syntax)" {
+    var op = ExprFilterOperator.init("json-eq", "json:status=approved");
+    const rec_match = ProcessingRecord.init("k", "{\"status\":\"approved\",\"amount\":100}", 0);
+    const rec_miss = ProcessingRecord.init("k", "{\"status\":\"pending\",\"amount\":50}", 0);
+    const rec_bad = ProcessingRecord.init("k", "not-json", 0);
+
+    try std.testing.expect(op.evaluate(rec_match));
+    try std.testing.expect(!op.evaluate(rec_miss));
+    try std.testing.expect(!op.evaluate(rec_bad));
+}
+
+test "ExprFilterOperator — json not equals" {
+    var op = ExprFilterOperator.init("jneq", "json:type!=refund");
+    const rec_pass = ProcessingRecord.init("k", "{\"type\":\"payment\"}", 0);
+    const rec_fail = ProcessingRecord.init("k", "{\"type\":\"refund\"}", 0);
+
+    try std.testing.expect(op.evaluate(rec_pass));
+    try std.testing.expect(!op.evaluate(rec_fail));
+}
+
+test "ExprFilterOperator — json prefix (^=)" {
+    var op = ExprFilterOperator.init("jpfx", "json:type^=payment");
+    const rec_match = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\",\"id\":\"x12345\"}", 0);
+    const rec_exact = ProcessingRecord.init("k", "{\"type\":\"payment\",\"id\":\"x1\"}", 0);
+    const rec_miss = ProcessingRecord.init("k", "{\"type\":\"refund.partial\",\"id\":\"x99\"}", 0);
+    const rec_bad = ProcessingRecord.init("k", "not-json", 0);
+    const rec_num = ProcessingRecord.init("k", "{\"type\":42}", 0);
+
+    try std.testing.expect(op.evaluate(rec_match));
+    try std.testing.expect(op.evaluate(rec_exact));
+    try std.testing.expect(!op.evaluate(rec_miss));
+    try std.testing.expect(!op.evaluate(rec_bad));
+    try std.testing.expect(!op.evaluate(rec_num));
+}
+
+test "ExprFilterOperator — json contains (*=)" {
+    var op = ExprFilterOperator.init("jcnt", "json:type*=transfer");
+    const rec_match = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\",\"id\":\"x12345\"}", 0);
+    const rec_mid = ProcessingRecord.init("k", "{\"type\":\"bank_transfer_ach\",\"id\":\"b1\"}", 0);
+    const rec_miss = ProcessingRecord.init("k", "{\"type\":\"payment.refund\",\"id\":\"r1\"}", 0);
+    const rec_nofield = ProcessingRecord.init("k", "{\"action\":\"transfer\"}", 0);
+
+    try std.testing.expect(op.evaluate(rec_match));
+    try std.testing.expect(op.evaluate(rec_mid));
+    try std.testing.expect(!op.evaluate(rec_miss));
+    try std.testing.expect(!op.evaluate(rec_nofield));
+}
+
+test "ExprFilterOperator — json not prefix (!^=)" {
+    var op = ExprFilterOperator.init("jnpfx", "json:type!^=payment");
+    const rec_no = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\"}", 0);
+    const rec_yes = ProcessingRecord.init("k", "{\"type\":\"refund.partial\"}", 0);
+
+    try std.testing.expect(!op.evaluate(rec_no)); // starts with payment → negated = false
+    try std.testing.expect(op.evaluate(rec_yes)); // doesn't start with payment → negated = true
+}
+
+test "ExprFilterOperator — json not contains (!*=)" {
+    var op = ExprFilterOperator.init("jncnt", "json:type!*=transfer");
+    const rec_has = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\"}", 0);
+    const rec_not = ProcessingRecord.init("k", "{\"type\":\"payment.refund\"}", 0);
+
+    try std.testing.expect(!op.evaluate(rec_has));
+    try std.testing.expect(op.evaluate(rec_not));
+}
+
+test "ExprFilterOperator — json numeric comparisons" {
+    // greater than
+    var gt = ExprFilterOperator.init("gt", "json:amount>100");
+    try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":200}", 0)));
+    try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
+    try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":50}", 0)));
+
+    // greater or equal
+    var gte = ExprFilterOperator.init("gte", "json:amount>=100");
+    try std.testing.expect(gte.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
+    try std.testing.expect(!gte.evaluate(ProcessingRecord.init("k", "{\"amount\":99}", 0)));
+
+    // less than
+    var lt = ExprFilterOperator.init("lt", "json:amount<100");
+    try std.testing.expect(lt.evaluate(ProcessingRecord.init("k", "{\"amount\":50}", 0)));
+    try std.testing.expect(!lt.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
+
+    // less or equal
+    var lte = ExprFilterOperator.init("lte", "json:amount<=100");
+    try std.testing.expect(lte.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
+    try std.testing.expect(!lte.evaluate(ProcessingRecord.init("k", "{\"amount\":101}", 0)));
+
+    // numeric ops on string fields → false
+    try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":\"200\"}", 0)));
+}
+
+test "ExprFilterOperator — json integer equality" {
+    var op = ExprFilterOperator.init("jeqi", "json:code=200");
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"code\":200}", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"code\":404}", 0)));
+}
+
+test "ExprFilterOperator — json boolean equality" {
+    var op_t = ExprFilterOperator.init("jbt", "json:active=true");
+    var op_f = ExprFilterOperator.init("jbf", "json:active!=true");
+    const rec_true = ProcessingRecord.init("k", "{\"active\":true}", 0);
+    const rec_false = ProcessingRecord.init("k", "{\"active\":false}", 0);
+
+    try std.testing.expect(op_t.evaluate(rec_true));
+    try std.testing.expect(!op_t.evaluate(rec_false));
+    try std.testing.expect(!op_f.evaluate(rec_true));
+    try std.testing.expect(op_f.evaluate(rec_false));
+}
+
+test "ExprFilterOperator — json missing field" {
+    var op = ExprFilterOperator.init("miss", "json:nonexistent=x");
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"other\":\"y\"}", 0)));
 }

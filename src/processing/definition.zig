@@ -45,15 +45,15 @@
 //!       namespace: production
 //!
 //!   - name: late-events
-//!     stream:                     # receives only the "late" side output
+//!     stream:                     # receives only records tagged "late"
 //!       name: late-data
-//!     routes_from: late
+//!     tags: [late]
 //!
 //!   - name: errors
-//!     queue:                      # receives only the "errors" side output
+//!     queue:                      # receives only records tagged "errors"
 //!       name: error-queue
 //!       namespace: default
-//!     routes_from: errors
+//!     tags: [errors]
 //!
 //!   - name: profiles
 //!     kv:                         # KV sink
@@ -110,6 +110,64 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+// =============================================================================
+// TagRegistry — maps tag names to bit positions (0–31)
+// =============================================================================
+
+/// Maps symbolic tag names to bit positions within a 32-bit bitfield.
+///
+/// Built at pipeline init time from:
+///   - All sinks' `tags:` lists
+///   - All classify operators' tag_N name values
+///
+/// Used to:
+///   1. Resolve classify operator tag names → bit positions
+///   2. Compute each sink's `required_tags` bitmask
+///
+/// Capacity: 32 tags per pipeline (u5 bit positions, u32 bitfield).
+pub const TagRegistry = struct {
+    names: [MAX_TAGS][]const u8 = undefined,
+    count: u6 = 0,
+
+    pub const MAX_TAGS: usize = 32;
+
+    /// Look up or create a bit position for a tag name.
+    /// Returns null if the registry is full (32 tags).
+    /// Names are compared by value — caller must ensure strings outlive the registry.
+    pub fn getOrCreate(self: *TagRegistry, name: []const u8) ?u5 {
+        // Check existing entries
+        for (0..@as(usize, self.count)) |i| {
+            if (std.mem.eql(u8, self.names[i], name)) return @intCast(i);
+        }
+        // Add new entry
+        if (self.count >= MAX_TAGS) return null;
+        const bit: u5 = @intCast(self.count);
+        self.names[self.count] = name;
+        self.count += 1;
+        return bit;
+    }
+
+    /// Look up a tag name's bit position. Returns null if not found.
+    pub fn resolve(self: *const TagRegistry, name: []const u8) ?u5 {
+        for (0..@as(usize, self.count)) |i| {
+            if (std.mem.eql(u8, self.names[i], name)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Build a bitmask from a list of tag names.
+    /// Unknown names are silently ignored (resolve returns null).
+    pub fn buildMask(self: *const TagRegistry, names: []const []const u8) u32 {
+        var mask: u32 = 0;
+        for (names) |name| {
+            if (self.resolve(name)) |bit| {
+                mask |= @as(u32, 1) << bit;
+            }
+        }
+        return mask;
+    }
+};
 
 // =============================================================================
 // SourceKind — which Flo primitive the source reads from
@@ -216,12 +274,16 @@ pub const SinkSpec = struct {
     /// Namespace of the target resource
     namespace: []const u8,
 
-    // -- Side-output routing --
+    // -- Tag-based routing --
 
-    /// When set, this sink receives only records emitted to the named
-    /// side output tag (via `ctx.sideOutput(tag, record)`). When null,
-    /// the sink receives from the main operator chain output.
-    routes_from: ?[]const u8 = null,
+    /// When set, this sink receives only records whose tag bitfield
+    /// matches ALL listed tag names (AND logic). When null, the sink
+    /// receives all records from the main operator chain output.
+    tags: ?[]const []const u8 = null,
+
+    /// Pre-computed bitmask from tag names (resolved at pipeline init).
+    /// `record.tags & required_tags == required_tags` → deliver.
+    required_tags: u32 = 0,
 
     // -- KV-specific options --
 
@@ -364,7 +426,10 @@ pub const JobDefinition = struct {
             allocator.free(snk.key_prefix);
             allocator.free(snk.separator);
             allocator.free(snk.write_mode);
-            if (snk.routes_from) |rf| allocator.free(rf);
+            if (snk.tags) |tag_list| {
+                for (tag_list) |t| allocator.free(t);
+                allocator.free(tag_list);
+            }
             // TS-specific fields
             if (snk.ts_measurement.len > 0) allocator.free(snk.ts_measurement);
             if (snk.ts_value_field.len > 0) allocator.free(snk.ts_value_field);
@@ -390,3 +455,67 @@ pub const JobDefinition = struct {
         self.operators.deinit(allocator);
     }
 };
+
+// =============================================================================
+// TagRegistry tests
+// =============================================================================
+
+test "TagRegistry: getOrCreate adds and returns bit positions" {
+    var reg: TagRegistry = .{};
+    const bit0 = reg.getOrCreate("errors").?;
+    const bit1 = reg.getOrCreate("warnings").?;
+    try std.testing.expectEqual(@as(u5, 0), bit0);
+    try std.testing.expectEqual(@as(u5, 1), bit1);
+    try std.testing.expectEqual(@as(u5, 2), reg.count);
+}
+
+test "TagRegistry: getOrCreate returns existing bit position" {
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("errors");
+    _ = reg.getOrCreate("warnings");
+    const again = reg.getOrCreate("errors").?;
+    try std.testing.expectEqual(@as(u5, 0), again);
+    try std.testing.expectEqual(@as(u5, 2), reg.count);
+}
+
+test "TagRegistry: resolve finds existing tag" {
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("errors");
+    _ = reg.getOrCreate("warnings");
+    try std.testing.expectEqual(@as(u5, 1), reg.resolve("warnings").?);
+}
+
+test "TagRegistry: resolve returns null for unknown tag" {
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("errors");
+    try std.testing.expect(reg.resolve("unknown") == null);
+}
+
+test "TagRegistry: buildMask computes bitmask from names" {
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("errors"); // bit 0
+    _ = reg.getOrCreate("warnings"); // bit 1
+    _ = reg.getOrCreate("info"); // bit 2
+
+    const mask = reg.buildMask(&.{ "errors", "info" });
+    try std.testing.expectEqual(@as(u32, 0b101), mask);
+}
+
+test "TagRegistry: buildMask ignores unknown names" {
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("errors"); // bit 0
+
+    const mask = reg.buildMask(&.{ "errors", "nonexistent" });
+    try std.testing.expectEqual(@as(u32, 0b1), mask);
+}
+
+test "TagRegistry: capacity limit" {
+    var reg: TagRegistry = .{};
+    var buf: [32][10]u8 = undefined;
+    for (0..32) |i| {
+        const name = std.fmt.bufPrint(&buf[i], "tag{d}", .{i}) catch unreachable;
+        try std.testing.expect(reg.getOrCreate(name) != null);
+    }
+    // 33rd tag should fail
+    try std.testing.expect(reg.getOrCreate("overflow") == null);
+}

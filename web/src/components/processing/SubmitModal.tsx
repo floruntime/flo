@@ -27,7 +27,7 @@ operators:
     name: my-filter
     config:
       - key: condition
-        value: "json_field:level=ERROR"
+        value: "json:level=ERROR"
 
 sink:
   name: output-sink
@@ -146,7 +146,7 @@ operators:
     name: high-value
     config:
       - key: condition
-        value: "json_field:price>100"
+        value: "json:price>100"
 
 sink:
   name: high-value-items

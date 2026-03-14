@@ -109,6 +109,7 @@ test {
     _ = @import("processing/operators/json_aggregate.zig");
     _ = @import("processing/operators/json_map.zig");
     _ = @import("processing/operators/json_flatmap.zig");
+    _ = @import("processing/operators/kv_lookup.zig");
     _ = @import("processing/operators/native_registry.zig");
     // Processing: windowing
     _ = @import("processing/window/assigner.zig");
@@ -128,8 +129,8 @@ test {
     _ = @import("processing/checkpoint/coordinator.zig");
     _ = @import("processing/checkpoint/alignment.zig");
     _ = @import("processing/checkpoint/recovery.zig");
-    // Processing: side outputs & metrics
-    _ = @import("processing/side_output.zig");
+    // Processing: classify operator & metrics
+    _ = @import("processing/operators/classify.zig");
     _ = @import("processing/metrics.zig");
     // Processing: definition & parser
     _ = @import("processing/definition.zig");
