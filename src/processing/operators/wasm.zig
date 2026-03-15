@@ -1,10 +1,11 @@
 //! WASM Processing Operator
 //!
-//! Executes a WASM module for each input record, passing the record's
-//! value as input and emitting the WASM output as a new record.
+//! Executes a WASM module for each input record. Supports three modes:
 //!
-//! Uses the centralized WASM runner (`src/wasm/runner.zig`) shared
-//! with the actions subsystem.
+//!   - **Map** (1→1): handle() returns packed ptr|len → single output record.
+//!   - **Filter** (1→0): handle() returns 0 → record is dropped.
+//!   - **FlatMap** (1→N): flo.emit() called 0..N times during handle() →
+//!     each emitted record becomes an output. handle() return is ignored.
 //!
 //! ## Processing WASM Contract
 //!
@@ -15,9 +16,10 @@
 //!
 //! Host imports (provided by Flo runtime):
 //!   - `flo.set_tag(name_ptr: u32, name_len: u32) -> i32`
-//!     Tag the output record for sink match-based routing. The tag name
-//!     is resolved via the pipeline's TagRegistry. Returns 0 on success,
-//!     -1 if the tag name is unknown.
+//!   - `flo.emit(ptr: u32, len: u32) -> i32`         — FlatMap multi-emit
+//!   - `flo.state_get(key_ptr, key_len, buf_ptr, buf_len) -> i32`
+//!   - `flo.state_set(key_ptr, key_len, val_ptr, val_len) -> i32`
+//!   - `flo.state_delete(key_ptr, key_len) -> i32`
 //!   - `flo.kv_get(key_ptr, key_len, buf_ptr, buf_len) -> i32`
 //!   - `flo.kv_set(key_ptr, key_len, val_ptr, val_len) -> i32`
 //!   - `flo.kv_delete(key_ptr, key_len) -> i32`
@@ -56,6 +58,7 @@ const WasmRunner = wasm_runner.WasmRunner;
 const WasmModule = wasm_runner.WasmModule;
 const WasmConfig = wasm_runner.WasmConfig;
 const WasmKvContext = wasm_runner.WasmKvContext;
+const EmittedRecord = wasm_runner.EmittedRecord;
 const TagRegistry = @import("../definition.zig").TagRegistry;
 const log = @import("stdx").log;
 
@@ -126,8 +129,12 @@ pub const WasmOperator = struct {
             .allocator = self.allocator,
             .kv_enabled = false,
             .tag_resolve_fn = if (self.tag_registry != null) tagResolveCallback else null,
-            .tag_resolve_ctx = if (self.tag_registry) |reg| @constCast(@ptrCast(reg)) else null,
+            .tag_resolve_ctx = if (self.tag_registry) |reg| @ptrCast(@constCast(reg)) else null,
             .output_tags = 0,
+            // State dispatch wired to operator's keyed state (if available)
+            .state_dispatch_fn = if (ctx.keyed_state != null) stateDispatchCallback else null,
+            .state_dispatch_ctx = if (ctx.keyed_state) |ks| @ptrCast(ks) else null,
+            .state_enabled = ctx.keyed_state != null,
         };
 
         var result = runner.executeWithKv(module, rec.value, &wasm_ctx) catch |err| {
@@ -136,7 +143,45 @@ pub const WasmOperator = struct {
         };
         defer result.deinit();
 
-        // Dupe output and key so the emitted record owns its memory
+        // Merge: input tags + any tags set by the WASM module via flo.set_tag()
+        const tags = rec.tags | wasm_ctx.output_tags;
+
+        // Multi-emit mode: flo.emit() was called during handle()
+        if (wasm_ctx.emit_called) {
+            defer {
+                for (wasm_ctx.emitted_records.items) |er| {
+                    self.allocator.free(er.data);
+                }
+                wasm_ctx.emitted_records.deinit(self.allocator);
+            }
+            for (wasm_ctx.emitted_records.items) |er| {
+                const output = try self.allocator.dupe(u8, er.data);
+                errdefer self.allocator.free(output);
+
+                const key_dupe = if (rec.key.len > 0)
+                    try self.allocator.dupe(u8, rec.key)
+                else
+                    @as([]const u8, &.{});
+
+                try ctx.emit(.{
+                    .key = key_dupe,
+                    .value = output,
+                    .event_time_ms = rec.event_time_ms,
+                    .source = rec.source,
+                    .headers = &.{},
+                    .owns_memory = true,
+                    .tags = tags,
+                });
+            }
+            return;
+        }
+
+        // Filter mode: handle() returned 0 → drop this record
+        if (result.filtered) {
+            return;
+        }
+
+        // Standard map mode: single output from handle() return value
         const output = try self.allocator.dupe(u8, result.output);
         errdefer self.allocator.free(output);
 
@@ -144,9 +189,6 @@ pub const WasmOperator = struct {
             try self.allocator.dupe(u8, rec.key)
         else
             @as([]const u8, &.{});
-
-        // Merge: input tags + any tags set by the WASM module via flo.set_tag()
-        const tags = rec.tags | wasm_ctx.output_tags;
 
         try ctx.emit(.{
             .key = key_dupe,
@@ -163,6 +205,42 @@ pub const WasmOperator = struct {
     fn tagResolveCallback(ctx_ptr: *anyopaque, tag_name: []const u8) ?u5 {
         const reg: *const TagRegistry = @ptrCast(@alignCast(ctx_ptr));
         return reg.resolve(tag_name);
+    }
+
+    /// Callback for flo.state_get/set/delete — bridges to KeyedStateAccess.
+    fn stateDispatchCallback(ctx_ptr: *anyopaque, op: wasm_runner.StateOp, _: Allocator) wasm_runner.StateResult {
+        const keyed_state = @as(*@import("../state.zig").KeyedStateAccess, @ptrCast(@alignCast(ctx_ptr)));
+        const vs = keyed_state.getValueState();
+
+        switch (op) {
+            .get => |g| {
+                const val = vs.get(g.key) catch {
+                    return .{ .status = .err };
+                };
+                if (val) |v| {
+                    return .{ .status = .success, .value = v };
+                }
+                return .{ .status = .not_found };
+            },
+            .set => |s| {
+                vs.put(s.key, s.value) catch {
+                    return .{ .status = .err };
+                };
+                return .{ .status = .success };
+            },
+            .delete => |d| {
+                const existed = vs.get(d.key) catch {
+                    return .{ .status = .err };
+                };
+                vs.delete(d.key) catch {
+                    return .{ .status = .err };
+                };
+                return if (existed != null)
+                    .{ .status = .success }
+                else
+                    .{ .status = .not_found };
+            },
+        }
     }
 
     fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
@@ -456,4 +534,170 @@ test "WasmOperator — dynamic tags merge with existing tags" {
     const output = collector.drain();
     // Should have both pre-existing bit 3 AND "high-value" bit 0
     try testing.expectEqual(@as(u32, 0b1001), output[0].tags);
+}
+
+test "WasmOperator — filter drops record (handle returns 0)" {
+    const allocator = testing.allocator;
+    const wasm_bytes = @embedFile("../testdata/txn_enricher.wasm");
+
+    var op = try allocator.create(WasmOperator);
+    op.* = WasmOperator.init(allocator, "enricher-filter", "./txn_enricher.wasm");
+    defer {
+        op.deinit();
+        allocator.destroy(op);
+    }
+
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("high-value");
+    _ = reg.getOrCreate("standard");
+    op.tag_registry = &reg;
+
+    try op.loadWasm(wasm_bytes);
+    const iface = op.operator();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 1000,
+        .current_watermark_ms = 0,
+        .operator_name = "enricher-filter",
+    };
+
+    // Input missing "amount" field → should be filtered (dropped)
+    try iface.processElement(
+        ProcessingRecord.init("k1", "{\"txn_id\": \"X1\", \"merchant\": \"NONE\"}", 100),
+        &ctx,
+    );
+
+    try testing.expectEqual(@as(usize, 0), collector.count());
+}
+
+test "WasmOperator — flatmap emits multiple records" {
+    const allocator = testing.allocator;
+    const wasm_bytes = @embedFile("../testdata/txn_enricher.wasm");
+
+    var op = try allocator.create(WasmOperator);
+    op.* = WasmOperator.init(allocator, "enricher-flatmap", "./txn_enricher.wasm");
+    defer {
+        op.deinit();
+        allocator.destroy(op);
+    }
+
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("high-value");
+    _ = reg.getOrCreate("standard");
+    op.tag_registry = &reg;
+
+    try op.loadWasm(wasm_bytes);
+    const iface = op.operator();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 2000,
+        .current_watermark_ms = 0,
+        .operator_name = "enricher-flatmap",
+    };
+
+    // High-value transaction (amount >= 10000) → WASM calls flo.emit() twice
+    try iface.processElement(
+        ProcessingRecord.init("t1", "{\"txn_id\": \"HV1\", \"amount\": 50000, \"merchant\": \"BIG\"}", 100),
+        &ctx,
+    );
+
+    // Should get 2 records: enriched + alert
+    try testing.expectEqual(@as(usize, 2), collector.count());
+
+    const output = collector.drain();
+    // Both should inherit the key
+    try testing.expectEqualStrings("t1", output[0].key);
+    try testing.expectEqualStrings("t1", output[1].key);
+
+    // First record should be the enriched one with "class":"high-value"
+    try testing.expect(std.mem.indexOf(u8, output[0].value, "\"class\":\"high-value\"") != null);
+    // Second record should be the alert
+    try testing.expect(std.mem.indexOf(u8, output[1].value, "\"alert\":\"high-value-txn\"") != null);
+
+    // Both should have "high-value" tag (bit 0)
+    try testing.expectEqual(@as(u32, 0b01), output[0].tags);
+    try testing.expectEqual(@as(u32, 0b01), output[1].tags);
+}
+
+test "WasmOperator — standard map with state counter" {
+    const allocator = testing.allocator;
+    const wasm_bytes = @embedFile("../testdata/txn_enricher.wasm");
+
+    var op = try allocator.create(WasmOperator);
+    op.* = WasmOperator.init(allocator, "enricher-state", "./txn_enricher.wasm");
+    defer {
+        op.deinit();
+        allocator.destroy(op);
+    }
+
+    var reg: TagRegistry = .{};
+    _ = reg.getOrCreate("high-value");
+    _ = reg.getOrCreate("standard");
+    op.tag_registry = &reg;
+
+    try op.loadWasm(wasm_bytes);
+    const iface = op.operator();
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+
+    // Set up state backend + keyed state
+    const StateBackend = @import("../state.zig").StateBackend;
+    const KeyedStateAccess = @import("../state.zig").KeyedStateAccess;
+
+    var backend = StateBackend.init(allocator);
+    defer backend.deinit();
+
+    var keyed_state = try KeyedStateAccess.init(allocator, &backend, "test-job", "enricher-state");
+    defer keyed_state.deinit();
+
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 3000,
+        .current_watermark_ms = 0,
+        .operator_name = "enricher-state",
+        .keyed_state = &keyed_state,
+    };
+
+    // Standard transaction → single output with merchant_txn_count
+    try iface.processElement(
+        ProcessingRecord.init("s1", "{\"txn_id\": \"S1\", \"amount\": 50, \"merchant\": \"CAFE\"}", 100),
+        &ctx,
+    );
+
+    try testing.expectEqual(@as(usize, 1), collector.count());
+    const out1 = collector.drain();
+    // Should have "standard" tag (bit 1)
+    try testing.expectEqual(@as(u32, 0b10), out1[0].tags);
+    // Should have merchant_txn_count:1 (first time seeing CAFE)
+    try testing.expect(std.mem.indexOf(u8, out1[0].value, "\"merchant_txn_count\":1") != null);
+
+    collector.clear();
+
+    // Second call for same merchant → count should be 2
+    try iface.processElement(
+        ProcessingRecord.init("s2", "{\"txn_id\": \"S2\", \"amount\": 75, \"merchant\": \"CAFE\"}", 200),
+        &ctx,
+    );
+
+    try testing.expectEqual(@as(usize, 1), collector.count());
+    const out2 = collector.drain();
+    try testing.expect(std.mem.indexOf(u8, out2[0].value, "\"merchant_txn_count\":2") != null);
 }

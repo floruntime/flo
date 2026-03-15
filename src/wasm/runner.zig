@@ -32,6 +32,15 @@
 //!   flo.kv_set(key_ptr, key_len, val_ptr, val_len) -> i32
 //!   flo.kv_delete(key_ptr, key_len) -> i32
 //!   flo.set_tag(name_ptr: u32, name_len: u32) -> i32
+//!   flo.emit(ptr: u32, len: u32) -> i32
+//!   flo.state_get(key_ptr, key_len, buf_ptr, buf_len) -> i32
+//!   flo.state_set(key_ptr, key_len, val_ptr, val_len) -> i32
+//!   flo.state_delete(key_ptr, key_len) -> i32
+//!
+//! ## Filter Convention
+//!
+//!   handle() returning 0 means "drop this record" (filter).
+//!   Negative values are errors. Positive packed ptr|len is output.
 //!
 //! ## Thread Safety
 //!
@@ -92,6 +101,9 @@ pub const GUEST_ERROR_INVALID_INPUT: i64 = -1;
 pub const GUEST_ERROR_ALLOC_FAILED: i64 = -2;
 pub const GUEST_ERROR_EXECUTION: i64 = -3;
 
+/// handle() returning 0 means "filter / drop this record".
+pub const GUEST_FILTER: i64 = 0;
+
 // =============================================================================
 // Host function ABI constants
 // =============================================================================
@@ -118,6 +130,16 @@ const kv_delete_results = &[_]ValType{.I32};
 const set_tag_params = &[_]ValType{ .I32, .I32 };
 const set_tag_results = &[_]ValType{.I32};
 
+const emit_params = &[_]ValType{ .I32, .I32 };
+const emit_results = &[_]ValType{.I32};
+
+const state_get_params = &[_]ValType{ .I32, .I32, .I32, .I32 };
+const state_get_results = &[_]ValType{.I32};
+const state_set_params = &[_]ValType{ .I32, .I32, .I32, .I32 };
+const state_set_results = &[_]ValType{.I32};
+const state_delete_params = &[_]ValType{ .I32, .I32 };
+const state_delete_results = &[_]ValType{.I32};
+
 const wasi_clock_time_get_params = &[_]ValType{ .I32, .I64, .I32 };
 const wasi_clock_time_get_results = &[_]ValType{.I32};
 const wasi_random_get_params = &[_]ValType{ .I32, .I32 };
@@ -143,6 +165,8 @@ const wasi_proc_exit_results = &[_]ValType{};
 pub const ExecutionResult = struct {
     output: []u8,
     allocator: Allocator,
+    /// True when handle() returned 0, meaning the record should be dropped.
+    filtered: bool = false,
 
     pub fn deinit(self: *ExecutionResult) void {
         self.allocator.free(self.output);
@@ -198,6 +222,26 @@ pub const KvResult = struct {
 /// Callback type for tag resolution: maps tag name → bit position.
 pub const TagResolveFn = *const fn (ctx: *anyopaque, tag_name: []const u8) ?u5;
 
+/// Callback type for sandboxed operator state (processing only).
+/// Mirrors KvDispatchFn but operates on the per-operator StateBackend.
+pub const StateDispatchFn = *const fn (ctx: *anyopaque, op: StateOp, allocator: Allocator) StateResult;
+
+pub const StateOp = union(enum) {
+    get: struct { key: []const u8 },
+    set: struct { key: []const u8, value: []const u8 },
+    delete: struct { key: []const u8 },
+};
+
+pub const StateResult = struct {
+    status: enum { success, not_found, err },
+    value: ?[]const u8 = null,
+};
+
+/// A single emitted record from flo.emit() calls during handle().
+pub const EmittedRecord = struct {
+    data: []u8,
+};
+
 /// Context passed to host functions via the usize context parameter.
 /// Lives for the duration of a single WASM execute() call.
 pub const WasmKvContext = struct {
@@ -213,6 +257,16 @@ pub const WasmKvContext = struct {
     /// Accumulated tag bits set by the WASM guest via flo.set_tag().
     /// Read by the caller after execute() to apply to the output record.
     output_tags: u32 = 0,
+
+    /// Sandboxed state dispatch (processing only). Separate from kv_dispatch.
+    state_dispatch_fn: ?StateDispatchFn = null,
+    state_dispatch_ctx: ?*anyopaque = null,
+    state_enabled: bool = false,
+
+    /// Records emitted via flo.emit() during handle(). Owned by caller.
+    emitted_records: std.ArrayListUnmanaged(EmittedRecord) = .empty,
+    /// Whether flo.emit() was called at least once during this invocation.
+    emit_called: bool = false,
 
     pub fn fromContext(context: usize) *WasmKvContext {
         return @ptrFromInt(context);
@@ -263,6 +317,10 @@ pub const WasmRunner = struct {
         try self.store.exposeHostFunction(flo_module, "kv_set", hostFnKvSet, 0, kv_set_params, kv_set_results);
         try self.store.exposeHostFunction(flo_module, "kv_delete", hostFnKvDelete, 0, kv_delete_params, kv_delete_results);
         try self.store.exposeHostFunction(flo_module, "set_tag", hostFnSetTag, 0, set_tag_params, set_tag_results);
+        try self.store.exposeHostFunction(flo_module, "emit", hostFnEmit, 0, emit_params, emit_results);
+        try self.store.exposeHostFunction(flo_module, "state_get", hostFnStateGet, 0, state_get_params, state_get_results);
+        try self.store.exposeHostFunction(flo_module, "state_set", hostFnStateSet, 0, state_set_params, state_set_results);
+        try self.store.exposeHostFunction(flo_module, "state_delete", hostFnStateDelete, 0, state_delete_params, state_delete_results);
 
         try self.store.exposeHostFunction(wasi_module, "clock_time_get", hostFnWasiClockTimeGet, 0, wasi_clock_time_get_params, wasi_clock_time_get_results);
         try self.store.exposeHostFunction(wasi_module, "random_get", hostFnWasiRandomGet, 0, wasi_random_get_params, wasi_random_get_results);
@@ -380,7 +438,31 @@ pub const WasmRunner = struct {
             };
         }
 
-        // Unpack output: high 32 bits = ptr, low 32 bits = len
+        // If flo.emit() was called during handle(), those records are the output.
+        // The handle() return value is ignored for output (only checked for errors above).
+        if (kv_ctx) |ctx| {
+            if (ctx.emit_called) {
+                // Multi-emit mode: emitted_records owned by caller via kv_ctx.
+                // Return empty output from executeWithKv — caller reads ctx.emitted_records.
+                const empty = try self.allocator.alloc(u8, 0);
+                return ExecutionResult{
+                    .output = empty,
+                    .allocator = self.allocator,
+                };
+            }
+        }
+
+        // Filter: handle() returning 0 means "drop this record"
+        if (result == GUEST_FILTER) {
+            const empty = try self.allocator.alloc(u8, 0);
+            return ExecutionResult{
+                .output = empty,
+                .allocator = self.allocator,
+                .filtered = true,
+            };
+        }
+
+        // Standard map mode: unpack single output from handle() return
         const output_ptr: u32 = @truncate(@as(u64, @bitCast(result)) >> 32);
         const output_len: u32 = @truncate(@as(u64, @bitCast(result)));
 
@@ -456,7 +538,11 @@ pub const WasmRunner = struct {
                 if (hf.func == hostFnKvGet or
                     hf.func == hostFnKvSet or
                     hf.func == hostFnKvDelete or
-                    hf.func == hostFnSetTag)
+                    hf.func == hostFnSetTag or
+                    hf.func == hostFnEmit or
+                    hf.func == hostFnStateGet or
+                    hf.func == hostFnStateSet or
+                    hf.func == hostFnStateDelete)
                 {
                     hf.context = context;
                 }
@@ -701,6 +787,193 @@ fn hostFnSetTag(vm: *VirtualMachine, context: usize) WasmError!void {
 
     ctx.output_tags |= @as(u32, 1) << bit;
     vm.pushOperandNoCheck(i32, RC_SUCCESS);
+}
+
+// =============================================================================
+// Emit Host Function (FlatMap / Multi-emit)
+// =============================================================================
+
+/// flo.emit(ptr: u32, len: u32) -> i32
+///
+/// Called 0..N times during handle() to emit output records.
+/// When emit is called at least once, handle()'s return value is
+/// ignored for output purposes (only checked for errors).
+/// Returns 0 on success, RC_STATE_ERROR if emit list is unavailable.
+fn hostFnEmit(vm: *VirtualMachine, context: usize) WasmError!void {
+    const len = vm.popOperand(u32);
+    const ptr = vm.popOperand(u32);
+
+    if (context == 0) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const ctx = WasmKvContext.fromContext(context);
+    ctx.emit_called = true;
+
+    const bytes = readGuestBytes(vm, ptr, len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+
+    // Copy bytes out of guest memory into our allocator
+    const copy = ctx.allocator.alloc(u8, len) catch {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+    @memcpy(copy, bytes);
+
+    ctx.emitted_records.append(ctx.allocator, .{ .data = copy }) catch {
+        ctx.allocator.free(copy);
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+
+    vm.pushOperandNoCheck(i32, RC_SUCCESS);
+}
+
+// =============================================================================
+// State Host Functions (Sandboxed Per-Operator State)
+// =============================================================================
+
+/// flo.state_get(key_ptr, key_len, buf_ptr, buf_len) -> i32
+///
+/// Read from per-operator sandboxed state. Returns byte count on success,
+/// RC_NOT_FOUND if key doesn't exist, RC_BUFFER_TOO_SMALL if value exceeds
+/// buf_len, RC_STATE_ERROR if state is not available.
+fn hostFnStateGet(vm: *VirtualMachine, context: usize) WasmError!void {
+    const buf_len = vm.popOperand(u32);
+    const buf_ptr = vm.popOperand(u32);
+    const key_len = vm.popOperand(u32);
+    const key_ptr = vm.popOperand(u32);
+
+    if (context == 0) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const ctx = WasmKvContext.fromContext(context);
+    if (!ctx.state_enabled) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const state_fn = ctx.state_dispatch_fn orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+    const state_ctx = ctx.state_dispatch_ctx orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+
+    const key = readGuestBytes(vm, key_ptr, key_len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+
+    const result = state_fn(state_ctx, .{ .get = .{ .key = key } }, ctx.allocator);
+
+    switch (result.status) {
+        .not_found => vm.pushOperandNoCheck(i32, RC_NOT_FOUND),
+        .err => vm.pushOperandNoCheck(i32, RC_STATE_ERROR),
+        .success => {
+            const value = result.value orelse {
+                vm.pushOperandNoCheck(i32, RC_NOT_FOUND);
+                return;
+            };
+            if (value.len > buf_len) {
+                vm.pushOperandNoCheck(i32, RC_BUFFER_TOO_SMALL);
+                return;
+            }
+            writeGuestBytes(vm, buf_ptr, value) catch {
+                vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+                return;
+            };
+            vm.pushOperandNoCheck(i32, @as(i32, @intCast(value.len)));
+        },
+    }
+}
+
+/// flo.state_set(key_ptr, key_len, val_ptr, val_len) -> i32
+fn hostFnStateSet(vm: *VirtualMachine, context: usize) WasmError!void {
+    const val_len = vm.popOperand(u32);
+    const val_ptr = vm.popOperand(u32);
+    const key_len = vm.popOperand(u32);
+    const key_ptr = vm.popOperand(u32);
+
+    if (context == 0) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const ctx = WasmKvContext.fromContext(context);
+    if (!ctx.state_enabled) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const state_fn = ctx.state_dispatch_fn orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+    const state_ctx = ctx.state_dispatch_ctx orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+
+    const key = readGuestBytes(vm, key_ptr, key_len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+    const value = readGuestBytes(vm, val_ptr, val_len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+
+    const result = state_fn(state_ctx, .{ .set = .{ .key = key, .value = value } }, ctx.allocator);
+    vm.pushOperandNoCheck(i32, switch (result.status) {
+        .success => RC_SUCCESS,
+        else => RC_STATE_ERROR,
+    });
+}
+
+/// flo.state_delete(key_ptr, key_len) -> i32
+fn hostFnStateDelete(vm: *VirtualMachine, context: usize) WasmError!void {
+    const key_len = vm.popOperand(u32);
+    const key_ptr = vm.popOperand(u32);
+
+    if (context == 0) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const ctx = WasmKvContext.fromContext(context);
+    if (!ctx.state_enabled) {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    }
+
+    const state_fn = ctx.state_dispatch_fn orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+    const state_ctx = ctx.state_dispatch_ctx orelse {
+        vm.pushOperandNoCheck(i32, RC_STATE_ERROR);
+        return;
+    };
+
+    const key = readGuestBytes(vm, key_ptr, key_len) catch {
+        vm.pushOperandNoCheck(i32, RC_INVALID_ARGS);
+        return;
+    };
+
+    const result = state_fn(state_ctx, .{ .delete = .{ .key = key } }, ctx.allocator);
+    vm.pushOperandNoCheck(i32, switch (result.status) {
+        .success => RC_SUCCESS,
+        .not_found => RC_NOT_FOUND,
+        .err => RC_STATE_ERROR,
+    });
 }
 
 // =============================================================================
@@ -974,7 +1247,7 @@ test "WasmRunner set_tag via txn_classifier" {
         .allocator = allocator,
         .kv_enabled = false,
         .tag_resolve_fn = testTagResolve,
-        .tag_resolve_ctx = @constCast(@ptrCast(&reg)),
+        .tag_resolve_ctx = @ptrCast(@constCast(&reg)),
         .output_tags = 0,
     };
 
@@ -1010,7 +1283,7 @@ test "WasmRunner set_tag refund classification" {
         .allocator = allocator,
         .kv_enabled = false,
         .tag_resolve_fn = testTagResolve,
-        .tag_resolve_ctx = @constCast(@ptrCast(&reg)),
+        .tag_resolve_ctx = @ptrCast(@constCast(&reg)),
         .output_tags = 0,
     };
 
@@ -1020,4 +1293,82 @@ test "WasmRunner set_tag refund classification" {
     // Should have set "refund" tag (bit 1)
     try std.testing.expectEqual(@as(u32, 0b010), ctx.output_tags);
     try std.testing.expect(std.mem.indexOf(u8, result.outputStr(), "\"class\":\"refund\"") != null);
+}
+
+test "WasmRunner — filter: handle returns 0 sets filtered flag" {
+    const allocator = std.testing.allocator;
+
+    var runner = try WasmRunner.init(allocator);
+    defer runner.deinit();
+
+    const wasm_bytes = @embedFile("../processing/testdata/txn_enricher.wasm");
+    var module = try runner.loadModule(wasm_bytes, .{});
+    defer module.deinit();
+
+    var ctx = WasmKvContext{
+        .namespace = "",
+        .kv_dispatch_fn = null,
+        .kv_dispatch_ctx = null,
+        .allocator = allocator,
+        .kv_enabled = false,
+    };
+
+    // Missing "amount" field → handle returns 0 → filter
+    var result = try runner.executeWithKv(&module, "{\"txn_id\": \"X1\", \"merchant\": \"NONE\"}", &ctx);
+    defer result.deinit();
+
+    try std.testing.expect(result.filtered);
+    try std.testing.expectEqual(@as(usize, 0), result.output.len);
+}
+
+test "WasmRunner — emit: flo.emit() collects multiple records" {
+    const allocator = std.testing.allocator;
+
+    var runner = try WasmRunner.init(allocator);
+    defer runner.deinit();
+
+    const wasm_bytes = @embedFile("../processing/testdata/txn_enricher.wasm");
+    var module = try runner.loadModule(wasm_bytes, .{});
+    defer module.deinit();
+
+    var reg: TestTagRegistry = .{};
+    _ = reg.getOrCreate("high-value");
+    _ = reg.getOrCreate("standard");
+
+    var ctx = WasmKvContext{
+        .namespace = "",
+        .kv_dispatch_fn = null,
+        .kv_dispatch_ctx = null,
+        .allocator = allocator,
+        .kv_enabled = false,
+        .tag_resolve_fn = testTagResolve,
+        .tag_resolve_ctx = @ptrCast(@constCast(&reg)),
+        .output_tags = 0,
+    };
+
+    // High-value transaction → WASM calls flo.emit() twice
+    var result = try runner.executeWithKv(&module, "{\"txn_id\": \"HV1\", \"amount\": 50000, \"merchant\": \"BIG\"}", &ctx);
+    defer result.deinit();
+
+    // emit_called should be true
+    try std.testing.expect(ctx.emit_called);
+
+    // Should have 2 emitted records
+    try std.testing.expectEqual(@as(usize, 2), ctx.emitted_records.items.len);
+
+    // Clean up emitted records
+    defer {
+        for (ctx.emitted_records.items) |er| {
+            allocator.free(er.data);
+        }
+        ctx.emitted_records.deinit(allocator);
+    }
+
+    // First: enriched record with class
+    try std.testing.expect(std.mem.indexOf(u8, ctx.emitted_records.items[0].data, "\"class\":\"high-value\"") != null);
+    // Second: alert record
+    try std.testing.expect(std.mem.indexOf(u8, ctx.emitted_records.items[1].data, "\"alert\":\"high-value-txn\"") != null);
+
+    // Should have "high-value" tag set
+    try std.testing.expectEqual(@as(u32, 0b01), ctx.output_tags);
 }
