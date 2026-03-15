@@ -2715,3 +2715,112 @@ test "e2e/processing: WASM operator with dynamic tag routing" {
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_wasm_tag" });
 }
+
+// =============================================================================
+// WASM Filter + FlatMap + State Tests
+// =============================================================================
+
+test "e2e/processing: WASM operator filter, flatmap, and state" {
+    // Pipeline: source → wasm (txn_enricher) → three sinks:
+    //   - all-sink:       no match (firehose)
+    //   - hv-sink:        match: [high-value]
+    //   - std-sink:       match: [standard]
+    //
+    // txn_enricher WASM module:
+    //   - Missing "amount" → filter (dropped, handle returns 0)
+    //   - amount >= 10000  → flatmap: emits enriched + alert, tags "high-value"
+    //   - otherwise        → map: emits single enriched, tags "standard"
+    //   - All emitted records include "merchant_txn_count" from flo.state_*
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_wasm_enrich" });
+
+    // Seed source stream:
+    //   1. Missing amount → filtered
+    //   2. High-value     → flatmap (2 outputs)
+    //   3. Standard       → map (1 output with state counter)
+    //   4. Standard same merchant → map (1 output, counter=2)
+    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"X1\",\"merchant\":\"NONE\"}", "-n", "proc_wasm_enrich" });
+    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"HV1\",\"amount\":50000,\"merchant\":\"BIG\"}", "-n", "proc_wasm_enrich" });
+    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"S1\",\"amount\":50,\"merchant\":\"CAFE\"}", "-n", "proc_wasm_enrich" });
+    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"S2\",\"amount\":75,\"merchant\":\"CAFE\"}", "-n", "proc_wasm_enrich" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-wasm-enrich
+        \\namespace: proc_wasm_enrich
+        \\sources.[0].stream.name: wasm-enrich-in
+        \\operators.[0].type: wasm
+        \\operators.[0].name: txn-enricher
+        \\operators.[0].module: src/processing/testdata/txn_enricher.wasm
+        \\sinks.[0].name: all-sink
+        \\sinks.[0].stream.name: wasm-enrich-all
+        \\sinks.[1].name: hv-sink
+        \\sinks.[1].stream.name: wasm-enrich-hv
+        \\sinks.[1].match.[0]: high-value
+        \\sinks.[2].name: std-sink
+        \\sinks.[2].stream.name: wasm-enrich-std
+        \\sinks.[2].match.[0]: standard
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-wasm-enrich.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_wasm_enrich" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // --- Wait for standard sink to receive merchant_txn_count ---
+    // The second CAFE record should have count=2, proving state works
+    const found_std = try readStreamBlocking(ctx, "wasm-enrich-std", "proc_wasm_enrich", "merchant_txn_count", "10000");
+    if (!found_std) {
+        std.debug.print("\n[TIMEOUT] Standard sink did not receive enriched records\n", .{});
+        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_wasm_enrich" });
+        defer status.deinit();
+        std.debug.print("Status: {s}\n", .{status.stdout});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // --- Wait for high-value sink to receive the alert (flatmap) ---
+    const found_alert = try readStreamBlocking(ctx, "wasm-enrich-hv", "proc_wasm_enrich", "alert", "8000");
+    if (!found_alert) {
+        std.debug.print("\n[TIMEOUT] High-value sink did not receive alert record\n", .{});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // --- Verify firehose sink: should have 4 records (2 from flatmap + 2 standard) ---
+    // The filtered record (no amount) should NOT appear
+    var all_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-all", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
+    defer all_result.deinit();
+    try stdx.testing.assertSucceeded(all_result);
+    // The filtered record had txn_id "X1" — should NOT be in output
+    try testing.expect(!all_result.stdoutContains("\"txn_id\":\"X1\""));
+    // High-value enriched + alert should be there
+    try stdx.testing.assertContains(all_result, "high-value");
+    try stdx.testing.assertContains(all_result, "alert");
+    // Standard records should be there
+    try stdx.testing.assertContains(all_result, "\"class\":\"standard\"");
+
+    // --- Verify high-value sink has both enriched and alert records ---
+    var hv_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-hv", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
+    defer hv_result.deinit();
+    try stdx.testing.assertSucceeded(hv_result);
+    try stdx.testing.assertContains(hv_result, "\"class\":\"high-value\"");
+    try stdx.testing.assertContains(hv_result, "\"alert\":\"high-value-txn\"");
+    // Should NOT have standard records
+    try testing.expect(!hv_result.stdoutContains("\"class\":\"standard\""));
+
+    // --- Verify standard sink has only standard records with state counter ---
+    var std_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-std", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
+    defer std_result.deinit();
+    try stdx.testing.assertSucceeded(std_result);
+    try stdx.testing.assertContains(std_result, "\"class\":\"standard\"");
+    try stdx.testing.assertContains(std_result, "merchant_txn_count");
+    // Should NOT have high-value records
+    try testing.expect(!std_result.stdoutContains("\"class\":\"high-value\""));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_wasm_enrich" });
+}
