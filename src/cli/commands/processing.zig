@@ -265,10 +265,65 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    ctx.print("Job: {s}\n", .{job_id});
     if (result.asRawData()) |data| {
-        ctx.print("{s}\n", .{data});
+        printProcessingJobStatus(ctx, data);
     }
+}
+
+fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) void {
+    var off: usize = 0;
+
+    // job_id
+    if (off + 2 > data.len) return;
+    const id_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2;
+    if (off + id_len > data.len) return;
+    const job_id = data[off .. off + id_len];
+    off += id_len;
+
+    // name
+    if (off + 2 > data.len) return;
+    const name_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2;
+    if (off + name_len > data.len) return;
+    const name = data[off .. off + name_len];
+    off += name_len;
+
+    // status
+    if (off >= data.len) return;
+    const status_str: []const u8 = switch (data[off]) {
+        0 => "RUNNING",
+        1 => "STOPPED",
+        2 => "CANCELLED",
+        3 => "FAILED",
+        4 => "COMPLETED",
+        else => "UNKNOWN",
+    };
+    off += 1;
+
+    // parallelism, batch_size
+    if (off + 8 > data.len) return;
+    const parallelism = std.mem.readInt(u32, data[off..][0..4], .little);
+    off += 4;
+    const batch_size = std.mem.readInt(u32, data[off..][0..4], .little);
+    off += 4;
+
+    // records_processed
+    if (off + 8 > data.len) return;
+    const records = std.mem.readInt(u64, data[off..][0..8], .little);
+    off += 8;
+
+    // created_at
+    if (off + 8 > data.len) return;
+    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
+
+    ctx.print("Job:        {s}\n", .{job_id});
+    ctx.print("Name:       {s}\n", .{name});
+    ctx.print("Status:     {s}\n", .{status_str});
+    ctx.print("Parallelism:{d}\n", .{parallelism});
+    ctx.print("Batch size: {d}\n", .{batch_size});
+    ctx.print("Processed:  {d} records\n", .{records});
+    ctx.print("Created:    {d}ms\n", .{created_at});
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {

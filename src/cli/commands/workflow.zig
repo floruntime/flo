@@ -376,10 +376,116 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    ctx.print("Run: {s}\n", .{run_id});
     if (result.asRawData()) |data| {
-        ctx.print("{s}\n", .{data});
+        printWorkflowRunStatus(ctx, run_id, data);
     }
+}
+
+fn printWorkflowRunStatus(ctx: *commander.Context, run_id: []const u8, data: []const u8) void {
+    var off: usize = 0;
+
+    // skip run_id field (already have it)
+    if (off + 2 > data.len) return;
+    const rid_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2 + rid_len;
+
+    // workflow name
+    if (off + 2 > data.len) return;
+    const wf_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2;
+    if (off + wf_len > data.len) return;
+    const workflow = data[off .. off + wf_len];
+    off += wf_len;
+
+    // version
+    if (off + 2 > data.len) return;
+    const ver_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2;
+    if (off + ver_len > data.len) return;
+    const version = data[off .. off + ver_len];
+    off += ver_len;
+
+    // status
+    if (off >= data.len) return;
+    const status_str: []const u8 = switch (data[off]) {
+        0 => "pending",
+        1 => "running",
+        2 => "waiting",
+        3 => "completed",
+        4 => "failed",
+        5 => "cancelled",
+        6 => "timed_out",
+        else => "unknown",
+    };
+    off += 1;
+
+    // current_step
+    if (off + 2 > data.len) return;
+    const step_len = std.mem.readInt(u16, data[off..][0..2], .little);
+    off += 2;
+    if (off + step_len > data.len) return;
+    const current_step = data[off .. off + step_len];
+    off += step_len;
+
+    // input (u32-prefixed)
+    if (off + 4 > data.len) return;
+    const input_len = std.mem.readInt(u32, data[off..][0..4], .little);
+    off += 4;
+    if (off + input_len > data.len) return;
+    const input = data[off .. off + input_len];
+    off += input_len;
+
+    // created_at
+    if (off + 8 > data.len) return;
+    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
+    off += 8;
+
+    // started_at (optional)
+    var started_at: ?i64 = null;
+    if (off < data.len) {
+        if (data[off] == 1 and off + 9 <= data.len) {
+            off += 1;
+            started_at = std.mem.readInt(i64, data[off..][0..8], .little);
+            off += 8;
+        } else {
+            off += 1;
+        }
+    }
+
+    // completed_at (optional)
+    var completed_at: ?i64 = null;
+    if (off < data.len) {
+        if (data[off] == 1 and off + 9 <= data.len) {
+            off += 1;
+            completed_at = std.mem.readInt(i64, data[off..][0..8], .little);
+            off += 8;
+        } else {
+            off += 1;
+        }
+    }
+
+    // wait_signal (optional)
+    var wait_signal: ?[]const u8 = null;
+    if (off < data.len and data[off] == 1) {
+        off += 1;
+        if (off + 2 <= data.len) {
+            const wsig_len = std.mem.readInt(u16, data[off..][0..2], .little);
+            off += 2;
+            if (off + wsig_len <= data.len) {
+                wait_signal = data[off .. off + wsig_len];
+            }
+        }
+    }
+
+    ctx.print("Run:      {s}\n", .{run_id});
+    ctx.print("Workflow: {s} (v{s})\n", .{ workflow, version });
+    ctx.print("Status:   {s}\n", .{status_str});
+    ctx.print("Step:     {s}\n", .{current_step});
+    ctx.print("Input:    {s}\n", .{input});
+    ctx.print("Created:  {d}ms\n", .{created_at});
+    if (started_at) |v| ctx.print("Started:  {d}ms\n", .{v});
+    if (completed_at) |v| ctx.print("Completed:{d}ms\n", .{v});
+    if (wait_signal) |sig| ctx.print("Waiting:  signal={s}\n", .{sig});
 }
 
 fn runHistory(ctx: *commander.Context) commander.Error!void {

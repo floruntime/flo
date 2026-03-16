@@ -484,23 +484,22 @@ pub const ProcessingHandler = struct {
         }
 
         if (self.jobs.get(job_id)) |job| {
-            // Build JSON status response
+            // Binary wire format:
+            // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
+            // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
             var buf: [4096]u8 = undefined;
-            const json = std.fmt.bufPrint(&buf,
-                \\{{"job_id":"{s}","name":"{s}","status":"{s}","parallelism":{d},"batch_size":{d},"records_processed":{d},"created_at_ms":{d}}}
-            , .{
-                job.job_id_owned,
-                job.name_owned,
-                job.status.toString(),
-                job.parallelism,
-                job.batch_size,
-                job.records_processed,
-                job.created_at_ms,
-            }) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
-                return;
-            };
-            shard.sendOkResponse(conn, req.header.request_id, json);
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
+            w.writeInt(u16, @intCast(job.job_id_owned.len), .little) catch return;
+            w.writeAll(job.job_id_owned) catch return;
+            w.writeInt(u16, @intCast(job.name_owned.len), .little) catch return;
+            w.writeAll(job.name_owned) catch return;
+            w.writeByte(@intFromEnum(job.status)) catch return;
+            w.writeInt(u32, job.parallelism, .little) catch return;
+            w.writeInt(u32, job.batch_size, .little) catch return;
+            w.writeInt(u64, job.records_processed, .little) catch return;
+            w.writeInt(i64, job.created_at_ms, .little) catch return;
+            shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }

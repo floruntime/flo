@@ -637,8 +637,8 @@ test "e2e/processing: passthrough pipeline - data flows from source to sink stre
     defer status_result.deinit();
 
     try stdx.testing.assertSucceeded(status_result);
-    // Should show records_processed > 0
-    try testing.expect(!status_result.stdoutContains("\"records_processed\":0"));
+    // Should show records processed > 0
+    try testing.expect(!status_result.stdoutContains("Processed:  0 records"));
 
     // Step 6: Clean up — stop the job
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_pipe" });
@@ -732,8 +732,8 @@ test "e2e/processing: job status reflects processed record count" {
     defer status_result.deinit();
 
     try stdx.testing.assertSucceeded(status_result);
-    // Status JSON should contain records_processed field
-    try stdx.testing.assertContains(status_result, "records_processed");
+    // Status should contain the Processed field
+    try stdx.testing.assertContains(status_result, "Processed:");
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_metrics" });
 }
@@ -1270,7 +1270,7 @@ test "e2e/processing: ts source - TS measurement data flows to stream sink" {
     defer status_result.deinit();
 
     try stdx.testing.assertSucceeded(status_result);
-    try testing.expect(!status_result.stdoutContains("\"records_processed\":0"));
+    try testing.expect(!status_result.stdoutContains("Processed:  0 records"));
 
     // Clean up
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tssrc" });
@@ -1989,7 +1989,7 @@ test "e2e/processing: rescaled parallelism survives restart" {
     var before = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
     defer before.deinit();
     try stdx.testing.assertSucceeded(before);
-    try stdx.testing.assertContains(before, "\"parallelism\":4");
+    try stdx.testing.assertContains(before, "Parallelism:4");
 
     // Restart the server
     try ctx.restartServer();
@@ -1998,7 +1998,7 @@ test "e2e/processing: rescaled parallelism survives restart" {
     var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
     defer after.deinit();
     try stdx.testing.assertSucceeded(after);
-    try stdx.testing.assertContains(after, "\"parallelism\":4");
+    try stdx.testing.assertContains(after, "Parallelism:4");
 }
 
 test "e2e/processing: new job IDs don't collide after restart" {

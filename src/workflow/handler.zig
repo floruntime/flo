@@ -834,25 +834,48 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        // Build JSON status
-        var buf: [8192]u8 = undefined;
+        // Binary wire format:
+        // [run_id_len:u16][run_id][workflow_len:u16][workflow][version_len:u16][version]
+        // [status:u8][current_step_len:u16][current_step][input_len:u32][input]
+        // [created_at:i64][has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
+        // [has_wait_signal:u8][wait_signal_len:u16][wait_signal]?
         const current_step = run.current_step_name_owned orelse "start";
-        const status_json = std.fmt.bufPrint(&buf,
-            \\{{"run_id":"{s}","workflow":"{s}","version":"{s}","status":"{s}","current_step":"{s}","input":{s},"created_at":{d}}}
-        , .{
-            run.run_id_owned,
-            run.workflow_name_owned,
-            run.workflow_version_owned,
-            run.status.toString(),
-            current_step,
-            run.input_owned,
-            run.created_at_ms,
-        }) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "status serialization failed");
-            return;
-        };
+        var wire_buf: [16384]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&wire_buf);
+        const w = fbs.writer();
+        w.writeInt(u16, @intCast(run.run_id_owned.len), .little) catch return;
+        w.writeAll(run.run_id_owned) catch return;
+        w.writeInt(u16, @intCast(run.workflow_name_owned.len), .little) catch return;
+        w.writeAll(run.workflow_name_owned) catch return;
+        w.writeInt(u16, @intCast(run.workflow_version_owned.len), .little) catch return;
+        w.writeAll(run.workflow_version_owned) catch return;
+        w.writeByte(@intFromEnum(run.status)) catch return;
+        w.writeInt(u16, @intCast(current_step.len), .little) catch return;
+        w.writeAll(current_step) catch return;
+        w.writeInt(u32, @intCast(run.input_owned.len), .little) catch return;
+        w.writeAll(run.input_owned) catch return;
+        w.writeInt(i64, run.created_at_ms, .little) catch return;
+        if (run.started_at_ms) |v| {
+            w.writeByte(1) catch return;
+            w.writeInt(i64, v, .little) catch return;
+        } else {
+            w.writeByte(0) catch return;
+        }
+        if (run.completed_at_ms) |v| {
+            w.writeByte(1) catch return;
+            w.writeInt(i64, v, .little) catch return;
+        } else {
+            w.writeByte(0) catch return;
+        }
+        if (run.wait_signal_type_owned) |sig| {
+            w.writeByte(1) catch return;
+            w.writeInt(u16, @intCast(sig.len), .little) catch return;
+            w.writeAll(sig) catch return;
+        } else {
+            w.writeByte(0) catch return;
+        }
 
-        shard.sendOkResponse(conn, req.header.request_id, status_json);
+        shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
     }
 
     // ── HISTORY ─────────────────────────────────────────────────────────
