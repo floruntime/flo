@@ -243,3 +243,15 @@ pub fn enable(
 ) !Response {
     return client.sendRequest(.workflow_enable, namespace, workflow_name, version orelse "");
 }
+
+/// List workflow definitions
+/// Wire format:
+///   - namespace: req.namespace
+///   - key: (unused)
+///   - value: (empty)
+pub fn listDefinitions(
+    client: *Client,
+    namespace: []const u8,
+) !Response {
+    return client.sendRequest(.workflow_list_definitions, namespace, "", "");
+}

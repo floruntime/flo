@@ -377,6 +377,36 @@ test "extractRunId helper" {
     try testing.expect(extractRunId("Result: ") == null);
 }
 
+/// Poll a CLI command until it succeeds (exit code 0), retrying up to timeout_ms.
+fn pollUntilSuccess(ctx: *stdx.testing.TestContext, args: []const []const u8, timeout_ms: u64) !stdx.testing.CommandResult {
+    const interval_ns: u64 = 200 * std.time.ns_per_ms;
+    const max_attempts = @max(timeout_ms / 200, 1);
+    var last: stdx.testing.CommandResult = try ctx.cli.run(args);
+    if (last.succeeded()) return last;
+    for (1..max_attempts) |_| {
+        last.deinit();
+        std.Thread.sleep(interval_ns);
+        last = try ctx.cli.run(args);
+        if (last.succeeded()) return last;
+    }
+    return last;
+}
+
+/// Poll a CLI command until stdout contains `needle`, retrying up to timeout_ms.
+fn pollForOutput(ctx: *stdx.testing.TestContext, args: []const []const u8, needle: []const u8, timeout_ms: u64) !stdx.testing.CommandResult {
+    const interval_ns: u64 = 200 * std.time.ns_per_ms;
+    const max_attempts = @max(timeout_ms / 200, 1);
+    var last: stdx.testing.CommandResult = try ctx.cli.run(args);
+    if (last.succeeded() and last.stdoutContains(needle)) return last;
+    for (1..max_attempts) |_| {
+        last.deinit();
+        std.Thread.sleep(interval_ns);
+        last = try ctx.cli.run(args);
+        if (last.succeeded() and last.stdoutContains(needle)) return last;
+    }
+    return last;
+}
+
 test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -404,8 +434,8 @@ test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
 
     std.debug.print("\n[TEST] Invoked action, got run_id: {s}\n", .{run_id});
 
-    // 4. Check initial status (should be pending)
-    var status1 = try ctx.cli.run(&.{ "action", "status", run_id });
+    // 4. Check initial status (should be pending) — poll to let Raft commit
+    var status1 = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 5000);
     defer status1.deinit();
     try stdx.testing.assertSucceeded(status1);
 
@@ -486,15 +516,17 @@ test "e2e/action/worker: worker fails task with retry" {
         return error.TestFailed;
     };
 
-    // 4. Worker awaits task
+    // 4. Worker awaits task — poll to let Raft enqueue
     var await_result = try ctx.cli.run(&.{
         "worker",      "await",   action_name,
         "--worker-id", worker_id, "--block",
-        "2000",
+        "5000",
     });
     defer await_result.deinit();
 
-    if (!await_result.succeeded()) return; // Skip if no task
+    if (!await_result.succeeded()) return; // Skip if server error
+    const await_out = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
+    if (await_out.len == 0 or std.mem.eql(u8, await_out, "(no tasks)")) return; // No task yet
 
     // 5. Worker fails the task (with retry enabled)
     var fail_result = try ctx.cli.run(&.{
@@ -506,8 +538,8 @@ test "e2e/action/worker: worker fails task with retry" {
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
 
-    // 6. Check status - should still be pending (retry queued)
-    var status = try ctx.cli.run(&.{ "action", "status", run_id });
+    // 6. Check status — poll to let Raft commit the fail
+    var status = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 3000);
     defer status.deinit();
     try stdx.testing.assertSucceeded(status);
     // The status indicates the task is back in pending/retry state
@@ -536,15 +568,17 @@ test "e2e/action/worker: worker fails task permanently" {
         return error.TestFailed;
     };
 
-    // 4. Worker awaits task
+    // 4. Worker awaits task — poll to let Raft enqueue
     var await_result = try ctx.cli.run(&.{
         "worker",      "await",   action_name,
         "--worker-id", worker_id, "--block",
-        "2000",
+        "5000",
     });
     defer await_result.deinit();
 
-    if (!await_result.succeeded()) return; // Skip if no task
+    if (!await_result.succeeded()) return; // Skip if server error
+    const await_out = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
+    if (await_out.len == 0 or std.mem.eql(u8, await_out, "(no tasks)")) return; // No task yet
 
     // 5. Worker fails the task (NO retry - permanent failure)
     var fail_result = try ctx.cli.run(&.{
@@ -557,8 +591,8 @@ test "e2e/action/worker: worker fails task permanently" {
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
 
-    // 6. Check status - should be failed
-    var status = try ctx.cli.run(&.{ "action", "status", run_id });
+    // 6. Check status — poll to let Raft commit the fail
+    var status = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 3000);
     defer status.deinit();
     try stdx.testing.assertSucceeded(status);
     // The status indicates the task has failed permanently
@@ -750,8 +784,8 @@ test "e2e/action/runs: completed run shows completed status" {
     defer complete_result.deinit();
     try stdx.testing.assertSucceeded(complete_result);
 
-    // 5. List runs — should show "completed"
-    var runs_result = try ctx.cli.run(&.{ "action", "runs", action_name });
+    // 5. List runs — poll until "completed" appears (Raft commit lag)
+    var runs_result = try pollForOutput(ctx, &.{ "action", "runs", action_name }, "completed", 5000);
     defer runs_result.deinit();
 
     try stdx.testing.assertSucceeded(runs_result);

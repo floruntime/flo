@@ -810,7 +810,7 @@ pub const Shard = struct {
             .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream),
             // queue_list uses rich binary format with per-queue stats
             .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
-            // processing_list and workflow_list_definitions use JSON format
+            // processing_list and workflow_list_definitions use binary wire format with rich fields
             .processing_list => serializeWalkProcessingJobs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
             .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
             // action_list uses scan wire format with action metadata
@@ -923,6 +923,9 @@ pub const Shard = struct {
 
         // Drive workflow stream triggers (poll streams → start runs)
         self.workflow_handler.tickStreamTriggers(self);
+
+        // Check for completed async actions and resume waiting workflow runs
+        self.workflow_handler.checkPendingActions(self);
 
         return events.len;
     }
@@ -1502,24 +1505,22 @@ fn serializeWalkActionEntries(
     return buf;
 }
 
-/// Serialize walk results as a JSON array of processing jobs.
+/// Serialize walk results as binary wire format for processing jobs.
 ///
-/// Looks up each job name across all shard contexts to produce full JSON
-/// matching the format the CLI expects: [{"job_id":..., "name":..., ...}].
+/// Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
+///              [status_len:u16][status][parallelism:u32][created_at:i64])*
+///              [has_more:u8][cursor_len:u16]
 fn serializeWalkProcessingJobs(
     allocator: std.mem.Allocator,
     names: []const []const u8,
     contexts: []const *anyopaque,
     namespace: []const u8,
 ) ![]u8 {
-    var result_buf: [65536]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&result_buf);
-    const writer = fbs.writer();
-
-    writer.writeByte('[') catch return error.OutOfMemory;
+    const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
+    var jobs: std.ArrayListUnmanaged(JobInfo) = .{};
+    defer jobs.deinit(allocator);
 
     const req_ns = if (namespace.len > 0) namespace else "default";
-    var count: u32 = 0;
 
     for (names) |name| {
         for (contexts) |ctx| {
@@ -1528,44 +1529,75 @@ fn serializeWalkProcessingJobs(
             while (it.next()) |entry| {
                 const job = entry.value_ptr;
                 if (std.mem.eql(u8, job.name_owned, name) and std.mem.eql(u8, job.namespace_owned, req_ns)) {
-                    if (count > 0) writer.writeByte(',') catch return error.OutOfMemory;
-                    std.fmt.format(writer,
-                        \\{{"job_id":"{s}","name":"{s}","status":"{s}","parallelism":{d},"created_at_ms":{d}}}
-                    , .{
-                        job.job_id_owned,
-                        job.name_owned,
-                        job.status.toString(),
-                        job.parallelism,
-                        job.created_at_ms,
-                    }) catch return error.OutOfMemory;
-                    count += 1;
+                    try jobs.append(allocator, .{
+                        .name = job.name_owned,
+                        .job_id = job.job_id_owned,
+                        .status = job.status.toString(),
+                        .parallelism = job.parallelism,
+                        .created_at = job.created_at_ms,
+                    });
                     break;
                 }
             }
         }
     }
 
-    writer.writeByte(']') catch return error.OutOfMemory;
-    return try allocator.dupe(u8, fbs.getWritten());
+    // Calculate total size
+    var total: usize = 4; // count: u32
+    for (jobs.items) |j| {
+        total += 2 + j.name.len; // name_len:u16 + name
+        total += 2 + j.job_id.len; // job_id_len:u16 + job_id
+        total += 2 + j.status.len; // status_len:u16 + status
+        total += 4; // parallelism:u32
+        total += 8; // created_at:i64
+    }
+    total += 1 + 2; // has_more:u8 + cursor_len:u16
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(jobs.items.len), .little);
+    var pos: usize = 4;
+    for (jobs.items) |j| {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.name.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..j.name.len], j.name);
+        pos += j.name.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.job_id.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..j.job_id.len], j.job_id);
+        pos += j.job_id.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.status.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..j.status.len], j.status);
+        pos += j.status.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], j.parallelism, .little);
+        pos += 4;
+        std.mem.writeInt(i64, buf[pos..][0..8], j.created_at, .little);
+        pos += 8;
+    }
+
+    // Trailer: no pagination
+    buf[pos] = 0; // has_more
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+    return buf;
 }
 
-/// Serialize walk results as a JSON array of workflow definitions.
+/// Serialize walk results as binary wire format for workflow definitions.
 ///
-/// Looks up each definition name across all shard contexts to produce full JSON
-/// matching the format the handler produces: [{"name":..., "version":..., ...}].
+/// Wire format: [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
+///              [has_more:u8][cursor_len:u16]
 fn serializeWalkWorkflowDefs(
     allocator: std.mem.Allocator,
     names: []const []const u8,
     contexts: []const *anyopaque,
     namespace: []const u8,
 ) ![]u8 {
-    var result_buf: [65536]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&result_buf);
-    const writer = fbs.writer();
-
-    writer.writeByte('[') catch return error.OutOfMemory;
-
-    var count: u32 = 0;
+    // First pass: collect matching definitions and compute size
+    const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
+    var defs: std.ArrayListUnmanaged(DefInfo) = .{};
+    defer defs.deinit(allocator);
 
     for (names) |name| {
         for (contexts) |ctx| {
@@ -1574,28 +1606,54 @@ fn serializeWalkWorkflowDefs(
             while (dit.next()) |entry| {
                 const def = entry.value_ptr;
                 if (!std.mem.eql(u8, def.name_owned, name)) continue;
-                // Verify namespace via map key ("namespace:name")
                 if (namespace.len > 0) {
                     const map_key = entry.key_ptr.*;
                     if (!std.mem.startsWith(u8, map_key, namespace)) continue;
                     if (map_key.len <= namespace.len or map_key[namespace.len] != ':') continue;
                 }
-                if (count > 0) writer.writeByte(',') catch return error.OutOfMemory;
-                std.fmt.format(writer,
-                    \\{{"name":"{s}","version":"{s}","created_at":{d}}}
-                , .{
-                    def.name_owned,
-                    def.version_owned,
-                    def.created_at_ms,
-                }) catch return error.OutOfMemory;
-                count += 1;
+                try defs.append(allocator, .{
+                    .name = def.name_owned,
+                    .version = def.version_owned,
+                    .created_at = def.created_at_ms,
+                });
                 break;
             }
         }
     }
 
-    writer.writeByte(']') catch return error.OutOfMemory;
-    return try allocator.dupe(u8, fbs.getWritten());
+    // Calculate total size
+    var total: usize = 4; // count: u32
+    for (defs.items) |d| {
+        total += 2 + d.name.len; // name_len:u16 + name
+        total += 2 + d.version.len; // version_len:u16 + version
+        total += 8; // created_at:i64
+    }
+    total += 1 + 2; // has_more:u8 + cursor_len:u16
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    // Write entries
+    std.mem.writeInt(u32, buf[0..4], @intCast(defs.items.len), .little);
+    var pos: usize = 4;
+    for (defs.items) |d| {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.name.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..d.name.len], d.name);
+        pos += d.name.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.version.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..d.version.len], d.version);
+        pos += d.version.len;
+        std.mem.writeInt(i64, buf[pos..][0..8], d.created_at, .little);
+        pos += 8;
+    }
+
+    // Trailer: no pagination
+    buf[pos] = 0; // has_more
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+    return buf;
 }
 
 fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8) ![]u8 {

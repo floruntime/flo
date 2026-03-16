@@ -186,7 +186,6 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
 fn runList(ctx: *commander.Context) commander.Error!void {
     const include_all = ctx.getBool("all");
-    const format = output.getFormat(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     if (output.isVerbose(ctx)) {
@@ -213,49 +212,12 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    // Parse response data: [count: u32] + [name_len: u16][name: bytes]...
-    const data = result.asRawData() orelse {
-        ctx.printErr("Invalid response from server\n", .{});
-        return error.CommandFailed;
-    };
-
-    const count = std.mem.readInt(u32, data[0..4], .little);
-
-    if (format == .json) {
-        // JSON output
-        ctx.print("{{\n  \"namespaces\": [\n", .{});
-        var offset: usize = 4;
-        var i: u32 = 0;
-        while (i < count and offset + 2 <= data.len) : (i += 1) {
-            const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
-            offset += 2;
-            if (offset + name_len > data.len) break;
-            const name = data[offset..][0..name_len];
-            offset += name_len;
-
-            if (i > 0) ctx.print(",\n", .{});
-            ctx.print("    \"{s}\"", .{name});
-        }
-        ctx.print("\n  ]\n}}\n", .{});
+    if (result.asRawData()) |data| {
+        output.printWireList(ctx, data, "(no namespaces)", &.{
+            .{ .field = "name", .header = "NAMESPACE", .field_type = .str_u16 },
+        });
     } else {
-        // Table output
-        ctx.print("NAMESPACE\n", .{});
-        ctx.print("---------\n", .{});
-
-        var offset: usize = 4;
-        var i: u32 = 0;
-        while (i < count and offset + 2 <= data.len) : (i += 1) {
-            const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
-            offset += 2;
-            if (offset + name_len > data.len) break;
-            const name = data[offset..][0..name_len];
-            offset += name_len;
-            ctx.print("{s}\n", .{name});
-        }
-
-        if (count == 0) {
-            ctx.print("(no namespaces)\n", .{});
-        }
+        ctx.print("(no namespaces)\n", .{});
     }
 }
 

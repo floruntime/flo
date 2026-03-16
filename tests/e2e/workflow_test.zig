@@ -157,6 +157,100 @@ test "e2e/workflow: create workflow with retry config" {
 }
 
 // =============================================================================
+// Workflow List Definitions Tests
+// =============================================================================
+
+test "e2e/workflow: list returns empty initially" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // flo workflow list
+    var result = try ctx.cli.run(&.{ "workflow", "list" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "(no workflows)");
+}
+
+test "e2e/workflow: list returns created workflows" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const wf1 =
+        \\kind: Workflow
+        \\name: list-wf-alpha
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const wf2 =
+        \\kind: Workflow
+        \\name: list-wf-beta
+        \\version: 2.0.0
+        \\start.run: @actions/process
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path1 = try writeDottedToTempYaml(testing.allocator, wf1, "list-wf-alpha.yaml");
+    defer cleanupTempFile(testing.allocator, path1);
+    const path2 = try writeDottedToTempYaml(testing.allocator, wf2, "list-wf-beta.yaml");
+    defer cleanupTempFile(testing.allocator, path2);
+
+    // Create both workflows
+    try ctx.exec(&.{ "workflow", "create", "-f", path1 });
+    try ctx.exec(&.{ "workflow", "create", "-f", path2 });
+
+    // flo workflow list (default table format)
+    var result = try ctx.cli.run(&.{ "workflow", "list" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // Table header
+    try stdx.testing.assertContains(result, "NAME");
+    try stdx.testing.assertContains(result, "VERSION");
+    // Workflow entries
+    try stdx.testing.assertContains(result, "list-wf-alpha");
+    try stdx.testing.assertContains(result, "1.0.0");
+    try stdx.testing.assertContains(result, "list-wf-beta");
+    try stdx.testing.assertContains(result, "2.0.0");
+}
+
+test "e2e/workflow: list is namespace-scoped" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const wf_def =
+        \\kind: Workflow
+        \\name: list-ns-wf
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+
+    const path = try writeDottedToTempYaml(testing.allocator, wf_def, "list-ns-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // Create workflow in namespace "team-a" only
+    try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", "team-a" });
+
+    // List in team-a should show the workflow
+    var result_a = try ctx.cli.run(&.{ "workflow", "list", "-n", "team-a" });
+    defer result_a.deinit();
+    try stdx.testing.assertSucceeded(result_a);
+    try stdx.testing.assertContains(result_a, "list-ns-wf");
+
+    // List in team-b should be empty
+    var result_b = try ctx.cli.run(&.{ "workflow", "list", "-n", "team-b" });
+    defer result_b.deinit();
+    try stdx.testing.assertSucceeded(result_b);
+    try stdx.testing.assertContains(result_b, "(no workflows)");
+}
+
+// =============================================================================
 // Workflow Lifecycle Tests
 // =============================================================================
 
@@ -170,7 +264,7 @@ test "e2e/workflow: list runs returns empty initially" {
 
     // Should succeed but return empty list
     try stdx.testing.assertSucceeded(result);
-    try stdx.testing.assertContains(result, "[]");
+    try stdx.testing.assertContains(result, "(no runs)");
 }
 
 test "e2e/workflow: get definition not found" {
@@ -2505,11 +2599,11 @@ test "e2e/workflow: start and status are namespace-scoped" {
     try stdx.testing.assertSucceeded(list_a);
     try stdx.testing.assertContains(list_a, "run-scoped");
 
-    // List runs in namespace B — should be empty (just "[]")
+    // List runs in namespace B — should be empty
     var list_b = try ctx.cli.run(&.{ "workflow", "list-runs", "run-scoped", "-n", "wf_run_b" });
     defer list_b.deinit();
     try stdx.testing.assertSucceeded(list_b);
-    try stdx.testing.assertContains(list_b, "[]");
+    try stdx.testing.assertContains(list_b, "(no runs)");
 }
 
 test "e2e/workflow: disable in one namespace does not affect another" {

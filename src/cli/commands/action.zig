@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
+const cli_output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
 const cli_config = @import("../config.zig");
@@ -339,11 +340,27 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    // Response data is the raw run_id string (no wire encoding for this response)
-    if (result.asRawData()) |run_id| {
-        if (run_id.len > 0) {
-            ctx.print("Result: {s}\n", .{run_id});
-            return;
+    // Response wire format: [run_id_len:u16][run_id][has_output:u8][output_len:u32]?[output]?
+    if (result.asRawData()) |data| {
+        if (data.len >= 2) {
+            const run_id_len = std.mem.readInt(u16, data[0..2], .little);
+            const run_id_end = @as(usize, 2) + run_id_len;
+            if (data.len >= run_id_end and run_id_len > 0) {
+                const run_id = data[2..run_id_end];
+                ctx.print("Result: {s}\n", .{run_id});
+
+                // Check for output after run_id
+                if (data.len > run_id_end and data[run_id_end] == 1) {
+                    const out_off = run_id_end + 1;
+                    if (data.len >= out_off + 4) {
+                        const out_len = std.mem.readInt(u32, data[out_off..][0..4], .little);
+                        if (data.len >= out_off + 4 + out_len) {
+                            ctx.print("Output: {s}\n", .{data[out_off + 4 ..][0..out_len]});
+                        }
+                    }
+                }
+                return;
+            }
         }
     }
     ctx.print("OK\n", .{});
@@ -638,98 +655,17 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         ctx.print("(no runs)\n", .{});
         return;
     };
-    if (data.len < 4) {
-        ctx.print("(no runs)\n", .{});
-        return;
-    }
 
-    var reader = WireReader.init(data);
-    const count = reader.readU32() orelse {
-        ctx.print("(no runs)\n", .{});
-        return;
-    };
-
-    if (count == 0) {
-        ctx.print("(no runs)\n", .{});
-        return;
-    }
-
-    // Table header
-    ctx.print("{s:<12} {s:<20} {s:<12} {s:<24} {s:<24} {s:<24}\n", .{
-        "RUN ID", "ACTION", "STATUS", "CREATED", "STARTED", "COMPLETED",
+    // Server wire format is read directly — enum_u8 maps status byte to string,
+    // timestamp_i64 formats as relative time, optional_timestamp_i64 handles has:u8 + i64.
+    cli_output.printWireList(ctx, data, "(no runs)", &.{
+        .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16 },
+        .{ .field = "action", .header = "ACTION", .field_type = .str_u16 },
+        .{ .field = "status", .header = "STATUS", .field_type = .enum_u8, .enum_labels = &.{ "pending", "running", "completed", "failed", "cancelled", "timed_out" } },
+        .{ .field = "created", .header = "CREATED", .field_type = .timestamp_i64 },
+        .{ .field = "started", .header = "STARTED", .field_type = .optional_timestamp_i64 },
+        .{ .field = "completed", .header = "COMPLETED", .field_type = .optional_timestamp_i64 },
     });
-    ctx.print("{s}\n", .{"-" ** 116});
-
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        // run_id
-        const rid_len = reader.readU16() orelse break;
-        const run_id = reader.readSlice(rid_len) orelse break;
-
-        // action_name
-        const aname_len = reader.readU16() orelse break;
-        const action_name = reader.readSlice(aname_len) orelse break;
-
-        // status
-        const status_byte = reader.readU8() orelse break;
-        const status_str: []const u8 = switch (status_byte) {
-            0 => "pending",
-            1 => "running",
-            2 => "completed",
-            3 => "failed",
-            4 => "cancelled",
-            5 => "timed_out",
-            else => "unknown",
-        };
-
-        // created_at
-        const created_at = reader.readI64() orelse break;
-
-        // started_at (optional)
-        const has_started = reader.readU8() orelse break;
-        var started_at: ?i64 = null;
-        if (has_started == 1) {
-            started_at = reader.readI64();
-        }
-
-        // completed_at (optional)
-        const has_completed = reader.readU8() orelse break;
-        var completed_at: ?i64 = null;
-        if (has_completed == 1) {
-            completed_at = reader.readI64();
-        }
-
-        // Format timestamps as relative durations or raw
-        var created_buf: [24]u8 = undefined;
-        const created_str = formatTimestamp(created_at, &created_buf);
-        var started_buf: [24]u8 = undefined;
-        const started_str = if (started_at) |s| formatTimestamp(s, &started_buf) else "—";
-        var completed_buf: [24]u8 = undefined;
-        const completed_str = if (completed_at) |c| formatTimestamp(c, &completed_buf) else "—";
-
-        ctx.print("{s:<12} {s:<20} {s:<12} {s:<24} {s:<24} {s:<24}\n", .{
-            run_id, action_name, status_str, created_str, started_str, completed_str,
-        });
-    }
-}
-
-fn formatTimestamp(ms: i64, buf: *[24]u8) []const u8 {
-    const now = std.time.milliTimestamp();
-    const diff = now - ms;
-
-    if (diff < 0) {
-        return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
-    }
-    if (diff < 1000) {
-        return std.fmt.bufPrint(buf, "{d}ms ago", .{diff}) catch "?";
-    }
-    if (diff < 60_000) {
-        return std.fmt.bufPrint(buf, "{d}s ago", .{@divTrunc(diff, 1000)}) catch "?";
-    }
-    if (diff < 3_600_000) {
-        return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(diff, 60_000)}) catch "?";
-    }
-    return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(diff, 3_600_000)}) catch "?";
 }
 
 // Worker handlers
@@ -994,82 +930,30 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         ctx.print("(no workers)\n", .{});
         return;
     };
-    if (data.len < 4) {
-        ctx.print("(no workers)\n", .{});
-        return;
-    }
 
-    var reader = WireReader.init(data);
-    const count = reader.readU32() orelse {
-        ctx.print("(no workers)\n", .{});
-        return;
-    };
-
-    if (count == 0) {
-        ctx.print("(no workers)\n", .{});
-        return;
-    }
-
-    // Table header
-    ctx.print("{s:<24} {s:<10} {s:<8} {s:<20} {s:<6} {s:<10} {s:<10}\n", .{
-        "WORKER ID", "STATUS", "TYPE", "MACHINE", "LOAD", "COMPLETED", "FAILED",
+    // Server wire format is read directly — enum_u8 maps type/status bytes,
+    // skip_counted_records_u16 skips the nested process list,
+    // optional_str_u16 handles metadata and machine_id.
+    cli_output.printWireList(ctx, data, "(no workers)", &.{
+        .{ .field = "worker_id", .header = "WORKER ID", .field_type = .str_u16 },
+        .{ .field = "type", .header = "TYPE", .field_type = .enum_u8, .enum_labels = &.{ "action", "stream" } },
+        .{ .field = "status", .header = "STATUS", .field_type = .enum_u8, .enum_labels = &.{ "active", "idle", "draining", "unhealthy" } },
+        .{ .field = "completed", .header = "COMPLETED", .field_type = .uint_u64 },
+        .{ .field = "failed", .header = "FAILED", .field_type = .uint_u64 },
+        .{ .field = "load", .header = "LOAD", .field_type = .uint_u32 },
+        .{ .field = "", .header = "", .field_type = .uint_u32 }, // max_concurrency (skip)
+        .{ .field = "", .header = "", .field_type = .int_i64 }, // registered_at (skip)
+        .{ .field = "", .header = "", .field_type = .int_i64 }, // last_heartbeat (skip)
+        .{ .field = "", .header = "", .field_type = .skip_counted_records_u16, .sub_columns = &.{
+            .{ .field = "", .header = "", .field_type = .str_u16 }, // name
+            .{ .field = "", .header = "", .field_type = .enum_u8 }, // kind
+            .{ .field = "", .header = "", .field_type = .uint_u64 }, // run_count
+            .{ .field = "", .header = "", .field_type = .uint_u64 }, // fail_count
+            .{ .field = "", .header = "", .field_type = .int_i64 }, // last_run_at
+        } },
+        .{ .field = "", .header = "", .field_type = .optional_str_u16 }, // metadata (skip)
+        .{ .field = "machine", .header = "MACHINE", .field_type = .optional_str_u16 },
     });
-    ctx.print("{s}\n", .{"-" ** 90});
-
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        // Parse worker_record: [id_len:u16][id][type:u8][status:u8]...
-        const id_len = reader.readU16() orelse break;
-        const id = reader.readSlice(id_len) orelse break;
-        const wtype = reader.readU8() orelse break;
-        const wstatus = reader.readU8() orelse break;
-        const tasks_completed = reader.readU64() orelse break;
-        const tasks_failed = reader.readU64() orelse break;
-        const current_load = reader.readU32() orelse break;
-        _ = reader.readU32(); // max_concurrency
-        _ = reader.readI64(); // registered_at
-        _ = reader.readI64(); // last_heartbeat
-
-        // Skip processes
-        const proc_count = reader.readU16() orelse break;
-        var pi: u16 = 0;
-        while (pi < proc_count) : (pi += 1) {
-            const nlen = reader.readU16() orelse break;
-            _ = reader.readSlice(nlen); // name
-            _ = reader.readU8(); // kind
-            _ = reader.readU64(); // run_count
-            _ = reader.readU64(); // fail_count
-            _ = reader.readI64(); // last_run_at
-        }
-
-        // Skip metadata
-        const has_meta = reader.readU8() orelse break;
-        if (has_meta == 1) {
-            const mlen = reader.readU16() orelse break;
-            _ = reader.readSlice(mlen);
-        }
-
-        // Skip machine_id but capture it
-        var machine: []const u8 = "—";
-        const has_mid = reader.readU8() orelse break;
-        if (has_mid == 1) {
-            const midlen = reader.readU16() orelse break;
-            machine = reader.readSlice(midlen) orelse "—";
-        }
-
-        const type_str: []const u8 = if (wtype == 0) "action" else "stream";
-        const status_str: []const u8 = switch (wstatus) {
-            0 => "active",
-            1 => "idle",
-            2 => "draining",
-            3 => "unhealthy",
-            else => "unknown",
-        };
-
-        ctx.print("{s:<24} {s:<10} {s:<8} {s:<20} {d:<6} {d:<10} {d:<10}\n", .{
-            id, status_str, type_str, machine, current_load, tasks_completed, tasks_failed,
-        });
-    }
 }
 
 fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {

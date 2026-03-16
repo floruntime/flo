@@ -518,59 +518,72 @@ pub const ProcessingHandler = struct {
         }
         if (limit == 0) limit = 100;
 
-        // Build JSON array of jobs
-        var response_buf: [65536]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&response_buf);
-        const writer = fbs.writer();
-
-        writer.writeByte('[') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
-            return;
-        };
-
         // Resolve effective namespace for filtering
         const req_ns = if (req.namespace.len > 0) req.namespace else "default";
 
-        var count: u32 = 0;
+        // Collect matching jobs
+        const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
+        var jobs: std.ArrayListUnmanaged(JobInfo) = .{};
+        defer jobs.deinit(self.allocator);
+
         var jit = self.jobs.iterator();
         while (jit.next()) |entry| {
-            if (count >= limit) break;
-
-            // Filter: only include jobs belonging to the requested namespace
-            const job_ns = entry.value_ptr.namespace_owned;
-            if (!std.mem.eql(u8, job_ns, req_ns)) continue;
-
-            if (count > 0) {
-                writer.writeByte(',') catch {
-                    shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
-                    return;
-                };
-            }
-
+            if (jobs.items.len >= limit) break;
             const job = entry.value_ptr;
-            std.fmt.format(writer,
-                \\{{"job_id":"{s}","name":"{s}","status":"{s}","parallelism":{d},"created_at_ms":{d}}}
-            , .{
-                job.job_id_owned,
-                job.name_owned,
-                job.status.toString(),
-                job.parallelism,
-                job.created_at_ms,
+            if (!std.mem.eql(u8, job.namespace_owned, req_ns)) continue;
+            jobs.append(self.allocator, .{
+                .name = job.name_owned,
+                .job_id = job.job_id_owned,
+                .status = job.status.toString(),
+                .parallelism = job.parallelism,
+                .created_at = job.created_at_ms,
             }) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
                 return;
             };
-
-            count += 1;
         }
 
-        writer.writeByte(']') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
+        // Serialize to binary wire format:
+        // [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
+        //  [status_len:u16][status][parallelism:u32][created_at:i64])*
+        // [has_more:u8][cursor_len:u16]
+        var total: usize = 4; // count
+        for (jobs.items) |j| {
+            total += 2 + j.name.len + 2 + j.job_id.len + 2 + j.status.len + 4 + 8;
+        }
+        total += 1 + 2; // trailer
+
+        const buf = self.allocator.alloc(u8, total) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
+        defer self.allocator.free(buf);
 
-        const written = fbs.getWritten();
-        shard.sendOkResponse(conn, req.header.request_id, written);
+        std.mem.writeInt(u32, buf[0..4], @intCast(jobs.items.len), .little);
+        var pos: usize = 4;
+        for (jobs.items) |j| {
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.name.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..j.name.len], j.name);
+            pos += j.name.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.job_id.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..j.job_id.len], j.job_id);
+            pos += j.job_id.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.status.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..j.status.len], j.status);
+            pos += j.status.len;
+            std.mem.writeInt(u32, buf[pos..][0..4], j.parallelism, .little);
+            pos += 4;
+            std.mem.writeInt(i64, buf[pos..][0..8], j.created_at, .little);
+            pos += 8;
+        }
+        buf[pos] = 0; // has_more
+        pos += 1;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+
+        shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
     // ── Savepoint ────────────────────────────────────────────────────────

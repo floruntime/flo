@@ -85,6 +85,7 @@ pub const ActionsHandler = struct {
         input_owned: ?[]const u8,
         labels_owned: ?[]const u8 = null,
         result_owned: ?[]const u8 = null,
+        outcome_owned: ?[]const u8 = null,
         worker_id_owned: ?[]const u8 = null,
         error_owned: ?[]const u8 = null,
         source: u8 = 0, // 0 = direct, 1 = workflow, 2 = trigger
@@ -120,6 +121,7 @@ pub const ActionsHandler = struct {
             if (entry.value_ptr.input_owned) |inp| self.allocator.free(inp);
             if (entry.value_ptr.labels_owned) |lbl| self.allocator.free(lbl);
             if (entry.value_ptr.result_owned) |res| self.allocator.free(res);
+            if (entry.value_ptr.outcome_owned) |out| self.allocator.free(out);
             if (entry.value_ptr.worker_id_owned) |wid| self.allocator.free(wid);
             if (entry.value_ptr.error_owned) |err_msg| self.allocator.free(err_msg);
         }
@@ -806,7 +808,10 @@ pub const ActionsHandler = struct {
         // Parse outcome
         if (offset + 2 > value.len) return "invalid value format";
         const outcome_len = std.mem.readInt(u16, value[offset..][0..2], .little);
-        offset += 2 + outcome_len;
+        offset += 2;
+        if (offset + outcome_len > value.len) return "invalid value format";
+        const outcome_str = value[offset .. offset + outcome_len];
+        offset += outcome_len;
 
         // Parse result
         var result_data: []const u8 = "";
@@ -826,6 +831,11 @@ pub const ActionsHandler = struct {
             if (req.key.len > 0) {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, req.key) catch null;
+            }
+            // Store outcome
+            if (outcome_str.len > 0) {
+                if (run.outcome_owned) |old| self.allocator.free(old);
+                run.outcome_owned = self.allocator.dupe(u8, outcome_str) catch null;
             }
             // Store result
             if (result_data.len > 0) {
@@ -991,6 +1001,7 @@ pub const ActionsHandler = struct {
     pub const InternalRunResult = struct {
         status: ActionRunStatus,
         output: ?[]const u8,
+        outcome: ?[]const u8 = null,
     };
 
     /// Invoke an action programmatically (used by WorkflowHandler).
@@ -1056,6 +1067,7 @@ pub const ActionsHandler = struct {
         return .{
             .status = run.status,
             .output = run.result_owned,
+            .outcome = run.outcome_owned,
         };
     }
 
@@ -1415,7 +1427,7 @@ pub const ActionsHandler = struct {
 
 const Waiter = waiter_pool_mod.Waiter;
 
-/// Action await resolver: claim a pending run matching the action name.
+/// Action await resolver: claim a pending run matching any action the worker handles.
 /// Waiter key is compound: action_name + worker_id (min_version = action_name.len).
 fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
@@ -1431,13 +1443,32 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     else
         null;
 
-    // Try to claim a pending run
-    const task = shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id) orelse return false;
+    // Try to claim a pending run for the primary action name first
+    if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
+        const conn = shard.getConnection(waiter.fd) orelse return true;
+        sendTaskAssignment(shard, conn, waiter.request_id, task);
+        shard.flushToClient(waiter.fd);
+        return true;
+    }
 
-    const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone
-    sendTaskAssignment(shard, conn, waiter.request_id, task);
-    shard.flushToClient(waiter.fd);
-    return true;
+    // If the worker is registered, try all its other action processes
+    if (worker_id.len > 0) {
+        if (shard.worker_handler.workers.get(worker_id)) |worker| {
+            for (worker.processes.items) |process| {
+                if (process.kind != .action) continue;
+                // Skip the primary name we already tried
+                if (std.mem.eql(u8, process.name_owned, action_name)) continue;
+                if (shard.actions_handler.claimPendingRun(process.name_owned, worker_labels, worker_id)) |task| {
+                    const conn = shard.getConnection(waiter.fd) orelse return true;
+                    sendTaskAssignment(shard, conn, waiter.request_id, task);
+                    shard.flushToClient(waiter.fd);
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
 /// Send a task assignment response in the full wire format:

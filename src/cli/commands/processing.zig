@@ -16,6 +16,7 @@ const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
+const output = @import("../output.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -293,15 +294,18 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    if (result.asRawData()) |data| {
-        if (data.len == 0) {
-            ctx.print("(no processing jobs)\n", .{});
-        } else {
-            ctx.print("{s}\n", .{data});
-        }
-    } else {
+    const data = result.asRawData() orelse {
         ctx.print("(no processing jobs)\n", .{});
-    }
+        return;
+    };
+
+    output.printWireList(ctx, data, "(no processing jobs)", &.{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "parallelism", .header = "", .field_type = .uint_u32 },
+        .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
+    });
 }
 
 fn runSavepoint(ctx: *commander.Context) commander.Error!void {

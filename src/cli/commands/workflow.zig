@@ -11,6 +11,7 @@
 //!   flo workflow definition <name> [--version <ver>]
 //!   flo workflow disable <name> [--version <ver>]
 //!   flo workflow enable <name> [--version <ver>]
+//!   flo workflow list
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,6 +19,7 @@ const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
+const output = @import("../output.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -149,6 +151,17 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .arg("name", "Workflow name")
                 .stringFlag("version", 'v', "", "Specific version (default: all versions)")
                 .action(wrapHandler(runEnable)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("list")
+                .about("List workflow definitions")
+                .aliases(&.{"ls"})
+                .examples(&.{
+                    "flo workflow list",
+                    "flo workflow list --namespace production",
+                })
+                .action(wrapHandler(runListDefinitions)),
         )
         .build();
 }
@@ -405,11 +418,11 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
     ctx.print("History for run: {s}\n", .{run_id});
     if (result.asRawData()) |data| {
-        if (data.len > 0) {
-            ctx.print("{s}\n", .{data});
-        } else {
-            ctx.print("(no events)\n", .{});
-        }
+        output.printWireList(ctx, data, "(no events)", &.{
+            .{ .field = "type", .header = "TYPE", .field_type = .str_u16, .alignment = .left },
+            .{ .field = "detail", .header = "DETAIL", .field_type = .str_u16, .alignment = .left },
+            .{ .field = "timestamp", .header = "", .field_type = .int_i64 },
+        });
     } else {
         ctx.print("(no events)\n", .{});
     }
@@ -449,11 +462,12 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 
     ctx.print("Runs for workflow: {s}\n", .{name});
     if (result.asRawData()) |data| {
-        if (data.len > 0) {
-            ctx.print("{s}\n", .{data});
-        } else {
-            ctx.print("(no runs)\n", .{});
-        }
+        output.printWireList(ctx, data, "(no runs)", &.{
+            .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
+            .{ .field = "workflow", .header = "WORKFLOW", .field_type = .str_u16, .alignment = .left },
+            .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
+            .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+        });
     } else {
         ctx.print("(no runs)\n", .{});
     }
@@ -619,6 +633,41 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.print("Workflow '{s}' enabled\n", .{name});
     }
+}
+
+fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
+    const namespace = ctx.getString("namespace") orelse "default";
+    const endpoint = cli_config.getEndpoint(ctx);
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    var result = client_mod.workflow.listDefinitions(&client, namespace) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const data = result.asRawData() orelse {
+        ctx.print("(no workflows)\n", .{});
+        return;
+    };
+
+    output.printWireList(ctx, data, "(no workflows)", &.{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "version", .header = "VERSION", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+    });
 }
 
 // =============================================================================

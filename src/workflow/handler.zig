@@ -882,34 +882,45 @@ pub const WorkflowHandler = struct {
             limit = std.mem.readInt(u32, req.value[0..4], .little);
         }
 
-        // Build JSON array of history events
-        var result_buf: [65536]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&result_buf);
-        const writer = fbs.writer();
-
-        writer.writeByte('[') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "history serialization failed");
-            return;
-        };
-
+        // Serialize to binary wire format:
+        // [count:u32]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+        // [has_more:u8][cursor_len:u16]
         const events = run.history.items;
-        const count = @min(events.len, limit);
-        for (events[0..count], 0..) |evt, i| {
-            if (i > 0) writer.writeByte(',') catch return;
-            std.fmt.format(writer,
-                \\{{"type":"{s}","detail":"{s}","timestamp":{d}}}
-            , .{ evt.event_type_owned, evt.detail_owned, evt.timestamp_ms }) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "history serialization failed");
-                return;
-            };
-        }
+        const count: u32 = @intCast(@min(events.len, limit));
 
-        writer.writeByte(']') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "history serialization failed");
+        var total: usize = 4; // count
+        for (events[0..count]) |evt| {
+            total += 2 + evt.event_type_owned.len; // type_len:u16 + type
+            total += 2 + evt.detail_owned.len; // detail_len:u16 + detail
+            total += 8; // timestamp:i64
+        }
+        total += 1 + 2; // trailer
+
+        const buf = self.allocator.alloc(u8, total) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
+        defer self.allocator.free(buf);
 
-        shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+        std.mem.writeInt(u32, buf[0..4], count, .little);
+        var pos: usize = 4;
+        for (events[0..count]) |evt| {
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(evt.event_type_owned.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..evt.event_type_owned.len], evt.event_type_owned);
+            pos += evt.event_type_owned.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(evt.detail_owned.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..evt.detail_owned.len], evt.detail_owned);
+            pos += evt.detail_owned.len;
+            std.mem.writeInt(i64, buf[pos..][0..8], evt.timestamp_ms, .little);
+            pos += 8;
+        }
+        buf[pos] = 0; // has_more
+        pos += 1;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+
+        shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
     // ── LIST RUNS ───────────────────────────────────────────────────────
@@ -936,16 +947,6 @@ pub const WorkflowHandler = struct {
             }
         }
 
-        // Build JSON array of matching runs
-        var result_buf: [65536]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&result_buf);
-        const writer = fbs.writer();
-
-        writer.writeByte('[') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list serialization failed");
-            return;
-        };
-
         // Build namespace prefix for filtering ("namespace:")
         const ns_prefix = self.makeNsKey(req.namespace, "") orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
@@ -953,47 +954,73 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(ns_prefix);
 
-        var count: u32 = 0;
+        // Collect matching runs
+        const RunInfo = struct { run_id: []const u8, workflow: []const u8, status: []const u8, created_at: i64 };
+        var runs_list: std.ArrayListUnmanaged(RunInfo) = .{};
+        defer runs_list.deinit(self.allocator);
+
         var rit = self.runs.iterator();
         while (rit.next()) |entry| {
-            if (count >= limit) break;
+            if (runs_list.items.len >= limit) break;
             const run = entry.value_ptr;
             const map_key = entry.key_ptr.*;
 
-            // Only include runs from the current namespace
             if (!std.mem.startsWith(u8, map_key, ns_prefix)) continue;
-
-            // Filter by workflow name if specified
-            if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) {
-                continue;
-            }
-
-            // Filter by status if specified
+            if (workflow_name.len > 0 and !std.mem.eql(u8, run.workflow_name_owned, workflow_name)) continue;
             if (status_filter) |sf| {
                 if (!std.mem.eql(u8, run.status.toString(), sf)) continue;
             }
 
-            if (count > 0) writer.writeByte(',') catch return;
-            std.fmt.format(writer,
-                \\{{"run_id":"{s}","workflow":"{s}","status":"{s}","created_at":{d}}}
-            , .{
-                run.run_id_owned,
-                run.workflow_name_owned,
-                run.status.toString(),
-                run.created_at_ms,
+            runs_list.append(self.allocator, .{
+                .run_id = run.run_id_owned,
+                .workflow = run.workflow_name_owned,
+                .status = run.status.toString(),
+                .created_at = run.created_at_ms,
             }) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list serialization failed");
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
                 return;
             };
-            count += 1;
         }
 
-        writer.writeByte(']') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list serialization failed");
+        // Serialize to binary wire format:
+        // [count:u32]([run_id_len:u16][run_id][workflow_len:u16][workflow]
+        //  [status_len:u16][status][created_at:i64])*
+        // [has_more:u8][cursor_len:u16]
+        var total: usize = 4; // count
+        for (runs_list.items) |r| {
+            total += 2 + r.run_id.len + 2 + r.workflow.len + 2 + r.status.len + 8;
+        }
+        total += 1 + 2; // trailer
+
+        const buf = self.allocator.alloc(u8, total) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
+        defer self.allocator.free(buf);
 
-        shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+        std.mem.writeInt(u32, buf[0..4], @intCast(runs_list.items.len), .little);
+        var pos: usize = 4;
+        for (runs_list.items) |r| {
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.run_id.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..r.run_id.len], r.run_id);
+            pos += r.run_id.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.workflow.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..r.workflow.len], r.workflow);
+            pos += r.workflow.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.status.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..r.status.len], r.status);
+            pos += r.status.len;
+            std.mem.writeInt(i64, buf[pos..][0..8], r.created_at, .little);
+            pos += 8;
+        }
+        buf[pos] = 0; // has_more
+        pos += 1;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+
+        shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
     // ── GET DEFINITION ──────────────────────────────────────────────────
@@ -1097,38 +1124,60 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(ns_prefix);
 
-        var result_buf: [65536]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&result_buf);
-        const writer = fbs.writer();
+        // Collect matching definitions
+        const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
+        var defs: std.ArrayListUnmanaged(DefInfo) = .{};
+        defer defs.deinit(self.allocator);
 
-        writer.writeByte('[') catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list serialization failed");
-            return;
-        };
-
-        var count: u32 = 0;
         var dit = self.definitions.iterator();
         while (dit.next()) |entry| {
             const def = entry.value_ptr;
             const map_key = entry.key_ptr.*;
-
-            // Only include definitions from the current namespace
             if (!std.mem.startsWith(u8, map_key, ns_prefix)) continue;
-
-            if (count > 0) writer.writeByte(',') catch return;
-            std.fmt.format(writer,
-                \\{{"name":"{s}","version":"{s}","created_at":{d}}}
-            , .{
-                def.name_owned,
-                def.version_owned,
-                def.created_at_ms,
-            }) catch return;
-            count += 1;
+            defs.append(self.allocator, .{
+                .name = def.name_owned,
+                .version = def.version_owned,
+                .created_at = def.created_at_ms,
+            }) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+                return;
+            };
         }
 
-        writer.writeByte(']') catch return;
+        // Serialize to binary wire format:
+        // [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
+        // [has_more:u8][cursor_len:u16]
+        var total: usize = 4; // count
+        for (defs.items) |d| {
+            total += 2 + d.name.len + 2 + d.version.len + 8;
+        }
+        total += 1 + 2; // trailer
 
-        shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+        const buf = self.allocator.alloc(u8, total) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+            return;
+        };
+        defer self.allocator.free(buf);
+
+        std.mem.writeInt(u32, buf[0..4], @intCast(defs.items.len), .little);
+        var pos: usize = 4;
+        for (defs.items) |d| {
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.name.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..d.name.len], d.name);
+            pos += d.name.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.version.len), .little);
+            pos += 2;
+            @memcpy(buf[pos..][0..d.version.len], d.version);
+            pos += d.version.len;
+            std.mem.writeInt(i64, buf[pos..][0..8], d.created_at, .little);
+            pos += 8;
+        }
+        buf[pos] = 0; // has_more
+        pos += 1;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+
+        shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
     // ── Step Executor ───────────────────────────────────────────────────
@@ -1461,10 +1510,12 @@ pub const WorkflowHandler = struct {
 
         const outcome: []const u8 = switch (result.status) {
             .completed => blk: {
+                // Use the named outcome from the action if provided, otherwise default to "success"
+                const action_outcome = result.outcome orelse definition.StepOutcome.success;
                 if (run.step_outputs) |*so| {
-                    so.put(self.allocator, step_label, result.output orelse "{}", definition.StepOutcome.success) catch {};
+                    so.put(self.allocator, step_label, result.output orelse "{}", action_outcome) catch {};
                 }
-                break :blk definition.StepOutcome.success;
+                break :blk action_outcome;
             },
             .failed => blk: {
                 if (run.step_outputs) |*so| {
@@ -2124,6 +2175,25 @@ pub const WorkflowHandler = struct {
         return self.runs.count();
     }
 };
+
+/// Write a string with JSON escaping (escapes ", \, and control chars).
+/// Caller writes surrounding quotes.
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20) {
+                try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests

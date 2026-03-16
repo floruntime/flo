@@ -682,7 +682,6 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 100;
-    const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -692,21 +691,26 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // Collect all streams from all shards
-    var all_streams: std.ArrayList(StreamEntry) = .empty;
+    // Accumulate raw row bytes from paginated wire responses.
+    // Server sends: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]?
+    // We copy the raw row bytes (between count and trailer) and track names for dedup.
+    var row_bytes: std.ArrayListUnmanaged(u8) = .{};
+    defer row_bytes.deinit(ctx.allocator);
+    var entry_count: u32 = 0;
+
+    // Track seen names for dedup across shards
+    var seen: std.StringHashMapUnmanaged(void) = .{};
     defer {
-        for (all_streams.items) |entry| {
-            ctx.allocator.free(entry.name);
-        }
-        all_streams.deinit(ctx.allocator);
+        var it = seen.keyIterator();
+        while (it.next()) |k| ctx.allocator.free(k.*);
+        seen.deinit(ctx.allocator);
     }
 
     var cursor: ?[]const u8 = null;
     var cursor_owned: ?[]u8 = null;
     defer if (cursor_owned) |c| ctx.allocator.free(c);
 
-    // Walk all shards until no more data
-    while (all_streams.items.len < limit) {
+    while (entry_count < limit) {
         var response = client_mod.stream.list(&client, namespace, @intCast(limit), cursor) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
             return error.CommandFailed;
@@ -718,62 +722,52 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             return error.CommandFailed;
         }
 
-        // Parse response data - wire format:
-        // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16][cursor]?
         if (response.data.len < 4) break;
 
         var reader = wire.WireReader.init(response.data);
         const count = reader.readU32() orelse break;
 
-        // Read streams
         var i: u32 = 0;
         while (i < count) : (i += 1) {
+            // Mark row start to capture raw bytes
+            const row_start = reader.pos;
+
             const name_len = reader.readU32() orelse break;
             const name = reader.readSlice(name_len) orelse break;
-            const partitions = reader.readU32() orelse break;
+            _ = reader.readU32() orelse break; // partition_count
 
-            // Check if already seen (dedup across shards)
-            var found = false;
-            for (all_streams.items) |entry| {
-                if (std.mem.eql(u8, entry.name, name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                const name_copy = ctx.allocator.dupe(u8, name) catch break;
-                all_streams.append(ctx.allocator, .{ .name = name_copy, .partitions = partitions }) catch {
-                    ctx.allocator.free(name_copy);
-                    break;
-                };
-            }
+            const row_end = reader.pos;
 
-            if (all_streams.items.len >= limit) break;
+            // Dedup by name
+            if (seen.get(name) != null) continue;
+            const name_copy = ctx.allocator.dupe(u8, name) catch break;
+            seen.put(ctx.allocator, name_copy, {}) catch {
+                ctx.allocator.free(name_copy);
+                break;
+            };
+
+            // Copy raw row bytes
+            row_bytes.appendSlice(ctx.allocator, response.data[row_start..row_end]) catch break;
+            entry_count += 1;
+            if (entry_count >= limit) break;
         }
 
-        // Read has_more flag
         const has_more = (reader.readU8() orelse 0) != 0;
-
-        // Read next cursor
         const cursor_len = reader.readU16() orelse 0;
         const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
 
-        // Free previous cursor and copy new one
         if (cursor_owned) |c| ctx.allocator.free(c);
         cursor_owned = null;
 
-        if (!has_more or next_cursor == null) {
-            break; // Done walking shards
-        }
+        if (!has_more or next_cursor == null) break;
 
-        // Copy cursor for next iteration
         cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
         cursor = cursor_owned;
     }
 
-    // Output results
-    if (all_streams.items.len == 0) {
-        if (json_output) {
+    if (entry_count == 0) {
+        const fmt = output.getFormat(ctx);
+        if (fmt == .json) {
             ctx.print("[]\n", .{});
         } else {
             ctx.print("No streams found in namespace '{s}'\n", .{namespace});
@@ -781,27 +775,18 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    if (json_output) {
-        ctx.print("[", .{});
-        for (all_streams.items, 0..) |entry, idx| {
-            if (idx > 0) ctx.print(",", .{});
-            ctx.print("{{\"name\":\"{s}\",\"partitions\":{d}}}", .{ entry.name, entry.partitions });
-        }
-        ctx.print("]\n", .{});
-    } else {
-        ctx.print("Streams in namespace '{s}':\n", .{namespace});
-        ctx.print("{s:<30} {s:<12}\n", .{ "NAME", "PARTITIONS" });
-        ctx.print("{s}\n", .{"-" ** 42});
-        for (all_streams.items) |entry| {
-            ctx.print("{s:<30} {d:<12}\n", .{ entry.name, entry.partitions });
-        }
-    }
-}
+    // Build final wire buffer: [count:u32][accumulated_raw_rows]
+    const buf = ctx.allocator.alloc(u8, 4 + row_bytes.items.len) catch return;
+    defer ctx.allocator.free(buf);
 
-const StreamEntry = struct {
-    name: []const u8,
-    partitions: u32,
-};
+    std.mem.writeInt(u32, buf[0..4], entry_count, .little);
+    @memcpy(buf[4..][0..row_bytes.items.len], row_bytes.items);
+
+    output.printWireList(ctx, buf, "No streams found", &.{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u32 },
+        .{ .field = "partitions", .header = "PARTITIONS", .field_type = .uint_u32, .alignment = .right },
+    });
+}
 
 fn runTrim(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander

@@ -32,6 +32,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("commander/mod.zig");
 const Context = commander.Context;
+const wire_mod = @import("../util/wire.zig");
+const WireReader = wire_mod.WireReader;
 
 /// Central JSON utilities - re-exported from util/json.zig
 pub const Json = @import("../util/json.zig");
@@ -222,6 +224,351 @@ pub const Table = struct {
 pub fn printList(ctx: *Context, items: []const []const u8) void {
     for (items) |item| {
         ctx.print("{s}\n", .{item});
+    }
+}
+
+// ============================================================================
+// Wire List Printer — format binary wire responses as table / json / raw
+//
+// Architecture: two-phase decode → render.
+//   1. readFieldValue() decodes one wire field into a FieldValue union.
+//   2. Renderers (table/json/raw) operate on FieldValue — no wire knowledge.
+// Adding a new field type: update WireFieldType, readFieldValue, skipField,
+// formatFieldForDisplay, writeJsonField, writeRawField.
+// ============================================================================
+
+/// Wire field types for binary list entries.
+pub const WireFieldType = enum {
+    str_u16, // [len:u16][bytes] — string with u16 length prefix
+    str_u32, // [len:u32][bytes] — string with u32 length prefix
+    uint_u32, // [value:u32] — unsigned 32-bit integer
+    uint_u64, // [value:u64] — unsigned 64-bit integer
+    int_i64, // [value:i64] — signed 64-bit integer
+    enum_u8, // [value:u8] — mapped to string via enum_labels
+    timestamp_i64, // [value:i64] — relative time string (table/raw), raw int (json)
+    optional_timestamp_i64, // [has:u8][value?:i64] — "—" if absent
+    optional_str_u16, // [has:u8][len?:u16][bytes?] — "—" if absent
+    skip_counted_records_u16, // [count:u16](sub_record)* — skip nested records, uses sub_columns
+};
+
+/// Column spec for printWireList: maps a binary field to a table column.
+///
+/// The column list must match the wire entry layout exactly — every field
+/// in the binary entry must have a corresponding WireColumn (in order).
+/// Set `header = ""` to read a field from the wire but hide it from table
+/// output. JSON output includes all columns with non-empty `field`.
+pub const WireColumn = struct {
+    field: []const u8, // JSON field name
+    header: []const u8, // Table column header (empty = hidden from table)
+    field_type: WireFieldType,
+    alignment: Alignment = .left,
+    enum_labels: ?[]const []const u8 = null, // index→string mapping for enum_u8
+    sub_columns: ?[]const WireColumn = null, // record layout for skip_counted_records_u16
+};
+
+/// Decoded wire field value — output of readFieldValue, input to renderers.
+const FieldValue = union(enum) {
+    string: []const u8,
+    uint: u64,
+    int: i64,
+    enum_val: u8,
+    optional_int: ?i64,
+    optional_string: ?[]const u8,
+    skipped: void,
+};
+
+/// Format a binary wire list response as table, json, or raw output.
+///
+/// Expects the standard binary wire format:
+///   [count:u32] ([field1][field2]...)* [has_more:u8] [cursor_len:u16] [cursor]?
+///
+/// Only the count and per-entry fields are consumed. The has_more/cursor
+/// trailer (if present) is left unread — callers needing pagination should
+/// inspect `data` themselves after this function returns.
+pub fn printWireList(
+    ctx: *Context,
+    data: []const u8,
+    empty_message: []const u8,
+    columns: []const WireColumn,
+) void {
+    var reader = WireReader.init(data);
+
+    const count = reader.readU32() orelse {
+        ctx.print("{s}\n", .{empty_message});
+        return;
+    };
+    if (count == 0) {
+        ctx.print("{s}\n", .{empty_message});
+        return;
+    }
+
+    switch (getFormat(ctx)) {
+        .json => printWireJson(ctx, &reader, count, columns),
+        .raw => printWireRaw(ctx, &reader, count, columns),
+        .table => printWireTable(ctx, &reader, count, columns),
+    }
+}
+
+// ── Wire decoding (phase 1) ─────────────────────────────────────────────
+
+/// Read one wire field and return a typed FieldValue.
+fn readFieldValue(reader: *WireReader, col: WireColumn) ?FieldValue {
+    return switch (col.field_type) {
+        .str_u16 => .{ .string = reader.readLengthPrefixed(u16) orelse return null },
+        .str_u32 => .{ .string = reader.readLengthPrefixed(u32) orelse return null },
+        .uint_u32 => .{ .uint = reader.readU32() orelse return null },
+        .uint_u64 => .{ .uint = reader.readU64() orelse return null },
+        .int_i64, .timestamp_i64 => .{ .int = reader.readI64() orelse return null },
+        .enum_u8 => .{ .enum_val = reader.readU8() orelse return null },
+        .optional_timestamp_i64 => blk: {
+            const has = reader.readU8() orelse return null;
+            break :blk .{ .optional_int = if (has == 1) (reader.readI64() orelse return null) else null };
+        },
+        .optional_str_u16 => blk: {
+            const has = reader.readU8() orelse return null;
+            break :blk .{ .optional_string = if (has == 1) (reader.readLengthPrefixed(u16) orelse return null) else null };
+        },
+        .skip_counted_records_u16 => blk: {
+            skipField(reader, col);
+            break :blk .skipped;
+        },
+    };
+}
+
+/// Advance the reader past a single wire field (used for skipping).
+fn skipField(reader: *WireReader, col: WireColumn) void {
+    switch (col.field_type) {
+        .str_u16 => _ = reader.readLengthPrefixed(u16),
+        .str_u32 => _ = reader.readLengthPrefixed(u32),
+        .uint_u32 => _ = reader.readU32(),
+        .uint_u64 => _ = reader.readU64(),
+        .int_i64, .timestamp_i64 => _ = reader.readI64(),
+        .enum_u8 => _ = reader.readU8(),
+        .optional_timestamp_i64 => {
+            const has = reader.readU8() orelse return;
+            if (has == 1) _ = reader.readI64();
+        },
+        .optional_str_u16 => {
+            const has = reader.readU8() orelse return;
+            if (has == 1) _ = reader.readLengthPrefixed(u16);
+        },
+        .skip_counted_records_u16 => {
+            const cnt = reader.readU16() orelse return;
+            var j: u16 = 0;
+            while (j < cnt) : (j += 1) {
+                for (col.sub_columns orelse return) |sc| skipField(reader, sc);
+            }
+        },
+    }
+}
+
+// ── Shared helpers ──────────────────────────────────────────────────────
+
+/// Format an i64 millisecond timestamp as a relative time string.
+fn formatRelativeTimeBuf(ms: i64, buf: *[24]u8) []const u8 {
+    const now = std.time.milliTimestamp();
+    const diff = now - ms;
+    if (diff < 0) return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
+    if (diff < 1000) return std.fmt.bufPrint(buf, "{d}ms ago", .{diff}) catch "?";
+    if (diff < 60_000) return std.fmt.bufPrint(buf, "{d}s ago", .{@divTrunc(diff, 1000)}) catch "?";
+    if (diff < 3_600_000) return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(diff, 60_000)}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(diff, 3_600_000)}) catch "?";
+}
+
+/// Resolve enum_val → label string using column metadata.
+fn enumLabel(col: WireColumn, v: u8) []const u8 {
+    if (col.enum_labels) |l| if (v < l.len) return l[v];
+    return "unknown";
+}
+
+/// Dupe a stack-buffered string, track it in `formatted` for cleanup.
+fn dupeFormatted(
+    s: []const u8,
+    allocator: Allocator,
+    formatted: *std.ArrayList([]const u8),
+) ?[]const u8 {
+    const d = allocator.dupe(u8, s) catch return null;
+    formatted.append(allocator, d) catch {
+        allocator.free(d);
+        return null;
+    };
+    return d;
+}
+
+// ── Renderers (phase 2) ─────────────────────────────────────────────────
+
+/// Convert a FieldValue to a display string for table output.
+/// Numeric values are formatted to decimal and tracked in `formatted` for cleanup.
+fn formatFieldForDisplay(
+    val: FieldValue,
+    col: WireColumn,
+    allocator: Allocator,
+    formatted: *std.ArrayList([]const u8),
+) ?[]const u8 {
+    switch (val) {
+        .string => |s| return s,
+        .uint => |v| {
+            var buf: [24]u8 = undefined;
+            return dupeFormatted(std.fmt.bufPrint(&buf, "{d}", .{v}) catch return null, allocator, formatted);
+        },
+        .int => |v| {
+            var buf: [24]u8 = undefined;
+            const s = if (col.field_type == .timestamp_i64) formatRelativeTimeBuf(v, &buf) else (std.fmt.bufPrint(&buf, "{d}", .{v}) catch return null);
+            return dupeFormatted(s, allocator, formatted);
+        },
+        .enum_val => |v| return enumLabel(col, v),
+        .optional_int => |maybe| {
+            const v = maybe orelse return "\xe2\x80\x94";
+            var buf: [24]u8 = undefined;
+            const s = if (col.field_type == .optional_timestamp_i64) formatRelativeTimeBuf(v, &buf) else (std.fmt.bufPrint(&buf, "{d}", .{v}) catch return null);
+            return dupeFormatted(s, allocator, formatted);
+        },
+        .optional_string => |maybe| return maybe orelse "\xe2\x80\x94",
+        .skipped => return "",
+    }
+}
+
+/// Emit one JSON field. Caller handles comma separation.
+fn writeJsonField(ctx: *Context, col: WireColumn, val: FieldValue) void {
+    switch (val) {
+        .string => |s| ctx.print("\"{s}\":\"{s}\"", .{ col.field, s }),
+        .uint => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
+        .int => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
+        .enum_val => |v| ctx.print("\"{s}\":\"{s}\"", .{ col.field, enumLabel(col, v) }),
+        .optional_int => |maybe| {
+            if (maybe) |v| ctx.print("\"{s}\":{d}", .{ col.field, v }) else ctx.print("\"{s}\":null", .{col.field});
+        },
+        .optional_string => |maybe| {
+            if (maybe) |s| ctx.print("\"{s}\":\"{s}\"", .{ col.field, s }) else ctx.print("\"{s}\":null", .{col.field});
+        },
+        .skipped => {},
+    }
+}
+
+/// Emit one field value for raw output.
+fn writeRawField(ctx: *Context, col: WireColumn, val: FieldValue) void {
+    switch (val) {
+        .string => |s| ctx.print("{s}", .{s}),
+        .uint => |v| ctx.print("{d}", .{v}),
+        .int => |v| {
+            if (col.field_type == .timestamp_i64) {
+                var buf: [24]u8 = undefined;
+                ctx.print("{s}", .{formatRelativeTimeBuf(v, &buf)});
+            } else ctx.print("{d}", .{v});
+        },
+        .enum_val => |v| ctx.print("{s}", .{enumLabel(col, v)}),
+        .optional_int => |maybe| {
+            if (maybe) |v| {
+                if (col.field_type == .optional_timestamp_i64) {
+                    var buf: [24]u8 = undefined;
+                    ctx.print("{s}", .{formatRelativeTimeBuf(v, &buf)});
+                } else ctx.print("{d}", .{v});
+            } else ctx.print("\xe2\x80\x94", .{});
+        },
+        .optional_string => |maybe| {
+            if (maybe) |s| ctx.print("{s}", .{s}) else ctx.print("\xe2\x80\x94", .{});
+        },
+        .skipped => {},
+    }
+}
+
+// ── Top-level format dispatchers ────────────────────────────────────────
+
+fn printWireTable(
+    ctx: *Context,
+    reader: *WireReader,
+    count: u32,
+    columns: []const WireColumn,
+) void {
+    var table = Table.init(ctx.allocator);
+    defer table.deinit();
+
+    var formatted: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (formatted.items) |s| ctx.allocator.free(s);
+        formatted.deinit(ctx.allocator);
+    }
+
+    for (columns) |col| {
+        if (col.header.len > 0) table.addColumn(col.header, col.alignment) catch return;
+    }
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        var cells: [32][]const u8 = undefined;
+        var cell_idx: usize = 0;
+        var ok = true;
+
+        for (columns) |col| {
+            const fv = readFieldValue(reader, col) orelse {
+                ok = false;
+                break;
+            };
+            if (col.header.len > 0) {
+                cells[cell_idx] = formatFieldForDisplay(fv, col, ctx.allocator, &formatted) orelse {
+                    ok = false;
+                    break;
+                };
+                cell_idx += 1;
+            }
+        }
+
+        if (!ok) break;
+        table.addRow(cells[0..cell_idx]) catch continue;
+    }
+
+    table.print(ctx);
+}
+
+fn printWireJson(
+    ctx: *Context,
+    reader: *WireReader,
+    count: u32,
+    columns: []const WireColumn,
+) void {
+    ctx.print("[", .{});
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) ctx.print(",", .{});
+        ctx.print("{{", .{});
+        var first = true;
+        for (columns) |col| {
+            const fv = readFieldValue(reader, col) orelse return;
+            if (col.field.len == 0) continue;
+            if (!first) ctx.print(",", .{});
+            first = false;
+            writeJsonField(ctx, col, fv);
+        }
+        ctx.print("}}", .{});
+    }
+    ctx.print("]\n", .{});
+}
+
+/// Raw output: prints the first visible column's value per row, one per line.
+fn printWireRaw(
+    ctx: *Context,
+    reader: *WireReader,
+    count: u32,
+    columns: []const WireColumn,
+) void {
+    var first_visible: ?usize = null;
+    for (columns, 0..) |col, ci| {
+        if (col.header.len > 0) {
+            first_visible = ci;
+            break;
+        }
+    }
+    if (first_visible == null) return;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        for (columns, 0..) |col, ci| {
+            const fv = readFieldValue(reader, col) orelse return;
+            if (ci == first_visible.?) {
+                writeRawField(ctx, col, fv);
+                ctx.print("\n", .{});
+            }
+        }
     }
 }
 

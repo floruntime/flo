@@ -148,8 +148,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-
-
 fn runEnqueue(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
     const payload = ctx.getPositional("payload").?; // validated by commander
@@ -523,21 +521,10 @@ test "create queue command" {
 
 // ==================== Queue List ====================
 
-const QueueListEntry = struct {
-    name: []const u8,
-    namespace: []const u8,
-    pending: u64,
-    available: u64,
-    enqueued: u64,
-    dequeued: u64,
-    dlq: u64,
-};
-
 fn runList(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 100;
-    const json_output = ctx.getBool("json");
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -547,22 +534,25 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // Collect all queues from all shards via cursor-based shard walking
-    var all_queues: std.ArrayList(QueueListEntry) = .empty;
+    // Accumulate raw row bytes from paginated wire responses.
+    // Server sends: [count:u32]([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*[has_more:u8][cursor_len:u16][cursor]?
+    var row_bytes: std.ArrayListUnmanaged(u8) = .{};
+    defer row_bytes.deinit(ctx.allocator);
+    var entry_count: u32 = 0;
+
+    // Track seen names for dedup across shards
+    var seen: std.StringHashMapUnmanaged(void) = .{};
     defer {
-        for (all_queues.items) |entry| {
-            ctx.allocator.free(entry.name);
-            ctx.allocator.free(entry.namespace);
-        }
-        all_queues.deinit(ctx.allocator);
+        var it = seen.keyIterator();
+        while (it.next()) |k| ctx.allocator.free(k.*);
+        seen.deinit(ctx.allocator);
     }
 
     var cursor: ?[]const u8 = null;
     var cursor_owned: ?[]u8 = null;
     defer if (cursor_owned) |c| ctx.allocator.free(c);
 
-    // Walk all shards until no more data
-    while (all_queues.items.len < limit) {
+    while (entry_count < limit) {
         var response = client_mod.queue.list(&client, namespace, @intCast(limit), cursor) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
             return error.CommandFailed;
@@ -574,82 +564,55 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             return error.CommandFailed;
         }
 
-        // Parse response data - wire format:
-        // [count:u32] ([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])* [has_more:u8] [cursor_len:u16][cursor]?
         if (response.data.len < 4) break;
 
         var reader = WireReader.init(response.data);
         const count = reader.readU32() orelse break;
 
-        // Read queues
         var i: u32 = 0;
         while (i < count) : (i += 1) {
+            const row_start = reader.pos;
+
             const name_len = reader.readU32() orelse break;
             const name = reader.readSlice(name_len) orelse break;
             const ns_len = reader.readU32() orelse break;
-            const ns = reader.readSlice(ns_len) orelse break;
-            const pending = reader.readU64() orelse break;
-            const available = reader.readU64() orelse break;
-            const enqueued = reader.readU64() orelse break;
-            const dequeued = reader.readU64() orelse break;
-            const dlq_count = reader.readU64() orelse break;
+            _ = reader.readSlice(ns_len) orelse break; // namespace
+            _ = reader.readU64() orelse break; // pending
+            _ = reader.readU64() orelse break; // available
+            _ = reader.readU64() orelse break; // enqueued
+            _ = reader.readU64() orelse break; // dequeued
+            _ = reader.readU64() orelse break; // dlq
 
-            // Dedup across shards (same queue name shouldn't appear on multiple shards,
-            // but guard against it)
-            var found = false;
-            for (all_queues.items) |entry| {
-                if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.namespace, ns)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                const name_copy = ctx.allocator.dupe(u8, name) catch break;
-                const ns_copy = ctx.allocator.dupe(u8, ns) catch {
-                    ctx.allocator.free(name_copy);
-                    break;
-                };
-                all_queues.append(ctx.allocator, .{
-                    .name = name_copy,
-                    .namespace = ns_copy,
-                    .pending = pending,
-                    .available = available,
-                    .enqueued = enqueued,
-                    .dequeued = dequeued,
-                    .dlq = dlq_count,
-                }) catch {
-                    ctx.allocator.free(name_copy);
-                    ctx.allocator.free(ns_copy);
-                    break;
-                };
-            }
+            const row_end = reader.pos;
 
-            if (all_queues.items.len >= limit) break;
+            if (seen.get(name) != null) continue;
+            const name_copy = ctx.allocator.dupe(u8, name) catch break;
+            seen.put(ctx.allocator, name_copy, {}) catch {
+                ctx.allocator.free(name_copy);
+                break;
+            };
+
+            row_bytes.appendSlice(ctx.allocator, response.data[row_start..row_end]) catch break;
+            entry_count += 1;
+            if (entry_count >= limit) break;
         }
 
-        // Read has_more flag
         const has_more = (reader.readU8() orelse 0) != 0;
-
-        // Read next cursor
         const cursor_len = reader.readU16() orelse 0;
         const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
 
-        // Free previous cursor and copy new one
         if (cursor_owned) |c| ctx.allocator.free(c);
         cursor_owned = null;
 
-        if (!has_more or next_cursor == null) {
-            break; // Done walking shards
-        }
+        if (!has_more or next_cursor == null) break;
 
-        // Copy cursor for next iteration
         cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
         cursor = cursor_owned;
     }
 
-    // Output results
-    if (all_queues.items.len == 0) {
-        if (json_output) {
+    if (entry_count == 0) {
+        const fmt = output.getFormat(ctx);
+        if (fmt == .json) {
             ctx.print("[]\n", .{});
         } else {
             ctx.print("No queues found in namespace '{s}'\n", .{namespace});
@@ -657,19 +620,20 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    if (json_output) {
-        ctx.print("[", .{});
-        for (all_queues.items, 0..) |entry, idx| {
-            if (idx > 0) ctx.print(",", .{});
-            ctx.print("{{\"name\":\"{s}\",\"namespace\":\"{s}\",\"pending\":{d},\"available\":{d},\"enqueued\":{d},\"dequeued\":{d},\"dlq\":{d}}}", .{ entry.name, entry.namespace, entry.pending, entry.available, entry.enqueued, entry.dequeued, entry.dlq });
-        }
-        ctx.print("]\n", .{});
-    } else {
-        ctx.print("Queues in namespace '{s}':\n", .{namespace});
-        ctx.print("{s:<20} {s:<12} {s:<10} {s:<10} {s:<10} {s:<10} {s:<6}\n", .{ "NAME", "NAMESPACE", "PENDING", "AVAILABLE", "ENQUEUED", "DEQUEUED", "DLQ" });
-        ctx.print("{s}\n", .{"-" ** 78});
-        for (all_queues.items) |entry| {
-            ctx.print("{s:<20} {s:<12} {d:<10} {d:<10} {d:<10} {d:<10} {d:<6}\n", .{ entry.name, entry.namespace, entry.pending, entry.available, entry.enqueued, entry.dequeued, entry.dlq });
-        }
-    }
+    // Build final wire buffer: [count:u32][accumulated_raw_rows]
+    const buf = ctx.allocator.alloc(u8, 4 + row_bytes.items.len) catch return;
+    defer ctx.allocator.free(buf);
+
+    std.mem.writeInt(u32, buf[0..4], entry_count, .little);
+    @memcpy(buf[4..][0..row_bytes.items.len], row_bytes.items);
+
+    output.printWireList(ctx, buf, "No queues found", &.{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u32 },
+        .{ .field = "namespace", .header = "NAMESPACE", .field_type = .str_u32 },
+        .{ .field = "pending", .header = "PENDING", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "available", .header = "AVAILABLE", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "enqueued", .header = "ENQUEUED", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "dequeued", .header = "DEQUEUED", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "dlq", .header = "DLQ", .field_type = .uint_u64, .alignment = .right },
+    });
 }
