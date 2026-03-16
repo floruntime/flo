@@ -3,6 +3,7 @@
 //! A comprehensive CLI with grouped commands, examples, and configuration sections.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const commander = @import("commander/mod.zig");
 const commands = @import("commands/mod.zig");
 
@@ -50,7 +51,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .name("flo")
         .about("Flo - High-performance distributed platform")
         .usage("flo <command> [args...]")
-        .version("0.1.0")
+        .version(build_options.version)
         .examples(&.{
             "flo server start --port 9000 --data-dir ./data",
             "flo status --endpoint localhost:9000",
@@ -293,7 +294,7 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
 }
 
 fn showVersion(ctx: *commander.Context) commander.Error!void {
-    ctx.print("flo version 0.1.0\n", .{});
+    ctx.print("flo version {s}\n", .{build_options.version});
 }
 
 fn showHelp(ctx: *commander.Context) commander.Error!void {

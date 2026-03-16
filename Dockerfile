@@ -46,15 +46,16 @@ COPY --from=web-builder /build/web/dist/ ./src/node/dashboard/dist/
 # When BUILDPLATFORM == TARGETPLATFORM, this is a native build (no -Dtarget needed).
 # When they differ (e.g. building arm64 on amd64), Zig cross-compiles without QEMU.
 ARG TARGETPLATFORM
+ARG FLO_VERSION=dev
 RUN case "${TARGETPLATFORM}" in \
       linux/arm64)  ZIG_TARGET="aarch64-linux-musl" ;; \
       linux/amd64)  ZIG_TARGET="x86_64-linux-musl"  ;; \
       *)            ZIG_TARGET="" ;; \
     esac && \
     if [ -n "${ZIG_TARGET}" ]; then \
-      zig build -Drelease -Dtarget=${ZIG_TARGET}; \
+      zig build -Drelease -Dtarget=${ZIG_TARGET} -Dversion=${FLO_VERSION}; \
     else \
-      zig build -Drelease; \
+      zig build -Drelease -Dversion=${FLO_VERSION}; \
     fi
 
 # Stage 3: Runtime image

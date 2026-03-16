@@ -4,6 +4,7 @@
 //! - GET /metrics       — Internal metrics (JSON format)
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
@@ -33,7 +34,7 @@ pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     try obj.intField("rps", rps);
     try obj.intField("active_connections", server_metrics.connections);
     try obj.stringField("uptime", uptime_str);
-    try obj.stringField("version", "0.9.0");
+    try obj.stringField("version", build_options.version);
     try obj.intField("num_shards", num_shards);
     try obj.intField("commands_total", server_metrics.commands_total);
     try obj.intField("bytes_received", server_metrics.bytes_received);

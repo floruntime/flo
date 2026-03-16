@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
     });
     const zware_module = zware_dep.module("zware");
 
+    // ── Version (git describe) ──
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", getGitVersion(b));
+
     // ── Dashboard Assets ──
     // Generate assets.zig by scanning src/node/dashboard/dist at configure time.
     // The file is @import'd by http_server.zig via relative path.
@@ -37,6 +42,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("stdx", stdx_module);
     exe.root_module.addImport("zware", zware_module);
+    exe.root_module.addOptions("build_options", build_options);
     exe.linkLibC();
 
     b.installArtifact(exe);
@@ -77,6 +83,7 @@ pub fn build(b: *std.Build) void {
     });
     src_module.addImport("stdx", stdx_module);
     src_module.addImport("zware", zware_module);
+    src_module.addOptions("build_options", build_options);
 
     // ── Test Filter ──
 
@@ -95,6 +102,7 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("src", src_module);
     unit_tests.root_module.addImport("stdx", stdx_module);
     unit_tests.root_module.addImport("zware", zware_module);
+    unit_tests.root_module.addOptions("build_options", build_options);
     unit_tests.linkLibC();
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -112,6 +120,7 @@ pub fn build(b: *std.Build) void {
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
     e2e_tests.root_module.addImport("zware", zware_module);
+    e2e_tests.root_module.addOptions("build_options", build_options);
     e2e_tests.linkLibC();
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
@@ -130,6 +139,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.addImport("src", src_module);
     integration_tests.root_module.addImport("stdx", stdx_module);
     integration_tests.root_module.addImport("zware", zware_module);
+    integration_tests.root_module.addOptions("build_options", build_options);
     integration_tests.linkLibC();
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
@@ -342,4 +352,20 @@ fn getMimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
     if (std.mem.endsWith(u8, path, ".map")) return "application/json";
     return "application/octet-stream";
+}
+
+fn getGitVersion(b: *std.Build) []const u8 {
+    const version_override = b.option([]const u8, "version", "Override version string");
+    if (version_override) |v| return v;
+
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "describe", "--tags", "--always", "--dirty" },
+    }) catch return "dev";
+
+    const out = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    if (out.len == 0) return "dev";
+
+    // Strip leading 'v' prefix (e.g. "v0.1.0-dev.3" → "0.1.0-dev.3")
+    return if (out[0] == 'v') out[1..] else out;
 }

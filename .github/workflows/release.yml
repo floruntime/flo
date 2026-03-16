@@ -61,8 +61,12 @@ jobs:
           mkdir -p ../src/node/dashboard/dist
           cp -r dist/* ../src/node/dashboard/dist/
 
+      - name: Determine version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build release binary
-        run: zig build --release=safe -Dtarget=${{ matrix.target }}
+        run: zig build --release=safe -Dtarget=${{ matrix.target }} -Dversion=${{ steps.version.outputs.VERSION }}
 
       - name: Package
         run: |
