@@ -1020,8 +1020,8 @@ pub const StreamHandler = struct {
 
     /// Read payloads from a named stream (used by processing pipelines).
     /// Uses per-stream StreamID reads for proper stream isolation.
-    /// Returns (payloads slice, next_sequence cursor) so the pipeline can advance.
-    pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, start_offset: u64, limit: usize) struct { payloads: []const []const u8, next_offset: u64 } {
+    /// Returns (payloads slice, last StreamID read) so the pipeline can advance its cursor.
+    pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) struct { payloads: []const []const u8, last_id: StreamID } {
         var results: [1000][]const u8 = undefined;
         var count: usize = 0;
         const capped = @min(limit, 1000);
@@ -1029,12 +1029,10 @@ pub const StreamHandler = struct {
         const ns_hash_u32 = router.namespaceHash(namespace);
         const name_hash = router.nameHash(ns_hash_u32, stream_name);
 
-        // Use StreamID-based read: treat start_offset as a bare sequence
-        const start_id = StreamID.fromSeq(start_offset);
         var rec_buf: [1000]StreamRecord = undefined;
-        const n = self.stream.readStreamAfter(name_hash, start_id, null, rec_buf[0..capped]);
+        const n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
 
-        var last_seq: u64 = start_offset;
+        var last_id = after_id;
         for (rec_buf[0..n]) |rec| {
             if (count >= capped) break;
             const result = self.getPayloadAndTier(rec.ual_index);
@@ -1056,13 +1054,12 @@ pub const StreamHandler = struct {
                     count += 1;
                 }
             }
-            last_seq = rec.id.sequence;
+            last_id = rec.id;
         }
 
-        const next = if (n > 0) last_seq + 1 else start_offset;
-        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .next_offset = next };
+        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .last_id = last_id };
         @memcpy(out, results[0..count]);
-        return .{ .payloads = out, .next_offset = next };
+        return .{ .payloads = out, .last_id = last_id };
     }
 
     /// Try to unpack a batch-format stream value into individual record payloads.

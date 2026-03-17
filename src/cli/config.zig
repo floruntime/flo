@@ -18,12 +18,33 @@ pub fn getDefaultNamespace() []const u8 {
     return std.posix.getenv("FLO_NAMESPACE") orelse "default";
 }
 
+/// Static buffer for --port constructed endpoint (CLI is single-threaded).
+var port_endpoint_buf: [21]u8 = undefined; // "127.0.0.1:" (10) + max u16 digits (5) + margin
+
 /// Get endpoint from command flags, falling back to env/default.
+/// Precedence: --endpoint > --port > FLO_ENDPOINT > FLO_PORT > "127.0.0.1:9000"
 pub fn getEndpoint(ctx: *commander.Context) []const u8 {
+    // --endpoint flag takes highest precedence
     if (ctx.getString("endpoint")) |ep| {
         if (ep.len > 0) return ep;
     }
-    return getDefaultEndpoint();
+    // --port flag: construct 127.0.0.1:{port}
+    if (ctx.getChangedUint("port")) |port_val| {
+        if (port_val > 0 and port_val <= 65535) {
+            return std.fmt.bufPrint(&port_endpoint_buf, "127.0.0.1:{d}", .{port_val}) catch
+                return getDefaultEndpoint();
+        }
+    }
+    // FLO_ENDPOINT env
+    if (std.posix.getenv("FLO_ENDPOINT")) |ep| return ep;
+    // FLO_PORT env
+    if (std.posix.getenv("FLO_PORT")) |port_str| {
+        if (std.fmt.parseInt(u16, port_str, 10)) |_| {
+            return std.fmt.bufPrint(&port_endpoint_buf, "127.0.0.1:{s}", .{port_str}) catch
+                return "127.0.0.1:9000";
+        } else |_| {}
+    }
+    return "127.0.0.1:9000";
 }
 
 /// Get namespace from command flags, falling back to env/default.

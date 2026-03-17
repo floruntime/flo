@@ -104,7 +104,11 @@ pub const CreateResult = struct {
                 ptr.deinit();
                 allocator.destroy(ptr);
             },
-            .expr_filter => |ptr| allocator.destroy(ptr),
+            .expr_filter => |ptr| {
+                allocator.free(ptr.condition);
+                allocator.free(ptr.name);
+                allocator.destroy(ptr);
+            },
             .passthrough => |ptr| allocator.destroy(ptr),
             .kv_lookup => |ptr| {
                 ptr.deinit(allocator);
@@ -183,8 +187,14 @@ fn createExprFilter(allocator: Allocator, spec: *const OperatorSpec) CreateError
         return CreateError.MissingConfig;
     };
 
+    // Dupe name and condition — the spec is freed after pipeline creation
+    const owned_name = allocator.dupe(u8, spec.name) catch return CreateError.OutOfMemory;
+    errdefer allocator.free(owned_name);
+    const owned_condition = allocator.dupe(u8, condition) catch return CreateError.OutOfMemory;
+    errdefer allocator.free(owned_condition);
+
     const ptr = allocator.create(ExprFilterOperator) catch return CreateError.OutOfMemory;
-    ptr.* = ExprFilterOperator.init(spec.name, condition);
+    ptr.* = ExprFilterOperator.init(owned_name, owned_condition);
 
     return .{
         .op = ptr.operator(),
@@ -352,6 +362,10 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     const rules = allocator.alloc(ClassifyRule, rule_count) catch return CreateError.OutOfMemory;
     errdefer allocator.free(rules);
 
+    // Dupe the operator name — the spec is freed after pipeline creation
+    const owned_name = allocator.dupe(u8, spec.name) catch return CreateError.OutOfMemory;
+    errdefer allocator.free(owned_name);
+
     var idx: usize = 0;
     for (0..rule_count) |i| {
         // Build key strings for lookup
@@ -376,8 +390,17 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
             };
         };
 
+        // Dupe the condition string — the spec config is freed after pipeline creation.
+        // ExprFilterOperator.init parses sub-slices into this string, so the dupe
+        // must outlive the operator.
+        const owned_condition = allocator.dupe(u8, condition) catch {
+            // Free conditions already duped for previous rules
+            for (rules[0..idx]) |*r| allocator.free(r.condition.condition);
+            return CreateError.OutOfMemory;
+        };
+
         rules[idx] = .{
-            .condition = ExprFilterOperator.init(spec.name, condition),
+            .condition = ExprFilterOperator.init(owned_name, owned_condition),
             .tag_bit = tag_bit,
         };
         idx += 1;
@@ -399,7 +422,7 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     } else null;
 
     const ptr = allocator.create(ClassifyOperator) catch return CreateError.OutOfMemory;
-    ptr.* = ClassifyOperator.init(allocator, spec.name, rules[0..idx], default_tag_bit);
+    ptr.* = ClassifyOperator.init(allocator, owned_name, rules[0..idx], default_tag_bit);
 
     return .{
         .op = ptr.operator(),

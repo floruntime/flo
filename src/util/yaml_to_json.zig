@@ -345,6 +345,12 @@ const Converter = struct {
             }
         }
 
+        // YAML flow sequence: [item1, item2, ...] → JSON array
+        if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+            try self.writeFlowSequence(trimmed);
+            return;
+        }
+
         // Strip inline comments from unquoted values (YAML spec: " #" starts a comment)
         const clean = stripInlineComment(trimmed);
 
@@ -368,6 +374,35 @@ const Converter = struct {
 
         // Unquoted string - needs to be quoted
         try self.writeString(clean);
+    }
+
+    /// Convert a YAML flow sequence `[item1, item2, ...]` to a JSON array.
+    fn writeFlowSequence(self: *Converter, value: []const u8) ConvertError!void {
+        const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
+        self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
+
+        if (inner.len > 0) {
+            var first = true;
+            var rest: []const u8 = inner;
+            while (rest.len > 0) {
+                if (!first) {
+                    self.output.append(self.allocator, ',') catch return ConvertError.OutOfMemory;
+                }
+                first = false;
+
+                if (mem.indexOf(u8, rest, ",")) |comma_pos| {
+                    const item = mem.trim(u8, rest[0..comma_pos], " \t");
+                    try self.writeValue(item);
+                    rest = if (comma_pos + 1 < rest.len) rest[comma_pos + 1 ..] else "";
+                } else {
+                    const item = mem.trim(u8, rest, " \t");
+                    try self.writeValue(item);
+                    break;
+                }
+            }
+        }
+
+        self.output.append(self.allocator, ']') catch return ConvertError.OutOfMemory;
     }
 
     /// Strip inline YAML comments: " # ..." (space-hash) outside quoted strings.

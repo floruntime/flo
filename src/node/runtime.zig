@@ -30,6 +30,7 @@ const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfi
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const generateNodeId = @import("../raft/network.zig").generateNodeId;
+const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const manifest = @import("manifest.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
@@ -179,6 +180,9 @@ pub const Runtime = struct {
     /// Slots: [0] = ts_list. More slots added as modules gain list support.
     walk_ctx_slices: [8]?[]*anyopaque,
 
+    /// Cross-shard stream handler array — allocated during wirePeerStreamHandlers, freed on deinit.
+    peer_stream_handlers_slice: ?[]const *StreamHandler,
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         const shard_count = detectShardCount(config.num_shards);
 
@@ -198,6 +202,7 @@ pub const Runtime = struct {
             .dashboard_ctx = null,
             .metrics_registry = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
+            .peer_stream_handlers_slice = null,
         };
     }
 
@@ -247,6 +252,12 @@ pub const Runtime = struct {
                 self.allocator.free(s);
                 slot.* = null;
             }
+        }
+
+        // Clean up peer stream handler array
+        if (self.peer_stream_handlers_slice) |s| {
+            self.allocator.free(s);
+            self.peer_stream_handlers_slice = null;
         }
 
         // Clean up shards
@@ -346,6 +357,9 @@ pub const Runtime = struct {
         // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
         // Each walk opcode gets a slice of per-shard projection pointers.
         try self.wireWalkContexts(shards);
+
+        // 2.55 Wire cross-shard stream handler references for processing pipelines.
+        try self.wirePeerStreamHandlers(shards);
 
         // 2.6 Register cooperative background tasks (hot_flush, etc.).
         // Must happen after shards are at final heap addresses.
@@ -455,6 +469,23 @@ pub const Runtime = struct {
 
         self.started = true;
         log.debug("Runtime.start: all components started, node is ready", .{});
+    }
+
+    /// Wire cross-shard stream handler references so processing pipelines
+    /// can read/write streams on any shard.
+    fn wirePeerStreamHandlers(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const handlers = try self.allocator.alloc(*StreamHandler, n);
+        for (0..n) |i| {
+            handlers[i] = shards[i].stream_handler;
+        }
+        self.peer_stream_handlers_slice = handlers;
+
+        const partition_count = shards[0].router.partition_count;
+        const shard_count = shards[0].router.shard_count;
+        for (0..n) |i| {
+            shards[i].processing_handler.setPeerStreamHandlers(handlers, partition_count, shard_count);
+        }
     }
 
     /// Wire cross-shard walk contexts for all walk-registered opcodes.

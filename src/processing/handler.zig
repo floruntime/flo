@@ -40,6 +40,8 @@ const StoredPoint = ts_mod.StoredPoint;
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const stream_handler_mod = @import("../stream/handler.zig");
+const StreamID = @import("../projection/stream.zig").StreamID;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
@@ -86,6 +88,12 @@ pub const ProcessingHandler = struct {
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
 
+    /// Cross-shard stream handlers — one per shard, wired by Runtime.
+    /// Enables pipelines to read/write streams on the shard that owns them.
+    peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
+    peer_shard_count: u16 = 1,
+    peer_partition_count: u32 = 0,
+
     const MAX_JOBS: usize = 100_000;
 
     /// Sink configuration for a single sink in the pipeline.
@@ -116,7 +124,8 @@ pub const ProcessingHandler = struct {
 
         // Read cursors — track what's been processed
         ts_cursor_ns: u64, // TS source: next timestamp_ns to read from
-        stream_cursor: u64, // Stream source: last offset read
+        stream_cursor_ts: u64, // Stream source: last StreamID timestamp_ms read
+        stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
 
         // Operator chain — instantiated from job definition
@@ -194,6 +203,27 @@ pub const ProcessingHandler = struct {
             self.allocator.free(entry.value_ptr.job_id_owned);
         }
         self.savepoints.deinit();
+    }
+
+    /// Wire cross-shard stream handler references.
+    /// Called by Runtime after all shards are initialized.
+    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler, partition_count: u32, shard_count: u16) void {
+        self.peer_stream_handlers = handlers;
+        self.peer_partition_count = partition_count;
+        self.peer_shard_count = shard_count;
+    }
+
+    /// Resolve the correct StreamHandler for a given stream name + namespace.
+    /// Uses hashKey (key-only, no namespace prefix) to match the Acceptor's
+    /// connection routing — the Acceptor peeks the raw key and hashes with
+    /// hashKey(), so stream data lives on the shard selected by hashKey(name).
+    fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, _: []const u8) *stream_handler_mod.StreamHandler {
+        const peers = self.peer_stream_handlers orelse return local;
+        if (peers.len <= 1) return local;
+        const hash = router.hashKey(stream_name);
+        const partition_id: u32 = @intCast(hash % self.peer_partition_count);
+        const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
+        return peers[shard_id];
     }
 
     fn freeJobRecord(self: *ProcessingHandler, job: *JobRecord) void {
@@ -1072,7 +1102,8 @@ pub const ProcessingHandler = struct {
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
             .sinks = sink_configs,
             .ts_cursor_ns = 0,
-            .stream_cursor = 0,
+            .stream_cursor_ts = 0,
+            .stream_cursor_seq = 0,
             .last_poll_ms = 0,
         };
     }
@@ -1104,7 +1135,7 @@ pub const ProcessingHandler = struct {
 
             switch (pipe.source_kind) {
                 .ts => tickTsSource(pipe, shard, job),
-                .stream => tickStreamSource(pipe, shard, job),
+                .stream => self.tickStreamSource(pipe, shard, job),
             }
         }
     }
@@ -1155,17 +1186,17 @@ pub const ProcessingHandler = struct {
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
-    fn tickStreamSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+    fn tickStreamSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+        // Build cursor from last-read StreamID
+        const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
+
+        // Resolve the stream handler that owns the source stream (may be on a different shard)
+        const src_handler = self.resolveStreamHandler(shard.stream_handler, pipe.src_stream, pipe.src_namespace);
+
         // Read from the named source stream using namespace-qualified name-hash filtering
-        const result = shard.stream_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, pipe.stream_cursor + 1, 100);
-        if (result.payloads.len == 0) {
-            // Still advance cursor so we don't re-scan the same empty range
-            if (result.next_offset > pipe.stream_cursor + 1) {
-                pipe.stream_cursor = result.next_offset - 1;
-            }
-            return;
-        }
-        defer shard.stream_handler.allocator.free(result.payloads);
+        const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, 100);
+        if (result.payloads.len == 0) return;
+        defer src_handler.allocator.free(result.payloads);
 
         for (result.payloads) |payload| {
             const output_records = applyOperatorChain(pipe.operators, payload, std.time.milliTimestamp(), shard.allocator) catch null;
@@ -1173,19 +1204,18 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer shard.allocator.free(records);
                 for (records) |rec| {
-                    writeSinkRecordFromStream(pipe, shard, rec.value, rec.tags);
+                    self.writeSinkRecordFromStream(pipe, shard, rec.value, rec.tags);
                 }
             } else {
-                writeSinkRecordFromStream(pipe, shard, payload, 0);
+                self.writeSinkRecordFromStream(pipe, shard, payload, 0);
             }
 
             job.records_processed += 1;
         }
 
-        // Advance cursor past the scanned range
-        if (result.next_offset > pipe.stream_cursor) {
-            pipe.stream_cursor = result.next_offset - 1;
-        }
+        // Advance cursor to last StreamID read
+        pipe.stream_cursor_ts = result.last_id.timestamp_ms;
+        pipe.stream_cursor_seq = result.last_id.sequence;
     }
 
     /// Apply the operator chain to a single input value.
@@ -1260,12 +1290,13 @@ pub const ProcessingHandler = struct {
     }
 
     /// Write a processed record to all matching sinks (stream source variant).
-    fn writeSinkRecordFromStream(pipe: *PipelineState, shard: *Shard, payload: []const u8, record_tags: u32) void {
+    fn writeSinkRecordFromStream(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, record_tags: u32) void {
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
             switch (snk.kind) {
                 .stream => {
-                    _ = shard.stream_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                    const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
+                    _ = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
                 },
                 .ts => {
                     // Extract value from JSON payload using the sink's value_field as source key.

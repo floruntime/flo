@@ -64,7 +64,13 @@ pub const ClassifyOperator = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free owned condition strings (duped in createClassify)
+        for (self.rules) |*rule| {
+            self.allocator.free(rule.condition.condition);
+        }
         self.allocator.free(self.rules);
+        // Free owned name (duped in createClassify)
+        self.allocator.free(self.name);
     }
 
     /// Return an Operator interface backed by this ClassifyOperator

@@ -40,6 +40,7 @@ const StepOutputMap = wf_types.StepOutputMap;
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
+const StreamID = @import("../projection/stream.zig").StreamID;
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
 const Partition = @import("../storage/partition.zig").Partition;
@@ -177,7 +178,8 @@ pub const WorkflowHandler = struct {
         stream_namespace_owned: []const u8,
         batch_size: u32,
         poll_interval_ms: u32,
-        stream_cursor: u64,
+        stream_cursor_ts: u64,
+        stream_cursor_seq: u64,
         last_poll_ms: i64,
     };
 
@@ -1729,7 +1731,8 @@ pub const WorkflowHandler = struct {
             .stream_namespace_owned = owned_stream_ns,
             .batch_size = trigger.batch_size,
             .poll_interval_ms = trigger.batch_timeout_ms,
-            .stream_cursor = 0,
+            .stream_cursor_ts = 0,
+            .stream_cursor_seq = 0,
             .last_poll_ms = 0,
         }) catch {
             self.allocator.free(trigger_key);
@@ -1771,18 +1774,14 @@ pub const WorkflowHandler = struct {
 
             // Read from the source stream
             const batch_limit: usize = @intCast(trigger.batch_size);
+            const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
             const result = shard.stream_handler.readPayloadsForStream(
                 trigger.stream_name_owned,
                 trigger.stream_namespace_owned,
-                trigger.stream_cursor + 1,
+                cursor,
                 @max(batch_limit, 1) * 10, // read ahead for batching
             );
-            if (result.payloads.len == 0) {
-                if (result.next_offset > trigger.stream_cursor + 1) {
-                    trigger.stream_cursor = result.next_offset - 1;
-                }
-                continue;
-            }
+            if (result.payloads.len == 0) continue;
             defer shard.stream_handler.allocator.free(result.payloads);
 
             // Start one run per event (or per batch if batch_size > 1)
@@ -1807,10 +1806,9 @@ pub const WorkflowHandler = struct {
                 }
             }
 
-            // Advance cursor
-            if (result.next_offset > trigger.stream_cursor) {
-                trigger.stream_cursor = result.next_offset - 1;
-            }
+            // Advance cursor to last StreamID read
+            trigger.stream_cursor_ts = result.last_id.timestamp_ms;
+            trigger.stream_cursor_seq = result.last_id.sequence;
         }
     }
 
