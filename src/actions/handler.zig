@@ -43,6 +43,8 @@ const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
 const Flags = entry_mod.Flags;
 
+const ns_keys = @import("../namespace/handler.zig");
+
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -71,6 +73,7 @@ pub const ActionsHandler = struct {
 
     pub const ActionRecord = struct {
         name_owned: []const u8,
+        namespace_owned: []const u8,
         action_type: u8, // 0 = user, 1 = wasm
         version: u32,
         enabled: bool,
@@ -89,6 +92,8 @@ pub const ActionsHandler = struct {
         worker_id_owned: ?[]const u8 = null,
         error_owned: ?[]const u8 = null,
         source: u8 = 0, // 0 = direct, 1 = workflow, 2 = trigger
+        caller_run_id_owned: ?[]const u8 = null,
+        caller_workflow_name_owned: ?[]const u8 = null,
         status: ActionRunStatus,
         created_at_ms: i64,
         started_at_ms: ?i64,
@@ -109,6 +114,7 @@ pub const ActionsHandler = struct {
         var ait = self.actions.iterator();
         while (ait.next()) |entry| {
             if (entry.value_ptr.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(entry.value_ptr.namespace_owned);
             self.allocator.free(entry.value_ptr.name_owned);
         }
         self.actions.deinit();
@@ -124,6 +130,8 @@ pub const ActionsHandler = struct {
             if (entry.value_ptr.outcome_owned) |out| self.allocator.free(out);
             if (entry.value_ptr.worker_id_owned) |wid| self.allocator.free(wid);
             if (entry.value_ptr.error_owned) |err_msg| self.allocator.free(err_msg);
+            if (entry.value_ptr.caller_run_id_owned) |crid| self.allocator.free(crid);
+            if (entry.value_ptr.caller_workflow_name_owned) |cwn| self.allocator.free(cwn);
         }
         self.runs.deinit();
     }
@@ -172,7 +180,7 @@ pub const ActionsHandler = struct {
         const result = shard.actions_handler.handleCommand(shard, req);
         defer shard.actions_handler.freeResult(result);
         switch (result) {
-            .action_registered => shard.namespace_handler.markNamespaceHasData(req.namespace),
+            .action_registered => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
         sendActionResponse(shard, conn, req.header.request_id, result);
@@ -189,7 +197,7 @@ pub const ActionsHandler = struct {
         // Use notifyAny because waiter keys are compound (action_name + worker_id).
         switch (result) {
             .action_invoked => {
-                shard.namespace_handler.markNamespaceHasData(req.namespace);
+                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
             },
             else => {},
@@ -311,6 +319,8 @@ pub const ActionsHandler = struct {
         action_name: []const u8,
         input: ?[]const u8,
         created_at_ms: i64,
+        caller_run_id: ?[]const u8 = null,
+        caller_workflow_name: ?[]const u8 = null,
     };
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
@@ -338,7 +348,7 @@ pub const ActionsHandler = struct {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms };
+            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned };
         }
         return null;
     }
@@ -362,6 +372,7 @@ pub const ActionsHandler = struct {
 
     fn handleRegister(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const name = req.key;
+        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
 
         if (name.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
@@ -381,6 +392,7 @@ pub const ActionsHandler = struct {
         if (self.actions.fetchRemove(name)) |old| {
             version = old.value.version + 1;
             if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
         }
 
@@ -393,17 +405,23 @@ pub const ActionsHandler = struct {
         const owned_name = self.allocator.dupe(u8, name) catch {
             return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
         };
+        const owned_ns = self.allocator.dupe(u8, namespace) catch {
+            self.allocator.free(owned_name);
+            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
+        };
 
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
 
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
+            .namespace_owned = owned_ns,
             .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = now_ns,
             .wasm_blob_owned = wasm_blob,
         }) catch {
+            self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
         };
@@ -608,9 +626,9 @@ pub const ActionsHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *ActionsHandler, req: Request) CommandResult {
-        _ = req;
+        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
 
-        const data = self.serializeActionList() catch {
+        const data = self.serializeActionList(namespace) catch {
             return .{ .err = .{ .code = .internal_error, .message = "action list serialization failed" } };
         };
 
@@ -723,12 +741,13 @@ pub const ActionsHandler = struct {
     /// from one shard's ActionsHandler registry.
     fn localScanActions(
         ctx: *anyopaque,
-        _: []const u8, // namespace
+        namespace: []const u8,
         _: []const u8, // filter
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *ActionsHandler = @ptrCast(@alignCast(ctx));
+        const effective_ns = if (namespace.len == 0) "default" else namespace;
         const S = struct {
             threadlocal var name_buf: [1024][]const u8 = undefined;
         };
@@ -737,6 +756,7 @@ pub const ActionsHandler = struct {
         var it = handler.actions.iterator();
         while (it.next()) |entry| {
             if (count >= S.name_buf.len) break;
+            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, effective_ns)) continue;
             S.name_buf[count] = entry.value_ptr.name_owned;
             count += 1;
         }
@@ -755,6 +775,7 @@ pub const ActionsHandler = struct {
 
         if (self.actions.fetchRemove(name)) |kv| {
             if (kv.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(kv.value.namespace_owned);
             self.allocator.free(kv.value.name_owned);
 
             // Persist deletion through Raft
@@ -937,12 +958,13 @@ pub const ActionsHandler = struct {
     /// Wire format (scan format matching CLI expectations):
     ///   [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16]
     /// Key = action name, Value = [type:u8][version:u32][enabled:u8]
-    fn serializeActionList(self: *ActionsHandler) ![]u8 {
+    fn serializeActionList(self: *ActionsHandler, namespace: []const u8) ![]u8 {
         const value_size: usize = 1 + 4 + 1; // type + version + enabled
         var total_size: usize = 4; // count
         var entry_count: u32 = 0;
         var it = self.actions.iterator();
         while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) continue;
             total_size += 2 + entry.value_ptr.name_owned.len + 4 + value_size;
             entry_count += 1;
         }
@@ -958,6 +980,7 @@ pub const ActionsHandler = struct {
         var it2 = self.actions.iterator();
         while (it2.next()) |entry| {
             const rec = entry.value_ptr;
+            if (!std.mem.eql(u8, rec.namespace_owned, namespace)) continue;
             // key_len + key
             std.mem.writeInt(u16, buf[offset..][0..2], @intCast(rec.name_owned.len), .little);
             offset += 2;
@@ -1009,7 +1032,7 @@ pub const ActionsHandler = struct {
     /// Returns null if the action doesn't exist or on allocation failure.
     /// For user-hosted actions the `shard` is used to notify blocked
     /// action_await waiters so external workers can claim the run.
-    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8) ?[]const u8 {
+    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         // Check action exists
         if (!self.actions.contains(action_name)) return null;
 
@@ -1027,6 +1050,14 @@ pub const ActionsHandler = struct {
             self.allocator.dupe(u8, i) catch null
         else
             null;
+        const owned_caller_run_id: ?[]const u8 = if (caller_run_id) |crid|
+            self.allocator.dupe(u8, crid) catch null
+        else
+            null;
+        const owned_caller_workflow_name: ?[]const u8 = if (caller_workflow_name) |cwn|
+            self.allocator.dupe(u8, cwn) catch null
+        else
+            null;
 
         const now_ms: i64 = std.time.milliTimestamp();
 
@@ -1034,6 +1065,8 @@ pub const ActionsHandler = struct {
             .run_id_owned = owned_run_id,
             .action_name_owned = owned_action_name,
             .input_owned = owned_input,
+            .caller_run_id_owned = owned_caller_run_id,
+            .caller_workflow_name_owned = owned_caller_workflow_name,
             .status = .pending,
             .created_at_ms = now_ms,
             .started_at_ms = null,
@@ -1042,6 +1075,8 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_run_id);
             self.allocator.free(owned_action_name);
             if (owned_input) |inp| self.allocator.free(inp);
+            if (owned_caller_run_id) |crid| self.allocator.free(crid);
+            if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
             return null;
         };
 
@@ -1077,6 +1112,7 @@ pub const ActionsHandler = struct {
 
     /// Persist an action registration.
     /// Value format: [version:u32][created_at_ns:u64][original_req_value...]
+    /// Key is namespace-qualified (ns\x00name) so namespace can be recovered during replay.
     fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, req_value: []const u8) void {
         _ = self;
         var value_buf: [65536]u8 = undefined;
@@ -1087,7 +1123,9 @@ pub const ActionsHandler = struct {
             @memcpy(value_buf[12 .. 12 + req_value.len], req_value);
         }
         const value = value_buf[0 .. 12 + req_value.len];
-        _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, name, value) catch {};
+        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
+        _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, qkey, value) catch {};
     }
 
     /// Persist an action invocation (run creation).
@@ -1140,7 +1178,9 @@ pub const ActionsHandler = struct {
     /// Persist an action deletion.
     fn persistDelete(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8) void {
         _ = self;
-        _ = persistence.persistEntry(shard, .action_delete, Flags.TOMBSTONE, namespace, name, "") catch {};
+        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
+        _ = persistence.persistEntry(shard, .action_delete, Flags.TOMBSTONE, namespace, qkey, "") catch {};
     }
 
     /// Persist a run status update (complete, fail, retry).
@@ -1230,8 +1270,18 @@ pub const ActionsHandler = struct {
     }
 
     /// Rebuild an ActionRecord from a persisted register entry.
-    fn replayRegister(self: *ActionsHandler, name: []const u8, value: []const u8) void {
+    /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
+    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8) void {
         if (value.len < 12) return; // need version(4) + created_at_ns(8)
+
+        // Extract namespace from qualified key
+        var namespace: []const u8 = "default";
+        var name = key;
+        if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR)) |sep| {
+            namespace = key[0..sep];
+            name = key[sep + 1..];
+        }
+
         const version = std.mem.readInt(u32, value[0..4], .little);
         const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
         const req_value = value[12..];
@@ -1245,26 +1295,40 @@ pub const ActionsHandler = struct {
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(name)) |old| {
             if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
         }
 
         const owned_name = self.allocator.dupe(u8, name) catch return;
+        const owned_ns = self.allocator.dupe(u8, namespace) catch {
+            self.allocator.free(owned_name);
+            return;
+        };
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
+            .namespace_owned = owned_ns,
             .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = created_at_ns,
             .wasm_blob_owned = wasm_blob,
         }) catch {
+            self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
         };
     }
 
     /// Remove an action on replay of a delete entry.
-    fn replayDelete(self: *ActionsHandler, name: []const u8) void {
+    /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
+    fn replayDelete(self: *ActionsHandler, key: []const u8) void {
+        // Extract plain name from possibly qualified key
+        var name = key;
+        if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR)) |sep| {
+            name = key[sep + 1..];
+        }
         if (self.actions.fetchRemove(name)) |old| {
             if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
+            self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
         }
     }
@@ -1475,8 +1539,12 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
 ///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
 fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
     const payload = task.input orelse "";
+    const caller_run_id = task.caller_run_id orelse "";
+    const caller_wf_name = task.caller_workflow_name orelse "";
+    const has_caller: u8 = if (task.caller_run_id != null) 1 else 0;
+    const caller_extra: usize = if (has_caller == 1) (2 + caller_run_id.len + 2 + caller_wf_name.len) else 0;
     var buf: [8192]u8 = undefined;
-    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + payload.len;
+    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len;
     if (total > buf.len) {
         shard.sendOkResponse(conn, request_id, task.run_id);
         return;
@@ -1498,6 +1566,19 @@ fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: A
     // attempt (always 1 for initial assignment)
     std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
     pos += 4;
+    // has_caller flag + optional caller block
+    buf[pos] = has_caller;
+    pos += 1;
+    if (has_caller == 1) {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(caller_run_id.len), .little);
+        pos += 2;
+        @memcpy(buf[pos .. pos + caller_run_id.len], caller_run_id);
+        pos += caller_run_id.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(caller_wf_name.len), .little);
+        pos += 2;
+        @memcpy(buf[pos .. pos + caller_wf_name.len], caller_wf_name);
+        pos += caller_wf_name.len;
+    }
     // payload
     if (payload.len > 0) {
         @memcpy(buf[pos .. pos + payload.len], payload);

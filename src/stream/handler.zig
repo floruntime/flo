@@ -179,7 +179,7 @@ pub const StreamHandler = struct {
         const op: proto.OpCode = @enumFromInt(req.header.op_code);
         if (op == .stream_create) {
             switch (cmd_result) {
-                .ok => shard.namespace_handler.markNamespaceHasData(req.namespace),
+                .ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
                 else => {},
             }
         }
@@ -197,7 +197,7 @@ pub const StreamHandler = struct {
         // After a successful append, notify any blocking read waiters and track namespace data
         switch (cmd_result) {
             .stream_append_ok => {
-                shard.namespace_handler.markNamespaceHasData(req.namespace);
+                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 if (req.key.len > 0) {
                     shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
                 }

@@ -152,19 +152,20 @@ export async function listRuns(
   namespace = DEFAULT_NS,
 ): Promise<RunListEntry[]> {
   const q = qs({
+    namespace,
     status: params?.status,
     workflow: params?.workflow,
     limit: params?.limit,
     cursor: params?.cursor,
   });
-  return request<RunListEntry[]>(`${API_BASE}/${namespace}/runs${q}`);
+  return request<RunListEntry[]>(`${API_BASE}/runs${q}`);
 }
 
 export async function getRunStatus(
   runId: string,
   namespace = DEFAULT_NS,
 ): Promise<RunStatusResult> {
-  return request<RunStatusResult>(`${API_BASE}/${namespace}/runs/${runId}`);
+  return request<RunStatusResult>(`${API_BASE}/runs/${runId}${qs({ namespace })}`);
 }
 
 export async function getRunHistory(
@@ -172,8 +173,7 @@ export async function getRunHistory(
   limit = 100,
   namespace = DEFAULT_NS,
 ): Promise<HistoryEventEntry[]> {
-  const q = qs({ limit });
-  return request<HistoryEventEntry[]>(`${API_BASE}/${namespace}/runs/${runId}/history${q}`);
+  return request<HistoryEventEntry[]>(`${API_BASE}/runs/${runId}/history${qs({ namespace, limit })}`);
 }
 
 export async function startRun(
@@ -186,7 +186,7 @@ export async function startRun(
   },
   namespace = DEFAULT_NS,
 ): Promise<StartRunResult> {
-  return request<StartRunResult>(`${API_BASE}/${namespace}/runs`, {
+  return request<StartRunResult>(`${API_BASE}/runs${qs({ namespace })}`, {
     method: 'POST',
     body: JSON.stringify(params),
   });
@@ -197,7 +197,7 @@ export async function cancelRun(
   reason?: string,
   namespace = DEFAULT_NS,
 ): Promise<void> {
-  await request<unknown>(`${API_BASE}/${namespace}/runs/${runId}/cancel`, {
+  await request<unknown>(`${API_BASE}/runs/${runId}/cancel${qs({ namespace })}`, {
     method: 'POST',
     body: reason ? JSON.stringify({ reason }) : undefined,
   });
@@ -209,7 +209,7 @@ export async function signalRun(
   payload?: string,
   namespace = DEFAULT_NS,
 ): Promise<void> {
-  await request<unknown>(`${API_BASE}/${namespace}/runs/${runId}/signal`, {
+  await request<unknown>(`${API_BASE}/runs/${runId}/signal${qs({ namespace })}`, {
     method: 'POST',
     body: JSON.stringify({ signal_type: signalType, payload }),
   });
@@ -222,14 +222,14 @@ export async function signalRun(
 export async function listDefinitions(
   namespace = DEFAULT_NS,
 ): Promise<DefinitionListEntry[]> {
-  return request<DefinitionListEntry[]>(`${API_BASE}/${namespace}/definitions`);
+  return request<DefinitionListEntry[]>(`${API_BASE}/definitions${qs({ namespace })}`);
 }
 
 export async function createDefinition(
   yaml: string,
   namespace = DEFAULT_NS,
 ): Promise<CreateDefinitionResult> {
-  return request<CreateDefinitionResult>(`${API_BASE}/${namespace}/definitions`, {
+  return request<CreateDefinitionResult>(`${API_BASE}/definitions${qs({ namespace })}`, {
     method: 'POST',
     headers: { 'Content-Type': 'text/yaml' },
     body: yaml,
@@ -241,15 +241,14 @@ export async function getDefinition(
   version?: string,
   namespace = DEFAULT_NS,
 ): Promise<DefinitionResult> {
-  const q = qs({ version });
-  return request<DefinitionResult>(`${API_BASE}/${namespace}/definitions/${name}${q}`);
+  return request<DefinitionResult>(`${API_BASE}/definitions/${name}${qs({ namespace, version })}`);
 }
 
 export async function enableDefinition(
   name: string,
   namespace = DEFAULT_NS,
 ): Promise<void> {
-  await request<unknown>(`${API_BASE}/${namespace}/definitions/${name}/enable`, {
+  await request<unknown>(`${API_BASE}/definitions/${name}/enable${qs({ namespace })}`, {
     method: 'POST',
   });
 }
@@ -258,7 +257,7 @@ export async function disableDefinition(
   name: string,
   namespace = DEFAULT_NS,
 ): Promise<void> {
-  await request<unknown>(`${API_BASE}/${namespace}/definitions/${name}/disable`, {
+  await request<unknown>(`${API_BASE}/definitions/${name}/disable${qs({ namespace })}`, {
     method: 'POST',
   });
 }

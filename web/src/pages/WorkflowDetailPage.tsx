@@ -330,7 +330,10 @@ function StatusBanner({ run, onCancel, onSignal, onRetry }: {
   onRetry: () => void;
 }) {
   const now = useNow();
-  const config = STATUS_CONFIG[run.status];
+  const config = STATUS_CONFIG[run.status] ?? {
+    label: run.status || 'Unknown', icon: AlertTriangle,
+    color: 'text-text-secondary', bgColor: 'bg-text-secondary/10', ringColor: 'ring-text-secondary/30',
+  };
   const Icon = config.icon;
   const isTerminal = ['completed', 'failed', 'cancelled', 'timed_out'].includes(run.status);
   const elapsed = isTerminal ? run.duration_ms : now - run.started_at;

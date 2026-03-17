@@ -246,7 +246,7 @@ pub const KVHandler = struct {
         log.debug("KV PUT: key={s}, value_len={d}, version={d}", .{ req.key, req.value.len, version });
 
         // Track namespace data for non-empty delete check
-        shard.namespace_handler.markNamespaceHasData(req.namespace);
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
 
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }

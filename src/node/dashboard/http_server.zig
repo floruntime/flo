@@ -10,8 +10,8 @@
 //! Endpoints:
 //! - GET /health         - Health check (always public)
 //! - GET /api/v1/*       - REST API for dashboard data (requires auth)
-//! - GET /api/v1/kv/namespaces/:ns/keys/:key/watch — SSE live updates (stub)
-//! - GET /api/v1/workflow/namespaces/:ns/runs/:run_id/watch — SSE workflow run updates (stub)
+//! - GET /api/v1/kv/keys/:key/watch?namespace=:ns — SSE live updates (stub)
+//! - GET /api/v1/workflow/runs/:run_id/watch?namespace=:ns — SSE workflow run updates (stub)
 //! - GET /*              - Embedded static files (requires auth)
 //!
 //! The dashboard assets are embedded at compile time from web/dist/
@@ -437,59 +437,45 @@ fn extractJsonField(json: []const u8, field: []const u8) ?[]const u8 {
 
 /// Result of parsing an SSE watch path.
 const SSEWatchTarget = struct {
-    namespace: []const u8,
     key: []const u8,
 };
 
-/// Parse `kv/namespaces/:ns/keys/:key/watch` from the API sub-path.
+/// Parse `kv/keys/:key/watch` from the API sub-path.
+/// Namespace comes from the query string (handled by caller).
 /// Returns null if the path doesn't match.
 fn parseSSEWatchPath(api_path: []const u8) ?SSEWatchTarget {
-    const prefix = "kv/namespaces/";
+    const prefix = "kv/keys/";
     if (!std.mem.startsWith(u8, api_path, prefix)) return null;
     const rest = api_path[prefix.len..];
-    const ns_end = std.mem.indexOf(u8, rest, "/") orelse return null;
-    const namespace = rest[0..ns_end];
 
-    const after_ns = rest[ns_end + 1 ..];
-    const keys_prefix = "keys/";
-    if (!std.mem.startsWith(u8, after_ns, keys_prefix)) return null;
-    const key_rest = after_ns[keys_prefix.len..];
-
-    const key_end = std.mem.indexOf(u8, key_rest, "/") orelse return null;
-    const key_name = key_rest[0..key_end];
-    const sub = key_rest[key_end + 1 ..];
+    const key_end = std.mem.indexOf(u8, rest, "/") orelse return null;
+    const key_name = rest[0..key_end];
+    const sub = rest[key_end + 1 ..];
 
     if (std.mem.eql(u8, sub, "watch")) {
-        return .{ .namespace = namespace, .key = key_name };
+        return .{ .key = key_name };
     }
     return null;
 }
 
 /// Result of parsing a workflow SSE watch path.
 const WorkflowSSEWatchTarget = struct {
-    namespace: []const u8,
     run_id: []const u8,
 };
 
-/// Parse `workflow/namespaces/:ns/runs/:run_id/watch` from the API sub-path.
+/// Parse `workflow/runs/:run_id/watch` from the API sub-path.
+/// Namespace comes from the query string (handled by caller).
 fn parseWorkflowSSEPath(api_path: []const u8) ?WorkflowSSEWatchTarget {
-    const prefix = "workflow/namespaces/";
+    const prefix = "workflow/runs/";
     if (!std.mem.startsWith(u8, api_path, prefix)) return null;
     const rest = api_path[prefix.len..];
-    const ns_end = std.mem.indexOf(u8, rest, "/") orelse return null;
-    const namespace = rest[0..ns_end];
 
-    const after_ns = rest[ns_end + 1 ..];
-    const runs_prefix = "runs/";
-    if (!std.mem.startsWith(u8, after_ns, runs_prefix)) return null;
-    const run_rest = after_ns[runs_prefix.len..];
-
-    const rid_end = std.mem.indexOf(u8, run_rest, "/") orelse return null;
-    const run_id = run_rest[0..rid_end];
-    const sub = run_rest[rid_end + 1 ..];
+    const rid_end = std.mem.indexOf(u8, rest, "/") orelse return null;
+    const run_id = rest[0..rid_end];
+    const sub = rest[rid_end + 1 ..];
 
     if (std.mem.eql(u8, sub, "watch")) {
-        return .{ .namespace = namespace, .run_id = run_id };
+        return .{ .run_id = run_id };
     }
     return null;
 }
@@ -525,14 +511,13 @@ test "parseIpAddress invalid" {
 }
 
 test "parseSSEWatchPath correct" {
-    const target = parseSSEWatchPath("kv/namespaces/default/keys/mykey/watch");
+    const target = parseSSEWatchPath("kv/keys/mykey/watch");
     try std.testing.expect(target != null);
-    try std.testing.expectEqualStrings("default", target.?.namespace);
     try std.testing.expectEqualStrings("mykey", target.?.key);
 }
 
 test "parseSSEWatchPath no watch suffix" {
-    const target = parseSSEWatchPath("kv/namespaces/default/keys/mykey");
+    const target = parseSSEWatchPath("kv/keys/mykey");
     try std.testing.expect(target == null);
 }
 
@@ -542,14 +527,13 @@ test "parseSSEWatchPath unrelated path" {
 }
 
 test "parseWorkflowSSEPath correct" {
-    const target = parseWorkflowSSEPath("workflow/namespaces/default/runs/run-123/watch");
+    const target = parseWorkflowSSEPath("workflow/runs/run-123/watch");
     try std.testing.expect(target != null);
-    try std.testing.expectEqualStrings("default", target.?.namespace);
     try std.testing.expectEqualStrings("run-123", target.?.run_id);
 }
 
 test "parseWorkflowSSEPath no watch suffix" {
-    const target = parseWorkflowSSEPath("workflow/namespaces/default/runs/run-123");
+    const target = parseWorkflowSSEPath("workflow/runs/run-123");
     try std.testing.expect(target == null);
 }
 

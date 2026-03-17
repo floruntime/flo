@@ -29,7 +29,7 @@ fn shardCount(ctx: *DashboardContext) usize {
 
 /// GET /actions — List all registered actions with run counts
 pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -49,6 +49,8 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
             var it = ah.actions.iterator();
             while (it.next()) |entry| {
                 const rec = entry.value_ptr;
+                // Filter by namespace
+                if (!std.mem.eql(u8, rec.namespace_owned, ns_filter)) continue;
                 const gop = try seen.getOrPut(rec.name_owned);
                 if (!gop.found_existing) {
                     // Count runs for this action across all shards
@@ -87,7 +89,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try obj.begin();
                     try obj.stringField("name", rec.name_owned);
-                    try obj.stringField("namespace", "default");
+                    try obj.stringField("namespace", rec.namespace_owned);
                     try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
                     try obj.stringField("owner", "");
                     try obj.stringField("description", "");
@@ -126,20 +128,22 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
 /// GET /actions/:name — Action detail (metadata, trigger info, run counts, workers, recent runs)
 pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
-    // Search shards for this action
+    // Search shards for this action (matching namespace)
     var found_rec: ?*const ActionsHandler.ActionRecord = null;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
             if (shard.actions_handler.actions.getPtr(name)) |rec| {
-                found_rec = rec;
-                break;
+                if (std.mem.eql(u8, rec.namespace_owned, ns_filter)) {
+                    found_rec = rec;
+                    break;
+                }
             }
         }
     }
@@ -149,7 +153,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     try obj.stringField("name", name);
 
     if (found_rec) |rec| {
-        try obj.stringField("namespace", "default");
+        try obj.stringField("namespace", rec.namespace_owned);
         try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
         try obj.stringField("owner", "");
         try obj.stringField("description", "");

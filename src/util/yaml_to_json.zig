@@ -330,30 +330,11 @@ const Converter = struct {
     fn writeValue(self: *Converter, value: []const u8) ConvertError!void {
         const trimmed = mem.trim(u8, value, " \t");
 
-        // Boolean
-        if (mem.eql(u8, trimmed, "true") or mem.eql(u8, trimmed, "false")) {
-            self.output.appendSlice(self.allocator, trimmed) catch return ConvertError.OutOfMemory;
-            return;
-        }
-
-        // Null
-        if (mem.eql(u8, trimmed, "null") or mem.eql(u8, trimmed, "~")) {
-            self.output.appendSlice(self.allocator, "null") catch return ConvertError.OutOfMemory;
-            return;
-        }
-
-        // Number
-        if (isNumber(trimmed)) {
-            self.output.appendSlice(self.allocator, trimmed) catch return ConvertError.OutOfMemory;
-            return;
-        }
-
-        // Already quoted string
+        // Already quoted string — don't strip comments inside quotes
         if (trimmed.len >= 2) {
             if ((trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') or
                 (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\''))
             {
-                // Convert single quotes to double quotes, escaping inner double quotes
                 if (trimmed[0] == '\'') {
                     const inner = trimmed[1 .. trimmed.len - 1];
                     try self.writeString(inner);
@@ -364,8 +345,41 @@ const Converter = struct {
             }
         }
 
+        // Strip inline comments from unquoted values (YAML spec: " #" starts a comment)
+        const clean = stripInlineComment(trimmed);
+
+        // Boolean
+        if (mem.eql(u8, clean, "true") or mem.eql(u8, clean, "false")) {
+            self.output.appendSlice(self.allocator, clean) catch return ConvertError.OutOfMemory;
+            return;
+        }
+
+        // Null
+        if (mem.eql(u8, clean, "null") or mem.eql(u8, clean, "~")) {
+            self.output.appendSlice(self.allocator, "null") catch return ConvertError.OutOfMemory;
+            return;
+        }
+
+        // Number
+        if (isNumber(clean)) {
+            self.output.appendSlice(self.allocator, clean) catch return ConvertError.OutOfMemory;
+            return;
+        }
+
         // Unquoted string - needs to be quoted
-        try self.writeString(trimmed);
+        try self.writeString(clean);
+    }
+
+    /// Strip inline YAML comments: " # ..." (space-hash) outside quoted strings.
+    fn stripInlineComment(value: []const u8) []const u8 {
+        // Find " #" which starts an inline comment per YAML spec
+        var i: usize = 1;
+        while (i < value.len) : (i += 1) {
+            if (value[i] == '#' and value[i - 1] == ' ') {
+                return mem.trimRight(u8, value[0 .. i - 1], " \t");
+            }
+        }
+        return value;
     }
 
     fn writeString(self: *Converter, s: []const u8) ConvertError!void {
@@ -592,4 +606,25 @@ test "yaml_to_json: single-quoted value with embedded double quotes" {
     try std.testing.expect(mem.indexOf(u8, json, "\"max_concurrent\":1") != null);
     // The input value should have escaped double quotes inside
     try std.testing.expect(mem.indexOf(u8, json, "\"input\":\"{\\\"mode\\\":\\\"full\\\"}\"") != null);
+}
+
+test "yaml_to_json: inline comments stripped from values" {
+    const yaml =
+        \\transitions:
+        \\  success: settle     # mark as done
+        \\  failure: escalate   # alert ops
+        \\  timeout: flo.Failed
+        \\count: 42 # the answer
+        \\quoted: "has # inside"
+    ;
+    const json = try convert(std.testing.allocator, yaml);
+    defer std.testing.allocator.free(json);
+
+    // Comments should be stripped from unquoted values
+    try std.testing.expect(mem.indexOf(u8, json, "\"success\":\"settle\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"failure\":\"escalate\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"timeout\":\"flo.Failed\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"count\":42") != null);
+    // Quoted value should preserve the # character
+    try std.testing.expect(mem.indexOf(u8, json, "\"quoted\":\"has # inside\"") != null);
 }

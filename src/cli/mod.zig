@@ -46,6 +46,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const processing = try commands.createProcessingCommand(allocator);
     const ts = try commands.createTsCommand(allocator);
     const auth = try commands.createAuthCommand(allocator);
+    const validate = try commands.createValidateCommand(allocator);
 
     var root = try commander.newBuilder(allocator)
         .name("flo")
@@ -70,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .flag("verbose", .{ .short = 'v', .desc = "Enable verbose output", .persistent = true })
         .persistentFlag("output", .{ .short = 'o', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw" })
         .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
-        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "" }, .desc = "Namespace to use" })
+        .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })
 
         // Server Commands (pre-built)
         .addCommand(server)
@@ -97,6 +98,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         // Auth Commands (pre-built)
         .addCommand(auth)
+
+        // Validation (offline)
+        .addCommand(validate)
 
         // Config Commands
         .subcommand(

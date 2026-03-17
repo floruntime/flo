@@ -105,7 +105,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
             commander.newBuilder(allocator)
                 .name("list-runs")
                 .about("List workflow runs")
-                .aliases(&.{ "ls", "runs" })
+                .aliases(&.{"runs"})
                 .arg("name", "Workflow name")
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")

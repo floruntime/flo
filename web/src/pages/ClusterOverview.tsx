@@ -2,13 +2,15 @@ import { Database, Zap, HardDrive, GitGraph, RefreshCw, Activity } from "lucide-
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
 import { api } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
+import { useNamespace } from "../lib/NamespaceContext";
 
 export function ClusterOverview() {
+    const { selected: namespace } = useNamespace();
     const { data: stats, loading: statsLoading, error: statsError, refetch: refetchStats } = useApi(
         () => api.getClusterStats(), [], 5000
     );
     const { data: streams } = useApi(() => api.getStreams(), [], 5000);
-    const { data: actions } = useApi(() => api.getActions(), [], 5000);
+    const { data: actions } = useApi(() => api.getActions(namespace), [namespace], 5000);
     const { data: workflows } = useApi(() => api.getWorkflows(), [], 5000);
 
     if (statsLoading && !stats) return <LoadingState />;

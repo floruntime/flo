@@ -15,6 +15,9 @@ const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const KVProjection = @import("../../../projection/kv.zig").KVProjection;
+const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler;
+const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
+const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 
 // ── Helpers ──
 
@@ -42,13 +45,35 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var ns_set = std.StringHashMap(void).init(allocator);
     defer ns_set.deinit();
 
-    // 1. From shard 0's namespace handler (explicit namespace registry)
+    // 1. From ALL shards' namespace handlers, workflow handlers, and processing handlers
     if (ctx.shard_ptrs) |ptrs| {
-        if (ptrs.len > 0) {
-            const shard: *Shard = @ptrCast(@alignCast(ptrs[0]));
+        for (ptrs) |ptr| {
+            const shard: *Shard = @ptrCast(@alignCast(ptr));
+
+            // Explicit namespace registry
             var ns_it = shard.namespace_handler.namespaces.iterator();
             while (ns_it.next()) |entry| {
                 try ns_set.put(entry.key_ptr.*, {});
+            }
+
+            // Workflow definitions (keys are "namespace:name")
+            var wf_it = shard.workflow_handler.definitions.iterator();
+            while (wf_it.next()) |entry| {
+                if (extractNsPrefix(entry.key_ptr.*)) |ns| {
+                    try ns_set.put(ns, {});
+                }
+            }
+
+            // Processing jobs (keys are "namespace:job_id" or have namespace_owned)
+            var pj_it = shard.processing_handler.jobs.iterator();
+            while (pj_it.next()) |entry| {
+                try ns_set.put(entry.value_ptr.namespace_owned, {});
+            }
+
+            // Actions (have namespace_owned field)
+            var act_it = shard.actions_handler.actions.iterator();
+            while (act_it.next()) |entry| {
+                try ns_set.put(entry.value_ptr.namespace_owned, {});
             }
         }
     }
@@ -91,6 +116,9 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
         try obj.intField("stream_count", countStreamsInNamespace(ctx, ns_name));
         try obj.intField("queue_count", countQueuesInNamespace(ctx, ns_name));
         try obj.intField("kv_count", countKVInNamespace(ctx, ns_name));
+        try obj.intField("workflow_count", countWorkflowsInNamespace(ctx, ns_name));
+        try obj.intField("processing_count", countProcessingInNamespace(ctx, ns_name));
+        try obj.intField("action_count", countActionsInNamespace(ctx, ns_name));
         try obj.intField("created_at", 0);
         try obj.boolField("is_system", std.mem.startsWith(u8, ns_name, "_"));
         try obj.end();
@@ -446,6 +474,61 @@ fn countKVInNamespace(ctx: *DashboardContext, namespace: []const u8) u64 {
         }
     }
     return 0;
+}
+
+fn countWorkflowsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
+    const ptrs = ctx.shard_ptrs orelse return 0;
+    var count: u32 = 0;
+    for (ptrs) |ptr| {
+        const shard: *Shard = @ptrCast(@alignCast(ptr));
+        var it = shard.workflow_handler.definitions.iterator();
+        while (it.next()) |entry| {
+            if (nsKeyMatchesNamespace(entry.key_ptr.*, namespace)) count += 1;
+        }
+    }
+    return count;
+}
+
+fn countProcessingInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
+    const ptrs = ctx.shard_ptrs orelse return 0;
+    var count: u32 = 0;
+    for (ptrs) |ptr| {
+        const shard: *Shard = @ptrCast(@alignCast(ptr));
+        var it = shard.processing_handler.jobs.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) count += 1;
+        }
+    }
+    return count;
+}
+
+fn countActionsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
+    const ptrs = ctx.shard_ptrs orelse return 0;
+    var seen = std.StringHashMap(void).init(ctx.allocator);
+    defer seen.deinit();
+    for (ptrs) |ptr| {
+        const shard: *Shard = @ptrCast(@alignCast(ptr));
+        var it = shard.actions_handler.actions.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) {
+                seen.put(entry.value_ptr.name_owned, {}) catch continue;
+            }
+        }
+    }
+    return @intCast(seen.count());
+}
+
+/// Extract namespace prefix from a "namespace:name" key.
+fn extractNsPrefix(key: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOfScalar(u8, key, ':') orelse return null;
+    return key[0..idx];
+}
+
+/// Check if a "namespace:name" key belongs to the given namespace.
+fn nsKeyMatchesNamespace(key: []const u8, namespace: []const u8) bool {
+    if (key.len <= namespace.len) return false;
+    if (key[namespace.len] != ':') return false;
+    return std.mem.eql(u8, key[0..namespace.len], namespace);
 }
 
 // =============================================================================

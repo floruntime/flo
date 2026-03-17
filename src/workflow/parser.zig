@@ -165,6 +165,9 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
     const name = getString(root, "name") orelse return ParseError.MissingRequiredField;
     const version = getString(root, "version") orelse return ParseError.MissingRequiredField;
 
+    // Optional description (defaults to "")
+    const description = getString(root, "description") orelse "";
+
     // Idempotency mode
     const idempotency = blk: {
         const idem_str = getString(root, "idempotency") orelse "none";
@@ -236,6 +239,7 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
 
     return WorkflowDefinition{
         .name = allocator.dupe(u8, name) catch return ParseError.OutOfMemory,
+        .description = allocator.dupe(u8, description) catch return ParseError.OutOfMemory,
         .version = allocator.dupe(u8, version) catch return ParseError.OutOfMemory,
         .idempotency = idempotency,
         .search_attributes = search_attributes,

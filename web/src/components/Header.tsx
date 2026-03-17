@@ -11,6 +11,18 @@ import {
 } from "lucide-react";
 import { useNamespace } from "../lib/NamespaceContext";
 import { useAuth } from "../lib/AuthContext";
+import type { NamespaceInfo } from "../lib/api";
+
+function totalResources(ns: NamespaceInfo): number {
+    return (
+        (ns.stream_count || 0) +
+        (ns.queue_count || 0) +
+        (ns.kv_count || 0) +
+        (ns.workflow_count || 0) +
+        (ns.processing_count || 0) +
+        (ns.action_count || 0)
+    );
+}
 
 /*
  * NOTE: The "weaved" project selector and cloud/cluster mode toggle have been
@@ -80,7 +92,7 @@ export function Header() {
                                         >
                                             <div className="flex flex-col">
                                                 <span className="text-sm font-medium text-text-primary">{ns.name}</span>
-                                                <span className="text-[10px] text-text-secondary">{ns.stream_count + ns.queue_count + ns.kv_count} resources</span>
+                                                <span className="text-[10px] text-text-secondary">{totalResources(ns)} resources</span>
                                             </div>
                                             {ns.name === selected && (
                                                 <Check className="w-3.5 h-3.5 text-primary" />

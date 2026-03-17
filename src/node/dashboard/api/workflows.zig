@@ -334,16 +334,51 @@ fn startRun(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]c
 }
 
 fn getRunStatus(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
 
+    // Search for the run across shards
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getShard(ctx, i)) |shard| {
+            const run_ptr = shard.workflow_handler.runs.getPtr(run_id) orelse blk: {
+                // Fallback: linear scan by run_id_owned
+                var rit = shard.workflow_handler.runs.iterator();
+                while (rit.next()) |entry| {
+                    if (std.mem.eql(u8, entry.value_ptr.run_id_owned, run_id)) {
+                        break :blk entry.value_ptr;
+                    }
+                }
+                break :blk null;
+            };
+            if (run_ptr) |run| {
+                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try obj.begin();
+                try obj.stringField("run_id", run.run_id_owned);
+                try obj.stringField("status", run.status.toString());
+                if (run.current_step_name_owned) |step| {
+                    try obj.stringField("current_step", step);
+                } else {
+                    try obj.nullField("current_step");
+                }
+                if (run.started_at_ms) |t| {
+                    try obj.intField("started_at_ms", t);
+                }
+                if (run.completed_at_ms) |t| {
+                    try obj.intField("updated_at_ms", t);
+                }
+                try obj.end();
+                return try json_buf.toOwnedSlice(allocator);
+            }
+        }
+    }
+
+    // Not found
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.stringField("error", "Run not found");
     try obj.stringField("run_id", run_id);
-    try obj.stringField("status", "unknown");
     try obj.end();
     return try json_buf.toOwnedSlice(allocator);
 }

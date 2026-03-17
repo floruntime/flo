@@ -8,6 +8,7 @@ import { cn } from "../lib/utils";
 import { api } from "../lib/api";
 import type { ActionInfo } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
+import { useNamespace } from "../lib/NamespaceContext";
 
 // =============================================================================
 // Helpers
@@ -156,7 +157,8 @@ const STATUS_OPTIONS = [
 
 export function ActionsList() {
     const navigate = useNavigate();
-    const { data: actions, loading, error, refetch } = useApi(() => api.getActions(), [], 5000);
+    const { selected: namespace } = useNamespace();
+    const { data: actions, loading, error, refetch } = useApi(() => api.getActions(namespace), [namespace], 5000);
     const [search, setSearch] = useState('');
     const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
     const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');

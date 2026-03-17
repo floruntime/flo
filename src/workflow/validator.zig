@@ -612,6 +612,7 @@ test "validateWorkflow: valid workflow" {
     // Create a valid workflow
     var def = WorkflowDefinition{
         .name = "test-workflow",
+        .description = "",
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
@@ -661,6 +662,7 @@ test "validateWorkflow: missing name" {
 
     var def = WorkflowDefinition{
         .name = "",
+        .description = "",
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
@@ -693,6 +695,7 @@ test "validateWorkflow: invalid transition target" {
 
     var def = WorkflowDefinition{
         .name = "test",
+        .description = "",
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
@@ -733,6 +736,7 @@ test "validateWorkflow: invalid action reference" {
 
     var def = WorkflowDefinition{
         .name = "test",
+        .description = "",
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},
@@ -773,6 +777,7 @@ test "validateWorkflow: unreachable step warning" {
 
     var def = WorkflowDefinition{
         .name = "test",
+        .description = "",
         .version = "1.0.0",
         .idempotency = .none,
         .search_attributes = &.{},

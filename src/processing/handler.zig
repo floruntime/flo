@@ -285,7 +285,7 @@ pub const ProcessingHandler = struct {
         const op: OpCode = @enumFromInt(req.header.op_code);
         shard.processing_handler.handleCommand(shard, conn, req);
         if (op == .processing_submit) {
-            shard.namespace_handler.markNamespaceHasData(req.namespace);
+            shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         }
     }
 

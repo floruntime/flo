@@ -26,6 +26,9 @@ export interface NamespaceInfo {
   stream_count: number;
   queue_count: number;
   kv_count: number;
+  workflow_count: number;
+  processing_count: number;
+  action_count: number;
 }
 
 /**
@@ -826,8 +829,9 @@ class FloApiClient {
   /**
    * List registered actions with run statistics
    */
-  async getActions(): Promise<ActionInfo[]> {
-    return this.fetch<ActionInfo[]>('actions');
+  async getActions(namespace?: string): Promise<ActionInfo[]> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<ActionInfo[]>(`actions${params}`);
   }
 
   /**

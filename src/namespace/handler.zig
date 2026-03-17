@@ -202,7 +202,9 @@ pub const NamespaceHandler = struct {
     /// Mark a namespace as having data written to it.
     /// Called by KV/Stream/Queue handlers after successful writes.
     /// Auto-creates the "default" namespace entry when called with empty or "default" name.
-    pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8) void {
+    /// When `shard` is provided and the namespace is new, persists a namespace_create
+    /// entry to the segment log so the namespace survives restart.
+    pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8, shard: ?*Shard) void {
         const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
         if (self.namespaces.getPtr(effective)) |meta| {
             meta.data_count +|= 1; // saturating add
@@ -217,6 +219,10 @@ pub const NamespaceHandler = struct {
                 self.allocator.free(key);
                 return;
             };
+            // Persist implicit namespace creation so it survives restart
+            if (shard) |s| {
+                _ = proposeNamespaceEntry(s, .namespace_create, effective, &.{}) catch {};
+            }
         }
     }
 
@@ -995,7 +1001,7 @@ test "namespace handler: delete non-empty without force blocked" {
     defer handler.deinit();
 
     _ = handler.handleCommand(makeRequest(.namespace_create, "myns", ""));
-    handler.markNamespaceHasData("myns");
+    handler.markNamespaceHasData("myns", null);
 
     // Delete without force should fail
     const result = handler.handleCommand(makeRequest(.namespace_delete, "myns", ""));
@@ -1014,7 +1020,7 @@ test "namespace handler: delete non-empty with force succeeds" {
     defer handler.deinit();
 
     _ = handler.handleCommand(makeRequest(.namespace_create, "myns", ""));
-    handler.markNamespaceHasData("myns");
+    handler.markNamespaceHasData("myns", null);
 
     // Delete with force=1 should succeed
     const force_value = [_]u8{1};
@@ -1035,15 +1041,15 @@ test "namespace handler: markNamespaceHasData" {
     _ = handler.handleCommand(makeRequest(.namespace_create, "tracked", ""));
     try testing.expect(!handler.namespaceHasData("tracked"));
 
-    handler.markNamespaceHasData("tracked");
+    handler.markNamespaceHasData("tracked", null);
     try testing.expect(handler.namespaceHasData("tracked"));
 
     // Default namespace is auto-created on first implicit write
-    handler.markNamespaceHasData("default");
+    handler.markNamespaceHasData("default", null);
     try testing.expect(handler.namespaceHasData("default"));
 
     // Non-existent namespace is auto-created on write
-    handler.markNamespaceHasData("ghost");
+    handler.markNamespaceHasData("ghost", null);
     try testing.expect(handler.namespaceHasData("ghost"));
 }
 

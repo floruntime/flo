@@ -16,7 +16,7 @@ import type { RunListEntry, RunStatusResult, DefinitionListEntry } from './workf
 // ---------------------------------------------------------------------------
 // SSE base URL — dashboard server (port 9002 in dev, proxied via Vite)
 // ---------------------------------------------------------------------------
-const SSE_BASE = '/api/v1/workflow/namespaces';
+const SSE_BASE = '/api/v1/workflow';
 
 // ---------------------------------------------------------------------------
 // Polling helper
@@ -131,7 +131,14 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sseStatus, setSseStatus] = useState<'idle' | 'connecting' | 'open' | 'closed'>('idle');
+  // Tracks whether the initial REST fetch for the current runId has completed.
+  // Unlike `loading`, this never goes back to false on subsequent poll fetches,
+  // so the SSE effect doesn't tear down and re-create the connection on every poll.
+  const [initialLoaded, setInitialLoaded] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+
+  // Reset initialLoaded whenever the run we're watching changes.
+  useEffect(() => { setInitialLoaded(false); }, [runId]);
 
   // REST fetch — used for initial load and as fallback
   const fetch_ = useCallback(async () => {
@@ -169,6 +176,7 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
+      setInitialLoaded(true);
     }
   }, [runId]);
 
@@ -185,10 +193,10 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
       return;
     }
     // Don't connect until initial load completes (avoid racing)
-    if (loading) return;
+    if (!initialLoaded) return;
 
     const ns = 'default';
-    const url = `${SSE_BASE}/${ns}/runs/${encodeURIComponent(runId)}/watch`;
+    const url = `${SSE_BASE}/runs/${encodeURIComponent(runId)}/watch?namespace=${encodeURIComponent(ns)}`;
     const es = new EventSource(url);
     esRef.current = es;
     setSseStatus('connecting');
@@ -240,12 +248,9 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
       fetch_();
     });
 
-    es.addEventListener('error', () => {
-      // SSE error — close and fall back to polling
-      setSseStatus('closed');
-    });
-
     es.onerror = () => {
+      // SSE connection error — close immediately to suppress browser auto-reconnect,
+      // then fall back to the REST polling path.
       setSseStatus('closed');
       es.close();
     };
@@ -255,7 +260,7 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
       esRef.current = null;
       setSseStatus('idle');
     };
-  }, [runId, runStatus, loading, fetch_]);
+  }, [runId, runStatus, initialLoaded, fetch_]);
 
   // Fallback: poll via REST every 3s if SSE is not connected and run is active
   const isActive = run && !TERMINAL_STATUSES.has(run.status);

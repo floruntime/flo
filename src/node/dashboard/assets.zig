@@ -10,21 +10,9 @@ pub const Asset = struct {
 
 const asset_0 = @embedFile("dist/index.html");
 const asset_1 = @embedFile("dist/vite.svg");
-const asset_2 = @embedFile("dist/assets/index-Cry-3f1A.js");
-const asset_3 = @embedFile("dist/assets/index-Ct5ygAKT.js.map");
-const asset_4 = @embedFile("dist/assets/index-B6BegrKi.css");
-const asset_5 = @embedFile("dist/assets/index-BC-Rf4rH.js");
-const asset_6 = @embedFile("dist/assets/index-D1GDQjUA.js");
-const asset_7 = @embedFile("dist/assets/index-DDGd7fzy.js.map");
-const asset_8 = @embedFile("dist/assets/index-DOFqUyOi.css");
-const asset_9 = @embedFile("dist/assets/index-BC-Rf4rH.js.map");
-const asset_10 = @embedFile("dist/assets/index-TBj1D-fD.js.map");
-const asset_11 = @embedFile("dist/assets/index-D1GDQjUA.js.map");
-const asset_12 = @embedFile("dist/assets/index-Ct5ygAKT.js");
-const asset_13 = @embedFile("dist/assets/index-Cry-3f1A.js.map");
-const asset_14 = @embedFile("dist/assets/index-DDGd7fzy.js");
-const asset_15 = @embedFile("dist/assets/index-TBj1D-fD.js");
-const asset_16 = @embedFile("dist/assets/index-D4MfzxQq.css");
+const asset_2 = @embedFile("dist/assets/index-B3tPd7lg.js");
+const asset_3 = @embedFile("dist/assets/index-X_6wbgBt.css");
+const asset_4 = @embedFile("dist/assets/index-B3tPd7lg.js.map");
 
 pub fn get(path: []const u8) ?Asset {
     const mem = @import("std").mem;
@@ -35,36 +23,12 @@ pub fn get(path: []const u8) ?Asset {
         return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8" };
     } else if (mem.eql(u8, lookup, "vite.svg")) {
         return .{ .content = asset_1, .mime_type = "image/svg+xml" };
-    } else if (mem.eql(u8, lookup, "assets/index-Cry-3f1A.js")) {
+    } else if (mem.eql(u8, lookup, "assets/index-B3tPd7lg.js")) {
         return .{ .content = asset_2, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-Ct5ygAKT.js.map")) {
-        return .{ .content = asset_3, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-B6BegrKi.css")) {
-        return .{ .content = asset_4, .mime_type = "text/css; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-BC-Rf4rH.js")) {
-        return .{ .content = asset_5, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-D1GDQjUA.js")) {
-        return .{ .content = asset_6, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-DDGd7fzy.js.map")) {
-        return .{ .content = asset_7, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-DOFqUyOi.css")) {
-        return .{ .content = asset_8, .mime_type = "text/css; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-BC-Rf4rH.js.map")) {
-        return .{ .content = asset_9, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-TBj1D-fD.js.map")) {
-        return .{ .content = asset_10, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-D1GDQjUA.js.map")) {
-        return .{ .content = asset_11, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-Ct5ygAKT.js")) {
-        return .{ .content = asset_12, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-Cry-3f1A.js.map")) {
-        return .{ .content = asset_13, .mime_type = "application/json" };
-    } else if (mem.eql(u8, lookup, "assets/index-DDGd7fzy.js")) {
-        return .{ .content = asset_14, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-TBj1D-fD.js")) {
-        return .{ .content = asset_15, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-D4MfzxQq.css")) {
-        return .{ .content = asset_16, .mime_type = "text/css; charset=utf-8" };
+    } else if (mem.eql(u8, lookup, "assets/index-X_6wbgBt.css")) {
+        return .{ .content = asset_3, .mime_type = "text/css; charset=utf-8" };
+    } else if (mem.eql(u8, lookup, "assets/index-B3tPd7lg.js.map")) {
+        return .{ .content = asset_4, .mime_type = "application/json" };
     } else {
         if (!mem.startsWith(u8, lookup, "api/")) {
             return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8" };

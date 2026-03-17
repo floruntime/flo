@@ -321,7 +321,7 @@ pub const WorkflowHandler = struct {
         const op: OpCode = @enumFromInt(req.header.op_code);
         shard.workflow_handler.handleCommand(shard, conn, req);
         if (op == .workflow_create or op == .workflow_start) {
-            shard.namespace_handler.markNamespaceHasData(req.namespace);
+            shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         }
     }
 
@@ -588,6 +588,13 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
+
+        // Guard against ID collision (e.g. replayed entry with same key)
+        if (self.runs.contains(run_ns_key)) {
+            self.allocator.free(run_ns_key);
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run_id collision");
+            return;
+        }
 
         // Duplicate for storage
         const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
@@ -1422,7 +1429,7 @@ pub const WorkflowHandler = struct {
         }
 
         // Invoke the action — creates a run record in ActionsHandler
-        const action_run_id = shard.actions_handler.invokeByName(shard, action_name, input) orelse {
+        const action_run_id = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
             return definition.StepOutcome.execution_failure;
         };
 
@@ -2188,6 +2195,16 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_ver);
             self.allocator.free(owned_inp);
         };
+
+        // Advance next_run_id past replayed IDs to prevent collisions
+        // when new runs are started after recovery.
+        if (std.mem.startsWith(u8, raw_run_id, "wfrun-")) {
+            if (std.fmt.parseInt(u64, raw_run_id["wfrun-".len..], 10)) |n| {
+                if (n >= self.next_run_id) {
+                    self.next_run_id = n + 1;
+                }
+            } else |_| {}
+        }
     }
 
     pub fn definitionCount(self: *const WorkflowHandler) usize {
@@ -2308,8 +2325,14 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         return;
     };
+    const owned_ns = alloc.dupe(u8, "default") catch {
+        alloc.free(owned_name);
+        alloc.free(wasm_bytes);
+        return;
+    };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
+        .namespace_owned = owned_ns,
         .action_type = 1, // wasm
         .version = 1,
         .enabled = true,
@@ -2317,6 +2340,7 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         .wasm_blob_owned = wasm_bytes,
     }) catch {
         alloc.free(owned_name);
+        alloc.free(owned_ns);
         alloc.free(wasm_bytes);
     };
 }
@@ -2330,8 +2354,14 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         return;
     };
+    const owned_ns = alloc.dupe(u8, "default") catch {
+        alloc.free(owned_name);
+        alloc.free(wasm_bytes);
+        return;
+    };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
+        .namespace_owned = owned_ns,
         .action_type = 1,
         .version = 1,
         .enabled = true,
@@ -2339,6 +2369,7 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         .wasm_blob_owned = wasm_bytes,
     }) catch {
         alloc.free(owned_name);
+        alloc.free(owned_ns);
         alloc.free(wasm_bytes);
     };
 }

@@ -930,6 +930,8 @@ pub const InlinePlan = struct {
 pub const WorkflowDefinition = struct {
     /// Workflow name
     name: []const u8,
+    /// Optional human-readable description (empty string if not provided)
+    description: []const u8,
     /// Workflow version (semantic versioning)
     version: []const u8,
     /// Idempotency mode
@@ -953,6 +955,7 @@ pub const WorkflowDefinition = struct {
 
     pub fn deinit(self: *WorkflowDefinition, allocator: Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.description);
         allocator.free(self.version);
 
         for (self.search_attributes) |attr| {
@@ -1118,6 +1121,7 @@ pub const WorkflowDefinition = struct {
 
         try buf.append(allocator, WIRE_VERSION);
         try writeString(&buf, allocator, self.name);
+        try writeString(&buf, allocator, self.description);
         try writeString(&buf, allocator, self.version);
         try buf.append(allocator, @intFromEnum(self.idempotency));
 
@@ -1207,6 +1211,9 @@ pub const WorkflowDefinition = struct {
 
         const name = try readString(allocator, data, &pos);
         errdefer allocator.free(name);
+
+        const desc = try readString(allocator, data, &pos);
+        errdefer allocator.free(desc);
 
         const def_version = try readString(allocator, data, &pos);
         errdefer allocator.free(def_version);
@@ -1377,6 +1384,7 @@ pub const WorkflowDefinition = struct {
 
         return .{
             .name = name,
+            .description = desc,
             .version = def_version,
             .idempotency = idempotency,
             .search_attributes = search_attributes,
@@ -1688,6 +1696,7 @@ test "WorkflowDefinition: encode and decode roundtrip" {
 
     var def = WorkflowDefinition{
         .name = try allocator.dupe(u8, "process-order"),
+        .description = "",
         .version = try allocator.dupe(u8, "1.0.0"),
         .idempotency = .required,
         .search_attributes = search_attrs,
