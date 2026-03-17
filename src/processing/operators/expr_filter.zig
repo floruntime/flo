@@ -28,12 +28,26 @@
 //!   - `json:<path><<value>`         — field < value (numeric)
 //!   - `json:<path><=<value>`        — field <= value (numeric)
 //!
+//!   Compound (up to 8 sub-conditions):
+//!   - `<cond> OR <cond> [OR ...]`   — any sub-condition matches
+//!   - `<cond> AND <cond> [AND ...]` — all sub-conditions match
+//!
+//!   Note: OR and AND cannot be mixed in a single expression.
+//!   OR is checked first (lower precedence). Use classify rules for
+//!   complex routing instead of deeply nested boolean logic.
+//!
 //! YAML examples:
 //!   ```yaml
 //!   operators:
 //!     - type: filter
 //!       name: keep-important
 //!       condition: "value_contains:important"
+//!     - type: filter
+//!       name: keep-payments-or-kyc
+//!       condition: "value_contains:payment OR value_contains:kyc"
+//!     - type: filter
+//!       name: high-value-approved
+//!       condition: "json:amount>10000 AND json:status=approved"
 //!     - type: classify
 //!       name: route-payments
 //!       rules:
@@ -63,8 +77,12 @@ pub const ExprFilterOperator = struct {
 
     const Self = @This();
 
-    /// Parsed condition for efficient evaluation
-    const ParsedCondition = union(enum) {
+    /// Maximum number of sub-conditions in an OR/AND compound expression.
+    const MAX_COMPOUND: usize = 8;
+
+    /// A single (non-compound) parsed condition — used inside Compound to
+    /// avoid self-referencing the tagged union.
+    const SingleCondition = union(enum) {
         value_contains: []const u8,
         key_contains: []const u8,
         key_equals: []const u8,
@@ -74,8 +92,23 @@ pub const ExprFilterOperator = struct {
         key_not_empty,
         json_expr: JsonExpr,
         min_length: usize,
-        /// Unparseable condition — always passes (with warning logged at init)
         always_true,
+    };
+
+    /// Fixed-size array of sub-conditions for compound expressions.
+    const Compound = struct {
+        items: [MAX_COMPOUND]SingleCondition = undefined,
+        len: u8 = 0,
+    };
+
+    /// Parsed condition for efficient evaluation
+    const ParsedCondition = union(enum) {
+        /// A single atomic condition (no compound logic)
+        single: SingleCondition,
+        /// Any sub-condition matches (short-circuit)
+        or_expr: Compound,
+        /// All sub-conditions match (short-circuit)
+        and_expr: Compound,
     };
 
     /// JSON comparison operator
@@ -150,7 +183,29 @@ pub const ExprFilterOperator = struct {
     // =========================================================================
 
     pub fn evaluate(self: *const Self, rec: ProcessingRecord) bool {
-        return switch (self.parsed) {
+        return evaluateCondition(&self.parsed, rec);
+    }
+
+    fn evaluateCondition(cond: *const ParsedCondition, rec: ProcessingRecord) bool {
+        return switch (cond.*) {
+            .single => |s| evaluateSingle(&s, rec),
+            .or_expr => |compound| {
+                for (compound.items[0..compound.len]) |*sub| {
+                    if (evaluateSingle(sub, rec)) return true;
+                }
+                return false;
+            },
+            .and_expr => |compound| {
+                for (compound.items[0..compound.len]) |*sub| {
+                    if (!evaluateSingle(sub, rec)) return false;
+                }
+                return true;
+            },
+        };
+    }
+
+    fn evaluateSingle(cond: *const SingleCondition, rec: ProcessingRecord) bool {
+        return switch (cond.*) {
             .value_contains => |substr| std.mem.indexOf(u8, rec.value, substr) != null,
             .key_contains => |substr| std.mem.indexOf(u8, rec.key, substr) != null,
             .key_equals => |exact| std.mem.eql(u8, rec.key, exact),
@@ -169,6 +224,45 @@ pub const ExprFilterOperator = struct {
     // =========================================================================
 
     fn parseCondition(cond: []const u8) ParsedCondition {
+        // Compound: split on " OR " first (lower precedence), then " AND "
+        if (splitCompound(cond, " OR ")) |compound| return .{ .or_expr = compound };
+        if (splitCompound(cond, " AND ")) |compound| return .{ .and_expr = compound };
+
+        return .{ .single = parseSingleCondition(cond) };
+    }
+
+    /// Try to split `cond` on `sep` (e.g. " OR "). Returns a Compound if
+    /// two or more branches are found, null if `sep` does not appear.
+    fn splitCompound(cond: []const u8, sep: []const u8) ?Compound {
+        // Quick check — if sep is not present at all, skip iteration.
+        if (std.mem.indexOf(u8, cond, sep) == null) return null;
+
+        var compound = Compound{};
+        var rest: []const u8 = cond;
+        while (rest.len > 0) {
+            if (compound.len >= MAX_COMPOUND) break;
+            if (std.mem.indexOf(u8, rest, sep)) |pos| {
+                const part = std.mem.trim(u8, rest[0..pos], " ");
+                if (part.len > 0) {
+                    compound.items[compound.len] = parseSingleCondition(part);
+                    compound.len += 1;
+                }
+                rest = rest[pos + sep.len ..];
+            } else {
+                const part = std.mem.trim(u8, rest, " ");
+                if (part.len > 0) {
+                    compound.items[compound.len] = parseSingleCondition(part);
+                    compound.len += 1;
+                }
+                break;
+            }
+        }
+        if (compound.len < 2) return null; // not actually compound
+        return compound;
+    }
+
+    /// Parse a single (non-compound) condition expression.
+    fn parseSingleCondition(cond: []const u8) SingleCondition {
         // Simple keyword conditions
         if (std.mem.eql(u8, cond, "not_empty")) return .not_empty;
         if (std.mem.eql(u8, cond, "key_not_empty")) return .key_not_empty;
@@ -485,4 +579,66 @@ test "ExprFilterOperator — json boolean equality" {
 test "ExprFilterOperator — json missing field" {
     var op = ExprFilterOperator.init("miss", "json:nonexistent=x");
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"other\":\"y\"}", 0)));
+}
+
+// =========================================================================
+// Compound (OR / AND) tests
+// =========================================================================
+
+test "ExprFilterOperator — OR matches either sub-condition" {
+    var op = ExprFilterOperator.init("or-filter", "value_contains:payment OR value_contains:kyc");
+
+    // Matches first branch
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "payment.transfer", 0)));
+    // Matches second branch
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "kyc.approved", 0)));
+    // Matches neither
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "refund.issued", 0)));
+    // Matches both (still true)
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "payment kyc combined", 0)));
+}
+
+test "ExprFilterOperator — AND requires all sub-conditions" {
+    var op = ExprFilterOperator.init("and-filter", "value_contains:payment AND value_contains:approved");
+
+    // Both match
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "payment approved", 0)));
+    // Only first matches
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "payment pending", 0)));
+    // Only second matches
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "approved refund", 0)));
+    // Neither matches
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "refund pending", 0)));
+}
+
+test "ExprFilterOperator — OR with three branches" {
+    var op = ExprFilterOperator.init("or3", "value_contains:error OR value_contains:warn OR value_contains:fatal");
+
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "error occurred", 0)));
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "warn: low disk", 0)));
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "fatal crash", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "info: all good", 0)));
+}
+
+test "ExprFilterOperator — OR with json expressions" {
+    var op = ExprFilterOperator.init("or-json", "json:type^=payment OR json:type^=kyc");
+
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"type\":\"payment.deposit\"}", 0)));
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"type\":\"kyc.verified\"}", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"type\":\"refund.partial\"}", 0)));
+}
+
+test "ExprFilterOperator — AND with json expressions" {
+    var op = ExprFilterOperator.init("and-json", "json:amount>100 AND json:status=approved");
+
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"amount\":200,\"status\":\"approved\"}", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"amount\":50,\"status\":\"approved\"}", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"amount\":200,\"status\":\"pending\"}", 0)));
+}
+
+test "ExprFilterOperator — single condition with OR in value is not compound" {
+    // "value_contains:OR" should NOT be treated as compound — "OR" is inside the arg
+    var op = ExprFilterOperator.init("not-compound", "value_contains:OR-gate");
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "OR-gate open", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "AND-gate open", 0)));
 }

@@ -1,13 +1,13 @@
 # Webhook Account Filter Pipeline
 #
-# Reads deposit webhooks from bridge.xyz, filters to deposit events only,
-# then performs a KV lookup to check if the account_id belongs to a known
-# internal wallet. Only records with matching KV entries pass through.
+# Reads incoming webhooks, filters to deposit events only, then performs
+# a KV lookup to check if the account_id belongs to a known internal
+# wallet. Only records with matching KV entries pass through.
 #
 # Architecture:
-#   bridge-webhooks → [filter: deposits only]
-#                   → [kv_lookup: account:${$.account_id}]
-#                   → relevant-deposits
+#   incoming-webhooks → [filter: deposits only]
+#                     → [kv_lookup: account:${$.account_id}]
+#                     → relevant-deposits
 #
 # The kv_lookup operator constructs `account:<account_id>` and checks
 # if that key exists in KV storage. If it does, the record is emitted;
@@ -20,7 +20,7 @@ namespace: default
 sources:
   - name: webhooks
     stream:
-      name: bridge-webhooks
+      name: incoming-webhooks
       partitions: all
 
 operators:

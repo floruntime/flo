@@ -89,6 +89,8 @@ pub const ActionsHandler = struct {
         worker_id_owned: ?[]const u8 = null,
         error_owned: ?[]const u8 = null,
         source: u8 = 0, // 0 = direct, 1 = workflow, 2 = trigger
+        caller_run_id_owned: ?[]const u8 = null,
+        caller_workflow_name_owned: ?[]const u8 = null,
         status: ActionRunStatus,
         created_at_ms: i64,
         started_at_ms: ?i64,
@@ -124,6 +126,8 @@ pub const ActionsHandler = struct {
             if (entry.value_ptr.outcome_owned) |out| self.allocator.free(out);
             if (entry.value_ptr.worker_id_owned) |wid| self.allocator.free(wid);
             if (entry.value_ptr.error_owned) |err_msg| self.allocator.free(err_msg);
+            if (entry.value_ptr.caller_run_id_owned) |crid| self.allocator.free(crid);
+            if (entry.value_ptr.caller_workflow_name_owned) |cwn| self.allocator.free(cwn);
         }
         self.runs.deinit();
     }
@@ -311,6 +315,8 @@ pub const ActionsHandler = struct {
         action_name: []const u8,
         input: ?[]const u8,
         created_at_ms: i64,
+        caller_run_id: ?[]const u8 = null,
+        caller_workflow_name: ?[]const u8 = null,
     };
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
@@ -338,7 +344,7 @@ pub const ActionsHandler = struct {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms };
+            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned };
         }
         return null;
     }
@@ -1009,7 +1015,7 @@ pub const ActionsHandler = struct {
     /// Returns null if the action doesn't exist or on allocation failure.
     /// For user-hosted actions the `shard` is used to notify blocked
     /// action_await waiters so external workers can claim the run.
-    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8) ?[]const u8 {
+    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         // Check action exists
         if (!self.actions.contains(action_name)) return null;
 
@@ -1027,6 +1033,14 @@ pub const ActionsHandler = struct {
             self.allocator.dupe(u8, i) catch null
         else
             null;
+        const owned_caller_run_id: ?[]const u8 = if (caller_run_id) |crid|
+            self.allocator.dupe(u8, crid) catch null
+        else
+            null;
+        const owned_caller_workflow_name: ?[]const u8 = if (caller_workflow_name) |cwn|
+            self.allocator.dupe(u8, cwn) catch null
+        else
+            null;
 
         const now_ms: i64 = std.time.milliTimestamp();
 
@@ -1034,6 +1048,8 @@ pub const ActionsHandler = struct {
             .run_id_owned = owned_run_id,
             .action_name_owned = owned_action_name,
             .input_owned = owned_input,
+            .caller_run_id_owned = owned_caller_run_id,
+            .caller_workflow_name_owned = owned_caller_workflow_name,
             .status = .pending,
             .created_at_ms = now_ms,
             .started_at_ms = null,
@@ -1042,6 +1058,8 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_run_id);
             self.allocator.free(owned_action_name);
             if (owned_input) |inp| self.allocator.free(inp);
+            if (owned_caller_run_id) |crid| self.allocator.free(crid);
+            if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
             return null;
         };
 
@@ -1475,8 +1493,12 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
 ///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
 fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
     const payload = task.input orelse "";
+    const caller_run_id = task.caller_run_id orelse "";
+    const caller_wf_name = task.caller_workflow_name orelse "";
+    const has_caller: u8 = if (task.caller_run_id != null) 1 else 0;
+    const caller_extra: usize = if (has_caller == 1) (2 + caller_run_id.len + 2 + caller_wf_name.len) else 0;
     var buf: [8192]u8 = undefined;
-    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + payload.len;
+    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len;
     if (total > buf.len) {
         shard.sendOkResponse(conn, request_id, task.run_id);
         return;
@@ -1498,6 +1520,19 @@ fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: A
     // attempt (always 1 for initial assignment)
     std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
     pos += 4;
+    // has_caller flag + optional caller block
+    buf[pos] = has_caller;
+    pos += 1;
+    if (has_caller == 1) {
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(caller_run_id.len), .little);
+        pos += 2;
+        @memcpy(buf[pos .. pos + caller_run_id.len], caller_run_id);
+        pos += caller_run_id.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(caller_wf_name.len), .little);
+        pos += 2;
+        @memcpy(buf[pos .. pos + caller_wf_name.len], caller_wf_name);
+        pos += caller_wf_name.len;
+    }
     // payload
     if (payload.len > 0) {
         @memcpy(buf[pos .. pos + payload.len], payload);

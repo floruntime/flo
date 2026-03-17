@@ -180,6 +180,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 
     // Accumulators with errdefer cleanup
     var name: ?[]u8 = null;
+    var description: ?[]u8 = null;
     var namespace: ?[]u8 = null;
     var parallelism: u32 = 1;
     var batch_size: u32 = 100;
@@ -189,6 +190,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 
     errdefer {
         if (name) |n| allocator.free(n);
+        if (description) |d| allocator.free(d);
         if (namespace) |ns| allocator.free(ns);
         freeSourceSpecs(allocator, &sources);
         freeSinkSpecs(allocator, &sinks);
@@ -198,6 +200,11 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     // --- name (optional, defaults to "unnamed-job") ---
     if (getString(root, "name")) |v| {
         name = allocator.dupe(u8, v) catch return error.OutOfMemory;
+    }
+
+    // --- description (optional, defaults to "") ---
+    if (getString(root, "description")) |v| {
+        description = allocator.dupe(u8, v) catch return error.OutOfMemory;
     }
 
     // --- namespace (optional, defaults to fallback_namespace or "default") ---
@@ -388,9 +395,13 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     if (name == null) {
         name = allocator.dupe(u8, "unnamed-job") catch return error.OutOfMemory;
     }
+    if (description == null) {
+        description = allocator.dupe(u8, "") catch return error.OutOfMemory;
+    }
 
     return .{
         .name = name.?,
+        .description = description.?,
         .namespace = namespace.?,
         .parallelism = parallelism,
         .batch_size = batch_size,

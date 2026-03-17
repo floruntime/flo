@@ -2824,3 +2824,120 @@ test "e2e/processing: WASM operator filter, flatmap, and state" {
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_wasm_enrich" });
 }
+
+// =============================================================================
+// Compound Expression (OR / AND) Filter E2E Tests
+// =============================================================================
+
+test "e2e/processing: filter with OR condition — keeps records matching either branch" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_or" });
+
+    // Write records with different event types
+    try ctx.exec(&.{ "stream", "append", "or-input", "{\"eventType\":\"payment.deposit\",\"id\":1}", "-n", "proc_or" });
+    try ctx.exec(&.{ "stream", "append", "or-input", "{\"eventType\":\"kyc.verified\",\"id\":2}", "-n", "proc_or" });
+    try ctx.exec(&.{ "stream", "append", "or-input", "{\"eventType\":\"refund.issued\",\"id\":3}", "-n", "proc_or" });
+    try ctx.exec(&.{ "stream", "append", "or-input", "{\"eventType\":\"payment.transfer\",\"id\":4}", "-n", "proc_or" });
+
+    // Submit a pipeline with an OR filter: keep payment OR kyc events
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-or-filter
+        \\namespace: proc_or
+        \\sources.[0].stream.name: or-input
+        \\operators.[0].type: filter
+        \\operators.[0].name: payment-or-kyc
+        \\operators.[0].condition: value_contains:payment OR value_contains:kyc
+        \\sinks.[0].stream.name: or-output
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-or-filter.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_or" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait for data to flow through
+    const found = try readStreamBlocking(ctx, "or-output", "proc_or", "payment.deposit", "8000");
+
+    if (!found) {
+        std.debug.print("\n[TIMEOUT] OR filter pipeline did not produce output\n", .{});
+        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_or" });
+        defer status.deinit();
+        std.debug.print("Job status: {s}\n", .{status.stdout});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // Verify output contains payment and kyc records, but NOT refund
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "or-output", "-n", "proc_or", "--start", "0-0", "--limit", "100" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+    try stdx.testing.assertContains(read_result, "payment.deposit");
+    try stdx.testing.assertContains(read_result, "kyc.verified");
+    try stdx.testing.assertContains(read_result, "payment.transfer");
+    // Refund should have been filtered out
+    try testing.expect(!read_result.stdoutContains("refund.issued"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_or" });
+}
+
+test "e2e/processing: filter with AND condition — keeps records matching all branches" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_and" });
+
+    // Write records — only one has BOTH "payment" AND "approved"
+    try ctx.exec(&.{ "stream", "append", "and-input", "payment approved tx-1", "-n", "proc_and" });
+    try ctx.exec(&.{ "stream", "append", "and-input", "payment pending tx-2", "-n", "proc_and" });
+    try ctx.exec(&.{ "stream", "append", "and-input", "refund approved tx-3", "-n", "proc_and" });
+    try ctx.exec(&.{ "stream", "append", "and-input", "refund pending tx-4", "-n", "proc_and" });
+
+    // Submit pipeline with AND filter
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-and-filter
+        \\namespace: proc_and
+        \\sources.[0].stream.name: and-input
+        \\operators.[0].type: filter
+        \\operators.[0].name: payment-and-approved
+        \\operators.[0].condition: value_contains:payment AND value_contains:approved
+        \\sinks.[0].stream.name: and-output
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-and-filter.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_and" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait for data to flow through
+    const found = try readStreamBlocking(ctx, "and-output", "proc_and", "payment approved", "8000");
+
+    if (!found) {
+        std.debug.print("\n[TIMEOUT] AND filter pipeline did not produce output\n", .{});
+        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_and" });
+        defer status.deinit();
+        std.debug.print("Job status: {s}\n", .{status.stdout});
+        ctx.dumpServerLogs();
+        return error.PipelineTimeout;
+    }
+
+    // Verify output contains ONLY the record with both "payment" AND "approved"
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "and-output", "-n", "proc_and", "--start", "0-0", "--limit", "100" });
+    defer read_result.deinit();
+
+    try stdx.testing.assertSucceeded(read_result);
+    try stdx.testing.assertContains(read_result, "payment approved tx-1");
+    // Other records should not be present
+    try testing.expect(!read_result.stdoutContains("pending"));
+    try testing.expect(!read_result.stdoutContains("refund"));
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_and" });
+}

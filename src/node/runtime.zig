@@ -284,13 +284,14 @@ pub const Runtime = struct {
 
         // 1. Create per-shard pipes
         const pipes = try self.allocator.alloc([2]i32, self.shard_count);
-        errdefer self.allocator.free(pipes);
         var pipes_created: usize = 0;
         errdefer {
             for (0..pipes_created) |i| {
                 std.posix.close(pipes[i][0]);
                 std.posix.close(pipes[i][1]);
             }
+            self.allocator.free(pipes);
+            self.pipes = null;
         }
 
         for (0..self.shard_count) |i| {
@@ -304,6 +305,10 @@ pub const Runtime = struct {
 
         // Build write-end array for acceptor
         const write_ends = try self.allocator.alloc(i32, self.shard_count);
+        errdefer {
+            self.allocator.free(write_ends);
+            self.pipe_write_ends = null;
+        }
         for (0..self.shard_count) |i| {
             write_ends[i] = pipes[i][1];
         }
@@ -319,6 +324,7 @@ pub const Runtime = struct {
                 shards[i].deinit();
             }
             self.allocator.free(shards);
+            self.shards = null;
         }
 
         for (0..self.shard_count) |i| {
@@ -355,8 +361,24 @@ pub const Runtime = struct {
         const threads = try self.allocator.alloc(std.Thread, self.shard_count);
         self.shard_threads = threads;
 
+        var threads_spawned: usize = 0;
+        // If a later startup step fails (e.g. AddressInUse on the acceptor), we
+        // must signal every already-running shard to stop and join it BEFORE the
+        // outer shard errdefer calls shard.deinit().  deinit() closes the kqueue
+        // poll_fd, and a thread still blocked in kevent() would get EBADF, which
+        // hits the `unreachable` branch in std.posix and turns a clean "port busy"
+        // error into an SIGABRT crash.  Zig errdefers fire in LIFO order, so this
+        // one runs first (threads stop), then the shard errdefer runs (deinit ok).
+        errdefer {
+            for (0..threads_spawned) |i| shards[i].shutdown();
+            for (0..threads_spawned) |i| threads[i].join();
+            self.allocator.free(threads);
+            self.shard_threads = null;
+        }
+
         for (0..self.shard_count) |i| {
             threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
+            threads_spawned += 1;
             log.debug("Runtime.start: spawned shard thread {d}", .{i});
         }
 

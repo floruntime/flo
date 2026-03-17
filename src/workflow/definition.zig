@@ -930,6 +930,8 @@ pub const InlinePlan = struct {
 pub const WorkflowDefinition = struct {
     /// Workflow name
     name: []const u8,
+    /// Optional human-readable description (empty string if not provided)
+    description: []const u8,
     /// Workflow version (semantic versioning)
     version: []const u8,
     /// Idempotency mode
@@ -953,6 +955,7 @@ pub const WorkflowDefinition = struct {
 
     pub fn deinit(self: *WorkflowDefinition, allocator: Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.description);
         allocator.free(self.version);
 
         for (self.search_attributes) |attr| {

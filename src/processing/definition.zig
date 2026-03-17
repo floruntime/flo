@@ -365,6 +365,8 @@ pub const OperatorSpec = struct {
 pub const JobDefinition = struct {
     /// Job name (defaults to "unnamed-job" if not specified)
     name: []const u8,
+    /// Optional human-readable description (empty string if not provided)
+    description: []const u8,
     /// Namespace for this job (inherited by sources/sinks when not overridden)
     namespace: []const u8,
     /// Parallelism level (defaults to 1)
@@ -405,6 +407,7 @@ pub const JobDefinition = struct {
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.description);
         allocator.free(self.namespace);
 
         for (self.sources.items) |src| {
