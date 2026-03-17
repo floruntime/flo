@@ -1020,6 +1020,7 @@ pub const WorkflowDefinition = struct {
 
         return .{
             .name = try allocator.dupe(u8, self.name),
+            .description = try allocator.dupe(u8, self.description),
             .version = try allocator.dupe(u8, self.version),
             .idempotency = self.idempotency,
             .search_attributes = search_attributes,
