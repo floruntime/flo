@@ -29,6 +29,7 @@ const Allocator = mem.Allocator;
 
 const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
+const cron = @import("cron.zig");
 
 // Type imports
 pub const WorkflowDefinition = definition.WorkflowDefinition;
@@ -90,6 +91,9 @@ pub const ErrorCode = enum {
     conflicting_transitions,
     empty_transitions,
     signal_without_timeout,
+    invalid_schedule_config,
+    invalid_cron_expression,
+    child_workflow_unverifiable,
 
     pub fn code(self: ErrorCode) []const u8 {
         return switch (self) {
@@ -119,6 +123,9 @@ pub const ErrorCode = enum {
             .conflicting_transitions => "E501",
             .empty_transitions => "E502",
             .signal_without_timeout => "E503",
+            .invalid_schedule_config => "E504",
+            .invalid_cron_expression => "E506",
+            .child_workflow_unverifiable => "E507",
         };
     }
 };
@@ -221,6 +228,24 @@ pub fn validateWorkflow(allocator: Allocator, def: *const WorkflowDefinition) !V
 
     // 6. Reachability analysis
     try validateReachability(&result, def);
+
+    // 7. Validate inline plans
+    try validateInlinePlans(&result, def);
+
+    // 8. Validate @plan/ references resolve to defined inline plans
+    try validatePlanReferences(&result, def);
+
+    // 9. Validate custom terminal status mappings
+    try validateTerminalStatuses(&result, def);
+
+    // 10. Check that at least one path reaches a terminal
+    try validateTerminalPathExists(&result, def);
+
+    // 11. Validate schedule config (cron/interval mutual exclusivity)
+    try validateSchedule(&result, def);
+
+    // 12. Note @workflow/ references that can only be verified at runtime
+    try validateChildWorkflowReferences(&result, def);
 
     return result;
 }
@@ -443,8 +468,183 @@ fn isTerminal(name: []const u8, def: *const WorkflowDefinition) bool {
 }
 
 // =============================================================================
-// Inline Plan Validator (for plans embedded in workflows)
+// Inline Plan Validation (called from validateWorkflow)
 // =============================================================================
+
+fn validateInlinePlans(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    for (def.plans) |plan| {
+        try validateInlinePlan(result, &plan);
+    }
+}
+
+// =============================================================================
+// @plan/ Reference Resolution
+// =============================================================================
+
+fn validatePlanReferences(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    // Build set of defined inline plan names
+    var plan_names = std.StringHashMap(void).init(result.allocator);
+    defer plan_names.deinit();
+    for (def.plans) |p| {
+        try plan_names.put(p.name, {});
+    }
+
+    // Check start step
+    try validateStepPlanRef(result, def.start, "start", &plan_names);
+
+    // Check all named steps
+    for (def.steps) |step| {
+        try validateStepPlanRef(result, step.step, step.name, &plan_names);
+    }
+}
+
+fn validateStepPlanRef(result: *ValidationResult, step: Step, step_name: []const u8, plan_names: *std.StringHashMap(void)) !void {
+    switch (step) {
+        .run => |r| {
+            if (mem.startsWith(u8, r.target, "@plan/")) {
+                const plan_key = r.target["@plan/".len..];
+                if (!plan_names.contains(plan_key)) {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "Step '{s}' references undefined plan '{s}'", .{ step_name, r.target }) catch "Undefined plan reference";
+                    try result.addError(.invalid_plan_reference, msg, step_name);
+                }
+            }
+        },
+        .wait_for_signal => {},
+    }
+}
+
+// =============================================================================
+// Custom Terminal Status Validation
+// =============================================================================
+
+fn validateTerminalStatuses(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    for (def.terminals) |t| {
+        if (!t.status.isTerminal()) {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Custom terminal '{s}' maps to non-terminal status '{s}'", .{ t.name, t.status.toString() }) catch "Invalid terminal status";
+            try result.addError(.conflicting_transitions, msg, t.name);
+        }
+    }
+}
+
+// =============================================================================
+// Terminal Path Existence
+// =============================================================================
+
+fn validateTerminalPathExists(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    // Check that at least one transition anywhere targets a terminal
+    const start_transitions = switch (def.start) {
+        .run => |r| r.transitions,
+        .wait_for_signal => |w| w.transitions,
+    };
+
+    for (start_transitions) |t| {
+        if (isTerminal(t.target, def)) return; // found one
+    }
+
+    for (def.steps) |step| {
+        const transitions = switch (step.step) {
+            .run => |r| r.transitions,
+            .wait_for_signal => |w| w.transitions,
+        };
+        for (transitions) |t| {
+            if (isTerminal(t.target, def)) return; // found one
+        }
+        // Also check timeout target
+        if (step.step == .wait_for_signal) {
+            if (step.step.wait_for_signal.on_timeout) |timeout_target| {
+                if (isTerminal(timeout_target, def)) return;
+            }
+        }
+    }
+
+    try result.addWarning(.no_terminal_path, "No transition in the workflow targets a terminal state", null);
+}
+
+// =============================================================================
+// Schedule Validation
+// =============================================================================
+
+fn validateSchedule(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    const sched = def.schedule orelse return;
+    if (sched.cron_expr == null and sched.interval_ms == null) {
+        try result.addError(.invalid_schedule_config, "Schedule defined but missing both 'cron' and 'interval'", null);
+    }
+    if (sched.cron_expr != null and sched.interval_ms != null) {
+        try result.addError(.invalid_schedule_config, "Schedule has both 'cron' and 'interval' (mutually exclusive)", null);
+    }
+    if (sched.cron_expr) |expr| {
+        try validateCronExpr(result, expr);
+    }
+    if (sched.interval_ms) |ms| {
+        if (ms <= 0) {
+            try result.addError(.invalid_schedule_config, "Schedule interval must be positive", null);
+        }
+    }
+}
+
+/// Validate a 5-field cron expression by parsing each field.
+fn validateCronExpr(result: *ValidationResult, expr: []const u8) !void {
+    // Split into whitespace-separated fields
+    var fields: [5][]const u8 = undefined;
+    var field_count: usize = 0;
+    var start: usize = 0;
+
+    for (expr, 0..) |c, i| {
+        if (c == ' ' or c == '\t') {
+            if (i > start and field_count < 5) {
+                fields[field_count] = expr[start..i];
+                field_count += 1;
+            }
+            start = i + 1;
+        }
+    }
+    if (start < expr.len and field_count < 5) {
+        fields[field_count] = expr[start..];
+        field_count += 1;
+    }
+
+    if (field_count != 5) {
+        try result.addError(.invalid_cron_expression, "Cron expression must have exactly 5 fields (minute hour day month weekday)", "schedule.cron");
+        return;
+    }
+
+    const field_names = [_][]const u8{ "minute", "hour", "day-of-month", "month", "day-of-week" };
+    const field_ranges = [_][2]u8{ .{ 0, 59 }, .{ 0, 23 }, .{ 1, 31 }, .{ 1, 12 }, .{ 0, 7 } };
+
+    for (0..5) |i| {
+        if (cron.parseCronField(fields[i], field_ranges[i][0], field_ranges[i][1]) == null) {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Invalid cron {s} field: '{s}'", .{ field_names[i], fields[i] }) catch "Invalid cron field";
+            try result.addError(.invalid_cron_expression, msg, "schedule.cron");
+        }
+    }
+}
+
+// =============================================================================
+// Child Workflow Reference Hints
+// =============================================================================
+
+fn validateChildWorkflowReferences(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    try checkStepChildWorkflow(result, def.start, "start");
+    for (def.steps) |step| {
+        try checkStepChildWorkflow(result, step.step, step.name);
+    }
+}
+
+fn checkStepChildWorkflow(result: *ValidationResult, step: Step, step_name: []const u8) !void {
+    switch (step) {
+        .run => |r| {
+            if (mem.startsWith(u8, r.target, "@workflow/")) {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Step '{s}' references child workflow '{s}' (existence verified at runtime by server)", .{ step_name, r.target }) catch "Child workflow reference";
+                try result.addWarning(.child_workflow_unverifiable, msg, step_name);
+            }
+        },
+        .wait_for_signal => {},
+    }
+}
 
 /// Validate an inline plan within a workflow
 pub fn validateInlinePlan(result: *ValidationResult, plan: *const InlinePlan) !void {
@@ -634,7 +834,7 @@ test "validateWorkflow: valid workflow" {
                 .name = "process",
                 .step = .{
                     .run = .{
-                        .target = "@plan/processing",
+                        .target = "@actions/processing",
                         .input_mapping = null,
                         .retry = null,
                         .poll = null,
@@ -838,4 +1038,417 @@ test "isValidActionOrPlanReference" {
     try testing.expect(!isValidActionOrPlanReference("@plan/")); // Empty name
     try testing.expect(!isValidActionOrPlanReference("validate")); // No prefix
     try testing.expect(!isValidActionOrPlanReference("")); // Empty
+}
+
+test "validateWorkflow: undefined plan reference" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{}, // No plans defined
+        .start = .{
+            .run = .{
+                .target = "@plan/nonexistent",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                    .{ .outcome = "failure", .target = "flo.Failed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    try testing.expect(result.hasErrors());
+
+    var found = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_plan_reference) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "validateWorkflow: custom terminal with valid status" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/validate",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                    .{ .outcome = "failure", .target = "FraudDetected" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{
+            .{ .name = "FraudDetected", .status = .failed },
+        },
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    try testing.expect(!result.hasErrors());
+}
+
+test "validateWorkflow: no terminal path warning" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/validate",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "step_b" },
+                },
+            },
+        },
+        .steps = &.{
+            .{
+                .name = "step_b",
+                .step = .{
+                    .run = .{
+                        .target = "@actions/process",
+                        .input_mapping = null,
+                        .retry = null,
+                        .poll = null,
+                        .transitions = &.{
+                            .{ .outcome = "success", .target = "step_b" }, // loops forever
+                        },
+                    },
+                },
+            },
+        },
+        .terminals = &.{},
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found = false;
+    for (result.errors.items) |err| {
+        if (err.code == .no_terminal_path) {
+            found = true;
+            try testing.expectEqual(ErrorSeverity.warning, err.severity);
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "validateWorkflow: schedule missing cron and interval" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{}, // empty — no cron, no interval
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found_sched = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_schedule_config) {
+            found_sched = true;
+            break;
+        }
+    }
+    try testing.expect(found_sched);
+}
+
+test "validateWorkflow: schedule with both cron and interval" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{ .cron_expr = "*/5 * * * *", .interval_ms = 30000 },
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found_both = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_schedule_config) {
+            found_both = true;
+            break;
+        }
+    }
+    try testing.expect(found_both);
+}
+
+test "validateWorkflow: child workflow reference warning" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@workflow/child-wf",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                    .{ .outcome = "failure", .target = "flo.Failed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    // Should be a warning, not an error
+    try testing.expect(!result.hasErrors());
+
+    var found_cwf = false;
+    for (result.errors.items) |err| {
+        if (err.code == .child_workflow_unverifiable) {
+            found_cwf = true;
+            try testing.expectEqual(ErrorSeverity.warning, err.severity);
+            break;
+        }
+    }
+    try testing.expect(found_cwf);
+}
+
+test "validateWorkflow: valid cron expression passes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{ .cron_expr = "0 9 * * 1-5" },
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_cron_expression) {
+            try testing.expect(false); // should not have cron errors
+        }
+    }
+}
+
+test "validateWorkflow: invalid cron expression wrong field count" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{ .cron_expr = "*/5 * *" }, // only 3 fields
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_cron_expression) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "validateWorkflow: invalid cron expression bad field value" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{ .cron_expr = "99 * * * *" }, // 99 is out of range for minute (0-59)
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_cron_expression) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "validateWorkflow: negative interval rejected" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var def = WorkflowDefinition{
+        .name = "test",
+        .description = "",
+        .version = "1.0.0",
+        .idempotency = .none,
+        .search_attributes = &.{},
+        .plans = &.{},
+        .start = .{
+            .run = .{
+                .target = "@actions/test",
+                .input_mapping = null,
+                .retry = null,
+                .poll = null,
+                .transitions = &.{
+                    .{ .outcome = "success", .target = "flo.Completed" },
+                },
+            },
+        },
+        .steps = &.{},
+        .terminals = &.{},
+        .schedule = .{ .interval_ms = -1000 },
+    };
+
+    var result = try validateWorkflow(allocator, &def);
+    defer result.deinit();
+
+    var found = false;
+    for (result.errors.items) |err| {
+        if (err.code == .invalid_schedule_config) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
 }

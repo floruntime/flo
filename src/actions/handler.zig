@@ -56,6 +56,9 @@ const OpCode = proto.OpCode;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const ActionsHandler = struct {
+    /// Public reference to resolveActionAwait for cross-shard inbox notifications.
+    pub const resolveActionAwaitFn = resolveActionAwait;
+
     allocator: Allocator,
 
     /// In-memory action registry. Stored as name → ActionRecord.
@@ -63,7 +66,11 @@ pub const ActionsHandler = struct {
     actions: std.StringHashMap(ActionRecord),
 
     /// In-memory run store. run_id → RunRecord.
+    /// Protected by runs_mu for cross-shard access from workflow handler.
     runs: std.StringHashMap(RunRecord),
+
+    /// Mutex protecting runs for cross-shard access.
+    runs_mu: std.Thread.Mutex = .{},
 
     /// Monotonic run counter.
     next_run_id: u64,
@@ -145,7 +152,10 @@ pub const ActionsHandler = struct {
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_await, dispatchActionAwait, preRouteByActionAwait);
+        // action_await is NOT pre-routed: workers register multiple action names
+        // that may hash to different shards. Instead, tryClaimAnyAction checks all
+        // peer shards to find pending runs regardless of which shard created them.
+        dispatcher.register(.action_await, dispatchActionAwait);
         dispatcher.registerWithRoute(.action_complete, dispatchActionTaskCmd, preRouteByActionValue);
         dispatcher.registerWithRoute(.action_fail, dispatchActionTaskCmd, preRouteByActionValue);
         dispatcher.registerWithRoute(.action_touch, dispatchActionTaskCmd, preRouteByActionValue);
@@ -199,6 +209,18 @@ pub const ActionsHandler = struct {
             .action_invoked => {
                 shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
+
+                // Broadcast to all other shards so their action_await waiters can
+                // try claiming this run. Workers may be connected to any shard.
+                if (shard.peer_inboxes) |inboxes| {
+                    for (inboxes, 0..) |inbox, i| {
+                        if (i == shard.id) continue;
+                        _ = inbox.send(.{
+                            .tag = .action_invoke,
+                            .src_shard = @intCast(shard.id),
+                        });
+                    }
+                }
             },
             else => {},
         }
@@ -283,12 +305,10 @@ pub const ActionsHandler = struct {
         else
             null;
 
-        // Check if there's already a pending run to claim
-        if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
-            shard.worker_handler.recordTaskAssigned(worker_id);
-            sendTaskAssignment(shard, conn, req.header.request_id, task);
-            return;
-        }
+        // Try to claim a pending run for ANY registered action, not just the first.
+        // Workers register multiple actions and cross-shard invocations may create
+        // runs for any of them.
+        if (tryClaimAnyAction(shard, conn, req, worker_id, worker_labels)) return;
 
         // No pending work — register blocking waiter.
         // Encode compound key: action_name + worker_id (no separator needed,
@@ -313,6 +333,32 @@ pub const ActionsHandler = struct {
         conn.response_deferred = true;
     }
 
+    /// Try to claim a pending run for any action type listed in the await request.
+    /// Checks local shard first, then all peer shards. Returns true if a task was assigned.
+    fn tryClaimAnyAction(shard: *Shard, conn: *Connection, req: Request, worker_id: []const u8, worker_labels: ?[]const u8) bool {
+        var it = TaskTypeIterator.init(req.value);
+        while (it.next()) |name| {
+            // Check local shard first (fast path — no lock contention)
+            if (shard.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
+                shard.worker_handler.recordTaskAssigned(worker_id);
+                sendTaskAssignment(shard, conn, req.header.request_id, task);
+                return true;
+            }
+            // Check peer shards for runs created by pre-routed invokes
+            if (shard.peer_shards) |peers| {
+                for (peers, 0..) |peer, i| {
+                    if (i == shard.id) continue;
+                    if (peer.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
+                        shard.worker_handler.recordTaskAssigned(worker_id);
+                        sendTaskAssignment(shard, conn, req.header.request_id, task);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     /// Claimed task info returned by claimPendingRun.
     const ClaimedTask = struct {
         run_id: []const u8,
@@ -326,6 +372,9 @@ pub const ActionsHandler = struct {
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
     /// If worker_labels is provided, only claims runs whose required labels match.
     fn claimPendingRun(self: *ActionsHandler, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         var it = self.runs.iterator();
         while (it.next()) |entry| {
             const run = entry.value_ptr;
@@ -371,6 +420,9 @@ pub const ActionsHandler = struct {
     // ── REGISTER ────────────────────────────────────────────────────────
 
     fn handleRegister(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const name = req.key;
         const namespace = if (req.namespace.len == 0) "default" else req.namespace;
 
@@ -444,6 +496,9 @@ pub const ActionsHandler = struct {
     // ── INVOKE ──────────────────────────────────────────────────────────
 
     fn handleInvoke(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const action_name = req.key;
 
         if (action_name.len == 0) {
@@ -601,6 +656,9 @@ pub const ActionsHandler = struct {
     // ── STATUS ──────────────────────────────────────────────────────────
 
     fn handleStatus(self: *ActionsHandler, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const run_id = req.key;
 
         if (run_id.len == 0) {
@@ -626,6 +684,9 @@ pub const ActionsHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *ActionsHandler, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const namespace = if (req.namespace.len == 0) "default" else req.namespace;
 
         const data = self.serializeActionList(namespace) catch {
@@ -647,6 +708,9 @@ pub const ActionsHandler = struct {
     ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
     ///                [has_completed:u8][completed_at?:i64])*
     fn handleListRuns(self: *ActionsHandler, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const action_filter = req.key;
 
         // Parse limit from value field (u32 LE, default 100)
@@ -747,6 +811,9 @@ pub const ActionsHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *ActionsHandler = @ptrCast(@alignCast(ctx));
+        handler.runs_mu.lock();
+        defer handler.runs_mu.unlock();
+
         const effective_ns = if (namespace.len == 0) "default" else namespace;
         const S = struct {
             threadlocal var name_buf: [1024][]const u8 = undefined;
@@ -767,6 +834,9 @@ pub const ActionsHandler = struct {
     // ── DELETE ───────────────────────────────────────────────────────────
 
     fn handleDelete(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const name = req.key;
 
         if (name.len == 0) {
@@ -810,6 +880,9 @@ pub const ActionsHandler = struct {
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
     ///         [outcome_len:u16][outcome][result_len:u16][result]
     fn handleActionComplete(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const value = req.value;
         var offset: usize = 0;
 
@@ -873,6 +946,9 @@ pub const ActionsHandler = struct {
     /// Touch (extend lease on) a running task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
     fn handleActionTouch(self: *ActionsHandler, req: Request) ?[]const u8 {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const value = req.value;
         var offset: usize = 0;
 
@@ -902,6 +978,9 @@ pub const ActionsHandler = struct {
     /// Fail a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
     fn handleActionFail(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+
         const value = req.value;
         var offset: usize = 0;
 
@@ -1061,6 +1140,83 @@ pub const ActionsHandler = struct {
 
         const now_ms: i64 = std.time.milliTimestamp();
 
+        // Lock around runs map mutation (cross-shard invokeByNameWithId may race).
+        // We must release the lock before notifyAny because that calls
+        // claimPendingRun which also acquires runs_mu.
+        self.runs_mu.lock();
+        self.runs.put(owned_run_id, .{
+            .run_id_owned = owned_run_id,
+            .action_name_owned = owned_action_name,
+            .input_owned = owned_input,
+            .caller_run_id_owned = owned_caller_run_id,
+            .caller_workflow_name_owned = owned_caller_workflow_name,
+            .status = .pending,
+            .created_at_ms = now_ms,
+            .started_at_ms = null,
+            .completed_at_ms = null,
+        }) catch {
+            self.runs_mu.unlock();
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_action_name);
+            if (owned_input) |inp| self.allocator.free(inp);
+            if (owned_caller_run_id) |crid| self.allocator.free(crid);
+            if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
+            return null;
+        };
+
+        // For WASM actions, execute inline under the lock (synchronous, same thread).
+        // For user-hosted actions, release the lock FIRST, then notify waiters
+        // (notifyAny → resolveActionAwait → claimPendingRun also acquires runs_mu).
+        var is_wasm = false;
+        if (self.actions.get(action_name)) |action| {
+            if (action.action_type == 1) {
+                is_wasm = true;
+                const wasm_out = self.executeWasmAction(owned_run_id, &action, input orelse "");
+                if (wasm_out) |o| self.allocator.free(o);
+            }
+        }
+        self.runs_mu.unlock();
+
+        if (!is_wasm) {
+            // User-hosted: wake any workers waiting for this action
+            if (self.actions.get(action_name)) |action| {
+                if (action.action_type != 1) {
+                    shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
+                }
+            }
+        }
+
+        return owned_run_id;
+    }
+
+    /// Like invokeByName but uses a pre-generated run ID.
+    /// Used for cross-shard invocations via inbox where the caller needs
+    /// to know the run ID before the actual run is created on the target shard.
+    /// Does NOT notify waiters — the caller must send an inbox message to
+    /// the target shard for waiter notification.
+    pub fn invokeByNameWithId(self: *ActionsHandler, pre_run_id: []const u8, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) bool {
+        if (!self.actions.contains(action_name)) return false;
+
+        const owned_run_id = self.allocator.dupe(u8, pre_run_id) catch return false;
+        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
+            self.allocator.free(owned_run_id);
+            return false;
+        };
+        const owned_input: ?[]const u8 = if (input) |i|
+            self.allocator.dupe(u8, i) catch null
+        else
+            null;
+        const owned_caller_run_id: ?[]const u8 = if (caller_run_id) |crid|
+            self.allocator.dupe(u8, crid) catch null
+        else
+            null;
+        const owned_caller_workflow_name: ?[]const u8 = if (caller_workflow_name) |cwn|
+            self.allocator.dupe(u8, cwn) catch null
+        else
+            null;
+
+        const now_ms: i64 = std.time.milliTimestamp();
+
         self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
             .action_name_owned = owned_action_name,
@@ -1077,26 +1233,14 @@ pub const ActionsHandler = struct {
             if (owned_input) |inp| self.allocator.free(inp);
             if (owned_caller_run_id) |crid| self.allocator.free(crid);
             if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
-            return null;
+            return false;
         };
 
-        // For WASM actions, execute inline (synchronous).
-        // For user-hosted actions, notify action_await waiters so
-        // a blocked worker can claim the pending run.
-        if (self.actions.get(action_name)) |action| {
-            if (action.action_type == 1) {
-                const wasm_out = self.executeWasmAction(owned_run_id, &action, input orelse "");
-                if (wasm_out) |o| self.allocator.free(o);
-            } else {
-                // User-hosted: wake any workers waiting for this action
-                shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
-            }
-        }
-
-        return owned_run_id;
+        return true;
     }
 
     /// Check the status and result of an action run.
+    /// Thread-safe: protected by runs_mu for cross-shard access.
     pub fn getRunResult(self: *ActionsHandler, run_id: []const u8) ?InternalRunResult {
         const run = self.runs.get(run_id) orelse return null;
         return .{
@@ -1493,6 +1637,7 @@ const Waiter = waiter_pool_mod.Waiter;
 
 /// Action await resolver: claim a pending run matching any action the worker handles.
 /// Waiter key is compound: action_name + worker_id (min_version = action_name.len).
+/// Checks both local and peer shards since action runs may be pre-routed to any shard.
 fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const full_key = waiter.key_buf[0..waiter.key_len];
@@ -1507,8 +1652,8 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     else
         null;
 
-    // Try to claim a pending run for the primary action name first
-    if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
+    // Try to claim a pending run for the primary action name — local then peers
+    if (claimFromAnyShard(shard, action_name, worker_labels, worker_id)) |task| {
         const conn = shard.getConnection(waiter.fd) orelse return true;
         sendTaskAssignment(shard, conn, waiter.request_id, task);
         shard.flushToClient(waiter.fd);
@@ -1522,7 +1667,7 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
                 if (process.kind != .action) continue;
                 // Skip the primary name we already tried
                 if (std.mem.eql(u8, process.name_owned, action_name)) continue;
-                if (shard.actions_handler.claimPendingRun(process.name_owned, worker_labels, worker_id)) |task| {
+                if (claimFromAnyShard(shard, process.name_owned, worker_labels, worker_id)) |task| {
                     const conn = shard.getConnection(waiter.fd) orelse return true;
                     sendTaskAssignment(shard, conn, waiter.request_id, task);
                     shard.flushToClient(waiter.fd);
@@ -1533,6 +1678,24 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     }
 
     return false;
+}
+
+/// Try to claim a pending run from the local shard first, then all peer shards.
+fn claimFromAnyShard(shard: *Shard, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ActionsHandler.ClaimedTask {
+    // Local shard first (fast path)
+    if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
+        return task;
+    }
+    // Check peer shards
+    if (shard.peer_shards) |peers| {
+        for (peers, 0..) |peer, i| {
+            if (i == shard.id) continue;
+            if (peer.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
+                return task;
+            }
+        }
+    }
+    return null;
 }
 
 /// Send a task assignment response in the full wire format:
@@ -1598,6 +1761,33 @@ fn extractFirstTaskType(value: []const u8) ?[]const u8 {
     if (name.len == 0) return null;
     return name;
 }
+
+/// Iterator over task types in the action_await wire format.
+/// Wire format: [count:u32][type_len:u16][type_name]...
+const TaskTypeIterator = struct {
+    data: []const u8,
+    offset: usize,
+    remaining: u32,
+
+    fn init(value: []const u8) TaskTypeIterator {
+        if (value.len < 4) return .{ .data = value, .offset = 0, .remaining = 0 };
+        const count = std.mem.readInt(u32, value[0..4], .little);
+        return .{ .data = value, .offset = 4, .remaining = count };
+    }
+
+    fn next(self: *TaskTypeIterator) ?[]const u8 {
+        if (self.remaining == 0) return null;
+        if (self.offset + 2 > self.data.len) return null;
+        const type_len = std.mem.readInt(u16, self.data[self.offset..][0..2], .little);
+        self.offset += 2;
+        if (self.offset + type_len > self.data.len) return null;
+        const name = self.data[self.offset .. self.offset + type_len];
+        self.offset += type_len;
+        self.remaining -= 1;
+        if (name.len == 0) return self.next();
+        return name;
+    }
+};
 
 /// Parse the invoke value wire format to extract labels and actual input.
 /// Wire format:

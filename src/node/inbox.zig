@@ -49,6 +49,9 @@ pub const Tag = enum(u8) {
     // ── System ──
     metadata_update, // Namespace/partition table changed
     shutdown, // Graceful shutdown signal
+
+    // ── Actions ──
+    action_invoke, // Cross-shard action invocation from workflow handler
 };
 
 /// 32-byte compact envelope — payload is slab-allocated separately.

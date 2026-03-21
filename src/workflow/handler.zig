@@ -47,6 +47,7 @@ const Partition = @import("../storage/partition.zig").Partition;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
+const router = @import("../node/router.zig");
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -58,6 +59,10 @@ const OpCode = proto.OpCode;
 
 pub const WorkflowHandler = struct {
     allocator: Allocator,
+
+    /// Mutex for cross-shard thread safety. Acquired when this handler is
+    /// accessed from a different shard's thread via forwardToShard dispatch.
+    mu: std.Thread.Mutex,
 
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
@@ -72,6 +77,10 @@ pub const WorkflowHandler = struct {
     /// Active stream triggers: "namespace:workflow_name" → StreamTriggerState.
     /// Registered when a workflow with a `trigger:` block is created.
     stream_triggers: std.StringHashMap(StreamTriggerState),
+
+    /// Active interval/cron schedules: "namespace:workflow_name" → ScheduleState.
+    /// Registered when a workflow with a `schedule:` block is created.
+    schedules: std.StringHashMap(ScheduleState),
 
     /// Monotonic run counter.
     next_run_id: u64,
@@ -148,6 +157,9 @@ pub const WorkflowHandler = struct {
         /// Step name that triggered the pending action.
         pending_step_name_owned: ?[]const u8 = null,
 
+        /// Shard ID where the pending action run was created (for cross-shard lookup).
+        pending_action_shard_id: ?u16 = null,
+
         /// Retry attempt counter for the current step (reset on step transition).
         retry_count: u32 = 0,
 
@@ -183,13 +195,24 @@ pub const WorkflowHandler = struct {
         last_poll_ms: i64,
     };
 
+    pub const ScheduleState = struct {
+        workflow_name_owned: []const u8,
+        namespace_owned: []const u8,
+        interval_ms: i64,
+        max_concurrent: u32,
+        input_owned: ?[]const u8,
+        last_trigger_ms: i64,
+    };
+
     pub fn init(allocator: Allocator) WorkflowHandler {
         return .{
             .allocator = allocator,
+            .mu = .{},
             .definitions = std.StringHashMap(DefinitionRecord).init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
             .disabled = std.StringHashMap(void).init(allocator),
             .stream_triggers = std.StringHashMap(StreamTriggerState).init(allocator),
+            .schedules = std.StringHashMap(ScheduleState).init(allocator),
             .next_run_id = 1,
         };
     }
@@ -227,6 +250,14 @@ pub const WorkflowHandler = struct {
             self.freeTriggerState(entry.value_ptr);
         }
         self.stream_triggers.deinit();
+
+        // Free schedule state
+        var sit = self.schedules.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.freeScheduleState(entry.value_ptr);
+        }
+        self.schedules.deinit();
     }
 
     fn freeRunRecord(self: *WorkflowHandler, run: *RunRecord) void {
@@ -267,23 +298,38 @@ pub const WorkflowHandler = struct {
         self.allocator.free(state.stream_namespace_owned);
     }
 
+    fn freeScheduleState(self: *WorkflowHandler, state: *ScheduleState) void {
+        self.allocator.free(state.workflow_name_owned);
+        self.allocator.free(state.namespace_owned);
+        if (state.input_owned) |inp| self.allocator.free(inp);
+    }
+
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
-        // All workflow opcodes use standard key-based routing.
-        // The CLI sends key=workflow_name (extracted client-side from YAML),
-        // so the Acceptor hash-routes the connection to the correct shard.
-        dispatcher.register(.workflow_create, dispatchWorkflow);
-        dispatcher.register(.workflow_start, dispatchWorkflow);
+        // Name-based ops: pre-routed by hash(namespace, workflow_name) so that
+        // definitions and runs land on the same deterministic shard.
+        dispatcher.registerWithRoute(.workflow_create, dispatchWorkflow, preRouteByWorkflow);
+        dispatcher.registerWithRoute(.workflow_start, dispatchWorkflow, preRouteByWorkflow);
+        dispatcher.registerWithRoute(.workflow_list_runs, dispatchWorkflow, preRouteByWorkflow);
+        dispatcher.registerWithRoute(.workflow_get_definition, dispatchWorkflow, preRouteByWorkflow);
+        dispatcher.registerWithRoute(.workflow_disable, dispatchWorkflow, preRouteByWorkflow);
+        dispatcher.registerWithRoute(.workflow_enable, dispatchWorkflow, preRouteByWorkflow);
+        // Run-based ops: key is run_id, NOT workflow name. Cannot pre-route
+        // because we don't know which shard owns the run. Handlers search
+        // peer shards when not found locally.
+        dispatcher.register(.workflow_status, dispatchWorkflow);
         dispatcher.register(.workflow_signal, dispatchWorkflow);
         dispatcher.register(.workflow_cancel, dispatchWorkflow);
-        dispatcher.register(.workflow_status, dispatchWorkflow);
         dispatcher.register(.workflow_history, dispatchWorkflow);
-        dispatcher.register(.workflow_list_runs, dispatchWorkflow);
-        dispatcher.register(.workflow_get_definition, dispatchWorkflow);
-        dispatcher.register(.workflow_disable, dispatchWorkflow);
-        dispatcher.register(.workflow_enable, dispatchWorkflow);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
+    }
+
+    /// Route workflow requests by hash(namespace, workflow_name) so that all
+    /// operations for a given workflow land on the same shard.
+    fn preRouteByWorkflow(req: proto.Request) ?u64 {
+        if (req.key.len == 0) return 0;
+        return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
     /// ShardWalker LocalScanFn for workflow_list_definitions — returns
@@ -296,6 +342,9 @@ pub const WorkflowHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
+        handler.mu.lock();
+        defer handler.mu.unlock();
+
         const S = struct {
             threadlocal var name_buf: [256][]const u8 = undefined;
         };
@@ -330,6 +379,9 @@ pub const WorkflowHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     pub fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         const op: OpCode = @enumFromInt(req.header.op_code);
         switch (op) {
             .workflow_create => self.handleCreate(shard, conn, req),
@@ -347,6 +399,31 @@ pub const WorkflowHandler = struct {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown workflow opcode");
             },
         }
+    }
+
+    // ── Cross-Shard Run Forwarding ──────────────────────────────────────
+
+    /// For run-based operations (status, signal, cancel, history) where
+    /// the key is a run_id: when the run isn't found locally, check peer
+    /// shards. If a peer owns the run, dispatch the request on that peer
+    /// and return true. Returns false if no peer has the run.
+    fn forwardRunOp(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request, run_ns_key: []const u8) bool {
+        _ = self;
+        const peers = shard.peer_shards orelse return false;
+        for (peers) |peer| {
+            if (peer == shard) continue;
+            // Check if this peer's workflow handler has the run.
+            const peer_wh = peer.workflow_handler;
+            peer_wh.mu.lock();
+            const has_run = peer_wh.runs.contains(run_ns_key);
+            peer_wh.mu.unlock();
+            if (has_run) {
+                // Dispatch on the peer's handler (acquires its own lock).
+                peer_wh.handleCommand(peer, conn, req);
+                return true;
+            }
+        }
+        return false;
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
@@ -454,6 +531,13 @@ pub const WorkflowHandler = struct {
         } else {
             // Definition updated without trigger — remove any existing trigger
             self.unregisterStreamTrigger(req.namespace, name);
+        }
+
+        // Register schedule if the definition has one
+        if (def.schedule) |schedule| {
+            self.registerSchedule(req.namespace, name, schedule);
+        } else {
+            self.unregisterSchedule(req.namespace, name);
         }
 
         shard.sendOkResponse(conn, req.header.request_id, owned_name);
@@ -716,6 +800,8 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.getPtr(run_ns_key) orelse {
+            // Run not on this shard — forward to the peer that owns it.
+            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -808,6 +894,8 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.getPtr(run_ns_key) orelse {
+            // Run not on this shard — forward to the peer that owns it.
+            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -839,6 +927,8 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.get(run_ns_key) orelse {
+            // Run not on this shard — forward to the peer that owns it.
+            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -904,6 +994,8 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.get(run_ns_key) orelse {
+            // Run not on this shard — forward to the peer that owns it.
+            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1286,7 +1378,7 @@ pub const WorkflowHandler = struct {
                     const step_input: []const u8 = resolved_input orelse run.input_owned;
 
                     // Execute the step and determine outcome
-                    const outcome_or_park = self.executeRunStep(shard, run, run_step, step_input, step_label, now_ms);
+                    const outcome_or_park = self.executeRunStep(shard, run, run_step, step_input, step_label, namespace, now_ms);
 
                     // Free resolved input after action invocation
                     if (resolved_input) |ri| self.allocator.free(ri);
@@ -1319,8 +1411,8 @@ pub const WorkflowHandler = struct {
                         return;
                     };
 
-                    // Check if target is a terminal
-                    if (terminalStatus(transition.target)) |status| {
+                    // Check if target is a terminal (builtin or custom)
+                    if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
                         self.completeRun(run, status, transition.target, now_ms);
                         return;
                     }
@@ -1350,7 +1442,7 @@ pub const WorkflowHandler = struct {
                             return;
                         };
 
-                        if (terminalStatus(transition.target)) |status| {
+                        if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
                             self.completeRun(run, status, transition.target, now_ms);
                             return;
                         }
@@ -1390,10 +1482,11 @@ pub const WorkflowHandler = struct {
         run_step: definition.RunStep,
         step_input: []const u8,
         step_label: []const u8,
+        namespace: []const u8,
         now_ms: i64,
     ) ?[]const u8 {
         if (run_step.isAction()) {
-            return self.invokeAction(shard, run, run_step.targetName(), step_input, step_label, now_ms);
+            return self.invokeAction(shard, run, run_step.targetName(), step_input, step_label, namespace, now_ms);
         } else if (run_step.isPlan()) {
             // Plan execution: look up InlinePlan, select executor, invoke its action.
             // For now, plans succeed — full plan executor selection is a follow-up.
@@ -1417,9 +1510,72 @@ pub const WorkflowHandler = struct {
         action_name: []const u8,
         input: []const u8,
         step_label: []const u8,
+        namespace: []const u8,
         now_ms: i64,
     ) ?[]const u8 {
-        // Look up action in the registry
+        // Determine target shard via hash routing (deterministic: same as
+        // action_register and action_invoke pre_route). This replaces the
+        // old findActionShard scan.
+        const target_shard_id = self.resolveActionShardId(shard, namespace, action_name);
+        const is_local = (target_shard_id == shard.id);
+
+        if (is_local) {
+            // Local shard: use invokeByName directly (same thread, no threading concerns)
+            return self.invokeActionLocal(shard, run, action_name, input, step_label, target_shard_id, now_ms);
+        }
+
+        // Cross-shard: need to create run on the target shard's handler
+        const target_handler = self.resolveActionHandler(shard, namespace, action_name);
+
+        // Pre-generate a run ID for the cross-shard invocation
+        var run_id_buf: [32]u8 = undefined;
+        const ts = @as(u64, @bitCast(std.time.milliTimestamp()));
+        const pre_run_id = std.fmt.bufPrint(&run_id_buf, "x{d}-{d}", .{ shard.id, ts }) catch {
+            return definition.StepOutcome.execution_failure;
+        };
+
+        // Create the run on the target shard's handler under mutex
+        target_handler.runs_mu.lock();
+        const ok = target_handler.invokeByNameWithId(pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned);
+        target_handler.runs_mu.unlock();
+
+        if (!ok) return definition.StepOutcome.execution_failure;
+
+        // Dupe the pre_run_id for parking (it's on the stack)
+        const owned_pre_id = self.allocator.dupe(u8, pre_run_id) catch {
+            return definition.StepOutcome.execution_failure;
+        };
+
+        // Broadcast inbox notifications to all shards so action_await waiters
+        // on any shard can try claiming this run.
+        if (shard.peer_inboxes) |inboxes| {
+            for (inboxes, 0..) |inbox, i| {
+                _ = inbox.send(.{
+                    .tag = .action_invoke,
+                    .src_shard = @intCast(shard.id),
+                });
+                _ = i;
+            }
+        }
+
+        // Park the workflow run, awaiting action completion
+        self.parkForAction(run, owned_pre_id, step_label, action_name, target_shard_id, now_ms);
+        // Free the duped ID since parkForAction dupes it again
+        self.allocator.free(owned_pre_id);
+        return null; // signals: parked
+    }
+
+    /// Same-shard action invocation (no threading concerns).
+    fn invokeActionLocal(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        run: *RunRecord,
+        action_name: []const u8,
+        input: []const u8,
+        step_label: []const u8,
+        target_shard_id: u16,
+        now_ms: i64,
+    ) ?[]const u8 {
         const action = shard.actions_handler.actions.get(action_name) orelse {
             self.addHistoryEvent(run, "action_not_found", action_name, now_ms);
             return definition.StepOutcome.target_not_found;
@@ -1430,12 +1586,10 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.target_disabled;
         }
 
-        // Invoke the action — creates a run record in ActionsHandler
         const action_run_id = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
             return definition.StepOutcome.execution_failure;
         };
 
-        // Check the result immediately (WASM actions complete synchronously)
         if (shard.actions_handler.getRunResult(action_run_id)) |result| {
             switch (result.status) {
                 .completed => {
@@ -1451,9 +1605,8 @@ pub const WorkflowHandler = struct {
                     return definition.StepOutcome.failure;
                 },
                 .pending, .running => {
-                    // Async action (user-hosted) — park the workflow run
-                    self.parkForAction(run, action_run_id, step_label, action_name, now_ms);
-                    return null; // signals: parked
+                    self.parkForAction(run, action_run_id, step_label, action_name, target_shard_id, now_ms);
+                    return null;
                 },
                 else => return definition.StepOutcome.execution_failure,
             }
@@ -1461,8 +1614,56 @@ pub const WorkflowHandler = struct {
         return definition.StepOutcome.execution_failure;
     }
 
+    /// Resolve the ActionsHandler responsible for the given action name.
+    /// Uses peer_shards for cross-shard access, falls back to local.
+    fn resolveActionHandler(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) *ActionsHandler {
+        _ = self;
+        const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const target = shard.router.route(hash);
+        switch (target) {
+            .local => return shard.actions_handler,
+            .shard => |t| {
+                if (shard.peer_shards) |peers| {
+                    return peers[t.shard_id].actions_handler;
+                }
+                return shard.actions_handler;
+            },
+            .remote => return shard.actions_handler,
+        }
+    }
+
+    /// Compute the shard ID that owns the given action.
+    fn resolveActionShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) u16 {
+        _ = self;
+        const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const target = shard.router.route(hash);
+        return switch (target) {
+            .local => shard.id,
+            .shard => |t| t.shard_id,
+            .remote => shard.id,
+        };
+    }
+
+    /// Get an action run result, checking the correct shard's ActionsHandler.
+    /// For local shard: direct access. For remote shard: mutex-protected access.
+    fn getActionRunResult(shard: *Shard, target_shard_id: ?u16, action_rid: []const u8) ?ActionsHandler.InternalRunResult {
+        const tid = target_shard_id orelse shard.id;
+        if (tid == shard.id) {
+            // Local shard
+            return shard.actions_handler.getRunResult(action_rid);
+        }
+        // Cross-shard: use peer shard's handler with mutex
+        if (shard.peer_shards) |peers| {
+            const handler = peers[tid].actions_handler;
+            handler.runs_mu.lock();
+            defer handler.runs_mu.unlock();
+            return handler.getRunResult(action_rid);
+        }
+        return shard.actions_handler.getRunResult(action_rid);
+    }
+
     /// Park a workflow run waiting for an async action to complete.
-    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, now_ms: i64) void {
+    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, target_shard_id: u16, now_ms: i64) void {
         run.status = .waiting;
 
         // Store tracking info for checkPendingActions
@@ -1471,6 +1672,9 @@ pub const WorkflowHandler = struct {
 
         if (run.pending_step_name_owned) |old| self.allocator.free(old);
         run.pending_step_name_owned = self.allocator.dupe(u8, step_label) catch null;
+
+        // Store which shard the action run lives on
+        run.pending_action_shard_id = target_shard_id;
 
         // Set a synthetic signal type so handleSignal can also resume this run
         const sig_type = std.fmt.allocPrint(self.allocator, "_action_done:{s}", .{action_run_id}) catch null;
@@ -1483,6 +1687,9 @@ pub const WorkflowHandler = struct {
     /// Check all waiting runs for completed async actions and timed-out signals.
     /// Called periodically by the shard's task scheduler.
     pub fn checkPendingActions(self: *WorkflowHandler, shard: *Shard) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         const now_ms: i64 = std.time.milliTimestamp();
 
         // Collect keys of runs that need resuming (can't modify map while iterating)
@@ -1498,7 +1705,7 @@ pub const WorkflowHandler = struct {
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
-                if (shard.actions_handler.getRunResult(action_rid)) |result| {
+                if (getActionRunResult(shard, run.pending_action_shard_id, action_rid)) |result| {
                     if (result.status == .completed or result.status == .failed) {
                         if (resume_count < resume_keys.len) {
                             resume_keys[resume_count] = entry.key_ptr.*;
@@ -1537,8 +1744,8 @@ pub const WorkflowHandler = struct {
         const action_rid = run.pending_action_run_id_owned orelse return;
         const step_label = run.pending_step_name_owned orelse "unknown";
 
-        // Get the action result
-        const result = shard.actions_handler.getRunResult(action_rid) orelse return;
+        // Get the action result from the correct shard
+        const result = getActionRunResult(shard, run.pending_action_shard_id, action_rid) orelse return;
 
         const outcome: []const u8 = switch (result.status) {
             .completed => blk: {
@@ -1558,17 +1765,19 @@ pub const WorkflowHandler = struct {
             else => definition.StepOutcome.execution_failure,
         };
 
+        // Record completion before clearing state (step_label points into pending_step_name_owned)
+        run.status = .running;
+        self.addHistoryEvent(run, "action_completed", outcome, now_ms);
+        self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+
         // Clear pending action state
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
         run.pending_action_run_id_owned = null;
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         run.pending_step_name_owned = null;
+        run.pending_action_shard_id = null;
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         run.wait_signal_type_owned = null;
-
-        run.status = .running;
-        self.addHistoryEvent(run, "action_completed", outcome, now_ms);
-        self.addHistoryEvent(run, "step_completed", step_label, now_ms);
 
         // Look up definition and resolve transition for the completed step
         // We need the namespace from the run_ns_key ("namespace:run_id")
@@ -1593,7 +1802,7 @@ pub const WorkflowHandler = struct {
                     self.completeRun(run, .failed, "no transition for outcome", now_ms);
                     return;
                 };
-                if (terminalStatus(transition.target)) |status| {
+                if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
                     self.completeRun(run, status, transition.target, now_ms);
                     return;
                 }
@@ -1619,8 +1828,19 @@ pub const WorkflowHandler = struct {
 
             self.addHistoryEvent(run, "signal_timeout", target, now_ms);
 
-            // Check if timeout target is a terminal
-            if (terminalStatus(target)) |status| {
+            // Parse definition to resolve custom terminals
+            const ns_end = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
+            const namespace = run_ns_key[0..ns_end];
+
+            const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+            defer self.allocator.free(def_ns_key);
+            const def_record = self.definitions.get(def_ns_key) orelse return;
+
+            var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+            defer def.deinit(self.allocator);
+
+            // Check if timeout target is a terminal (builtin or custom)
+            if (resolveTerminalStatus(target, def.terminals)) |status| {
                 // Free before completing since completeRun doesn't touch these fields
                 run.status = .running; // transition to running briefly
                 self.allocator.free(target);
@@ -1635,9 +1855,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(target);
             run.wait_timeout_target_owned = null;
 
-            // Continue advancing — need namespace from the key
-            const ns_end = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
-            const namespace = run_ns_key[0..ns_end];
+            // Continue advancing
             const key_copy = self.allocator.dupe(u8, run_ns_key) catch return;
             defer self.allocator.free(key_copy);
             self.advanceWorkflow(shard, key_copy, namespace);
@@ -1652,12 +1870,31 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// Map a builtin terminal name to handler RunStatus.
-    fn terminalStatus(name: []const u8) ?RunStatus {
-        if (std.mem.eql(u8, name, "flo.Completed")) return .completed;
-        if (std.mem.eql(u8, name, "flo.Failed")) return .failed;
-        if (std.mem.eql(u8, name, "flo.Cancelled")) return .cancelled;
-        if (std.mem.eql(u8, name, "flo.TimedOut")) return .timed_out;
+    /// Map a terminal name (builtin or custom) to handler RunStatus.
+    /// Checks builtin terminals first, then custom terminals from the definition.
+    fn resolveTerminalStatus(name: []const u8, custom_terminals: []const definition.Terminal) ?RunStatus {
+        // Check builtins first
+        if (definition.BuiltinTerminal.statusFor(name)) |status| {
+            return switch (status) {
+                .completed => .completed,
+                .failed => .failed,
+                .cancelled => .cancelled,
+                .timed_out => .timed_out,
+                else => null,
+            };
+        }
+        // Check custom terminals
+        for (custom_terminals) |t| {
+            if (std.mem.eql(u8, t.name, name)) {
+                return switch (t.status) {
+                    .completed => .completed,
+                    .failed => .failed,
+                    .cancelled => .cancelled,
+                    .timed_out => .timed_out,
+                    else => .failed,
+                };
+            }
+        }
         return null;
     }
 
@@ -1753,6 +1990,193 @@ pub const WorkflowHandler = struct {
             var state = old.value;
             self.freeTriggerState(&state);
         }
+    }
+
+    // ── Schedule Registration ───────────────────────────────────────────
+
+    fn registerSchedule(
+        self: *WorkflowHandler,
+        namespace: []const u8,
+        workflow_name: []const u8,
+        schedule: definition.ScheduleDef,
+    ) void {
+        // Only interval-based schedules are supported for now
+        const interval_ms = schedule.interval_ms orelse return;
+        if (interval_ms <= 0) return;
+        if (schedule.paused) return;
+
+        const sched_key = self.makeNsKey(namespace, workflow_name) orelse return;
+
+        // Remove old schedule if re-creating workflow
+        if (self.schedules.fetchRemove(sched_key)) |old| {
+            self.allocator.free(old.key);
+            var state = old.value;
+            self.freeScheduleState(&state);
+        }
+
+        const owned_wf = self.allocator.dupe(u8, workflow_name) catch {
+            self.allocator.free(sched_key);
+            return;
+        };
+        const owned_ns = self.allocator.dupe(u8, namespace) catch {
+            self.allocator.free(sched_key);
+            self.allocator.free(owned_wf);
+            return;
+        };
+        const owned_input: ?[]const u8 = if (schedule.input) |inp|
+            self.allocator.dupe(u8, inp) catch null
+        else
+            null;
+
+        self.schedules.put(sched_key, .{
+            .workflow_name_owned = owned_wf,
+            .namespace_owned = owned_ns,
+            .interval_ms = interval_ms,
+            .max_concurrent = schedule.max_concurrent,
+            .input_owned = owned_input,
+            .last_trigger_ms = 0,
+        }) catch {
+            self.allocator.free(sched_key);
+            self.allocator.free(owned_wf);
+            self.allocator.free(owned_ns);
+            if (owned_input) |inp| self.allocator.free(inp);
+        };
+    }
+
+    fn unregisterSchedule(self: *WorkflowHandler, namespace: []const u8, workflow_name: []const u8) void {
+        const sched_key = self.makeNsKey(namespace, workflow_name) orelse return;
+        defer self.allocator.free(sched_key);
+
+        if (self.schedules.fetchRemove(sched_key)) |old| {
+            self.allocator.free(old.key);
+            var state = old.value;
+            self.freeScheduleState(&state);
+        }
+    }
+
+    /// Check all active schedules and start runs when the interval has elapsed.
+    /// Called from shard.tick() on every reactor cycle.
+    pub fn tickSchedules(self: *WorkflowHandler, shard: *Shard) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const now_ms: i64 = std.time.milliTimestamp();
+
+        var it = self.schedules.iterator();
+        while (it.next()) |entry| {
+            const schedule = entry.value_ptr;
+
+            // Enforce interval
+            if (now_ms - schedule.last_trigger_ms < schedule.interval_ms) continue;
+
+            // Skip disabled workflows
+            if (self.disabled.contains(entry.key_ptr.*)) continue;
+
+            // Check max_concurrent: count active (non-terminal) runs for this workflow
+            if (schedule.max_concurrent > 0) {
+                var active_count: u32 = 0;
+                var rit = self.runs.iterator();
+                while (rit.next()) |rentry| {
+                    const run = rentry.value_ptr;
+                    if (!run.status.isTerminal() and
+                        std.mem.eql(u8, run.workflow_name_owned, schedule.workflow_name_owned))
+                    {
+                        active_count += 1;
+                    }
+                }
+                if (active_count >= schedule.max_concurrent) continue;
+            }
+
+            schedule.last_trigger_ms = now_ms;
+            self.startRunFromSchedule(shard, schedule);
+        }
+    }
+
+    /// Start a workflow run from a schedule trigger.
+    fn startRunFromSchedule(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        schedule: *const ScheduleState,
+    ) void {
+        const now_ms: i64 = std.time.milliTimestamp();
+        const input = schedule.input_owned orelse "{}";
+
+        // Generate run ID
+        var run_id_buf: [32]u8 = undefined;
+        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch return;
+
+        // Build namespace-qualified run key
+        const run_ns_key = self.makeNsKey(schedule.namespace_owned, run_id_str) orelse return;
+
+        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        const owned_wf_name = self.allocator.dupe(u8, schedule.workflow_name_owned) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            return;
+        };
+        const owned_version = self.allocator.dupe(u8, "latest") catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            return;
+        };
+        const owned_input = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            self.allocator.free(owned_version);
+            return;
+        };
+
+        var run = RunRecord{
+            .run_id_owned = owned_run_id,
+            .workflow_name_owned = owned_wf_name,
+            .workflow_version_owned = owned_version,
+            .status = .running,
+            .input_owned = owned_input,
+            .created_at_ms = now_ms,
+            .started_at_ms = now_ms,
+            .completed_at_ms = null,
+            .idempotency_key_owned = null,
+            .signals = .empty,
+            .history = .empty,
+        };
+
+        // Add history event
+        const evt_type = self.allocator.dupe(u8, "schedule_started") catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        const evt_detail = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(evt_type);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+        run.history.append(self.allocator, .{
+            .event_type_owned = evt_type,
+            .detail_owned = evt_detail,
+            .timestamp_ms = now_ms,
+        }) catch {
+            self.allocator.free(evt_type);
+            self.allocator.free(evt_detail);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+
+        self.runs.put(run_ns_key, run) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return;
+        };
+
+        self.persistStart(shard, schedule.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
+        self.advanceWorkflow(shard, run_ns_key, schedule.namespace_owned);
     }
 
     /// Poll all active stream triggers and start workflow runs for new events.
@@ -2377,6 +2801,8 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
 fn createTestShard(actions: *ActionsHandler) Shard {
     var shard: Shard = undefined;
     shard.actions_handler = actions;
+    shard.peer_shards = null;
+    shard.router = router.Router.init(1, 1, 0);
     return shard;
 }
 

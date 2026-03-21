@@ -20,6 +20,8 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
 const output = @import("../output.zig");
+const wf_parser = @import("../../workflow/parser.zig");
+const wf_validator = @import("../../workflow/validator.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -228,6 +230,33 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
         owned = true;
     }
     defer if (owned) ctx.allocator.free(definition);
+
+    // Client-side pre-validation — catch errors before the server round-trip
+    prevalidate: {
+        var def = wf_parser.parseWorkflow(ctx.allocator, definition) catch {
+            ctx.printErr("Error: invalid workflow definition (failed to parse)\n", .{});
+            ctx.printErr("Hint: run 'flo validate workflow -f {s}' for detailed diagnostics\n", .{file_path});
+            return error.CommandFailed;
+        };
+        defer def.deinit(ctx.allocator);
+
+        var validation = wf_validator.validateWorkflow(ctx.allocator, &def) catch {
+            // Non-fatal: fall through to server-side validation
+            break :prevalidate;
+        };
+        defer validation.deinit();
+
+        if (validation.hasErrors()) {
+            ctx.printErr("Error: workflow definition has validation errors:\n", .{});
+            for (validation.items()) |item| {
+                if (item.severity == .@"error") {
+                    ctx.printErr("  [{s}] {s}\n", .{ item.code.code(), item.message });
+                }
+            }
+            ctx.printErr("Hint: run 'flo validate workflow -f {s}' for full diagnostics\n", .{file_path});
+            return error.CommandFailed;
+        }
+    }
 
     // Extract workflow name from definition for key-based routing.
     // The server still validates the full definition; this just enables

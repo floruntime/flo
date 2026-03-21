@@ -197,6 +197,14 @@ pub const Shard = struct {
     /// Cross-node request forwarder (null in single-node mode).
     forwarder: ?*Forwarder,
 
+    /// Cross-shard shard pointer array (null until wired by runtime).
+    /// Enables direct dispatch on another shard's handlers for pre-routed requests.
+    peer_shards: ?[]*Shard,
+
+    /// Cross-shard inbox array (null until wired by runtime).
+    /// Enables sending messages to other shards' inboxes.
+    peer_inboxes: ?[]*Inbox,
+
     /// Cluster partition table (null in single-node mode).
     partition_table: ?*PartitionTable,
 
@@ -463,6 +471,8 @@ pub const Shard = struct {
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
             .forwarder = null,
+            .peer_shards = null,
+            .peer_inboxes = null,
             .partition_table = null,
             .coordinator = null,
             .replay_registry = replay_registry,
@@ -701,6 +711,22 @@ pub const Shard = struct {
             }
             self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
         } else {
+            // Single-node mode: check pre_route for cross-shard forwarding.
+            // If the opcode has a pre_route function that returns a hash,
+            // and the hash maps to a different shard, forward the request
+            // to the target shard's handlers (runs on our thread).
+            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
+                if (pre_route_fn(req)) |hash| {
+                    const target = self.router.route(hash);
+                    switch (target) {
+                        .shard => |s| {
+                            self.forwardToShard(s.shard_id, conn, req);
+                            return;
+                        },
+                        .local, .remote => {},
+                    }
+                }
+            }
             self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
         }
     }
@@ -740,6 +766,26 @@ pub const Shard = struct {
                 self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
             },
         }
+    }
+
+    /// Forward a request to a different shard in single-node mode.
+    ///
+    /// Uses the peer_shards array to dispatch on the target shard's handlers
+    /// directly from the current thread. Thread safety is provided by per-handler
+    /// mutexes (e.g., ActionsHandler.runs_mu). The response is written to the
+    /// connection on the current thread (same thread owns the connection).
+    fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request) void {
+        const peers = self.peer_shards orelse {
+            // No peer shards wired — fall back to local dispatch
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            return;
+        };
+        if (target_shard_id >= peers.len) {
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            return;
+        }
+        const target = peers[target_shard_id];
+        target.dispatcher.dispatch(@ptrCast(target), @ptrCast(conn), req);
     }
 
     // ─── Cross-Shard Walk ────────────────────────────────────────────────
@@ -883,6 +929,10 @@ pub const Shard = struct {
                 }
             },
             else => {
+                // Cross-shard action invocation: wake action_await waiters
+                if (msg.tag == .action_invoke) {
+                    self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self));
+                }
                 // Other message types will be handled in later phases
             },
         }
@@ -923,6 +973,9 @@ pub const Shard = struct {
 
         // Drive workflow stream triggers (poll streams → start runs)
         self.workflow_handler.tickStreamTriggers(self);
+
+        // Drive workflow scheduled triggers (interval → start runs)
+        self.workflow_handler.tickSchedules(self);
 
         // Check for completed async actions and resume waiting workflow runs
         self.workflow_handler.checkPendingActions(self);

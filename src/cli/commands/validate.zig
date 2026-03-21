@@ -16,6 +16,7 @@ const output = @import("../output.zig");
 
 const wf_parser = @import("../../workflow/parser.zig");
 const wf_definition = @import("../../workflow/definition.zig");
+const wf_validator = @import("../../workflow/validator.zig");
 const proc_parser = @import("../../processing/parser.zig");
 
 /// Wrapper to cast *anyopaque to *Context
@@ -90,82 +91,28 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
 
     ctx.print("OK    Parsed workflow '{s}' v{s}\n", .{ def.name, def.version });
 
-    // Phase 2: Semantic validation
+    // Phase 2: Run the canonical server-side validator
+    var validation = wf_validator.validateWorkflow(ctx.allocator, &def) catch {
+        ctx.printErr("FAIL  Internal validation error\n", .{});
+        return error.CommandFailed;
+    };
+    defer validation.deinit();
+
     var errors: usize = 0;
     var warnings: usize = 0;
 
-    // Collect valid step names
-    var step_names = std.StringHashMap(void).init(ctx.allocator);
-    defer step_names.deinit();
-    for (def.steps) |step| {
-        step_names.put(step.name, {}) catch {};
-    }
-
-    // Collect valid terminal names (built-in + custom)
-    var terminal_names = std.StringHashMap(void).init(ctx.allocator);
-    defer terminal_names.deinit();
-    terminal_names.put("flo.Completed", {}) catch {};
-    terminal_names.put("flo.Failed", {}) catch {};
-    terminal_names.put("flo.Cancelled", {}) catch {};
-    terminal_names.put("flo.TimedOut", {}) catch {};
-    for (def.terminals) |t| {
-        terminal_names.put(t.name, {}) catch {};
-    }
-
-    // Collect inline plan names
-    var plan_names = std.StringHashMap(void).init(ctx.allocator);
-    defer plan_names.deinit();
-    for (def.plans) |p| {
-        plan_names.put(p.name, {}) catch {};
-    }
-
-    // Check start step transitions
-    errors += validateStepTransitions(ctx, "start", def.start, &step_names, &terminal_names);
-
-    // Check each named step's transitions
-    for (def.steps) |step| {
-        errors += validateStepTransitions(ctx, step.name, step.step, &step_names, &terminal_names);
-    }
-
-    // Check that start step transitions reference at least one defined step or terminal
-    const start_transitions = getStepTransitions(def.start);
-    if (start_transitions.len == 0) {
-        ctx.printErr("WARN  'start' step has no transitions\n", .{});
-        warnings += 1;
-    }
-
-    // Check for unreachable steps (not referenced by any transition)
-    for (def.steps) |step| {
-        if (!isStepReachable(step.name, def.start, def.steps)) {
-            ctx.printErr("WARN  Step '{s}' is not reachable from any transition\n", .{step.name});
+    // Report all validator findings with error codes
+    for (validation.items()) |item| {
+        const prefix: []const u8 = if (item.severity == .@"error") "ERR  " else "WARN ";
+        if (item.location) |loc| {
+            ctx.printErr("{s} [{s}] {s} (at '{s}')\n", .{ prefix, item.code.code(), item.message, loc });
+        } else {
+            ctx.printErr("{s} [{s}] {s}\n", .{ prefix, item.code.code(), item.message });
+        }
+        if (item.severity == .@"error") {
+            errors += 1;
+        } else {
             warnings += 1;
-        }
-    }
-
-    // Check that @plan/ references point to defined inline plans
-    checkPlanReferences(ctx, "start", def.start, &plan_names, &errors);
-    for (def.steps) |step| {
-        checkPlanReferences(ctx, step.name, step.step, &plan_names, &errors);
-    }
-
-    // Check custom terminals have valid status mappings
-    for (def.terminals) |t| {
-        const status = t.status;
-        if (!status.isTerminal()) {
-            ctx.printErr("ERR   Terminal '{s}' maps to non-terminal status '{s}'\n", .{ t.name, status.toString() });
-            errors += 1;
-        }
-    }
-
-    // Check schedule validity
-    if (def.schedule) |sched| {
-        if (sched.cron_expr == null and sched.interval_ms == null) {
-            ctx.printErr("ERR   Schedule defined but missing both 'cron' and 'interval'\n", .{});
-            errors += 1;
-        }
-        if (sched.cron_expr != null and sched.interval_ms != null) {
-            ctx.printErr("ERR   Schedule has both 'cron' and 'interval' (mutually exclusive)\n", .{});
-            errors += 1;
         }
     }
 
@@ -178,67 +125,6 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
         ctx.print("PASSED with {d} warning(s)\n", .{warnings});
     } else {
         ctx.print("PASSED: workflow definition is valid\n", .{});
-    }
-}
-
-fn validateStepTransitions(
-    ctx: *commander.Context,
-    step_name: []const u8,
-    step: wf_definition.Step,
-    step_names: *std.StringHashMap(void),
-    terminal_names: *std.StringHashMap(void),
-) usize {
-    var err_count: usize = 0;
-    const transitions = getStepTransitions(step);
-    for (transitions) |t| {
-        // Target must be a known step name or a terminal
-        if (!step_names.contains(t.target) and !terminal_names.contains(t.target)) {
-            ctx.printErr("ERR   Step '{s}': transition outcome '{s}' -> '{s}' references unknown step or terminal\n", .{ step_name, t.outcome, t.target });
-            err_count += 1;
-        }
-    }
-    return err_count;
-}
-
-fn getStepTransitions(step: wf_definition.Step) []const wf_definition.Transition {
-    return switch (step) {
-        .run => |r| r.transitions,
-        .wait_for_signal => |w| w.transitions,
-    };
-}
-
-fn isStepReachable(name: []const u8, start: wf_definition.Step, steps: []const wf_definition.NamedStep) bool {
-    // Check start step transitions
-    for (getStepTransitions(start)) |t| {
-        if (mem.eql(u8, t.target, name)) return true;
-    }
-    // Check all named steps
-    for (steps) |step| {
-        for (getStepTransitions(step.step)) |t| {
-            if (mem.eql(u8, t.target, name)) return true;
-        }
-    }
-    return false;
-}
-
-fn checkPlanReferences(
-    ctx: *commander.Context,
-    step_name: []const u8,
-    step: wf_definition.Step,
-    plan_names: *std.StringHashMap(void),
-    errors: *usize,
-) void {
-    switch (step) {
-        .run => |r| {
-            if (r.isPlan()) {
-                const plan_key = r.targetName();
-                if (!plan_names.contains(plan_key)) {
-                    ctx.printErr("ERR   Step '{s}': references plan '{s}' which is not defined in 'plans:'\n", .{ step_name, r.target });
-                    errors.* += 1;
-                }
-            }
-        },
-        .wait_for_signal => {},
     }
 }
 

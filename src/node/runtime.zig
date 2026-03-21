@@ -31,6 +31,7 @@ const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const generateNodeId = @import("../raft/network.zig").generateNodeId;
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
@@ -183,6 +184,12 @@ pub const Runtime = struct {
     /// Cross-shard stream handler array — allocated during wirePeerStreamHandlers, freed on deinit.
     peer_stream_handlers_slice: ?[]const *StreamHandler,
 
+    /// Cross-shard inbox array — allocated during wirePeerInboxes, freed on deinit.
+    peer_inboxes_slice: ?[]*Inbox,
+
+    /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
+    peer_shards_slice: ?[]*Shard,
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         const shard_count = detectShardCount(config.num_shards);
 
@@ -203,6 +210,8 @@ pub const Runtime = struct {
             .metrics_registry = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .peer_stream_handlers_slice = null,
+            .peer_inboxes_slice = null,
+            .peer_shards_slice = null,
         };
     }
 
@@ -258,6 +267,18 @@ pub const Runtime = struct {
         if (self.peer_stream_handlers_slice) |s| {
             self.allocator.free(s);
             self.peer_stream_handlers_slice = null;
+        }
+
+        // Clean up peer inbox array
+        if (self.peer_inboxes_slice) |s| {
+            self.allocator.free(s);
+            self.peer_inboxes_slice = null;
+        }
+
+        // Clean up peer shards array
+        if (self.peer_shards_slice) |s| {
+            self.allocator.free(s);
+            self.peer_shards_slice = null;
         }
 
         // Clean up shards
@@ -360,6 +381,12 @@ pub const Runtime = struct {
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
         try self.wirePeerStreamHandlers(shards);
+
+        // 2.56 Wire cross-shard inbox references for inbox messaging.
+        try self.wirePeerInboxes(shards);
+
+        // 2.57 Wire cross-shard shard pointers for pre-route forwarding.
+        try self.wirePeerShards(shards);
 
         // 2.6 Register cooperative background tasks (hot_flush, etc.).
         // Must happen after shards are at final heap addresses.
@@ -485,6 +512,34 @@ pub const Runtime = struct {
         const shard_count = shards[0].router.shard_count;
         for (0..n) |i| {
             shards[i].processing_handler.setPeerStreamHandlers(handlers, partition_count, shard_count);
+        }
+    }
+
+    /// Wire cross-shard inbox references so shards can send messages to
+    /// other shards' inboxes (e.g., action_invoke notifications).
+    fn wirePeerInboxes(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const inboxes = try self.allocator.alloc(*Inbox, n);
+        for (0..n) |i| {
+            inboxes[i] = &shards[i].inbox;
+        }
+        self.peer_inboxes_slice = inboxes;
+        for (0..n) |i| {
+            shards[i].peer_inboxes = inboxes;
+        }
+    }
+
+    /// Wire cross-shard shard pointers so dispatchRequest can forward
+    /// pre-routed requests to the correct shard's handlers.
+    fn wirePeerShards(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const ptrs = try self.allocator.alloc(*Shard, n);
+        for (0..n) |i| {
+            ptrs[i] = &shards[i];
+        }
+        self.peer_shards_slice = ptrs;
+        for (0..n) |i| {
+            shards[i].peer_shards = ptrs;
         }
     }
 
