@@ -166,15 +166,6 @@ pub const ActionsHandler = struct {
         return router.hashKeyWithNamespace(req.namespace, req.key);
     }
 
-    /// Route action_await by the first action name in the value, not by worker_id key.
-    /// This ensures await lands on the same shard as invoke (which routes by action name).
-    fn preRouteByActionAwait(req: Request) ?u64 {
-        if (extractFirstTaskType(req.value)) |action_name| {
-            return router.hashKeyWithNamespace(req.namespace, action_name);
-        }
-        return 0;
-    }
-
     /// Route complete/fail/touch by the leading action_name in the value.
     /// Value format: [action_name_len:u16][action_name][rest...]
     fn preRouteByActionValue(req: Request) ?u64 {
@@ -311,52 +302,66 @@ pub const ActionsHandler = struct {
         if (tryClaimAnyAction(shard, conn, req, worker_id, worker_labels)) return;
 
         // No pending work — register blocking waiter.
-        // Encode compound key: action_name + worker_id (no separator needed,
-        // min_version stores action_name.len).
+        // Encode compound key: [namespace\x00][action_name][worker_id]
+        // min_version packs both lengths: (ns_len << 16) | action_name_len
         const block_ms = req.getBlockMs() orelse 30_000; // default 30s for action_await
+        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
         var compound_key_buf: [256]u8 = undefined;
-        const action_len: usize = @min(action_name.len, 200);
-        const remaining: usize = 256 - action_len;
+        const ns_len: usize = @min(namespace.len, 64);
+        const action_len: usize = @min(action_name.len, 128);
+        const remaining: usize = 256 - ns_len - 1 - action_len;
         const wid_len: usize = @min(worker_id.len, remaining);
-        @memcpy(compound_key_buf[0..action_len], action_name[0..action_len]);
+        @memcpy(compound_key_buf[0..ns_len], namespace[0..ns_len]);
+        compound_key_buf[ns_len] = 0; // separator
+        @memcpy(compound_key_buf[ns_len + 1 ..][0..action_len], action_name[0..action_len]);
         if (wid_len > 0) {
-            @memcpy(compound_key_buf[action_len .. action_len + wid_len], worker_id[0..wid_len]);
+            @memcpy(compound_key_buf[ns_len + 1 + action_len ..][0..wid_len], worker_id[0..wid_len]);
         }
+        const total_len = ns_len + 1 + action_len + wid_len;
         _ = shard.waiter_pool.register(.{
             .kind = .action_await,
             .fd = conn.fd,
             .request_id = req.header.request_id,
-            .key = compound_key_buf[0 .. action_len + wid_len],
-            .min_version = action_len,
+            .key = compound_key_buf[0..total_len],
+            .min_version = (@as(u64, ns_len) << 16) | @as(u64, action_len),
             .timeout_ms = block_ms,
         });
         conn.response_deferred = true;
     }
 
     /// Try to claim a pending run for any action type listed in the await request.
-    /// Checks local shard first, then all peer shards. Returns true if a task was assigned.
+    /// Uses hash-based routing: action_invoke is pre-routed by action name, so
+    /// pending runs for action "foo" always live on route(hash(ns, "foo")).
+    /// O(action_types) instead of O(action_types * shards).
     fn tryClaimAnyAction(shard: *Shard, conn: *Connection, req: Request, worker_id: []const u8, worker_labels: ?[]const u8) bool {
+        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
         var it = TaskTypeIterator.init(req.value);
         while (it.next()) |name| {
-            // Check local shard first (fast path — no lock contention)
-            if (shard.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
+            const target = resolveActionShard(shard, namespace, name);
+            if (target.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
                 shard.worker_handler.recordTaskAssigned(worker_id);
                 sendTaskAssignment(shard, conn, req.header.request_id, task);
                 return true;
             }
-            // Check peer shards for runs created by pre-routed invokes
-            if (shard.peer_shards) |peers| {
-                for (peers, 0..) |peer, i| {
-                    if (i == shard.id) continue;
-                    if (peer.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
-                        shard.worker_handler.recordTaskAssigned(worker_id);
-                        sendTaskAssignment(shard, conn, req.header.request_id, task);
-                        return true;
-                    }
-                }
-            }
         }
         return false;
+    }
+
+    /// Resolve which shard owns a given action name via hash routing.
+    /// Returns the target shard (may be self). O(1).
+    fn resolveActionShard(shard: *Shard, namespace: []const u8, action_name: []const u8) *Shard {
+        const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const target = shard.router.route(hash);
+        return switch (target) {
+            .local => shard,
+            .shard => |t| {
+                if (shard.peer_shards) |peers| {
+                    if (t.shard_id < peers.len) return peers[t.shard_id];
+                }
+                return shard;
+            },
+            .remote => shard,
+        };
     }
 
     /// Claimed task info returned by claimPendingRun.
@@ -1636,15 +1641,18 @@ pub const ActionsHandler = struct {
 const Waiter = waiter_pool_mod.Waiter;
 
 /// Action await resolver: claim a pending run matching any action the worker handles.
-/// Waiter key is compound: action_name + worker_id (min_version = action_name.len).
-/// Checks both local and peer shards since action runs may be pre-routed to any shard.
+/// Waiter key is compound: [namespace\x00][action_name][worker_id]
+/// min_version packs: (ns_len << 16) | action_name_len.
+/// Uses hash-based routing to check only the shard that owns each action.
 fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const full_key = waiter.key_buf[0..waiter.key_len];
-    const action_name_len = @as(usize, @intCast(waiter.min_version));
-    if (action_name_len > full_key.len) return false;
-    const action_name = full_key[0..action_name_len];
-    const worker_id = full_key[action_name_len..];
+    const ns_len: usize = @intCast(waiter.min_version >> 16);
+    const action_name_len: usize = @intCast(waiter.min_version & 0xFFFF);
+    if (ns_len + 1 + action_name_len > full_key.len) return false;
+    const namespace = full_key[0..ns_len];
+    const action_name = full_key[ns_len + 1 ..][0..action_name_len];
+    const worker_id = full_key[ns_len + 1 + action_name_len ..];
 
     // Look up worker metadata from worker registry for label matching
     const worker_labels: ?[]const u8 = if (worker_id.len > 0)
@@ -1652,8 +1660,8 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     else
         null;
 
-    // Try to claim a pending run for the primary action name — local then peers
-    if (claimFromAnyShard(shard, action_name, worker_labels, worker_id)) |task| {
+    // Try to claim a pending run for the primary action name — hash-routed O(1)
+    if (claimFromTargetShard(shard, namespace, action_name, worker_labels, worker_id)) |task| {
         const conn = shard.getConnection(waiter.fd) orelse return true;
         sendTaskAssignment(shard, conn, waiter.request_id, task);
         shard.flushToClient(waiter.fd);
@@ -1667,7 +1675,7 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
                 if (process.kind != .action) continue;
                 // Skip the primary name we already tried
                 if (std.mem.eql(u8, process.name_owned, action_name)) continue;
-                if (claimFromAnyShard(shard, process.name_owned, worker_labels, worker_id)) |task| {
+                if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
                     const conn = shard.getConnection(waiter.fd) orelse return true;
                     sendTaskAssignment(shard, conn, waiter.request_id, task);
                     shard.flushToClient(waiter.fd);
@@ -1680,22 +1688,11 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     return false;
 }
 
-/// Try to claim a pending run from the local shard first, then all peer shards.
-fn claimFromAnyShard(shard: *Shard, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ActionsHandler.ClaimedTask {
-    // Local shard first (fast path)
-    if (shard.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
-        return task;
-    }
-    // Check peer shards
-    if (shard.peer_shards) |peers| {
-        for (peers, 0..) |peer, i| {
-            if (i == shard.id) continue;
-            if (peer.actions_handler.claimPendingRun(action_name, worker_labels, worker_id)) |task| {
-                return task;
-            }
-        }
-    }
-    return null;
+/// Claim a pending run from the shard that owns the action (via hash routing).
+/// O(1) — no peer scan needed since action_invoke is pre-routed by action name.
+fn claimFromTargetShard(shard: *Shard, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ActionsHandler.ClaimedTask {
+    const target = ActionsHandler.resolveActionShard(shard, namespace, action_name);
+    return target.actions_handler.claimPendingRun(action_name, worker_labels, worker_id);
 }
 
 /// Send a task assignment response in the full wire format:

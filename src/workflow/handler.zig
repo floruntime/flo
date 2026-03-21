@@ -404,26 +404,53 @@ pub const WorkflowHandler = struct {
     // ── Cross-Shard Run Forwarding ──────────────────────────────────────
 
     /// For run-based operations (status, signal, cancel, history) where
-    /// the key is a run_id: when the run isn't found locally, check peer
-    /// shards. If a peer owns the run, dispatch the request on that peer
-    /// and return true. Returns false if no peer has the run.
+    /// the key is a run_id: when the run isn't found locally, forward to
+    /// the peer that owns the run.
+    ///
+    /// Uses the shard hint encoded in the run_id (format wfrun-{shard}-{seq})
+    /// for O(1) routing. Falls back to linear scan for client-supplied or
+    /// legacy run_ids without a shard hint.
     fn forwardRunOp(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request, run_ns_key: []const u8) bool {
         _ = self;
         const peers = shard.peer_shards orelse return false;
+
+        // Fast path: extract shard hint from run_id (format: wfrun-{shard}-{seq})
+        if (parseRunShardHint(req.key)) |hint_shard| {
+            if (hint_shard < peers.len and hint_shard != shard.id) {
+                const peer = peers[hint_shard];
+                peer.workflow_handler.handleCommand(peer, conn, req);
+                return true;
+            }
+            // Hint points to us or is out of range — run should be local
+            return false;
+        }
+
+        // Slow path: client-supplied or legacy run_id without shard hint — linear scan.
         for (peers) |peer| {
             if (peer == shard) continue;
-            // Check if this peer's workflow handler has the run.
             const peer_wh = peer.workflow_handler;
             peer_wh.mu.lock();
             const has_run = peer_wh.runs.contains(run_ns_key);
             peer_wh.mu.unlock();
             if (has_run) {
-                // Dispatch on the peer's handler (acquires its own lock).
                 peer_wh.handleCommand(peer, conn, req);
                 return true;
             }
         }
         return false;
+    }
+
+    /// Parse the shard hint from a run_id with format "wfrun-{shard_id}-{seq}".
+    /// Returns the shard_id if present, null for client-supplied or legacy IDs.
+    fn parseRunShardHint(run_id: []const u8) ?u16 {
+        const prefix = "wfrun-";
+        if (run_id.len <= prefix.len) return null;
+        if (!std.mem.startsWith(u8, run_id, prefix)) return null;
+        const after_prefix = run_id[prefix.len..];
+        // Find the next '-' separator: "{shard_id}-{seq}"
+        const sep_pos = std.mem.indexOfScalar(u8, after_prefix, '-') orelse return null;
+        if (sep_pos == 0 or sep_pos >= after_prefix.len - 1) return null;
+        return std.fmt.parseInt(u16, after_prefix[0..sep_pos], 10) catch null;
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
@@ -661,12 +688,14 @@ pub const WorkflowHandler = struct {
             }
         }
 
-        // Generate or use explicit run ID
+        // Generate or use explicit run ID.
+        // Server-generated IDs encode the owning shard: wfrun-{shard}-{seq}
+        // for O(1) cross-shard routing on status/signal/cancel/history.
         var run_id_buf: [32]u8 = undefined;
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
-            break :blk std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch "wfrun-0";
+            break :blk std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch "wfrun-0";
         };
 
         // Build namespace-qualified key for the runs map
@@ -2101,9 +2130,9 @@ pub const WorkflowHandler = struct {
         const now_ms: i64 = std.time.milliTimestamp();
         const input = schedule.input_owned orelse "{}";
 
-        // Generate run ID
+        // Generate run ID — encode shard for O(1) cross-shard routing
         var run_id_buf: [32]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch return;
+        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch return;
 
         // Build namespace-qualified run key
         const run_ns_key = self.makeNsKey(schedule.namespace_owned, run_id_str) orelse return;
@@ -2283,9 +2312,9 @@ pub const WorkflowHandler = struct {
     ) void {
         const now_ms: i64 = std.time.milliTimestamp();
 
-        // Generate run ID
+        // Generate run ID — encode shard for O(1) cross-shard routing
         var run_id_buf: [32]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}", .{self.nextRunId()}) catch return;
+        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch return;
 
         // Build namespace-qualified run key
         const run_ns_key = self.makeNsKey(trigger.namespace_owned, run_id_str) orelse return;
