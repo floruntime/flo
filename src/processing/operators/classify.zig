@@ -33,6 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
 const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
+const log = @import("stdx").log;
 const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -97,8 +98,11 @@ pub const ClassifyOperator = struct {
         // Record is always emitted — classify never drops.
         var tagged_rec = rec;
         var any_matched = false;
+        log.debug("classify '{s}': processing record value[{d}]={s}", .{ self.name, rec.value.len, if (rec.value.len > 200) rec.value[0..200] else rec.value });
         for (self.rules) |*rule| {
-            if (rule.condition.evaluate(rec)) {
+            const matched = rule.condition.evaluate(rec);
+            log.debug("classify '{s}': rule bit={d} cond='{s}' matched={}", .{ self.name, rule.tag_bit, rule.condition.condition, matched });
+            if (matched) {
                 tagged_rec.addTag(rule.tag_bit);
                 any_matched = true;
             }

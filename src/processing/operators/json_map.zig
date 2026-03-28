@@ -80,9 +80,13 @@ pub const JsonMapOperator = struct {
         var mappings_list: std.ArrayListUnmanaged(Mapping) = .{};
         errdefer {
             for (mappings_list.items) |m| {
+                allocator.free(m.output_field);
                 switch (m.source) {
-                    .json_path => |segs| allocator.free(segs),
-                    .constant => {},
+                    .json_path => |segs| {
+                        for (segs) |seg| allocator.free(seg);
+                        allocator.free(segs);
+                    },
+                    .constant => |c| allocator.free(c),
                 }
             }
             mappings_list.deinit(allocator);
@@ -90,24 +94,24 @@ pub const JsonMapOperator = struct {
 
         for (config_entries) |entry| {
             const source: Mapping.Source = if (std.mem.startsWith(u8, entry.value, "$.")) blk: {
-                // JSONPath extraction — split into segments
+                // JSONPath extraction — split into segments (owned copies)
                 const field_path = entry.value[2..];
                 var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
                 var iter = std.mem.splitScalar(u8, field_path, '.');
                 while (iter.next()) |seg| {
-                    try seg_list.append(allocator, seg);
+                    try seg_list.append(allocator, try allocator.dupe(u8, seg));
                 }
                 break :blk .{ .json_path = try seg_list.toOwnedSlice(allocator) };
-            } else .{ .constant = entry.value };
+            } else .{ .constant = try allocator.dupe(u8, entry.value) };
 
             try mappings_list.append(allocator, .{
-                .output_field = entry.key,
+                .output_field = try allocator.dupe(u8, entry.key),
                 .source = source,
             });
         }
 
         return .{
-            .name = name,
+            .name = try allocator.dupe(u8, name),
             .allocator = allocator,
             .mappings = try mappings_list.toOwnedSlice(allocator),
         };
@@ -115,12 +119,17 @@ pub const JsonMapOperator = struct {
 
     pub fn deinit(self: *Self) void {
         for (self.mappings) |m| {
+            self.allocator.free(m.output_field);
             switch (m.source) {
-                .json_path => |segs| self.allocator.free(segs),
-                .constant => {},
+                .json_path => |segs| {
+                    for (segs) |seg| self.allocator.free(seg);
+                    self.allocator.free(segs);
+                },
+                .constant => |c| self.allocator.free(c),
             }
         }
         self.allocator.free(self.mappings);
+        self.allocator.free(self.name);
     }
 
     /// Return an Operator interface backed by this map operator
@@ -203,6 +212,8 @@ pub const JsonMapOperator = struct {
         // Emit as owned record
         const output = try self.allocator.dupe(u8, output_buf.items);
         errdefer self.allocator.free(output);
+
+        log.info("JsonMapOperator: emitting output='{s}'", .{output});
 
         const key_dupe = try self.allocator.dupe(u8, rec.key);
 
@@ -295,7 +306,6 @@ pub const JsonMapOperator = struct {
             },
         }
     }
-
 };
 
 // =============================================================================

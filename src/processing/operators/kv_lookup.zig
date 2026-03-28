@@ -386,7 +386,18 @@ pub const KvLookupOperator = struct {
 
         const prefix = record_value[0..last_brace];
         const comma = if (needs_comma) "," else "";
-        return std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":\"{s}\"}}", .{ prefix, comma, self.enrich_field, kv_value });
+
+        // If kv_value looks like a JSON object or array, embed it raw;
+        // otherwise wrap it as a JSON string.
+        const trimmed = std.mem.trim(u8, kv_value, " \t\n\r");
+        const is_json = (trimmed.len >= 2) and ((trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') or
+            (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']'));
+
+        if (is_json) {
+            return std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":{s}}}", .{ prefix, comma, self.enrich_field, trimmed });
+        } else {
+            return std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":\"{s}\"}}", .{ prefix, comma, self.enrich_field, kv_value });
+        }
     }
 
     // =========================================================================

@@ -46,7 +46,7 @@ pub const JsonKeyByOperator = struct {
     /// Create a JSON key-by operator.
     /// `key_expression` is the JSONPath expression from YAML config (e.g., "$.user_id").
     /// Also accepts plain field names without "$." prefix for convenience.
-    /// Both `name` and `key_expression` must outlive the operator.
+    /// Dupes all borrowed strings — safe to free the source after init.
     pub fn init(allocator: Allocator, name: []const u8, key_expression: []const u8) !Self {
         // Strip "$." prefix if present
         const field_path = if (std.mem.startsWith(u8, key_expression, "$."))
@@ -54,21 +54,24 @@ pub const JsonKeyByOperator = struct {
         else
             key_expression;
 
-        // Pre-split dotted path for efficient evaluation
+        // Pre-split dotted path for efficient evaluation (owned copies)
         var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
         var iter = std.mem.splitScalar(u8, field_path, '.');
         while (iter.next()) |seg| {
-            if (seg.len > 0) try seg_list.append(allocator, seg);
+            if (seg.len > 0) try seg_list.append(allocator, try allocator.dupe(u8, seg));
         }
         return .{
-            .name = name,
-            .key_expression = key_expression,
+            .name = try allocator.dupe(u8, name),
+            .key_expression = try allocator.dupe(u8, key_expression),
             .segments = try seg_list.toOwnedSlice(allocator),
         };
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
+        for (self.segments) |seg| allocator.free(seg);
         allocator.free(self.segments);
+        allocator.free(self.key_expression);
+        allocator.free(self.name);
     }
 
     /// Return an Operator interface backed by this JsonKeyByOperator
@@ -117,16 +120,21 @@ pub const JsonKeyByOperator = struct {
             };
         }
 
-        // Extract key value — emit before parsed JSON is freed
+        // Extract key value — must dupe strings extracted from parsed JSON
+        // because parsed.deinit() will free them before the next operator runs.
         switch (current) {
-            .string => |s| try ctx.emitWithKey(s, rec.value, rec.event_time_ms),
+            .string => |s| {
+                const duped = try ctx.allocator.dupe(u8, s);
+                try ctx.emitWithKey(duped, rec.value, rec.event_time_ms);
+            },
             .integer => |n| {
                 // Stringify integer value as key
                 const formatted = std.fmt.bufPrint(&self.scratch, "{d}", .{n}) catch {
                     try ctx.emitWithKey(rec.key, rec.value, rec.event_time_ms);
                     return;
                 };
-                try ctx.emitWithKey(formatted, rec.value, rec.event_time_ms);
+                const duped = try ctx.allocator.dupe(u8, formatted);
+                try ctx.emitWithKey(duped, rec.value, rec.event_time_ms);
             },
             .bool => |b| try ctx.emitWithKey(if (b) "true" else "false", rec.value, rec.event_time_ms),
             else => try ctx.emitWithKey(rec.key, rec.value, rec.event_time_ms),

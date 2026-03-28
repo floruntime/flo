@@ -254,7 +254,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .raft_snapshot => .snapshot,
 
         // Workflow — restored in replaySegments, no live projection
-        .workflow_create, .workflow_start => .none,
+        .workflow_create, .workflow_start, .workflow_complete => .none,
 
         // Namespace — restored in replaySegments, no live projection
         .namespace_create, .namespace_delete, .namespace_config => .none,

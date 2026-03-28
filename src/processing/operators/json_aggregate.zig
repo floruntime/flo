@@ -160,7 +160,7 @@ pub const JsonAggregateOperator = struct {
         field_expression: ?[]const u8,
         window: WindowConfig,
     ) !Self {
-        // Split JSONPath field expression into segments
+        // Split JSONPath field expression into segments (owned copies)
         const segments: ?[]const []const u8 = if (field_expression) |expr| blk: {
             const field_path = if (std.mem.startsWith(u8, expr, "$."))
                 expr[2..]
@@ -170,13 +170,13 @@ pub const JsonAggregateOperator = struct {
             var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
             var iter = std.mem.splitScalar(u8, field_path, '.');
             while (iter.next()) |seg| {
-                if (seg.len > 0) try seg_list.append(allocator, seg);
+                if (seg.len > 0) try seg_list.append(allocator, try allocator.dupe(u8, seg));
             }
             break :blk try seg_list.toOwnedSlice(allocator);
         } else null;
 
         return .{
-            .name = name,
+            .name = try allocator.dupe(u8, name),
             .allocator = allocator,
             .function = function,
             .field_segments = segments,
@@ -194,8 +194,10 @@ pub const JsonAggregateOperator = struct {
 
         // Free field segments
         if (self.field_segments) |segs| {
+            for (segs) |seg| self.allocator.free(seg);
             self.allocator.free(segs);
         }
+        self.allocator.free(self.name);
     }
 
     /// Return an Operator interface backed by this aggregate operator
@@ -222,14 +224,23 @@ pub const JsonAggregateOperator = struct {
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        log.info("aggregate processElement: entering, func={s} value_len={d} key_len={d}", .{ self.function.toStr(), rec.value.len, rec.key.len });
+
         // Extract numeric value (for non-count functions)
         const numeric_val: ?f64 = if (self.function != .count)
-            self.extractNumericField(rec.value) orelse return // skip non-numeric records
+            self.extractNumericField(rec.value) orelse {
+                log.info("aggregate processElement: extractNumericField returned null, skipping", .{});
+                return; // skip non-numeric records
+            }
         else
             null;
 
+        log.info("aggregate processElement: numeric_val extracted", .{});
+
         // Get or create group for this key
         const group = try self.getOrCreateGroup(rec.key, rec.event_time_ms);
+
+        log.info("aggregate processElement: got group, updating accumulator", .{});
 
         // Update accumulator
         if (numeric_val) |val| {
@@ -237,6 +248,8 @@ pub const JsonAggregateOperator = struct {
         } else {
             group.addCount();
         }
+
+        log.info("aggregate processElement: emitting result", .{});
 
         // Emit based on window mode
         switch (self.window) {
@@ -254,6 +267,7 @@ pub const JsonAggregateOperator = struct {
                 // Time windows emit on watermark, not on record arrival
             },
         }
+        log.info("aggregate processElement: done", .{});
     }
 
     fn processWatermark(ptr: *anyopaque, wm: Watermark, ctx: *OperatorContext) !void {
@@ -402,11 +416,11 @@ pub const JsonAggregateOperator = struct {
     fn emitResult(self: *Self, key: []const u8, group: *const Group, event_time_ms: i64, ctx: *OperatorContext) !void {
         const result = group.getResult(self.function);
 
-        // Format output as JSON: {"value": <result>, "count": <n>}
+        // Format output as JSON: {"key": "<key>", "value": <result>, "count": <n>}
         const output = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"value\":{d},\"count\":{d}}}",
-            .{ result, group.count },
+            "{{\"key\":\"{s}\",\"value\":{d},\"count\":{d}}}",
+            .{ key, result, group.count },
         );
         errdefer self.allocator.free(output);
 

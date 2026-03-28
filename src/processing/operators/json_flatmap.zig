@@ -63,16 +63,19 @@ pub const JsonFlatMapOperator = struct {
         array_field: []const u8,
         element_key: ?[]const u8,
     ) !Self {
-        const array_segs = try splitJsonPath(allocator, array_field);
-        errdefer allocator.free(array_segs);
+        const array_segs = try splitJsonPathOwned(allocator, array_field);
+        errdefer {
+            for (array_segs) |seg| allocator.free(seg);
+            allocator.free(array_segs);
+        }
 
         const key_segs: ?[]const []const u8 = if (element_key) |k|
-            try splitJsonPath(allocator, k)
+            try splitJsonPathOwned(allocator, k)
         else
             null;
 
         return .{
-            .name = name,
+            .name = try allocator.dupe(u8, name),
             .allocator = allocator,
             .array_segments = array_segs,
             .key_segments = key_segs,
@@ -80,10 +83,13 @@ pub const JsonFlatMapOperator = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.array_segments) |seg| self.allocator.free(seg);
         self.allocator.free(self.array_segments);
         if (self.key_segments) |segs| {
+            for (segs) |seg| self.allocator.free(seg);
             self.allocator.free(segs);
         }
+        self.allocator.free(self.name);
     }
 
     /// Return an Operator interface backed by this flatmap operator
@@ -176,6 +182,21 @@ pub const JsonFlatMapOperator = struct {
         var iter = std.mem.splitScalar(u8, path, '.');
         while (iter.next()) |seg| {
             try seg_list.append(allocator, seg);
+        }
+        return try seg_list.toOwnedSlice(allocator);
+    }
+
+    /// Like splitJsonPath but dupes each segment (owned copies).
+    fn splitJsonPathOwned(allocator: Allocator, expr: []const u8) ![]const []const u8 {
+        const path = if (std.mem.startsWith(u8, expr, "$."))
+            expr[2..]
+        else
+            expr;
+
+        var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
+        var iter = std.mem.splitScalar(u8, path, '.');
+        while (iter.next()) |seg| {
+            try seg_list.append(allocator, try allocator.dupe(u8, seg));
         }
         return try seg_list.toOwnedSlice(allocator);
     }
