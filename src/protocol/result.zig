@@ -250,8 +250,6 @@ pub const CommandResult = union(enum) {
         run_id: []const u8,
         /// Estimated queue position (if queued)
         queue_position: ?u32 = null,
-        /// WASM output bytes (populated inline for wasm actions, null for user actions)
-        output: ?[]const u8 = null,
         allocated: bool = false,
     },
 
@@ -735,7 +733,6 @@ pub const CommandResult = union(enum) {
             .action_invoked => |a| {
                 if (a.allocated) {
                     allocator.free(a.run_id);
-                    if (a.output) |o| allocator.free(o);
                 }
             },
             .action_run_status => |a| {
@@ -976,8 +973,7 @@ pub const CommandResult = union(enum) {
             .action_invoked => |a| blk: {
                 var size: usize = 1 + 4 + a.run_id.len + 1;
                 if (a.queue_position != null) size += 4;
-                size += 1; // has_output
-                if (a.output) |o| size += 4 + o.len;
+                size += 1; // has_output (always false now)
                 break :blk size;
             },
             .action_run_status => |s| blk: {
@@ -1196,13 +1192,7 @@ pub const CommandResult = union(enum) {
                 } else {
                     try writer.writeByte(0);
                 }
-                if (a.output) |o| {
-                    try writer.writeByte(1);
-                    try writer.writeInt(u32, @intCast(o.len), .little);
-                    try writer.writeAll(o);
-                } else {
-                    try writer.writeByte(0);
-                }
+                try writer.writeByte(0); // has_output (always false)
             },
             .action_run_status => |s| {
                 try writeSlice(writer, s.run_id);
@@ -1530,11 +1520,14 @@ pub const CommandResult = union(enum) {
                 const has_pos = try reader.readByte() != 0;
                 const queue_pos = if (has_pos) try reader.readInt(u32, .little) else null;
                 const has_output = (reader.readByte() catch 0) != 0;
-                const output = if (has_output) try readSlice(reader, allocator) else null;
+                if (has_output) {
+                    // Skip output bytes for wire compatibility
+                    const out = try readSlice(reader, allocator);
+                    allocator.free(out);
+                }
                 break :blk .{ .action_invoked = .{
                     .run_id = run_id,
                     .queue_position = queue_pos,
-                    .output = output,
                     .allocated = true,
                 } };
             },

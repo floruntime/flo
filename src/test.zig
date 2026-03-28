@@ -137,13 +137,6 @@ test {
     _ = @import("processing/parser.zig");
 }
 
-// WASM
-test {
-    _ = @import("wasm/runner.zig");
-    _ = @import("actions/wasm_runner.zig");
-    _ = @import("processing/operators/wasm.zig");
-}
-
 // Dashboard
 test {
     _ = @import("node/dashboard/api/helpers.zig");

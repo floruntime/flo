@@ -15,7 +15,7 @@
 //! - Invocations create a run record `_action_run:{run_id}` and enqueue a task.
 //! - Status checks read the run record from KV.
 //! - List scans the `_action:` prefix in KV.
-//! - Delete removes the action and its WASM blob if applicable.
+//! - Delete removes the action.
 //!
 //! Durable via the shared persistence interface: write mutations go through
 //! Raft propose (persistence.persistEntry), and in-memory state is rebuilt
@@ -27,15 +27,16 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const ActionMeta = @import("types.zig").ActionMeta;
-const ActionType = @import("types.zig").ActionType;
 const RunStatus = @import("types.zig").RunStatus;
 
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const run_id_mod = @import("../node/run_id.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
+const WorkerRecord = @import("../worker/handler.zig").WorkerRecord;
 
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
@@ -72,21 +73,15 @@ pub const ActionsHandler = struct {
     /// Mutex protecting runs for cross-shard access.
     runs_mu: std.Thread.Mutex = .{},
 
-    /// Monotonic run counter.
-    next_run_id: u64,
-
     const MAX_ACTION_NAME_LEN: usize = 256;
     const MAX_ACTIONS: usize = 10_000;
 
     pub const ActionRecord = struct {
         name_owned: []const u8,
         namespace_owned: []const u8,
-        action_type: u8, // 0 = user, 1 = wasm
         version: u32,
         enabled: bool,
         created_at_ns: u64,
-        /// WASM module bytes (for action_type == 1). Null for user-hosted actions.
-        wasm_blob_owned: ?[]const u8 = null,
     };
 
     pub const RunRecord = struct {
@@ -112,15 +107,13 @@ pub const ActionsHandler = struct {
             .allocator = allocator,
             .actions = std.StringHashMap(ActionRecord).init(allocator),
             .runs = std.StringHashMap(RunRecord).init(allocator),
-            .next_run_id = 1,
         };
     }
 
     pub fn deinit(self: *ActionsHandler) void {
-        // Free all owned action names and WASM blobs
+        // Free all owned action names
         var ait = self.actions.iterator();
         while (ait.next()) |entry| {
-            if (entry.value_ptr.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(entry.value_ptr.namespace_owned);
             self.allocator.free(entry.value_ptr.name_owned);
         }
@@ -290,11 +283,20 @@ pub const ActionsHandler = struct {
             return;
         }
 
-        // Look up worker metadata from worker registry for label matching
-        const worker_labels: ?[]const u8 = if (worker_id.len > 0)
-            if (shard.worker_handler.workers.get(worker_id)) |w| w.metadata_owned else null
-        else
-            null;
+        // Look up worker metadata from worker registry for label matching.
+        // worker_register is pre-routed by hash(namespace, worker_id), so the
+        // registration may live on a different shard than the action_await caller.
+        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
+        const worker_labels: ?[]const u8 = if (worker_id.len > 0) blk: {
+            const wh = router.hashKeyWithNamespace(namespace, worker_id);
+            const wt = shard.router.route(wh);
+            const ws: *Shard = switch (wt) {
+                .local => shard,
+                .shard => |t| if (shard.peer_shards) |peers| (if (t.shard_id < peers.len) peers[t.shard_id] else shard) else shard,
+                .remote => shard,
+            };
+            break :blk if (ws.worker_handler.workers.get(worker_id)) |w| w.metadata_owned else null;
+        } else null;
 
         // Try to claim a pending run for ANY registered action, not just the first.
         // Workers register multiple actions and cross-shard invocations may create
@@ -305,7 +307,6 @@ pub const ActionsHandler = struct {
         // Encode compound key: [namespace\x00][action_name][worker_id]
         // min_version packs both lengths: (ns_len << 16) | action_name_len
         const block_ms = req.getBlockMs() orelse 30_000; // default 30s for action_await
-        const namespace = if (req.namespace.len == 0) "default" else req.namespace;
         var compound_key_buf: [256]u8 = undefined;
         const ns_len: usize = @min(namespace.len, 64);
         const action_len: usize = @min(action_name.len, 128);
@@ -441,22 +442,12 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "action limit reached" } };
         }
 
-        // Determine action type (from value byte 0 if present)
-        const action_type: u8 = if (req.value.len > 0) req.value[0] else 0;
-
         // Version bump if re-registering
         var version: u32 = 1;
         if (self.actions.fetchRemove(name)) |old| {
             version = old.value.version + 1;
-            if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
-        }
-
-        // Store WASM bytes if type is wasm (value layout: [type_byte][wasm_bytes...])
-        var wasm_blob: ?[]const u8 = null;
-        if (action_type == 1 and req.value.len > 1) {
-            wasm_blob = self.allocator.dupe(u8, req.value[1..]) catch null;
         }
 
         const owned_name = self.allocator.dupe(u8, name) catch {
@@ -472,11 +463,9 @@ pub const ActionsHandler = struct {
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
-            .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = now_ns,
-            .wasm_blob_owned = wasm_blob,
         }) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
@@ -515,10 +504,14 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .not_found, .message = "action not found" } };
         }
 
-        // Generate run ID
-        const run_id_num = self.nextRunId();
-        var run_id_buf: [20]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "{d}", .{run_id_num}) catch "0";
+        // Generate run ID with embedded partition bits
+        var run_id_buf: [32]u8 = undefined;
+        const run_id_str = if (shard) |s| blk: {
+            const partition_id = s.router.keyToPartitionNs(req.namespace, action_name);
+            break :blk s.run_id_gen.next(.action, partition_id, &run_id_buf) catch "act-0";
+        } else blk: {
+            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}", .{std.time.milliTimestamp()}) catch "act-0";
+        };
 
         // Duplicate for storage
         const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
@@ -566,96 +559,12 @@ pub const ActionsHandler = struct {
         // Persist invoke through Raft
         if (shard) |s| self.persistInvoke(s, req.namespace, owned_run_id, action_name, now_ms, parsed_value.input, parsed_value.labels);
 
-        // For WASM actions, execute the module inline and update run status.
-        // User-hosted actions remain .pending for action_await to claim.
-        var wasm_output: ?[]const u8 = null;
-        if (self.actions.get(action_name)) |action| {
-            if (action.action_type == 1) { // wasm
-                wasm_output = self.executeWasmAction(owned_run_id, &action, req.value);
-            }
-        }
-
         return .{
             .action_invoked = .{
                 .run_id = owned_run_id, // points to heap-owned copy in runs map
                 .queue_position = @intCast(self.runs.count()),
-                .output = wasm_output,
             },
         };
-    }
-
-    /// Execute a WASM action inline. Updates the run record with the result.
-    /// Returns the output bytes (caller-owned) on success, null on failure.
-    /// In test builds, uses a lightweight validation path since the full WASM
-    /// runtime's test suite requires testdata/ WASM binaries. In production,
-    /// loads the module through ActionWasmRunner for real execution.
-    fn executeWasmAction(self: *ActionsHandler, run_id: []const u8, action: *const ActionRecord, input: []const u8) ?[]const u8 {
-        const is_test = comptime @import("builtin").is_test;
-        const run = self.runs.getPtr(run_id) orelse return null;
-        const wasm_bytes = action.wasm_blob_owned orelse {
-            run.status = .failed;
-            run.completed_at_ms = std.time.milliTimestamp();
-            return null;
-        };
-
-        run.status = .running;
-        run.started_at_ms = std.time.milliTimestamp();
-
-        if (comptime is_test) {
-            // In test mode, validate the WASM magic header.
-            if (wasm_bytes.len >= 4 and std.mem.eql(u8, wasm_bytes[0..4], &[_]u8{ 0x00, 0x61, 0x73, 0x6d })) {
-                run.status = .completed;
-                run.completed_at_ms = std.time.milliTimestamp();
-                // Return a small test output
-                return self.allocator.dupe(u8, "{\"ok\":true}") catch null;
-            } else {
-                run.status = .failed;
-                run.completed_at_ms = std.time.milliTimestamp();
-                return null;
-            }
-        }
-
-        const WasmRunner = @import("wasm_runner.zig").ActionWasmRunner;
-
-        var runner = WasmRunner.init(self.allocator) catch {
-            run.status = .failed;
-            run.completed_at_ms = std.time.milliTimestamp();
-            return null;
-        };
-        defer runner.deinit();
-
-        var module = runner.loadModule(wasm_bytes, .{}) catch {
-            run.status = .failed;
-            run.completed_at_ms = std.time.milliTimestamp();
-            return null;
-        };
-        defer module.deinit();
-
-        if (!runner.tryAcquire()) {
-            return null;
-        }
-        defer runner.release();
-
-        var exec_result = runner.execute(&module, input) catch {
-            run.status = .failed;
-            run.completed_at_ms = std.time.milliTimestamp();
-            return null;
-        };
-
-        // Copy output before deinit
-        const output_copy = self.allocator.dupe(u8, exec_result.output) catch {
-            exec_result.deinit();
-            run.status = .completed;
-            run.completed_at_ms = std.time.milliTimestamp();
-            return null;
-        };
-        exec_result.deinit();
-
-        run.status = .completed;
-        run.completed_at_ms = std.time.milliTimestamp();
-        // Also store result in run record
-        run.result_owned = self.allocator.dupe(u8, output_copy) catch null;
-        return output_copy;
     }
 
     // ── STATUS ──────────────────────────────────────────────────────────
@@ -849,7 +758,6 @@ pub const ActionsHandler = struct {
         }
 
         if (self.actions.fetchRemove(name)) |kv| {
-            if (kv.value.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(kv.value.namespace_owned);
             self.allocator.free(kv.value.name_owned);
 
@@ -864,12 +772,6 @@ pub const ActionsHandler = struct {
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
-
-    fn nextRunId(self: *ActionsHandler) u64 {
-        const id = self.next_run_id;
-        self.next_run_id += 1;
-        return id;
-    }
 
     pub fn actionCount(self: *const ActionsHandler) usize {
         return self.actions.count();
@@ -1073,7 +975,7 @@ pub const ActionsHandler = struct {
             // value_len + value (type + version + enabled)
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(value_size), .little);
             offset += 4;
-            buf[offset] = rec.action_type;
+            buf[offset] = 0; // action type (always user-hosted)
             offset += 1;
             std.mem.writeInt(u32, buf[offset..][0..4], rec.version, .little);
             offset += 4;
@@ -1096,7 +998,7 @@ pub const ActionsHandler = struct {
         switch (cmd_result) {
             .action_list_result => |r| self.allocator.free(r.data),
             .action_invoked => |r| {
-                if (r.output) |o| self.allocator.free(o);
+                _ = r;
             },
             else => {},
         }
@@ -1120,10 +1022,10 @@ pub const ActionsHandler = struct {
         // Check action exists
         if (!self.actions.contains(action_name)) return null;
 
-        // Generate run ID
-        const run_id_num = self.nextRunId();
-        var run_id_buf: [20]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "{d}", .{run_id_num}) catch return null;
+        // Generate run ID with embedded partition bits
+        const partition_id = shard.router.keyToPartitionNs("default", action_name);
+        var run_id_buf: [32]u8 = undefined;
+        const run_id_str = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch return null;
 
         const owned_run_id = self.allocator.dupe(u8, run_id_str) catch return null;
         const owned_action_name = self.allocator.dupe(u8, action_name) catch {
@@ -1155,6 +1057,7 @@ pub const ActionsHandler = struct {
             .input_owned = owned_input,
             .caller_run_id_owned = owned_caller_run_id,
             .caller_workflow_name_owned = owned_caller_workflow_name,
+            .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
             .status = .pending,
             .created_at_ms = now_ms,
             .started_at_ms = null,
@@ -1169,27 +1072,10 @@ pub const ActionsHandler = struct {
             return null;
         };
 
-        // For WASM actions, execute inline under the lock (synchronous, same thread).
-        // For user-hosted actions, release the lock FIRST, then notify waiters
-        // (notifyAny → resolveActionAwait → claimPendingRun also acquires runs_mu).
-        var is_wasm = false;
-        if (self.actions.get(action_name)) |action| {
-            if (action.action_type == 1) {
-                is_wasm = true;
-                const wasm_out = self.executeWasmAction(owned_run_id, &action, input orelse "");
-                if (wasm_out) |o| self.allocator.free(o);
-            }
-        }
         self.runs_mu.unlock();
 
-        if (!is_wasm) {
-            // User-hosted: wake any workers waiting for this action
-            if (self.actions.get(action_name)) |action| {
-                if (action.action_type != 1) {
-                    shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
-                }
-            }
-        }
+        // Wake any workers waiting for this action
+        shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
 
         return owned_run_id;
     }
@@ -1228,6 +1114,7 @@ pub const ActionsHandler = struct {
             .input_owned = owned_input,
             .caller_run_id_owned = owned_caller_run_id,
             .caller_workflow_name_owned = owned_caller_workflow_name,
+            .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
             .status = .pending,
             .created_at_ms = now_ms,
             .started_at_ms = null,
@@ -1433,17 +1320,9 @@ pub const ActionsHandler = struct {
 
         const version = std.mem.readInt(u32, value[0..4], .little);
         const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
-        const req_value = value[12..];
-
-        const action_type: u8 = if (req_value.len > 0) req_value[0] else 0;
-        var wasm_blob: ?[]const u8 = null;
-        if (action_type == 1 and req_value.len > 1) {
-            wasm_blob = self.allocator.dupe(u8, req_value[1..]) catch null;
-        }
 
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(name)) |old| {
-            if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
         }
@@ -1456,11 +1335,9 @@ pub const ActionsHandler = struct {
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
-            .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = created_at_ns,
-            .wasm_blob_owned = wasm_blob,
         }) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
@@ -1476,7 +1353,6 @@ pub const ActionsHandler = struct {
             name = key[sep + 1..];
         }
         if (self.actions.fetchRemove(name)) |old| {
-            if (old.value.wasm_blob_owned) |blob| self.allocator.free(blob);
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
         }
@@ -1531,13 +1407,6 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_run_id);
             return;
         };
-
-        // Update next_run_id to avoid collisions after restart
-        if (std.fmt.parseInt(u64, run_id, 10)) |id_num| {
-            if (id_num >= self.next_run_id) {
-                self.next_run_id = id_num + 1;
-            }
-        } else |_| {}
 
         self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
@@ -1654,11 +1523,31 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
     const action_name = full_key[ns_len + 1 ..][0..action_name_len];
     const worker_id = full_key[ns_len + 1 + action_name_len ..];
 
-    // Look up worker metadata from worker registry for label matching
-    const worker_labels: ?[]const u8 = if (worker_id.len > 0)
-        if (shard.worker_handler.workers.get(worker_id)) |w| w.metadata_owned else null
-    else
-        null;
+    // Look up worker metadata and process list from the worker registry.
+    // worker_register is pre-routed by hash(namespace, worker_id), so the
+    // registration may live on a different shard than the action_await waiter.
+    // We must check the correct shard via peer_shards.
+    var worker_labels: ?[]const u8 = null;
+    var worker_ptr: ?*const WorkerRecord = null;
+    if (worker_id.len > 0) {
+        // Find the shard that owns this worker's registration
+        const worker_hash = router.hashKeyWithNamespace(namespace, worker_id);
+        const worker_target = shard.router.route(worker_hash);
+        const worker_shard: *Shard = switch (worker_target) {
+            .local => shard,
+            .shard => |t| blk: {
+                if (shard.peer_shards) |peers| {
+                    if (t.shard_id < peers.len) break :blk peers[t.shard_id];
+                }
+                break :blk shard;
+            },
+            .remote => shard,
+        };
+        if (worker_shard.worker_handler.workers.getPtr(worker_id)) |w| {
+            worker_labels = w.metadata_owned;
+            worker_ptr = w;
+        }
+    }
 
     // Try to claim a pending run for the primary action name — hash-routed O(1)
     if (claimFromTargetShard(shard, namespace, action_name, worker_labels, worker_id)) |task| {
@@ -1668,19 +1557,17 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
         return true;
     }
 
-    // If the worker is registered, try all its other action processes
-    if (worker_id.len > 0) {
-        if (shard.worker_handler.workers.get(worker_id)) |worker| {
-            for (worker.processes.items) |process| {
-                if (process.kind != .action) continue;
-                // Skip the primary name we already tried
-                if (std.mem.eql(u8, process.name_owned, action_name)) continue;
-                if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
-                    const conn = shard.getConnection(waiter.fd) orelse return true;
-                    sendTaskAssignment(shard, conn, waiter.request_id, task);
-                    shard.flushToClient(waiter.fd);
-                    return true;
-                }
+    // Try all the worker's other registered action processes.
+    if (worker_ptr) |worker| {
+        for (worker.processes.items) |process| {
+            if (process.kind != .action) continue;
+            // Skip the primary name we already tried
+            if (std.mem.eql(u8, process.name_owned, action_name)) continue;
+            if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
+                const conn = shard.getConnection(waiter.fd) orelse return true;
+                sendTaskAssignment(shard, conn, waiter.request_id, task);
+                shard.flushToClient(waiter.fd);
+                return true;
             }
         }
     }
@@ -1906,19 +1793,13 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, r.name);
         },
         .action_invoked => |i| {
-            // Wire format: [run_id_len:u16][run_id][has_output:u8][output_len:u32]?[output]?
+            // Wire format: [run_id_len:u16][run_id][has_output:u8]
             var buf: [4096]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             const writer = fbs.writer();
             writer.writeInt(u16, @intCast(i.run_id.len), .little) catch return;
             writer.writeAll(i.run_id) catch return;
-            if (i.output) |o| {
-                writer.writeByte(1) catch return;
-                writer.writeInt(u32, @intCast(o.len), .little) catch return;
-                writer.writeAll(o) catch return;
-            } else {
-                writer.writeByte(0) catch return;
-            }
+            writer.writeByte(0) catch return; // has_output (always false)
             shard.sendOkResponse(conn, request_id, fbs.getWritten());
         },
         .action_run_status => |s| {
@@ -2066,22 +1947,6 @@ test "actions handler: register re-register bumps version" {
     }
 
     try testing.expectEqual(@as(usize, 1), handler.actionCount());
-}
-
-test "actions handler: register with wasm type" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    // value[0] = 1 means wasm type
-    const result = handler.handleCommand(null, makeRequest(.action_register, "wasm-action", &[_]u8{1}));
-    switch (result) {
-        .action_registered => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    const rec = handler.actions.get("wasm-action").?;
-    try testing.expectEqual(@as(u8, 1), rec.action_type);
 }
 
 test "actions handler: register empty name" {
@@ -2273,99 +2138,4 @@ test "actions handler: freeResult non-allocated is no-op" {
     handler.freeResult(.ok);
     handler.freeResult(.{ .err = .{ .code = .invalid_request, .message = "test" } });
     handler.freeResult(.{ .action_deleted = {} });
-}
-
-test "actions handler: wasm invoke with invalid blob fails gracefully" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    // Register a WASM action: value[0]=1 (wasm), value[1..] = invalid WASM bytes
-    const wasm_reg_value = [_]u8{ 1, 0x00, 0xDE, 0xAD }; // type=wasm + garbage
-    _ = handler.handleCommand(null, makeRequest(.action_register, "wasm-job", &wasm_reg_value));
-
-    // Verify WASM blob was stored
-    const rec = handler.actions.get("wasm-job").?;
-    try testing.expectEqual(@as(u8, 1), rec.action_type);
-    try testing.expect(rec.wasm_blob_owned != null);
-    try testing.expectEqual(@as(usize, 3), rec.wasm_blob_owned.?.len);
-
-    // Invoke — should succeed (returns run_id) but run status should be failed
-    // because the WASM bytes are invalid and loadModule will fail
-    const result = handler.handleCommand(null, makeRequest(.action_invoke, "wasm-job", "input"));
-    var run_id: []const u8 = "";
-    switch (result) {
-        .action_invoked => |r| run_id = r.run_id,
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Run should have been marked failed by executeWasmAction
-    const run = handler.runs.get(run_id).?;
-    try testing.expectEqual(ActionRunStatus.failed, run.status);
-    try testing.expect(run.completed_at_ms != null);
-}
-
-test "actions handler: wasm invoke with no blob fails gracefully" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    // Register WASM action with only the type byte (no blob)
-    _ = handler.handleCommand(null, makeRequest(.action_register, "no-blob", &[_]u8{1}));
-
-    const rec = handler.actions.get("no-blob").?;
-    try testing.expect(rec.wasm_blob_owned == null); // no blob stored
-
-    // Invoke — should return action_invoked but run is failed (no blob)
-    const result = handler.handleCommand(null, makeRequest(.action_invoke, "no-blob", "input"));
-    var run_id: []const u8 = "";
-    switch (result) {
-        .action_invoked => |r| run_id = r.run_id,
-        else => return error.TestUnexpectedResult,
-    }
-
-    const run = handler.runs.get(run_id).?;
-    try testing.expectEqual(ActionRunStatus.failed, run.status);
-}
-
-test "actions handler: wasm blob freed on re-register" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    // Register with WASM blob
-    const wasm_v1 = [_]u8{ 1, 0x01, 0x02, 0x03 };
-    _ = handler.handleCommand(null, makeRequest(.action_register, "evolve", &wasm_v1));
-    try testing.expectEqual(@as(u32, 1), handler.actions.get("evolve").?.version);
-    try testing.expect(handler.actions.get("evolve").?.wasm_blob_owned != null);
-
-    // Re-register with a new blob — old blob should be freed (no leak)
-    const wasm_v2 = [_]u8{ 1, 0x04, 0x05 };
-    _ = handler.handleCommand(null, makeRequest(.action_register, "evolve", &wasm_v2));
-    try testing.expectEqual(@as(u32, 2), handler.actions.get("evolve").?.version);
-    try testing.expectEqual(@as(usize, 2), handler.actions.get("evolve").?.wasm_blob_owned.?.len);
-}
-
-test "actions handler: wasm invoke with valid magic completes" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    // Register with valid WASM magic header: \0asm\1\0\0\0
-    const wasm_value = [_]u8{ 1, 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-    _ = handler.handleCommand(null, makeRequest(.action_register, "valid-wasm", &wasm_value));
-
-    const result = handler.handleCommand(null, makeRequest(.action_invoke, "valid-wasm", "input"));
-    defer handler.freeResult(result);
-    var run_id: []const u8 = "";
-    switch (result) {
-        .action_invoked => |r| run_id = r.run_id,
-        else => return error.TestUnexpectedResult,
-    }
-
-    // In test mode, valid WASM magic → completed
-    const run = handler.runs.get(run_id).?;
-    try testing.expectEqual(ActionRunStatus.completed, run.status);
-    try testing.expect(run.started_at_ms != null);
-    try testing.expect(run.completed_at_ms != null);
 }

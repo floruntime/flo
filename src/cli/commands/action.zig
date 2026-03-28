@@ -1,7 +1,7 @@
 //! Action & Worker commands for Flo CLI using Commander framework
 //!
 //! Usage:
-//!   flo action register <name> [--type user|wasm] [--owner <owner>] [--timeout <ms>]
+//!   flo action register <name> [--owner <owner>] [--timeout <ms>]
 //!   flo action invoke <name> <input> [--priority <0-255>] [--idempotency-key <key>]
 //!   flo action status <run_id>
 //!   flo action list [--limit <n>]
@@ -45,13 +45,10 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .about("Register a new action")
                 .examples(&.{
                     "flo action register myaction",
-                    "flo action register handler --type wasm --wasm-module rules.wasm",
                     "flo action register process --owner myteam --retries 3",
                 })
                 .arg("name", "Action name")
-                .stringFlag("type", 't', "user", "Action type: user, wasm")
                 .stringFlag("owner", 'o', "cli", "Owner/team name")
-                .stringFlag("wasm-module", 'w', "", "Path to WASM module file (for --type wasm)")
                 .uintFlag("timeout", 0, 30000, "Execution timeout (ms)")
                 .uintFlag("retries", 'r', 0, "Max retry attempts")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
@@ -239,48 +236,11 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
 fn runRegister(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
 
-    const action_type_str = ctx.getString("type") orelse "user";
     const owner = ctx.getString("owner") orelse "cli";
-    const wasm_module_path = ctx.getString("wasm-module");
     const timeout = ctx.getUint("timeout") orelse 30000;
     const retries = ctx.getUint("retries") orelse 0;
     const namespace = ctx.getString("namespace") orelse "default";
     const endpoint = cli_config.getEndpoint(ctx);
-
-    // Convert type string to enum value
-    var action_type: u8 = if (std.mem.eql(u8, action_type_str, "wasm")) 1 else 0;
-
-    // Read WASM module file if provided
-    var wasm_bytes: ?[]const u8 = null;
-    defer if (wasm_bytes) |wb| ctx.allocator.free(wb);
-
-    if (wasm_module_path) |path| {
-        if (path.len > 0) {
-            // Auto-set type to wasm when --wasm-module is provided
-            action_type = 1;
-
-            const file = std.fs.cwd().openFile(path, .{}) catch {
-                ctx.printErr("Cannot open WASM module: {s}\n", .{path});
-                return;
-            };
-            defer file.close();
-
-            const stat = file.stat() catch {
-                ctx.printErr("Cannot stat WASM module: {s}\n", .{path});
-                return;
-            };
-
-            if (stat.size > 10 * 1024 * 1024) {
-                ctx.printErr("WASM module too large ({d} bytes, max 10MB)\n", .{stat.size});
-                return;
-            }
-
-            wasm_bytes = file.readToEndAlloc(ctx.allocator, 10 * 1024 * 1024) catch {
-                ctx.printErr("Failed to read WASM module: {s}\n", .{path});
-                return;
-            };
-        }
-    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -291,7 +251,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     };
 
     // register(client, namespace, action_name, action_type, owner, timeout_ms, max_retries, retry_delay_ms, wasm_bytes)
-    var result = client_mod.action.register(&client, namespace, name, action_type, owner, @intCast(timeout), @intCast(retries), null, wasm_bytes) catch |err| {
+    var result = client_mod.action.register(&client, namespace, name, 0, owner, @intCast(timeout), @intCast(retries), null, null) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };
@@ -302,11 +262,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    if (wasm_bytes) |wb| {
-        ctx.print("Registered WASM action: {s} ({d} bytes)\n", .{ name, wb.len });
-    } else {
-        ctx.print("Registered action: {s}\n", .{name});
-    }
+    ctx.print("Registered action: {s}\n", .{name});
 }
 
 fn runInvoke(ctx: *commander.Context) commander.Error!void {

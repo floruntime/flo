@@ -9,13 +9,13 @@
 //! # Key Types
 //!
 //! - `ActionMeta`: Action registry metadata (type, config, limits)
-//! - `ActionType`: User-hosted vs Flo-hosted (WASM)
+//! - `ActionType`: Action execution type
 //! - `ActionRun`: Action execution state
 //! - `WorkerMeta`: Worker registration metadata
 //!
 //! # Design Principles
 //!
-//! 1. **Unified Registry**: Both user and WASM actions share the same registry
+//! 1. **Unified Registry**: All actions share the same registry
 //! 2. **Queue-Based Invocation**: All actions invoked via Layer 1 Queues
 //! 3. **Layer 0 Storage**: State persisted directly to storage engine
 
@@ -26,7 +26,7 @@ const WireWriter = @import("../util/wire.zig").WireWriter;
 const WireReader = @import("../util/wire.zig").WireReader;
 
 // =============================================================================
-// Action Type (User vs WASM)
+// Action Type
 // =============================================================================
 
 /// Type of action execution
@@ -35,11 +35,6 @@ pub const ActionType = enum(u8) {
     /// User provides: Go/Python/Node function
     /// Flo provides: Queue-based task delivery, retry, monitoring
     user = 0,
-
-    /// Flo-hosted: WASM module runs on Flo infrastructure
-    /// User provides: WASM module
-    /// Flo provides: Sandboxed execution, scaling, monitoring
-    wasm = 1,
 };
 
 // =============================================================================
@@ -127,9 +122,6 @@ pub const Outcome = enum(u8) {
 /// [timeout_ms:u32][max_retries:u32][retry_delay_ms:u32]
 /// [max_input_size:u32][max_output_size:u32]
 /// [created_at:i64][updated_at:i64][enabled:u8]
-/// [has_wasm_module:u8][wasm_module_len:u16]?[wasm_module]?
-/// [has_wasm_entrypoint:u8][wasm_entrypoint_len:u16]?[wasm_entrypoint]?
-/// [has_wasm_memory_limit:u8][wasm_memory_limit:u32]?
 /// [has_trigger_stream:u8][trigger_stream_len:u16]?[trigger_stream]?
 /// [has_trigger_group:u8][trigger_group_len:u16]?[trigger_group]?
 pub const ActionMeta = struct {
@@ -157,14 +149,6 @@ pub const ActionMeta = struct {
     max_input_size: u32 = 1024 * 1024, // 1MB
     /// Maximum output payload size in bytes
     max_output_size: u32 = 1024 * 1024, // 1MB
-
-    // WASM-specific configuration (for action_type = .wasm)
-    /// Path or URL to WASM module
-    wasm_module: ?[]const u8 = null,
-    /// Entrypoint function name (default: "handle")
-    wasm_entrypoint: ?[]const u8 = null,
-    /// Memory limit in bytes (default: 16MB)
-    wasm_memory_limit: ?u32 = null,
 
     // Stream-trigger configuration (for Flo-Processing)
     /// Source stream that triggers this action
@@ -221,25 +205,10 @@ pub const ActionMeta = struct {
         try writer.writeI64(self.updated_at);
         try writer.writeU8(if (self.enabled) 1 else 0);
 
-        // WASM configuration
-        if (self.wasm_module) |m| {
-            try writer.writeU8(1);
-            try writer.writeLengthPrefixed(u16, m);
-        } else {
-            try writer.writeU8(0);
-        }
-        if (self.wasm_entrypoint) |e| {
-            try writer.writeU8(1);
-            try writer.writeLengthPrefixed(u16, e);
-        } else {
-            try writer.writeU8(0);
-        }
-        if (self.wasm_memory_limit) |l| {
-            try writer.writeU8(1);
-            try writer.writeU32(l);
-        } else {
-            try writer.writeU8(0);
-        }
+        // WASM configuration (removed — write zero markers for wire compat)
+        try writer.writeU8(0); // has_wasm_module
+        try writer.writeU8(0); // has_wasm_entrypoint
+        try writer.writeU8(0); // has_wasm_memory_limit
 
         // Stream-trigger configuration
         if (self.trigger_stream) |s| {
@@ -300,24 +269,21 @@ pub const ActionMeta = struct {
         const updated_at = reader.readI64() orelse return error.InvalidData;
         const enabled = (reader.readU8() orelse return error.InvalidData) == 1;
 
-        // WASM configuration
+        // WASM configuration (removed — skip for wire compat)
         const has_wasm_module = reader.readU8() orelse return error.InvalidData;
-        const wasm_module: ?[]const u8 = if (has_wasm_module == 1)
-            reader.readLengthPrefixed(u16) orelse return error.InvalidData
-        else
-            null;
+        if (has_wasm_module == 1) {
+            _ = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
+        }
 
         const has_wasm_entrypoint = reader.readU8() orelse return error.InvalidData;
-        const wasm_entrypoint: ?[]const u8 = if (has_wasm_entrypoint == 1)
-            reader.readLengthPrefixed(u16) orelse return error.InvalidData
-        else
-            null;
+        if (has_wasm_entrypoint == 1) {
+            _ = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
+        }
 
         const has_wasm_memory_limit = reader.readU8() orelse return error.InvalidData;
-        const wasm_memory_limit: ?u32 = if (has_wasm_memory_limit == 1)
-            reader.readU32() orelse return error.InvalidData
-        else
-            null;
+        if (has_wasm_memory_limit == 1) {
+            _ = reader.readU32() orelse return error.InvalidData;
+        }
 
         // Stream-trigger configuration
         const has_trigger_stream = reader.readU8() orelse return error.InvalidData;
@@ -358,16 +324,6 @@ pub const ActionMeta = struct {
         else
             null;
 
-        const owned_wasm_module: ?[]const u8 = if (wasm_module) |m|
-            try allocator.dupe(u8, m)
-        else
-            null;
-
-        const owned_wasm_entrypoint: ?[]const u8 = if (wasm_entrypoint) |e|
-            try allocator.dupe(u8, e)
-        else
-            null;
-
         const owned_trigger_stream: ?[]const u8 = if (trigger_stream) |s|
             try allocator.dupe(u8, s)
         else
@@ -395,9 +351,6 @@ pub const ActionMeta = struct {
             .retry_delay_ms = retry_delay_ms,
             .max_input_size = max_input_size,
             .max_output_size = max_output_size,
-            .wasm_module = owned_wasm_module,
-            .wasm_entrypoint = owned_wasm_entrypoint,
-            .wasm_memory_limit = wasm_memory_limit,
             .trigger_stream = owned_trigger_stream,
             .trigger_group = owned_trigger_group,
             .trigger_queue = owned_trigger_queue,
@@ -414,8 +367,6 @@ pub const ActionMeta = struct {
         allocator.free(self.version);
         allocator.free(self.owner);
         if (self.description) |d| allocator.free(d);
-        if (self.wasm_module) |m| allocator.free(m);
-        if (self.wasm_entrypoint) |e| allocator.free(e);
         if (self.trigger_stream) |s| allocator.free(s);
         if (self.trigger_group) |g| allocator.free(g);
         if (self.trigger_queue) |q| allocator.free(q);

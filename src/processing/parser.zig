@@ -54,6 +54,7 @@ const Allocator = mem.Allocator;
 
 const job_definition = @import("definition.zig");
 const yaml_to_json = @import("../util/yaml_to_json.zig");
+const interpolate = @import("../util/interpolate.zig");
 
 // Re-export types for convenience
 pub const JobDefinition = job_definition.JobDefinition;
@@ -268,7 +269,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             errdefer allocator.free(name_dup);
 
             const module: ?[]u8 = if (getString(item, "module")) |mp|
-                (allocator.dupe(u8, mp) catch return error.OutOfMemory)
+                (interpolate.resolve(allocator, mp, .{}) catch return error.OutOfMemory)
             else
                 null;
 

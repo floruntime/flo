@@ -40,7 +40,9 @@ const StoredPoint = ts_mod.StoredPoint;
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const run_id_mod = @import("../node/run_id.zig");
 const stream_handler_mod = @import("../stream/handler.zig");
+const kv_handler_mod = @import("../kv/handler.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -76,14 +78,8 @@ pub const ProcessingHandler = struct {
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
 
-    /// Monotonic job counter for generating IDs.
-    next_job_id: u64,
-
     /// Savepoint store: savepoint_id → SavepointRecord.
     savepoints: std.StringHashMap(SavepointRecord),
-
-    /// Monotonic savepoint counter.
-    next_savepoint_id: u64,
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
@@ -93,6 +89,10 @@ pub const ProcessingHandler = struct {
     peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
+
+    /// Cross-shard KV handlers — one per shard, wired by Runtime.
+    /// Enables KV lookup operators to find keys on any shard.
+    peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
 
     const MAX_JOBS: usize = 100_000;
 
@@ -131,6 +131,9 @@ pub const ProcessingHandler = struct {
         // Operator chain — instantiated from job definition
         operators: []Operator = &.{},
         operator_backings: []native_registry.CreateResult = &.{},
+
+        // Tag registry — heap-allocated, used by classify operators for tag resolution
+        tag_registry: ?*definition.TagRegistry = null,
     };
 
     pub const JobStatus = enum(u8) {
@@ -174,18 +177,23 @@ pub const ProcessingHandler = struct {
         return .{
             .allocator = allocator,
             .jobs = std.StringHashMap(JobRecord).init(allocator),
-            .next_job_id = 1,
             .savepoints = std.StringHashMap(SavepointRecord).init(allocator),
-            .next_savepoint_id = 1,
             .pipelines = std.StringHashMap(PipelineState).init(allocator),
         };
     }
 
     pub fn deinit(self: *ProcessingHandler) void {
-        // Free pipeline state
+        // Free pipeline state + multi-source pipeline keys
         var pit = self.pipelines.iterator();
         while (pit.next()) |entry| {
             self.freePipelineState(entry.value_ptr);
+            // Multi-source pipeline keys (containing '\0' separator) are independently
+            // allocated and must be freed here. The idx==0 key is shared with the jobs
+            // map and freed via freeJobRecord below.
+            const key = entry.key_ptr.*;
+            if (std.mem.indexOfScalar(u8, key, 0) != null) {
+                self.allocator.free(key);
+            }
         }
         self.pipelines.deinit();
 
@@ -213,14 +221,21 @@ pub const ProcessingHandler = struct {
         self.peer_shard_count = shard_count;
     }
 
+    /// Wire cross-shard KV handler references.
+    /// Called by Runtime after all shards are initialized.
+    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
+        self.peer_kv_handlers = handlers;
+    }
+
     /// Resolve the correct StreamHandler for a given stream name + namespace.
-    /// Uses hashKey (key-only, no namespace prefix) to match the Acceptor's
-    /// connection routing — the Acceptor peeks the raw key and hashes with
-    /// hashKey(), so stream data lives on the shard selected by hashKey(name).
-    fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, _: []const u8) *stream_handler_mod.StreamHandler {
+    /// Uses hashKeyWithNamespace (namespace + key) to match the Dispatcher's
+    /// stream_append routing — the Dispatcher uses preRouteByStream which
+    /// hashes with hashKeyWithNamespace(namespace, key), so stream data lives
+    /// on the shard selected by that composite hash.
+    fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, namespace: []const u8) *stream_handler_mod.StreamHandler {
         const peers = self.peer_stream_handlers orelse return local;
         if (peers.len <= 1) return local;
-        const hash = router.hashKey(stream_name);
+        const hash = router.hashKeyWithNamespace(namespace, stream_name);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
         const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
         return peers[shard_id];
@@ -256,19 +271,22 @@ pub const ProcessingHandler = struct {
             if (snk.ts_field_keys.len > 0) self.allocator.free(snk.ts_field_keys);
         }
         if (pipe.sinks.len > 0) self.allocator.free(pipe.sinks);
+
+        // Free heap-allocated tag registry
+        if (pipe.tag_registry) |reg| self.allocator.destroy(reg);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.processing_submit, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_stop, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_status, dispatchProcessing, preRouteByProcessing);
+        dispatcher.registerWithRoute(.processing_stop, dispatchProcessing, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.processing_status, dispatchProcessing, run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.processing_list, dispatchProcessing, localScanJobs);
-        dispatcher.registerWithRoute(.processing_savepoint, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_restore, dispatchProcessing, preRouteByProcessing);
-        dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, preRouteByProcessing);
+        dispatcher.registerWithRoute(.processing_savepoint, dispatchProcessing, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.processing_restore, dispatchProcessing, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, run_id_mod.preRouteByRunId);
     }
 
     /// Pre-routing: hash on key (job_id) for deterministic shard assignment.
@@ -355,12 +373,10 @@ pub const ProcessingHandler = struct {
         };
         defer def.deinit(self.allocator);
 
-        // Generate a unique job ID
-        const job_id_num = self.next_job_id;
-        self.next_job_id += 1;
-
-        var id_buf: [64]u8 = undefined;
-        const job_id = std.fmt.bufPrint(&id_buf, "job-{d}", .{job_id_num}) catch {
+        // Generate a unique job ID with embedded partition bits
+        const partition_id = shard.router.keyToPartitionNs(def.namespace, def.name);
+        var id_buf: [32]u8 = undefined;
+        const job_id = shard.run_id_gen.next(.job, partition_id, &id_buf) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "id generation failed");
             return;
         };
@@ -423,7 +439,13 @@ pub const ProcessingHandler = struct {
         self.persistSubmit(shard, req.namespace, owned_id, &record);
 
         // Build tag registry from all sinks and classify operators
-        var tag_registry = definition.TagRegistry{};
+        // Heap-allocated so classify operators can reference it during creation
+        const tag_registry_ptr = self.allocator.create(definition.TagRegistry) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "tag registry alloc failed");
+            return;
+        };
+        tag_registry_ptr.* = definition.TagRegistry{};
+        var tag_registry = tag_registry_ptr;
         for (def.sinks.items) |snk| {
             if (snk.match) |tag_list| {
                 for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
@@ -434,6 +456,10 @@ pub const ProcessingHandler = struct {
                 if (op_spec.config) |entries| {
                     for (entries) |entry| {
                         if (std.mem.startsWith(u8, entry.key, "tag_")) {
+                            _ = tag_registry.getOrCreate(entry.value);
+                        }
+                        // Also register default_tag so it can be resolved
+                        if (std.mem.eql(u8, entry.key, "default_tag")) {
                             _ = tag_registry.getOrCreate(entry.value);
                         }
                     }
@@ -453,13 +479,13 @@ pub const ProcessingHandler = struct {
         if (def.sinks.items.len > 0) {
             for (def.sources.items, 0..) |*src, idx| {
                 if (idx == 0) {
-                    self.createPipeline(owned_id, src, def.sinks.items, &def, &tag_registry, shard);
+                    self.createPipeline(owned_id, src, def.sinks.items, &def, tag_registry);
                 } else {
                     // Multi-source: create additional pipeline with suffixed key
                     var key_buf: [256]u8 = undefined;
                     const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ owned_id, idx }) catch continue;
                     const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
-                    self.createPipeline(ms_owned, src, def.sinks.items, &def, &tag_registry, shard);
+                    self.createPipeline(ms_owned, src, def.sinks.items, &def, tag_registry);
                 }
             }
         }
@@ -625,12 +651,10 @@ pub const ProcessingHandler = struct {
         }
 
         if (self.jobs.get(job_id)) |job| {
-            // Generate savepoint ID
-            const sp_num = self.next_savepoint_id;
-            self.next_savepoint_id += 1;
-
-            var id_buf: [64]u8 = undefined;
-            const sp_id = std.fmt.bufPrint(&id_buf, "sp-{d}", .{sp_num}) catch {
+            // Generate savepoint ID with partition from parent job
+            const partition_id = run_id_mod.extractPartition(job_id) orelse 0;
+            var id_buf: [32]u8 = undefined;
+            const sp_id = shard.run_id_gen.next(.savepoint, partition_id, &id_buf) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "id generation failed");
                 return;
             };
@@ -917,13 +941,6 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_yaml);
             return;
         };
-
-        // Update next_job_id counter to avoid collisions
-        // Parse numeric suffix from "job-N"
-        if (std.mem.startsWith(u8, job_id, "job-")) {
-            const num = std.fmt.parseInt(u64, job_id[4..], 10) catch 0;
-            if (num >= self.next_job_id) self.next_job_id = num + 1;
-        }
     }
 
     /// Replay a status change (stop/cancel).
@@ -969,12 +986,6 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_sp_id);
             self.allocator.free(owned_job_id);
         };
-
-        // Update next_savepoint_id to avoid collisions
-        if (std.mem.startsWith(u8, key, "sp-")) {
-            const num = std.fmt.parseInt(u64, key[3..], 10) catch 0;
-            if (num >= self.next_savepoint_id) self.next_savepoint_id = num + 1;
-        }
     }
 
     /// Replay a rescale entry. Value = [parallelism:u32].
@@ -990,7 +1001,7 @@ pub const ProcessingHandler = struct {
 
     /// Create a pipeline execution state from parsed source/sink specifications.
     /// Instantiates the operator chain from the job definition.
-    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *const definition.TagRegistry, shard: *Shard) void {
+    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *definition.TagRegistry) void {
         // Compute tag hash for TS source filtering (same algorithm as TSHandler)
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
             var tag_buf: [1024]u8 = undefined;
@@ -1011,37 +1022,43 @@ pub const ProcessingHandler = struct {
         const op_specs = def.operators.items;
         var ops = self.allocator.alloc(Operator, op_specs.len) catch {
             // Fall through — pipeline will operate with no operators (passthrough)
-            self.pipelines.put(job_id, makePipeState(self.allocator, src, sinks, tag_hash)) catch {};
+            var ps = makePipeState(self.allocator, src, sinks, tag_hash);
+            self.pipelines.put(job_id, ps) catch {
+                self.freePipelineState(&ps);
+                return;
+            };
             return;
         };
         var backings = self.allocator.alloc(native_registry.CreateResult, op_specs.len) catch {
             self.allocator.free(ops);
-            self.pipelines.put(job_id, makePipeState(self.allocator, src, sinks, tag_hash)) catch {};
+            var ps = makePipeState(self.allocator, src, sinks, tag_hash);
+            self.pipelines.put(job_id, ps) catch {
+                self.freePipelineState(&ps);
+                return;
+            };
             return;
         };
 
         var count: usize = 0;
+        log.info("createPipeline: {d} operator specs to process", .{op_specs.len});
         for (op_specs) |*spec| {
-            if (!native_registry.isNativeType(spec.type_name)) continue;
-            const result = native_registry.create(self.allocator, spec, tag_registry) catch continue;
-            // Wire kv_lookup operators to the shard's KV projection
-            if (result.backing == .kv_lookup) {
-                result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(shard));
+            log.info("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
+            if (spec.config) |cfg| {
+                for (cfg) |entry| {
+                    log.info("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
+                }
             }
-            // Wire wasm operators: read module bytes and load
-            if (result.backing == .wasm) {
-                const wasm_op = result.backing.wasm;
-                const wasm_bytes = std.fs.cwd().readFileAlloc(self.allocator, wasm_op.module_path, 16 * 1024 * 1024) catch |err| {
-                    log.err("WASM operator '{s}': failed to read module '{s}': {}", .{ wasm_op.name, wasm_op.module_path, err });
-                    result.deinit(self.allocator);
-                    continue;
-                };
-                defer self.allocator.free(wasm_bytes);
-                wasm_op.loadWasm(wasm_bytes) catch |err| {
-                    log.err("WASM operator '{s}': failed to load module: {}", .{ wasm_op.name, err });
-                    result.deinit(self.allocator);
-                    continue;
-                };
+            if (!native_registry.isNativeType(spec.type_name)) {
+                log.info("createPipeline: not native type '{s}', skipping", .{spec.type_name});
+                continue;
+            }
+            const result = native_registry.create(self.allocator, spec, tag_registry) catch |err| {
+                log.err("createPipeline: native_registry.create failed for '{s}' type='{s}': {}", .{ spec.name, spec.type_name, err });
+                continue;
+            };
+            // Wire kv_lookup operators to route across all shards' KV projections
+            if (result.backing == .kv_lookup) {
+                result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(self));
             }
             backings[count] = result;
             ops[count] = result.op;
@@ -1049,6 +1066,8 @@ pub const ProcessingHandler = struct {
         }
 
         var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash);
+        pipe_state.tag_registry = tag_registry;
+        log.info("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
         if (count > 0) {
             pipe_state.operators = ops[0..count];
             pipe_state.operator_backings = backings[0..count];
@@ -1056,18 +1075,46 @@ pub const ProcessingHandler = struct {
             self.allocator.free(ops);
             self.allocator.free(backings);
         }
-        self.pipelines.put(job_id, pipe_state) catch {};
+        self.pipelines.put(job_id, pipe_state) catch {
+            self.freePipelineState(&pipe_state);
+        };
     }
 
     /// KV lookup callback passed to KvLookupOperator.
-    /// Resolves a key against the shard's KV projection, namespace-qualified.
+    /// Routes the lookup to the correct shard's KV projection via cross-shard peer handlers.
     fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
-        const shard: *Shard = @ptrCast(@alignCast(ctx));
+        const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const ns_handler = @import("../namespace/handler.zig");
         var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
-        const entry = shard.kv_handler.*.kv.get(qkey) orelse return null;
-        return entry.value;
+
+        log.info("shardKvLookup: ns='{s}' key='{s}' qkey='{s}' has_peers={} pc={d} sc={d}", .{
+            namespace,                     key,                       qkey,
+            self.peer_kv_handlers != null, self.peer_partition_count, self.peer_shard_count,
+        });
+
+        // Route to the correct shard using the same hash as the KV dispatcher
+        if (self.peer_kv_handlers) |handlers| {
+            if (self.peer_partition_count > 0 and self.peer_shard_count > 0) {
+                const hash = router.hashKeyWithNamespace(namespace, key);
+                const partition_id: u32 = @intCast(hash % self.peer_partition_count);
+                const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
+                log.info("shardKvLookup: hash={d} part={d} shard={d} nhandlers={d}", .{
+                    hash, partition_id, shard_id, handlers.len,
+                });
+                if (shard_id < handlers.len) {
+                    const entry = handlers[shard_id].*.kv.get(qkey) orelse {
+                        log.info("shardKvLookup: NOT FOUND on shard {d}", .{shard_id});
+                        return null;
+                    };
+                    log.info("shardKvLookup: FOUND val_len={d}", .{entry.value.len});
+                    return entry.value;
+                }
+            }
+        }
+
+        log.info("shardKvLookup: NO PEERS, returning null", .{});
+        return null;
     }
 
     /// Helper to build a PipelineState with source/sink config (no operators).
@@ -1187,6 +1234,7 @@ pub const ProcessingHandler = struct {
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
     fn tickStreamSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+        log.info("TICK_ENTRY: src={s} ns={s} cursor_ts={d} cursor_seq={d}", .{ pipe.src_stream, pipe.src_namespace, pipe.stream_cursor_ts, pipe.stream_cursor_seq });
         // Build cursor from last-read StreamID
         const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
 
@@ -1195,18 +1243,23 @@ pub const ProcessingHandler = struct {
 
         // Read from the named source stream using namespace-qualified name-hash filtering
         const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, 100);
+        log.info("TICK: read {d} payloads, last_id ts={d} seq={d}", .{ result.payloads.len, result.last_id.timestamp_ms, result.last_id.sequence });
         if (result.payloads.len == 0) return;
         defer src_handler.allocator.free(result.payloads);
 
         for (result.payloads) |payload| {
+            log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
             const output_records = applyOperatorChain(pipe.operators, payload, std.time.milliTimestamp(), shard.allocator) catch null;
 
             if (output_records) |records| {
                 defer shard.allocator.free(records);
+                log.info("TICK: chain returned {d} records for job", .{records.len});
                 for (records) |rec| {
+                    log.info("TICK: value_len={d} first50='{s}'", .{ rec.value.len, if (rec.value.len > 50) rec.value[0..50] else rec.value });
                     self.writeSinkRecordFromStream(pipe, shard, rec.value, rec.tags);
                 }
             } else {
+                log.debug("tickStreamSource: no operators, passthrough", .{});
                 self.writeSinkRecordFromStream(pipe, shard, payload, 0);
             }
 
@@ -1238,7 +1291,9 @@ pub const ProcessingHandler = struct {
 
         // Feed the initial record into the first operator
         const input_rec = ProcessingRecord.fromValue(value, event_time_ms);
+        log.info("applyOperatorChain: calling operator[0] name='{s}'", .{operators[0].getName()});
         try operators[0].processElement(input_rec, &ctx);
+        log.info("applyOperatorChain: operator[0] done, collector count={d}", .{collector.count()});
 
         // Chain: each operator processes the output of the previous one
         var i: usize = 1;
@@ -1249,10 +1304,21 @@ pub const ProcessingHandler = struct {
             // Dupe the records since clear will allow the backing to be reused
             const staged = allocator.dupe(ProcessingRecord, prev_output[0..prev_count]) catch return null;
             defer allocator.free(staged);
+            // Transfer ownership out of collector BEFORE clear frees owned memory
+            for (collector.records.items) |*rec| {
+                rec.owns_memory = false;
+            }
             collector.clear();
+            log.info("applyOperatorChain: calling operator[{d}] name='{s}' with {d} records", .{ i, operators[i].getName(), staged.len });
             for (staged) |rec| {
                 try operators[i].processElement(rec, &ctx);
             }
+            log.info("applyOperatorChain: operator[{d}] done, collector count={d}", .{ i, collector.count() });
+        }
+
+        // Transfer ownership out of collector BEFORE deinit frees owned memory
+        for (collector.records.items) |*rec| {
+            rec.owns_memory = false;
         }
 
         // Return final output — must dupe since collector.deinit() frees the backing array

@@ -23,8 +23,9 @@ const FixedWireWriter = wire.FixedWireWriter;
 /// Register an action
 /// Wire format in value:
 ///   [action_type:u8][timeout_ms:u32][max_retries:u32]
-///   [has_desc:u8][desc_len:u16]?[desc]?
-///   [has_wasm_module:u8]... etc
+///   [has_desc:u8]
+///   [has_wasm_module:u8][has_wasm_entrypoint:u8][has_wasm_memory_limit:u8]
+///   [has_trigger_stream:u8][has_trigger_group:u8]
 ///
 /// key = owner (used as req.key)
 /// name passed first in value for actual action name
@@ -37,40 +38,8 @@ pub fn register(
     timeout_ms: ?u32,
     max_retries: ?u8,
     _: ?u32, // retry_delay_ms - not in wire format
-    wasm_module_bytes: ?[]const u8,
+    _: ?[]const u8, // wasm_module_bytes - removed
 ) !Response {
-    // For WASM actions with module bytes, we need dynamic allocation
-    // since the fixed buffer is too small.
-    const wasm_len = if (wasm_module_bytes) |wb| wb.len else 0;
-    const header_size: usize = 1 + 4 + 4 + 1 + 1 + (if (wasm_len > 0) @as(usize, 2 + wasm_len) else 0) + 1 + 1 + 1 + 1;
-
-    // Use stack buffer for small payloads, heap for large (WASM)
-    if (wasm_len > 0) {
-        const alloc = client.allocator;
-        const buf = try alloc.alloc(u8, header_size);
-        defer alloc.free(buf);
-        var fbs = std.io.fixedBufferStream(buf);
-        const writer = fbs.writer();
-
-        try writer.writeByte(action_type);
-        try writer.writeInt(u32, timeout_ms orelse 30_000, .little);
-        try writer.writeInt(u32, @as(u32, max_retries orelse 3), .little);
-        try writer.writeByte(0); // no description
-
-        // Write WASM module bytes
-        try writer.writeByte(1); // has_wasm_module = 1
-        try writer.writeInt(u16, @intCast(wasm_len), .little);
-        try writer.writeAll(wasm_module_bytes.?);
-
-        try writer.writeByte(0); // no wasm_entrypoint
-        try writer.writeByte(0); // no wasm_memory_limit
-        try writer.writeByte(0); // no trigger_stream
-        try writer.writeByte(0); // no trigger_group
-
-        return client.sendRequest(.action_register, namespace, action_name, fbs.getWritten());
-    }
-
-    // Small payload path (no WASM bytes)
     var value_buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&value_buf);
     const writer = fbs.writer();

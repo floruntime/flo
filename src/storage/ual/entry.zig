@@ -89,6 +89,7 @@ pub const EntryType = enum(u8) {
     // ── Workflow ──
     workflow_create = 0x50,
     workflow_start = 0x51,
+    workflow_complete = 0x52,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -119,7 +120,7 @@ pub const EntryType = enum(u8) {
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => true,
             .ts_write, .ts_write_batch => true,
             .cg_commit, .cg_create, .cg_delete => true,
-            .workflow_create, .workflow_start => true,
+            .workflow_create, .workflow_start, .workflow_complete => true,
             .namespace_create, .namespace_delete, .namespace_config => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale => true,

@@ -99,13 +99,6 @@
 //!     field: "$.amount"
 //!     window: tumbling
 //!     window_size: 3600           # seconds
-//!
-//!   # WASM operator (uses 'module')
-//!   - type: map
-//!     name: transform
-//!     module: "transforms.wasm"
-//!     # Extra config keys are passed to WASM module
-//!     retry_count: 3
 //! ```
 
 const std = @import("std");
@@ -326,11 +319,11 @@ pub const SinkSpec = struct {
 
 /// Specification for an operator in the pipeline.
 pub const OperatorSpec = struct {
-    /// Operator type (e.g., "filter", "map", "flatmap", "keyby", "passthrough", "wasm")
+    /// Operator type (e.g., "filter", "map", "flatmap", "keyby", "passthrough")
     type_name: []const u8,
     /// Operator name (e.g., "positive-filter", "transform")
     name: []const u8,
-    /// WASM module path (relative or absolute). Null for built-in operators.
+    /// Module path (reserved for future use). Null for built-in operators.
     module: ?[]const u8 = null,
     /// Declarative configuration for native operators.
     /// Keys are operator-specific (e.g., "condition", "key_expression").

@@ -13,13 +13,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // zware: WebAssembly runtime (for WASM actions)
-    const zware_dep = b.dependency("zware", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zware_module = zware_dep.module("zware");
-
     // ── Version (git describe) ──
 
     const build_options = b.addOptions();
@@ -41,7 +34,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("stdx", stdx_module);
-    exe.root_module.addImport("zware", zware_module);
     exe.root_module.addOptions("build_options", build_options);
     exe.linkLibC();
 
@@ -82,7 +74,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     src_module.addImport("stdx", stdx_module);
-    src_module.addImport("zware", zware_module);
     src_module.addOptions("build_options", build_options);
 
     // ── Test Filter ──
@@ -101,7 +92,6 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addImport("src", src_module);
     unit_tests.root_module.addImport("stdx", stdx_module);
-    unit_tests.root_module.addImport("zware", zware_module);
     unit_tests.root_module.addOptions("build_options", build_options);
     unit_tests.linkLibC();
 
@@ -119,7 +109,6 @@ pub fn build(b: *std.Build) void {
     });
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
-    e2e_tests.root_module.addImport("zware", zware_module);
     e2e_tests.root_module.addOptions("build_options", build_options);
     e2e_tests.linkLibC();
 
@@ -138,7 +127,6 @@ pub fn build(b: *std.Build) void {
     });
     integration_tests.root_module.addImport("src", src_module);
     integration_tests.root_module.addImport("stdx", stdx_module);
-    integration_tests.root_module.addImport("zware", zware_module);
     integration_tests.root_module.addOptions("build_options", build_options);
     integration_tests.linkLibC();
 
