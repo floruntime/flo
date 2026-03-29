@@ -31,6 +31,7 @@ const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const generateNodeId = @import("../raft/network.zig").generateNodeId;
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+const KVHandler = @import("../kv/handler.zig").KVHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
@@ -187,6 +188,9 @@ pub const Runtime = struct {
     /// Cross-shard inbox array — allocated during wirePeerInboxes, freed on deinit.
     peer_inboxes_slice: ?[]*Inbox,
 
+    /// Cross-shard KV handler array — allocated during wirePeerKvHandlers, freed on deinit.
+    peer_kv_handlers_slice: ?[]const *KVHandler,
+
     /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
     peer_shards_slice: ?[]*Shard,
 
@@ -210,6 +214,7 @@ pub const Runtime = struct {
             .metrics_registry = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .peer_stream_handlers_slice = null,
+            .peer_kv_handlers_slice = null,
             .peer_inboxes_slice = null,
             .peer_shards_slice = null,
         };
@@ -267,6 +272,12 @@ pub const Runtime = struct {
         if (self.peer_stream_handlers_slice) |s| {
             self.allocator.free(s);
             self.peer_stream_handlers_slice = null;
+        }
+
+        // Clean up peer KV handler array
+        if (self.peer_kv_handlers_slice) |s| {
+            self.allocator.free(s);
+            self.peer_kv_handlers_slice = null;
         }
 
         // Clean up peer inbox array
@@ -381,6 +392,9 @@ pub const Runtime = struct {
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
         try self.wirePeerStreamHandlers(shards);
+
+        // 2.555 Wire cross-shard KV handler references for processing KV lookups.
+        try self.wirePeerKvHandlers(shards);
 
         // 2.56 Wire cross-shard inbox references for inbox messaging.
         try self.wirePeerInboxes(shards);
@@ -512,6 +526,21 @@ pub const Runtime = struct {
         const shard_count = shards[0].router.shard_count;
         for (0..n) |i| {
             shards[i].processing_handler.setPeerStreamHandlers(handlers, partition_count, shard_count);
+        }
+    }
+
+    /// Wire cross-shard KV handler references so processing pipelines'
+    /// KV lookup operators can find keys on any shard.
+    fn wirePeerKvHandlers(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const handlers = try self.allocator.alloc(*KVHandler, n);
+        for (0..n) |i| {
+            handlers[i] = shards[i].kv_handler;
+        }
+        self.peer_kv_handlers_slice = handlers;
+
+        for (0..n) |i| {
+            shards[i].processing_handler.setPeerKvHandlers(handlers);
         }
     }
 

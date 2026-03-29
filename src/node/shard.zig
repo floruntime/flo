@@ -87,6 +87,7 @@ const Forwarder = @import("../cluster/forwarder.zig").Forwarder;
 const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
 const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const NodeId = @import("../raft/node.zig").NodeId;
+pub const run_id_mod = @import("run_id.zig");
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -215,6 +216,9 @@ pub const Shard = struct {
     /// Replay registry — maps EntryType → handler replay callback.
     /// Used during segment replay and for follower entry application.
     replay_registry: ReplayRegistry,
+
+    /// Self-routing run ID generator (per-shard, single-threaded).
+    run_id_gen: run_id_mod.Generator,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -476,6 +480,7 @@ pub const Shard = struct {
             .partition_table = null,
             .coordinator = null,
             .replay_registry = replay_registry,
+            .run_id_gen = .{},
         };
     }
 
@@ -671,64 +676,42 @@ pub const Shard = struct {
 
     // ─── Dispatch ────────────────────────────────────────────────────────
 
-    /// Dispatch a parsed request through the Dispatcher.
-    /// Walk opcodes (list/scan) are routed to executeWalk() for cross-shard
-    /// aggregation when walk contexts are wired (multi-shard mode).
-    /// In cluster mode (partition_table != null), routable requests are checked
-    /// against the partition table and forwarded to remote nodes when needed.
+    /// Dispatch a parsed request: resolve the routing target, then forward
+    /// or handle locally. Walk opcodes (list/scan) aggregate across shards
+    /// unless the pre-route narrows to a single partition.
     pub fn dispatchRequest(self: *Shard, conn: *Connection, req: proto.Request) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
 
-        // Check if this is a walk opcode with contexts wired
         const op = req.header.op_code;
+
+        // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
-            // If there's also a pre-route function, check if it routes to a single shard.
-            // This supports dual-path opcodes like kv_scan: prefix → single shard,
-            // no prefix → multi-shard walk.
-            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
-                if (pre_route_fn(req) != null) {
-                    // Pre-route returned a hash → single-shard dispatch
-                    self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
-                    return;
-                }
+            const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
+            if (!has_single_target) {
+                self.executeWalk(conn, req);
+                return;
             }
-            self.executeWalk(conn, req);
-        } else if (self.partition_table) |pt| {
-            // Cluster mode: check if the request should be forwarded to another node
-            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
-                if (pre_route_fn(req)) |hash| {
-                    const ns_hash = node_router.namespaceHash(req.namespace);
-                    const target = self.router.routeCluster(hash, ns_hash, pt);
-                    switch (target) {
-                        .remote => |remote| {
-                            self.forwardToRemote(conn, req, remote.node_id);
-                            return;
-                        },
-                        .local, .shard => {},
-                    }
-                }
-            }
-            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
-        } else {
-            // Single-node mode: check pre_route for cross-shard forwarding.
-            // If the opcode has a pre_route function that returns a hash,
-            // and the hash maps to a different shard, forward the request
-            // to the target shard's handlers (runs on our thread).
-            if (self.dispatcher.pre_route[op]) |pre_route_fn| {
-                if (pre_route_fn(req)) |hash| {
-                    const target = self.router.route(hash);
-                    switch (target) {
-                        .shard => |s| {
-                            self.forwardToShard(s.shard_id, conn, req);
-                            return;
-                        },
-                        .local, .remote => {},
-                    }
-                }
-            }
-            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
         }
+
+        // Route to the correct shard/node, or dispatch locally.
+        switch (self.resolveTarget(op, req)) {
+            .local => self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req),
+            .shard => |s| self.forwardToShard(s.shard_id, conn, req),
+            .remote => |r| self.forwardToRemote(conn, req, r.node_id),
+        }
+    }
+
+    /// Pure routing decision: pre-route → partition table (cluster) or
+    /// local shard mapping (single-node). No side effects.
+    fn resolveTarget(self: *Shard, op: u8, req: proto.Request) node_router.RouteTarget {
+        const hash = if (self.dispatcher.pre_route[op]) |f| f(req) orelse return .{ .local = .{ .partition_id = 0 } } else return .{ .local = .{ .partition_id = 0 } };
+
+        if (self.partition_table) |pt| {
+            const ns_hash = node_router.namespaceHash(req.namespace);
+            return self.router.routeCluster(hash, ns_hash, pt);
+        }
+        return self.router.route(hash);
     }
 
     /// Forward a request to a remote node via the cluster forwarder.
@@ -894,48 +877,41 @@ pub const Shard = struct {
 
     fn handleInboxMessage(self: *Shard, msg: InboxMessage) void {
         switch (msg.tag) {
-            .shutdown => {
-                self.running = false;
-            },
-            .raft_message => {
-                // Received a replicated entry from a peer node.
-                // Deserialize and apply to ALL projections via partition.apply().
-                if (msg.payload_ptr) |ptr| {
-                    const data: [*]u8 = @ptrCast(ptr);
-                    const len = msg.payload_len;
-                    if (len > 0) {
-                        const payload = data[0..len];
-                        // Try to deserialize as a UAL entry
-                        if (entry_mod.Entry.deserialize(payload)) |entry| {
-                            // Apply to partition (UAL + projection router: KV, Queue, TS)
-                            const ual_index = self.defaultPartition().apply(&entry) catch 0;
-
-                            // Stream entries need manual offset tracking (router routes to .none)
-                            const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
-                            if (etype == .stream_append) {
-                                if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                                    const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                                    _ = self.defaultPartition().stream.appendToStream(name_hash, ual_index, 0) catch {};
-                                    self.defaultPartition().stream.registerStream(cmd.key) catch {};
-                                }
-                            }
-
-                            // Dispatch to handler replay (workflow, actions, namespace, etc.)
-                            _ = self.replay_registry.dispatch(&entry);
-                        }
-                        // Free the duplicated payload
-                        self.allocator.free(payload);
-                    }
-                }
-            },
-            else => {
-                // Cross-shard action invocation: wake action_await waiters
-                if (msg.tag == .action_invoke) {
-                    self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self));
-                }
-                // Other message types will be handled in later phases
-            },
+            .shutdown => self.running = false,
+            .raft_message => self.applyReplicatedEntry(msg),
+            .action_invoke => self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self)),
+            else => {},
         }
+    }
+
+    /// Apply a replicated UAL entry received from a peer node.
+    /// Deserializes the payload, applies to all projections, handles
+    /// stream offset tracking (router routes stream entries to .none),
+    /// and dispatches to handler replay (workflow, actions, namespace, etc.).
+    fn applyReplicatedEntry(self: *Shard, msg: InboxMessage) void {
+        const ptr = msg.payload_ptr orelse return;
+        const data: [*]u8 = @ptrCast(ptr);
+        if (msg.payload_len == 0) return;
+        const payload = data[0..msg.payload_len];
+        defer self.allocator.free(payload);
+
+        const entry = entry_mod.Entry.deserialize(payload) orelse return;
+        const partition = self.defaultPartition();
+
+        // Apply to partition (UAL + projection router: KV, Queue, TS)
+        const ual_index = partition.apply(&entry) catch 0;
+
+        // Stream entries need manual offset tracking (router routes to .none)
+        if (@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type)) == .stream_append) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
+                _ = partition.stream.appendToStream(name_hash, ual_index, 0) catch {};
+                partition.stream.registerStream(cmd.key) catch {};
+            }
+        }
+
+        // Dispatch to handler replay (workflow, actions, namespace, etc.)
+        _ = self.replay_registry.dispatch(&entry);
     }
 
     // ─── Event loop ──────────────────────────────────────────────────────
@@ -1326,30 +1302,11 @@ pub const Shard = struct {
     /// Free heap-allocated fields from a translated RESP command.
     /// Only frees key/value if they were heap-allocated (non-empty, since
     /// translateCommand uses allocator.dupe for non-empty strings).
+    /// Free heap-allocated fields from a translated RESP command.
+    /// translateCommand uses allocator.dupe — non-empty slices are heap-owned.
     fn freeRespCommand(self: *Shard, cmd: resp_mod.RespCommand) void {
-        // translateCommand allocates via dupe — these are heap slices.
-        // Empty strings are literal "" (not heap allocated).
-        switch (cmd.opcode) {
-            .ping => {}, // key="" value="" — literals
-            .kv_get, .kv_delete, .queue_dequeue => {
-                // key is duped, value is literal ""
-                if (cmd.key.len > 0) self.allocator.free(cmd.key);
-            },
-            .kv_put, .stream_append, .queue_enqueue => {
-                // Both key and value are duped
-                if (cmd.key.len > 0) self.allocator.free(cmd.key);
-                if (cmd.value.len > 0) self.allocator.free(cmd.value);
-            },
-            .stream_read => {
-                // key is duped, value is literal ""
-                if (cmd.key.len > 0) self.allocator.free(cmd.key);
-            },
-            else => {
-                // Conservative: try to free both if non-empty
-                if (cmd.key.len > 0) self.allocator.free(cmd.key);
-                if (cmd.value.len > 0) self.allocator.free(cmd.value);
-            },
-        }
+        if (cmd.key.len > 0) self.allocator.free(cmd.key);
+        if (cmd.value.len > 0) self.allocator.free(cmd.value);
     }
 
     /// Flush pending write data from a connection to the socket.
