@@ -202,7 +202,7 @@ test "e2e/ts: read with no data returns no data" {
     );
 }
 
-test "e2e/ts: read with --format json" {
+test "e2e/ts: read with --output json" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -214,7 +214,7 @@ test "e2e/ts: read with --format json" {
 
     var result = try ctx.cli.run(&.{
         "ts",     "read",          "json_read_test", "--tags", "env=prod",
-        "--from", "1708700000000", "--format",       "json",   "--limit",
+        "--from", "1708700000000", "--output",       "json",   "--limit",
         "10",
     });
     defer result.deinit();
@@ -224,7 +224,7 @@ test "e2e/ts: read with --format json" {
     try testing.expect(result.contains("[") or result.contains("{"));
 }
 
-test "e2e/ts: read with --format raw" {
+test "e2e/ts: read with --output raw" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -236,7 +236,7 @@ test "e2e/ts: read with --format raw" {
 
     var result = try ctx.cli.run(&.{
         "ts",     "read",          "raw_read_test", "--tags", "host=a",
-        "--from", "1708700000000", "--format",      "raw",    "--limit",
+        "--from", "1708700000000", "--output",      "raw",    "--limit",
         "10",
     });
     defer result.deinit();
@@ -296,7 +296,7 @@ test "e2e/ts: read with time range" {
     // Read only the middle range
     var result = try ctx.cli.run(&.{
         "ts",     "read",          "range_test", "--tags",        "host=z",
-        "--from", "1708700150000", "--to",       "1708700250000", "--format",
+        "--from", "1708700150000", "--to",       "1708700250000", "--output",
         "raw",    "--limit",       "100",
     });
     defer result.deinit();
@@ -445,7 +445,7 @@ test "e2e/ts: query json format" {
     var result = try ctx.cli.run(&.{
         "ts",     "query",         "query_json", "--tags", "host=a",
         "--from", "1708700000000", "--window",   "1m",     "--agg",
-        "avg",    "--format",      "json",
+        "avg",    "--output",      "json",
     });
     defer result.deinit();
 
@@ -528,7 +528,7 @@ test "e2e/ts: list json format" {
 
     try ctx.exec(&.{ "ts", "write", "json_list_cpu", "--tags", "host=a", "--value", "50.0" });
 
-    var result = try ctx.cli.run(&.{ "ts", "list", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "ts", "list", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -773,7 +773,7 @@ test "e2e/ts: read filters by tag" {
     var result = try ctx.cli.run(&.{
         "ts",            "read",        "tag_filter_test",
         "--tags",        "host=web-01", "--from",
-        "1708700000000", "--format",    "raw",
+        "1708700000000", "--output",    "raw",
         "--limit",       "100",
     });
     defer result.deinit();
@@ -824,7 +824,7 @@ test "e2e/ts: multiple writes to same series" {
     // Read them back
     var result = try ctx.cli.run(&.{
         "ts",     "read",          "multi_write_test", "--tags", "host=srv-1",
-        "--from", "1708700000000", "--limit",          "20",     "--format",
+        "--from", "1708700000000", "--limit",          "20",     "--output",
         "raw",
     });
     defer result.deinit();
@@ -863,7 +863,7 @@ test "e2e/ts: data is isolated between namespaces" {
     // Read from namespace A
     var result_a = try ctx.cli.run(&.{
         "ts",     "read",          "ns_test_cpu", "--tags", "host=a",
-        "--from", "1708700000000", "--format",    "raw",    "--limit",
+        "--from", "1708700000000", "--output",    "raw",    "--limit",
         "10",     "-n",            "ts_ns_a",
     });
     defer result_a.deinit();
@@ -872,7 +872,7 @@ test "e2e/ts: data is isolated between namespaces" {
     // Read from namespace B
     var result_b = try ctx.cli.run(&.{
         "ts",     "read",          "ns_test_cpu", "--tags", "host=a",
-        "--from", "1708700000000", "--format",    "raw",    "--limit",
+        "--from", "1708700000000", "--output",    "raw",    "--limit",
         "10",     "-n",            "ts_ns_b",
     });
     defer result_b.deinit();
