@@ -30,17 +30,28 @@ export interface RunListEntry {
   wait_type: string | null;
   parent_run_id: string | null;
   terminal_name: string | null;
+  triggered_by?: string; // "manual" | "schedule" | "stream"
 }
 
 /** Status result from GET /runs/:run_id */
 export interface RunStatusResult {
   run_id: string;
   status: string;
+  workflow?: string;
+  version?: string;
   current_step: string | null;
-  output?: string | null;
+  output?: Record<string, unknown> | null;
   error_message?: string | null;
   started_at_ms?: number;
+  completed_at?: number;
   updated_at_ms?: number;
+  duration_ms?: number;
+  input?: unknown;
+  step_results?: Record<string, { outcome: string; output: unknown }>;
+  triggered_by?: string;
+  pending_signals?: number;
+  history_event_count?: number;
+  search_attributes?: Record<string, unknown>;
 }
 
 /** History event from GET /runs/:run_id/history */
@@ -146,6 +157,7 @@ export async function listRuns(
   params?: {
     status?: string;
     workflow?: string;
+    search?: string;
     limit?: number;
     cursor?: string;
   },
@@ -155,6 +167,7 @@ export async function listRuns(
     namespace,
     status: params?.status,
     workflow: params?.workflow,
+    search: params?.search,
     limit: params?.limit,
     cursor: params?.cursor,
   });

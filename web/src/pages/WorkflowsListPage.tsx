@@ -37,6 +37,7 @@ import type { WorkflowRunStatus, WorkflowRun, SavedView } from '../lib/workflow-
 import { useWorkflowRuns, useWorkflowDefinitions } from '../lib/workflow-hooks';
 import type { DefinitionListEntry } from '../lib/workflow-api';
 import * as workflowApi from '../lib/workflow-api';
+import { useNamespace } from '../lib/NamespaceContext';
 
 // =============================================================================
 // Shared helpers
@@ -355,6 +356,8 @@ function RunsTab({
 }) {
   const [sortKey, setSortKey] = useState<SortField>('started_at');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const PAGE_SIZE = 50;
+  const [page, setPage] = useState(0);
 
   // Updated periodically to keep time-range filters fresh without calling Date.now() during render
   const [now, setNow] = useState(() => Date.now());
@@ -413,6 +416,15 @@ function RunsTab({
     return filtered;
   }, [runs, filters, activeViewId, allViews, now, sortKey, sortDir]);
 
+  // Reset page when filters or sort changes
+  useEffect(() => { setPage(0); }, [filters, sortKey, sortDir, activeViewId]);
+
+  const totalPages = Math.ceil(filteredRuns.length / PAGE_SIZE);
+  const pagedRuns = useMemo(
+    () => filteredRuns.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+    [filteredRuns, page],
+  );
+
   const columns: TableColumn<WorkflowRun>[] = [
     {
       key: 'run_id', label: 'Run ID', width: '18%',
@@ -439,12 +451,26 @@ function RunsTab({
           <GitGraph className="w-3.5 h-3.5 text-primary shrink-0" />
           <span className="font-medium text-text-primary">{run.workflow_name}</span>
           <span className="text-[10px] text-text-secondary">v{run.workflow_version}</span>
+          {run.triggered_by === 'schedule' && (
+            <span title="Scheduled run" className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 font-medium">
+              <CalendarClock className="w-3 h-3" /> schedule
+            </span>
+          )}
+          {run.triggered_by === 'stream' && (
+            <span title="Stream-triggered run" className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 font-medium">
+              <Radio className="w-3 h-3" /> trigger
+            </span>
+          )}
         </div>
       ),
     },
     {
       key: 'status', label: 'Status', width: '12%', sortable: true,
-      renderCell: (run) => <StatusBadge status={run.status} />,
+      renderCell: (run) => (
+        <div className="flex items-center gap-1.5">
+          <StatusBadge status={run.status} />
+        </div>
+      ),
     },
     {
       key: 'current_step', label: 'Current Step',
@@ -503,7 +529,7 @@ function RunsTab({
       </div>
       <DataTable
         columns={columns}
-        rows={filteredRuns}
+        rows={pagedRuns}
         rowKey={r => r.run_id}
         sortKey={sortKey}
         sortDir={sortDir}
@@ -516,6 +542,55 @@ function RunsTab({
           </div>
         }
       />
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between pt-2">
+          <span className="text-xs text-text-secondary">
+            Showing {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, filteredRuns.length)} of {filteredRuns.length}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              disabled={page === 0}
+              onClick={() => setPage(p => p - 1)}
+              className="px-2.5 py-1 text-xs rounded border border-surface-border bg-surface hover:bg-surface-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Previous
+            </button>
+            {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+              let pageNum: number;
+              if (totalPages <= 7) {
+                pageNum = i;
+              } else if (page < 3) {
+                pageNum = i;
+              } else if (page > totalPages - 4) {
+                pageNum = totalPages - 7 + i;
+              } else {
+                pageNum = page - 3 + i;
+              }
+              return (
+                <button
+                  key={pageNum}
+                  onClick={() => setPage(pageNum)}
+                  className={cn(
+                    'w-7 h-7 text-xs rounded transition-colors',
+                    pageNum === page
+                      ? 'bg-primary text-white font-medium'
+                      : 'hover:bg-surface-hover text-text-secondary'
+                  )}
+                >
+                  {pageNum + 1}
+                </button>
+              );
+            })}
+            <button
+              disabled={page >= totalPages - 1}
+              onClick={() => setPage(p => p + 1)}
+              className="px-2.5 py-1 text-xs rounded border border-surface-border bg-surface hover:bg-surface-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -658,8 +733,13 @@ export function WorkflowsListPage() {
   });
 
   // Fetch runs and definitions from the real API (poll runs every 10s)
-  const { runs, error: runsError, refetch: refetchRuns } = useWorkflowRuns({ pollInterval: 10000 });
-  const { definitions } = useWorkflowDefinitions();
+  const { selected: namespace } = useNamespace();
+  const { runs, error: runsError, refetch: refetchRuns } = useWorkflowRuns({
+    pollInterval: 10000,
+    search: filters.search || undefined,
+    limit: 500,
+  }, namespace);
+  const { definitions } = useWorkflowDefinitions(namespace);
 
   // Report current filters to layout so "Save View" captures the right state
   useEffect(() => {

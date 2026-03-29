@@ -8,6 +8,7 @@ import { Card, CardContent } from "../components/ui/Card";
 import { api, type ActionRunInfo, type WorkerInfo } from "../lib/api";
 import { useApi, LoadingState, ErrorState, EmptyState } from "../lib/useApi";
 import { cn } from "../lib/utils";
+import { useNamespace } from "../lib/NamespaceContext";
 
 function formatTimeAgo(ms: number): string {
     if (ms <= 0) return "—";
@@ -93,7 +94,17 @@ function RunsTable({ runs }: { runs: ActionRunInfo[] }) {
                                         {run.run_id.length > 20 ? run.run_id.slice(0, 20) + "…" : run.run_id}
                                     </td>
                                     <td className="px-4 py-3 text-text-secondary text-xs">
-                                        {run.source || "direct"}
+                                        {run.source === 'workflow' && run.caller_run_id ? (
+                                            <Link
+                                                to={`/workflows/runs/${run.caller_run_id}`}
+                                                className="text-accent hover:underline"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                {run.caller_workflow || 'workflow'}
+                                            </Link>
+                                        ) : (
+                                            run.source || "direct"
+                                        )}
                                     </td>
                                     <td className="px-4 py-3 text-text-secondary text-xs font-mono">
                                         {run.worker_id
@@ -190,9 +201,10 @@ function WorkersPanel({ workers }: { workers: WorkerInfo[] }) {
 
 export function ActionDetailPage() {
     const { actionName } = useParams<{ actionName: string }>();
+    const { selected: namespace } = useNamespace();
     const { data: action, loading, error, refetch } = useApi(
-        () => api.getActionDetail(actionName!),
-        [actionName],
+        () => api.getActionDetail(actionName!, namespace),
+        [actionName, namespace],
         5000
     );
     const [invokeResult, setInvokeResult] = useState<string | null>(null);
@@ -232,7 +244,7 @@ export function ActionDetailPage() {
         setInvoking(true);
         setInvokeError(null);
         try {
-            const result = await api.invokeAction(actionName, invokeInput);
+            const result = await api.invokeAction(actionName, invokeInput, namespace);
             setInvokeResult(result.run_id);
             setTimeout(() => setInvokeResult(null), 8000);
             setShowInvokeDialog(false);

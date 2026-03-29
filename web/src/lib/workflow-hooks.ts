@@ -60,10 +60,18 @@ function mapRunEntry(e: RunListEntry): WorkflowRun {
 function mapRunStatus(s: RunStatusResult): Partial<WorkflowRun> {
   return {
     run_id: s.run_id,
+    workflow_name: s.workflow,
+    workflow_version: s.version,
     status: s.status as WorkflowRunStatus,
     current_step: s.current_step,
     error: s.error_message ?? undefined,
     started_at: s.started_at_ms,
+    completed_at: s.completed_at ?? undefined,
+    duration_ms: s.duration_ms ?? undefined,
+    input: s.input as Record<string, unknown> | undefined,
+    output: s.output as Record<string, unknown> | undefined,
+    step_results: s.step_results as WorkflowRun['step_results'],
+    search_attributes: s.search_attributes,
   };
 }
 
@@ -81,20 +89,23 @@ export interface UseWorkflowRunsResult {
 export function useWorkflowRuns(params?: {
   status?: string;
   workflow?: string;
+  search?: string;
   limit?: number;
   pollInterval?: number;
-}): UseWorkflowRunsResult {
+}, namespace?: string): UseWorkflowRunsResult {
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  const nsRef = useRef(namespace);
+  nsRef.current = namespace;
 
   const fetch_ = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const entries = await api.listRuns(paramsRef.current);
+      const entries = await api.listRuns(paramsRef.current, nsRef.current);
       setRuns(Array.isArray(entries) ? entries.map(mapRunEntry) : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -102,6 +113,14 @@ export function useWorkflowRuns(params?: {
       setLoading(false);
     }
   }, []);
+
+  // Debounced search: refetch when search term stabilises (300ms)
+  const searchTerm = params?.search;
+  useEffect(() => {
+    const id = setTimeout(() => fetch_(), 300);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTerm]);
 
   useEffect(() => { fetch_(); }, [fetch_]);
   usePoll(fetch_, params?.pollInterval ?? null);
@@ -126,7 +145,7 @@ const TERMINAL_STATUSES = new Set([
   'completed', 'failed', 'cancelled', 'timed_out',
 ]);
 
-export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult {
+export function useWorkflowRun(runId: string | undefined, namespace?: string): UseWorkflowRunResult {
   const [run, setRun] = useState<WorkflowRun | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -136,6 +155,8 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
   // so the SSE effect doesn't tear down and re-create the connection on every poll.
   const [initialLoaded, setInitialLoaded] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+  const nsRef = useRef(namespace);
+  nsRef.current = namespace;
 
   // Reset initialLoaded whenever the run we're watching changes.
   useEffect(() => { setInitialLoaded(false); }, [runId]);
@@ -147,8 +168,8 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
     setError(null);
     try {
       const [status, history] = await Promise.all([
-        api.getRunStatus(runId),
-        api.getRunHistory(runId).catch(() => []),
+        api.getRunStatus(runId, nsRef.current),
+        api.getRunHistory(runId, 100, nsRef.current).catch(() => []),
       ]);
 
       const mapped = mapRunStatus(status);
@@ -156,11 +177,17 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
         run_id: status.run_id,
         workflow_name: mapped.workflow_name ?? runId,
         workflow_version: mapped.workflow_version ?? '',
-        namespace: 'default',
+        namespace: nsRef.current ?? 'default',
         status: mapped.status ?? 'pending',
         started_at: mapped.started_at ?? Date.now(),
+        completed_at: mapped.completed_at,
+        duration_ms: mapped.duration_ms,
         current_step: mapped.current_step,
         error: mapped.error,
+        input: mapped.input,
+        output: mapped.output,
+        step_results: mapped.step_results,
+        search_attributes: mapped.search_attributes,
         history: history.map((h, i) => ({
           event_id: i,
           event_type: h.event_type,
@@ -195,7 +222,7 @@ export function useWorkflowRun(runId: string | undefined): UseWorkflowRunResult 
     // Don't connect until initial load completes (avoid racing)
     if (!initialLoaded) return;
 
-    const ns = 'default';
+    const ns = nsRef.current ?? 'default';
     const url = `${SSE_BASE}/runs/${encodeURIComponent(runId)}/watch?namespace=${encodeURIComponent(ns)}`;
     const es = new EventSource(url);
     esRef.current = es;
@@ -281,7 +308,7 @@ export interface UseWorkflowDefinitionsResult {
   refetch: () => void;
 }
 
-export function useWorkflowDefinitions(): UseWorkflowDefinitionsResult {
+export function useWorkflowDefinitions(namespace?: string): UseWorkflowDefinitionsResult {
   const [definitions, setDefinitions] = useState<DefinitionListEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -290,7 +317,7 @@ export function useWorkflowDefinitions(): UseWorkflowDefinitionsResult {
     setLoading(true);
     setError(null);
     try {
-      const entries = await api.listDefinitions();
+      const entries = await api.listDefinitions(namespace);
       setDefinitions(Array.isArray(entries) ? entries : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

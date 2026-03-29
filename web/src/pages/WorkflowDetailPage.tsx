@@ -47,6 +47,7 @@ import type {
 import { useWorkflowRun, useWorkflowRuns, useWorkflowDefinitions } from '../lib/workflow-hooks';
 import type { DefinitionListEntry } from '../lib/workflow-api';
 import * as workflowApi from '../lib/workflow-api';
+import { useNamespace } from '../lib/NamespaceContext';
 
 // =============================================================================
 // Hooks
@@ -163,8 +164,10 @@ function formatTimestamp(ts: number): string {
   });
 }
 
-function formatTimeAgo(ts: number): string {
+function formatTimeAgo(ts: number | undefined): string {
+  if (ts == null || isNaN(ts)) return 'just now';
   const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
   if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
@@ -182,10 +185,20 @@ function copyToClipboard(text: string) {
 function buildEventGroups(events: HistoryEvent[]): EventGroup[] {
   const groups: EventGroup[] = [];
   const stepGroups: Record<string, EventGroup> = {};
+  // Track the current step name so non-step events can be attached to the correct group.
+  // The server sends detail_owned as step_name for all events, but only step_started/
+  // step_completed/step_failed/step_retry carry an actual step name — others carry
+  // outcomes ("success"), signal types ("approval_decision"), or terminals ("flo.Failed").
+  let currentStepName: string | null = null;
+
+  // Event types whose step_name is the actual workflow step
+  const STEP_EVENT_TYPES = new Set([
+    'step_started', 'step_completed', 'step_failed', 'step_retry',
+  ]);
 
   for (const evt of events) {
-    // Workflow lifecycle events are standalone groups
-    if (evt.event_type === 'workflow_started') {
+    // Workflow lifecycle events are standalone groups (filtered from timeline)
+    if (evt.event_type === 'workflow_started' || evt.event_type === 'schedule_started' || evt.event_type === 'trigger_started') {
       groups.push({
         id: 'workflow:start',
         category: 'workflow',
@@ -227,9 +240,25 @@ function buildEventGroups(events: HistoryEvent[]): EventGroup[] {
       continue;
     }
 
-    // Step events are grouped by step_name
-    if (evt.step_name) {
-      const key = evt.step_name;
+    // Determine the group key: use step_name for true step events,
+    // otherwise attach to the current step group.
+    let key: string | null = null;
+    if (STEP_EVENT_TYPES.has(evt.event_type) && evt.step_name) {
+      key = evt.step_name;
+      currentStepName = key;
+    } else if (evt.event_type === 'waiting_for_signal' || evt.event_type === 'signal_received' ||
+               evt.event_type === 'signal_matched' || evt.event_type === 'signal_timeout' ||
+               evt.event_type === 'action_completed' || evt.event_type === 'awaiting_action' ||
+               evt.event_type === 'action_not_found' || evt.event_type === 'action_disabled') {
+      // These events use step_name for detail (outcome, signal type, etc.).
+      // Attach to the current step group instead.
+      key = currentStepName;
+    } else if (evt.step_name) {
+      // Plan events, executor events, child workflow events, etc. — use step_name as-is
+      key = evt.step_name;
+    }
+
+    if (key) {
       if (!stepGroups[key]) {
         const category: EventGroupCategory = 'step';
         stepGroups[key] = {
@@ -813,7 +842,9 @@ function TimelineView({
   const containerRef = useRef<HTMLDivElement>(null);
 
   const filtered = useMemo(
-    () => groups.filter((g) => eventFilter.size === 0 || eventFilter.has(g.category)),
+    () => groups.filter((g) =>
+      g.category !== 'workflow' && (eventFilter.size === 0 || eventFilter.has(g.category))
+    ),
     [groups, eventFilter]
   );
 
@@ -1528,55 +1559,115 @@ function RelationshipsTab({ run, allRuns }: { run: WorkflowRun; allRuns: Workflo
 // Metadata Tab (search attributes, input/output, step results)
 // =============================================================================
 
-function MetaJsonPanel({
-  title,
-  data,
-  emptyMessage,
-}: {
-  title: string;
-  data: unknown;
-  emptyMessage?: string;
-}) {
+function JsonBlock({ data, emptyText }: { data: unknown; emptyText: string }) {
   if (!data || (typeof data === 'object' && Object.keys(data as object).length === 0)) {
-    return (
-      <div className="text-center py-6 text-text-secondary">
-        <p className="text-sm">{emptyMessage || 'No data'}</p>
-      </div>
-    );
+    return <p className="text-xs text-text-secondary italic py-3">{emptyText}</p>;
   }
   return (
-    <div>
-      <div className="flex items-center justify-between mb-2">
-        <h4 className="text-xs uppercase tracking-wider text-text-secondary font-medium">
-          {title}
-        </h4>
-        <button
-          onClick={() => copyToClipboard(JSON.stringify(data, null, 2))}
-          className="text-text-secondary hover:text-text-primary transition-colors"
-          title="Copy to clipboard"
-        >
-          <Copy className="w-3.5 h-3.5" />
-        </button>
-      </div>
-      <pre className="text-xs bg-background rounded-md p-4 overflow-x-auto text-text-secondary font-mono border border-surface-border leading-relaxed">
-        {JSON.stringify(data, null, 2)}
-      </pre>
-    </div>
+    <pre className="text-xs bg-background rounded-md p-3 overflow-x-auto text-text-secondary font-mono border border-surface-border/60 leading-relaxed">
+      {typeof data === 'string' ? data : JSON.stringify(data, null, 2)}
+    </pre>
   );
 }
 
 function MetadataTab({ run }: { run: WorkflowRun }) {
+  const stepEntries = Object.entries(run.step_results || {});
+  const [expandedSteps, setExpandedSteps] = useState<Set<string>>(() => new Set(stepEntries.map(([k]) => k)));
+  const toggleStep = (name: string) =>
+    setExpandedSteps((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      {/* Input / Output side-by-side */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <h4 className="text-[11px] uppercase tracking-wider text-text-secondary font-semibold">Input</h4>
+            {run.input && (
+              <button onClick={() => copyToClipboard(JSON.stringify(run.input, null, 2))} className="text-text-secondary hover:text-text-primary transition-colors" title="Copy">
+                <Copy className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+          <JsonBlock data={run.input} emptyText="No input" />
+        </div>
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <h4 className="text-[11px] uppercase tracking-wider text-text-secondary font-semibold">Output</h4>
+            {run.output && (
+              <button onClick={() => copyToClipboard(JSON.stringify(run.output, null, 2))} className="text-text-secondary hover:text-text-primary transition-colors" title="Copy">
+                <Copy className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+          <JsonBlock
+            data={run.output}
+            emptyText={
+              run.status === 'running' || run.status === 'waiting'
+                ? 'Awaiting completion…'
+                : 'No output'
+            }
+          />
+        </div>
+      </div>
+
+      {/* Step Results */}
+      {stepEntries.length > 0 && (
+        <div>
+          <h4 className="text-[11px] uppercase tracking-wider text-text-secondary font-semibold mb-2 flex items-center gap-1.5">
+            <Zap className="w-3 h-3" /> Step Results
+            <span className="text-text-secondary/60 font-normal">({stepEntries.length})</span>
+          </h4>
+          <div className="border border-surface-border rounded-md divide-y divide-surface-border/50 overflow-hidden">
+            {stepEntries.map(([stepName, result]) => {
+              const isSuccess = result.outcome === 'success' || result.outcome === 'received';
+              const isOpen = expandedSteps.has(stepName);
+              return (
+                <div key={stepName}>
+                  <button
+                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-surface-hover/50 transition-colors text-left"
+                    onClick={() => toggleStep(stepName)}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Zap className="w-3 h-3 text-primary shrink-0" />
+                      <span className="font-mono text-xs font-medium truncate">{stepName}</span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className={cn(
+                        'text-[10px] font-semibold px-1.5 py-0.5 rounded',
+                        isSuccess ? 'bg-success/10 text-success' : 'bg-error/10 text-error',
+                      )}>{result.outcome}</span>
+                      <ChevronDown className={cn('w-3 h-3 text-text-secondary transition-transform', isOpen && 'rotate-180')} />
+                    </div>
+                  </button>
+                  {isOpen && result.output != null && (
+                    <div className="px-3 pb-2">
+                      <pre className="text-xs bg-background rounded p-2.5 overflow-x-auto text-text-secondary font-mono border border-surface-border/40 leading-relaxed">
+                        {typeof result.output === 'string' ? result.output : JSON.stringify(result.output, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Search Attributes */}
       {run.search_attributes && Object.keys(run.search_attributes).length > 0 && (
         <div>
-          <h4 className="text-xs uppercase tracking-wider text-text-secondary font-medium mb-2 flex items-center gap-1.5">
+          <h4 className="text-[11px] uppercase tracking-wider text-text-secondary font-semibold mb-2 flex items-center gap-1.5">
             <Tag className="w-3 h-3" /> Search Attributes
           </h4>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
             {Object.entries(run.search_attributes).map(([key, value]) => (
-              <div key={key} className="bg-background rounded p-2 border border-surface-border">
+              <div key={key} className="bg-background rounded p-2 border border-surface-border/60">
                 <p className="text-[10px] text-text-secondary font-mono">{key}</p>
                 <p className="text-xs font-medium truncate">{String(value)}</p>
               </div>
@@ -1585,92 +1676,28 @@ function MetadataTab({ run }: { run: WorkflowRun }) {
         </div>
       )}
 
-      {/* Input */}
-      <MetaJsonPanel title="Input" data={run.input} emptyMessage="No input data" />
-
-      {/* Output */}
-      <MetaJsonPanel
-        title="Output"
-        data={run.output}
-        emptyMessage={
-          run.status === 'running' || run.status === 'waiting'
-            ? 'Workflow still in progress'
-            : 'No output'
-        }
-      />
-
-      {/* Step Results */}
-      {Object.keys(run.step_results || {}).length > 0 && (
-        <div>
-          <h4 className="text-xs uppercase tracking-wider text-text-secondary font-medium mb-2 flex items-center gap-1.5">
-            <Zap className="w-3 h-3" /> Step Results ({Object.keys(run.step_results || {}).length})
-          </h4>
-          <div className="space-y-2">
-            {Object.entries(run.step_results || {}).map(([stepName, result]) => (
-              <div key={stepName} className="border border-surface-border rounded-md p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <Zap className="w-3.5 h-3.5 text-primary" />
-                    <span className="font-mono text-sm font-medium">{stepName}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={cn(
-                        'text-[10px] font-medium px-2 py-0.5 rounded-full',
-                        result.outcome === 'success' || result.outcome === 'received'
-                          ? 'bg-success/10 text-success'
-                          : 'bg-error/10 text-error'
-                      )}
-                    >
-                      {result.outcome}
-                    </span>
-                    <span className="text-[10px] font-mono text-text-secondary">
-                      {formatDuration(result.duration_ms)}
-                    </span>
-                    {result.attempts > 1 && (
-                      <span className="text-[10px] text-text-secondary">
-                        {result.attempts} attempts
-                      </span>
-                    )}
-                  </div>
-                </div>
-                {result.output != null && (
-                  <pre className="text-xs bg-background rounded p-2 overflow-x-auto text-text-secondary font-mono border border-surface-border">
-                    {JSON.stringify(result.output, null, 2)}
-                  </pre>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Misc metadata */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div className="bg-background rounded p-2 border border-surface-border">
+      {/* Metadata grid */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <div className="bg-background rounded p-2 border border-surface-border/60">
           <p className="text-[10px] uppercase tracking-wider text-text-secondary">Namespace</p>
           <p className="text-xs font-medium font-mono">{run.namespace}</p>
         </div>
         {run.idempotency_key && (
-          <div className="bg-background rounded p-2 border border-surface-border">
-            <p className="text-[10px] uppercase tracking-wider text-text-secondary">
-              Idempotency Key
-            </p>
-            <p className="text-xs font-medium font-mono">{run.idempotency_key}</p>
+          <div className="bg-background rounded p-2 border border-surface-border/60">
+            <p className="text-[10px] uppercase tracking-wider text-text-secondary">Idempotency Key</p>
+            <p className="text-xs font-medium font-mono truncate">{run.idempotency_key}</p>
           </div>
         )}
-        <div className="bg-background rounded p-2 border border-surface-border">
-          <p className="text-[10px] uppercase tracking-wider text-text-secondary">
-            Pending Signals
-          </p>
+        <div className="bg-background rounded p-2 border border-surface-border/60">
+          <p className="text-[10px] uppercase tracking-wider text-text-secondary">Pending Signals</p>
           <p className="text-xs font-medium">{run.pending_signals ?? 0}</p>
         </div>
-        <div className="bg-background rounded p-2 border border-surface-border">
-          <p className="text-[10px] uppercase tracking-wider text-text-secondary">
-            Ancestry Depth
-          </p>
-          <p className="text-xs font-medium">{run.ancestry_depth}</p>
-        </div>
+        {run.triggered_by && (
+          <div className="bg-background rounded p-2 border border-surface-border/60">
+            <p className="text-[10px] uppercase tracking-wider text-text-secondary">Triggered By</p>
+            <p className="text-xs font-medium capitalize">{run.triggered_by}</p>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1812,9 +1839,10 @@ export function WorkflowDetailPage() {
   const [signalPayload, setSignalPayload] = useState('');
 
   // Fetch from real API
-  const { run: apiRun, loading, error, sseStatus, refetch } = useWorkflowRun(runId);
-  const { runs: allRuns } = useWorkflowRuns();
-  const { definitions } = useWorkflowDefinitions();
+  const { selected: namespace } = useNamespace();
+  const { run: apiRun, loading, error, sseStatus, refetch } = useWorkflowRun(runId, namespace);
+  const { runs: allRuns } = useWorkflowRuns(undefined, namespace);
+  const { definitions } = useWorkflowDefinitions(namespace);
 
   const handleCancel = useCallback(async () => {
     if (!runId) return;
@@ -1845,6 +1873,8 @@ export function WorkflowDetailPage() {
     try {
       const result = await workflowApi.startRun({
         workflow: apiRun.workflow_name,
+        version: apiRun.workflow_version || undefined,
+        input: apiRun.input ? JSON.stringify(apiRun.input) : undefined,
       }, apiRun.namespace);
       navigate(`/workflows/${result.run_id}`);
     } catch (e) {

@@ -90,7 +90,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.begin();
                     try obj.stringField("name", rec.name_owned);
                     try obj.stringField("namespace", rec.namespace_owned);
-                    try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
+                    try obj.stringField("type", "user");
                     try obj.stringField("owner", "");
                     try obj.stringField("description", "");
                     try obj.intField("version", @as(i64, @intCast(rec.version)));
@@ -100,10 +100,6 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
-                    if (rec.action_type == 1) {
-                        const wasm_size: u64 = if (rec.wasm_blob_owned) |b| b.len else 0;
-                        try obj.intField("wasm_module_size", @as(i64, @intCast(wasm_size)));
-                    }
                     {
                         var runs_obj = try obj.objectField("runs");
                         try runs_obj.begin();
@@ -154,7 +150,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 
     if (found_rec) |rec| {
         try obj.stringField("namespace", rec.namespace_owned);
-        try obj.stringField("type", if (rec.action_type == 1) "wasm" else "user");
+        try obj.stringField("type", "user");
         try obj.stringField("owner", "");
         try obj.stringField("description", "");
         try obj.intField("version", @as(i64, @intCast(rec.version)));
@@ -164,10 +160,6 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         try obj.intField("retry_delay_ms", 1000);
         try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
         try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-        if (rec.action_type == 1) {
-            const wasm_size: u64 = if (rec.wasm_blob_owned) |b| b.len else 0;
-            try obj.intField("wasm_module_size", @as(i64, @intCast(wasm_size)));
-        }
 
         // Count runs for this action across all shards
         var counts = h.RunCounts{};
@@ -268,6 +260,16 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
                             2 => "trigger",
                             else => "direct",
                         });
+                        if (run.caller_run_id_owned) |crid| {
+                            try robj.stringField("caller_run_id", crid);
+                        } else {
+                            try robj.nullField("caller_run_id");
+                        }
+                        if (run.caller_workflow_name_owned) |cwn| {
+                            try robj.stringField("caller_workflow", cwn);
+                        } else {
+                            try robj.nullField("caller_workflow");
+                        }
                         try robj.end();
                         rcount += 1;
                     }
@@ -298,39 +300,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
             try workers_arr.end();
         }
     } else {
-        try obj.stringField("namespace", "default");
-        try obj.stringField("type", "user");
-        try obj.stringField("owner", "");
-        try obj.stringField("description", "");
-        try obj.intField("version", 0);
-        try obj.boolField("enabled", false);
-        try obj.intField("timeout_ms", 0);
-        try obj.intField("max_retries", 0);
-        try obj.intField("retry_delay_ms", 0);
-        try obj.intField("created_at", 0);
-        try obj.intField("updated_at", 0);
-        {
-            var runs_obj = try obj.objectField("runs");
-            try runs_obj.begin();
-            try runs_obj.intField("total", 0);
-            try runs_obj.intField("pending", 0);
-            try runs_obj.intField("running", 0);
-            try runs_obj.intField("completed", 0);
-            try runs_obj.intField("failed", 0);
-            try runs_obj.intField("cancelled", 0);
-            try runs_obj.intField("timed_out", 0);
-            try runs_obj.end();
-        }
-        {
-            var recent_arr = try obj.arrayField("recent_runs");
-            try recent_arr.begin();
-            try recent_arr.end();
-        }
-        {
-            var workers_arr = try obj.arrayField("workers");
-            try workers_arr.begin();
-            try workers_arr.end();
-        }
+        return error.NotFound;
     }
 
     try obj.end();
@@ -341,6 +311,8 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = h.parseQueryParam(u64, query_string, "limit") orelse 100;
     const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    _ = ns_filter; // runs are already filtered by action name
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -411,6 +383,16 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
                     2 => "trigger",
                     else => "direct",
                 });
+                if (run.caller_run_id_owned) |crid| {
+                    try obj.stringField("caller_run_id", crid);
+                } else {
+                    try obj.nullField("caller_run_id");
+                }
+                if (run.caller_workflow_name_owned) |cwn| {
+                    try obj.stringField("caller_workflow", cwn);
+                } else {
+                    try obj.nullField("caller_workflow");
+                }
                 try obj.end();
                 count += 1;
             }
@@ -422,7 +404,8 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
 }
 
 /// POST /actions/:name/invoke — Invoke action
-pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     _ = ctx;
 
     var json_buf: std.ArrayList(u8) = .empty;

@@ -374,6 +374,8 @@ export interface ActionRunInfo {
   input?: string;
   output?: string;
   source?: 'direct' | 'workflow' | 'trigger';
+  caller_run_id?: string;
+  caller_workflow?: string;
 }
 
 /** Action detail returned from GET /actions/:name */
@@ -706,15 +708,17 @@ class FloApiClient {
   /**
    * List all streams across all namespaces
    */
-  async getStreams(): Promise<StreamInfo[]> {
-    return this.fetch<StreamInfo[]>('streams');
+  async getStreams(namespace?: string): Promise<StreamInfo[]> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<StreamInfo[]>(`streams${params}`);
   }
 
   /**
    * Get stream details
    */
-  async getStreamDetail(name: string): Promise<StreamDetail> {
-    return this.fetch<StreamDetail>(`streams/${encodeURIComponent(name)}`);
+  async getStreamDetail(name: string, namespace?: string): Promise<StreamDetail> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<StreamDetail>(`streams/${encodeURIComponent(name)}${params}`);
   }
 
   /**
@@ -722,7 +726,7 @@ class FloApiClient {
    * @param cursor - StreamID cursor "ts-seq" (omit for start of stream)
    * @param partition - optional partition number (omit for partition 0)
    */
-  async getStreamMessages(name: string, cursor?: string, limit = 2000, partition?: number): Promise<StreamMessagesResponse> {
+  async getStreamMessages(name: string, cursor?: string, limit = 2000, partition?: number, namespace?: string): Promise<StreamMessagesResponse> {
     let url = `streams/${encodeURIComponent(name)}/messages?limit=${limit}`;
     if (cursor) {
       url += `&cursor=${encodeURIComponent(cursor)}`;
@@ -730,33 +734,39 @@ class FloApiClient {
     if (partition !== undefined && partition > 0) {
       url += `&partition=${partition}`;
     }
+    if (namespace) {
+      url += `&namespace=${encodeURIComponent(namespace)}`;
+    }
     return this.fetch<StreamMessagesResponse>(url);
   }
 
   /**
    * Get consumer group detail including members and assignments
    */
-  async getGroupDetail(streamName: string, groupName: string): Promise<GroupDetail> {
+  async getGroupDetail(streamName: string, groupName: string, namespace?: string): Promise<GroupDetail> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
     return this.fetch<GroupDetail>(
-      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}`
+      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}${params}`
     );
   }
 
   /**
    * Get consumer group members
    */
-  async getGroupMembers(streamName: string, groupName: string): Promise<GroupMember[]> {
+  async getGroupMembers(streamName: string, groupName: string, namespace?: string): Promise<GroupMember[]> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
     return this.fetch<GroupMember[]>(
-      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}/members`
+      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}/members${params}`
     );
   }
 
   /**
    * Get pending messages for a consumer group
    */
-  async getGroupPending(streamName: string, groupName: string): Promise<GroupPendingResponse> {
+  async getGroupPending(streamName: string, groupName: string, namespace?: string): Promise<GroupPendingResponse> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
     return this.fetch<GroupPendingResponse>(
-      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}/pending`
+      `streams/${encodeURIComponent(streamName)}/groups/${encodeURIComponent(groupName)}/pending${params}`
     );
   }
 
@@ -775,24 +785,28 @@ class FloApiClient {
   /**
    * Get queue details
    */
-  async getQueueDetail(name: string): Promise<QueueDetail> {
-    return this.fetch<QueueDetail>(`queues/${encodeURIComponent(name)}`);
+  async getQueueDetail(name: string, namespace?: string): Promise<QueueDetail> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<QueueDetail>(`queues/${encodeURIComponent(name)}${params}`);
   }
 
   /**
    * Get messages from a queue
    */
-  async getQueueMessages(name: string, status?: string, limit = 50): Promise<QueueMessagesResponse> {
+  async getQueueMessages(name: string, status?: string, limit = 50, namespace?: string): Promise<QueueMessagesResponse> {
     let url = `queues/${encodeURIComponent(name)}/messages?limit=${limit}`;
     if (status) url += `&status=${status}`;
+    if (namespace) url += `&namespace=${encodeURIComponent(namespace)}`;
     return this.fetch<QueueMessagesResponse>(url);
   }
 
   /**
    * Get DLQ entries for a queue
    */
-  async getQueueDLQ(name: string, limit = 50): Promise<QueueDLQResponse> {
-    return this.fetch<QueueDLQResponse>(`queues/${encodeURIComponent(name)}/dlq?limit=${limit}`);
+  async getQueueDLQ(name: string, limit = 50, namespace?: string): Promise<QueueDLQResponse> {
+    let url = `queues/${encodeURIComponent(name)}/dlq?limit=${limit}`;
+    if (namespace) url += `&namespace=${encodeURIComponent(namespace)}`;
+    return this.fetch<QueueDLQResponse>(url);
   }
 
   /**
@@ -837,22 +851,26 @@ class FloApiClient {
   /**
    * Get detailed action information including recent runs and workers
    */
-  async getActionDetail(name: string): Promise<ActionDetail> {
-    return this.fetch<ActionDetail>(`actions/${encodeURIComponent(name)}`);
+  async getActionDetail(name: string, namespace?: string): Promise<ActionDetail> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<ActionDetail>(`actions/${encodeURIComponent(name)}${params}`);
   }
 
   /**
    * Get runs for a specific action
    */
-  async getActionRuns(name: string, limit = 50): Promise<ActionRunInfo[]> {
-    return this.fetch<ActionRunInfo[]>(`actions/${encodeURIComponent(name)}/runs?limit=${limit}`);
+  async getActionRuns(name: string, limit = 50, namespace?: string): Promise<ActionRunInfo[]> {
+    let url = `actions/${encodeURIComponent(name)}/runs?limit=${limit}`;
+    if (namespace) url += `&namespace=${encodeURIComponent(namespace)}`;
+    return this.fetch<ActionRunInfo[]>(url);
   }
 
   /**
    * Trigger an action from the dashboard
    */
-  async invokeAction(name: string, input?: string): Promise<ActionInvokeResult> {
-    return this.fetch<ActionInvokeResult>(`actions/${encodeURIComponent(name)}/invoke`, {
+  async invokeAction(name: string, input?: string, namespace?: string): Promise<ActionInvokeResult> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<ActionInvokeResult>(`actions/${encodeURIComponent(name)}/invoke${params}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: input || '{}',
@@ -902,15 +920,17 @@ class FloApiClient {
   /**
    * List all processing jobs
    */
-  async getProcessingJobs(): Promise<ProcessingJobInfo[]> {
-    return this.fetch<ProcessingJobInfo[]>('processing/jobs');
+  async getProcessingJobs(namespace?: string): Promise<ProcessingJobInfo[]> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<ProcessingJobInfo[]>(`processing/jobs${params}`);
   }
 
   /**
    * Get full detail for a specific processing job
    */
-  async getProcessingJobDetail(jobId: string): Promise<import('./processing-types').ProcessingJobDetail> {
-    return this.fetch<import('./processing-types').ProcessingJobDetail>(`processing/jobs/${encodeURIComponent(jobId)}`);
+  async getProcessingJobDetail(jobId: string, namespace?: string): Promise<import('./processing-types').ProcessingJobDetail> {
+    const params = namespace ? `?namespace=${encodeURIComponent(namespace)}` : '';
+    return this.fetch<import('./processing-types').ProcessingJobDetail>(`processing/jobs/${encodeURIComponent(jobId)}${params}`);
   }
 
   /**

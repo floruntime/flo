@@ -31,11 +31,11 @@ fn shardCount(ctx: *DashboardContext) usize {
 }
 
 /// Router for /processing/* requests
-pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []const u8, _: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     // /processing/jobs (exact)
     if (std.mem.eql(u8, path, "/jobs")) {
         return switch (method) {
-            .GET => listJobs(allocator, ctx),
+            .GET => listJobs(allocator, query_string, ctx),
             .POST => submitJob(allocator, body, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
@@ -63,7 +63,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         // DELETE /processing/jobs/:id or GET /processing/jobs/:id
         return switch (method) {
             .DELETE => cancelJob(allocator, rest, ctx),
-            .GET => getJobDetail(allocator, rest, ctx),
+            .GET => getJobDetail(allocator, rest, query_string, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
     }
@@ -71,7 +71,8 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
     return h.jsonError(allocator, "Not found");
 }
 
-fn listJobs(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -92,6 +93,10 @@ fn listJobs(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
                 const job = entry.value_ptr;
                 const gop = try seen.getOrPut(job.job_id_owned);
                 if (!gop.found_existing) {
+                    // Filter by namespace if specified
+                    if (ns_filter) |ns| {
+                        if (!std.mem.eql(u8, job.namespace_owned, ns)) continue;
+                    }
                     try arr.next();
                     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try obj.begin();
@@ -113,7 +118,8 @@ fn listJobs(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     return try json_buf.toOwnedSlice(allocator);
 }
 
-fn getJobDetail(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
+fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     _ = ctx;
 
     var json_buf: std.ArrayList(u8) = .empty;

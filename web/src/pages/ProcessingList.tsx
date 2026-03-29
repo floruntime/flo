@@ -9,6 +9,7 @@ import { PageTabs } from "../components/ui/PageTabs";
 import { cn } from "../lib/utils";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
 import { api } from "../lib/api";
+import { useNamespace } from "../lib/NamespaceContext";
 import type { ProcessingJobInfo } from "../lib/api";
 import type { JobState } from "../lib/processing-types";
 import { ProcessingSubmitModal } from "../components/processing/SubmitModal";
@@ -218,7 +219,8 @@ export function ProcessingList() {
     const navigate = useNavigate();
     const [activeTab, setActiveTab] = useState('all');
     const [showSubmitModal, setShowSubmitModal] = useState(false);
-    const { data: jobs, loading, error, refetch } = useApi(() => api.getProcessingJobs(), [], 5000);
+    const { selected: namespace } = useNamespace();
+    const { data: jobs, loading, error, refetch } = useApi(() => api.getProcessingJobs(namespace), [namespace], 5000);
 
     if (loading && !jobs) return <LoadingState message="Loading processing jobs..." />;
     if (error && !jobs) return <ErrorState message={error} onRetry={refetch} />;

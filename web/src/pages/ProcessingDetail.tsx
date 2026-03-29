@@ -11,6 +11,7 @@ import { PageTabs } from "../components/ui/PageTabs";
 import { cn } from "../lib/utils";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
 import { api } from "../lib/api";
+import { useNamespace } from "../lib/NamespaceContext";
 import type { ProcessingJobDetail, JobState, JobEvent } from "../lib/processing-types";
 
 // =============================================================================
@@ -786,10 +787,11 @@ export function ProcessingDetail() {
     const [activeTab, setActiveTab] = useState('overview');
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
+    const { selected: namespace } = useNamespace();
 
     const { data: job, loading, error, refetch } = useApi(
-        () => api.getProcessingJobDetail(jobId!),
-        [jobId],
+        () => api.getProcessingJobDetail(jobId!, namespace),
+        [jobId, namespace],
         3000
     );
 

@@ -44,7 +44,7 @@ pub fn handleRequest(
 
     // ── streams ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "streams")) {
-        return streams.getStreams(allocator, ctx);
+        return streams.getStreams(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "streams/")) {
         return routeStream(allocator, path["streams/".len..], query_string, ctx);
@@ -147,7 +147,7 @@ fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_stri
     const name = if (slash_idx) |idx| rest[0..idx] else rest;
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
-    if (sub.len == 0) return queues.getQueueDetail(allocator, name, ctx);
+    if (sub.len == 0) return queues.getQueueDetail(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "messages")) return queues.getQueueMessages(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "dlq")) return queues.getQueueDLQ(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "purge")) return queues.purgeQueue(allocator, name, ctx);
@@ -188,7 +188,7 @@ fn routeStream(allocator: Allocator, rest: []const u8, query_string: ?[]const u8
     const name = if (slash_idx) |idx| rest[0..idx] else rest;
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
-    if (sub.len == 0) return streams.getStreamDetail(allocator, name, ctx);
+    if (sub.len == 0) return streams.getStreamDetail(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "messages")) return streams.getStreamMessages(allocator, name, query_string, ctx);
 
     // groups/:group[/pending|/members]
@@ -198,9 +198,9 @@ fn routeStream(allocator: Allocator, rest: []const u8, query_string: ?[]const u8
         const group_name = if (group_slash) |idx| group_rest[0..idx] else group_rest;
         const group_sub = if (group_slash) |idx| group_rest[idx + 1 ..] else "";
 
-        if (group_sub.len == 0) return streams.getGroupDetail(allocator, name, group_name, ctx);
-        if (std.mem.eql(u8, group_sub, "pending")) return streams.getGroupPending(allocator, name, group_name, ctx);
-        if (std.mem.eql(u8, group_sub, "members")) return streams.getGroupMembers(allocator, name, group_name, ctx);
+        if (group_sub.len == 0) return streams.getGroupDetail(allocator, name, group_name, query_string, ctx);
+        if (std.mem.eql(u8, group_sub, "pending")) return streams.getGroupPending(allocator, name, group_name, query_string, ctx);
+        if (std.mem.eql(u8, group_sub, "members")) return streams.getGroupMembers(allocator, name, group_name, query_string, ctx);
     }
 
     return helpers.jsonError(allocator, "Not found");
@@ -259,7 +259,7 @@ fn routeAction(allocator: Allocator, rest: []const u8, query_string: ?[]const u8
 
     if (sub.len == 0) return actions.getActionDetail(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "runs")) return actions.getActionRuns(allocator, name, query_string, ctx);
-    if (std.mem.eql(u8, sub, "invoke")) return actions.invokeAction(allocator, name, body, ctx);
+    if (std.mem.eql(u8, sub, "invoke")) return actions.invokeAction(allocator, name, body, query_string, ctx);
 
     return helpers.jsonError(allocator, "Not found");
 }

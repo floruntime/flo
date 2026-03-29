@@ -18,6 +18,7 @@ import { useWorkflowDefinitions } from '../lib/workflow-hooks';
 import type { DefinitionListEntry } from '../lib/workflow-api';
 import * as workflowApi from '../lib/workflow-api';
 import { Button } from '../components/ui/Button';
+import { useNamespace } from '../lib/NamespaceContext';
 
 // =============================================================================
 // Helpers
@@ -261,7 +262,8 @@ export function WorkflowDefinitionsPage() {
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState('');
   const [showCreate, setShowCreate] = useState(false);
-  const { definitions, refetch } = useWorkflowDefinitions();
+  const { selected: namespace } = useNamespace();
+  const { definitions, refetch } = useWorkflowDefinitions(namespace);
 
   const filtered = definitions.filter((def) => {
     if (!searchQuery) return true;

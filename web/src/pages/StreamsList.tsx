@@ -3,10 +3,12 @@ import { Link, useNavigate } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { api } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
+import { useNamespace } from "../lib/NamespaceContext";
 
 export function StreamsList() {
     const navigate = useNavigate();
-    const { data: streams, loading, error, refetch } = useApi(() => api.getStreams(), [], 5000);
+    const { selected: namespace } = useNamespace();
+    const { data: streams, loading, error, refetch } = useApi(() => api.getStreams(namespace), [namespace], 5000);
 
     if (loading && !streams) return <LoadingState />;
     if (error) return <ErrorState message={error} onRetry={refetch} />;

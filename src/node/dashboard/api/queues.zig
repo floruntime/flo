@@ -71,7 +71,8 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
 }
 
 /// GET /queues/:name - Queue detail
-pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);

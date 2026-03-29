@@ -31,6 +31,8 @@ export type HistoryEventType =
   | 'workflow_failed'
   | 'workflow_cancelled'
   | 'workflow_timed_out'
+  | 'schedule_started'
+  | 'trigger_started'
   // Step lifecycle
   | 'step_started'
   | 'step_completed'
@@ -39,8 +41,17 @@ export type HistoryEventType =
   | 'plan_started'
   | 'plan_executor_tried'
   | 'plan_completed'
+  | 'step_retry'
   // Signal
+  | 'waiting_for_signal'
   | 'signal_received'
+  | 'signal_matched'
+  | 'signal_timeout'
+  // Action
+  | 'action_completed'
+  | 'awaiting_action'
+  | 'action_not_found'
+  | 'action_disabled'
   // Timer
   | 'timer_scheduled'
   | 'timer_fired'
@@ -106,6 +117,8 @@ export interface WorkflowRun {
     duration_ms: number;
     attempts: number;
   }>;
+  // Trigger source
+  triggered_by?: string;
   // Ancestry
   parent_run_id?: string;
   child_run_ids?: string[];

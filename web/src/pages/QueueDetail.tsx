@@ -14,6 +14,7 @@ import { cn } from "../lib/utils";
 import { api } from "../lib/api";
 import type { QueueDetail as QueueDetailType, QueueMessage, QueueDLQEntry } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
+import { useNamespace } from "../lib/NamespaceContext";
 
 // =============================================================================
 // Helpers
@@ -250,11 +251,12 @@ function StatRow({ label, value, color }: { label: string; value: string; color?
 function MessagesTab({ queueName, detail }: { queueName: string; detail: QueueDetailType }) {
     const [statusFilter, setStatusFilter] = useState<string>('all');
     const [expandedMsg, setExpandedMsg] = useState<number | null>(null);
+    const { selected: namespace } = useNamespace();
 
     // Fetch messages from API
     const { data: msgResponse } = useApi(
-        () => api.getQueueMessages(queueName, statusFilter === 'all' ? undefined : statusFilter),
-        [queueName, statusFilter],
+        () => api.getQueueMessages(queueName, statusFilter === 'all' ? undefined : statusFilter, 50, namespace),
+        [queueName, statusFilter, namespace],
         5000
     );
 
@@ -456,11 +458,12 @@ function MessageRow({ message, isExpanded, onToggle }: {
 
 function DLQTab({ queueName, dlqCount: _dlqCount }: { queueName: string; dlqCount: number }) {
     const [expandedEntry, setExpandedEntry] = useState<number | null>(null);
+    const { selected: namespace } = useNamespace();
 
     // Fetch DLQ entries from API
     const { data: dlqResponse } = useApi(
-        () => api.getQueueDLQ(queueName),
-        [queueName],
+        () => api.getQueueDLQ(queueName, 50, namespace),
+        [queueName, namespace],
         5000
     );
 
@@ -644,11 +647,12 @@ function DLQRow({ entry, isExpanded, onToggle }: {
 export function QueueDetail() {
     const { queueName } = useParams();
     const [activeTab, setActiveTab] = useState('overview');
+    const { selected: namespace } = useNamespace();
 
     // Try real API, fall back to mock
     const { data: apiDetail, loading, error: _error, refetch } = useApi(
-        () => api.getQueueDetail(queueName || ''),
-        [queueName],
+        () => api.getQueueDetail(queueName || '', namespace),
+        [queueName, namespace],
         5000
     );
 

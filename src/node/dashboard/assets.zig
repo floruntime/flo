@@ -10,9 +10,9 @@ pub const Asset = struct {
 
 const asset_0 = @embedFile("dist/index.html");
 const asset_1 = @embedFile("dist/vite.svg");
-const asset_2 = @embedFile("dist/assets/index-B3tPd7lg.js");
-const asset_3 = @embedFile("dist/assets/index-X_6wbgBt.css");
-const asset_4 = @embedFile("dist/assets/index-B3tPd7lg.js.map");
+const asset_2 = @embedFile("dist/assets/index-Ct-xFt6d.css");
+const asset_3 = @embedFile("dist/assets/index-C65BRLHh.js");
+const asset_4 = @embedFile("dist/assets/index-C65BRLHh.js.map");
 
 pub fn get(path: []const u8) ?Asset {
     const mem = @import("std").mem;
@@ -23,11 +23,11 @@ pub fn get(path: []const u8) ?Asset {
         return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8" };
     } else if (mem.eql(u8, lookup, "vite.svg")) {
         return .{ .content = asset_1, .mime_type = "image/svg+xml" };
-    } else if (mem.eql(u8, lookup, "assets/index-B3tPd7lg.js")) {
-        return .{ .content = asset_2, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-X_6wbgBt.css")) {
-        return .{ .content = asset_3, .mime_type = "text/css; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-B3tPd7lg.js.map")) {
+    } else if (mem.eql(u8, lookup, "assets/index-Ct-xFt6d.css")) {
+        return .{ .content = asset_2, .mime_type = "text/css; charset=utf-8" };
+    } else if (mem.eql(u8, lookup, "assets/index-C65BRLHh.js")) {
+        return .{ .content = asset_3, .mime_type = "application/javascript; charset=utf-8" };
+    } else if (mem.eql(u8, lookup, "assets/index-C65BRLHh.js.map")) {
         return .{ .content = asset_4, .mime_type = "application/json" };
     } else {
         if (!mem.startsWith(u8, lookup, "api/")) {

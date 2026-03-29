@@ -33,7 +33,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 }
 
 /// GET /streams - List all streams
-pub fn getStreams(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -53,6 +55,10 @@ pub fn getStreams(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
         var it = ctx.metrics.streams.iterator();
         while (it.next()) |entry| {
             const stream_entry = entry.value_ptr.*;
+            // Filter by namespace if specified
+            if (ns_filter) |ns| {
+                if (!std.mem.eql(u8, stream_entry.namespace, ns)) continue;
+            }
             const gop = try seen.getOrPut(stream_entry.topic);
             if (!gop.found_existing) {
                 try arr.next();
@@ -74,7 +80,8 @@ pub fn getStreams(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
 }
 
 /// GET /streams/:name - Stream detail with partitions and consumer groups
-pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -229,7 +236,8 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
 }
 
 /// GET /streams/:name/groups/:group - Consumer group detail
-pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -296,7 +304,8 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
 }
 
 /// GET /streams/:name/groups/:group/members - Consumer group members (flat array)
-pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     _ = stream_name;
 
     var json_buf: std.ArrayList(u8) = .empty;
@@ -330,7 +339,8 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
 }
 
 /// GET /streams/:name/groups/:group/pending - Pending messages
-pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = query_string;
     _ = stream_name;
 
     var json_buf: std.ArrayList(u8) = .empty;
@@ -388,7 +398,7 @@ test "getStreams returns empty when no streams registered" {
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try getStreams(allocator, &ctx);
+    const result = try getStreams(allocator, null, &ctx);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("[]", result);
 }
@@ -399,7 +409,7 @@ test "getStreamDetail returns detail without shards" {
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try getStreamDetail(allocator, "events", &ctx);
+    const result = try getStreamDetail(allocator, "events", null, &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"events\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"partitions\":[]") != null);

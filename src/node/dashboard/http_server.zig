@@ -146,8 +146,11 @@ pub const DashboardServer = struct {
             // before the kernel sends FIN. Without this, close() on a socket
             // with buffered data sends RST ("Connection reset by peer")
             // which breaks Docker port forwarding.
+            // Use raw libc call because std.posix.setsockopt maps EINVAL to
+            // unreachable (panic). On macOS the fd can become invalid before
+            // defer runs, so we must tolerate any errno.
             const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
-            std.posix.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+            _ = std.c.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &linger, @sizeOf(@TypeOf(linger)));
             std.posix.close(client);
         }
 
@@ -237,6 +240,10 @@ pub const DashboardServer = struct {
         const path = parsed.pathAfter("/api/v1/") orelse "";
 
         const response = api.handleRequest(self.allocator, parsed.method, path, parsed.query_string, body, self.ctx) catch |err| {
+            if (err == error.NotFound) {
+                self.sendError(client, .not_found, "Not found");
+                return;
+            }
             std.log.warn("Dashboard API error: {}", .{err});
             self.sendError(client, .internal_server_error, "Internal server error");
             return;

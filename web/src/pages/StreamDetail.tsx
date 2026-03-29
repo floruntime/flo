@@ -9,6 +9,7 @@ import { api } from "../lib/api";
 import type { StreamMessagesResponse, GroupPendingResponse } from "../lib/api";
 import { useApi, LoadingState, ErrorState } from "../lib/useApi";
 import type { StreamMessage, ConsumerGroup, PendingMessage } from "../lib/types";
+import { useNamespace } from "../lib/NamespaceContext";
 
 /** Map API stream message to the component's StreamMessage shape */
 function toStreamMessage(msg: StreamMessagesResponse['messages'][0]): StreamMessage {
@@ -41,21 +42,22 @@ function toPendingMessage(entry: GroupPendingResponse['pending'][0], groupName: 
 
 export function StreamDetail() {
     const { streamId } = useParams();
+    const { selected: namespace } = useNamespace();
     const [selectedPartition, setSelectedPartition] = useState<number | undefined>(undefined);
 
     const { data: detail, loading, error, refetch } = useApi(
-        () => api.getStreamDetail(streamId || ''), [streamId], 5000
+        () => api.getStreamDetail(streamId || '', namespace), [streamId, namespace], 5000
     );
     const { data: messagesResp } = useApi(
-        () => api.getStreamMessages(streamId || '', undefined, 2000, selectedPartition),
-        [streamId, selectedPartition], 5000
+        () => api.getStreamMessages(streamId || '', undefined, 2000, selectedPartition, namespace),
+        [streamId, selectedPartition, namespace], 5000
     );
 
     // Fetch pending messages for first consumer group (if any)
     const firstGroup = detail?.consumer_groups?.[0]?.name;
     const { data: pendingResp } = useApi(
-        () => firstGroup ? api.getGroupPending(streamId || '', firstGroup) : Promise.resolve({ pending: [], count: 0 }),
-        [streamId, firstGroup], 10000
+        () => firstGroup ? api.getGroupPending(streamId || '', firstGroup, namespace) : Promise.resolve({ pending: [], count: 0 }),
+        [streamId, firstGroup, namespace], 10000
     );
 
     // Seeker range state (shared between InfiniteTape and MessagesList)
