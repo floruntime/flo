@@ -164,7 +164,7 @@ pub fn history(
 
 /// List workflow runs
 /// Wire format in value:
-///   [limit:u32][status_filter_len:u16]?[status_filter]?[cursor_len:u16]?[cursor]?
+///   [limit:u32][status_filter_len:u16][status_filter]?[cursor_len:u16][cursor]?[search_len:u16][search]?
 ///
 /// key = workflow_name
 pub fn listRuns(
@@ -174,6 +174,7 @@ pub fn listRuns(
     limit: u32,
     status_filter: ?[]const u8,
     cursor: ?[]const u8,
+    search: ?[]const u8,
 ) !Response {
     var value_buf: [512]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&value_buf);
@@ -194,6 +195,14 @@ pub fn listRuns(
     if (cursor) |c| {
         try writer.writeInt(u16, @intCast(c.len), .little);
         try writer.writeAll(c);
+    } else {
+        try writer.writeInt(u16, 0, .little);
+    }
+
+    // Write optional search query
+    if (search) |s| {
+        try writer.writeInt(u16, @intCast(s.len), .little);
+        try writer.writeAll(s);
     } else {
         try writer.writeInt(u16, 0, .little);
     }

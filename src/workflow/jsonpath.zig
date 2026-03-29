@@ -452,3 +452,61 @@ test "PathResolver: resolveInput with path references" {
         \\{"step1_val":42,"run":"run_123"}
     , result);
 }
+
+test "PathResolver: composed workflow output mapping" {
+    const allocator = std.testing.allocator;
+
+    var outputs = StepOutputMap.init();
+    defer outputs.deinit(allocator);
+
+    try outputs.put(allocator, "validate_order",
+        \\{"valid": true, "orderId": "ORD-123"}
+    , "success");
+    try outputs.put(allocator, "charge_payment",
+        \\{"charged": true, "orderId": "ORD-123", "amount": 99.99}
+    , "success");
+    try outputs.put(allocator, "ship_order",
+        \\{"shipped": true, "orderId": "ORD-123", "trackingId": "TRK-42"}
+    , "success");
+
+    const workflow_input =
+        \\{"orderId": "ORD-123", "amount": 99.99}
+    ;
+    const output_mapping =
+        \\{"order_id": "$.input.orderId", "tracking_id": "$.steps.ship_order.output.trackingId", "amount_charged": "$.steps.charge_payment.output.amount", "run_id": "$.flo.run_id"}
+    ;
+
+    const result = try resolveInput(allocator, output_mapping, workflow_input, &outputs, "wfr-ABC123");
+    defer allocator.free(result);
+
+    // Verify all fields resolved correctly
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("ORD-123", obj.get("order_id").?.string);
+    try std.testing.expectEqualStrings("TRK-42", obj.get("tracking_id").?.string);
+    try std.testing.expect(obj.get("amount_charged").?.float == 99.99);
+    try std.testing.expectEqualStrings("wfr-ABC123", obj.get("run_id").?.string);
+}
+
+test "PathResolver: direct step output passthrough" {
+    const allocator = std.testing.allocator;
+
+    var outputs = StepOutputMap.init();
+    defer outputs.deinit(allocator);
+
+    // Step output could be any raw bytes (JSON, binary, etc.)
+    try outputs.put(allocator, "ship_order",
+        \\{"shipped": true, "trackingId": "TRK-42", "binaryRef": "s3://bucket/audio.wav"}
+    , "success");
+
+    var resolver = PathResolver.init(allocator, null, &outputs, "wfr-test");
+
+    // Direct passthrough — resolves the whole step output
+    const result = try resolver.resolve("$.steps.ship_order.output");
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings(
+        \\{"shipped": true, "trackingId": "TRK-42", "binaryRef": "s3://bucket/audio.wav"}
+    , result.?);
+}

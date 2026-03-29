@@ -237,6 +237,13 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
         }
     }
 
+    // Output expression (optional JSONPath, e.g. "$.steps.process_expense.output")
+    const output_expr: ?[]const u8 = if (getString(root, "output")) |expr|
+        allocator.dupe(u8, expr) catch return ParseError.OutOfMemory
+    else
+        null;
+    errdefer if (output_expr) |o| allocator.free(o);
+
     return WorkflowDefinition{
         .name = allocator.dupe(u8, name) catch return ParseError.OutOfMemory,
         .description = allocator.dupe(u8, description) catch return ParseError.OutOfMemory,
@@ -249,6 +256,7 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
         .terminals = terminals,
         .schedule = schedule,
         .trigger = trigger,
+        .output = output_expr,
     };
 }
 
@@ -1113,4 +1121,59 @@ test "parseWorkflow: YAML with schedule block" {
     try testing.expectEqualStrings("0 */6 * * *", def.schedule.?.cron_expr.?);
     try testing.expectEqual(@as(u32, 1), def.schedule.?.max_concurrent);
     try testing.expectEqualStrings("{\"mode\":\"full\"}", def.schedule.?.input.?);
+}
+
+test "parseWorkflow: YAML with output mapping" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const yaml =
+        \\kind: Workflow
+        \\name: test-output
+        \\version: "1.0.0"
+        \\output: '{"order_id": "$.input.orderId", "tracking": "$.steps.ship.output.trackingId"}'
+        \\start:
+        \\  run: "@actions/ship"
+        \\  transitions:
+        \\    success: flo.Completed
+    ;
+
+    var def = parseWorkflow(allocator, yaml) catch |err| {
+        std.debug.print("Parse error: {any}\n", .{err});
+        return err;
+    };
+    defer def.deinit(allocator);
+
+    try testing.expectEqualStrings("test-output", def.name);
+    try testing.expect(def.output != null);
+    // Single-quoted YAML string should be preserved as the inner JSON content
+    try testing.expectEqualStrings(
+        \\{"order_id": "$.input.orderId", "tracking": "$.steps.ship.output.trackingId"}
+    , def.output.?);
+}
+
+test "parseWorkflow: YAML with direct step output passthrough" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const yaml =
+        \\kind: Workflow
+        \\name: audio-pipeline
+        \\version: "1.0.0"
+        \\output: "$.steps.encode.output"
+        \\start:
+        \\  run: "@actions/encode"
+        \\  transitions:
+        \\    success: flo.Completed
+    ;
+
+    var def = parseWorkflow(allocator, yaml) catch |err| {
+        std.debug.print("Parse error: {any}\n", .{err});
+        return err;
+    };
+    defer def.deinit(allocator);
+
+    try testing.expectEqualStrings("audio-pipeline", def.name);
+    try testing.expect(def.output != null);
+    try testing.expectEqualStrings("$.steps.encode.output", def.output.?);
 }

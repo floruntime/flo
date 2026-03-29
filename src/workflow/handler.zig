@@ -21,7 +21,7 @@
 //! | workflow_cancel      | run_id            | reason (optional)                   |
 //! | workflow_status      | run_id            | (empty)                             |
 //! | workflow_history     | run_id            | [limit:u32]                         |
-//! | workflow_list_runs   | workflow_name     | [limit:u32][sf_len:u16][sf][cl:u16]  |
+//! | workflow_list_runs   | workflow_name     | [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search] |
 //! | workflow_get_def     | workflow_name     | version (optional)                  |
 //! | workflow_disable     | workflow_name     | version (optional)                  |
 //! | workflow_enable      | workflow_name     | version (optional)                  |
@@ -29,10 +29,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
 const definition = @import("definition.zig");
+const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
 const jsonpath = @import("jsonpath.zig");
 const wf_types = @import("types.zig");
@@ -48,6 +50,7 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const router = @import("../node/router.zig");
+const run_id_mod = @import("../node/run_id.zig");
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -82,8 +85,10 @@ pub const WorkflowHandler = struct {
     /// Registered when a workflow with a `schedule:` block is created.
     schedules: std.StringHashMap(ScheduleState),
 
-    /// Monotonic run counter.
-    next_run_id: u64,
+    /// Plan executor health tracking: "namespace:workflow:plan:executor" → ExecutorHealth.
+    /// Used by health-weighted selection to route to the healthiest executor and
+    /// by circuit breakers to skip failing executors.
+    plan_health: std.StringHashMap(plan_types.ExecutorHealth),
 
     const MAX_WORKFLOW_NAME_LEN: usize = 256;
     const MAX_DEFINITIONS: usize = 10_000;
@@ -148,6 +153,9 @@ pub const WorkflowHandler = struct {
         /// History events for this run.
         history: std.ArrayList(HistoryEvent),
 
+        /// Final workflow output (resolved from `output` mapping when completed, null if not declared).
+        output_owned: ?[]const u8 = null,
+
         /// Per-step outputs for JSONPath resolution ($.steps.*).
         step_outputs: ?StepOutputMap = null,
 
@@ -163,11 +171,28 @@ pub const WorkflowHandler = struct {
         /// Retry attempt counter for the current step (reset on step transition).
         retry_count: u32 = 0,
 
+        /// Index of the current executor within a plan (reset on step transition).
+        plan_executor_idx: u8 = 0,
+
+        /// Natural index into plan.executors[] for the active executor.
+        /// In health-weighted mode, plan_executor_idx tracks position in
+        /// the sorted order while this holds the actual executor index.
+        plan_executor_natural_idx: u8 = 0,
+
+        /// Retry counter for the current plan executor (reset on executor advance).
+        plan_executor_retry_count: u32 = 0,
+
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
         wait_timeout_at_ms: i64 = 0,
 
         /// Transition target to follow when wait times out.
         wait_timeout_target_owned: ?[]const u8 = null,
+
+        /// Pre-computed search attribute JSON (e.g. {"customer_id":"C-789"}).
+        /// Built at run start from $.input.* paths, updated at completion for
+        /// $.steps.* and $.flo.* paths. Enables fast substring search without
+        /// re-parsing definition YAML on every list request.
+        search_tags_owned: ?[]const u8 = null,
     };
 
     pub const Signal = struct {
@@ -213,7 +238,7 @@ pub const WorkflowHandler = struct {
             .disabled = std.StringHashMap(void).init(allocator),
             .stream_triggers = std.StringHashMap(StreamTriggerState).init(allocator),
             .schedules = std.StringHashMap(ScheduleState).init(allocator),
-            .next_run_id = 1,
+            .plan_health = std.StringHashMap(plan_types.ExecutorHealth).init(allocator),
         };
     }
 
@@ -258,6 +283,14 @@ pub const WorkflowHandler = struct {
             self.freeScheduleState(entry.value_ptr);
         }
         self.schedules.deinit();
+
+        // Free plan health state
+        var phit = self.plan_health.iterator();
+        while (phit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.plan_health.deinit();
     }
 
     fn freeRunRecord(self: *WorkflowHandler, run: *RunRecord) void {
@@ -271,6 +304,8 @@ pub const WorkflowHandler = struct {
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         if (run.wait_timeout_target_owned) |t| self.allocator.free(t);
+        if (run.output_owned) |o| self.allocator.free(o);
+        if (run.search_tags_owned) |t| self.allocator.free(t);
         if (run.step_outputs) |*so| {
             var mutable = so.*;
             mutable.deinit(self.allocator);
@@ -315,13 +350,12 @@ pub const WorkflowHandler = struct {
         dispatcher.registerWithRoute(.workflow_get_definition, dispatchWorkflow, preRouteByWorkflow);
         dispatcher.registerWithRoute(.workflow_disable, dispatchWorkflow, preRouteByWorkflow);
         dispatcher.registerWithRoute(.workflow_enable, dispatchWorkflow, preRouteByWorkflow);
-        // Run-based ops: key is run_id, NOT workflow name. Cannot pre-route
-        // because we don't know which shard owns the run. Handlers search
-        // peer shards when not found locally.
-        dispatcher.register(.workflow_status, dispatchWorkflow);
-        dispatcher.register(.workflow_signal, dispatchWorkflow);
-        dispatcher.register(.workflow_cancel, dispatchWorkflow);
-        dispatcher.register(.workflow_history, dispatchWorkflow);
+        // Run-based ops: key is run_id with embedded partition bits.
+        // Pre-routed by extracting partition from the run ID.
+        dispatcher.registerWithRoute(.workflow_status, dispatchWorkflow, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_signal, dispatchWorkflow, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_cancel, dispatchWorkflow, run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.workflow_history, dispatchWorkflow, run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.workflow_list_definitions, dispatchWorkflow, localScanWorkflowDefs);
     }
 
@@ -399,58 +433,6 @@ pub const WorkflowHandler = struct {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown workflow opcode");
             },
         }
-    }
-
-    // ── Cross-Shard Run Forwarding ──────────────────────────────────────
-
-    /// For run-based operations (status, signal, cancel, history) where
-    /// the key is a run_id: when the run isn't found locally, forward to
-    /// the peer that owns the run.
-    ///
-    /// Uses the shard hint encoded in the run_id (format wfrun-{shard}-{seq})
-    /// for O(1) routing. Falls back to linear scan for client-supplied or
-    /// legacy run_ids without a shard hint.
-    fn forwardRunOp(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request, run_ns_key: []const u8) bool {
-        _ = self;
-        const peers = shard.peer_shards orelse return false;
-
-        // Fast path: extract shard hint from run_id (format: wfrun-{shard}-{seq})
-        if (parseRunShardHint(req.key)) |hint_shard| {
-            if (hint_shard < peers.len and hint_shard != shard.id) {
-                const peer = peers[hint_shard];
-                peer.workflow_handler.handleCommand(peer, conn, req);
-                return true;
-            }
-            // Hint points to us or is out of range — run should be local
-            return false;
-        }
-
-        // Slow path: client-supplied or legacy run_id without shard hint — linear scan.
-        for (peers) |peer| {
-            if (peer == shard) continue;
-            const peer_wh = peer.workflow_handler;
-            peer_wh.mu.lock();
-            const has_run = peer_wh.runs.contains(run_ns_key);
-            peer_wh.mu.unlock();
-            if (has_run) {
-                peer_wh.handleCommand(peer, conn, req);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// Parse the shard hint from a run_id with format "wfrun-{shard_id}-{seq}".
-    /// Returns the shard_id if present, null for client-supplied or legacy IDs.
-    fn parseRunShardHint(run_id: []const u8) ?u16 {
-        const prefix = "wfrun-";
-        if (run_id.len <= prefix.len) return null;
-        if (!std.mem.startsWith(u8, run_id, prefix)) return null;
-        const after_prefix = run_id[prefix.len..];
-        // Find the next '-' separator: "{shard_id}-{seq}"
-        const sep_pos = std.mem.indexOfScalar(u8, after_prefix, '-') orelse return null;
-        if (sep_pos == 0 or sep_pos >= after_prefix.len - 1) return null;
-        return std.fmt.parseInt(u16, after_prefix[0..sep_pos], 10) catch null;
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
@@ -689,13 +671,14 @@ pub const WorkflowHandler = struct {
         }
 
         // Generate or use explicit run ID.
-        // Server-generated IDs encode the owning shard: wfrun-{shard}-{seq}
+        // Server-generated IDs have embedded partition bits
         // for O(1) cross-shard routing on status/signal/cancel/history.
         var run_id_buf: [32]u8 = undefined;
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
-            break :blk std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch "wfrun-0";
+            const partition_id = shard.router.keyToPartitionNs(req.namespace, workflow_name);
+            break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch "wfr-0";
         };
 
         // Build namespace-qualified key for the runs map
@@ -802,8 +785,13 @@ pub const WorkflowHandler = struct {
             return;
         };
 
+        // Pre-compute search tags from $.input.* paths in the definition
+        if (self.runs.getPtr(run_ns_key)) |stored_run| {
+            stored_run.search_tags_owned = self.buildSearchTags(def_ns_key, stored_run);
+        }
+
         // Return the run ID
-        self.persistStart(shard, req.namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
+        self.persistStart(shard, req.namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, if (self.runs.getPtr(run_ns_key)) |r| r.search_tags_owned else null);
         shard.sendOkResponse(conn, req.header.request_id, owned_run_id);
 
         // Begin step execution. The run is already in the map; advanceWorkflow
@@ -829,8 +817,6 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.getPtr(run_ns_key) orelse {
-            // Run not on this shard — forward to the peer that owns it.
-            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -923,18 +909,13 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.getPtr(run_ns_key) orelse {
-            // Run not on this shard — forward to the peer that owns it.
-            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
 
         const now_ms: i64 = std.time.milliTimestamp();
-        run.status = .cancelled;
-        run.completed_at_ms = now_ms;
-
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
-        self.addHistoryEvent(run, "workflow_cancelled", reason, now_ms);
+        self.completeRun(shard, run_ns_key, run, .cancelled, reason, now_ms);
 
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
@@ -956,8 +937,6 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.get(run_ns_key) orelse {
-            // Run not on this shard — forward to the peer that owns it.
-            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1002,6 +981,14 @@ pub const WorkflowHandler = struct {
         } else {
             w.writeByte(0) catch return;
         }
+        // Optional: output (composed from definition's output mapping)
+        if (run.output_owned) |output| {
+            w.writeByte(1) catch return;
+            w.writeInt(u32, @intCast(output.len), .little) catch return;
+            w.writeAll(output) catch return;
+        } else {
+            w.writeByte(0) catch return;
+        }
 
         shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
     }
@@ -1023,8 +1010,6 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.get(run_ns_key) orelse {
-            // Run not on this shard — forward to the peer that owns it.
-            if (self.forwardRunOp(shard, conn, req, run_ns_key)) return;
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
             return;
         };
@@ -1078,43 +1063,28 @@ pub const WorkflowHandler = struct {
 
     // ── LIST RUNS ───────────────────────────────────────────────────────
 
-    fn handleListRuns(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const workflow_name = req.key;
+    const RunInfo = struct {
+        run_id: []const u8,
+        workflow: []const u8,
+        status: []const u8,
+        created_at: i64,
+    };
 
-        // Parse value: [limit:u32][status_len:u16][status]?[cursor_len:u16][cursor]?
-        var limit: u32 = 100;
-        var status_filter: ?[]const u8 = null;
-
-        if (req.value.len >= 4) {
-            limit = std.mem.readInt(u32, req.value[0..4], .little);
-            var offset: usize = 4;
-
-            // Optional status filter
-            if (offset + 2 <= req.value.len) {
-                const sf_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-                offset += 2;
-                if (sf_len > 0 and offset + sf_len <= req.value.len) {
-                    status_filter = req.value[offset .. offset + sf_len];
-                    offset += sf_len;
-                }
-            }
-        }
-
-        // Build namespace prefix for filtering ("namespace:")
-        const ns_prefix = self.makeNsKey(req.namespace, "") orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
+    /// Collect runs matching filters from this handler's local runs map.
+    /// Called under mu.lock() — safe for both local and cross-shard use.
+    fn collectMatchingRuns(
+        self: *WorkflowHandler,
+        runs_list: *std.ArrayListUnmanaged(RunInfo),
+        namespace: []const u8,
+        workflow_name: []const u8,
+        status_filter: ?[]const u8,
+        search_lower: ?[]const u8,
+    ) !void {
+        const ns_prefix = self.makeNsKey(namespace, "") orelse return error.OutOfMemory;
         defer self.allocator.free(ns_prefix);
-
-        // Collect matching runs
-        const RunInfo = struct { run_id: []const u8, workflow: []const u8, status: []const u8, created_at: i64 };
-        var runs_list: std.ArrayListUnmanaged(RunInfo) = .{};
-        defer runs_list.deinit(self.allocator);
 
         var rit = self.runs.iterator();
         while (rit.next()) |entry| {
-            if (runs_list.items.len >= limit) break;
             const run = entry.value_ptr;
             const map_key = entry.key_ptr.*;
 
@@ -1124,26 +1094,138 @@ pub const WorkflowHandler = struct {
                 if (!std.mem.eql(u8, run.status.toString(), sf)) continue;
             }
 
-            runs_list.append(self.allocator, .{
+            // Free-text search: match against run_id, workflow, step, input, search_tags
+            if (search_lower) |sq| {
+                const matched = containsLower(run.run_id_owned, sq) or
+                    containsLower(run.workflow_name_owned, sq) or
+                    (if (run.current_step_name_owned) |step| containsLower(step, sq) else false) or
+                    containsLower(run.input_owned, sq) or
+                    (if (run.search_tags_owned) |tags| containsLower(tags, sq) else false);
+                if (!matched) continue;
+            }
+
+            try runs_list.append(self.allocator, .{
                 .run_id = run.run_id_owned,
                 .workflow = run.workflow_name_owned,
                 .status = run.status.toString(),
-                .created_at = run.created_at_ms,
-            }) catch {
+                .created_at = run.started_at_ms orelse run.created_at_ms,
+            });
+        }
+    }
+
+    fn handleListRuns(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+        const workflow_name = req.key;
+
+        // Parse value: [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]
+        if (req.value.len < 10) { // 4 + 2 + 2 + 2 minimum
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid list-runs request");
+            return;
+        }
+
+        const limit = std.mem.readInt(u32, req.value[0..4], .little);
+        var offset: usize = 4;
+
+        // Status filter
+        const sf_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
+        offset += 2;
+        const status_filter: ?[]const u8 = if (sf_len > 0 and offset + sf_len <= req.value.len) blk: {
+            const s = req.value[offset .. offset + sf_len];
+            offset += sf_len;
+            break :blk s;
+        } else null;
+
+        // Cursor
+        const c_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
+        offset += 2;
+        const cursor_filter: ?[]const u8 = if (c_len > 0 and offset + c_len <= req.value.len) blk: {
+            const c = req.value[offset .. offset + c_len];
+            offset += c_len;
+            break :blk c;
+        } else null;
+
+        // Search query
+        const sq_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
+        offset += 2;
+        const search_query: ?[]const u8 = if (sq_len > 0 and offset + sq_len <= req.value.len) blk: {
+            const s = req.value[offset .. offset + sq_len];
+            offset += sq_len;
+            break :blk s;
+        } else null;
+
+        // Lowercase the search query once for case-insensitive matching
+        var search_lower_buf: [256]u8 = undefined;
+        const search_lower: ?[]const u8 = if (search_query) |sq| blk: {
+            const len = @min(sq.len, search_lower_buf.len);
+            for (0..len) |idx| {
+                search_lower_buf[idx] = std.ascii.toLower(sq[idx]);
+            }
+            break :blk search_lower_buf[0..len];
+        } else null;
+
+        // Collect matching runs with sort key
+        var runs_list: std.ArrayListUnmanaged(RunInfo) = .{};
+        defer runs_list.deinit(self.allocator);
+
+        // Cross-shard aggregation: when workflow_name is empty, search all shards.
+        // When workflow_name is set, all runs for that workflow are on this shard.
+        if (workflow_name.len == 0) {
+            // Search all shards via peer_shards
+            self.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+                return;
+            };
+            if (shard.peer_shards) |peers| {
+                for (peers) |peer| {
+                    if (peer.id == shard.id) continue; // skip self — already collected
+                    const peer_handler = peer.workflow_handler;
+                    peer_handler.mu.lock();
+                    defer peer_handler.mu.unlock();
+                    peer_handler.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
+                        shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
+                        return;
+                    };
+                }
+            }
+        } else {
+            // Single-shard: all runs for this workflow are local
+            self.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
                 return;
             };
         }
 
+        // Sort by created_at descending (newest first)
+        std.mem.sortUnstable(RunInfo, runs_list.items, {}, struct {
+            fn lessThan(_: void, a: RunInfo, b: RunInfo) bool {
+                return a.created_at > b.created_at;
+            }
+        }.lessThan);
+
+        // Apply cursor-based pagination: skip past the cursor run_id
+        var start_idx: usize = 0;
+        if (cursor_filter) |c| {
+            for (runs_list.items, 0..) |item, idx| {
+                if (std.mem.eql(u8, item.run_id, c)) {
+                    start_idx = idx + 1;
+                    break;
+                }
+            }
+        }
+
+        const end_idx = @min(start_idx + limit, runs_list.items.len);
+        const page = runs_list.items[start_idx..end_idx];
+        const has_more = end_idx < runs_list.items.len;
+        const last_run_id: []const u8 = if (page.len > 0) page[page.len - 1].run_id else "";
+
         // Serialize to binary wire format:
         // [count:u32]([run_id_len:u16][run_id][workflow_len:u16][workflow]
         //  [status_len:u16][status][created_at:i64])*
-        // [has_more:u8][cursor_len:u16]
+        // [has_more:u8][cursor_len:u16][cursor]?
         var total: usize = 4; // count
-        for (runs_list.items) |r| {
+        for (page) |r| {
             total += 2 + r.run_id.len + 2 + r.workflow.len + 2 + r.status.len + 8;
         }
-        total += 1 + 2; // trailer
+        total += 1 + 2 + (if (has_more) last_run_id.len else 0); // trailer
 
         const buf = self.allocator.alloc(u8, total) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
@@ -1151,9 +1233,9 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(buf);
 
-        std.mem.writeInt(u32, buf[0..4], @intCast(runs_list.items.len), .little);
+        std.mem.writeInt(u32, buf[0..4], @intCast(page.len), .little);
         var pos: usize = 4;
-        for (runs_list.items) |r| {
+        for (page) |r| {
             std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.run_id.len), .little);
             pos += 2;
             @memcpy(buf[pos..][0..r.run_id.len], r.run_id);
@@ -1169,9 +1251,13 @@ pub const WorkflowHandler = struct {
             std.mem.writeInt(i64, buf[pos..][0..8], r.created_at, .little);
             pos += 8;
         }
-        buf[pos] = 0; // has_more
+        buf[pos] = if (has_more) 1 else 0;
         pos += 1;
-        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(if (has_more) last_run_id.len else 0), .little);
+        pos += 2;
+        if (has_more) {
+            @memcpy(buf[pos..][0..last_run_id.len], last_run_id);
+        }
 
         shard.sendOkResponse(conn, req.header.request_id, buf);
     }
@@ -1381,7 +1467,7 @@ pub const WorkflowHandler = struct {
             const step: definition.Step = if (run.current_step_name_owned) |step_name|
                 def.getStep(step_name) orelse {
                     // Step not found in definition — fail the run
-                    self.completeRun(run, .failed, "step not found in definition", now_ms);
+                    self.completeRun(shard, run_ns_key, run, .failed, "step not found in definition", now_ms);
                     return;
                 }
             else
@@ -1407,7 +1493,7 @@ pub const WorkflowHandler = struct {
                     const step_input: []const u8 = resolved_input orelse run.input_owned;
 
                     // Execute the step and determine outcome
-                    const outcome_or_park = self.executeRunStep(shard, run, run_step, step_input, step_label, namespace, now_ms);
+                    const outcome_or_park = self.executeRunStep(shard, run, &def, run_step, step_input, step_label, namespace, now_ms);
 
                     // Free resolved input after action invocation
                     if (resolved_input) |ri| self.allocator.free(ri);
@@ -1436,13 +1522,13 @@ pub const WorkflowHandler = struct {
                     // Follow transition
                     const transition = run_step.resolveTransition(outcome) orelse {
                         // No matching transition — fail
-                        self.completeRun(run, .failed, "no transition for outcome", now_ms);
+                        self.completeRun(shard, run_ns_key, run, .failed, "no transition for outcome", now_ms);
                         return;
                     };
 
                     // Check if target is a terminal (builtin or custom)
                     if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
-                        self.completeRun(run, status, transition.target, now_ms);
+                        self.completeRun(shard, run_ns_key, run, status, transition.target, now_ms);
                         return;
                     }
 
@@ -1467,12 +1553,12 @@ pub const WorkflowHandler = struct {
                         // Signal already received — follow "success" transition
                         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
                         const transition = wait_step.getTransition(definition.StepOutcome.success) orelse {
-                            self.completeRun(run, .failed, "no success transition for wait step", now_ms);
+                            self.completeRun(shard, run_ns_key, run, .failed, "no success transition for wait step", now_ms);
                             return;
                         };
 
                         if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
-                            self.completeRun(run, status, transition.target, now_ms);
+                            self.completeRun(shard, run_ns_key, run, status, transition.target, now_ms);
                             return;
                         }
                         self.setCurrentStep(run, transition.target);
@@ -1499,7 +1585,7 @@ pub const WorkflowHandler = struct {
         }
 
         // Safety: too many steps — possible infinite loop in definition
-        self.completeRun(run, .failed, "max step limit reached", now_ms);
+        self.completeRun(shard, run_ns_key, run, .failed, "max step limit reached", now_ms);
     }
 
     /// Execute a single run step. Returns the step outcome string, or null
@@ -1508,6 +1594,7 @@ pub const WorkflowHandler = struct {
         self: *WorkflowHandler,
         shard: *Shard,
         run: *RunRecord,
+        def: *const definition.WorkflowDefinition,
         run_step: definition.RunStep,
         step_input: []const u8,
         step_label: []const u8,
@@ -1517,17 +1604,109 @@ pub const WorkflowHandler = struct {
         if (run_step.isAction()) {
             return self.invokeAction(shard, run, run_step.targetName(), step_input, step_label, namespace, now_ms);
         } else if (run_step.isPlan()) {
-            // Plan execution: look up InlinePlan, select executor, invoke its action.
-            // For now, plans succeed — full plan executor selection is a follow-up.
-            if (run.step_outputs) |*so| {
-                so.put(self.allocator, step_label, "{}", definition.StepOutcome.success) catch {};
-            }
-            return definition.StepOutcome.success;
+            return self.executePlan(shard, run, def, run_step.targetName(), step_input, step_label, namespace, now_ms);
         } else if (run_step.isChildWorkflow()) {
             // Child workflow invocation — not yet wired.
             return definition.StepOutcome.execution_failure;
         }
         return definition.StepOutcome.execution_failure;
+    }
+
+    /// Execute a plan step: iterate executors with selection strategy awareness.
+    /// For health-weighted selection, executors are sorted by health score and
+    /// circuit breakers are consulted before each attempt. For static-order
+    /// (and other strategies), executors are tried in definition order.
+    /// Returns the outcome string, or null if parked waiting for an async action.
+    fn executePlan(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        run: *RunRecord,
+        def: *const definition.WorkflowDefinition,
+        plan_name: []const u8,
+        step_input: []const u8,
+        step_label: []const u8,
+        namespace: []const u8,
+        now_ms: i64,
+    ) ?[]const u8 {
+        const plan = def.getPlan(plan_name) orelse {
+            self.addHistoryEvent(run, "plan_not_found", plan_name, now_ms);
+            return definition.StepOutcome.execution_failure;
+        };
+
+        // Build executor iteration order — health-weighted sorts by score,
+        // all other strategies use definition order.
+        var order_buf: [32]u8 = undefined;
+        const exec_count: u8 = @intCast(@min(plan.executors.len, 32));
+        const exec_order = order_buf[0..exec_count];
+        for (exec_order, 0..) |*slot, i| slot.* = @intCast(i);
+
+        if (plan.selection == .health_weighted) {
+            self.sortExecutorsByHealth(exec_order, plan, namespace, run.workflow_name_owned);
+        }
+
+        while (run.plan_executor_idx < exec_count) {
+            const natural_idx = exec_order[run.plan_executor_idx];
+            const executor = plan.executors[natural_idx];
+
+            // Health-weighted: check circuit breaker before attempting
+            if (plan.selection == .health_weighted) {
+                if (executor.breaker) |breaker_cfg| {
+                    if (self.getOrCreateHealth(namespace, run.workflow_name_owned, plan_name, executor.name)) |health| {
+                        if (!health.shouldAllowRequest(breaker_cfg, now_ms)) {
+                            self.addHistoryEvent(run, "plan_breaker_skip", executor.name, now_ms);
+                            run.plan_executor_idx += 1;
+                            run.plan_executor_retry_count = 0;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Track natural index for async resume health recording
+            run.plan_executor_natural_idx = natural_idx;
+
+            self.addHistoryEvent(run, "plan_executor_start", executor.name, now_ms);
+            const outcome = self.invokeAction(shard, run, executor.action_name, step_input, step_label, namespace, now_ms);
+
+            // Parked for async action — will resume via resumeFromAction
+            if (outcome == null) return null;
+
+            const success = std.mem.eql(u8, outcome.?, definition.StepOutcome.success);
+
+            // Record health metrics for synchronous completions
+            if (plan.selection == .health_weighted) {
+                self.recordPlanHealth(namespace, run.workflow_name_owned, plan_name, executor, success, now_ms);
+            }
+
+            // Success — reset plan state and return
+            if (success) {
+                self.addHistoryEvent(run, "plan_executor_success", executor.name, now_ms);
+                run.plan_executor_idx = 0;
+                run.plan_executor_natural_idx = 0;
+                run.plan_executor_retry_count = 0;
+                return outcome;
+            }
+
+            // Failure — check per-executor retry
+            if (executor.retry) |retry| {
+                if (run.plan_executor_retry_count < retry.max_attempts) {
+                    run.plan_executor_retry_count += 1;
+                    self.addHistoryEvent(run, "plan_executor_retry", executor.name, now_ms);
+                    continue;
+                }
+            }
+
+            // Executor exhausted — advance to next
+            self.addHistoryEvent(run, "plan_executor_exhausted", executor.name, now_ms);
+            run.plan_executor_idx += 1;
+            run.plan_executor_retry_count = 0;
+        }
+
+        // All executors exhausted
+        run.plan_executor_idx = 0;
+        run.plan_executor_natural_idx = 0;
+        run.plan_executor_retry_count = 0;
+        return definition.StepOutcome.failure;
     }
 
     /// Invoke an action by name via the ActionsHandler.
@@ -1556,10 +1735,10 @@ pub const WorkflowHandler = struct {
         // Cross-shard: need to create run on the target shard's handler
         const target_handler = self.resolveActionHandler(shard, namespace, action_name);
 
-        // Pre-generate a run ID for the cross-shard invocation
+        // Generate a run ID for the cross-shard invocation
         var run_id_buf: [32]u8 = undefined;
-        const ts = @as(u64, @bitCast(std.time.milliTimestamp()));
-        const pre_run_id = std.fmt.bufPrint(&run_id_buf, "x{d}-{d}", .{ shard.id, ts }) catch {
+        const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
+        const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch {
             return definition.StepOutcome.execution_failure;
         };
 
@@ -1619,19 +1798,34 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.execution_failure;
         };
 
+        // Broadcast to all peer shards so action_await waiters on any shard
+        // can claim this run. invokeByName only notifies the local waiter_pool,
+        // but workers may be connected to any shard.
+        if (shard.peer_inboxes) |inboxes| {
+            for (inboxes, 0..) |inbox, i| {
+                if (i == shard.id) continue;
+                _ = inbox.send(.{
+                    .tag = .action_invoke,
+                    .src_shard = @intCast(shard.id),
+                });
+            }
+        }
+
         if (shard.actions_handler.getRunResult(action_run_id)) |result| {
             switch (result.status) {
                 .completed => {
+                    const outcome = result.outcome orelse definition.StepOutcome.success;
                     if (run.step_outputs) |*so| {
-                        so.put(self.allocator, step_label, result.output orelse "{}", definition.StepOutcome.success) catch {};
+                        so.put(self.allocator, step_label, result.output orelse "{}", outcome) catch {};
                     }
-                    return definition.StepOutcome.success;
+                    return outcome;
                 },
                 .failed => {
+                    const outcome = result.outcome orelse definition.StepOutcome.failure;
                     if (run.step_outputs) |*so| {
-                        so.put(self.allocator, step_label, result.output orelse "{}", definition.StepOutcome.failure) catch {};
+                        so.put(self.allocator, step_label, result.output orelse "{}", outcome) catch {};
                     }
-                    return definition.StepOutcome.failure;
+                    return outcome;
                 },
                 .pending, .running => {
                     self.parkForAction(run, action_run_id, step_label, action_name, target_shard_id, now_ms);
@@ -1827,12 +2021,69 @@ pub const WorkflowHandler = struct {
 
         switch (step) {
             .run => |run_step| {
+                // Record health for health-weighted plan executors (on async completion)
+                if (run_step.isPlan()) {
+                    if (def.getPlan(run_step.targetName())) |plan| {
+                        if (plan.selection == .health_weighted and run.plan_executor_natural_idx < plan.executors.len) {
+                            const attempted_executor = plan.executors[run.plan_executor_natural_idx];
+                            const is_success = std.mem.eql(u8, outcome, definition.StepOutcome.success);
+                            self.recordPlanHealth(namespace, run.workflow_name_owned, run_step.targetName(), attempted_executor, is_success, now_ms);
+                        }
+                    }
+                }
+
+                // Plan executor fallback: if an async action failed and this is a plan step,
+                // try the next executor before following the failure transition.
+                if (run_step.isPlan() and (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
+                    std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
+                {
+                    if (def.getPlan(run_step.targetName())) |plan| {
+                        // Use natural index — in health-weighted mode plan_executor_idx
+                        // is the position in sorted order, not the index into plan.executors[].
+                        const exec_count: u8 = @intCast(@min(plan.executors.len, 32));
+
+                        // Check per-executor retry first
+                        if (run.plan_executor_idx < exec_count and
+                            run.plan_executor_natural_idx < plan.executors.len)
+                        {
+                            const executor = plan.executors[run.plan_executor_natural_idx];
+                            if (executor.retry) |retry| {
+                                if (run.plan_executor_retry_count < retry.max_attempts) {
+                                    run.plan_executor_retry_count += 1;
+                                    self.addHistoryEvent(run, "plan_executor_retry", executor.name, now_ms);
+                                    const key_copy = self.allocator.dupe(u8, run_ns_key) catch return;
+                                    defer self.allocator.free(key_copy);
+                                    self.advanceWorkflow(shard, key_copy, namespace);
+                                    return;
+                                }
+                            }
+
+                            // Executor exhausted — advance to next
+                            self.addHistoryEvent(run, "plan_executor_exhausted", executor.name, now_ms);
+                            run.plan_executor_idx += 1;
+                            run.plan_executor_retry_count = 0;
+
+                            if (run.plan_executor_idx < exec_count) {
+                                // More executors available — re-enter advance loop
+                                const key_copy = self.allocator.dupe(u8, run_ns_key) catch return;
+                                defer self.allocator.free(key_copy);
+                                self.advanceWorkflow(shard, key_copy, namespace);
+                                return;
+                            }
+                        }
+                        // All executors exhausted — reset and fall through to failure transition
+                        run.plan_executor_idx = 0;
+                        run.plan_executor_natural_idx = 0;
+                        run.plan_executor_retry_count = 0;
+                    }
+                }
+
                 const transition = run_step.resolveTransition(outcome) orelse {
-                    self.completeRun(run, .failed, "no transition for outcome", now_ms);
+                    self.completeRun(shard, run_ns_key, run, .failed, "no transition for outcome", now_ms);
                     return;
                 };
                 if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
-                    self.completeRun(run, status, transition.target, now_ms);
+                    self.completeRun(shard, run_ns_key, run, status, transition.target, now_ms);
                     return;
                 }
                 self.setCurrentStep(run, transition.target);
@@ -1874,7 +2125,7 @@ pub const WorkflowHandler = struct {
                 run.status = .running; // transition to running briefly
                 self.allocator.free(target);
                 run.wait_timeout_target_owned = null;
-                self.completeRun(run, status, "signal timeout", now_ms);
+                self.completeRun(shard, run_ns_key, run, status, "signal timeout", now_ms);
                 return;
             }
 
@@ -1927,10 +2178,28 @@ pub const WorkflowHandler = struct {
         return null;
     }
 
-    /// Transition the run to a terminal status.
-    fn completeRun(self: *WorkflowHandler, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
+    /// Transition the run to a terminal status and persist to UAL.
+    fn completeRun(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
         run.status = status;
         run.completed_at_ms = now_ms;
+
+        // Resolve explicit output mapping from definition (if declared)
+        if (status == .completed) {
+            self.resolveWorkflowOutput(run, run_ns_key);
+        }
+
+        // Re-compute search tags now that $.steps.* and $.flo.* are available
+        {
+            const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
+            const namespace = run_ns_key[0..sep];
+            const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+            defer self.allocator.free(def_ns_key);
+            if (self.buildSearchTags(def_ns_key, run)) |tags| {
+                if (run.search_tags_owned) |old| self.allocator.free(old);
+                run.search_tags_owned = tags;
+            }
+        }
+
         const event_type = switch (status) {
             .completed => "workflow_completed",
             .failed => "workflow_failed",
@@ -1939,12 +2208,134 @@ pub const WorkflowHandler = struct {
             else => "workflow_ended",
         };
         self.addHistoryEvent(run, event_type, detail, now_ms);
+        self.persistComplete(shard, run_ns_key, run, status, now_ms);
+    }
+
+    /// Resolve the workflow's `output` mapping (same format as step inputMapping).
+    /// Looks up the definition, parses the YAML, and if `output:` is declared,
+    /// resolves the JSON mapping via PathResolver and stores it on the run.
+    ///
+    /// Two modes:
+    ///  1. `output: "$.steps.ship.output"` → direct path passthrough (raw bytes).
+    ///  2. `output: '{"key": "$.path"}'` → JSON mapping with interpolation.
+    /// If `output` is not declared, workflow output remains null.
+    fn resolveWorkflowOutput(self: *WorkflowHandler, run: *RunRecord, run_ns_key: []const u8) void {
+        // Extract namespace from run_ns_key ("namespace:run_id")
+        const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
+        const namespace = run_ns_key[0..sep];
+
+        // Look up the workflow definition
+        const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+        defer self.allocator.free(def_ns_key);
+        const def_record = self.definitions.get(def_ns_key) orelse return;
+
+        // Parse definition to access the output mapping
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch |err| {
+            log.warn("Failed to parse workflow definition for output resolution: {}", .{err});
+            return;
+        };
+        defer def.deinit(self.allocator);
+
+        const output_expr = def.output orelse return;
+
+        const trimmed = std.mem.trim(u8, output_expr, " \t");
+        if (trimmed.len < 2) return;
+
+        // Mode 1: Direct path passthrough ("$.steps.ship.output" or "$.input")
+        if (trimmed[0] == '$' and trimmed[1] == '.') {
+            var resolver = jsonpath.PathResolver.init(
+                self.allocator,
+                run.input_owned,
+                if (run.step_outputs) |*so| so else null,
+                run.run_id_owned,
+            );
+            const resolved = resolver.resolve(trimmed) catch |err| {
+                log.warn("Workflow output path resolution failed for '{s}': {}", .{ trimmed, err });
+                return;
+            } orelse return;
+
+            if (run.output_owned) |old| self.allocator.free(old);
+            run.output_owned = resolved;
+            return;
+        }
+
+        // Mode 2: JSON mapping — resolve all $.path references within the object
+        const resolved = jsonpath.resolveInput(
+            self.allocator,
+            output_expr,
+            run.input_owned,
+            if (run.step_outputs) |*so| so else null,
+            run.run_id_owned,
+        ) catch |err| {
+            log.warn("Workflow output mapping resolution failed: {}", .{err});
+            return;
+        };
+
+        // Store on the run (free any previous output)
+        if (run.output_owned) |old| self.allocator.free(old);
+        run.output_owned = resolved;
+    }
+
+    /// Build pre-computed search attribute JSON from definition + run data.
+    /// Returns an owned JSON string like `{"customer_id":"C-789","order_amount":149.99}`
+    /// or null if the definition has no search attributes.
+    fn buildSearchTags(self: *WorkflowHandler, def_ns_key: []const u8, run: *RunRecord) ?[]const u8 {
+        const def_rec = self.definitions.get(def_ns_key) orelse return null;
+        var def = parser.parseWorkflow(self.allocator, def_rec.yaml_owned) catch return null;
+        defer def.deinit(self.allocator);
+        if (def.search_attributes.len == 0) return null;
+
+        var resolver = jsonpath.PathResolver.init(
+            self.allocator,
+            run.input_owned,
+            if (run.step_outputs) |*so| so else null,
+            run.run_id_owned,
+        );
+
+        var buf: std.ArrayList(u8) = .empty;
+        const w = buf.writer(self.allocator);
+        w.writeByte('{') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+
+        var first = true;
+        for (def.search_attributes) |attr| {
+            const resolved = resolver.resolve(attr.from) catch null;
+            defer if (resolved) |r| self.allocator.free(r);
+
+            if (!first) w.writeByte(',') catch continue;
+            w.writeByte('"') catch continue;
+            writeJsonEscaped(w, attr.name) catch continue;
+            w.writeAll("\":") catch continue;
+
+            if (resolved) |val| {
+                // val is already JSON-formatted (strings quoted, numbers raw)
+                w.writeAll(val) catch continue;
+            } else {
+                w.writeAll("null") catch continue;
+            }
+            first = false;
+        }
+
+        w.writeByte('}') catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
+        return buf.toOwnedSlice(self.allocator) catch {
+            buf.deinit(self.allocator);
+            return null;
+        };
     }
 
     /// Update the run's current step pointer.
     fn setCurrentStep(self: *WorkflowHandler, run: *RunRecord, step_name: []const u8) void {
         if (run.current_step_name_owned) |old| self.allocator.free(old);
         run.current_step_name_owned = self.allocator.dupe(u8, step_name) catch null;
+        // Reset plan state on step transition
+        run.plan_executor_idx = 0;
+        run.plan_executor_natural_idx = 0;
+        run.plan_executor_retry_count = 0;
     }
 
     // ── Stream Trigger Polling ─────────────────────────────────────────
@@ -2130,9 +2521,10 @@ pub const WorkflowHandler = struct {
         const now_ms: i64 = std.time.milliTimestamp();
         const input = schedule.input_owned orelse "{}";
 
-        // Generate run ID — encode shard for O(1) cross-shard routing
+        // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch return;
+        const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
 
         // Build namespace-qualified run key
         const run_ns_key = self.makeNsKey(schedule.namespace_owned, run_id_str) orelse return;
@@ -2204,7 +2596,7 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        self.persistStart(shard, schedule.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
+        self.persistStart(shard, schedule.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
         self.advanceWorkflow(shard, run_ns_key, schedule.namespace_owned);
     }
 
@@ -2312,9 +2704,10 @@ pub const WorkflowHandler = struct {
     ) void {
         const now_ms: i64 = std.time.milliTimestamp();
 
-        // Generate run ID — encode shard for O(1) cross-shard routing
+        // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const run_id_str = std.fmt.bufPrint(&run_id_buf, "wfrun-{d}-{d}", .{ shard.id, self.nextRunId() }) catch return;
+        const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
 
         // Build namespace-qualified run key
         const run_ns_key = self.makeNsKey(trigger.namespace_owned, run_id_str) orelse return;
@@ -2386,17 +2779,103 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        self.persistStart(shard, trigger.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms);
+        self.persistStart(shard, trigger.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
         self.advanceWorkflow(shard, run_ns_key, trigger.namespace_owned);
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────
+    // ── Plan Health Helpers ─────────────────────────────────────────────
 
-    fn nextRunId(self: *WorkflowHandler) u64 {
-        const id = self.next_run_id;
-        self.next_run_id += 1;
-        return id;
+    /// Get or create the health record for a plan executor.
+    /// Returns null on allocation failure; callers must handle gracefully.
+    fn getOrCreateHealth(
+        self: *WorkflowHandler,
+        namespace: []const u8,
+        workflow: []const u8,
+        plan_name: []const u8,
+        executor_name: []const u8,
+    ) ?*plan_types.ExecutorHealth {
+        const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}:{s}", .{ namespace, workflow, plan_name, executor_name }) catch return null;
+
+        if (self.plan_health.getPtr(key)) |health| {
+            self.allocator.free(key);
+            return health;
+        }
+
+        const owned_name = self.allocator.dupe(u8, executor_name) catch {
+            self.allocator.free(key);
+            return null;
+        };
+
+        self.plan_health.put(key, plan_types.ExecutorHealth.initWithName(owned_name)) catch {
+            self.allocator.free(key);
+            self.allocator.free(owned_name);
+            return null;
+        };
+        return self.plan_health.getPtr(key);
     }
+
+    /// Record an API attempt outcome against a plan executor's health state.
+    /// Updates circuit breaker state if the executor has breaker config.
+    fn recordPlanHealth(
+        self: *WorkflowHandler,
+        namespace: []const u8,
+        workflow: []const u8,
+        plan_name: []const u8,
+        executor: definition.ExecutorConfig,
+        success: bool,
+        now_ms: i64,
+    ) void {
+        const health = self.getOrCreateHealth(namespace, workflow, plan_name, executor.name) orelse return;
+        health.recordApiAttempt(success, 0, now_ms);
+        if (executor.breaker) |breaker_cfg| {
+            health.updateBreakerState(breaker_cfg, success, now_ms);
+        }
+    }
+
+    /// Sort executor indices by health score (descending). Used by health-weighted
+    /// selection to try the healthiest executor first.
+    fn sortExecutorsByHealth(
+        self: *WorkflowHandler,
+        order: []u8,
+        plan: definition.InlinePlan,
+        namespace: []const u8,
+        workflow: []const u8,
+    ) void {
+        // Insertion sort — max 32 executors, O(n²) is fine
+        var i: usize = 1;
+        while (i < order.len) : (i += 1) {
+            var j = i;
+            while (j > 0) {
+                const a_score = self.getExecutorHealthScore(namespace, workflow, plan.name, plan.executors[order[j]].name);
+                const b_score = self.getExecutorHealthScore(namespace, workflow, plan.name, plan.executors[order[j - 1]].name);
+                if (a_score > b_score) {
+                    const tmp = order[j];
+                    order[j] = order[j - 1];
+                    order[j - 1] = tmp;
+                    j -= 1;
+                } else break;
+            }
+        }
+    }
+
+    /// Return the health score for a plan executor (0.0–1.0).
+    /// Returns 1.0 if no health data exists (assume healthy).
+    fn getExecutorHealthScore(
+        self: *WorkflowHandler,
+        namespace: []const u8,
+        workflow: []const u8,
+        plan_name: []const u8,
+        executor_name: []const u8,
+    ) f64 {
+        const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}:{s}", .{ namespace, workflow, plan_name, executor_name }) catch return 1.0;
+        defer self.allocator.free(key);
+        if (self.plan_health.get(key)) |health| {
+            return health.healthScore();
+        }
+        return 1.0;
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
 
     /// Build a namespace-qualified key: "namespace:name" for map lookups.
     fn makeNsKey(self: *WorkflowHandler, namespace: []const u8, name: []const u8) ?[]const u8 {
@@ -2433,7 +2912,9 @@ pub const WorkflowHandler = struct {
     }
 
     /// Persist a workflow_start entry to the UAL so the run survives restart.
-    /// Key stored is "namespace:run_id". Value format: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at_ms:i64][input...]
+    /// Key stored is "namespace:run_id".
+    /// Value format: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at_ms:i64]
+    ///   [tags_len:u16][search_tags]?[input...]
     fn persistStart(
         self: *WorkflowHandler,
         shard: *Shard,
@@ -2443,14 +2924,15 @@ pub const WorkflowHandler = struct {
         version: []const u8,
         input: []const u8,
         created_at_ms: i64,
+        search_tags: ?[]const u8,
     ) void {
         _ = self;
         // Build ns-qualified key: "namespace:run_id"
         var ns_key_buf: [600]u8 = undefined;
         const ns_key = std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id }) catch return;
 
-        // Serialize value: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64][input...]
-        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + input.len;
+        const tags = search_tags orelse "";
+        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + 2 + tags.len + input.len;
         if (value_len > 65000) return;
         var value_buf: [65536]u8 = undefined;
         var off: usize = 0;
@@ -2471,16 +2953,138 @@ pub const WorkflowHandler = struct {
         std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
         off += 8;
 
+        // [tags_len:u16][search_tags]
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(tags.len), .little);
+        off += 2;
+        if (tags.len > 0) {
+            @memcpy(value_buf[off .. off + tags.len], tags);
+            off += tags.len;
+        }
+
         @memcpy(value_buf[off .. off + input.len], input);
         off += input.len;
 
         _ = persistence_mod.persistEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]) catch {};
     }
 
+    /// Persist a workflow_complete entry to the UAL so terminal state survives restarts.
+    /// Value format: [status:u8][completed_at_ms:i64]
+    ///   [has_output:u8][output_len:u32][output]?
+    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
+    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+    ///   [tags_len:u16][search_tags]?
+    fn persistComplete(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        ns_key: []const u8,
+        run: *const RunRecord,
+        status: RunStatus,
+        completed_at_ms: i64,
+    ) void {
+        // Extract namespace from "namespace:run_id"
+        const colon = std.mem.indexOfScalar(u8, ns_key, ':') orelse return;
+        const namespace = ns_key[0..colon];
+
+        // Calculate total size needed
+        var total: usize = 9; // status + completed_at_ms
+        // Output
+        total += 1; // has_output flag
+        if (run.output_owned) |out| {
+            total += 4 + out.len; // output_len + output
+        }
+        // Step outputs
+        total += 2; // step_count
+        if (run.step_outputs) |so| {
+            for (so.entries) |entry| {
+                total += 2 + entry.step_name.len + 2 + entry.outcome.len + 4 + entry.output.len;
+            }
+        }
+        // History events
+        total += 2; // history_count
+        for (run.history.items) |ev| {
+            total += 2 + ev.event_type_owned.len + 2 + ev.detail_owned.len + 8;
+        }
+        // Search tags
+        const tags = run.search_tags_owned orelse "";
+        total += 2 + tags.len;
+
+        const buf = self.allocator.alloc(u8, total) catch return;
+        defer self.allocator.free(buf);
+        var off: usize = 0;
+
+        // [status:u8][completed_at_ms:i64]
+        buf[off] = @intFromEnum(status);
+        off += 1;
+        std.mem.writeInt(i64, buf[off..][0..8], completed_at_ms, .little);
+        off += 8;
+
+        // [has_output:u8][output_len:u32][output]?
+        if (run.output_owned) |out| {
+            buf[off] = 1;
+            off += 1;
+            std.mem.writeInt(u32, buf[off..][0..4], @intCast(out.len), .little);
+            off += 4;
+            @memcpy(buf[off .. off + out.len], out);
+            off += out.len;
+        } else {
+            buf[off] = 0;
+            off += 1;
+        }
+
+        // [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
+        const step_count: u16 = if (run.step_outputs) |so| @intCast(so.entries.len) else 0;
+        std.mem.writeInt(u16, buf[off..][0..2], step_count, .little);
+        off += 2;
+        if (run.step_outputs) |so| {
+            for (so.entries) |entry| {
+                std.mem.writeInt(u16, buf[off..][0..2], @intCast(entry.step_name.len), .little);
+                off += 2;
+                @memcpy(buf[off .. off + entry.step_name.len], entry.step_name);
+                off += entry.step_name.len;
+                std.mem.writeInt(u16, buf[off..][0..2], @intCast(entry.outcome.len), .little);
+                off += 2;
+                @memcpy(buf[off .. off + entry.outcome.len], entry.outcome);
+                off += entry.outcome.len;
+                std.mem.writeInt(u32, buf[off..][0..4], @intCast(entry.output.len), .little);
+                off += 4;
+                @memcpy(buf[off .. off + entry.output.len], entry.output);
+                off += entry.output.len;
+            }
+        }
+
+        // [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+        const hist_count: u16 = @intCast(run.history.items.len);
+        std.mem.writeInt(u16, buf[off..][0..2], hist_count, .little);
+        off += 2;
+        for (run.history.items) |ev| {
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(ev.event_type_owned.len), .little);
+            off += 2;
+            @memcpy(buf[off .. off + ev.event_type_owned.len], ev.event_type_owned);
+            off += ev.event_type_owned.len;
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(ev.detail_owned.len), .little);
+            off += 2;
+            @memcpy(buf[off .. off + ev.detail_owned.len], ev.detail_owned);
+            off += ev.detail_owned.len;
+            std.mem.writeInt(i64, buf[off..][0..8], ev.timestamp_ms, .little);
+            off += 8;
+        }
+
+        // [tags_len:u16][search_tags]?
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(tags.len), .little);
+        off += 2;
+        if (tags.len > 0) {
+            @memcpy(buf[off .. off + tags.len], tags);
+            off += tags.len;
+        }
+
+        _ = persistence_mod.persistEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch {};
+    }
+
     /// Register this handler's entry types with the shared ReplayRegistry.
     pub fn registerReplay(self: *WorkflowHandler, registry: *persistence_mod.ReplayRegistry) void {
         registry.register(.workflow_create, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
+        registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
@@ -2496,6 +3100,7 @@ pub const WorkflowHandler = struct {
         switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value),
             .workflow_start => self.replayStart(cmd.key, cmd.value),
+            .workflow_complete => self.replayComplete(cmd.key, cmd.value),
             else => {},
         }
     }
@@ -2564,7 +3169,8 @@ pub const WorkflowHandler = struct {
         else
             ns_key_raw;
 
-        // Deserialize: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64][input...]
+        // Deserialize: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64]
+        //   [tags_len:u16][search_tags]?[input...]
         var off: usize = 0;
         if (off + 2 > value.len) return;
         const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
@@ -2587,6 +3193,17 @@ pub const WorkflowHandler = struct {
         if (off + 8 > value.len) return;
         const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
         off += 8;
+
+        // Read optional search tags (new format)
+        var search_tags: ?[]const u8 = null;
+        if (off + 2 <= value.len) {
+            const tags_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (tags_len > 0 and off + tags_len <= value.len) {
+                search_tags = value[off .. off + tags_len];
+                off += tags_len;
+            }
+        }
 
         const input = if (off < value.len) value[off..] else "{}";
 
@@ -2617,6 +3234,11 @@ pub const WorkflowHandler = struct {
             return;
         };
 
+        const owned_tags: ?[]const u8 = if (search_tags) |st|
+            self.allocator.dupe(u8, st) catch null
+        else
+            null;
+
         // Skip if already replayed (idempotent)
         if (self.runs.contains(ns_key)) {
             self.allocator.free(ns_key);
@@ -2624,6 +3246,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_wf);
             self.allocator.free(owned_ver);
             self.allocator.free(owned_inp);
+            if (owned_tags) |t| self.allocator.free(t);
             return;
         }
 
@@ -2639,22 +3262,120 @@ pub const WorkflowHandler = struct {
             .idempotency_key_owned = null,
             .signals = .empty,
             .history = .empty,
+            .search_tags_owned = owned_tags,
         }) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_rid);
             self.allocator.free(owned_wf);
             self.allocator.free(owned_ver);
             self.allocator.free(owned_inp);
+            if (owned_tags) |t| self.allocator.free(t);
         };
+    }
 
-        // Advance next_run_id past replayed IDs to prevent collisions
-        // when new runs are started after recovery.
-        if (std.mem.startsWith(u8, raw_run_id, "wfrun-")) {
-            if (std.fmt.parseInt(u64, raw_run_id["wfrun-".len..], 10)) |n| {
-                if (n >= self.next_run_id) {
-                    self.next_run_id = n + 1;
-                }
-            } else |_| {}
+    /// Replay a workflow_complete entry. Updates the run's terminal status,
+    /// output, step_outputs, and history events.
+    /// Value format: [status:u8][completed_at_ms:i64]
+    ///   [has_output:u8][output_len:u32][output]?
+    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
+    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
+        if (value.len < 9) return;
+        const status: RunStatus = @enumFromInt(value[0]);
+        const completed_at_ms = std.mem.readInt(i64, value[1..9], .little);
+
+        // Look up existing run (must have been replayed via workflow_start first)
+        const run = self.runs.getPtr(ns_key_raw) orelse return;
+        run.status = status;
+        run.completed_at_ms = completed_at_ms;
+
+        var off: usize = 9;
+
+        // [has_output:u8][output_len:u32][output]?
+        const has_output = value[off];
+        off += 1;
+        if (has_output == 1) {
+            if (off + 4 > value.len) return;
+            const out_len = std.mem.readInt(u32, value[off..][0..4], .little);
+            off += 4;
+            if (off + out_len > value.len) return;
+            run.output_owned = self.allocator.dupe(u8, value[off .. off + out_len]) catch return;
+            off += out_len;
+        }
+
+        // [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
+        if (off + 2 > value.len) return;
+        const step_count = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (step_count > 0) {
+            var so = StepOutputMap.init();
+            var i: u16 = 0;
+            while (i < step_count) : (i += 1) {
+                if (off + 2 > value.len) return;
+                const name_len = std.mem.readInt(u16, value[off..][0..2], .little);
+                off += 2;
+                if (off + name_len > value.len) return;
+                const name = value[off .. off + name_len];
+                off += name_len;
+
+                if (off + 2 > value.len) return;
+                const outcome_len = std.mem.readInt(u16, value[off..][0..2], .little);
+                off += 2;
+                if (off + outcome_len > value.len) return;
+                const outcome = value[off .. off + outcome_len];
+                off += outcome_len;
+
+                if (off + 4 > value.len) return;
+                const output_len = std.mem.readInt(u32, value[off..][0..4], .little);
+                off += 4;
+                if (off + output_len > value.len) return;
+                const output = value[off .. off + output_len];
+                off += output_len;
+
+                so.put(self.allocator, name, output, outcome) catch return;
+            }
+            run.step_outputs = so;
+        }
+
+        // [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+        if (off + 2 > value.len) return;
+        const hist_count = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        var h: u16 = 0;
+        while (h < hist_count) : (h += 1) {
+            if (off + 2 > value.len) return;
+            const type_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (off + type_len > value.len) return;
+            const event_type = self.allocator.dupe(u8, value[off .. off + type_len]) catch return;
+            off += type_len;
+
+            if (off + 2 > value.len) return;
+            const detail_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (off + detail_len > value.len) return;
+            const detail = self.allocator.dupe(u8, value[off .. off + detail_len]) catch return;
+            off += detail_len;
+
+            if (off + 8 > value.len) return;
+            const timestamp_ms = std.mem.readInt(i64, value[off..][0..8], .little);
+            off += 8;
+
+            run.history.append(self.allocator, .{
+                .event_type_owned = event_type,
+                .detail_owned = detail,
+                .timestamp_ms = timestamp_ms,
+            }) catch return;
+        }
+
+        // [tags_len:u16][search_tags]? — optional, may be absent in old entries
+        if (off + 2 <= value.len) {
+            const tags_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (tags_len > 0 and off + tags_len <= value.len) {
+                if (run.search_tags_owned) |old| self.allocator.free(old);
+                run.search_tags_owned = self.allocator.dupe(u8, value[off .. off + tags_len]) catch null;
+            }
         }
     }
 
@@ -2684,6 +3405,20 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
             },
         }
     }
+}
+
+/// Case-insensitive substring search. needle_lower must already be lowercase.
+fn containsLower(haystack: []const u8, needle_lower: []const u8) bool {
+    if (needle_lower.len == 0) return true;
+    if (haystack.len < needle_lower.len) return false;
+    const end = haystack.len - needle_lower.len + 1;
+    outer: for (0..end) |i| {
+        for (0..needle_lower.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != needle_lower[j]) continue :outer;
+        }
+        return true;
+    }
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

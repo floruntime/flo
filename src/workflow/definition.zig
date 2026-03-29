@@ -57,6 +57,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
 const plan_types = @import("plan_types.zig");
+const json_util = @import("../util/json.zig");
 
 // Re-export from types for convenience
 pub const RunStatus = types.RunStatus;
@@ -950,6 +951,8 @@ pub const WorkflowDefinition = struct {
     schedule: ?ScheduleDef = null,
     /// Optional stream trigger — starts a run for each stream event
     trigger: ?StreamTriggerDef = null,
+    /// Optional output expression (JSONPath, e.g. "$.steps.process_expense.output")
+    output: ?[]const u8 = null,
 
     const WIRE_VERSION: u8 = 1;
 
@@ -993,6 +996,66 @@ pub const WorkflowDefinition = struct {
         if (self.trigger) |*t| {
             var mt = t.*;
             mt.deinit(allocator);
+        }
+
+        if (self.output) |o| allocator.free(o);
+    }
+
+    /// Write dashboard-friendly metadata fields into an open JSON ObjectBuilder.
+    /// Emits: step_count, plan_count, has_schedule, has_trigger, start_step,
+    ///        terminals (array), steps (array).
+    pub fn writeJsonMeta(self: WorkflowDefinition, obj: anytype) !void {
+        try obj.intField("step_count", @as(i64, @intCast(self.steps.len + 1))); // +1 for start
+        try obj.intField("plan_count", @as(i64, @intCast(self.plans.len)));
+        try obj.boolField("has_schedule", self.schedule != null);
+        try obj.boolField("has_trigger", self.trigger != null);
+        try obj.stringField("start_step", "start");
+
+        // terminals: [{ "name": "..." }, ...]
+        {
+            var arr = try obj.arrayField("terminals");
+            try arr.begin();
+            for (self.terminals) |t| {
+                try arr.next();
+                var inner = json_util.ObjectBuilder(@TypeOf(arr.writer)).init(arr.writer);
+                try inner.begin();
+                try inner.stringField("name", t.name);
+                try inner.end();
+            }
+            try arr.end();
+        }
+
+        // steps: [{ "name": "step1" }, { "name": "step2" }, ...]
+        {
+            var arr = try obj.arrayField("steps");
+            try arr.begin();
+            for (self.steps) |s| {
+                try arr.next();
+                var inner = json_util.ObjectBuilder(@TypeOf(arr.writer)).init(arr.writer);
+                try inner.begin();
+                try inner.stringField("name", s.name);
+                try inner.end();
+            }
+            try arr.end();
+        }
+    }
+
+    /// Write empty/default metadata (fallback when YAML parsing fails).
+    pub fn writeJsonMetaEmpty(obj: anytype) !void {
+        try obj.intField("step_count", @as(i64, 0));
+        try obj.intField("plan_count", @as(i64, 0));
+        try obj.boolField("has_schedule", false);
+        try obj.boolField("has_trigger", false);
+        try obj.stringField("start_step", "start");
+        {
+            var arr = try obj.arrayField("terminals");
+            try arr.begin();
+            try arr.end();
+        }
+        {
+            var arr = try obj.arrayField("steps");
+            try arr.begin();
+            try arr.end();
         }
     }
 

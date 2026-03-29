@@ -6,7 +6,7 @@
 //!   flo workflow signal <run_id> --type <signal_type> [--payload <json>]
 //!   flo workflow status <run_id>
 //!   flo workflow history <run_id> [--limit <n>]
-//!   flo workflow list-runs <name> [--status <status>] [--limit <n>]
+//!   flo workflow list-runs [--workflow <name>] [--status <status>] [--search <query>] [--limit <n>]
 //!   flo workflow cancel <run_id> [--reason <reason>]
 //!   flo workflow definition <name> [--version <ver>]
 //!   flo workflow disable <name> [--version <ver>]
@@ -108,8 +108,9 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .name("list-runs")
                 .about("List workflow runs")
                 .aliases(&.{"runs"})
-                .arg("name", "Workflow name")
+                .stringFlag("workflow", 'w', "", "Filter by workflow name")
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
+                .stringFlag("search", 'q', "", "Search runs by keyword")
                 .uintFlag("limit", 'l', 100, "Maximum runs to show")
                 .action(wrapHandler(runListRuns)),
         )
@@ -564,13 +565,20 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runListRuns(ctx: *commander.Context) commander.Error!void {
-    const name = ctx.getPositional("name") orelse {
-        ctx.printErr("Error: workflow name is required\n", .{});
-        return error.CommandFailed;
-    };
+    const wf_flag = ctx.getString("workflow");
+    const name: []const u8 = if (wf_flag) |w| if (w.len > 0) w else "" else "";
 
     const status_filter = ctx.getString("status");
     const status_val: ?[]const u8 = if (status_filter) |s| if (s.len > 0) s else null else null;
+
+    const search_filter = ctx.getString("search");
+    const search_val: ?[]const u8 = if (search_filter) |s| if (s.len > 0) s else null else null;
+
+    // Require at least one filter
+    if (name.len == 0 and search_val == null and status_val == null) {
+        ctx.printErr("Error: specify --workflow, --status, or --search to list runs\n", .{});
+        return error.CommandFailed;
+    }
 
     const limit = ctx.getUint("limit") orelse 100;
     const namespace = ctx.getString("namespace") orelse "default";
@@ -584,7 +592,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit), status_val, null) catch |err| {
+    var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit), status_val, null, search_val) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -595,7 +603,11 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    ctx.print("Runs for workflow: {s}\n", .{name});
+    if (name.len > 0) {
+        ctx.print("Runs for workflow: {s}\n", .{name});
+    } else {
+        ctx.print("Runs across all workflows:\n", .{});
+    }
     if (result.asRawData()) |data| {
         output.printWireList(ctx, data, "(no runs)", &.{
             .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
