@@ -75,6 +75,14 @@ pub const CommandResult = union(enum) {
         data: []const u8,
     },
 
+    /// Multi-GET response (pre-serialized)
+    /// Wire format: [count:u32] ([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
+    /// status: 0 = found, 2 = not_found (value_len=0, version=0 when not found)
+    kv_mget_result: struct {
+        /// Pre-serialized wire data
+        data: []const u8,
+    },
+
     /// Transaction started successfully
     kv_txn_started: void,
 
@@ -681,6 +689,9 @@ pub const CommandResult = union(enum) {
             .kv_history_result => |h| {
                 if (h.data.len > 0) allocator.free(h.data);
             },
+            .kv_mget_result => |b| {
+                if (b.data.len > 0) allocator.free(b.data);
+            },
             .stream_messages => |m| {
                 if (m.data.len > 0) allocator.free(m.data);
             },
@@ -852,6 +863,7 @@ pub const CommandResult = union(enum) {
             .kv_put_ok, .kv_cas_failed, .kv_condition_not_met => .kv_put_response,
             .kv_scan_result => .kv_scan_response,
             .kv_history_result => .kv_history_response,
+            .kv_mget_result => .kv_mget_response,
             .kv_txn_started, .kv_txn_committed, .kv_txn_rolled_back => .ok,
             .kv_snapshot_created => .kv_snapshot_create_response,
             .kv_snapshot_released => .ok,
@@ -947,6 +959,7 @@ pub const CommandResult = union(enum) {
             // Pre-serialized types: tag + length prefix + data blob
             .kv_scan_result => |r| 1 + 4 + r.data.len,
             .kv_history_result => |h| 1 + 4 + h.data.len,
+            .kv_mget_result => |b| 1 + 4 + b.data.len,
 
             .stream_append_ok => 1 + 8 + 8,
             .stream_messages => |m| 1 + 4 + m.data.len + 16, // tag + len + data + next_timestamp_ms + next_sequence
@@ -1105,6 +1118,9 @@ pub const CommandResult = union(enum) {
             },
             .kv_history_result => |h| {
                 try writeSlice(writer, h.data);
+            },
+            .kv_mget_result => |b| {
+                try writeSlice(writer, b.data);
             },
 
             .stream_append_ok => |a| {
@@ -1424,6 +1440,9 @@ pub const CommandResult = union(enum) {
                 .data = try readSlice(reader, allocator),
             } },
             .kv_history_result => .{ .kv_history_result = .{
+                .data = try readSlice(reader, allocator),
+            } },
+            .kv_mget_result => .{ .kv_mget_result = .{
                 .data = try readSlice(reader, allocator),
             } },
 

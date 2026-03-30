@@ -3,6 +3,7 @@
 //! Key-Value operations for the Flo CLI client.
 //! All functions take a *Client and namespace as parameters.
 
+const std = @import("std");
 const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
@@ -120,4 +121,29 @@ pub fn history(client: *Client, namespace: []const u8, key: []const u8, limit: ?
         return client.sendRequestWithOptions(.kv_history, namespace, key, "", builder.getOptions());
     }
     return client.sendRequest(.kv_history, namespace, key, "");
+}
+
+/// Execute a batch GET (MGET) command — multiple keys in one request.
+/// Keys are packed in the value field: [count:u16]([key_len:u16][key])*
+pub fn mget(client: *Client, namespace: []const u8, keys: []const []const u8) !Response {
+    if (keys.len == 0) return error.EmptyBatch;
+    if (keys.len > 256) return error.BatchTooLarge;
+
+    // Pack keys into value field: [count:u16]([key_len:u16][key])*
+    var value_buf: [64 * 1024]u8 = undefined; // 64KB for up to 256 keys
+    var offset: usize = 0;
+
+    // Write count
+    std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(keys.len), .little);
+    offset += 2;
+
+    for (keys) |key| {
+        if (offset + 2 + key.len > value_buf.len) return error.BatchTooLarge;
+        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(key.len), .little);
+        offset += 2;
+        @memcpy(value_buf[offset..][0..key.len], key);
+        offset += key.len;
+    }
+
+    return client.sendRequest(.kv_mget, namespace, "", value_buf[0..offset]);
 }

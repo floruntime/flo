@@ -109,6 +109,18 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("limit", 'l', 10, "Maximum entries to show")
                 .action(wrapHandler(runHistory)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("mget")
+                .about("Get multiple keys in one request")
+                .examples(&.{
+                    "flo kv mget key1 key2 key3",
+                    "flo kv mget user:1 user:2 user:3 --output json",
+                    "flo kv mget key1 key2 --namespace myns",
+                })
+                .variadicArg("keys", "Keys to retrieve (space-separated)")
+                .action(wrapHandler(runMget)),
+        )
         .build();
 }
 
@@ -414,6 +426,130 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
         if (data.len > 0) {
             ctx.print("{s}\n", .{data});
         }
+    }
+}
+
+fn runMget(ctx: *commander.Context) commander.Error!void {
+    const keys = ctx.getVariadicArgs("keys") orelse {
+        ctx.printErr("Error: at least one key is required\n", .{});
+        return error.CommandFailed;
+    };
+
+    if (keys.len == 0) {
+        ctx.printErr("Error: at least one key is required\n", .{});
+        return error.CommandFailed;
+    }
+
+    if (keys.len > 256) {
+        ctx.printErr("Error: max 256 keys per request\n", .{});
+        return error.CommandFailed;
+    }
+
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
+    const format = output.getFormat(ctx);
+
+    if (output.isVerbose(ctx)) {
+        ctx.printErr("[verbose] MGET keys={d} namespace={s} endpoint={s}\n", .{ keys.len, namespace, endpoint });
+    }
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
+        return error.CommandFailed;
+    };
+
+    var result = client_mod.kv.mget(&client, namespace, keys) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    // Parse batch GET response: [count:u32]([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
+    const data = result.asRawData() orelse {
+        ctx.printErr("Error: empty response\n", .{});
+        return error.CommandFailed;
+    };
+
+    if (data.len < 4) {
+        ctx.printErr("Error: malformed response\n", .{});
+        return error.CommandFailed;
+    }
+
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse {
+        ctx.printErr("Error: malformed response\n", .{});
+        return error.CommandFailed;
+    };
+
+    switch (format) {
+        .json => {
+            ctx.print("[", .{});
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const status = reader.readU8() orelse break;
+                const key_len = reader.readU16() orelse break;
+                const key = reader.readSlice(key_len) orelse break;
+                const version = reader.readU64() orelse break;
+                const value_len = reader.readU32() orelse break;
+                const value = reader.readSlice(value_len) orelse break;
+
+                if (i > 0) ctx.print(",", .{});
+                if (status == 0) {
+                    ctx.print("{{\"key\":\"{s}\",\"value\":\"{s}\",\"version\":{d}}}", .{ key, value, version });
+                } else {
+                    ctx.print("{{\"key\":\"{s}\",\"value\":null}}", .{key});
+                }
+            }
+            ctx.print("]\n", .{});
+        },
+        .table => {
+            // Print as aligned table
+            ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ "KEY", "VALUE", "VERSION" });
+            ctx.print("{s:-<30} {s:-<40} {s:-<10}\n", .{ "", "", "" });
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const status = reader.readU8() orelse break;
+                const key_len = reader.readU16() orelse break;
+                const key = reader.readSlice(key_len) orelse break;
+                const version = reader.readU64() orelse break;
+                const value_len = reader.readU32() orelse break;
+                const value = reader.readSlice(value_len) orelse break;
+
+                if (status == 0) {
+                    var ver_buf: [32]u8 = undefined;
+                    const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{version}) catch "";
+                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ key, value, ver_str });
+                } else {
+                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ key, "(nil)", "" });
+                }
+            }
+        },
+        .raw => {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const status = reader.readU8() orelse break;
+                const key_len = reader.readU16() orelse break;
+                const key = reader.readSlice(key_len) orelse break;
+                _ = reader.readU64() orelse break; // skip version
+                const value_len = reader.readU32() orelse break;
+                const value = reader.readSlice(value_len) orelse break;
+
+                if (status == 0) {
+                    ctx.print("{s}\t{s}\n", .{ key, value });
+                } else {
+                    ctx.print("{s}\t(nil)\n", .{key});
+                }
+            }
+        },
     }
 }
 

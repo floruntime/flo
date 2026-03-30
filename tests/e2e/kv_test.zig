@@ -1246,3 +1246,334 @@ test "e2e/kv: history after delete preserves prior versions" {
     const output = try ctx.execCapture(&.{ "kv", "history", "del_hist" });
     try testing.expect(std.mem.indexOf(u8, output, "del_hist") != null);
 }
+
+// =============================================================================
+// Multi-GET (mget) — Single Node
+// =============================================================================
+
+test "e2e/kv: mget basic — all keys exist" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mg_a", "alpha" });
+    try ctx.exec(&.{ "kv", "set", "mg_b", "beta" });
+    try ctx.exec(&.{ "kv", "set", "mg_c", "gamma" });
+
+    // flo kv mget mg_a mg_b mg_c --format json
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_a", "mg_b", "mg_c", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "mg_a");
+    try stdx.testing.assertContains(result, "alpha");
+    try stdx.testing.assertContains(result, "mg_b");
+    try stdx.testing.assertContains(result, "beta");
+    try stdx.testing.assertContains(result, "mg_c");
+    try stdx.testing.assertContains(result, "gamma");
+}
+
+test "e2e/kv: mget partial — some keys missing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mg_exists1", "val1" });
+    try ctx.exec(&.{ "kv", "set", "mg_exists2", "val2" });
+
+    // mget with mix of existing and non-existing keys
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_exists1", "mg_missing", "mg_exists2", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // Existing keys should have values
+    try stdx.testing.assertContains(result, "val1");
+    try stdx.testing.assertContains(result, "val2");
+    // Missing key should be present with null value
+    try stdx.testing.assertContains(result, "mg_missing");
+    try stdx.testing.assertContains(result, "null");
+}
+
+test "e2e/kv: mget all keys missing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "kv", "mget", "nope_a", "nope_b", "nope_c", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // All keys null
+    try stdx.testing.assertContains(result, "nope_a");
+    try stdx.testing.assertContains(result, "nope_b");
+    try stdx.testing.assertContains(result, "nope_c");
+    try stdx.testing.assertContains(result, "null");
+}
+
+test "e2e/kv: mget single key" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mg_single", "only" });
+
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_single", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "mg_single");
+    try stdx.testing.assertContains(result, "only");
+}
+
+test "e2e/kv: mget table format" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "tbl_a", "apple" });
+    try ctx.exec(&.{ "kv", "set", "tbl_b", "banana" });
+
+    var result = try ctx.cli.run(&.{ "kv", "mget", "tbl_a", "tbl_b", "--format", "table" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "KEY");
+    try stdx.testing.assertContains(result, "VALUE");
+    try stdx.testing.assertContains(result, "tbl_a");
+    try stdx.testing.assertContains(result, "apple");
+    try stdx.testing.assertContains(result, "tbl_b");
+    try stdx.testing.assertContains(result, "banana");
+}
+
+test "e2e/kv: mget reflects latest value after overwrite" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mg_ow", "original" });
+    try ctx.exec(&.{ "kv", "set", "mg_ow", "updated" });
+
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_ow", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "updated");
+    try stdx.testing.assertNotContains(result, "original");
+}
+
+test "e2e/kv: mget after delete shows nil" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mg_del_a", "va" });
+    try ctx.exec(&.{ "kv", "set", "mg_del_b", "vb" });
+    try ctx.exec(&.{ "kv", "delete", "mg_del_a" });
+
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_del_a", "mg_del_b", "--format", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // mg_del_a was deleted, should be null
+    try stdx.testing.assertContains(result, "null");
+    // mg_del_b should still have its value
+    try stdx.testing.assertContains(result, "vb");
+}
+
+// =============================================================================
+// Multi-GET (mget) — Multi-Shard
+// =============================================================================
+
+test "e2e/kv: mget across shards returns all results" {
+    // 4 shards — keys hash to different shards via Wyhash
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    // Use enough distinctly-named keys to ensure cross-shard distribution
+    const keys = [_][]const u8{
+        "alpha_cpu", "bravo_mem",   "charlie_disk", "delta_net",
+        "echo_iops", "foxtrot_lat", "golf_tput",    "hotel_err",
+    };
+    const vals = [_][]const u8{
+        "v_alpha", "v_bravo",   "v_charlie", "v_delta",
+        "v_echo",  "v_foxtrot", "v_golf",    "v_hotel",
+    };
+
+    for (keys, vals) |k, v| {
+        try ctx.exec(&.{ "kv", "set", k, v });
+    }
+
+    // MGET all 8 keys in one request — handler must gather from all shards
+    var result = try ctx.cli.run(&.{
+        "kv",           "mget",      "alpha_cpu", "bravo_mem",
+        "charlie_disk", "delta_net", "echo_iops", "foxtrot_lat",
+        "golf_tput",    "hotel_err", "--format",  "json",
+    });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    for (keys, vals) |k, v| {
+        try stdx.testing.assertContains(result, k);
+        try stdx.testing.assertContains(result, v);
+    }
+}
+
+test "e2e/kv: mget across shards with partial hits" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    // Only set some keys — others will miss on various shards
+    try ctx.exec(&.{ "kv", "set", "shard_hit_1", "found1" });
+    try ctx.exec(&.{ "kv", "set", "shard_hit_3", "found3" });
+
+    var result = try ctx.cli.run(&.{
+        "kv",          "mget",         "shard_hit_1", "shard_miss_2",
+        "shard_hit_3", "shard_miss_4", "--format",    "json",
+    });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "found1");
+    try stdx.testing.assertContains(result, "found3");
+    try stdx.testing.assertContains(result, "shard_miss_2");
+    try stdx.testing.assertContains(result, "shard_miss_4");
+    try stdx.testing.assertContains(result, "null");
+}
+
+test "e2e/kv: mget with namespace across shards" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "mget_ns" });
+
+    try ctx.exec(&.{ "kv", "set", "ns_key1", "ns_val1", "-n", "mget_ns" });
+    try ctx.exec(&.{ "kv", "set", "ns_key2", "ns_val2", "-n", "mget_ns" });
+    try ctx.exec(&.{ "kv", "set", "ns_key3", "ns_val3", "-n", "mget_ns" });
+
+    // Also set same keys in default namespace with different values
+    try ctx.exec(&.{ "kv", "set", "ns_key1", "default_val" });
+
+    // MGET in the named namespace — should NOT return default namespace values
+    var result = try ctx.cli.run(&.{
+        "kv", "mget", "ns_key1", "ns_key2", "ns_key3", "-n", "mget_ns", "--format", "json",
+    });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertContains(result, "ns_val1");
+    try stdx.testing.assertContains(result, "ns_val2");
+    try stdx.testing.assertContains(result, "ns_val3");
+    try stdx.testing.assertNotContains(result, "default_val");
+}
+
+// =============================================================================
+// Multi-GET (mget) — Multi-Node Cluster
+// =============================================================================
+
+test "e2e/kv/cluster: mget after replication" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    // Write keys on node 0
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_a", "cluster_alpha" });
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_b", "cluster_beta" });
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_c", "cluster_gamma" });
+
+    // Allow replication
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // MGET from node 1 — keys were written on node 0
+    const result1 = try cluster.execCaptureOnWithRetry(1, &.{
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+    }, 5, 500);
+    defer testing.allocator.free(result1);
+
+    try testing.expect(std.mem.indexOf(u8, result1, "cluster_alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, result1, "cluster_beta") != null);
+    try testing.expect(std.mem.indexOf(u8, result1, "cluster_gamma") != null);
+
+    // MGET from node 2
+    const result2 = try cluster.execCaptureOnWithRetry(2, &.{
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+    }, 5, 500);
+    defer testing.allocator.free(result2);
+
+    try testing.expect(std.mem.indexOf(u8, result2, "cluster_alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, result2, "cluster_beta") != null);
+    try testing.expect(std.mem.indexOf(u8, result2, "cluster_gamma") != null);
+}
+
+test "e2e/kv/cluster: mget reads from all nodes" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    // Write different keys from different nodes
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_n0", "from_node0" });
+    try cluster.execOn(1, &.{ "kv", "set", "cmg_n1", "from_node1" });
+    try cluster.execOn(2, &.{ "kv", "set", "cmg_n2", "from_node2" });
+
+    // Allow replication
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // MGET all three keys from each node
+    for (0..3) |node| {
+        const result = try cluster.execCaptureOnWithRetry(@intCast(node), &.{
+            "kv", "mget", "cmg_n0", "cmg_n1", "cmg_n2", "--format", "json",
+        }, 5, 500);
+        defer testing.allocator.free(result);
+
+        try testing.expect(std.mem.indexOf(u8, result, "from_node0") != null);
+        try testing.expect(std.mem.indexOf(u8, result, "from_node1") != null);
+        try testing.expect(std.mem.indexOf(u8, result, "from_node2") != null);
+    }
+}
+
+test "e2e/kv/cluster: mget with partial hits across cluster" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    // Only set 2 of 4 keys
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_hit_a", "found_a" });
+    try cluster.execOn(1, &.{ "kv", "set", "cmg_hit_b", "found_b" });
+
+    // Allow replication
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // MGET 4 keys (2 exist, 2 missing) from node 2
+    const result = try cluster.execCaptureOnWithRetry(2, &.{
+        "kv", "mget", "cmg_hit_a", "cmg_miss_x", "cmg_hit_b", "cmg_miss_y", "--format", "json",
+    }, 5, 500);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "found_a") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "found_b") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "cmg_miss_x") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "cmg_miss_y") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "null") != null);
+}
+
+test "e2e/kv/cluster: mget after node failure" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    // Write keys on node 0
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_survive_a", "survives_a" });
+    try cluster.execOn(0, &.{ "kv", "set", "cmg_survive_b", "survives_b" });
+
+    // Allow replication to all 3 nodes
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // Kill node 0
+    cluster.stopNode(0);
+
+    // Allow re-election
+    std.Thread.sleep(3 * std.time.ns_per_s);
+
+    // MGET from surviving node — data should be available
+    const result = try cluster.execCaptureOnWithRetry(1, &.{
+        "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--format", "json",
+    }, 5, 1000);
+    defer testing.allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "survives_a") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "survives_b") != null);
+}
