@@ -113,6 +113,7 @@ pub const KVHandler = struct {
         dispatcher.registerWithRoute(.kv_delete, dispatchDelete, preRouteByKey);
         dispatcher.registerWalk(.kv_scan, dispatchScan, localScanKeys);
         dispatcher.register(.kv_history, dispatchHistory);
+        dispatcher.register(.kv_mget, dispatchMget);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -359,6 +360,147 @@ pub const KVHandler = struct {
         const cmd_result = shard.kv_handler.*.handleCommand(req);
         defer shard.kv_handler.*.freeResult(cmd_result);
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
+    // ── Multi-GET (mget) ─────────────────────────────────────────────────
+
+    /// Maximum keys in a single MGET request.
+    const MAX_MGET_KEYS = 256;
+
+    /// Maximum response buffer for MGET (256 keys × average ~4KB = ~1MB).
+    const MAX_MGET_RESPONSE = 1024 * 1024;
+
+    /// Handle a batch GET request: look up multiple keys in a single round trip.
+    /// Keys may span multiple shards — uses peer_shards for cross-shard reads.
+    ///
+    /// Request wire format (in value field):
+    ///   [count:u16] ([key_len:u16][key])*
+    ///
+    /// Response wire format:
+    ///   [count:u32] ([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
+    ///   status: 0 = found, 2 = not_found
+    fn dispatchMget(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Parse key count from value field
+        if (req.value.len < 2) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "mget: missing key count" } });
+            return;
+        }
+
+        const count = std.mem.readInt(u16, req.value[0..2], .little);
+        if (count == 0) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "mget: zero keys" } });
+            return;
+        }
+        if (count > MAX_MGET_KEYS) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "mget: too many keys (max 256)" } });
+            return;
+        }
+
+        // Parse all keys from the packed value field
+        var keys: [MAX_MGET_KEYS][]const u8 = undefined;
+        var offset: usize = 2;
+        for (0..count) |i| {
+            if (offset + 2 > req.value.len) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "mget: truncated key list" } });
+                return;
+            }
+            const key_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
+            offset += 2;
+            if (offset + key_len > req.value.len) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "mget: truncated key data" } });
+                return;
+            }
+            keys[i] = req.value[offset..][0..key_len];
+            offset += key_len;
+        }
+
+        // Build response: [count:u32] ([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
+        var resp_buf: [MAX_MGET_RESPONSE]u8 = undefined;
+        var resp_offset: usize = 4; // reserve space for count header
+
+        for (0..count) |i| {
+            const raw_key = keys[i];
+
+            // Namespace-qualify key
+            var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+            const qkey = qualifyKey(&qbuf, req.namespace, raw_key) catch {
+                // Key too large — treat as not found
+                if (resp_offset + 1 + 2 + raw_key.len + 8 + 4 > resp_buf.len) break;
+                resp_buf[resp_offset] = 2; // not_found
+                resp_offset += 1;
+                std.mem.writeInt(u16, resp_buf[resp_offset..][0..2], @intCast(raw_key.len), .little);
+                resp_offset += 2;
+                @memcpy(resp_buf[resp_offset..][0..raw_key.len], raw_key);
+                resp_offset += raw_key.len;
+                std.mem.writeInt(u64, resp_buf[resp_offset..][0..8], 0, .little);
+                resp_offset += 8;
+                std.mem.writeInt(u32, resp_buf[resp_offset..][0..4], 0, .little);
+                resp_offset += 4;
+                continue;
+            };
+
+            // Route key to the correct shard
+            const lookup_result = lookupKeyOnShard(shard, req.namespace, raw_key, qkey);
+
+            // Serialize result entry
+            const value_data = if (lookup_result.found) lookup_result.value else &[_]u8{};
+            const entry_size = 1 + 2 + raw_key.len + 8 + 4 + value_data.len;
+            if (resp_offset + entry_size > resp_buf.len) break; // response buffer full
+
+            resp_buf[resp_offset] = if (lookup_result.found) 0 else 2;
+            resp_offset += 1;
+            std.mem.writeInt(u16, resp_buf[resp_offset..][0..2], @intCast(raw_key.len), .little);
+            resp_offset += 2;
+            @memcpy(resp_buf[resp_offset..][0..raw_key.len], raw_key);
+            resp_offset += raw_key.len;
+            std.mem.writeInt(u64, resp_buf[resp_offset..][0..8], lookup_result.version, .little);
+            resp_offset += 8;
+            std.mem.writeInt(u32, resp_buf[resp_offset..][0..4], @intCast(value_data.len), .little);
+            resp_offset += 4;
+            if (value_data.len > 0) {
+                @memcpy(resp_buf[resp_offset..][0..value_data.len], value_data);
+                resp_offset += value_data.len;
+            }
+        }
+
+        // Write count header
+        std.mem.writeInt(u32, resp_buf[0..4], @intCast(count), .little);
+
+        log.debug("KV MGET: count={d}, response_size={d}", .{ count, resp_offset });
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_mget_result = .{ .data = resp_buf[0..resp_offset] } });
+    }
+
+    const MgetLookup = struct {
+        found: bool,
+        value: []const u8,
+        version: u64,
+    };
+
+    /// Look up a single key, routing to the correct shard via peer_shards.
+    fn lookupKeyOnShard(shard: *Shard, namespace: []const u8, raw_key: []const u8, qkey: []const u8) MgetLookup {
+        const hash = router.hashKeyWithNamespace(namespace, raw_key);
+        const target_shard_id = shard.router.partitionToShard(shard.router.hashToPartition(hash));
+
+        if (target_shard_id == shard.id) {
+            // Local lookup
+            if (shard.kv_handler.*.kv.get(qkey)) |entry| {
+                return .{ .found = true, .value = entry.value, .version = entry.version };
+            }
+            return .{ .found = false, .value = &[_]u8{}, .version = 0 };
+        }
+
+        // Cross-shard lookup via peer_shards
+        if (shard.peer_shards) |peers| {
+            if (target_shard_id < peers.len) {
+                if (peers[target_shard_id].kv_handler.*.kv.get(qkey)) |entry| {
+                    return .{ .found = true, .value = entry.value, .version = entry.version };
+                }
+            }
+        }
+        return .{ .found = false, .value = &[_]u8{}, .version = 0 };
     }
 
     // ── Raft Propose ────────────────────────────────────────────────────
@@ -788,6 +930,9 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
         .kv_history_result => |hist| {
             shard.sendOkResponse(conn, request_id, hist.data);
         },
+        .kv_mget_result => |batch| {
+            shard.sendOkResponse(conn, request_id, batch.data);
+        },
         .err => |e| {
             const status = errorCodeToStatus(e.code);
             shard.sendErrorResponse(conn, request_id, status, e.message);
@@ -899,7 +1044,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
             .version = proto.VERSION,
             .op_code = @intFromEnum(op),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
         },
         .namespace = "default",
         .key = key,
@@ -1274,15 +1419,17 @@ test "kv handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_delete)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_scan)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_history)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_mget)] != null);
 
     // Verify pre-route hooks
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_get)] != null);
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_put)] != null);
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_scan)] == null); // walk-only, no pre-route
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_history)] == null); // no routing for history
+    try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_mget)] == null); // multi-key, no pre-route
 
-    // 5 handlers registered
-    try testing.expectEqual(@as(u16, 5), dispatcher.handler_count);
+    // 6 handlers registered
+    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
 }
 
 test "kv handler: pre-route by key" {

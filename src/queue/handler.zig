@@ -858,7 +858,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
             .version = proto.VERSION,
             .op_code = @intFromEnum(op),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
         },
         .namespace = "default",
         .key = key,

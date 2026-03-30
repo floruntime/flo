@@ -1315,7 +1315,7 @@ pub const ActionsHandler = struct {
         var name = key;
         if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR)) |sep| {
             namespace = key[0..sep];
-            name = key[sep + 1..];
+            name = key[sep + 1 ..];
         }
 
         const version = std.mem.readInt(u32, value[0..4], .little);
@@ -1350,7 +1350,7 @@ pub const ActionsHandler = struct {
         // Extract plain name from possibly qualified key
         var name = key;
         if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR)) |sep| {
-            name = key[sep + 1..];
+            name = key[sep + 1 ..];
         }
         if (self.actions.fetchRemove(name)) |old| {
             self.allocator.free(old.value.namespace_owned);
@@ -1888,7 +1888,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
             .version = proto.VERSION,
             .op_code = @intFromEnum(op),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
         },
         .namespace = "default",
         .key = key,

@@ -120,7 +120,7 @@ fn sendRequest(
             .version = proto.VERSION,
             .op_code = @intFromEnum(op_code),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
             .payload_length = 0, // Will be set during serialization
             .request_id = 1, // Simple request ID for CLI
             .crc32 = 0, // Will be computed during serialization

@@ -217,7 +217,7 @@ pub const Client = struct {
         }
 
         // Read response header
-        var header_buf: [24]u8 = undefined;
+        var header_buf: [@sizeOf(proto.ResponseHeader)]u8 = undefined;
         try readExact(stream, &header_buf);
 
         const response_header = @as(*align(1) const proto.ResponseHeader, @ptrCast(&header_buf)).*;

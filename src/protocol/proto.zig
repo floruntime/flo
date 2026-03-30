@@ -16,211 +16,238 @@ pub const MAGIC: u32 = 0x004F4C46;
 /// Protocol version (for future evolution)
 pub const VERSION: u8 = 0x01;
 
-/// Operation codes organized by functional area
-/// Full opcode space defined now, implement incrementally
-pub const OpCode = enum(u8) {
-    // System Operations (0x00 - 0x0F)
-    ping = 0x00,
-    pong = 0x01,
-    error_response = 0x02,
-    auth = 0x03,
-    set_durability = 0x04, // Set per-connection durability mode
-    ok = 0x05, // Generic OK response
+/// Maximum number of opcodes supported by the dispatch table.
+/// Layout: Infra(0x0__) + Data(0x1__–0x2__) + Compute(0x3__)
+/// See docs/architecture/OPCODE_LAYOUT.md for full rationale.
+pub const MAX_OPCODES: u16 = 1024;
 
-    // Streams (0x10 - 0x1F)
-    stream_append = 0x10,
-    stream_read = 0x11,
-    stream_trim = 0x12,
-    stream_info = 0x13,
-    stream_append_response = 0x14,
-    stream_read_response = 0x15,
-    stream_event = 0x16, // Server-push for subscriptions
-    stream_subscribe = 0x17, // Subscribe to stream (WebSocket continuous push)
-    stream_unsubscribe = 0x18, // Unsubscribe from stream
-    stream_subscribed = 0x19, // Response: subscription confirmed
-    stream_unsubscribed = 0x1A, // Response: unsubscription confirmed
-    stream_list = 0x1B, // List all streams in namespace
-    stream_list_response = 0x1C,
-    stream_create = 0x1D, // Create stream with partition count
-    stream_create_response = 0x1E,
-    stream_alter = 0x1F, // Alter stream configuration (retention policy)
+/// Operation codes — three-layer layout:
+///   Infra  (0x000–0x0FF): System, Namespace, Cluster
+///   Data   (0x100–0x2FF): KV, Streams, Queues, TS, Vectors
+///   Compute(0x300–0x3FF): Actions, Workers, Workflows, Processing, Emit
+pub const OpCode = enum(u16) {
 
-    // Stream Consumer Groups (0x20 - 0x2F)
-    stream_group_create = 0x20, // Create consumer group with configuration
-    stream_group_join = 0x21,
-    stream_group_leave = 0x22,
-    stream_group_read = 0x23,
-    stream_group_ack = 0x24,
-    stream_group_claim = 0x25,
-    stream_group_pending = 0x26,
-    stream_group_configure_sweeper = 0x27,
-    stream_group_read_response = 0x28,
-    stream_group_nack = 0x29,
-    stream_group_touch = 0x2A, // Extend ack deadline for pending messages
-    stream_group_info = 0x2B, // Get consumer group info (config + consumers)
-    stream_group_delete = 0x2C, // Delete consumer group
+    // =========================================================================
+    // INFRASTRUCTURE — Page 0x0__ (256 slots)
+    // =========================================================================
 
-    // Flo-KV Operations (0x30 - 0x3F)
-    kv_put = 0x30,
-    kv_get = 0x31,
-    kv_delete = 0x32,
-    kv_scan = 0x33,
-    kv_history = 0x34,
-    kv_get_response = 0x35,
-    kv_put_response = 0x36,
-    kv_scan_response = 0x37,
-    kv_history_response = 0x38,
+    // ── System (0x000 – 0x00F) ───────────────────────────────────────────────
+    ping = 0x000,
+    pong = 0x001,
+    error_response = 0x002,
+    auth = 0x003,
+    set_durability = 0x004,
+    ok = 0x005,
 
-    // Transactions (0x39 - 0x3B)
-    kv_begin_txn = 0x39,
-    kv_commit_txn = 0x3A,
-    kv_rollback_txn = 0x3B,
+    // ── Namespace (0x010 – 0x02F) ────────────────────────────────────────────
+    namespace_create = 0x010,
+    namespace_delete = 0x011,
+    namespace_list = 0x012,
+    namespace_info = 0x013,
+    namespace_config_set = 0x014,
+    namespace_config_get = 0x015,
+    namespace_create_response = 0x020,
+    namespace_delete_response = 0x021,
+    namespace_list_response = 0x022,
+    namespace_info_response = 0x023,
+    namespace_config_set_response = 0x024,
+    namespace_config_get_response = 0x025,
 
-    // Snapshots (0x3C - 0x3F)
-    kv_snapshot_create = 0x3C,
-    kv_snapshot_get = 0x3D,
-    kv_snapshot_release = 0x3E,
-    kv_snapshot_create_response = 0x3F,
+    // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
+    cluster_status = 0x030,
+    cluster_members = 0x031,
+    cluster_join = 0x032,
+    cluster_leave = 0x033,
+    cluster_transfer_leader = 0x034,
+    cluster_add_node = 0x035,
+    cluster_remove_node = 0x036,
+    cluster_status_response = 0x040,
+    cluster_members_response = 0x041,
+    cluster_join_response = 0x042,
 
-    // Queues (0x40 - 0x5F)
-    queue_enqueue = 0x40,
-    queue_dequeue = 0x41,
-    queue_complete = 0x42,
-    queue_extend_lease = 0x43,
-    queue_fail = 0x44,
-    queue_fail_auto = 0x45, // Fail with auto retry/DLQ based on config
-    queue_dlq_list = 0x46,
-    queue_dlq_delete = 0x47,
-    queue_dlq_requeue = 0x48,
-    queue_dlq_stats = 0x49,
-    queue_promote_due = 0x4A,
-    queue_stats = 0x4B, // Get queue statistics
-    queue_peek = 0x4C, // Peek without consuming
-    queue_touch = 0x4D, // Extend lease timeout (renew)
-    queue_batch_enqueue = 0x4E, // Batch enqueue multiple messages
-    queue_purge = 0x4F, // Delete all messages from queue
+    // 0x050–0x0FF: infra reserve (auth, rate-limit, telemetry, audit)
 
-    // Queue responses (0x50 - 0x5F)
-    queue_enqueue_response = 0x50,
-    queue_dequeue_response = 0x51,
-    queue_dlq_list_response = 0x52,
-    queue_stats_response = 0x53,
-    queue_peek_response = 0x54,
-    queue_touch_response = 0x55,
-    queue_batch_enqueue_response = 0x56,
-    queue_purge_response = 0x57,
-    queue_list = 0x58, // List all queues in namespace
-    queue_list_response = 0x59,
+    // =========================================================================
+    // DATA — Pages 0x1__ + 0x2__ (512 slots)
+    // =========================================================================
 
-    // Actions (0x60 - 0x6F) — action definitions + task dispatch
-    action_register = 0x60, // Register an action (user or WASM)
-    action_invoke = 0x61, // Invoke an action (create run)
-    action_status = 0x62, // Get action run status
-    action_list = 0x63, // List registered actions
-    action_delete = 0x64, // Delete/disable an action
-    action_await = 0x65, // Worker blocks waiting for task assignment
-    action_complete = 0x66, // Worker completes a task
-    action_fail = 0x67, // Worker fails a task (with optional retry)
-    action_touch = 0x68, // Extend task lease
-    action_register_response = 0x69,
-    action_invoke_response = 0x6A,
-    action_status_response = 0x6B,
-    action_list_response = 0x6C,
-    action_task_assignment = 0x6D, // Push task to worker
-    action_list_runs = 0x6E, // List runs for an action
+    // ── KV + Transactions + Snapshots (0x100 – 0x12F) ───────────────────────
+    kv_put = 0x100,
+    kv_get = 0x101,
+    kv_mget = 0x102,
+    kv_delete = 0x103,
+    kv_scan = 0x104,
+    kv_history = 0x105,
+    kv_get_response = 0x106,
+    kv_mget_response = 0x107,
+    kv_put_response = 0x108,
+    kv_scan_response = 0x109,
+    kv_history_response = 0x10A,
 
-    // Workers (0x70 - 0x7F) — physical worker tracking & health
-    worker_register = 0x70, // Register worker with type + metadata
-    worker_heartbeat = 0x71, // Worker heartbeat / health ping
-    worker_deregister = 0x72, // Remove worker from registry
-    worker_list = 0x73, // List all workers (with health)
-    worker_info = 0x74, // Get single worker details
-    worker_register_response = 0x75,
-    worker_list_response = 0x76,
-    worker_info_response = 0x77,
-    worker_drain = 0x78, // Drain a worker (stop new task assignments)
+    kv_begin_txn = 0x110,
+    kv_commit_txn = 0x111,
+    kv_rollback_txn = 0x112,
 
-    // Workflows (0x80 - 0x8F)
-    workflow_create = 0x80, // Create workflow from YAML definition
-    workflow_start = 0x81, // Start a workflow run
-    workflow_signal = 0x82, // Send signal to running workflow
-    workflow_cancel = 0x83, // Cancel a workflow run
-    workflow_status = 0x84, // Get workflow run status
-    workflow_history = 0x85, // Get workflow run history
-    workflow_list_runs = 0x86, // List workflow runs
-    workflow_get_definition = 0x87, // Get workflow definition
-    workflow_create_response = 0x88,
-    workflow_start_response = 0x89,
-    workflow_status_response = 0x8A,
-    workflow_history_response = 0x8B,
-    workflow_list_runs_response = 0x8C,
-    workflow_get_definition_response = 0x8D,
-    workflow_disable = 0x8E,
-    workflow_enable = 0x8F,
-    workflow_disable_response = 0x90,
-    workflow_enable_response = 0x91,
-    workflow_list_definitions = 0x92,
-    workflow_list_definitions_response = 0x93,
+    kv_snapshot_create = 0x120,
+    kv_snapshot_get = 0x121,
+    kv_snapshot_release = 0x122,
+    kv_snapshot_create_response = 0x123,
 
-    // Cluster Management (0xA0 - 0xAF)
-    cluster_status = 0xA0, // Get cluster status (leader, term, health)
-    cluster_members = 0xA1, // List cluster members
-    cluster_join = 0xA2, // Request to join cluster
-    cluster_leave = 0xA3, // Request to leave cluster gracefully
-    cluster_transfer_leader = 0xA4, // Transfer leadership to another node
-    cluster_add_node = 0xA5, // Admin: add node to cluster (leader only)
-    cluster_remove_node = 0xA6, // Admin: remove node from cluster (leader only)
-    cluster_status_response = 0xA8,
-    cluster_members_response = 0xA9,
-    cluster_join_response = 0xAA,
+    // ── Streams (0x130 – 0x14F) ──────────────────────────────────────────────
+    stream_append = 0x130,
+    stream_read = 0x131,
+    stream_trim = 0x132,
+    stream_info = 0x133,
+    stream_append_response = 0x134,
+    stream_read_response = 0x135,
+    stream_event = 0x136,
+    stream_subscribe = 0x137,
+    stream_unsubscribe = 0x138,
+    stream_subscribed = 0x139,
+    stream_unsubscribed = 0x13A,
+    stream_list = 0x13B,
+    stream_list_response = 0x13C,
+    stream_create = 0x13D,
+    stream_create_response = 0x13E,
+    stream_alter = 0x13F,
 
-    // Namespace Management (0xB0 - 0xBF)
-    namespace_create = 0xB0, // Create a new namespace
-    namespace_delete = 0xB1, // Delete an existing namespace
-    namespace_list = 0xB2, // List all namespaces
-    namespace_info = 0xB3, // Get namespace info/config
-    namespace_create_response = 0xB4,
-    namespace_delete_response = 0xB5,
-    namespace_list_response = 0xB6,
-    namespace_info_response = 0xB7,
-    namespace_config_set = 0xB8, // Set namespace configuration (admin-only)
-    namespace_config_get = 0xB9, // Get namespace configuration
-    namespace_config_set_response = 0xBA,
-    namespace_config_get_response = 0xBB,
+    // ── Stream Consumer Groups (0x150 – 0x16F) ──────────────────────────────
+    stream_group_create = 0x150,
+    stream_group_join = 0x151,
+    stream_group_leave = 0x152,
+    stream_group_read = 0x153,
+    stream_group_ack = 0x154,
+    stream_group_claim = 0x155,
+    stream_group_pending = 0x156,
+    stream_group_configure_sweeper = 0x157,
+    stream_group_read_response = 0x158,
+    stream_group_nack = 0x159,
+    stream_group_touch = 0x15A,
+    stream_group_info = 0x15B,
+    stream_group_delete = 0x15C,
 
-    // Processing / Stream Processing (0xC0 - 0xCF)
-    processing_submit = 0xC0, // Submit a processing job
-    processing_stop = 0xC1, // Gracefully stop a processing job
-    processing_cancel = 0xC2, // Force cancel a processing job
-    processing_status = 0xC3, // Get processing job status
-    processing_list = 0xC4, // List processing jobs
-    processing_savepoint = 0xC6, // Trigger a savepoint
-    processing_restore = 0xC7, // Restore from a savepoint
-    processing_rescale = 0xC8, // Rescale job parallelism
-    processing_submit_response = 0xC9,
-    processing_stop_response = 0xCA,
-    processing_cancel_response = 0xCB,
-    processing_status_response = 0xCC,
-    processing_list_response = 0xCD,
-    processing_savepoint_response = 0xCF,
-    processing_restore_response = 0xD0,
-    processing_rescale_response = 0xD1,
+    // ── Queues (0x170 – 0x19F) ───────────────────────────────────────────────
+    queue_enqueue = 0x170,
+    queue_dequeue = 0x171,
+    queue_complete = 0x172,
+    queue_extend_lease = 0x173,
+    queue_fail = 0x174,
+    queue_fail_auto = 0x175,
+    queue_dlq_list = 0x176,
+    queue_dlq_delete = 0x177,
+    queue_dlq_requeue = 0x178,
+    queue_dlq_stats = 0x179,
+    queue_promote_due = 0x17A,
+    queue_stats = 0x17B,
+    queue_peek = 0x17C,
+    queue_touch = 0x17D,
+    queue_batch_enqueue = 0x17E,
+    queue_purge = 0x17F,
 
-    // Time-Series Operations (0xE0-0xEF)
-    ts_write = 0xE0, // Write data point(s) to a time-series
-    ts_read = 0xE1, // Read raw data points from a time-series
-    ts_query = 0xE2, // Aggregated query over a time range
-    ts_floql = 0xE3, // FloQL query string
-    ts_list = 0xE4, // List measurements or series
-    ts_delete = 0xE5, // Delete a series and its metadata
-    ts_retention = 0xE6, // Configure retention / downsampling policy
-    ts_write_response = 0xE7,
-    ts_read_response = 0xE8,
-    ts_query_response = 0xE9,
-    ts_floql_response = 0xEA,
-    ts_list_response = 0xEB,
-    ts_delete_response = 0xEC,
-    ts_retention_response = 0xED,
+    queue_enqueue_response = 0x190,
+    queue_dequeue_response = 0x191,
+    queue_dlq_list_response = 0x192,
+    queue_stats_response = 0x193,
+    queue_peek_response = 0x194,
+    queue_touch_response = 0x195,
+    queue_batch_enqueue_response = 0x196,
+    queue_purge_response = 0x197,
+    queue_list = 0x198,
+    queue_list_response = 0x199,
+
+    // ── Time-Series (0x1A0 – 0x1BF) ─────────────────────────────────────────
+    ts_write = 0x1A0,
+    ts_read = 0x1A1,
+    ts_query = 0x1A2,
+    ts_floql = 0x1A3,
+    ts_list = 0x1A4,
+    ts_delete = 0x1A5,
+    ts_retention = 0x1A6,
+    ts_write_response = 0x1A7,
+    ts_read_response = 0x1A8,
+    ts_query_response = 0x1A9,
+    ts_floql_response = 0x1AA,
+    ts_list_response = 0x1AB,
+    ts_delete_response = 0x1AC,
+    ts_retention_response = 0x1AD,
+
+    // 0x1C0–0x2FF: data reserve (vectors, documents, geospatial, counters)
+
+    // =========================================================================
+    // COMPUTE — Page 0x3__ (256 slots)
+    // =========================================================================
+
+    // ── Actions (0x300 – 0x31F) ──────────────────────────────────────────────
+    action_register = 0x300,
+    action_invoke = 0x301,
+    action_status = 0x302,
+    action_list = 0x303,
+    action_list_runs = 0x304,
+    action_delete = 0x305,
+    action_await = 0x306,
+    action_complete = 0x307,
+    action_fail = 0x308,
+    action_touch = 0x309,
+    action_register_response = 0x310,
+    action_invoke_response = 0x311,
+    action_status_response = 0x312,
+    action_list_response = 0x313,
+    action_list_runs_response = 0x314,
+    action_task_assignment = 0x315,
+
+    // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
+    worker_register = 0x320,
+    worker_heartbeat = 0x321,
+    worker_deregister = 0x322,
+    worker_list = 0x323,
+    worker_info = 0x324,
+    worker_drain = 0x325,
+    worker_register_response = 0x330,
+    worker_list_response = 0x331,
+    worker_info_response = 0x332,
+    worker_drain_response = 0x333,
+
+    // ── Workflows (0x340 – 0x35F) ────────────────────────────────────────────
+    workflow_create = 0x340,
+    workflow_start = 0x341,
+    workflow_signal = 0x342,
+    workflow_cancel = 0x343,
+    workflow_status = 0x344,
+    workflow_history = 0x345,
+    workflow_list_runs = 0x346,
+    workflow_get_definition = 0x347,
+    workflow_disable = 0x348,
+    workflow_enable = 0x349,
+    workflow_list_definitions = 0x34A,
+    workflow_create_response = 0x350,
+    workflow_start_response = 0x351,
+    workflow_status_response = 0x352,
+    workflow_history_response = 0x353,
+    workflow_list_runs_response = 0x354,
+    workflow_get_definition_response = 0x355,
+    workflow_disable_response = 0x356,
+    workflow_enable_response = 0x357,
+    workflow_list_definitions_response = 0x358,
+
+    // ── Processing (0x360 – 0x37F) ───────────────────────────────────────────
+    processing_submit = 0x360,
+    processing_stop = 0x361,
+    processing_cancel = 0x362,
+    processing_status = 0x363,
+    processing_list = 0x364,
+    processing_savepoint = 0x365,
+    processing_restore = 0x366,
+    processing_rescale = 0x367,
+    processing_submit_response = 0x370,
+    processing_stop_response = 0x371,
+    processing_cancel_response = 0x372,
+    processing_status_response = 0x373,
+    processing_list_response = 0x374,
+    processing_savepoint_response = 0x375,
+    processing_restore_response = 0x376,
+    processing_rescale_response = 0x377,
+
+    // 0x380–0x3FF: compute reserve (emit, future compute — 128 slots)
 
     _,
 };
@@ -529,17 +556,17 @@ pub const Flags = packed struct(u8) {
     _reserved: u5 = 0,
 };
 
-/// Request header (24 bytes total)
-/// Fields ordered to avoid padding: 8-byte aligned first, then 4-byte, then 1-byte
+/// Request header (32 bytes total)
+/// Fields ordered to avoid padding: 8-byte aligned first, then 4-byte, then 2-byte, then 1-byte
 pub const RequestHeader = extern struct {
     magic: u32, // 0-3 (4 bytes)
     payload_length: u32, // 4-7 (4 bytes)
     request_id: u64, // 8-15 (8 bytes) - must be 8-byte aligned
     crc32: u32, // 16-19 (4 bytes)
-    version: u8, // 20 (1 byte)
-    op_code: u8, // 21 (1 byte)
-    flags: u8, // 22 (1 byte)
-    reserved: u8, // 23 (1 byte) - must be 0
+    op_code: u16, // 20-21 (2 bytes)
+    version: u8, // 22 (1 byte)
+    flags: u8, // 23 (1 byte)
+    reserved: [8]u8, // 24-31 (8 bytes) - must be zeros, future expansion
 
     pub fn validate(self: RequestHeader) !void {
         if (self.magic != MAGIC) {
@@ -548,7 +575,7 @@ pub const RequestHeader = extern struct {
         if (self.version != VERSION) {
             return error.UnsupportedVersion;
         }
-        if (self.reserved != 0) {
+        if (!std.mem.eql(u8, &self.reserved, &[_]u8{0} ** 8)) {
             return error.InvalidReservedField;
         }
         // Validate reasonable sizes (prevent DoS)
@@ -566,8 +593,8 @@ pub const RequestHeader = extern struct {
         // Hash bytes 0-15 (magic, payload_length, request_id)
         hasher.update(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
-        // Hash bytes 20-23 (version, op_code, flags, reserved)
-        hasher.update(header_bytes[20..24]);
+        // Hash bytes 20-31 (op_code, version, flags, reserved)
+        hasher.update(header_bytes[20..32]);
 
         // Hash payload
         hasher.update(payload);
@@ -576,7 +603,7 @@ pub const RequestHeader = extern struct {
     }
 };
 
-/// Response header (24 bytes, matches request header structure)
+/// Response header (32 bytes, matches request header structure)
 pub const ResponseHeader = extern struct {
     magic: u32, // 0-3 (4 bytes)
     data_len: u32, // 4-7 (4 bytes)
@@ -585,7 +612,8 @@ pub const ResponseHeader = extern struct {
     version: u8, // 20 (1 byte)
     status: u8, // 21 (1 byte)
     flags: u8, // 22 (1 byte)
-    reserved: u8, // 23 (1 byte)
+    _pad: u8, // 23 (1 byte) - structural padding
+    reserved: [8]u8, // 24-31 (8 bytes) - must be zeros, future expansion
 
     pub fn validate(self: ResponseHeader) !void {
         if (self.magic != MAGIC) {
@@ -604,8 +632,8 @@ pub const ResponseHeader = extern struct {
         // Hash bytes 0-15 (magic, data_len, request_id)
         hasher.update(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
-        // Hash bytes 20-23 (version, status, flags, reserved)
-        hasher.update(header_bytes[20..24]);
+        // Hash bytes 20-31 (version, status, flags, pad, reserved)
+        hasher.update(header_bytes[20..32]);
 
         hasher.update(data);
 
@@ -997,7 +1025,8 @@ pub const Response = struct {
                 .version = VERSION,
                 .status = @intFromEnum(status),
                 .flags = 0,
-                .reserved = 0,
+                ._pad = 0,
+                .reserved = .{0} ** 8,
                 .data_len = @intCast(data.len),
                 .request_id = request_id,
                 .crc32 = 0, // Will be computed during serialization
@@ -1013,11 +1042,11 @@ pub const Response = struct {
 
 comptime {
     // Verify header sizes at compile time
-    if (@sizeOf(RequestHeader) != 24) {
-        @compileError("RequestHeader must be exactly 24 bytes");
+    if (@sizeOf(RequestHeader) != 32) {
+        @compileError("RequestHeader must be exactly 32 bytes");
     }
-    if (@sizeOf(ResponseHeader) != 24) {
-        @compileError("ResponseHeader must be exactly 24 bytes");
+    if (@sizeOf(ResponseHeader) != 32) {
+        @compileError("ResponseHeader must be exactly 32 bytes");
     }
 }
 
@@ -1100,7 +1129,7 @@ test "Request with TLV options serialization" {
             .version = VERSION,
             .op_code = @intFromEnum(OpCode.kv_put),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
             .payload_length = 0,
             .request_id = 42,
             .crc32 = 0,

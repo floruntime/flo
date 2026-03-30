@@ -31,11 +31,11 @@ const auth_session = @import("../auth/session.zig");
 /// Defaults allow common read/write/subscribe operations.
 /// Administrative and cluster opcodes are denied by default.
 pub const OpWhitelist = struct {
-    allowed: [256]bool,
+    allowed: [proto.MAX_OPCODES]bool,
 
     /// Create whitelist with safe defaults for browser clients
     pub fn initDefault() OpWhitelist {
-        var wl = OpWhitelist{ .allowed = [_]bool{false} ** 256 };
+        var wl = OpWhitelist{ .allowed = [_]bool{false} ** proto.MAX_OPCODES };
 
         // System
         wl.allow(.ping);
@@ -69,11 +69,12 @@ pub const OpWhitelist = struct {
 
     /// Create a permissive whitelist (all opcodes allowed)
     pub fn initPermissive() OpWhitelist {
-        return .{ .allowed = [_]bool{true} ** 256 };
+        return .{ .allowed = [_]bool{true} ** proto.MAX_OPCODES };
     }
 
     /// Check if an opcode is allowed
-    pub fn isAllowed(self: *const OpWhitelist, opcode: u8) bool {
+    pub fn isAllowed(self: *const OpWhitelist, opcode: u16) bool {
+        if (opcode >= proto.MAX_OPCODES) return false;
         return self.allowed[opcode];
     }
 

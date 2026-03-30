@@ -1,7 +1,7 @@
 //! Table-Driven Dispatcher — opcode → handler lookup
 //!
 //! Replaces the old 2,900-line `dispatch()` god function with a flat
-//! 256-entry function pointer table. Each subsystem (KV, Stream, Queue,
+//! 512-entry function pointer table. Each subsystem (KV, Stream, Queue,
 //! etc.) self-registers its handlers at startup.
 //!
 //! ## Handler Signature
@@ -61,28 +61,28 @@ pub const HandlerFn = *const fn (shard: *anyopaque, conn: *anyopaque, req: proto
 pub const PreRouteFn = *const fn (req: proto.Request) ?u64;
 
 /// Error callback — invoked when no handler is registered for an opcode.
-pub const ErrorFn = *const fn (conn: *anyopaque, request_id: u64, op_code: u8) void;
+pub const ErrorFn = *const fn (conn: *anyopaque, request_id: u64, op_code: u16) void;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Dispatcher
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const Dispatcher = struct {
-    /// Handler lookup table — indexed by OpCode (u8).
-    handlers: [256]?HandlerFn,
+    /// Handler lookup table — indexed by OpCode (u16, capped at MAX_OPCODES).
+    handlers: [proto.MAX_OPCODES]?HandlerFn,
 
-    /// Pre-route hooks — indexed by OpCode (u8).
-    pre_route: [256]?PreRouteFn,
+    /// Pre-route hooks — indexed by OpCode (u16).
+    pre_route: [proto.MAX_OPCODES]?PreRouteFn,
 
-    /// ShardWalker local-scan functions — indexed by OpCode (u8).
+    /// ShardWalker local-scan functions — indexed by OpCode (u16).
     /// Set for opcodes that need cross-shard walking (list/scan).
     /// Matches `NameWalker.LocalScanFn` signature.
-    walk_fn: [256]?NameWalker.LocalScanFn,
+    walk_fn: [proto.MAX_OPCODES]?NameWalker.LocalScanFn,
 
     /// Per-opcode cross-shard walk contexts.
     /// walk_contexts[opcode] = slice of per-shard *anyopaque (one per shard).
     /// Set by runtime after all shards are created.
-    walk_contexts: [256]?[]const *anyopaque,
+    walk_contexts: [proto.MAX_OPCODES]?[]const *anyopaque,
 
     /// Error callback for unknown opcodes.
     on_error: ?ErrorFn,
@@ -93,10 +93,10 @@ pub const Dispatcher = struct {
     /// Initialize with empty tables.
     pub fn init() Dispatcher {
         return .{
-            .handlers = [_]?HandlerFn{null} ** 256,
-            .pre_route = [_]?PreRouteFn{null} ** 256,
-            .walk_fn = [_]?NameWalker.LocalScanFn{null} ** 256,
-            .walk_contexts = [_]?[]const *anyopaque{null} ** 256,
+            .handlers = [_]?HandlerFn{null} ** proto.MAX_OPCODES,
+            .pre_route = [_]?PreRouteFn{null} ** proto.MAX_OPCODES,
+            .walk_fn = [_]?NameWalker.LocalScanFn{null} ** proto.MAX_OPCODES,
+            .walk_contexts = [_]?[]const *anyopaque{null} ** proto.MAX_OPCODES,
             .on_error = null,
             .handler_count = 0,
         };
@@ -152,12 +152,13 @@ pub const Dispatcher = struct {
     }
 
     /// Check if an opcode is a walk (list/scan) operation.
-    pub fn isWalkOp(self: *const Dispatcher, op_code: u8) bool {
+    pub fn isWalkOp(self: *const Dispatcher, op_code: u16) bool {
+        if (op_code >= proto.MAX_OPCODES) return false;
         return self.walk_fn[op_code] != null;
     }
 
     /// Register a handler for a contiguous range of opcode values [lo, hi] inclusive.
-    pub fn registerRange(self: *Dispatcher, lo: u8, hi: u8, handler: HandlerFn) void {
+    pub fn registerRange(self: *Dispatcher, lo: u16, hi: u16, handler: HandlerFn) void {
         var i: u16 = lo;
         while (i <= hi) : (i += 1) {
             if (self.handlers[@intCast(i)] == null) {
@@ -179,6 +180,10 @@ pub const Dispatcher = struct {
     /// If no handler is registered, invokes the error callback (if set).
     pub fn dispatch(self: *const Dispatcher, shard: *anyopaque, conn: *anyopaque, req: proto.Request) void {
         const idx = req.header.op_code;
+        if (idx >= proto.MAX_OPCODES) {
+            if (self.on_error) |err_fn| err_fn(conn, req.header.request_id, idx);
+            return;
+        }
         if (self.handlers[idx]) |handler| {
             handler(shard, conn, req);
         } else if (self.on_error) |err_fn| {
@@ -216,9 +221,9 @@ pub const Dispatcher = struct {
 // Test helpers — mock Shard/Connection as simple counters
 const TestContext = struct {
     dispatch_count: u32 = 0,
-    last_opcode: u8 = 0,
+    last_opcode: u16 = 0,
     error_count: u32 = 0,
-    last_error_opcode: u8 = 0,
+    last_error_opcode: u16 = 0,
 };
 
 fn mockHandler(shard: *anyopaque, _: *anyopaque, req: proto.Request) void {
@@ -233,7 +238,7 @@ fn mockHandler2(shard: *anyopaque, _: *anyopaque, req: proto.Request) void {
     ctx.last_opcode = req.header.op_code;
 }
 
-fn mockErrorHandler(conn: *anyopaque, _: u64, op_code: u8) void {
+fn mockErrorHandler(conn: *anyopaque, _: u64, op_code: u16) void {
     const ctx: *TestContext = @ptrCast(@alignCast(conn));
     ctx.error_count += 1;
     ctx.last_error_opcode = op_code;

@@ -686,7 +686,7 @@ pub const Shard = struct {
         const op = req.header.op_code;
 
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
-        if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
+        if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!has_single_target) {
                 self.executeWalk(conn, req);
@@ -704,7 +704,8 @@ pub const Shard = struct {
 
     /// Pure routing decision: pre-route → partition table (cluster) or
     /// local shard mapping (single-node). No side effects.
-    fn resolveTarget(self: *Shard, op: u8, req: proto.Request) node_router.RouteTarget {
+    fn resolveTarget(self: *Shard, op: u16, req: proto.Request) node_router.RouteTarget {
+        if (op >= proto.MAX_OPCODES) return .{ .local = .{ .partition_id = 0 } };
         const hash = if (self.dispatcher.pre_route[op]) |f| f(req) orelse return .{ .local = .{ .partition_id = 0 } } else return .{ .local = .{ .partition_id = 0 } };
 
         if (self.partition_table) |pt| {
@@ -1257,7 +1258,7 @@ pub const Shard = struct {
                 .version = proto.VERSION,
                 .op_code = @intFromEnum(cmd.opcode),
                 .flags = 0,
-                .reserved = 0,
+                .reserved = .{0} ** 8,
             },
             .namespace = cmd.namespace,
             .key = cmd.key,
@@ -1349,7 +1350,7 @@ pub const Shard = struct {
     /// Send an OK response with data payload on a connection.
     pub fn sendOkResponse(self: *Shard, conn: *Connection, request_id: u64, data: []const u8) void {
         _ = self;
-        var buf: [MAX_REQUEST_SIZE + 24]u8 = undefined;
+        var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         const serialized = proto.Response.serializeNew(.ok, request_id, data, &buf) catch return;
         _ = conn.queueWrite(serialized);
     }

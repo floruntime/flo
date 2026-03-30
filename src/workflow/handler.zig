@@ -3437,7 +3437,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
             .version = proto.VERSION,
             .op_code = @intFromEnum(op),
             .flags = 0,
-            .reserved = 0,
+            .reserved = .{0} ** 8,
         },
         .namespace = "default",
         .key = key,
@@ -3519,16 +3519,14 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
-        .action_type = 1, // wasm
         .version = 1,
         .enabled = true,
         .created_at_ns = 0,
-        .wasm_blob_owned = wasm_bytes,
     }) catch {
         alloc.free(owned_name);
         alloc.free(owned_ns);
-        alloc.free(wasm_bytes);
     };
+    alloc.free(wasm_bytes);
 }
 
 /// Register a test action with invalid WASM (fails on invocation).
@@ -3548,16 +3546,14 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
-        .action_type = 1,
         .version = 1,
         .enabled = true,
         .created_at_ns = 0,
-        .wasm_blob_owned = wasm_bytes,
     }) catch {
         alloc.free(owned_name);
         alloc.free(owned_ns);
-        alloc.free(wasm_bytes);
     };
+    alloc.free(wasm_bytes);
 }
 
 /// Create a minimal test shard with an actions handler for unit tests.

@@ -88,7 +88,7 @@ pub fn getRole(result: AuthResult) ?keys.Role {
 /// Check if a role is authorized for an opcode.
 /// Uses scope patterns from Role.scopes(): "*:*:*", "read:*:*", "write:kv:*", etc.
 /// Opcode categories are determined by the high nibble of the opcode byte.
-pub fn matchScope(role: keys.Role, op_code: u8) bool {
+pub fn matchScope(role: keys.Role, op_code: u16) bool {
     const scopes = role.scopes();
     for (scopes) |scope| {
         if (std.mem.eql(u8, scope, "*:*:*")) return true;
@@ -109,36 +109,32 @@ pub fn matchScope(role: keys.Role, op_code: u8) bool {
 }
 
 /// Classify opcode as read or write based on naming conventions.
-fn isReadOpcode(op_code: u8) bool {
-    // System/ping/auth are reads; list/scan/get/info/read/stats are reads
-    // Everything else is a write (put/set/delete/append/create/enqueue/dequeue)
+fn isReadOpcode(op_code: u16) bool {
+    // System/ping/auth are reads
     return switch (op_code) {
-        0x01, 0x02, 0x03 => true, // ping, pong, auth
-        else => {
-            // Read opcodes follow patterns: *_get, *_list, *_info, *_scan, *_read, *_stats
-            // Use the low bits — even opcodes tend to be reads in the protocol layout
-            // This is a heuristic; full enforcement would use the opcode enum directly
-            const high = op_code >> 4;
-            _ = high;
-            return false; // Default: treat unknown as write (secure default)
-        },
+        0x001, 0x002, 0x003 => true, // pong, error_response, auth
+        else => false, // Default: treat unknown as write (secure default)
     };
 }
 
 /// Map opcode to subsystem name for scope matching.
-fn opcodeSubsystem(op_code: u8) []const u8 {
-    // Opcode ranges from proto.zig
-    return switch (op_code >> 4) {
-        0x0 => "system", // 0x00-0x0F: system/ping/auth
-        0x1, 0x2 => "stream", // 0x10-0x2F: Stream + consumer groups
-        0x3 => "kv", // 0x30-0x3F: KV
-        0x4, 0x5 => "queue", // 0x40-0x5F: Queue + responses
-        0x6, 0x7 => "actions", // 0x60-0x7F: Actions + workers
-        0x8, 0x9 => "workflow", // 0x80-0x9F: Workflow + responses
-        0xA => "cluster", // 0xA0-0xAF: Cluster
-        0xB => "namespace", // 0xB0-0xBF: Namespace
-        0xC, 0xD => "processing", // 0xC0-0xDF: Processing + responses
-        0xE => "ts", // 0xE0-0xEF: TimeSeries
+/// Layout: Infra(0x0__), Data(0x1__-0x2__), Compute(0x3__)
+fn opcodeSubsystem(op_code: u16) []const u8 {
+    return switch (op_code) {
+        0x000...0x00F => "system",
+        0x010...0x02F => "namespace",
+        0x030...0x04F => "cluster",
+        // 0x050-0x0FF = infra reserve
+        0x100...0x12F => "kv",
+        0x130...0x16F => "stream", // streams + consumer groups
+        0x170...0x19F => "queue",
+        0x1A0...0x1BF => "ts",
+        // 0x1C0-0x2FF = data reserve (vectors, documents, geo, counters)
+        0x300...0x31F => "actions",
+        0x320...0x33F => "worker",
+        0x340...0x35F => "workflow",
+        0x360...0x37F => "processing",
+        // 0x380-0x3FF = compute reserve (emit, future compute)
         else => "unknown",
     };
 }
@@ -200,40 +196,41 @@ test "getRole" {
 }
 
 test "matchScope admin allows everything" {
-    try std.testing.expect(matchScope(.admin, 0x31)); // kv_get
-    try std.testing.expect(matchScope(.admin, 0x30)); // kv_put
-    try std.testing.expect(matchScope(.admin, 0xA5)); // cluster_add_node
-    try std.testing.expect(matchScope(.admin, 0xE0)); // ts_write
+    try std.testing.expect(matchScope(.admin, 0x101)); // kv_get
+    try std.testing.expect(matchScope(.admin, 0x100)); // kv_put
+    try std.testing.expect(matchScope(.admin, 0x035)); // cluster_add_node
+    try std.testing.expect(matchScope(.admin, 0x1A0)); // ts_write
 }
 
 test "matchScope viewer allows reads only" {
     // Viewer has "read:*:*" — system opcodes (reads) should pass
-    try std.testing.expect(matchScope(.viewer, 0x01)); // ping
+    try std.testing.expect(matchScope(.viewer, 0x001)); // pong
     // Viewer should not be able to write
-    try std.testing.expect(!matchScope(.viewer, 0x30)); // kv_put (write)
+    try std.testing.expect(!matchScope(.viewer, 0x100)); // kv_put (write)
 }
 
 test "matchScope operator allows kv/stream/queue/ts writes" {
-    try std.testing.expect(matchScope(.operator, 0x30)); // kv_put (write:kv:*)
-    try std.testing.expect(matchScope(.operator, 0x10)); // stream_append (write:stream:*)
-    try std.testing.expect(matchScope(.operator, 0x40)); // queue_enqueue (write:queue:*)
-    try std.testing.expect(matchScope(.operator, 0xE0)); // ts_write (write:ts:*)
+    try std.testing.expect(matchScope(.operator, 0x100)); // kv_put (write:kv:*)
+    try std.testing.expect(matchScope(.operator, 0x130)); // stream_append (write:stream:*)
+    try std.testing.expect(matchScope(.operator, 0x170)); // queue_enqueue (write:queue:*)
+    try std.testing.expect(matchScope(.operator, 0x1A0)); // ts_write (write:ts:*)
     // Operator should not have cluster access
-    try std.testing.expect(!matchScope(.operator, 0xA5)); // cluster_add_node
+    try std.testing.expect(!matchScope(.operator, 0x035)); // cluster_add_node
 }
 
 test "opcodeSubsystem ranges" {
-    try std.testing.expectEqualStrings("system", opcodeSubsystem(0x03));
-    try std.testing.expectEqualStrings("stream", opcodeSubsystem(0x10));
-    try std.testing.expectEqualStrings("stream", opcodeSubsystem(0x20));
-    try std.testing.expectEqualStrings("kv", opcodeSubsystem(0x31));
-    try std.testing.expectEqualStrings("queue", opcodeSubsystem(0x40));
-    try std.testing.expectEqualStrings("actions", opcodeSubsystem(0x60));
-    try std.testing.expectEqualStrings("workflow", opcodeSubsystem(0x80));
-    try std.testing.expectEqualStrings("cluster", opcodeSubsystem(0xA0));
-    try std.testing.expectEqualStrings("namespace", opcodeSubsystem(0xB0));
-    try std.testing.expectEqualStrings("processing", opcodeSubsystem(0xC0));
-    try std.testing.expectEqualStrings("ts", opcodeSubsystem(0xE0));
+    try std.testing.expectEqualStrings("system", opcodeSubsystem(0x003));
+    try std.testing.expectEqualStrings("namespace", opcodeSubsystem(0x010));
+    try std.testing.expectEqualStrings("cluster", opcodeSubsystem(0x030));
+    try std.testing.expectEqualStrings("kv", opcodeSubsystem(0x101));
+    try std.testing.expectEqualStrings("stream", opcodeSubsystem(0x130));
+    try std.testing.expectEqualStrings("stream", opcodeSubsystem(0x150));
+    try std.testing.expectEqualStrings("queue", opcodeSubsystem(0x170));
+    try std.testing.expectEqualStrings("ts", opcodeSubsystem(0x1A0));
+    try std.testing.expectEqualStrings("actions", opcodeSubsystem(0x300));
+    try std.testing.expectEqualStrings("worker", opcodeSubsystem(0x320));
+    try std.testing.expectEqualStrings("workflow", opcodeSubsystem(0x340));
+    try std.testing.expectEqualStrings("processing", opcodeSubsystem(0x360));
 }
 
 test {
