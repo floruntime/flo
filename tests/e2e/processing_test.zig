@@ -331,28 +331,28 @@ test "e2e/processing: processing opcodes are defined" {
     const proto = src.protocol.proto;
 
     // Processing opcodes must exist and have stable values (wire contract)
-    try testing.expectEqual(@as(u8, 0xC0), @intFromEnum(proto.OpCode.processing_submit));
-    try testing.expectEqual(@as(u8, 0xC1), @intFromEnum(proto.OpCode.processing_stop));
-    try testing.expectEqual(@as(u8, 0xC2), @intFromEnum(proto.OpCode.processing_cancel));
-    try testing.expectEqual(@as(u8, 0xC3), @intFromEnum(proto.OpCode.processing_status));
-    try testing.expectEqual(@as(u8, 0xC4), @intFromEnum(proto.OpCode.processing_list));
-    try testing.expectEqual(@as(u8, 0xC6), @intFromEnum(proto.OpCode.processing_savepoint));
-    try testing.expectEqual(@as(u8, 0xC7), @intFromEnum(proto.OpCode.processing_restore));
-    try testing.expectEqual(@as(u8, 0xC8), @intFromEnum(proto.OpCode.processing_rescale));
+    try testing.expectEqual(@as(u16, 0x360), @intFromEnum(proto.OpCode.processing_submit));
+    try testing.expectEqual(@as(u16, 0x361), @intFromEnum(proto.OpCode.processing_stop));
+    try testing.expectEqual(@as(u16, 0x362), @intFromEnum(proto.OpCode.processing_cancel));
+    try testing.expectEqual(@as(u16, 0x363), @intFromEnum(proto.OpCode.processing_status));
+    try testing.expectEqual(@as(u16, 0x364), @intFromEnum(proto.OpCode.processing_list));
+    try testing.expectEqual(@as(u16, 0x365), @intFromEnum(proto.OpCode.processing_savepoint));
+    try testing.expectEqual(@as(u16, 0x366), @intFromEnum(proto.OpCode.processing_restore));
+    try testing.expectEqual(@as(u16, 0x367), @intFromEnum(proto.OpCode.processing_rescale));
 }
 
 test "e2e/processing: processing response opcodes are defined" {
     const proto = src.protocol.proto;
 
     // Response opcodes must pair with request opcodes (wire contract)
-    try testing.expectEqual(@as(u8, 0xC9), @intFromEnum(proto.OpCode.processing_submit_response));
-    try testing.expectEqual(@as(u8, 0xCA), @intFromEnum(proto.OpCode.processing_stop_response));
-    try testing.expectEqual(@as(u8, 0xCB), @intFromEnum(proto.OpCode.processing_cancel_response));
-    try testing.expectEqual(@as(u8, 0xCC), @intFromEnum(proto.OpCode.processing_status_response));
-    try testing.expectEqual(@as(u8, 0xCD), @intFromEnum(proto.OpCode.processing_list_response));
-    try testing.expectEqual(@as(u8, 0xCF), @intFromEnum(proto.OpCode.processing_savepoint_response));
-    try testing.expectEqual(@as(u8, 0xD0), @intFromEnum(proto.OpCode.processing_restore_response));
-    try testing.expectEqual(@as(u8, 0xD1), @intFromEnum(proto.OpCode.processing_rescale_response));
+    try testing.expectEqual(@as(u16, 0x370), @intFromEnum(proto.OpCode.processing_submit_response));
+    try testing.expectEqual(@as(u16, 0x371), @intFromEnum(proto.OpCode.processing_stop_response));
+    try testing.expectEqual(@as(u16, 0x372), @intFromEnum(proto.OpCode.processing_cancel_response));
+    try testing.expectEqual(@as(u16, 0x373), @intFromEnum(proto.OpCode.processing_status_response));
+    try testing.expectEqual(@as(u16, 0x374), @intFromEnum(proto.OpCode.processing_list_response));
+    try testing.expectEqual(@as(u16, 0x375), @intFromEnum(proto.OpCode.processing_savepoint_response));
+    try testing.expectEqual(@as(u16, 0x376), @intFromEnum(proto.OpCode.processing_restore_response));
+    try testing.expectEqual(@as(u16, 0x377), @intFromEnum(proto.OpCode.processing_rescale_response));
 }
 
 // =============================================================================

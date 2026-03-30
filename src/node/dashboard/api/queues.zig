@@ -296,7 +296,7 @@ test "getQueueDetail returns zeroed queue for unknown name" {
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try getQueueDetail(allocator, "unknown", &ctx);
+    const result = try getQueueDetail(allocator, "unknown", null, &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"unknown\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"pending\":0") != null);

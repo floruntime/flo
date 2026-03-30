@@ -14,11 +14,11 @@
 //! └─────────┘                    │  + Queue Task │
 //!                                └───────────────┘
 //!                                       │
-//! ┌─────────┐  worker_await_task        ▼
+//! ┌─────────┐  action_await_task         ▼
 //! │  Worker │ ◄──────────────── task_assignment {task_id, payload=input}
 //! └─────────┘
 //!       │
-//!       │  worker_complete_task(result="{...}")
+//!       │  action_complete_task(result="{...}")
 //!       ▼
 //! ┌───────────────┐
 //! │  ActionRun    │ (status=completed, output=result)

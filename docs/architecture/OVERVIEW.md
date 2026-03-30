@@ -63,11 +63,11 @@ loop {
 
 ### Dispatcher
 
-Table-driven routing with a flat 256-slot handler array:
+Table-driven routing with a flat 1024-slot handler array (OpCode is u16):
 
 ```zig
 pub const Dispatcher = struct {
-    handlers: [256]?HandlerFn = [_]?HandlerFn{null} ** 256,
+    handlers: [1024]?HandlerFn = [_]?HandlerFn{null} ** 1024,
 
     pub fn dispatch(self, shard, conn, req) void {
         if (self.handlers[@intFromEnum(req.header.opcode)]) |handler| {
