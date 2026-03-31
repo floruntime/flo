@@ -258,8 +258,8 @@ test "e2e/workflow: list runs returns empty initially" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo workflow list-runs some-workflow
-    var result = try ctx.cli.run(&.{ "workflow", "list-runs", "nonexistent-workflow" });
+    // flo workflow list-runs --workflow some-workflow
+    var result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "nonexistent-workflow" });
     defer result.deinit();
 
     // Should succeed but return empty list
@@ -704,7 +704,7 @@ test "e2e/workflow: list runs after starting workflows" {
 
     // List runs for this workflow
     var list_result = try ctx.cli.run(&.{
-        "workflow", "list-runs", "list-test-wf",
+        "workflow", "list-runs", "--workflow", "list-test-wf",
     });
     defer list_result.deinit();
 
@@ -2306,7 +2306,7 @@ test "e2e/workflow: append to stream triggers workflow run" {
     try ctx.exec(&.{ "stream", "append", "trigger-events", "{\"order_id\":\"123\",\"type\":\"created\"}" });
 
     // List runs — a triggered run should appear
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-auto-start" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-auto-start" });
     defer list_result.deinit();
     try stdx.testing.assertSucceeded(list_result);
     // The triggered run should be listed (run-id is auto-generated)
@@ -2345,7 +2345,7 @@ test "e2e/workflow: multiple appends trigger multiple runs" {
     try ctx.exec(&.{ "stream", "append", "multi-trigger-events", "{\"event\":3}" });
 
     // List runs — should have at least three triggered runs
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-multi-run" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-multi-run" });
     defer list_result.deinit();
     try stdx.testing.assertSucceeded(list_result);
     // Output should reference the workflow name (confirming runs exist)
@@ -2384,7 +2384,7 @@ test "e2e/workflow: trigger with custom consumer group" {
     // Append to stream — workflow should be triggered
     try ctx.exec(&.{ "stream", "append", "cg-events", "{\"item\":\"widget\"}" });
 
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-cg-test" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-cg-test" });
     defer list_result.deinit();
     try stdx.testing.assertSucceeded(list_result);
     try stdx.testing.assertContains(list_result, "st-cg-test");
@@ -2419,7 +2419,7 @@ test "e2e/workflow: no trigger on unrelated stream" {
     try ctx.exec(&.{ "stream", "append", "other-stream", "{\"data\":\"test\"}" });
 
     // List runs — should be empty (no runs triggered)
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-nomatch-wf" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-nomatch-wf" });
     defer list_result.deinit();
     // The command should succeed (even with zero runs)
     try stdx.testing.assertSucceeded(list_result);
@@ -2460,7 +2460,7 @@ test "e2e/workflow: triggered workflow with multi-step pipeline" {
     try ctx.exec(&.{ "stream", "append", "pipeline-events", "{\"order\":\"ABC-1\"}" });
 
     // Verify the triggered run exists
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-pipeline" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-pipeline" });
     defer list_result.deinit();
     try stdx.testing.assertSucceeded(list_result);
     try stdx.testing.assertContains(list_result, "st-pipeline");
@@ -2509,7 +2509,7 @@ test "e2e/workflow: batch_size accumulates events and fires on full batch" {
     try ctx.exec(&.{ "stream", "append", "batch-events", "{\"order\":3}" });
 
     // 3. Verify the triggered run exists
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "st-batch-test" });
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-batch-test" });
     defer list_result.deinit();
     try stdx.testing.assertSucceeded(list_result);
     try stdx.testing.assertContains(list_result, "st-batch-test");
@@ -2594,13 +2594,13 @@ test "e2e/workflow: start and status are namespace-scoped" {
     try stdx.testing.assertSucceeded(start_res);
 
     // List runs in namespace A — should have runs
-    var list_a = try ctx.cli.run(&.{ "workflow", "list-runs", "run-scoped", "-n", "wf_run_a" });
+    var list_a = try ctx.cli.run(&.{ "workflow", "list-runs", "-w", "run-scoped", "-n", "wf_run_a" });
     defer list_a.deinit();
     try stdx.testing.assertSucceeded(list_a);
     try stdx.testing.assertContains(list_a, "run-scoped");
 
     // List runs in namespace B — should be empty
-    var list_b = try ctx.cli.run(&.{ "workflow", "list-runs", "run-scoped", "-n", "wf_run_b" });
+    var list_b = try ctx.cli.run(&.{ "workflow", "list-runs", "-w", "run-scoped", "-n", "wf_run_b" });
     defer list_b.deinit();
     try stdx.testing.assertSucceeded(list_b);
     try stdx.testing.assertContains(list_b, "(no runs)");
@@ -2673,12 +2673,12 @@ test "e2e/workflow: default namespace is isolated from named namespaces" {
     try ctx.exec(&.{ "workflow", "start", "ns-default", "{\"src\":\"custom\"}", "-n", "wf_custom" });
 
     // Both namespaces should have runs
-    var list_default = try ctx.cli.run(&.{ "workflow", "list-runs", "ns-default" });
+    var list_default = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "ns-default" });
     defer list_default.deinit();
     try stdx.testing.assertSucceeded(list_default);
     try stdx.testing.assertContains(list_default, "ns-default");
 
-    var list_custom = try ctx.cli.run(&.{ "workflow", "list-runs", "ns-default", "-n", "wf_custom" });
+    var list_custom = try ctx.cli.run(&.{ "workflow", "list-runs", "-w", "ns-default", "-n", "wf_custom" });
     defer list_custom.deinit();
     try stdx.testing.assertSucceeded(list_custom);
     try stdx.testing.assertContains(list_custom, "ns-default");
