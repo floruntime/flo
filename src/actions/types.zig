@@ -31,10 +31,23 @@ const WireReader = @import("../util/wire.zig").WireReader;
 
 /// Type of action execution
 pub const ActionType = enum(u8) {
-    /// User-hosted: Worker runs on user's infrastructure
-    /// User provides: Go/Python/Node function
-    /// Flo provides: Queue-based task delivery, retry, monitoring
+    /// User-hosted: Worker runs on user's infrastructure.
+    /// User provides: Go/Python/Node function.
+    /// Flo provides: Queue-based task delivery, retry, monitoring.
     user = 0,
+
+    pub fn toString(self: ActionType) []const u8 {
+        return switch (self) {
+            .user => "user",
+        };
+    }
+
+    pub fn fromU8(v: u8) ActionType {
+        return switch (v) {
+            0 => .user,
+            else => .user, // default to user for unknown values
+        };
+    }
 };
 
 // =============================================================================
@@ -131,7 +144,7 @@ pub const ActionMeta = struct {
     namespace: []const u8,
     /// Action version (semantic versioning)
     version: []const u8,
-    /// Action type (user or wasm)
+    /// Action type (user)
     action_type: ActionType,
     /// Owner identifier (user ID or organization)
     owner: []const u8,
@@ -850,12 +863,11 @@ test "ActionMeta encode/decode roundtrip with trigger_queue" {
         .name = "process-payment",
         .namespace = "finance",
         .version = "2.0.0",
-        .action_type = .wasm,
+        .action_type = .user,
         .owner = "team-payments",
         .trigger_stream = "txn-events",
         .trigger_group = "payment-cg",
         .trigger_queue = "pending-payments",
-        .wasm_entrypoint = "handle",
         .created_at = 1700000000000,
         .updated_at = 1700000000000,
     };
@@ -868,10 +880,10 @@ test "ActionMeta encode/decode roundtrip with trigger_queue" {
 
     try std.testing.expectEqualStrings("process-payment", decoded.name);
     try std.testing.expectEqualStrings("finance", decoded.namespace);
+    try std.testing.expectEqual(ActionType.user, decoded.action_type);
     try std.testing.expectEqualStrings("txn-events", decoded.trigger_stream.?);
     try std.testing.expectEqualStrings("payment-cg", decoded.trigger_group.?);
     try std.testing.expectEqualStrings("pending-payments", decoded.trigger_queue.?);
-    try std.testing.expectEqualStrings("handle", decoded.wasm_entrypoint.?);
 }
 
 test "ActionMeta decode backward compat (no trigger_queue)" {

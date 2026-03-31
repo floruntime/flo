@@ -27,6 +27,7 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const ActionMeta = @import("types.zig").ActionMeta;
+const ActionType = @import("types.zig").ActionType;
 const RunStatus = @import("types.zig").RunStatus;
 
 const shard_mod = @import("../node/shard.zig");
@@ -79,6 +80,7 @@ pub const ActionsHandler = struct {
     pub const ActionRecord = struct {
         name_owned: []const u8,
         namespace_owned: []const u8,
+        action_type: ActionType,
         version: u32,
         enabled: bool,
         created_at_ns: u64,
@@ -460,9 +462,13 @@ pub const ActionsHandler = struct {
 
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
 
+        // Parse action_type from first byte of value (client wire format)
+        const action_type = if (req.value.len > 0) ActionType.fromU8(req.value[0]) else .user;
+
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
+            .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = now_ns,
@@ -472,8 +478,8 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
         };
 
-        // Persist through Raft: value = [version:u32][created_at_ns:u64][original_value...]
-        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, req.value);
+        // Persist through Raft: value = [version:u32][created_at_ns:u64][action_type:u8][original_value...]
+        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, action_type, req.value);
 
         // Version string
         var ver_buf: [12]u8 = undefined;
@@ -975,7 +981,7 @@ pub const ActionsHandler = struct {
             // value_len + value (type + version + enabled)
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(value_size), .little);
             offset += 4;
-            buf[offset] = 0; // action type (always user-hosted)
+            buf[offset] = @intFromEnum(rec.action_type);
             offset += 1;
             std.mem.writeInt(u32, buf[offset..][0..4], rec.version, .little);
             offset += 4;
@@ -1149,16 +1155,17 @@ pub const ActionsHandler = struct {
     /// Persist an action registration.
     /// Value format: [version:u32][created_at_ns:u64][original_req_value...]
     /// Key is namespace-qualified (ns\x00name) so namespace can be recovered during replay.
-    fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, req_value: []const u8) void {
+    fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) void {
         _ = self;
         var value_buf: [65536]u8 = undefined;
-        if (4 + 8 + req_value.len > value_buf.len) return;
+        if (4 + 8 + 1 + req_value.len > value_buf.len) return;
         std.mem.writeInt(u32, value_buf[0..4], version, .little);
         std.mem.writeInt(u64, value_buf[4..12], created_at_ns, .little);
+        value_buf[12] = @intFromEnum(action_type);
         if (req_value.len > 0) {
-            @memcpy(value_buf[12 .. 12 + req_value.len], req_value);
+            @memcpy(value_buf[13 .. 13 + req_value.len], req_value);
         }
-        const value = value_buf[0 .. 12 + req_value.len];
+        const value = value_buf[0 .. 13 + req_value.len];
         var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
         _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, qkey, value) catch {};
@@ -1308,7 +1315,7 @@ pub const ActionsHandler = struct {
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
     fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8) void {
-        if (value.len < 12) return; // need version(4) + created_at_ns(8)
+        if (value.len < 13) return; // need version(4) + created_at_ns(8) + action_type(1)
 
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
@@ -1320,6 +1327,7 @@ pub const ActionsHandler = struct {
 
         const version = std.mem.readInt(u32, value[0..4], .little);
         const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
+        const action_type = ActionType.fromU8(value[12]);
 
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(name)) |old| {
@@ -1335,6 +1343,7 @@ pub const ActionsHandler = struct {
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
+            .action_type = action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = created_at_ns,

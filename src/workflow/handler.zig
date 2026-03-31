@@ -3502,23 +3502,18 @@ const test_retry_workflow_json =
     \\"start":{"run":"@actions/flaky","retry":{"maxAttempts":3},"transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
 ;
 
-/// Register a test action as WASM (completes synchronously in test mode).
+/// Register a test action for workflow step executor tests.
 fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
     const alloc = actions.allocator;
     const owned_name = alloc.dupe(u8, name) catch return;
-    // WASM magic header: \x00asm — enough for the test-mode validation
-    const wasm_bytes = alloc.dupe(u8, &[_]u8{ 0x00, 0x61, 0x73, 0x6d }) catch {
-        alloc.free(owned_name);
-        return;
-    };
     const owned_ns = alloc.dupe(u8, "default") catch {
         alloc.free(owned_name);
-        alloc.free(wasm_bytes);
         return;
     };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
+        .action_type = .user,
         .version = 1,
         .enabled = true,
         .created_at_ns = 0,
@@ -3526,26 +3521,20 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         alloc.free(owned_ns);
     };
-    alloc.free(wasm_bytes);
 }
 
-/// Register a test action with invalid WASM (fails on invocation).
+/// Register a test action that simulates failure on invocation.
 fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
     const alloc = actions.allocator;
     const owned_name = alloc.dupe(u8, name) catch return;
-    // Invalid WASM magic — executeWasmAction will set .failed in test mode
-    const wasm_bytes = alloc.dupe(u8, &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }) catch {
-        alloc.free(owned_name);
-        return;
-    };
     const owned_ns = alloc.dupe(u8, "default") catch {
         alloc.free(owned_name);
-        alloc.free(wasm_bytes);
         return;
     };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
+        .action_type = .user,
         .version = 1,
         .enabled = true,
         .created_at_ns = 0,
@@ -3553,7 +3542,6 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         alloc.free(owned_ns);
     };
-    alloc.free(wasm_bytes);
 }
 
 /// Create a minimal test shard with an actions handler for unit tests.

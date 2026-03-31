@@ -90,7 +90,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.begin();
                     try obj.stringField("name", rec.name_owned);
                     try obj.stringField("namespace", rec.namespace_owned);
-                    try obj.stringField("type", "user");
+                    try obj.stringField("type", rec.action_type.toString());
                     try obj.stringField("owner", "");
                     try obj.stringField("description", "");
                     try obj.intField("version", @as(i64, @intCast(rec.version)));
@@ -150,7 +150,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 
     if (found_rec) |rec| {
         try obj.stringField("namespace", rec.namespace_owned);
-        try obj.stringField("type", "user");
+        try obj.stringField("type", rec.action_type.toString());
         try obj.stringField("owner", "");
         try obj.stringField("description", "");
         try obj.intField("version", @as(i64, @intCast(rec.version)));
