@@ -2032,6 +2032,26 @@ pub const WorkflowHandler = struct {
                     }
                 }
 
+                // Per-step retry for non-plan steps (mirrors advanceWorkflow sync retry logic).
+                // Re-invokes the same step by calling advanceWorkflow, which sees the unchanged
+                // current_step_name_owned and invokes the action again.
+                if (!run_step.isPlan() and
+                    (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
+                     std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
+                {
+                    if (run_step.retry) |retry_cfg| {
+                        if (run.retry_count < retry_cfg.max_attempts) {
+                            run.retry_count += 1;
+                            const retry_label = run.current_step_name_owned orelse "start";
+                            self.addHistoryEvent(run, "step_retry", retry_label, now_ms);
+                            const key_copy = self.allocator.dupe(u8, run_ns_key) catch return;
+                            defer self.allocator.free(key_copy);
+                            self.advanceWorkflow(shard, key_copy, namespace);
+                            return;
+                        }
+                    }
+                }
+
                 // Plan executor fallback: if an async action failed and this is a plan step,
                 // try the next executor before following the failure transition.
                 if (run_step.isPlan() and (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
@@ -3547,11 +3567,33 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
 /// Create a minimal test shard with an actions handler for unit tests.
 /// Only `actions_handler` is usable — all other fields are undefined.
 fn createTestShard(actions: *ActionsHandler) Shard {
+    const waiter_pool_mod = @import("../node/waiter_pool.zig");
     var shard: Shard = undefined;
+    shard.id = 0;
     shard.actions_handler = actions;
     shard.peer_shards = null;
+    shard.peer_inboxes = null;
+    shard.raft_node = null;
+    shard.raft_network = null;
     shard.router = router.Router.init(1, 1, 0);
+    shard.run_id_gen = .{};
+    shard.waiter_pool = waiter_pool_mod.WaiterPool.init();
     return shard;
+}
+
+/// Complete a pending test action run with outcome "success".
+/// Call this after advanceWorkflow parks, then call checkPendingActions to resume.
+fn completeTestAction(actions: *ActionsHandler, run_id: []const u8) void {
+    completeTestActionWith(actions, run_id, "success");
+}
+
+/// Complete a pending test action run with a specific outcome.
+fn completeTestActionWith(actions: *ActionsHandler, run_id: []const u8, outcome: []const u8) void {
+    const run = actions.runs.getPtr(run_id) orelse return;
+    run.status = .completed;
+    run.completed_at_ms = std.time.milliTimestamp();
+    if (run.outcome_owned) |old| actions.allocator.free(old);
+    run.outcome_owned = actions.allocator.dupe(u8, outcome) catch null;
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
@@ -3696,13 +3738,33 @@ test "step executor: linear workflow completes via action invocation" {
     createTestRun(&handler, "default:run-1", "run-1", "test-wf");
 
     try testing.expectEqual(@as(usize, 1), handler.runCount());
+
+    // Phase 1: advance invokes step-a asynchronously, workflow parks
     handler.advanceWorkflow(&shard, "default:run-1", "default");
+    {
+        const run = handler.runs.getPtr("default:run-1").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        // Complete step-a with "success"
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+
+    // Phase 2: checkPendingActions resumes step-a, advances to step-b (parks again)
+    handler.checkPendingActions(&shard);
+    {
+        const run = handler.runs.getPtr("default:run-1").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        // Complete step-b with "success"
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+
+    // Phase 3: checkPendingActions resumes step-b, workflow completes
+    handler.checkPendingActions(&shard);
 
     const run = handler.runs.get("default:run-1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expect(run.completed_at_ms != null);
-    // History should have: step_started(start), step_completed(start),
-    // step_started(step_b), step_completed(step_b), workflow_completed
+    // History should have: step_started(start), action_completed, step_completed(start),
+    // step_started(step_b), action_completed, step_completed(step_b), workflow_completed
     try testing.expect(run.history.items.len >= 5);
     // Step outputs should be tracked
     try testing.expect(run.step_outputs != null);
@@ -3721,10 +3783,20 @@ test "step executor: wait_for_signal parks run" {
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-2", "run-2", "wait-wf");
 
+    // Phase 1: advance invokes init action, parks
     handler.advanceWorkflow(&shard, "default:run-2", "default");
+    {
+        const run = handler.runs.getPtr("default:run-2").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        // Complete init with success so workflow transitions to wait_approval
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+
+    // Phase 2: checkPendingActions resumes init, workflow transitions to wait_approval (parks for signal)
+    handler.checkPendingActions(&shard);
 
     const run = handler.runs.get("default:run-2").?;
-    // Should be waiting after start → wait_approval
+    // Should be waiting for approval signal after init → wait_approval
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     try testing.expect(run.wait_signal_type_owned != null);
     try testing.expectEqualStrings("approval", run.wait_signal_type_owned.?);
@@ -3743,8 +3815,14 @@ test "step executor: signal resumes waiting workflow" {
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-3", "run-3", "wait-wf");
 
-    // Advance until it parks
+    // Advance until init parks, then complete it
     handler.advanceWorkflow(&shard, "default:run-3", "default");
+    {
+        const run = handler.runs.getPtr("default:run-3").?;
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+    // Resume init → transitions to wait_approval → parks for signal
+    handler.checkPendingActions(&shard);
     {
         const run = handler.runs.get("default:run-3").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -3764,7 +3842,7 @@ test "step executor: signal resumes waiting workflow" {
         run.status = .running;
     }
 
-    // Resume execution
+    // Resume execution — signal found, follow success transition → flo.Completed
     handler.advanceWorkflow(&shard, "default:run-3", "default");
 
     const run = handler.runs.get("default:run-3").?;
@@ -3825,7 +3903,22 @@ test "step executor: failing action follows failure transition" {
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-6", "run-6", "test-wf");
 
+    // Phase 1: advance invokes step-a, parks
     handler.advanceWorkflow(&shard, "default:run-6", "default");
+    {
+        const run = handler.runs.getPtr("default:run-6").?;
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+    // Phase 2: step-a completes (success) → transitions to step_b → step-b parks
+    handler.checkPendingActions(&shard);
+    {
+        const run = handler.runs.getPtr("default:run-6").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        // Complete step-b with "failure"
+        completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "failure");
+    }
+    // Phase 3: step-b fails → follows "failure" transition → flo.Failed
+    handler.checkPendingActions(&shard);
 
     const run = handler.runs.get("default:run-6").?;
     // step-a succeeds → step_b → step-b fails → "failure" → flo.Failed
@@ -3845,7 +3938,20 @@ test "step executor: retry on failure" {
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
     createTestRun(&handler, "default:run-7", "run-7", "retry-wf");
 
+    // Initial attempt: flaky action parks
     handler.advanceWorkflow(&shard, "default:run-7", "default");
+
+    // Drive attempts: 1 original + 3 retries (maxAttempts=3) = 4 total
+    // Each iteration: complete current action with "failure", checkPendingActions
+    // (which either retries→re-parks, or exhausts retries→flo.Failed)
+    var attempt: u32 = 0;
+    while (attempt < 5) : (attempt += 1) {
+        const run_ptr = handler.runs.getPtr("default:run-7").?;
+        if (run_ptr.status.isTerminal()) break;
+        const rid = run_ptr.pending_action_run_id_owned orelse break;
+        completeTestActionWith(&actions, rid, "failure");
+        handler.checkPendingActions(&shard);
+    }
 
     const run = handler.runs.get("default:run-7").?;
     // Should fail after retries exhausted (max_attempts=3 means up to 3 retries)
@@ -3967,10 +4073,21 @@ test "step executor: checkPendingActions handles completed async action" {
         registerTestAction(&actions, "step-b");
     }
 
-    // checkPendingActions should detect the completed action and resume
+    // checkPendingActions should detect the completed action and resume step-a
+    handler.checkPendingActions(&shard);
+
+    // After step-a resumes, workflow advances to step_b (async) — parks again
+    {
+        const run = handler.runs.getPtr("default:run-8").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        // Complete step-b so the workflow can finish
+        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+    }
+
+    // Second checkPendingActions: step-b done → flo.Completed
     handler.checkPendingActions(&shard);
 
     const run = handler.runs.get("default:run-8").?;
-    // After resuming: start → step_b (success) → flo.Completed
+    // After resuming start → step_b (success) → flo.Completed
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
 }

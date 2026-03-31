@@ -299,8 +299,8 @@ test "Dispatcher: unrecognized opcode without error handler is silent" {
 
 test "Dispatcher: register range" {
     var d = Dispatcher.init();
-    // KV opcodes: 0x30–0x3F
-    d.registerRange(0x30, 0x3F, mockHandler);
+    // KV opcodes: 0x100–0x10F (16 slots after u16 opcode remapping)
+    d.registerRange(0x100, 0x10F, mockHandler);
 
     try std.testing.expectEqual(@as(u16, 16), d.handler_count);
     try std.testing.expect(d.hasHandler(.kv_get));

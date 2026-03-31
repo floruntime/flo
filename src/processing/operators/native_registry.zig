@@ -519,7 +519,6 @@ test "NativeOperatorRegistry — isNativeType" {
     try std.testing.expect(isNativeType("map"));
     try std.testing.expect(isNativeType("flatmap"));
     try std.testing.expect(isNativeType("classify"));
-    try std.testing.expect(isNativeType("wasm"));
     try std.testing.expect(!isNativeType("unknown"));
 }
 

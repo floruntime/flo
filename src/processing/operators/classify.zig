@@ -137,11 +137,11 @@ test "ClassifyOperator single rule match" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("rule0", "value_contains:error"),
+        .condition = ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
-    var op = ClassifyOperator.init(allocator, "test-classify", rules, null);
+    var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "test-classify"), rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -173,11 +173,11 @@ test "ClassifyOperator no rules match — record still emitted" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("rule0", "value_contains:error"),
+        .condition = ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
-    var op = ClassifyOperator.init(allocator, "test-classify", rules, null);
+    var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "test-classify"), rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -208,19 +208,19 @@ test "ClassifyOperator multiple rules compose" {
 
     var rules = try allocator.alloc(Rule, 3);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", "value_contains:error"),
+        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
     rules[1] = .{
-        .condition = ExprFilterOperator.init("r1", "value_contains:critical"),
+        .condition = ExprFilterOperator.init("r1", try allocator.dupe(u8, "value_contains:critical")),
         .tag_bit = 1,
     };
     rules[2] = .{
-        .condition = ExprFilterOperator.init("r2", "not_empty"),
+        .condition = ExprFilterOperator.init("r2", try allocator.dupe(u8, "not_empty")),
         .tag_bit = 2,
     };
 
-    var op = ClassifyOperator.init(allocator, "multi-classify", rules, null);
+    var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "multi-classify"), rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -260,12 +260,12 @@ test "ClassifyOperator default tag on unmatched records" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", "value_contains:error"),
+        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
     // default_tag_bit = 3 — applied when no rules match
-    var op = ClassifyOperator.init(allocator, "default-classify", rules, 3);
+    var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "default-classify"), rules, 3);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);
@@ -304,12 +304,12 @@ test "ClassifyOperator default tag null — unmatched gets no tags" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", "value_contains:error"),
+        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
     // No default tag
-    var op = ClassifyOperator.init(allocator, "no-default", rules, null);
+    var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "no-default"), rules, null);
     defer op.deinit();
 
     var collector = OutputCollector.init(allocator);

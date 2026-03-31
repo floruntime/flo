@@ -183,7 +183,8 @@ pub const Shard = struct {
 
     /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
     /// Writes go through propose() → commit → apply to projections.
-    raft_node: *RaftNode,
+    /// Null only in test shards created without a full init().
+    raft_node: ?*RaftNode,
 
     /// Unified waiter pool — handles blocking GET, blocking dequeue,
     /// stream long-poll, and action_await across all subsystems.
@@ -546,8 +547,10 @@ pub const Shard = struct {
         self.allocator.destroy(self.ts_handler);
 
         // Clean up Raft consensus node
-        self.raft_node.deinit();
-        self.allocator.destroy(self.raft_node);
+        if (self.raft_node) |rn| {
+            rn.deinit();
+            self.allocator.destroy(rn);
+        }
 
         // Clean up partitions (each owns UAL + all projections)
         for (self.partitions) |p| {

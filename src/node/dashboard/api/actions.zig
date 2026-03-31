@@ -300,7 +300,40 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
             try workers_arr.end();
         }
     } else {
-        return error.NotFound;
+        // Action not registered — return stub with empty defaults
+        try obj.stringField("namespace", ns_filter);
+        try obj.stringField("type", "user");
+        try obj.stringField("owner", "");
+        try obj.stringField("description", "");
+        try obj.intField("version", 0);
+        try obj.boolField("enabled", false);
+        try obj.intField("timeout_ms", 30000);
+        try obj.intField("max_retries", 3);
+        try obj.intField("retry_delay_ms", 1000);
+        try obj.intField("created_at", 0);
+        try obj.intField("updated_at", 0);
+        {
+            var runs_obj = try obj.objectField("runs");
+            try runs_obj.begin();
+            try runs_obj.intField("total", 0);
+            try runs_obj.intField("pending", 0);
+            try runs_obj.intField("running", 0);
+            try runs_obj.intField("completed", 0);
+            try runs_obj.intField("failed", 0);
+            try runs_obj.intField("cancelled", 0);
+            try runs_obj.intField("timed_out", 0);
+            try runs_obj.end();
+        }
+        {
+            var recent_arr = try obj.arrayField("recent_runs");
+            try recent_arr.begin();
+            try recent_arr.end();
+        }
+        {
+            var workers_arr = try obj.arrayField("workers");
+            try workers_arr.begin();
+            try workers_arr.end();
+        }
     }
 
     try obj.end();

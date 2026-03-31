@@ -108,6 +108,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .name("list-runs")
                 .about("List workflow runs")
                 .aliases(&.{"runs"})
+                .optionalArg("workflow_name", "Workflow name (shorthand for --workflow)")
                 .stringFlag("workflow", 'w', "", "Filter by workflow name")
                 .stringFlag("status", 's', "", "Filter by status (running, completed, failed, cancelled)")
                 .stringFlag("search", 'q', "", "Search runs by keyword")
@@ -566,7 +567,16 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
 fn runListRuns(ctx: *commander.Context) commander.Error!void {
     const wf_flag = ctx.getString("workflow");
-    const name: []const u8 = if (wf_flag) |w| if (w.len > 0) w else "" else "";
+    const positional = ctx.getPositional("workflow_name");
+    const name: []const u8 = blk: {
+        if (wf_flag) |w| {
+            if (w.len > 0) break :blk w;
+        }
+        if (positional) |p| {
+            if (p.len > 0) break :blk p;
+        }
+        break :blk "";
+    };
 
     const status_filter = ctx.getString("status");
     const status_val: ?[]const u8 = if (status_filter) |s| if (s.len > 0) s else null else null;

@@ -101,19 +101,24 @@ pub fn persistEntry(
 
     const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
 
-    const propose_result = try shard.raft_node.propose(
-        entry_type,
-        flags,
-        timestamp_ns,
-        payload_buf[0..payload_len],
-    );
+    const propose_result = blk: {
+        const rn = shard.raft_node orelse return error.NotLeader;
+        break :blk try rn.propose(
+            entry_type,
+            flags,
+            timestamp_ns,
+            payload_buf[0..payload_len],
+        );
+    };
 
     // Broadcast to cluster peers via raft network
     if (shard.raft_network) |rn| {
-        if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
-            var entry_buf: [MAX_PERSIST_PAYLOAD + 64]u8 = undefined;
-            if (committed_entry.serialize(&entry_buf)) |serialized_len| {
-                rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+        if (shard.raft_node) |raft| {
+            if (raft.log.getEntry(propose_result.index)) |committed_entry| {
+                var entry_buf: [MAX_PERSIST_PAYLOAD + 64]u8 = undefined;
+                if (committed_entry.serialize(&entry_buf)) |serialized_len| {
+                    rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+                }
             }
         }
     }

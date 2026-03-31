@@ -58,6 +58,18 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
+                .name("mget")
+                .about("Get multiple keys in one request")
+                .examples(&.{
+                    "flo kv mget key1 key2 key3",
+                    "flo kv mget user:1 user:2 user:3 --output json",
+                    "flo kv mget key1 key2 --namespace myns",
+                })
+                .variadicArg("keys", "Keys to retrieve (space-separated)")
+                .action(wrapHandler(runMget)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
                 .name("set")
                 .about("Set a key-value pair")
                 .examples(&.{
@@ -109,22 +121,8 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("limit", 'l', 10, "Maximum entries to show")
                 .action(wrapHandler(runHistory)),
         )
-        .subcommand(
-            commander.newBuilder(allocator)
-                .name("mget")
-                .about("Get multiple keys in one request")
-                .examples(&.{
-                    "flo kv mget key1 key2 key3",
-                    "flo kv mget user:1 user:2 user:3 --output json",
-                    "flo kv mget key1 key2 --namespace myns",
-                })
-                .variadicArg("keys", "Keys to retrieve (space-separated)")
-                .action(wrapHandler(runMget)),
-        )
         .build();
 }
-
-
 
 fn runGet(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander

@@ -74,6 +74,9 @@ pub const ActionsHandler = struct {
     /// Mutex protecting runs for cross-shard access.
     runs_mu: std.Thread.Mutex = .{},
 
+    /// Monotonic counter used to produce unique run IDs when shard is null (tests).
+    null_shard_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     const MAX_ACTION_NAME_LEN: usize = 256;
     const MAX_ACTIONS: usize = 10_000;
 
@@ -516,7 +519,10 @@ pub const ActionsHandler = struct {
             const partition_id = s.router.keyToPartitionNs(req.namespace, action_name);
             break :blk s.run_id_gen.next(.action, partition_id, &run_id_buf) catch "act-0";
         } else blk: {
-            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}", .{std.time.milliTimestamp()}) catch "act-0";
+            // Monotonic counter so concurrent null-shard invocations (tests)
+            // don't collide when called within the same millisecond.
+            const seq = self.null_shard_seq.fetchAdd(1, .monotonic);
+            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ std.time.milliTimestamp(), seq }) catch "act-0";
         };
 
         // Duplicate for storage
