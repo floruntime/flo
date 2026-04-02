@@ -29,6 +29,51 @@ pub const BrokerAddress = struct {
 };
 
 // =============================================================================
+// CircuitBreaker — per-broker failure tracking (§13.4)
+// =============================================================================
+
+pub const CircuitBreaker = struct {
+    state: State = .closed,
+    failure_count: u32 = 0,
+    failure_threshold: u32 = 5,
+    last_failure_ms: i64 = 0,
+    open_duration_ms: u32 = 30_000,
+
+    pub const State = enum(u8) { closed, open, half_open };
+
+    /// Record a successful request — resets the circuit.
+    pub fn recordSuccess(self: *CircuitBreaker) void {
+        self.failure_count = 0;
+        self.state = .closed;
+    }
+
+    /// Record a failed request — may trip the circuit open.
+    pub fn recordFailure(self: *CircuitBreaker) void {
+        self.failure_count += 1;
+        self.last_failure_ms = std.time.milliTimestamp();
+        if (self.failure_count >= self.failure_threshold) {
+            self.state = .open;
+        }
+    }
+
+    /// Returns true if a request should be allowed through.
+    pub fn allowRequest(self: *CircuitBreaker) bool {
+        switch (self.state) {
+            .closed => return true,
+            .open => {
+                const now = std.time.milliTimestamp();
+                if (now - self.last_failure_ms >= self.open_duration_ms) {
+                    self.state = .half_open;
+                    return true; // allow one probe
+                }
+                return false;
+            },
+            .half_open => return true, // probe in progress
+        }
+    }
+};
+
+// =============================================================================
 // SaslConfig
 // =============================================================================
 
@@ -193,6 +238,9 @@ pub const BrokerPool = struct {
     /// Broker address table from metadata
     broker_addresses: std.AutoHashMap(i32, BrokerAddress),
 
+    /// Circuit breakers per broker (§13.4)
+    circuit_breakers: std.AutoHashMap(i32, CircuitBreaker),
+
     /// Next correlation_id (monotonically increasing)
     next_correlation_id: i32,
 
@@ -211,6 +259,7 @@ pub const BrokerPool = struct {
             .allocator = allocator,
             .connections = std.AutoHashMap(i32, BrokerConnection).init(allocator),
             .broker_addresses = std.AutoHashMap(i32, BrokerAddress).init(allocator),
+            .circuit_breakers = std.AutoHashMap(i32, CircuitBreaker).init(allocator),
             .next_correlation_id = 1,
             .api_versions = [_]ApiVersionRange{.{}} ** 64,
             .api_versions_initialized = false,
@@ -226,6 +275,7 @@ pub const BrokerPool = struct {
         }
         self.connections.deinit();
         self.broker_addresses.deinit();
+        self.circuit_breakers.deinit();
     }
 
     /// Get the next correlation ID.
@@ -259,6 +309,15 @@ pub const BrokerPool = struct {
                 return error.UnknownBroker;
             };
             gop.value_ptr.* = try BrokerConnection.init(self.allocator, broker_id, addr);
+        }
+        return gop.value_ptr;
+    }
+
+    /// Get the circuit breaker for a broker (creates with defaults if absent).
+    pub fn getCircuitBreaker(self: *BrokerPool, broker_id: i32) !*CircuitBreaker {
+        const gop = try self.circuit_breakers.getOrPut(broker_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
         }
         return gop.value_ptr;
     }
@@ -325,6 +384,13 @@ pub const BrokerPool = struct {
         max_bytes: i32,
         isolation_level: i8,
     ) !protocol.FetchResponse {
+        // Check circuit breaker before attempting fetch
+        const cb = try self.getCircuitBreaker(broker_id);
+        if (!cb.allowRequest()) {
+            log.warn("Circuit breaker open for broker {d}, skipping fetch", .{broker_id});
+            return error.CircuitBreakerOpen;
+        }
+
         const conn = try self.getConnection(broker_id);
         if (conn.state != .ready) try conn.connect();
         if (self.sasl_config) |sasl| {
@@ -341,12 +407,20 @@ pub const BrokerPool = struct {
         try protocol.encodeFetchRequest(&writer, version, topic, partitions, max_wait_ms, min_bytes, max_bytes, isolation_level);
 
         const corr_id = self.nextCorrelationId();
-        try self.sendRequest(conn, .Fetch, version, corr_id, writer.getWritten());
+        self.sendRequest(conn, .Fetch, version, corr_id, writer.getWritten()) catch |err| {
+            cb.recordFailure();
+            return err;
+        };
 
-        const response_data = try conn.receive();
+        const response_data = conn.receive() catch |err| {
+            cb.recordFailure();
+            return err;
+        };
         const header = try codec.decodeResponseHeader(response_data, corr_id);
 
-        return try protocol.decodeFetchResponse(header.body, version, self.allocator);
+        const result = try protocol.decodeFetchResponse(header.body, version, self.allocator);
+        cb.recordSuccess();
+        return result;
     }
 
     /// Send ListOffsets request for a single partition.
@@ -565,4 +639,37 @@ test "getOurVersionRange for known APIs" {
     const metadata = getOurVersionRange(.Metadata);
     try std.testing.expectEqual(@as(i16, 1), metadata.min_version);
     try std.testing.expectEqual(@as(i16, 12), metadata.max_version);
+}
+
+test "CircuitBreaker starts closed and allows requests" {
+    var cb = CircuitBreaker{};
+    try std.testing.expectEqual(CircuitBreaker.State.closed, cb.state);
+    try std.testing.expect(cb.allowRequest());
+}
+
+test "CircuitBreaker opens after threshold failures" {
+    var cb = CircuitBreaker{ .failure_threshold = 3 };
+    cb.recordFailure();
+    cb.recordFailure();
+    try std.testing.expect(cb.allowRequest()); // still closed
+    cb.recordFailure(); // hits threshold
+    try std.testing.expectEqual(CircuitBreaker.State.open, cb.state);
+    try std.testing.expect(!cb.allowRequest()); // open, blocks
+}
+
+test "CircuitBreaker resets on success" {
+    var cb = CircuitBreaker{ .failure_threshold = 2 };
+    cb.recordFailure();
+    cb.recordSuccess();
+    try std.testing.expectEqual(@as(u32, 0), cb.failure_count);
+    try std.testing.expectEqual(CircuitBreaker.State.closed, cb.state);
+}
+
+test "CircuitBreaker transitions open→half_open after timeout" {
+    var cb = CircuitBreaker{ .failure_threshold = 1, .open_duration_ms = 0 };
+    cb.recordFailure(); // opens immediately
+    try std.testing.expectEqual(CircuitBreaker.State.open, cb.state);
+    // With open_duration_ms=0, next allowRequest should transition to half_open
+    try std.testing.expect(cb.allowRequest());
+    try std.testing.expectEqual(CircuitBreaker.State.half_open, cb.state);
 }

@@ -64,6 +64,39 @@ pub const StartOffset = enum(u8) {
 };
 
 // =============================================================================
+// BackoffConfig — per-partition exponential backoff (§13.2)
+// =============================================================================
+
+pub const BackoffConfig = struct {
+    initial_ms: u32 = 100,
+    max_ms: u32 = 30_000,
+    multiplier: f32 = 2.0,
+    jitter_fraction: f32 = 0.2,
+
+    /// Compute the backoff delay for a given consecutive failure count.
+    pub fn delayMs(self: BackoffConfig, failure_count: u32) u32 {
+        if (failure_count == 0) return 0;
+        var delay: f32 = @floatFromInt(self.initial_ms);
+        var i: u32 = 1;
+        while (i < failure_count) : (i += 1) {
+            delay *= self.multiplier;
+            if (delay >= @as(f32, @floatFromInt(self.max_ms))) {
+                delay = @floatFromInt(self.max_ms);
+                break;
+            }
+        }
+        // Apply jitter: ±jitter_fraction
+        const jitter_range = delay * self.jitter_fraction;
+        // Deterministic jitter based on failure_count (no RNG needed)
+        const jitter_seed: f32 = @floatFromInt((failure_count *% 7919) % 1000);
+        const jitter = (jitter_seed / 1000.0) * 2.0 * jitter_range - jitter_range;
+        delay += jitter;
+        if (delay < 0) delay = 0;
+        return @intFromFloat(@min(delay, @as(f32, @floatFromInt(self.max_ms))));
+    }
+};
+
+// =============================================================================
 // PartitionReader — per-partition state
 // =============================================================================
 
@@ -77,6 +110,7 @@ pub const PartitionReader = struct {
     error_count: u32,
     committed_offset: i64,
     initialized: bool,
+    backoff_until_ms: i64,
 
     pub fn init(partition_id: i32) PartitionReader {
         return .{
@@ -89,6 +123,7 @@ pub const PartitionReader = struct {
             .error_count = 0,
             .committed_offset = -1,
             .initialized = false,
+            .backoff_until_ms = 0,
         };
     }
 };
@@ -106,6 +141,7 @@ pub const KafkaSource = struct {
     poll_index: usize,
     deserializer: Deserializer,
     state: SourceState,
+    backoff: BackoffConfig,
 
     // Metrics
     records_fetched: u64,
@@ -146,6 +182,7 @@ pub const KafkaSource = struct {
             .poll_index = 0,
             .deserializer = Deserializer.init(config.format, config.on_deser_error),
             .state = .uninitialized,
+            .backoff = .{},
             .records_fetched = 0,
             .bytes_fetched = 0,
             .fetch_errors = 0,
@@ -472,12 +509,16 @@ pub const KafkaSource = struct {
         // Round-robin: pick next partition
         const start_idx = self.poll_index;
         var tried: usize = 0;
+        const now = std.time.milliTimestamp();
 
         while (tried < self.partitions.len) : (tried += 1) {
             const idx = (start_idx + tried) % self.partitions.len;
             const p = &self.partitions[idx];
 
             if (!p.initialized or p.leader_broker_id < 0) continue;
+
+            // Per-partition backoff: skip if still in cooldown (§13.2)
+            if (p.error_count > 0 and now < p.backoff_until_ms) continue;
 
             // Build fetch request for this partition
             const fetch_parts = [_]FetchPartitionRequest{.{
@@ -496,14 +537,18 @@ pub const KafkaSource = struct {
                 self.config.isolation_level,
             ) catch |err| {
                 p.error_count += 1;
+                p.backoff_until_ms = now + self.backoff.delayMs(p.error_count);
                 if (p.error_count >= 3) {
-                    log.warn("Partition {d} fetch error #{d}: {}", .{ p.partition_id, p.error_count, err });
+                    log.warn("Partition {d} fetch error #{d}: {} (backoff {d}ms)", .{
+                        p.partition_id, p.error_count, err, self.backoff.delayMs(p.error_count),
+                    });
                 }
                 continue;
             };
             defer resp.deinit();
 
             p.error_count = 0;
+            p.backoff_until_ms = 0;
             p.last_fetch_ms = std.time.milliTimestamp();
             self.poll_index = (idx + 1) % self.partitions.len;
 
@@ -620,6 +665,31 @@ test "PartitionReader init defaults" {
     try std.testing.expectEqual(@as(i64, -1), p.high_watermark);
     try std.testing.expect(!p.initialized);
     try std.testing.expectEqual(@as(u32, 0), p.error_count);
+    try std.testing.expectEqual(@as(i64, 0), p.backoff_until_ms);
+}
+
+test "BackoffConfig delayMs exponential growth" {
+    const cfg = BackoffConfig{ .initial_ms = 100, .max_ms = 30_000, .multiplier = 2.0, .jitter_fraction = 0.0 };
+    try std.testing.expectEqual(@as(u32, 0), cfg.delayMs(0));
+    try std.testing.expectEqual(@as(u32, 100), cfg.delayMs(1));
+    try std.testing.expectEqual(@as(u32, 200), cfg.delayMs(2));
+    try std.testing.expectEqual(@as(u32, 400), cfg.delayMs(3));
+    try std.testing.expectEqual(@as(u32, 800), cfg.delayMs(4));
+}
+
+test "BackoffConfig delayMs caps at max" {
+    const cfg = BackoffConfig{ .initial_ms = 100, .max_ms = 500, .multiplier = 2.0, .jitter_fraction = 0.0 };
+    try std.testing.expectEqual(@as(u32, 400), cfg.delayMs(3));
+    try std.testing.expectEqual(@as(u32, 500), cfg.delayMs(4)); // capped
+    try std.testing.expectEqual(@as(u32, 500), cfg.delayMs(10)); // still capped
+}
+
+test "BackoffConfig delayMs with jitter stays within bounds" {
+    const cfg = BackoffConfig{ .initial_ms = 1000, .max_ms = 30_000, .multiplier = 2.0, .jitter_fraction = 0.2 };
+    // With jitter_fraction=0.2, delay should be within ±20% of base
+    const delay = cfg.delayMs(1);
+    try std.testing.expect(delay >= 800); // 1000 - 200
+    try std.testing.expect(delay <= 1200); // 1000 + 200
 }
 
 test "snapshotOffsets and restoreOffsets roundtrip" {

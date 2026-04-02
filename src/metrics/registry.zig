@@ -366,6 +366,72 @@ pub const ProcessingMetrics = struct {
     }
 };
 
+// =============================================================================
+// Kafka Source Metrics (§17.1)
+// =============================================================================
+
+/// Per-KafkaSource metrics for Prometheus observability.
+/// Thread-safe: uses atomic operations for all counters.
+pub const KafkaSourceMetrics = struct {
+    /// Total records fetched from Kafka
+    records_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total bytes fetched from Kafka
+    bytes_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total fetch errors
+    fetch_errors_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total deserialization errors
+    deserialize_errors_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total metadata refreshes
+    metadata_refreshes_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Active broker connections
+    connection_count: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn init() KafkaSourceMetrics {
+        return .{};
+    }
+
+    pub fn recordFetched(self: *KafkaSourceMetrics, records: u64, bytes: u64) void {
+        _ = self.records_total.fetchAdd(records, .monotonic);
+        _ = self.bytes_total.fetchAdd(bytes, .monotonic);
+    }
+
+    pub fn recordFetchError(self: *KafkaSourceMetrics) void {
+        _ = self.fetch_errors_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordDeserializeError(self: *KafkaSourceMetrics) void {
+        _ = self.deserialize_errors_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordMetadataRefresh(self: *KafkaSourceMetrics) void {
+        _ = self.metadata_refreshes_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn setConnectionCount(self: *KafkaSourceMetrics, count: u64) void {
+        self.connection_count.store(count, .monotonic);
+    }
+
+    pub const Snapshot = struct {
+        records_total: u64,
+        bytes_total: u64,
+        fetch_errors_total: u64,
+        deserialize_errors_total: u64,
+        metadata_refreshes_total: u64,
+        connection_count: u64,
+    };
+
+    pub fn snapshot(self: *const KafkaSourceMetrics) Snapshot {
+        return .{
+            .records_total = self.records_total.load(.monotonic),
+            .bytes_total = self.bytes_total.load(.monotonic),
+            .fetch_errors_total = self.fetch_errors_total.load(.monotonic),
+            .deserialize_errors_total = self.deserialize_errors_total.load(.monotonic),
+            .metadata_refreshes_total = self.metadata_refreshes_total.load(.monotonic),
+            .connection_count = self.connection_count.load(.monotonic),
+        };
+    }
+};
+
 /// Server-level metrics (connections, subscriptions, commands, etc.)
 pub const ServerMetrics = struct {
     /// Current active connections
@@ -619,6 +685,10 @@ pub const MetricsRegistry = struct {
     /// Processing engine metrics (singleton - one per node)
     processing: ProcessingMetrics,
 
+    /// Kafka source metrics
+    /// Key format: "{job_name}:{topic}"
+    kafka_sources: std.StringHashMap(KafkaSourceEntry),
+
     /// Per-shard metrics for the thread-per-shard architecture.
     /// Indexed by shard_id. Null until initShards() is called.
     shard_counters: ?[]ShardMetrics,
@@ -651,6 +721,12 @@ pub const MetricsRegistry = struct {
         metrics: TieredLogMetrics,
     };
 
+    pub const KafkaSourceEntry = struct {
+        job_name: []const u8,
+        topic: []const u8,
+        metrics: KafkaSourceMetrics,
+    };
+
     pub fn init(allocator: Allocator) MetricsRegistry {
         return MetricsRegistry{
             .allocator = allocator,
@@ -661,6 +737,7 @@ pub const MetricsRegistry = struct {
             .tiered_logs = std.AutoHashMap(u32, TieredLogEntry).init(allocator),
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
+            .kafka_sources = std.StringHashMap(KafkaSourceEntry).init(allocator),
             .shard_counters = null,
             .num_shards = 0,
             .mutex = std.Thread.Mutex{},
@@ -714,6 +791,18 @@ pub const MetricsRegistry = struct {
 
         // Free tiered log entries (no string keys)
         self.tiered_logs.deinit();
+
+        // Free kafka source keys and entries
+        var kafka_key_iter = self.kafka_sources.keyIterator();
+        while (kafka_key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        var kafka_value_iter = self.kafka_sources.valueIterator();
+        while (kafka_value_iter.next()) |entry| {
+            self.allocator.free(entry.job_name);
+            self.allocator.free(entry.topic);
+        }
+        self.kafka_sources.deinit();
     }
 
     /// Register a stream and return a pointer to its metrics
@@ -853,6 +942,37 @@ pub const MetricsRegistry = struct {
         return &self.tiered_logs.getPtr(group_id).?.metrics;
     }
 
+    /// Register a Kafka source and return a pointer to its metrics.
+    pub fn registerKafkaSource(
+        self: *MetricsRegistry,
+        job_name: []const u8,
+        topic: []const u8,
+    ) !*KafkaSourceMetrics {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const key = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}:{s}",
+            .{ job_name, topic },
+        );
+        errdefer self.allocator.free(key);
+
+        if (self.kafka_sources.getPtr(key)) |existing| {
+            self.allocator.free(key);
+            return &existing.metrics;
+        }
+
+        const entry = KafkaSourceEntry{
+            .job_name = try self.allocator.dupe(u8, job_name),
+            .topic = try self.allocator.dupe(u8, topic),
+            .metrics = KafkaSourceMetrics.init(),
+        };
+
+        try self.kafka_sources.put(key, entry);
+        return &self.kafka_sources.getPtr(key).?.metrics;
+    }
+
     /// Initialize per-shard metrics counters.
     /// Must be called once during node startup with the number of shards.
     /// Each shard thread then obtains its ShardMetrics via shardMetrics(shard_id).
@@ -955,6 +1075,19 @@ pub const MetricsRegistry = struct {
 
         // Export processing metrics
         try writeProcessingMetrics(writer, self.processing.snapshot());
+
+        // Export Kafka source metrics
+        var kafka_iter = self.kafka_sources.valueIterator();
+        while (kafka_iter.next()) |entry| {
+            const ks_snapshot = entry.metrics.snapshot();
+            const ks_labels = try std.fmt.allocPrint(
+                allocator,
+                "job=\"{s}\",topic=\"{s}\"",
+                .{ entry.job_name, entry.topic },
+            );
+            defer allocator.free(ks_labels);
+            try writeKafkaSourceMetrics(writer, ks_snapshot, ks_labels);
+        }
 
         return buf.toOwnedSlice(allocator);
     }
@@ -1231,6 +1364,33 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_reactor_loops_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.reactor_loops });
     try writer.print("flo_shard_inbox_processed_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_processed });
     try writer.print("flo_shard_inbox_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_pending });
+}
+
+/// Write Kafka source metrics in Prometheus format (§17.1)
+fn writeKafkaSourceMetrics(writer: anytype, snap: KafkaSourceMetrics.Snapshot, labels: []const u8) !void {
+    try writer.print("\n# HELP flo_kafka_source_records_total Total records fetched from Kafka\n", .{});
+    try writer.print("# TYPE flo_kafka_source_records_total counter\n", .{});
+    try writer.print("flo_kafka_source_records_total{{{s}}} {d}\n", .{ labels, snap.records_total });
+
+    try writer.print("# HELP flo_kafka_source_bytes_total Total bytes fetched from Kafka\n", .{});
+    try writer.print("# TYPE flo_kafka_source_bytes_total counter\n", .{});
+    try writer.print("flo_kafka_source_bytes_total{{{s}}} {d}\n", .{ labels, snap.bytes_total });
+
+    try writer.print("# HELP flo_kafka_source_fetch_errors_total Total fetch errors\n", .{});
+    try writer.print("# TYPE flo_kafka_source_fetch_errors_total counter\n", .{});
+    try writer.print("flo_kafka_source_fetch_errors_total{{{s}}} {d}\n", .{ labels, snap.fetch_errors_total });
+
+    try writer.print("# HELP flo_kafka_source_deserialize_errors_total Total deserialization errors\n", .{});
+    try writer.print("# TYPE flo_kafka_source_deserialize_errors_total counter\n", .{});
+    try writer.print("flo_kafka_source_deserialize_errors_total{{{s}}} {d}\n", .{ labels, snap.deserialize_errors_total });
+
+    try writer.print("# HELP flo_kafka_source_metadata_refreshes_total Total metadata refreshes\n", .{});
+    try writer.print("# TYPE flo_kafka_source_metadata_refreshes_total counter\n", .{});
+    try writer.print("flo_kafka_source_metadata_refreshes_total{{{s}}} {d}\n", .{ labels, snap.metadata_refreshes_total });
+
+    try writer.print("# HELP flo_kafka_source_connection_count Active broker connections\n", .{});
+    try writer.print("# TYPE flo_kafka_source_connection_count gauge\n", .{});
+    try writer.print("flo_kafka_source_connection_count{{{s}}} {d}\n", .{ labels, snap.connection_count });
 }
 
 // ============================================================================
