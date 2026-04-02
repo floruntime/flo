@@ -2,6 +2,7 @@
 //!
 //! Pure-Zig Kafka wire protocol client for KafkaSource integration.
 //! Phase 1: plaintext + SASL/PLAIN, JSON + RAW + STRING, GZIP compression.
+//! Phase 2: SCRAM-SHA-256/512, Snappy/LZ4/ZSTD compression.
 //!
 //! Public imports for use by the processing handler and other modules.
 
@@ -10,6 +11,7 @@ pub const protocol = @import("protocol.zig");
 pub const broker = @import("broker.zig");
 pub const auth = @import("auth.zig");
 pub const record_batch = @import("record_batch.zig");
+pub const compress = @import("compress.zig");
 pub const deser = @import("deser.zig");
 pub const source = @import("source.zig");
 
@@ -26,6 +28,7 @@ test {
     _ = broker;
     _ = auth;
     _ = record_batch;
+    _ = compress;
     _ = deser;
     _ = source;
 }

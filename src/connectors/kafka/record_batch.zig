@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const codec = @import("codec.zig");
 const KafkaReader = codec.KafkaReader;
+const compress = @import("compress.zig");
 
 const log = @import("stdx").log;
 
@@ -153,9 +154,29 @@ pub const RecordBatchIterator = struct {
         const records_data = switch (comp) {
             .none => raw_records,
             .gzip => try decompressGzip(raw_records, self.allocator, &self.decompressed),
-            .snappy, .lz4, .zstd => {
-                log.err("Compression type {d} not supported in Phase 1", .{@intFromEnum(comp)});
-                return error.UnsupportedCompression;
+            .snappy => blk: {
+                const decompressed = compress.decompressSnappy(raw_records, self.allocator) catch |err| {
+                    log.err("Snappy decompression failed: {}", .{err});
+                    return error.DecompressionFailed;
+                };
+                self.decompressed = decompressed;
+                break :blk decompressed;
+            },
+            .lz4 => blk: {
+                const decompressed = compress.decompressLz4(raw_records, self.allocator) catch |err| {
+                    log.err("LZ4 decompression failed: {}", .{err});
+                    return error.DecompressionFailed;
+                };
+                self.decompressed = decompressed;
+                break :blk decompressed;
+            },
+            .zstd => blk: {
+                const decompressed = compress.decompressZstd(raw_records, self.allocator) catch |err| {
+                    log.err("ZSTD decompression failed: {}", .{err});
+                    return error.DecompressionFailed;
+                };
+                self.decompressed = decompressed;
+                break :blk decompressed;
             },
         };
 

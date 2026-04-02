@@ -2952,7 +2952,10 @@ test "e2e/processing: kafka source ingests JSON records into flo stream" {
     // Start Redpanda container
     var rp = try RedpandaProcess.init(testing.allocator, .{});
     defer rp.deinit();
-    rp.start() catch return error.SkipZigTest;
+    rp.start() catch |err| {
+        std.debug.print("\n[SKIPPED] Could not start Redpanda: {s}\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
 
     // Start Flo server
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
@@ -3022,7 +3025,10 @@ test "e2e/processing: kafka source ingests JSON records into flo stream" {
 test "e2e/processing: kafka source with earliest offset reads all existing records" {
     var rp = try RedpandaProcess.init(testing.allocator, .{});
     defer rp.deinit();
-    rp.start() catch return error.SkipZigTest;
+    rp.start() catch |err| {
+        std.debug.print("\n[SKIPPED] Could not start Redpanda: {s}\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
 
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -3075,7 +3081,10 @@ test "e2e/processing: kafka source with earliest offset reads all existing recor
 test "e2e/processing: kafka source with keyed records" {
     var rp = try RedpandaProcess.init(testing.allocator, .{});
     defer rp.deinit();
-    rp.start() catch return error.SkipZigTest;
+    rp.start() catch |err| {
+        std.debug.print("\n[SKIPPED] Could not start Redpanda: {s}\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
 
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -3125,7 +3134,10 @@ test "e2e/processing: kafka source with keyed records" {
 test "e2e/processing: kafka pipeline lifecycle - submit and stop" {
     var rp = try RedpandaProcess.init(testing.allocator, .{});
     defer rp.deinit();
-    rp.start() catch return error.SkipZigTest;
+    rp.start() catch |err| {
+        std.debug.print("\n[SKIPPED] Could not start Redpanda: {s}\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
 
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
