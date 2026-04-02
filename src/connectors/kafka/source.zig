@@ -25,11 +25,11 @@ const Deserializer = deser_mod.Deserializer;
 const RecordBatchIterator = record_batch.RecordBatchIterator;
 
 // Processing types
-const Source = @import("../processing/endpoints/source.zig").Source;
-const ProcessingRecord = @import("../processing/record.zig").ProcessingRecord;
-const SourceRef = @import("../processing/record.zig").SourceRef;
-const StreamElement = @import("../processing/record.zig").StreamElement;
-const StreamID = @import("../stream/stream_id.zig").StreamID;
+const Source = @import("../../processing/endpoints/source.zig").Source;
+const ProcessingRecord = @import("../../processing/record.zig").ProcessingRecord;
+const SourceRef = @import("../../processing/record.zig").SourceRef;
+const StreamElement = @import("../../processing/record.zig").StreamElement;
+const StreamID = @import("../../stream/stream_id.zig").StreamID;
 
 const log = @import("stdx").log;
 

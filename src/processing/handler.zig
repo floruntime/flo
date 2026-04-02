@@ -52,9 +52,9 @@ const persistence_mod = @import("../storage/persistence.zig");
 const EntryType = entry_mod.EntryType;
 const Flags = entry_mod.Flags;
 
-const KafkaSource = @import("../kafka/source.zig").KafkaSource;
-const KafkaSourceConfig = @import("../kafka/source.zig").KafkaSourceConfig;
-const KafkaStartOffset = @import("../kafka/source.zig").StartOffset;
+const KafkaSource = @import("../connectors/kafka/source.zig").KafkaSource;
+const KafkaSourceConfig = @import("../connectors/kafka/source.zig").KafkaSourceConfig;
+const KafkaStartOffset = @import("../connectors/kafka/source.zig").StartOffset;
 const SourceVTable = @import("endpoints/source.zig").Source;
 const StreamElement = @import("record.zig").StreamElement;
 
@@ -1138,7 +1138,7 @@ pub const ProcessingHandler = struct {
 
     /// Create and attach a KafkaSource to a pipeline state.
     fn initKafkaSource(self: *ProcessingHandler, pipe: *PipelineState, src: *const definition.SourceSpec) void {
-        const deser_format: @import("../kafka/deser.zig").Format = switch (src.kafka_format) {
+        const deser_format: @import("../connectors/kafka/deser.zig").Format = switch (src.kafka_format) {
             .raw => .raw,
             .json => .json,
             .string => .string,

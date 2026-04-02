@@ -137,16 +137,17 @@ test {
     _ = @import("processing/parser.zig");
 }
 
-// Kafka source
+// Connectors (Kafka, ...)
 test {
-    _ = @import("kafka/codec.zig");
-    _ = @import("kafka/protocol.zig");
-    _ = @import("kafka/record_batch.zig");
-    _ = @import("kafka/broker.zig");
-    _ = @import("kafka/auth.zig");
-    _ = @import("kafka/deser.zig");
-    _ = @import("kafka/source.zig");
-    _ = @import("kafka/mod.zig");
+    _ = @import("connectors/kafka/codec.zig");
+    _ = @import("connectors/kafka/protocol.zig");
+    _ = @import("connectors/kafka/record_batch.zig");
+    _ = @import("connectors/kafka/broker.zig");
+    _ = @import("connectors/kafka/auth.zig");
+    _ = @import("connectors/kafka/deser.zig");
+    _ = @import("connectors/kafka/source.zig");
+    _ = @import("connectors/kafka/mod.zig");
+    _ = @import("connectors/mod.zig");
 }
 
 // Dashboard

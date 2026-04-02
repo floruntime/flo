@@ -85,9 +85,9 @@ pub const processing = struct {
 };
 
 // =============================================================================
-// Kafka Source: Wire protocol client for consuming from Apache Kafka
+// Connectors: External system integrations (Kafka, Redis, NATS, ...)
 // =============================================================================
-pub const kafka = @import("kafka/mod.zig");
+pub const connectors = @import("connectors/mod.zig");
 
 // =============================================================================
 // Auth: API keys, session tokens, key store
