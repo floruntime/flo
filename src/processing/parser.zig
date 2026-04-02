@@ -562,6 +562,44 @@ fn appendKafkaSource(
         sasl_password = getString(sasl_obj, "password") orelse "";
     }
 
+    // Parse Schema Registry config
+    var sr_url: []const u8 = "";
+    var sr_username: []const u8 = "";
+    var sr_password: []const u8 = "";
+    if (getObject(kafka_obj, "schema_registry")) |sr_obj| {
+        sr_url = getString(sr_obj, "url") orelse "";
+        if (getObject(sr_obj, "auth")) |auth_obj| {
+            sr_username = getString(auth_obj, "username") orelse "";
+            sr_password = getString(auth_obj, "password") orelse "";
+        }
+    }
+
+    // Parse TLS config
+    var tls_ca_cert: []const u8 = "";
+    var tls_client_cert: []const u8 = "";
+    var tls_client_key: []const u8 = "";
+    var tls_skip_verify: bool = false;
+    if (getObject(kafka_obj, "tls")) |tls_obj| {
+        tls_ca_cert = getString(tls_obj, "ca_cert") orelse "";
+        tls_client_cert = getString(tls_obj, "client_cert") orelse "";
+        tls_client_key = getString(tls_obj, "client_key") orelse "";
+        if (getString(tls_obj, "skip_verify")) |sv| {
+            tls_skip_verify = std.mem.eql(u8, sv, "true");
+        }
+    }
+
+    // Parse AWS MSK IAM config
+    var aws_access_key_id: []const u8 = "";
+    var aws_secret_access_key: []const u8 = "";
+    var aws_session_token: []const u8 = "";
+    var aws_region: []const u8 = "";
+    if (getObject(kafka_obj, "aws")) |aws_obj| {
+        aws_access_key_id = getString(aws_obj, "access_key_id") orelse "";
+        aws_secret_access_key = getString(aws_obj, "secret_access_key") orelse "";
+        aws_session_token = getString(aws_obj, "session_token") orelse "";
+        aws_region = getString(aws_obj, "region") orelse "";
+    }
+
     // Map string enums
     const kafka_security = parseKafkaSecurityMode(security_raw);
     const kafka_format = parseKafkaFormat(format_raw);
@@ -587,6 +625,26 @@ fn appendKafkaSource(
     errdefer allocator.free(sasl_user_d);
     const sasl_pass_d = interpolate.resolve(allocator, sasl_password, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(sasl_pass_d);
+    const sr_url_d = interpolate.resolve(allocator, sr_url, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(sr_url_d);
+    const sr_user_d = interpolate.resolve(allocator, sr_username, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(sr_user_d);
+    const sr_pass_d = interpolate.resolve(allocator, sr_password, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(sr_pass_d);
+    const tls_ca_d = interpolate.resolve(allocator, tls_ca_cert, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(tls_ca_d);
+    const tls_cert_d = interpolate.resolve(allocator, tls_client_cert, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(tls_cert_d);
+    const tls_key_d = interpolate.resolve(allocator, tls_client_key, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(tls_key_d);
+    const aws_key_d = interpolate.resolve(allocator, aws_access_key_id, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(aws_key_d);
+    const aws_secret_d = interpolate.resolve(allocator, aws_secret_access_key, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(aws_secret_d);
+    const aws_token_d = interpolate.resolve(allocator, aws_session_token, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(aws_token_d);
+    const aws_region_d = interpolate.resolve(allocator, aws_region, resolve_opts) catch return error.OutOfMemory;
+    errdefer allocator.free(aws_region_d);
 
     sources.append(allocator, .{
         .kind = .kafka,
@@ -611,6 +669,17 @@ fn appendKafkaSource(
         .kafka_fetch_min_bytes = fetch_min_bytes,
         .kafka_metadata_refresh_ms = metadata_refresh_ms,
         .kafka_isolation_level = isolation_level,
+        .kafka_schema_registry_url = sr_url_d,
+        .kafka_schema_registry_username = sr_user_d,
+        .kafka_schema_registry_password = sr_pass_d,
+        .kafka_tls_ca_cert = tls_ca_d,
+        .kafka_tls_client_cert = tls_cert_d,
+        .kafka_tls_client_key = tls_key_d,
+        .kafka_tls_skip_verify = tls_skip_verify,
+        .kafka_aws_access_key_id = aws_key_d,
+        .kafka_aws_secret_access_key = aws_secret_d,
+        .kafka_aws_session_token = aws_token_d,
+        .kafka_aws_region = aws_region_d,
     }) catch return error.OutOfMemory;
 }
 

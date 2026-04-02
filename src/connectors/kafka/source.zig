@@ -54,6 +54,23 @@ pub const KafkaSourceConfig = struct {
     security_mechanism: ?[]const u8 = null,
     sasl_username: ?[]const u8 = null,
     sasl_password: ?[]const u8 = null,
+
+    // Schema Registry
+    schema_registry_url: ?[]const u8 = null,
+    schema_registry_username: ?[]const u8 = null,
+    schema_registry_password: ?[]const u8 = null,
+
+    // TLS / mTLS
+    tls_ca_cert: ?[]const u8 = null,
+    tls_client_cert: ?[]const u8 = null,
+    tls_client_key: ?[]const u8 = null,
+    tls_skip_verify: bool = false,
+
+    // AWS MSK IAM
+    aws_access_key_id: ?[]const u8 = null,
+    aws_secret_access_key: ?[]const u8 = null,
+    aws_session_token: ?[]const u8 = null,
+    aws_region: ?[]const u8 = null,
 };
 
 pub const StartOffset = enum(u8) {

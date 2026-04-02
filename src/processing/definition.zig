@@ -293,6 +293,37 @@ pub const SourceSpec = struct {
     kafka_isolation_level: u8 = 0,
     /// Offset reset strategy on out-of-range
     kafka_on_offset_reset: KafkaStartOffset = .latest,
+
+    // -- Schema Registry (Avro/Protobuf) --
+
+    /// Schema Registry URL (e.g. "http://localhost:8081")
+    kafka_schema_registry_url: []const u8 = "",
+    /// Schema Registry basic auth username
+    kafka_schema_registry_username: []const u8 = "",
+    /// Schema Registry basic auth password
+    kafka_schema_registry_password: []const u8 = "",
+
+    // -- TLS / mTLS --
+
+    /// Path to CA certificate (PEM) for TLS server verification
+    kafka_tls_ca_cert: []const u8 = "",
+    /// Path to client certificate (PEM) for mTLS
+    kafka_tls_client_cert: []const u8 = "",
+    /// Path to client private key (PEM) for mTLS
+    kafka_tls_client_key: []const u8 = "",
+    /// Skip TLS server certificate verification (insecure)
+    kafka_tls_skip_verify: bool = false,
+
+    // -- AWS MSK IAM --
+
+    /// AWS Access Key ID for MSK IAM auth
+    kafka_aws_access_key_id: []const u8 = "",
+    /// AWS Secret Access Key for MSK IAM auth
+    kafka_aws_secret_access_key: []const u8 = "",
+    /// AWS Session Token (optional, for temporary credentials)
+    kafka_aws_session_token: []const u8 = "",
+    /// AWS Region for MSK IAM auth
+    kafka_aws_region: []const u8 = "",
 };
 
 // =============================================================================

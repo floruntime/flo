@@ -10,6 +10,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 
+const schema_registry = @import("schema_registry.zig");
+const avro = @import("avro.zig");
+const protobuf = @import("protobuf.zig");
+
 pub const Format = enum(u8) {
     raw = 0,
     json = 1,
@@ -27,6 +31,7 @@ pub const DeserializeError = enum(u8) {
 pub const Deserializer = struct {
     format: Format,
     on_error: DeserializeError,
+    registry_client: ?*schema_registry.SchemaRegistryClient = null,
 
     pub fn init(format: Format, on_error: DeserializeError) Deserializer {
         return .{ .format = format, .on_error = on_error };
@@ -43,10 +48,8 @@ pub const Deserializer = struct {
             .raw => v,
             .json => self.deserializeJson(v, allocator),
             .string => self.deserializeString(v, allocator),
-            .avro, .protobuf => {
-                log.err("Avro/Protobuf deserialization not supported in Phase 1", .{});
-                return error.UnsupportedFormat;
-            },
+            .avro => return self.deserializeAvro(v, allocator),
+            .protobuf => return self.deserializeProtobuf(v, allocator),
         };
     }
 
@@ -109,6 +112,58 @@ pub const Deserializer = struct {
                 return error.DeserializationFailed;
             },
         }
+    }
+
+    fn deserializeAvro(self: *const Deserializer, data: []const u8, allocator: Allocator) !?[]const u8 {
+        // Parse Confluent wire header: [0x00][schema_id:i32 BE][avro_bytes...]
+        const header = schema_registry.parseConfluentHeader(data) orelse {
+            return self.handleError("invalid Confluent Avro header", data, allocator);
+        };
+
+        // Get schema from registry (required for Avro)
+        const client = self.registry_client orelse {
+            log.err("Avro format requires Schema Registry client", .{});
+            return self.handleError("no schema registry configured", data, allocator);
+        };
+
+        const schema_obj = client.getSchema(header.schema_id) catch {
+            return self.handleError("schema registry lookup failed", data, allocator);
+        };
+
+        // Parse Avro schema JSON → AvroType
+        var schema_parser = avro.SchemaParser.init(allocator);
+        defer schema_parser.deinit();
+        const avro_type = schema_parser.parse(schema_obj.schema) catch {
+            return self.handleError("invalid Avro schema", data, allocator);
+        };
+
+        // Decode Avro binary → JSON
+        var avro_decoder = avro.AvroDecoder.init(allocator);
+        const json = avro_decoder.decode(header.payload, avro_type) catch {
+            return self.handleError("Avro decode failed", data, allocator);
+        };
+
+        return json;
+    }
+
+    fn deserializeProtobuf(self: *const Deserializer, data: []const u8, allocator: Allocator) !?[]const u8 {
+        // Parse Confluent protobuf header (magic + schema_id + message indexes)
+        const header = protobuf.parseConfluentProtobufHeader(data) orelse {
+            // No Confluent header — try raw protobuf decode
+            var decoder = protobuf.ProtobufDecoder.init(allocator);
+            const json = decoder.decode(data) catch {
+                return self.handleError("protobuf decode failed", data, allocator);
+            };
+            return json;
+        };
+
+        // Decode protobuf payload → JSON (self-describing, schema-less)
+        var decoder = protobuf.ProtobufDecoder.init(allocator);
+        const json = decoder.decode(header.payload) catch {
+            return self.handleError("protobuf decode failed", data, allocator);
+        };
+
+        return json;
     }
 };
 
