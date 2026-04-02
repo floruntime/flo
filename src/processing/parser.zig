@@ -567,24 +567,25 @@ fn appendKafkaSource(
     const kafka_format = parseKafkaFormat(format_raw);
     const kafka_start_offset = parseKafkaStartOffset(start_offset_raw);
 
-    // Dupe strings — resolve ${env.*} for config and ${secrets.*} for credentials
+    // Dupe strings — resolve ${env.*} and ${secrets.*} on all string fields
+    const resolve_opts: interpolate.Options = .{ .secrets = true };
     const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
     errdefer allocator.free(name_d);
     const stream_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
     errdefer allocator.free(stream_d);
     const ns_d = allocator.dupe(u8, "default") catch return error.OutOfMemory;
     errdefer allocator.free(ns_d);
-    const brokers_d = interpolate.resolve(allocator, brokers_raw, .{}) catch return error.OutOfMemory;
+    const brokers_d = interpolate.resolve(allocator, brokers_raw, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(brokers_d);
-    const topic_d = interpolate.resolve(allocator, topic_raw, .{}) catch return error.OutOfMemory;
+    const topic_d = interpolate.resolve(allocator, topic_raw, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(topic_d);
-    const group_d = interpolate.resolve(allocator, group_raw, .{}) catch return error.OutOfMemory;
+    const group_d = interpolate.resolve(allocator, group_raw, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(group_d);
-    const sasl_mech_d = allocator.dupe(u8, sasl_mechanism) catch return error.OutOfMemory;
+    const sasl_mech_d = interpolate.resolve(allocator, sasl_mechanism, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(sasl_mech_d);
-    const sasl_user_d = interpolate.resolve(allocator, sasl_username, .{ .secrets = true }) catch return error.OutOfMemory;
+    const sasl_user_d = interpolate.resolve(allocator, sasl_username, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(sasl_user_d);
-    const sasl_pass_d = interpolate.resolve(allocator, sasl_password, .{ .secrets = true }) catch return error.OutOfMemory;
+    const sasl_pass_d = interpolate.resolve(allocator, sasl_password, resolve_opts) catch return error.OutOfMemory;
     errdefer allocator.free(sasl_pass_d);
 
     sources.append(allocator, .{
