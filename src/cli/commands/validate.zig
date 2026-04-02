@@ -321,6 +321,16 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
                     errors += 1;
                 }
             },
+            .kafka => {
+                if (src.kafka_brokers.len == 0) {
+                    ctx.printErr("ERR   Source '{s}': kafka source missing brokers\n", .{src.name});
+                    errors += 1;
+                }
+                if (src.kafka_topic.len == 0) {
+                    ctx.printErr("ERR   Source '{s}': kafka source missing topic\n", .{src.name});
+                    errors += 1;
+                }
+            },
         }
     }
 
