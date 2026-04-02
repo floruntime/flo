@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
 // Re-export framework components
 pub const ServerProcess = @import("server.zig").ServerProcess;
 pub const ServerConfig = ServerProcess.ServerConfig;
+pub const findFreePort = @import("server.zig").findFreePort;
 pub const CliRunner = @import("client.zig").CliRunner;
 pub const CommandResult = @import("client.zig").CommandResult;
 pub const HttpRunner = @import("http.zig").HttpRunner;
@@ -44,6 +45,9 @@ pub const HttpResponse = @import("http.zig").HttpResponse;
 pub const cluster = @import("cluster.zig");
 pub const ClusterContext = cluster.ClusterContext;
 pub const ClusterConfig = cluster.ClusterConfig;
+
+// Redpanda (Docker) testing
+pub const RedpandaProcess = @import("redpanda.zig").RedpandaProcess;
 
 // Re-export assertions
 pub const assertions = @import("assertions.zig");

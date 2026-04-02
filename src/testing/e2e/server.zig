@@ -669,7 +669,7 @@ pub const ServerProcess = struct {
 };
 
 /// Find a free TCP port by binding to port 0
-fn findFreePort() !u16 {
+pub fn findFreePort() !u16 {
     const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(sock);
 
