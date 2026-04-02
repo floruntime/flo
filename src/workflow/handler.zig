@@ -1666,7 +1666,16 @@ pub const WorkflowHandler = struct {
             run.plan_executor_natural_idx = natural_idx;
 
             self.addHistoryEvent(run, "plan_executor_start", executor.name, now_ms);
-            const outcome = self.invokeAction(shard, run, executor.action_name, step_input, step_label, namespace, now_ms);
+
+            // Plan executor action_name stores the raw YAML "run" value
+            // (e.g. "@actions/process-payment").  Strip the prefix so the
+            // actions handler can look it up by its registered name.
+            const resolved_action = if (std.mem.startsWith(u8, executor.action_name, "@actions/"))
+                executor.action_name["@actions/".len..]
+            else
+                executor.action_name;
+
+            const outcome = self.invokeAction(shard, run, resolved_action, step_input, step_label, namespace, now_ms);
 
             // Parked for async action — will resume via resumeFromAction
             if (outcome == null) return null;
@@ -2037,7 +2046,7 @@ pub const WorkflowHandler = struct {
                 // current_step_name_owned and invokes the action again.
                 if (!run_step.isPlan() and
                     (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
-                     std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
+                        std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
                 {
                     if (run_step.retry) |retry_cfg| {
                         if (run.retry_count < retry_cfg.max_attempts) {
@@ -3566,19 +3575,28 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
 
 /// Create a minimal test shard with an actions handler for unit tests.
 /// Only `actions_handler` is usable — all other fields are undefined.
-fn createTestShard(actions: *ActionsHandler) Shard {
+fn createTestShard(actions: *ActionsHandler) !Shard {
     const waiter_pool_mod = @import("../node/waiter_pool.zig");
+    const RaftNode = @import("../raft/node.zig").RaftNode;
     var shard: Shard = undefined;
     shard.id = 0;
     shard.actions_handler = actions;
     shard.peer_shards = null;
     shard.peer_inboxes = null;
-    shard.raft_node = null;
+    const raft_node = try std.testing.allocator.create(RaftNode);
+    raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
+    try raft_node.bootstrap();
+    shard.raft_node = raft_node;
     shard.raft_network = null;
     shard.router = router.Router.init(1, 1, 0);
     shard.run_id_gen = .{};
     shard.waiter_pool = waiter_pool_mod.WaiterPool.init();
     return shard;
+}
+
+fn destroyTestShard(shard: *Shard) void {
+    shard.raft_node.deinit();
+    std.testing.allocator.destroy(shard.raft_node);
 }
 
 /// Complete a pending test action run with outcome "success".
@@ -3732,7 +3750,8 @@ test "step executor: linear workflow completes via action invocation" {
     defer actions.deinit();
     registerTestAction(&actions, "step-a");
     registerTestAction(&actions, "step-b");
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-1", "run-1", "test-wf");
@@ -3778,7 +3797,8 @@ test "step executor: wait_for_signal parks run" {
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
     registerTestAction(&actions, "init");
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-2", "run-2", "wait-wf");
@@ -3810,7 +3830,8 @@ test "step executor: signal resumes waiting workflow" {
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
     registerTestAction(&actions, "init");
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-3", "run-3", "wait-wf");
@@ -3856,7 +3877,8 @@ test "step executor: missing definition does not crash" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     // No definition registered
     createTestRun(&handler, "default:run-4", "run-4", "nonexistent-wf");
@@ -3877,7 +3899,8 @@ test "step executor: missing action yields target_not_found" {
     // Actions handler with NO actions registered
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-5", "run-5", "test-wf");
@@ -3898,7 +3921,8 @@ test "step executor: failing action follows failure transition" {
     defer actions.deinit();
     registerTestAction(&actions, "step-a");
     registerFailingAction(&actions, "step-b"); // step-b will fail
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-6", "run-6", "test-wf");
@@ -3933,7 +3957,8 @@ test "step executor: retry on failure" {
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
     registerFailingAction(&actions, "flaky"); // always fails
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
     createTestRun(&handler, "default:run-7", "run-7", "retry-wf");
@@ -3973,7 +3998,8 @@ test "step executor: checkPendingActions handles completed async action" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    var shard = createTestShard(&actions);
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
