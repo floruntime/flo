@@ -183,8 +183,7 @@ pub const Shard = struct {
 
     /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
     /// Writes go through propose() → commit → apply to projections.
-    /// Null only in test shards created without a full init().
-    raft_node: ?*RaftNode,
+    raft_node: *RaftNode,
 
     /// Unified waiter pool — handles blocking GET, blocking dequeue,
     /// stream long-poll, and action_await across all subsystems.
@@ -547,10 +546,8 @@ pub const Shard = struct {
         self.allocator.destroy(self.ts_handler);
 
         // Clean up Raft consensus node
-        if (self.raft_node) |rn| {
-            rn.deinit();
-            self.allocator.destroy(rn);
-        }
+        self.raft_node.deinit();
+        self.allocator.destroy(self.raft_node);
 
         // Clean up partitions (each owns UAL + all projections)
         for (self.partitions) |p| {
@@ -803,7 +800,15 @@ pub const Shard = struct {
         var result_buf: [NameWalker.MAX_BATCH][]const u8 = undefined;
         var cursor_buf: [64]u8 = undefined;
 
-        const cursor: ?[]const u8 = if (req.value.len > 0) req.value else null;
+        // Parse limit + cursor from value: [limit:u32][cursor...]
+        // All walk ops use the same wire format. limit=0 means server default.
+        var limit: u32 = NameWalker.MAX_BATCH;
+        var cursor: ?[]const u8 = null;
+        if (req.value.len >= 4) {
+            const parsed_limit = std.mem.readInt(u32, req.value[0..4], .little);
+            if (parsed_limit > 0) limit = @min(parsed_limit, NameWalker.MAX_BATCH);
+            if (req.value.len > 4) cursor = req.value[4..];
+        }
         const filter: []const u8 = req.key; // prefix filter (empty = no filter)
 
         const result = walker.walk(
@@ -811,7 +816,7 @@ pub const Shard = struct {
             req.namespace,
             filter,
             cursor,
-            NameWalker.MAX_BATCH,
+            limit,
             &result_buf,
             &cursor_buf,
         );
@@ -844,10 +849,10 @@ pub const Shard = struct {
             // queue_list uses rich binary format with per-queue stats
             .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // processing_list and workflow_list_definitions use binary wire format with rich fields
-            .processing_list => serializeWalkProcessingJobs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
-            .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
+            .processing_list => serializeWalkProcessingJobs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
+            .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // action_list uses scan wire format with action metadata
-            .action_list => serializeWalkActionEntries(self.allocator, deduped[0..dedup_count], contexts, req.namespace),
+            .action_list => serializeWalkActionEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // Default: name-list format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
             else => serializeWalkNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
         } catch {
@@ -1483,15 +1488,19 @@ fn serializeWalkQueueEntries(
 fn serializeWalkActionEntries(
     allocator: std.mem.Allocator,
     names: []const []const u8,
+    next_cursor: ?[]const u8,
     _: []const *anyopaque,
     _: []const u8,
 ) ![]u8 {
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
+
     // Calculate total buffer size
     var total_size: usize = 4; // count:u32
     for (names) |name| {
         total_size += 2 + name.len + 4; // key_len:u16 + key + value_len:u32
     }
-    total_size += 1 + 2; // has_more:u8 + cursor_len:u16
+    total_size += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
 
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
@@ -1511,10 +1520,14 @@ fn serializeWalkActionEntries(
         pos += 4;
     }
 
-    // has_more = 0, cursor_len = 0
-    buf[pos] = 0;
+    // pagination trailer
+    buf[pos] = has_more;
     pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
 
     return buf;
 }
@@ -1527,6 +1540,7 @@ fn serializeWalkActionEntries(
 fn serializeWalkProcessingJobs(
     allocator: std.mem.Allocator,
     names: []const []const u8,
+    next_cursor: ?[]const u8,
     contexts: []const *anyopaque,
     namespace: []const u8,
 ) ![]u8 {
@@ -1557,6 +1571,8 @@ fn serializeWalkProcessingJobs(
     }
 
     // Calculate total size
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
     var total: usize = 4; // count: u32
     for (jobs.items) |j| {
         total += 2 + j.name.len; // name_len:u16 + name
@@ -1565,7 +1581,7 @@ fn serializeWalkProcessingJobs(
         total += 4; // parallelism:u32
         total += 8; // created_at:i64
     }
-    total += 1 + 2; // has_more:u8 + cursor_len:u16
+    total += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
 
     const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
@@ -1591,10 +1607,14 @@ fn serializeWalkProcessingJobs(
         pos += 8;
     }
 
-    // Trailer: no pagination
-    buf[pos] = 0; // has_more
+    // pagination trailer
+    buf[pos] = has_more;
     pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
     return buf;
 }
 
@@ -1605,6 +1625,7 @@ fn serializeWalkProcessingJobs(
 fn serializeWalkWorkflowDefs(
     allocator: std.mem.Allocator,
     names: []const []const u8,
+    next_cursor: ?[]const u8,
     contexts: []const *anyopaque,
     namespace: []const u8,
 ) ![]u8 {
@@ -1636,13 +1657,15 @@ fn serializeWalkWorkflowDefs(
     }
 
     // Calculate total size
+    const cursor_bytes = next_cursor orelse &[_]u8{};
+    const has_more: u8 = if (next_cursor != null) 1 else 0;
     var total: usize = 4; // count: u32
     for (defs.items) |d| {
         total += 2 + d.name.len; // name_len:u16 + name
         total += 2 + d.version.len; // version_len:u16 + version
         total += 8; // created_at:i64
     }
-    total += 1 + 2; // has_more:u8 + cursor_len:u16
+    total += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
 
     const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
@@ -1663,10 +1686,14 @@ fn serializeWalkWorkflowDefs(
         pos += 8;
     }
 
-    // Trailer: no pagination
-    buf[pos] = 0; // has_more
+    // pagination trailer
+    buf[pos] = has_more;
     pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little); // cursor_len
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
+    pos += 2;
+    if (cursor_bytes.len > 0) {
+        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
+    }
     return buf;
 }
 

@@ -52,6 +52,12 @@ const persistence_mod = @import("../storage/persistence.zig");
 const EntryType = entry_mod.EntryType;
 const Flags = entry_mod.Flags;
 
+const KafkaSource = @import("../kafka/source.zig").KafkaSource;
+const KafkaSourceConfig = @import("../kafka/source.zig").KafkaSourceConfig;
+const KafkaStartOffset = @import("../kafka/source.zig").StartOffset;
+const SourceVTable = @import("endpoints/source.zig").Source;
+const StreamElement = @import("record.zig").StreamElement;
+
 const native_registry = @import("operators/native_registry.zig");
 const kv_lookup_mod = @import("operators/kv_lookup.zig");
 const operator_mod = @import("operator.zig");
@@ -134,6 +140,10 @@ pub const ProcessingHandler = struct {
 
         // Tag registry — heap-allocated, used by classify operators for tag resolution
         tag_registry: ?*definition.TagRegistry = null,
+
+        // External source (Kafka, etc.) — null for Flo-internal sources
+        external_source: ?SourceVTable = null,
+        external_source_handle: ?*KafkaSource = null,
     };
 
     pub const JobStatus = enum(u8) {
@@ -274,6 +284,9 @@ pub const ProcessingHandler = struct {
 
         // Free heap-allocated tag registry
         if (pipe.tag_registry) |reg| self.allocator.destroy(reg);
+
+        // Free external source (Kafka, etc.)
+        if (pipe.external_source_handle) |ks| ks.deinit();
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -1075,6 +1088,12 @@ pub const ProcessingHandler = struct {
             self.allocator.free(ops);
             self.allocator.free(backings);
         }
+
+        // Initialize external source for Kafka pipelines
+        if (src.kind == .kafka) {
+            self.initKafkaSource(&pipe_state, src);
+        }
+
         self.pipelines.put(job_id, pipe_state) catch {
             self.freePipelineState(&pipe_state);
         };
@@ -1115,6 +1134,45 @@ pub const ProcessingHandler = struct {
 
         log.info("shardKvLookup: NO PEERS, returning null", .{});
         return null;
+    }
+
+    /// Create and attach a KafkaSource to a pipeline state.
+    fn initKafkaSource(self: *ProcessingHandler, pipe: *PipelineState, src: *const definition.SourceSpec) void {
+        const deser_format: @import("../kafka/deser.zig").Format = switch (src.kafka_format) {
+            .raw => .raw,
+            .json => .json,
+            .string => .string,
+            .avro => .avro,
+            .protobuf => .protobuf,
+        };
+        const start_off: KafkaStartOffset = switch (src.kafka_start_offset) {
+            .latest => .latest,
+            .earliest => .earliest,
+            .timestamp => .timestamp,
+            .committed => .committed,
+        };
+        const ks = KafkaSource.init(self.allocator, .{
+            .brokers = src.kafka_brokers,
+            .topic = src.kafka_topic,
+            .group_id = src.kafka_group,
+            .format = deser_format,
+            .start_offset = start_off,
+            .fetch_max_wait_ms = @intCast(src.kafka_fetch_max_wait_ms),
+            .fetch_min_bytes = @intCast(src.kafka_fetch_min_bytes),
+            .fetch_max_bytes = @intCast(src.kafka_fetch_max_bytes),
+            .partition_max_bytes = @intCast(src.kafka_partition_max_bytes),
+            .max_poll_records = src.kafka_max_poll_records,
+            .metadata_refresh_ms = @intCast(src.kafka_metadata_refresh_ms),
+            .isolation_level = @intCast(src.kafka_isolation_level),
+            .security_mechanism = if (src.kafka_sasl_mechanism.len > 0) src.kafka_sasl_mechanism else null,
+            .sasl_username = if (src.kafka_sasl_username.len > 0) src.kafka_sasl_username else null,
+            .sasl_password = if (src.kafka_sasl_password.len > 0) src.kafka_sasl_password else null,
+        }) catch |err| {
+            log.err("Failed to create KafkaSource: {}", .{err});
+            return;
+        };
+        pipe.external_source = ks.source();
+        pipe.external_source_handle = ks;
     }
 
     /// Helper to build a PipelineState with source/sink config (no operators).
@@ -1183,6 +1241,42 @@ pub const ProcessingHandler = struct {
             switch (pipe.source_kind) {
                 .ts => tickTsSource(pipe, shard, job),
                 .stream => self.tickStreamSource(pipe, shard, job),
+                .kafka => self.tickExternalSource(pipe, shard, job),
+            }
+        }
+    }
+
+    /// Tick an external (Kafka) source pipeline: poll for records, apply operators, write to sinks.
+    fn tickExternalSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+        const src = pipe.external_source orelse return;
+
+        var batch_count: u32 = 0;
+        const max_batch: u32 = 500; // cap per tick to avoid starvation
+
+        while (batch_count < max_batch) {
+            const element = src.poll() catch |err| {
+                log.err("Kafka source poll error: {}", .{err});
+                break;
+            };
+            const el = element orelse break;
+
+            switch (el) {
+                .record => |rec| {
+                    const output = applyOperatorChain(pipe.operators, rec.value, rec.event_time_ms, shard.allocator) catch null;
+                    if (output) |records| {
+                        defer shard.allocator.free(records);
+                        for (records) |out_rec| {
+                            self.writeSinkRecordFromStream(pipe, shard, out_rec.value, out_rec.tags);
+                        }
+                    } else {
+                        self.writeSinkRecordFromStream(pipe, shard, rec.value, 0);
+                    }
+                    job.records_processed += 1;
+                    batch_count += 1;
+                },
+                .watermark => {},
+                .barrier => {},
+                .end_of_stream => break,
             }
         }
     }

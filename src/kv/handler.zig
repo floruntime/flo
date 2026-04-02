@@ -544,12 +544,11 @@ pub const KVHandler = struct {
         }
 
         // Propose through Raft — in single-node mode this commits immediately
-        const kv_raft = shard.raft_node orelse return error.NotLeader;
-        const propose_result = try kv_raft.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
+        const propose_result = try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
 
         // Broadcast to cluster peers via raft network
         if (shard.raft_network) |rn| {
-            if (kv_raft.log.getEntry(propose_result.index)) |committed_entry| {
+            if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
                 var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
                 if (committed_entry.serialize(&entry_buf)) |serialized_len| {
                     rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
@@ -564,7 +563,7 @@ pub const KVHandler = struct {
     /// KV projection. In single-node mode this is a tight synchronous loop since
     /// propose() advances commit_index immediately.
     fn applyCommittedEntries(shard: *Shard) void {
-        const raft = shard.raft_node orelse return;
+        const raft = shard.raft_node;
         while (raft.last_applied < raft.commit_index) {
             const next_idx = raft.last_applied + 1;
             // Grab Entry from RaftLog (may have payload on stack — getEntry borrows from UAL ring)

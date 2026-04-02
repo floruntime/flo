@@ -456,6 +456,12 @@ fn parseOneSource(allocator: Allocator, item: JsonValue, default_batch_size: u32
 
     const base_name = getString(item, "name") orelse "default-source";
 
+    // Detect Kafka source
+    if (getObject(item, "kafka")) |kafka_obj| {
+        try appendKafkaSource(allocator, base_name, kafka_obj, default_batch_size, sources);
+        return;
+    }
+
     // Detect TS source
     if (getObject(item, "ts")) |ts_obj| {
         try appendTsSource(allocator, base_name, ts_obj, default_batch_size, default_namespace, sources);
@@ -474,6 +480,162 @@ fn parseOneSource(allocator: Allocator, item: JsonValue, default_batch_size: u32
     }
 
     return error.MissingSourceStream;
+}
+
+/// Append a Kafka source spec parsed from a `kafka:` object.
+///
+/// ```yaml
+/// - name: my-kafka-source
+///   kafka:
+///     brokers: "broker1:9092,broker2:9092"
+///     topic: transactions
+///     group: flo-enricher
+///     security: plaintext
+///     format: json
+///     start_offset: latest
+///     fetch_max_wait_ms: 100
+///     fetch_min_bytes: 1
+///     fetch_max_bytes: 1048576
+///     partition_max_bytes: 262144
+///     max_poll_records: 500
+///     metadata_refresh_ms: 300000
+///     sasl:
+///       mechanism: PLAIN
+///       username: user
+///       password: pass
+/// ```
+fn appendKafkaSource(
+    allocator: Allocator,
+    source_name: []const u8,
+    kafka_obj: JsonValue,
+    default_batch_size: u32,
+    sources: *std.ArrayList(SourceSpec),
+) ParseError!void {
+    const brokers_raw = getString(kafka_obj, "brokers") orelse return error.MissingSourceStream;
+    const topic_raw = getString(kafka_obj, "topic") orelse return error.MissingSourceStream;
+    const group_raw = getString(kafka_obj, "group") orelse "";
+    const format_raw = getString(kafka_obj, "format") orelse "json";
+    const start_offset_raw = getString(kafka_obj, "start_offset") orelse "latest";
+    const security_raw = getString(kafka_obj, "security") orelse "plaintext";
+
+    var bs: u32 = default_batch_size;
+    if (getInt(kafka_obj, "batch_size")) |v| {
+        if (v > 0) bs = @intCast(@as(i64, v));
+    }
+
+    // Parse kafka-specific integer fields
+    var fetch_max_wait_ms: u32 = 100;
+    if (getInt(kafka_obj, "fetch_max_wait_ms")) |v| {
+        if (v > 0) fetch_max_wait_ms = @intCast(@as(i64, v));
+    }
+    var fetch_min_bytes: u32 = 1;
+    if (getInt(kafka_obj, "fetch_min_bytes")) |v| {
+        if (v > 0) fetch_min_bytes = @intCast(@as(i64, v));
+    }
+    var fetch_max_bytes: u32 = 1_048_576;
+    if (getInt(kafka_obj, "fetch_max_bytes")) |v| {
+        if (v > 0) fetch_max_bytes = @intCast(@as(i64, v));
+    }
+    var partition_max_bytes: u32 = 262_144;
+    if (getInt(kafka_obj, "partition_max_bytes")) |v| {
+        if (v > 0) partition_max_bytes = @intCast(@as(i64, v));
+    }
+    var max_poll_records: u32 = 500;
+    if (getInt(kafka_obj, "max_poll_records")) |v| {
+        if (v > 0) max_poll_records = @intCast(@as(i64, v));
+    }
+    var metadata_refresh_ms: u32 = 300_000;
+    if (getInt(kafka_obj, "metadata_refresh_ms")) |v| {
+        if (v > 0) metadata_refresh_ms = @intCast(@as(i64, v));
+    }
+    var isolation_level: u8 = 0;
+    const isolation_raw = getString(kafka_obj, "isolation_level") orelse "read_uncommitted";
+    if (std.mem.eql(u8, isolation_raw, "read_committed")) isolation_level = 1;
+
+    // Parse SASL config
+    var sasl_mechanism: []const u8 = "";
+    var sasl_username: []const u8 = "";
+    var sasl_password: []const u8 = "";
+    if (getObject(kafka_obj, "sasl")) |sasl_obj| {
+        sasl_mechanism = getString(sasl_obj, "mechanism") orelse "PLAIN";
+        sasl_username = getString(sasl_obj, "username") orelse "";
+        sasl_password = getString(sasl_obj, "password") orelse "";
+    }
+
+    // Map string enums
+    const kafka_security = parseKafkaSecurityMode(security_raw);
+    const kafka_format = parseKafkaFormat(format_raw);
+    const kafka_start_offset = parseKafkaStartOffset(start_offset_raw);
+
+    // Dupe strings
+    const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
+    errdefer allocator.free(name_d);
+    const stream_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
+    errdefer allocator.free(stream_d);
+    const ns_d = allocator.dupe(u8, "default") catch return error.OutOfMemory;
+    errdefer allocator.free(ns_d);
+    const brokers_d = allocator.dupe(u8, brokers_raw) catch return error.OutOfMemory;
+    errdefer allocator.free(brokers_d);
+    const topic_d = allocator.dupe(u8, topic_raw) catch return error.OutOfMemory;
+    errdefer allocator.free(topic_d);
+    const group_d = allocator.dupe(u8, group_raw) catch return error.OutOfMemory;
+    errdefer allocator.free(group_d);
+    const sasl_mech_d = allocator.dupe(u8, sasl_mechanism) catch return error.OutOfMemory;
+    errdefer allocator.free(sasl_mech_d);
+    const sasl_user_d = allocator.dupe(u8, sasl_username) catch return error.OutOfMemory;
+    errdefer allocator.free(sasl_user_d);
+    const sasl_pass_d = allocator.dupe(u8, sasl_password) catch return error.OutOfMemory;
+    errdefer allocator.free(sasl_pass_d);
+
+    sources.append(allocator, .{
+        .kind = .kafka,
+        .name = name_d,
+        .stream = stream_d,
+        .namespace = ns_d,
+        .partition = 0,
+        .batch_size = bs,
+        .kafka_brokers = brokers_d,
+        .kafka_topic = topic_d,
+        .kafka_group = group_d,
+        .kafka_security = kafka_security,
+        .kafka_sasl_mechanism = sasl_mech_d,
+        .kafka_sasl_username = sasl_user_d,
+        .kafka_sasl_password = sasl_pass_d,
+        .kafka_format = kafka_format,
+        .kafka_start_offset = kafka_start_offset,
+        .kafka_fetch_max_bytes = fetch_max_bytes,
+        .kafka_partition_max_bytes = partition_max_bytes,
+        .kafka_max_poll_records = max_poll_records,
+        .kafka_fetch_max_wait_ms = fetch_max_wait_ms,
+        .kafka_fetch_min_bytes = fetch_min_bytes,
+        .kafka_metadata_refresh_ms = metadata_refresh_ms,
+        .kafka_isolation_level = isolation_level,
+    }) catch return error.OutOfMemory;
+}
+
+fn parseKafkaSecurityMode(raw: []const u8) job_definition.KafkaSecurityMode {
+    if (std.mem.eql(u8, raw, "sasl_plain")) return .sasl_plain;
+    if (std.mem.eql(u8, raw, "sasl_ssl")) return .sasl_ssl;
+    if (std.mem.eql(u8, raw, "sasl_scram_256")) return .sasl_scram_256;
+    if (std.mem.eql(u8, raw, "sasl_scram_512")) return .sasl_scram_512;
+    if (std.mem.eql(u8, raw, "mtls")) return .mtls;
+    if (std.mem.eql(u8, raw, "sasl_aws_msk_iam")) return .sasl_aws_msk_iam;
+    return .plaintext;
+}
+
+fn parseKafkaFormat(raw: []const u8) job_definition.KafkaFormat {
+    if (std.mem.eql(u8, raw, "raw")) return .raw;
+    if (std.mem.eql(u8, raw, "string")) return .string;
+    if (std.mem.eql(u8, raw, "avro")) return .avro;
+    if (std.mem.eql(u8, raw, "protobuf")) return .protobuf;
+    return .json;
+}
+
+fn parseKafkaStartOffset(raw: []const u8) job_definition.KafkaStartOffset {
+    if (std.mem.eql(u8, raw, "earliest")) return .earliest;
+    if (std.mem.eql(u8, raw, "timestamp")) return .timestamp;
+    if (std.mem.eql(u8, raw, "committed")) return .committed;
+    return .latest;
 }
 
 /// Append a TS source spec parsed from a `ts:` object.

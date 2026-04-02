@@ -170,13 +170,44 @@ pub const TagRegistry = struct {
 pub const SourceKind = enum(u8) {
     stream = 0,
     ts = 1,
+    kafka = 2,
 
     pub fn toStr(self: SourceKind) []const u8 {
         return switch (self) {
             .stream => "stream",
             .ts => "ts",
+            .kafka => "kafka",
         };
     }
+};
+
+// =============================================================================
+// Kafka Source Enums
+// =============================================================================
+
+pub const KafkaSecurityMode = enum(u8) {
+    plaintext = 0,
+    sasl_plain = 1,
+    sasl_ssl = 2,
+    sasl_scram_256 = 3,
+    sasl_scram_512 = 4,
+    mtls = 5,
+    sasl_aws_msk_iam = 6,
+};
+
+pub const KafkaFormat = enum(u8) {
+    raw = 0,
+    json = 1,
+    string = 2,
+    avro = 3,
+    protobuf = 4,
+};
+
+pub const KafkaStartOffset = enum(u8) {
+    latest = 0,
+    earliest = 1,
+    timestamp = 2,
+    committed = 3,
 };
 
 // =============================================================================
@@ -225,6 +256,43 @@ pub const SourceSpec = struct {
     ts_field: []const u8 = "",
     /// Polling interval in milliseconds for TS source (default: 1000)
     ts_poll_interval_ms: u32 = 1000,
+
+    // -- Kafka-specific fields (only used when kind = .kafka) --
+
+    /// Comma-separated broker addresses (e.g. "broker1:9092,broker2:9092")
+    kafka_brokers: []const u8 = "",
+    /// Kafka topic name
+    kafka_topic: []const u8 = "",
+    /// Consumer group ID for offset commits (default: "flo-{job_id}")
+    kafka_group: []const u8 = "",
+    /// Security mode
+    kafka_security: KafkaSecurityMode = .plaintext,
+    /// SASL mechanism (e.g. "PLAIN", "SCRAM-SHA-256")
+    kafka_sasl_mechanism: []const u8 = "",
+    /// SASL username
+    kafka_sasl_username: []const u8 = "",
+    /// SASL password
+    kafka_sasl_password: []const u8 = "",
+    /// Deserialization format
+    kafka_format: KafkaFormat = .json,
+    /// Initial offset strategy on cold start
+    kafka_start_offset: KafkaStartOffset = .latest,
+    /// Max bytes per fetch response
+    kafka_fetch_max_bytes: u32 = 1_048_576,
+    /// Max bytes per partition per fetch
+    kafka_partition_max_bytes: u32 = 262_144,
+    /// Max records per poll
+    kafka_max_poll_records: u32 = 500,
+    /// Fetch max wait time in ms (broker long-poll)
+    kafka_fetch_max_wait_ms: u32 = 100,
+    /// Fetch min bytes before broker responds
+    kafka_fetch_min_bytes: u32 = 1,
+    /// Metadata refresh interval in ms
+    kafka_metadata_refresh_ms: u32 = 300_000,
+    /// Isolation level: 0=read_uncommitted, 1=read_committed
+    kafka_isolation_level: u8 = 0,
+    /// Offset reset strategy on out-of-range
+    kafka_on_offset_reset: KafkaStartOffset = .latest,
 };
 
 // =============================================================================

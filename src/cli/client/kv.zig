@@ -94,13 +94,9 @@ pub fn delete(client: *Client, namespace: []const u8, key: []const u8, routing_k
 
 /// Execute a SCAN command with full options including keys_only
 pub fn scan(client: *Client, namespace: []const u8, prefix: []const u8, cursor: ?[]const u8, limit: ?u32, keys_only: bool) !Response {
-    // Build options
+    // Build TLV options (keys_only only — limit is in value now)
     var options_buf: [64]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (limit) |l| {
-        builder.addU32(.limit, l) catch return error.OptionsBufferTooSmall;
-    }
 
     if (keys_only) {
         builder.addU8(.keys_only, 1) catch return error.OptionsBufferTooSmall;
@@ -108,8 +104,17 @@ pub fn scan(client: *Client, namespace: []const u8, prefix: []const u8, cursor: 
 
     const options = builder.getOptions();
 
-    // kv_scan uses prefix in key field, cursor in value field
-    return client.sendRequestWithOptions(.kv_scan, namespace, prefix, cursor orelse "", options);
+    // Value: [limit:u32][cursor...]
+    var value_buf: [4 + 1024]u8 = undefined;
+    const cursor_bytes = cursor orelse "";
+    if (4 + cursor_bytes.len > value_buf.len) return error.CursorTooLong;
+    const lim: u32 = limit orelse 0; // 0 = server default
+    std.mem.writeInt(u32, value_buf[0..4], lim, .little);
+    if (cursor_bytes.len > 0) {
+        @memcpy(value_buf[4 .. 4 + cursor_bytes.len], cursor_bytes);
+    }
+
+    return client.sendRequestWithOptions(.kv_scan, namespace, prefix, value_buf[0 .. 4 + cursor_bytes.len], options);
 }
 
 /// Execute a HISTORY command (get version history for a key)

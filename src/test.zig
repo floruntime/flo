@@ -137,6 +137,18 @@ test {
     _ = @import("processing/parser.zig");
 }
 
+// Kafka source
+test {
+    _ = @import("kafka/codec.zig");
+    _ = @import("kafka/protocol.zig");
+    _ = @import("kafka/record_batch.zig");
+    _ = @import("kafka/broker.zig");
+    _ = @import("kafka/auth.zig");
+    _ = @import("kafka/deser.zig");
+    _ = @import("kafka/source.zig");
+    _ = @import("kafka/mod.zig");
+}
+
 // Dashboard
 test {
     _ = @import("node/dashboard/api/helpers.zig");
