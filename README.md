@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Flo</h1>
-  <p align="center">The Universal Distributed Runtime</p>
+  <p align="center">The stream processor with built-in state.</p>
   <p align="center">
     <a href="https://github.com/floruntime/flo/actions"><img alt="CI" src="https://github.com/floruntime/flo/actions/workflows/release.yml/badge.svg"></a>
     <a href="https://github.com/floruntime/flo/releases"><img alt="Release" src="https://img.shields.io/github/v/release/floruntime/flo?include_prereleases"></a>
@@ -11,42 +11,62 @@
 
 ---
 
-Flo is a distributed runtime that unifies **streams**, **key-value storage**, **queues**, **durable actions**, and **workflow orchestration** in a single binary. Instead of stitching together separate systems for each concern, Flo provides all five as primitives over one Raft-replicated log — with a single connection, consistent durability, and zero integration overhead.
+Flo is a **stream processor with built-in state**. Define processing pipelines in YAML, deploy with one command, and enrich from KV, dead-letter to queues, and write derived metrics to time-series — all in one binary, one memory space, zero serialization hops. No JVM. No cluster. No glue.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│             Layer 3: Orchestration                          │
-│   Workflows · Plans · Signals · Timers                      │
-├─────────────────────────────────────────────────────────────┤
-│             Layer 2: Durable Execution + Processing         │
-│   Actions · Workers · Stream Processing · WASM Operators    │
-├─────────────────────────────────────────────────────────────┤
-│             Layer 1: Core Primitives                        │
-│   Streams · KV · Queues · Time-Series                       │
-├─────────────────────────────────────────────────────────────┤
-│             Layer 0: Unified Append Log + Raft Consensus    │
-│   The log IS the database                                   │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Source (Flo Streams, Kafka, …)                              │
+│    ↓                                                         │
+│  Operators — filter, map, enrich, route, aggregate, window   │
+│    ↓                                                         │
+│  Built-in state (same process, same shard, pointer speed)    │
+│    ├─ KV    — enrichment lookups, no Redis                   │
+│    ├─ Queue — dead-letter & retry, no SQS                    │
+│    ├─ TS    — derived metrics, no InfluxDB                   │
+│    └─ Stream — processed output                              │
+│                                                              │
+│  One binary. One YAML file. One command.                     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Why Flo?
 
-Modern backends tend to accumulate a separate system for every concern — an event log here, a cache there, a job queue, a workflow engine. Each one brings its own connection pool, failure mode, and consistency model. Developers end up spending as much time wiring infrastructure together as building the actual product.
+Every stream processor needs state. You enrich events from Redis. Dead-letter failures to SQS. Write derived metrics to InfluxDB. Orchestrate multi-step reactions in Temporal. Each integration is a network hop, a serialization boundary, a failure mode, and an ops burden.
 
-Flo takes a different approach. All five primitives share one Raft consensus log as their storage engine. Streams expose the log directly. KV and Queues are deterministic state machines that consume it. Because everything lives in the same replication path, there are no dual-write race conditions, no cross-system sync issues, and one fewer thing to operate.
+```
+The status quo:                         With Flo:
+┌────────┐  ┌────────┐  ┌───────┐      ┌──────────────────────────────┐
+│ Kafka  │→ │ Flink  │→ │ Redis │      │           Flo                │
+│ (pipe) │  │(process)│  │(state)│      │                              │
+└───┬────┘  └───┬────┘  └───────┘      │  stream → process → KV       │
+    │           │        ┌───────┐      │                   → queue    │
+    │           └──────→ │  SQS  │      │                   → TS       │
+    │                    │ (DLQ) │      │                              │
+    │           ┌──────→ ┌───────┐      │  Zero serialization.         │
+    │           │        │Influx │      │  One binary.                 │
+    │           │        │ (TS)  │      │                              │
+    └───────────┘        └───────┘      └──────────────────────────────┘
+
+4 serialization boundaries.             0 serialization boundaries.
+4 failure modes. 3+ clusters.           1 process. 1 binary.
+```
+
+In Flo, the KV lookup is a pointer dereference. The dead-letter queue is a function call. The metrics write is a memory copy. Processing and state live in the same process, on the same shard, in the same memory space.
+
+**Already on Kafka?** Keep it. Flo's Source interface is pluggable — point Flo at your topics and get processing with built-in state in minutes, not weeks.
 
 ## Features
 
-- **Streams** — Partitioned, append-only commit log with consumer groups, configurable storage tiers, and exactly-once delivery
-- **Key-Value** — Strongly consistent, versioned storage with compare-and-swap (CAS), TTL, blocking gets, and prefix scans
-- **Queues** — Priority queues with competing consumers, lease-based delivery, dead-letter support, and visibility timeouts
-- **Time-Series** — Columnar write buffers with block index, InfluxDB line protocol ingest, and FloQL query language
-- **Actions** — Durable execution of external business logic with automatic retries, timeouts, and dead-letter handling
-- **Stream Processing** — Real-time stateful pipelines with windowing, keyed state, checkpointing, watermarks, and WASM operators — no separate cluster needed
-- **Workflows** — Multi-step orchestration with YAML definitions, signals, timers, circuit breakers, and health-weighted routing
-- **Thread-per-Core** — Shared-nothing architecture with io_uring/kqueue per core. No locks, no GC pauses
+- **Stream Processing** — YAML-defined pipelines with filter, map, enrich, route, aggregate, and window operators. Checkpointing, watermarks, exactly-once. No separate cluster
+- **KV Store** — Sub-microsecond enrichment lookups from the same shard. CAS, TTL, blocking gets, prefix scans. No Redis sidecar
+- **Queues** — Dead-letter, retry, and task dispatch as pipeline sinks. Priority, leases, competing consumers. No SQS
+- **Time-Series** — Derived metrics written by pipelines. InfluxDB line protocol, FloQL queries. No InfluxDB
+- **Streams** — Raft-replicated commit log with consumer groups and exactly-once delivery. The default data plane for pipelines
+- **Actions** — External system triggers with retries, timeouts, and dead-letter. Webhooks, notifications, API calls from pipelines
+- **Workflows** — Multi-step orchestration with YAML definitions, signals, timers, and circuit breakers. No Temporal
+- **Shard-per-Core** — Shared-nothing architecture with io_uring/kqueue per core. No locks, no GC pauses
 - **Raft Consensus** — Linearizable writes, tiered storage (hot RAM → warm disk → cold remote), automatic leader election
-- **Built-in Dashboard** — Real-time web UI for monitoring streams, keys, queues, and cluster health
+- **Built-in Dashboard** — Real-time web UI for monitoring pipelines, streams, keys, queues, and cluster health
 
 ## Quick Start
 
@@ -97,16 +117,41 @@ volumes:
 docker compose up -d
 ```
 
-### Try It Out (CLI)
+### Try It Out
 
 ```bash
-# Key-Value
-flo kv set user:alice '{"name": "Alice", "role": "admin"}'
-flo kv get user:alice
+# Deploy a processing pipeline
+cat <<EOF > enrich-payments.yaml
+name: enrich-payments
+sources:
+  - type: stream
+    stream: raw-payments
+operators:
+  - type: kv_lookup
+    key: "$.merchant_id"
+    namespace: merchants
+  - type: classify
+    rules:
+      - name: high-value
+        condition: "$.amount > 10000"
+sinks:
+  - type: stream
+    stream: enriched-payments
+    tag: high-value
+  - type: ts
+    measurement: payment-throughput
+EOF
+
+flo processing submit -f enrich-payments.yaml
+# ✓ Pipeline deployed: enrich-payments
 
 # Streams
-flo stream append events '{"type": "signup", "user": "alice"}'
-flo stream read events --last 10
+flo stream append raw-payments '{"merchant_id": "acme", "amount": 15000}'
+flo stream read enriched-payments --last 10
+
+# KV (enrichment state)
+flo kv set merchants:acme '{"name": "ACME Corp", "tier": "gold"}'
+flo kv get merchants:acme
 
 # Queues
 flo queue push jobs '{"task": "send-welcome-email", "to": "alice"}'
@@ -119,7 +164,7 @@ flo ts query "cpu{host=web-01}[1h] | avg(5m)"
 
 ## Architecture
 
-Flo is built on a **log-native, shard-per-core** architecture. Every CPU core runs an independent shard with its own event loop, memory, and partitions — zero cross-thread contention.
+Flo is built on a **shard-per-core** architecture. Every CPU core runs an independent shard with its own event loop, processing pipelines, state projections, and partitions — zero cross-thread contention. When a pipeline does a KV enrichment lookup, it's a pointer dereference on the same shard. When it dead-letters to a queue, it's a function call. No serialization. No network.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -191,134 +236,9 @@ Benchmarked on the new architecture (Apple M-series, single core, ReleaseFast):
 | KV scan | 6.0M ops/sec | 165 ns/op |
 | Inbox SPSC | 28.5M msg/sec | 35 ns/msg |
 
-## SDK Examples
-
-### TypeScript / JavaScript
-
-```bash
-npm install @floruntime/node
-```
-
-```typescript
-import { FloClient } from '@floruntime/node';
-
-const client = new FloClient('localhost:9000');
-await client.connect();
-
-// Key-Value
-await client.kv.set('user:alice', Buffer.from('{"role": "admin"}'));
-const result = await client.kv.get('user:alice');
-
-// Streams
-await client.stream.append('events', Buffer.from('{"type": "signup"}'));
-const records = await client.stream.read('events', { maxRecords: 10 });
-
-// Queues
-await client.queue.push('jobs', Buffer.from('send-welcome-email'));
-const msg = await client.queue.pop('jobs');
-
-await client.close();
-```
-
-### Python
-
-```bash
-pip install flo-python
-```
-
-```python
-import asyncio
-from flo import FloClient
-
-async def main():
-    client = FloClient("localhost:9000")
-    await client.connect()
-
-    # Key-Value
-    await client.kv.set("user:alice", b'{"role": "admin"}')
-    result = await client.kv.get("user:alice")
-
-    # Streams
-    await client.stream.append("events", b'{"type": "signup"}')
-    records = await client.stream.read("events", max_records=10)
-
-    # Queues
-    await client.queue.push("jobs", b"send-welcome-email")
-    msg = await client.queue.pop("jobs")
-
-    await client.close()
-
-asyncio.run(main())
-```
-
-### Go
-
-```bash
-go get github.com/floruntime/flo-go
-```
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    flo "github.com/floruntime/flo-go"
-)
-
-func main() {
-    client, _ := flo.NewClient("localhost:9000")
-    defer client.Close()
-    ctx := context.Background()
-
-    // Key-Value
-    client.KV.Set(ctx, "user:alice", []byte(`{"role": "admin"}`), nil)
-    result, _ := client.KV.Get(ctx, "user:alice", nil)
-    fmt.Println(string(result.Value))
-
-    // Streams
-    client.Stream.Append(ctx, "events", []byte(`{"type": "signup"}`), nil)
-    records, _ := client.Stream.Read(ctx, "events", nil)
-
-    // Queues
-    client.Queue.Push(ctx, "jobs", []byte("send-welcome-email"), nil)
-    msg, _ := client.Queue.Pop(ctx, "jobs", nil)
-}
-```
-
-## Actions & Workers
-
-Actions provide durable execution of external business logic. Register a handler, and Flo manages dispatch, retries, timeouts, and dead-letter handling.
-
-```typescript
-import { FloClient } from '@floruntime/node';
-
-const client = new FloClient('localhost:9000');
-await client.connect();
-
-const worker = client.newWorker({ concurrency: 5 });
-
-worker.registerAction('send-email', async (task) => {
-  const { to, subject, body } = task.input;
-  await sendEmail(to, subject, body);
-  return { status: 'sent', timestamp: Date.now() };
-});
-
-await worker.start();
-```
-
-Invoke actions from anywhere:
-
-```bash
-flo action invoke send-email '{"to": "alice@example.com", "subject": "Welcome!"}'
-flo action status <run-id>
-```
-
 ## Stream Processing
 
-Flo includes a built-in stream processing engine for real-time, stateful pipelines. Define jobs declaratively in YAML or programmatically via the SDK — Flo handles checkpointing, watermarks, and state management internally.
-
-### Declarative (YAML)
+The core of Flo. Define pipelines in YAML, deploy with one command. Flo handles checkpointing, watermarks, and state management — with KV enrichment, queue dead-letter, and TS metrics all built in. No Flink cluster. No Redis sidecar. No SQS subscription.
 
 ```yaml
 kind: ProcessingJob
@@ -366,6 +286,34 @@ flo processing submit --file jobs/user-spend-alerts.yaml
 flo processing status user-spend-alerts
 flo processing savepoint user-spend-alerts
 flo processing stop user-spend-alerts
+```
+
+## Actions & Workers
+
+Actions provide durable execution of external business logic. Register a handler, and Flo manages dispatch, retries, timeouts, and dead-letter handling.
+
+```typescript
+import { FloClient } from '@floruntime/node';
+
+const client = new FloClient('localhost:9000');
+await client.connect();
+
+const worker = client.newWorker({ concurrency: 5 });
+
+worker.registerAction('send-email', async (task) => {
+  const { to, subject, body } = task.input;
+  await sendEmail(to, subject, body);
+  return { status: 'sent', timestamp: Date.now() };
+});
+
+await worker.start();
+```
+
+Invoke actions from anywhere:
+
+```bash
+flo action invoke send-email '{"to": "alice@example.com", "subject": "Welcome!"}'
+flo action status <run-id>
 ```
 
 ## Workflows
@@ -589,10 +537,11 @@ zig build bench                        # Build benchmarks (ReleaseFast)
 
 ## Project Status
 
-Flo is in **active development**. The core runtime has been rewritten from the ground up with a shard-per-core architecture.
+Flo is in **active development**. The stream processing engine and all built-in state primitives are complete.
 
 | Component | Status |
 |---|---|
+| Stream Processing (operators, windows, checkpoints) | ✅ Complete |
 | Shard-per-core runtime (Acceptor, Reactor, Dispatcher) | ✅ Complete |
 | Unified Append Log (UAL) | ✅ Complete |
 | Raft consensus (election, replication, snapshots) | ✅ Complete |
@@ -603,11 +552,11 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Time-Series (write, query, FloQL) | ✅ Complete |
 | Actions (register, invoke, WASM) | ✅ Complete |
 | Workflows (YAML, signals, timers) | ✅ Complete |
-| Stream Processing (operators, windows, checkpoints) | ✅ Complete |
 | Web Dashboard | ✅ Complete |
 | SWIM gossip + cluster membership | ✅ Complete |
 | Cross-node request forwarding | ✅ Complete |
-| Cold Storage (S3/GCS) | � Local backend complete, remote planned |
+| Kafka Source | 🚧 In Progress |
+| Cold Storage (S3/GCS) | 🔲 Local backend complete, remote planned |
 
 ## Contributing
 

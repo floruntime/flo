@@ -548,6 +548,10 @@ fn appendKafkaSource(
     if (getInt(kafka_obj, "metadata_refresh_ms")) |v| {
         if (v > 0) metadata_refresh_ms = @intCast(@as(i64, v));
     }
+    var poll_interval_ms: u32 = 100;
+    if (getInt(kafka_obj, "poll_interval_ms")) |v| {
+        if (v > 0) poll_interval_ms = @intCast(@as(i64, v));
+    }
     var isolation_level: u8 = 0;
     const isolation_raw = getString(kafka_obj, "isolation_level") orelse "read_uncommitted";
     if (std.mem.eql(u8, isolation_raw, "read_committed")) isolation_level = 1;
@@ -669,6 +673,7 @@ fn appendKafkaSource(
         .kafka_fetch_min_bytes = fetch_min_bytes,
         .kafka_metadata_refresh_ms = metadata_refresh_ms,
         .kafka_isolation_level = isolation_level,
+        .kafka_poll_interval_ms = poll_interval_ms,
         .kafka_schema_registry_url = sr_url_d,
         .kafka_schema_registry_username = sr_user_d,
         .kafka_schema_registry_password = sr_pass_d,

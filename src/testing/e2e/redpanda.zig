@@ -61,33 +61,47 @@ pub const RedpandaProcess = struct {
 
         // Build port format strings
         var kafka_map_buf: [32]u8 = undefined;
-        const kafka_map = std.fmt.bufPrint(&kafka_map_buf, "{d}:9092", .{self.kafka_port}) catch unreachable;
+        const kafka_map = std.fmt.bufPrint(&kafka_map_buf, "{d}:19092", .{self.kafka_port}) catch unreachable;
 
         var admin_map_buf: [32]u8 = undefined;
         const admin_map = std.fmt.bufPrint(&admin_map_buf, "{d}:9644", .{self.admin_port}) catch unreachable;
 
-        var advertise_buf: [64]u8 = undefined;
-        const advertise = std.fmt.bufPrint(&advertise_buf, "localhost:{d}", .{self.kafka_port}) catch unreachable;
+        var external_advertise_buf: [64]u8 = undefined;
+        const external_advertise = std.fmt.bufPrint(&external_advertise_buf, "localhost:{d}", .{self.kafka_port}) catch unreachable;
 
         var smp_buf: [4]u8 = undefined;
         const smp_str = std.fmt.bufPrint(&smp_buf, "{d}", .{self.config.smp}) catch unreachable;
 
         // Build argv
+        // Two listeners: "internal" on 9092 (for rpk inside container) and
+        // "external" on 19092 (mapped to host dynamic port). This avoids the
+        // classic Docker problem where rpk can't reach the advertised host port.
         var argv_list: std.ArrayList([]const u8) = .empty;
         defer argv_list.deinit(self.allocator);
 
         try argv_list.appendSlice(self.allocator, &.{
-            "docker",            "run",
-            "-d",                "--rm",
-            "-p",                kafka_map,
-            "-p",                admin_map,
+            "docker",                  "run",
+            "-d",                      "--rm",
+            "-p",                      kafka_map,
+            "-p",                      admin_map,
             self.config.image,
-            "redpanda",          "start",
-            "--mode",            "dev-container",
-            "--smp",             smp_str,
-            "--memory",          self.config.memory,
-            "--advertise-kafka-addr", advertise,
+            "redpanda",                "start",
+            "--mode",                  "dev-container",
+            "--smp",                   smp_str,
+            "--memory",                self.config.memory,
+            "--kafka-addr",            "internal://0.0.0.0:9092,external://0.0.0.0:19092",
+            "--advertise-kafka-addr",
         });
+
+        // Advertise: internal=localhost:9092 (for rpk in container),
+        // external=localhost:{host_port} (for Flo on host)
+        var advertise_buf: [128]u8 = undefined;
+        const advertise_str = std.fmt.bufPrint(
+            &advertise_buf,
+            "internal://localhost:9092,external://{s}",
+            .{external_advertise},
+        ) catch unreachable;
+        try argv_list.append(self.allocator, advertise_str);
 
         if (self.config.sasl_enabled) {
             try argv_list.appendSlice(self.allocator, &.{
@@ -163,14 +177,28 @@ pub const RedpandaProcess = struct {
         return try self.allocator.dupe(u8, addr);
     }
 
-    /// Create a topic with given number of partitions
+    /// Create a topic with given number of partitions.
+    /// Retries a few times if the Kafka API isn't fully settled.
     pub fn createTopic(self: *Self, name: []const u8, partitions: u32) !void {
         const cid = self.container_id orelse return error.NotStarted;
 
         var part_buf: [16]u8 = undefined;
         const part_str = std.fmt.bufPrint(&part_buf, "{d}", .{partitions}) catch unreachable;
 
-        try self.dockerExec(&.{ "rpk", "topic", "create", name, "-p", part_str }, cid);
+        const max_retries: u32 = 5;
+        const retry_sleep: u64 = 2 * std.time.ns_per_s;
+
+        for (0..max_retries) |attempt| {
+            self.dockerExec(&.{ "rpk", "topic", "create", name, "-p", part_str }, cid) catch |err| {
+                if (attempt + 1 < max_retries) {
+                    std.debug.print("[RedpandaProcess] createTopic attempt {d}/{d} failed, retrying...\n", .{ attempt + 1, max_retries });
+                    std.Thread.sleep(retry_sleep);
+                    continue;
+                }
+                return err;
+            };
+            return; // success
+        }
     }
 
     /// Produce a single record to a topic
@@ -178,17 +206,7 @@ pub const RedpandaProcess = struct {
         const cid = self.container_id orelse return error.NotStarted;
 
         if (key) |k| {
-            // key:value format via stdin
-            var argv_buf: [16][]const u8 = undefined;
-            const argv = argv_buf[0..7];
-            argv[0] = "docker";
-            argv[1] = "exec";
-            argv[2] = "-i";
-            argv[3] = cid;
-            argv[4] = "rpk";
-            argv[5] = "topic";
-            argv[6] = "produce";
-
+            // Use rpk format flag to parse key:value from stdin
             var full_argv: [10][]const u8 = undefined;
             full_argv[0] = "docker";
             full_argv[1] = "exec";
@@ -198,8 +216,8 @@ pub const RedpandaProcess = struct {
             full_argv[5] = "topic";
             full_argv[6] = "produce";
             full_argv[7] = topic;
-            full_argv[8] = "-K";
-            full_argv[9] = ":";
+            full_argv[8] = "-f";
+            full_argv[9] = "%k:%v\\n";
 
             var child = std.process.Child.init(&full_argv, self.allocator);
             child.stdin_behavior = .Pipe;
@@ -261,7 +279,7 @@ pub const RedpandaProcess = struct {
             "rpk",    "topic", "produce", topic,
         });
         if (has_keys) {
-            try argv_list.appendSlice(self.allocator, &.{ "-K", ":" });
+            try argv_list.appendSlice(self.allocator, &.{ "-f", "%k:%v\\n" });
         }
 
         var child = std.process.Child.init(argv_list.items, self.allocator);
@@ -334,11 +352,26 @@ pub const RedpandaProcess = struct {
     }
 
     fn waitForReady(self: *Self) !void {
-        const max_attempts: u32 = 60; // 30s at 500ms intervals
-        const sleep_ns: u64 = 500 * std.time.ns_per_ms;
+        const cid = self.container_id orelse return error.NotStarted;
 
-        for (0..max_attempts) |_| {
-            if (self.canConnect()) return;
+        // Phase 1: Wait for TCP port to accept connections (fast)
+        const tcp_max: u32 = 60; // 30s at 500ms intervals
+        const sleep_ns: u64 = 500 * std.time.ns_per_ms;
+        var tcp_ok = false;
+        for (0..tcp_max) |_| {
+            if (self.canConnect()) {
+                tcp_ok = true;
+                break;
+            }
+            std.Thread.sleep(sleep_ns);
+        }
+        if (!tcp_ok) return error.RedpandaNotReady;
+
+        // Phase 2: Wait for Kafka API to be operational via `rpk cluster health`
+        // TCP accept != API ready; Redpanda needs time to initialize its Raft groups.
+        const api_max: u32 = 60; // 30s at 500ms intervals
+        for (0..api_max) |_| {
+            if (self.isKafkaApiReady(cid)) return;
             std.Thread.sleep(sleep_ns);
         }
 
@@ -351,6 +384,21 @@ pub const RedpandaProcess = struct {
         defer std.posix.close(sock);
         std.posix.connect(sock, &addr.any, @sizeOf(std.posix.sockaddr.in)) catch return false;
         return true;
+    }
+
+    /// Check if Kafka API is actually ready (not just TCP).
+    fn isKafkaApiReady(self: *Self, cid: []const u8) bool {
+        const argv = &[_][]const u8{ "docker", "exec", cid, "rpk", "cluster", "health" };
+        var child = std.process.Child.init(argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return false;
+        const result = child.wait() catch return false;
+        return switch (result) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
     }
 
     fn dockerExec(self: *Self, rpk_args: []const []const u8, cid: []const u8) !void {
@@ -376,11 +424,19 @@ pub const RedpandaProcess = struct {
         var stderr_list: std.ArrayList(u8) = .empty;
         try child.collectOutput(self.allocator, &stdout_list, &stderr_list, 256 * 1024);
         stdout_list.deinit(self.allocator);
-        stderr_list.deinit(self.allocator);
+        defer stderr_list.deinit(self.allocator);
 
         const result = try child.wait();
         switch (result) {
-            .Exited => |code| if (code != 0) return error.RpkCommandFailed,
+            .Exited => |code| if (code != 0) {
+                const stderr_out = stderr_list.items;
+                if (stderr_out.len > 0) {
+                    std.debug.print("\n[RedpandaProcess] rpk failed (exit {d}): {s}\n", .{ code, stderr_out });
+                } else {
+                    std.debug.print("\n[RedpandaProcess] rpk failed with exit code {d}\n", .{code});
+                }
+                return error.RpkCommandFailed;
+            },
             else => return error.RpkCommandFailed,
         }
     }

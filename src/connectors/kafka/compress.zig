@@ -2,8 +2,6 @@
 //!
 //! Implements decompression for Snappy, LZ4, and ZSTD — the three codecs
 //! used by Kafka RecordBatch (in addition to GZIP, handled elsewhere).
-//!
-//! Phase 2: All three codecs fully implemented.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -334,7 +332,11 @@ test "Snappy: literal-only roundtrip" {
     const compressed = [_]u8{
         0x05, // uncompressed length = 5
         0x10, // literal, length = (4 << 2) | 0 = 16 → (tag >> 2) = 4, length = 4+1 = 5
-        'h', 'e', 'l', 'l', 'o',
+        'h',
+        'e',
+        'l',
+        'l',
+        'o',
     };
     const result = try decompressSnappy(&compressed, std.testing.allocator);
     defer std.testing.allocator.free(result);
@@ -347,10 +349,12 @@ test "Snappy: literal + copy" {
     // Actually copy-2 length = (tag >> 2) + 1, so for length 3: (2 << 2) | 0x02 = 0x0A
     // offset = 3 in little-endian 2 bytes
     const compressed = [_]u8{
-        0x06,       // uncompressed length = 6
-        0x08,       // literal, length (2 << 2) | 0 = 8 → length = 2+1 = 3
-        'a', 'b', 'c',
-        0x0A,       // copy-2: (2 << 2) | 0x02 → length = 2+1 = 3
+        0x06, // uncompressed length = 6
+        0x08, // literal, length (2 << 2) | 0 = 8 → length = 2+1 = 3
+        'a',
+        'b',
+        'c',
+        0x0A, // copy-2: (2 << 2) | 0x02 → length = 2+1 = 3
         0x03, 0x00, // offset = 3 (LE)
     };
     const result = try decompressSnappy(&compressed, std.testing.allocator);
@@ -362,10 +366,10 @@ test "LZ4 frame: empty block decompresses to empty" {
     // Minimal LZ4 frame: magic + FLG + BD + HC + end mark(4 zeros)
     const frame = [_]u8{
         0x04, 0x22, 0x4D, 0x18, // magic
-        0x60,                     // FLG: version=01, no content size, no dict
-        0x40,                     // BD: block max = 64KB
-        0x82,                     // HC (checksum — simplified, may not match real)
-        0x00, 0x00, 0x00, 0x00,  // end mark
+        0x60, // FLG: version=01, no content size, no dict
+        0x40, // BD: block max = 64KB
+        0x82, // HC (checksum — simplified, may not match real)
+        0x00, 0x00, 0x00, 0x00, // end mark
     };
     const result = try decompressLz4(&frame, std.testing.allocator);
     defer std.testing.allocator.free(result);
@@ -376,12 +380,13 @@ test "LZ4 frame: uncompressed block" {
     // LZ4 frame with one uncompressed block containing "hello"
     const frame = [_]u8{
         0x04, 0x22, 0x4D, 0x18, // magic
-        0x60,                     // FLG
-        0x40,                     // BD
-        0x82,                     // HC
-        0x05, 0x00, 0x00, 0x80,  // block header: size=5 | 0x80000000 (uncompressed)
-        'h',  'e',  'l',  'l', 'o',
-        0x00, 0x00, 0x00, 0x00,  // end mark
+        0x60, // FLG
+        0x40, // BD
+        0x82, // HC
+        0x05, 0x00, 0x00, 0x80, // block header: size=5 | 0x80000000 (uncompressed)
+        'h',  'e',  'l',  'l',
+        'o',
+        0x00, 0x00, 0x00, 0x00, // end mark
     };
     const result = try decompressLz4(&frame, std.testing.allocator);
     defer std.testing.allocator.free(result);

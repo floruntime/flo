@@ -358,7 +358,7 @@ pub const BrokerPool = struct {
         try self.sendRequest(conn, .Metadata, version, corr_id, writer.getWritten());
 
         const response_data = try conn.receive();
-        const header = try codec.decodeResponseHeader(response_data, corr_id);
+        const header = try codec.decodeResponseHeader(response_data, .Metadata, version, corr_id);
 
         const metadata = try protocol.decodeMetadataResponse(header.body, version, self.allocator);
 
@@ -416,7 +416,7 @@ pub const BrokerPool = struct {
             cb.recordFailure();
             return err;
         };
-        const header = try codec.decodeResponseHeader(response_data, corr_id);
+        const header = try codec.decodeResponseHeader(response_data, .Fetch, version, corr_id);
 
         const result = try protocol.decodeFetchResponse(header.body, version, self.allocator);
         cb.recordSuccess();
@@ -445,7 +445,7 @@ pub const BrokerPool = struct {
         try self.sendRequest(conn, .ListOffsets, version, corr_id, writer.getWritten());
 
         const response_data = try conn.receive();
-        const header = try codec.decodeResponseHeader(response_data, corr_id);
+        const header = try codec.decodeResponseHeader(response_data, .ListOffsets, version, corr_id);
 
         return try protocol.decodeListOffsetsResponse(header.body, version, self.allocator);
     }
@@ -490,7 +490,7 @@ pub const BrokerPool = struct {
         try self.sendRequest(conn, .OffsetFetch, version, corr_id, writer.getWritten());
 
         const response_data = try conn.receive();
-        const header = try codec.decodeResponseHeader(response_data, corr_id);
+        const header = try codec.decodeResponseHeader(response_data, .OffsetFetch, version, corr_id);
 
         return try protocol.decodeOffsetFetchResponse(header.body, version, self.allocator);
     }
@@ -529,7 +529,7 @@ pub const BrokerPool = struct {
         try self.sendRequest(conn, .ApiVersions, 0, corr_id, writer.getWritten());
 
         const response_data = try conn.receive();
-        const header = try codec.decodeResponseHeader(response_data, corr_id);
+        const header = try codec.decodeResponseHeader(response_data, .ApiVersions, 0, corr_id);
         const result = try protocol.decodeApiVersionsResponse(header.body, 0);
 
         if (result.error_code != .none) {
@@ -562,13 +562,17 @@ pub const BrokerPool = struct {
 // =============================================================================
 
 fn getOurVersionRange(api_key: ApiKey) ApiVersionRange {
+    // Support up to the first flexible version for each API.
+    // Our codec handles compact strings, compact arrays, and tagged fields.
+    // We stop before versions that add new required fields we don't handle
+    // (e.g., Metadata v10 adds topic_id UUID, Fetch v13 adds topic_id).
     return switch (api_key) {
         .ApiVersions => .{ .min_version = 0, .max_version = 3 },
-        .Metadata => .{ .min_version = 1, .max_version = 12 },
-        .Fetch => .{ .min_version = 4, .max_version = 16 },
-        .ListOffsets => .{ .min_version = 1, .max_version = 8 },
-        .OffsetCommit => .{ .min_version = 2, .max_version = 9 },
-        .OffsetFetch => .{ .min_version = 1, .max_version = 9 },
+        .Metadata => .{ .min_version = 1, .max_version = 9 },
+        .Fetch => .{ .min_version = 4, .max_version = 12 },
+        .ListOffsets => .{ .min_version = 1, .max_version = 6 },
+        .OffsetCommit => .{ .min_version = 2, .max_version = 8 },
+        .OffsetFetch => .{ .min_version = 1, .max_version = 6 },
         .SaslHandshake => .{ .min_version = 0, .max_version = 1 },
         .SaslAuthenticate => .{ .min_version = 0, .max_version = 2 },
     };
@@ -626,19 +630,19 @@ test "negotiateVersion picks highest mutual version" {
     pool.api_versions[@intFromEnum(ApiKey.Fetch)] = .{ .min_version = 0, .max_version = 14 };
     pool.api_versions_initialized = true;
 
-    // Our range for Fetch: v4-v16
-    // Mutual: v4-v14, best = v14
-    try std.testing.expectEqual(@as(i16, 14), pool.negotiateVersion(.Fetch));
+    // Our range for Fetch: v4-v12
+    // Mutual: v4-v12, best = v12
+    try std.testing.expectEqual(@as(i16, 12), pool.negotiateVersion(.Fetch));
 }
 
 test "getOurVersionRange for known APIs" {
     const fetch = getOurVersionRange(.Fetch);
     try std.testing.expectEqual(@as(i16, 4), fetch.min_version);
-    try std.testing.expectEqual(@as(i16, 16), fetch.max_version);
+    try std.testing.expectEqual(@as(i16, 12), fetch.max_version);
 
     const metadata = getOurVersionRange(.Metadata);
     try std.testing.expectEqual(@as(i16, 1), metadata.min_version);
-    try std.testing.expectEqual(@as(i16, 12), metadata.max_version);
+    try std.testing.expectEqual(@as(i16, 9), metadata.max_version);
 }
 
 test "CircuitBreaker starts closed and allows requests" {

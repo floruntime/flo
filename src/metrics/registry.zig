@@ -367,7 +367,7 @@ pub const ProcessingMetrics = struct {
 };
 
 // =============================================================================
-// Kafka Source Metrics (§17.1)
+// Kafka Source Metrics
 // =============================================================================
 
 /// Per-KafkaSource metrics for Prometheus observability.

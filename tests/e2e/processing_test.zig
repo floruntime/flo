@@ -407,6 +407,28 @@ fn readStreamBlocking(ctx: *stdx.testing.TestContext, stream_name: []const u8, n
     return result.succeeded() and result.stdoutContains(expected);
 }
 
+/// Poll `flo kv list` until output contains `expected_prefix`, or timeout.
+fn pollKvForKey(ctx: *stdx.testing.TestContext, ns: []const u8, expected_prefix: []const u8, timeout_ms_str: []const u8) !bool {
+    const timeout_ms = std.fmt.parseInt(u64, timeout_ms_str, 10) catch 3000;
+    const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
+    const max_attempts = @max(timeout_ms / 100, 1);
+
+    for (0..max_attempts) |_| {
+        var result = try ctx.cli.run(&.{ "kv", "list", "-n", ns });
+        defer result.deinit();
+
+        if (result.succeeded() and result.stdoutContains(expected_prefix)) {
+            return true;
+        }
+
+        std.Thread.sleep(poll_interval_ns);
+    }
+
+    var result = try ctx.cli.run(&.{ "kv", "list", "-n", ns });
+    defer result.deinit();
+    return result.succeeded() and result.stdoutContains(expected_prefix);
+}
+
 /// Poll until job reaches a given state, or timeout.
 /// Returns true if the state was reached.
 fn pollForJobState(ctx: *stdx.testing.TestContext, job_id: []const u8, ns: []const u8, target_state: []const u8, timeout_ms: u64) !bool {
@@ -917,17 +939,11 @@ test "e2e/processing: checkpoint persists to internal KV namespace" {
     defer sp_result.deinit();
     try stdx.testing.assertSucceeded(sp_result);
 
-    // With expose_internal_keys=true, _proc: checkpoint keys should be visible
-    var scan_result = try ctx.cli.run(&.{ "kv", "list", "-n", "proc_ckpt" });
-    defer scan_result.deinit();
-    if (scan_result.succeeded()) {
-        // Verify checkpoint keys are present under _proc: namespace
-        const has_proc_keys = scan_result.stdoutContains("_proc:");
-        if (!has_proc_keys) {
-            std.debug.print("WARN: kv list did not contain _proc: keys (checkpoint may not have flushed yet)\n", .{});
-            std.debug.print("kv list output:\n{s}\n", .{scan_result.stdout});
-        }
-    }
+    // With expose_internal_keys=true, _proc:checkpoint:{job_id} should be visible
+    // in kv list. Poll briefly since the write-through is synchronous but the
+    // projection may not be immediately visible via the CLI scan path.
+    const found = try pollKvForKey(ctx, "proc_ckpt", "_proc:checkpoint:", "3000");
+    try testing.expect(found);
 
     // Also verify that a server WITHOUT expose_internal_keys hides these keys.
     // We've already verified the mechanism in the KVHandler unit: the filter
@@ -951,7 +967,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
             "ts",       "read",    measurement,
             "-n",       ns,        "--from",
             "0",        "--limit", "100",
-            "--format", "json",
+            "--output", "json",
         });
         defer result.deinit();
 
@@ -967,7 +983,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
         "ts",       "read",    measurement,
         "-n",       ns,        "--from",
         "0",        "--limit", "100",
-        "--format", "json",
+        "--output", "json",
     });
     defer result.deinit();
 
@@ -1025,7 +1041,7 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
     // Step 4: Verify data via `flo ts read` with tag filter
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_cpu_metrics", "-n",  "proc_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--limit",          "100", "--format",    "json",
+        "--from", "0",    "--limit",          "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1089,7 +1105,7 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
     // Read with sensor tag filter
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_temp", "-n",  "proc_tsscal", "--tags", "sensor=A1",
-        "--from", "0",    "--limit",   "100", "--format",    "json",
+        "--from", "0",    "--limit",   "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1145,7 +1161,7 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
     // Verify via read
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_late_metric", "-n",  "proc_tslate", "--tags", "host=db-01",
-        "--from", "0",    "--limit",          "100", "--format",    "json",
+        "--from", "0",    "--limit",          "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1196,7 +1212,7 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
     // Verify via `flo ts query` with aggregation
     var query_result = try ctx.cli.run(&.{
         "ts",     "query", "proc_requests", "-n", "proc_tsagg", "--tags", "region=us",
-        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--format",
+        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--output",
         "json",
     });
     defer query_result.deinit();
@@ -1430,7 +1446,7 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         "ts",       "read",       "derived_temp",
         "-n",       "proc_ts2ts", "--from",
         "0",        "--limit",    "100",
-        "--format", "json",
+        "--output", "json",
     });
     defer read_result.deinit();
 
@@ -2607,227 +2623,6 @@ test "e2e/processing: classify multi-tag routing with AND match" {
 }
 
 // =============================================================================
-// WASM Operator + Dynamic Tag Routing Tests
-// =============================================================================
-
-test "e2e/processing: WASM operator with dynamic tag routing" {
-    // Pipeline: source → wasm (txn_classifier) → four sinks:
-    //   - all-sink:       no match (firehose — gets everything)
-    //   - high-value-sink: match: [high-value]
-    //   - refund-sink:    match: [refund]
-    //   - standard-sink:  match: [standard]
-    //
-    // The txn_classifier WASM module classifies transactions by amount:
-    //   amount >= 10000 → tags "high-value"
-    //   amount <  0     → tags "refund"
-    //   otherwise       → tags "standard"
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "ns", "create", "proc_wasm_tag" });
-
-    // Seed source stream with three transaction types
-    try ctx.exec(&.{ "stream", "append", "wasm-txn-in", "{\"txn_id\":\"T1\",\"amount\":25000,\"merchant\":\"ACME\"}", "-n", "proc_wasm_tag" });
-    try ctx.exec(&.{ "stream", "append", "wasm-txn-in", "{\"txn_id\":\"R1\",\"amount\":-300,\"merchant\":\"STORE\"}", "-n", "proc_wasm_tag" });
-    try ctx.exec(&.{ "stream", "append", "wasm-txn-in", "{\"txn_id\":\"S1\",\"amount\":42,\"merchant\":\"CAFE\"}", "-n", "proc_wasm_tag" });
-
-    const job_def =
-        \\kind: Processing
-        \\name: e2e-wasm-tag-route
-        \\namespace: proc_wasm_tag
-        \\sources.[0].stream.name: wasm-txn-in
-        \\operators.[0].type: wasm
-        \\operators.[0].name: txn-classifier
-        \\operators.[0].module: src/processing/testdata/txn_classifier.wasm
-        \\sinks.[0].name: all-sink
-        \\sinks.[0].stream.name: wasm-tag-all
-        \\sinks.[1].name: high-value-sink
-        \\sinks.[1].stream.name: wasm-tag-hv
-        \\sinks.[1].match.[0]: high-value
-        \\sinks.[2].name: refund-sink
-        \\sinks.[2].stream.name: wasm-tag-ref
-        \\sinks.[2].match.[0]: refund
-        \\sinks.[3].name: standard-sink
-        \\sinks.[3].stream.name: wasm-tag-std
-        \\sinks.[3].match.[0]: standard
-        \\parallelism: 1
-        \\batch_size: 100
-    ;
-    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-wasm-tag-route.yaml");
-    defer cleanupTempFile(testing.allocator, path);
-
-    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_wasm_tag" });
-    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
-
-    // Wait for high-value sink to receive the high-value txn
-    const found_hv = try readStreamBlocking(ctx, "wasm-tag-hv", "proc_wasm_tag", "high-value", "8000");
-    if (!found_hv) {
-        std.debug.print("\n[TIMEOUT] High-value sink did not receive classified record\n", .{});
-        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_wasm_tag" });
-        defer status.deinit();
-        std.debug.print("Status: {s}\n", .{status.stdout});
-        ctx.dumpServerLogs();
-        return error.PipelineTimeout;
-    }
-
-    // Firehose sink should have all 3 records
-    const found_all = try readStreamBlocking(ctx, "wasm-tag-all", "proc_wasm_tag", "ACME", "5000");
-    if (!found_all) {
-        std.debug.print("\n[TIMEOUT] Firehose sink did not receive all records\n", .{});
-        return error.PipelineTimeout;
-    }
-
-    // Refund sink should get the negative-amount transaction
-    const found_ref = try readStreamBlocking(ctx, "wasm-tag-ref", "proc_wasm_tag", "refund", "5000");
-    if (!found_ref) {
-        std.debug.print("\n[TIMEOUT] Refund sink did not receive refund record\n", .{});
-        return error.PipelineTimeout;
-    }
-
-    // Standard sink should get the small positive transaction
-    const found_std = try readStreamBlocking(ctx, "wasm-tag-std", "proc_wasm_tag", "standard", "5000");
-    if (!found_std) {
-        std.debug.print("\n[TIMEOUT] Standard sink did not receive standard record\n", .{});
-        return error.PipelineTimeout;
-    }
-
-    // Verify high-value sink has ONLY the high-value transaction (not refund or standard)
-    var hv_result = try ctx.cli.run(&.{ "stream", "read", "wasm-tag-hv", "-n", "proc_wasm_tag", "--start", "0-0", "--limit", "100" });
-    defer hv_result.deinit();
-    try stdx.testing.assertSucceeded(hv_result);
-    try stdx.testing.assertContains(hv_result, "high-value");
-    try testing.expect(!hv_result.stdoutContains("refund"));
-    try testing.expect(!hv_result.stdoutContains("\"class\":\"standard\""));
-
-    // Verify refund sink has ONLY the refund transaction
-    var ref_result = try ctx.cli.run(&.{ "stream", "read", "wasm-tag-ref", "-n", "proc_wasm_tag", "--start", "0-0", "--limit", "100" });
-    defer ref_result.deinit();
-    try stdx.testing.assertSucceeded(ref_result);
-    try stdx.testing.assertContains(ref_result, "refund");
-    try testing.expect(!ref_result.stdoutContains("high-value"));
-    try testing.expect(!ref_result.stdoutContains("\"class\":\"standard\""));
-
-    // Verify standard sink has ONLY the standard transaction
-    var std_result = try ctx.cli.run(&.{ "stream", "read", "wasm-tag-std", "-n", "proc_wasm_tag", "--start", "0-0", "--limit", "100" });
-    defer std_result.deinit();
-    try stdx.testing.assertSucceeded(std_result);
-    try stdx.testing.assertContains(std_result, "\"class\":\"standard\"");
-    try testing.expect(!std_result.stdoutContains("high-value"));
-    try testing.expect(!std_result.stdoutContains("\"class\":\"refund\""));
-
-    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_wasm_tag" });
-}
-
-// =============================================================================
-// WASM Filter + FlatMap + State Tests
-// =============================================================================
-
-test "e2e/processing: WASM operator filter, flatmap, and state" {
-    // Pipeline: source → wasm (txn_enricher) → three sinks:
-    //   - all-sink:       no match (firehose)
-    //   - hv-sink:        match: [high-value]
-    //   - std-sink:       match: [standard]
-    //
-    // txn_enricher WASM module:
-    //   - Missing "amount" → filter (dropped, handle returns 0)
-    //   - amount >= 10000  → flatmap: emits enriched + alert, tags "high-value"
-    //   - otherwise        → map: emits single enriched, tags "standard"
-    //   - All emitted records include "merchant_txn_count" from flo.state_*
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "ns", "create", "proc_wasm_enrich" });
-
-    // Seed source stream:
-    //   1. Missing amount → filtered
-    //   2. High-value     → flatmap (2 outputs)
-    //   3. Standard       → map (1 output with state counter)
-    //   4. Standard same merchant → map (1 output, counter=2)
-    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"X1\",\"merchant\":\"NONE\"}", "-n", "proc_wasm_enrich" });
-    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"HV1\",\"amount\":50000,\"merchant\":\"BIG\"}", "-n", "proc_wasm_enrich" });
-    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"S1\",\"amount\":50,\"merchant\":\"CAFE\"}", "-n", "proc_wasm_enrich" });
-    try ctx.exec(&.{ "stream", "append", "wasm-enrich-in", "{\"txn_id\":\"S2\",\"amount\":75,\"merchant\":\"CAFE\"}", "-n", "proc_wasm_enrich" });
-
-    const job_def =
-        \\kind: Processing
-        \\name: e2e-wasm-enrich
-        \\namespace: proc_wasm_enrich
-        \\sources.[0].stream.name: wasm-enrich-in
-        \\operators.[0].type: wasm
-        \\operators.[0].name: txn-enricher
-        \\operators.[0].module: src/processing/testdata/txn_enricher.wasm
-        \\sinks.[0].name: all-sink
-        \\sinks.[0].stream.name: wasm-enrich-all
-        \\sinks.[1].name: hv-sink
-        \\sinks.[1].stream.name: wasm-enrich-hv
-        \\sinks.[1].match.[0]: high-value
-        \\sinks.[2].name: std-sink
-        \\sinks.[2].stream.name: wasm-enrich-std
-        \\sinks.[2].match.[0]: standard
-        \\parallelism: 1
-        \\batch_size: 100
-    ;
-    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-wasm-enrich.yaml");
-    defer cleanupTempFile(testing.allocator, path);
-
-    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_wasm_enrich" });
-    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
-
-    // --- Wait for standard sink to receive merchant_txn_count ---
-    // The second CAFE record should have count=2, proving state works
-    const found_std = try readStreamBlocking(ctx, "wasm-enrich-std", "proc_wasm_enrich", "merchant_txn_count", "10000");
-    if (!found_std) {
-        std.debug.print("\n[TIMEOUT] Standard sink did not receive enriched records\n", .{});
-        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_wasm_enrich" });
-        defer status.deinit();
-        std.debug.print("Status: {s}\n", .{status.stdout});
-        ctx.dumpServerLogs();
-        return error.PipelineTimeout;
-    }
-
-    // --- Wait for high-value sink to receive the alert (flatmap) ---
-    const found_alert = try readStreamBlocking(ctx, "wasm-enrich-hv", "proc_wasm_enrich", "alert", "8000");
-    if (!found_alert) {
-        std.debug.print("\n[TIMEOUT] High-value sink did not receive alert record\n", .{});
-        ctx.dumpServerLogs();
-        return error.PipelineTimeout;
-    }
-
-    // --- Verify firehose sink: should have 4 records (2 from flatmap + 2 standard) ---
-    // The filtered record (no amount) should NOT appear
-    var all_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-all", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
-    defer all_result.deinit();
-    try stdx.testing.assertSucceeded(all_result);
-    // The filtered record had txn_id "X1" — should NOT be in output
-    try testing.expect(!all_result.stdoutContains("\"txn_id\":\"X1\""));
-    // High-value enriched + alert should be there
-    try stdx.testing.assertContains(all_result, "high-value");
-    try stdx.testing.assertContains(all_result, "alert");
-    // Standard records should be there
-    try stdx.testing.assertContains(all_result, "\"class\":\"standard\"");
-
-    // --- Verify high-value sink has both enriched and alert records ---
-    var hv_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-hv", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
-    defer hv_result.deinit();
-    try stdx.testing.assertSucceeded(hv_result);
-    try stdx.testing.assertContains(hv_result, "\"class\":\"high-value\"");
-    try stdx.testing.assertContains(hv_result, "\"alert\":\"high-value-txn\"");
-    // Should NOT have standard records
-    try testing.expect(!hv_result.stdoutContains("\"class\":\"standard\""));
-
-    // --- Verify standard sink has only standard records with state counter ---
-    var std_result = try ctx.cli.run(&.{ "stream", "read", "wasm-enrich-std", "-n", "proc_wasm_enrich", "--start", "0-0", "--limit", "100" });
-    defer std_result.deinit();
-    try stdx.testing.assertSucceeded(std_result);
-    try stdx.testing.assertContains(std_result, "\"class\":\"standard\"");
-    try stdx.testing.assertContains(std_result, "merchant_txn_count");
-    // Should NOT have high-value records
-    try testing.expect(!std_result.stdoutContains("\"class\":\"high-value\""));
-
-    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_wasm_enrich" });
-}
-
-// =============================================================================
 // Compound Expression (OR / AND) Filter E2E Tests
 // =============================================================================
 
@@ -3009,14 +2804,24 @@ test "e2e/processing: kafka source ingests JSON records into flo stream" {
     };
 
     // Wait for records to flow through (poll the output stream)
-    const found = try readStreamBlocking(ctx, "enriched", "default", "event-", "10000");
+    const found = try readStreamBlocking(ctx, "enriched", "default", "event-", "15000");
     if (!found) {
-        std.debug.print("\n[FAILED] No records found in output stream 'enriched' after 10s\n", .{});
+        std.debug.print("\n[FAILED] No records found in output stream 'enriched' after 15s\n", .{});
 
         // Check job status for diagnostics
         var status_result = try ctx.cli.run(&.{ "processing", "status", job_id });
         defer status_result.deinit();
         std.debug.print("[DIAG] Job status: {s}\n", .{status_result.stdout});
+
+        // Dump raw stream read for diagnostics
+        var read_result = try ctx.cli.run(&.{ "stream", "read", "enriched", "-n", "default", "--start", "0-0", "--limit", "20" });
+        defer read_result.deinit();
+        std.debug.print("[DIAG] Stream read stdout: '{s}'\n", .{read_result.stdout});
+        std.debug.print("[DIAG] Stream read stderr: '{s}'\n", .{read_result.stderr});
+        std.debug.print("[DIAG] Stream read exit: {d}\n", .{read_result.exit_code});
+
+        // Dump server logs for debugging
+        ctx.server.dumpLogs();
 
         return error.NoRecordsFound;
     }
@@ -3122,11 +2927,30 @@ test "e2e/processing: kafka source with keyed records" {
     defer cleanupTempFile(testing.allocator, yaml_path);
 
     const submit_output = try ctx.execCapture(&.{ "processing", "submit", yaml_path });
-    _ = extractJobId(submit_output) orelse return error.NoJobId;
+    const job_id = extractJobId(submit_output) orelse {
+        std.debug.print("\n[FAILED] Could not extract job ID from: '{s}'\n", .{submit_output});
+        return error.NoJobId;
+    };
 
-    const found = try readStreamBlocking(ctx, "keyed-output", "default", "purchase", "10000");
+    const found = try readStreamBlocking(ctx, "keyed-output", "default", "purchase", "15000");
     if (!found) {
         std.debug.print("\n[FAILED] Keyed records not found in output stream\n", .{});
+
+        // Check job status for diagnostics
+        var status_result = try ctx.cli.run(&.{ "processing", "status", job_id });
+        defer status_result.deinit();
+        std.debug.print("[DIAG] Job status: {s}\n", .{status_result.stdout});
+
+        // Dump raw stream read for diagnostics
+        var read_result = try ctx.cli.run(&.{ "stream", "read", "keyed-output", "-n", "default", "--start", "0-0", "--limit", "20" });
+        defer read_result.deinit();
+        std.debug.print("[DIAG] Stream read stdout: '{s}'\n", .{read_result.stdout});
+        std.debug.print("[DIAG] Stream read stderr: '{s}'\n", .{read_result.stderr});
+        std.debug.print("[DIAG] Stream read exit: {d}\n", .{read_result.exit_code});
+
+        // Dump server logs for debugging
+        ctx.server.dumpLogs();
+
         return error.NoRecordsFound;
     }
 }

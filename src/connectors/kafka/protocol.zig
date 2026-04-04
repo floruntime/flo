@@ -193,6 +193,8 @@ pub fn encodeMetadataRequest(writer: *KafkaWriter, topic: []const u8, api_versio
         try writer.writeTaggedFields(); // per-topic tagged fields
         // allow_auto_topic_creation (v4+)
         try writer.writeByte(0); // false
+        // include_cluster_authorized_operations (v8+)
+        if (api_version >= 8) try writer.writeByte(0);
         // include_topic_authorized_operations (v8+)
         if (api_version >= 8) try writer.writeByte(0);
         try writer.writeTaggedFields(); // top-level
@@ -202,6 +204,10 @@ pub fn encodeMetadataRequest(writer: *KafkaWriter, topic: []const u8, api_versio
         try writer.writeString(topic);
         // allow_auto_topic_creation (v4+)
         if (api_version >= 4) try writer.writeByte(0);
+        // include_cluster_authorized_operations (v8+)
+        if (api_version >= 8) try writer.writeByte(0);
+        // include_topic_authorized_operations (v8+)
+        if (api_version >= 8) try writer.writeByte(0);
     }
 }
 
@@ -328,6 +334,9 @@ pub fn decodeMetadataResponse(data: []const u8, api_version: i16, allocator: All
 
         topics[ti] = .{ .error_code = topic_error, .name = topic_name, .partitions = partitions };
     }
+
+    // cluster_authorized_operations (v8+) — skip
+    if (api_version >= 8) _ = try reader.readInt32();
 
     if (is_flex) reader.readTaggedFields() catch {};
 

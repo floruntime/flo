@@ -487,13 +487,21 @@ pub fn encodeRequest(
 }
 
 /// Decode a response frame. Validates correlation_id matches expected.
-pub fn decodeResponseHeader(data: []const u8, expected_correlation_id: i32) !ResponseFrame {
+/// For flexible versions, reads and skips the response header tagged fields.
+pub fn decodeResponseHeader(data: []const u8, api_key: ApiKey, api_version: i16, expected_correlation_id: i32) !ResponseFrame {
     if (data.len < 4) return error.EndOfBuffer;
-    const correlation_id = std.mem.readInt(i32, data[0..4], .big);
+    var reader = KafkaReader.init(data);
+    const correlation_id = try reader.readInt32();
     if (correlation_id != expected_correlation_id) return error.CorrelationIdMismatch;
+
+    // Flex versions add tagged fields after correlation_id in the response header
+    if (isFlexibleVersion(api_key, api_version)) {
+        try reader.readTaggedFields();
+    }
+
     return .{
         .correlation_id = correlation_id,
-        .body = data[4..],
+        .body = data[reader.pos..],
     };
 }
 
@@ -681,14 +689,23 @@ test "encodeRequest non-flexible" {
 
 test "decodeResponseHeader" {
     const data = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0xDE, 0xAD };
-    const frame = try decodeResponseHeader(&data, 5);
+    // Non-flex: Metadata v7
+    const frame = try decodeResponseHeader(&data, .Metadata, 7, 5);
+    try std.testing.expectEqual(@as(i32, 5), frame.correlation_id);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD }, frame.body);
+}
+
+test "decodeResponseHeader flex version" {
+    // correlation_id=5, tagged_fields=0 (empty), body=0xDE 0xAD
+    const data = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0x00, 0xDE, 0xAD };
+    const frame = try decodeResponseHeader(&data, .Metadata, 9, 5);
     try std.testing.expectEqual(@as(i32, 5), frame.correlation_id);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD }, frame.body);
 }
 
 test "decodeResponseHeader bad correlation id" {
     const data = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0xDE, 0xAD };
-    try std.testing.expectError(error.CorrelationIdMismatch, decodeResponseHeader(&data, 99));
+    try std.testing.expectError(error.CorrelationIdMismatch, decodeResponseHeader(&data, .Metadata, 7, 99));
 }
 
 test "isFlexibleVersion" {

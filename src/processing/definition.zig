@@ -281,6 +281,8 @@ pub const SourceSpec = struct {
     kafka_fetch_max_bytes: u32 = 1_048_576,
     /// Max bytes per partition per fetch
     kafka_partition_max_bytes: u32 = 262_144,
+    /// Poll interval in milliseconds for Kafka source (default: 100)
+    kafka_poll_interval_ms: u32 = 100,
     /// Max records per poll
     kafka_max_poll_records: u32 = 500,
     /// Fetch max wait time in ms (broker long-poll)

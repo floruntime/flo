@@ -386,6 +386,13 @@ pub const Runtime = struct {
         }
         self.shards = shards;
 
+        // 2.4 Wire per-shard config flags.
+        if (self.config.expose_internal_keys) {
+            for (0..self.shard_count) |i| {
+                shards[i].kv_handler.expose_internal_keys = true;
+            }
+        }
+
         // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
         // Each walk opcode gets a slice of per-shard projection pointers.
         try self.wireWalkContexts(shards);
@@ -591,10 +598,10 @@ pub const Runtime = struct {
         }
         self.walk_ctx_slices[0] = ts_ctxs;
 
-        // kv_scan (full scan) → each shard's KVProjection
+        // kv_scan (full scan) → each shard's KVHandler (includes expose_internal_keys flag)
         const kv_ctxs = try self.allocator.alloc(*anyopaque, n);
         for (0..n) |i| {
-            kv_ctxs[i] = @ptrCast(&shards[i].defaultPartition().kv);
+            kv_ctxs[i] = @ptrCast(shards[i].kv_handler);
         }
         for (0..n) |i| {
             shards[i].dispatcher.setWalkContexts(proto.OpCode.kv_scan, kv_ctxs);

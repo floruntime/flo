@@ -81,7 +81,7 @@ pub const StartOffset = enum(u8) {
 };
 
 // =============================================================================
-// BackoffConfig — per-partition exponential backoff (§13.2)
+// BackoffConfig — per-partition exponential backoff
 // =============================================================================
 
 pub const BackoffConfig = struct {
@@ -166,6 +166,10 @@ pub const KafkaSource = struct {
     fetch_errors: u64,
     last_metadata_refresh_ms: i64,
 
+    // Connection retry state
+    connect_failures: u32,
+    next_retry_ms: i64,
+
     // Buffered records from last fetch response
     pending_records: std.ArrayList(ProcessingRecord),
 
@@ -204,6 +208,8 @@ pub const KafkaSource = struct {
             .bytes_fetched = 0,
             .fetch_errors = 0,
             .last_metadata_refresh_ms = 0,
+            .connect_failures = 0,
+            .next_retry_ms = 0,
             .pending_records = .{},
         };
         return self;
@@ -276,11 +282,45 @@ pub const KafkaSource = struct {
         // Initialize on first poll
         if (self.state == .uninitialized) {
             self.connectAndDiscover() catch |err| {
-                log.err("Kafka source initialization failed: {}", .{err});
+                self.connect_failures += 1;
+                self.next_retry_ms = std.time.milliTimestamp() + self.backoff.delayMs(self.connect_failures);
+                log.err("Kafka source initialization failed (attempt {d}): {}", .{ self.connect_failures, err });
                 self.state = .error_backoff;
                 return null;
             };
             self.state = .ready;
+            self.connect_failures = 0;
+        }
+
+        // Retry connection on backoff expiry
+        if (self.state == .error_backoff) {
+            const now = std.time.milliTimestamp();
+            if (now < self.next_retry_ms) return null;
+
+            log.info("Kafka source '{s}' retrying connection (attempt {d})", .{ self.name, self.connect_failures + 1 });
+            // Reset broker pool before retry
+            self.brokers.deinit();
+            const sasl_config = if (self.config.sasl_username) |u|
+                broker_mod.SaslConfig{
+                    .mechanism = self.config.security_mechanism orelse "PLAIN",
+                    .username = u,
+                    .password = self.config.sasl_password orelse "",
+                }
+            else
+                null;
+            self.brokers = BrokerPool.init(self.allocator, sasl_config);
+
+            self.connectAndDiscover() catch |err| {
+                self.connect_failures += 1;
+                self.next_retry_ms = now + self.backoff.delayMs(self.connect_failures);
+                log.err("Kafka source retry failed (attempt {d}): {} (next retry in {d}ms)", .{
+                    self.connect_failures, err, self.backoff.delayMs(self.connect_failures),
+                });
+                return null;
+            };
+            self.state = .ready;
+            self.connect_failures = 0;
+            log.info("Kafka source '{s}' connected successfully", .{self.name});
         }
 
         if (self.state != .ready) return null;
@@ -534,7 +574,7 @@ pub const KafkaSource = struct {
 
             if (!p.initialized or p.leader_broker_id < 0) continue;
 
-            // Per-partition backoff: skip if still in cooldown (§13.2)
+            // Per-partition backoff: skip if still in cooldown
             if (p.error_count > 0 and now < p.backoff_until_ms) continue;
 
             // Build fetch request for this partition
@@ -618,10 +658,17 @@ pub const KafkaSource = struct {
             };
             const val = value orelse continue; // skip if null
 
+            // Dupe value and key — record slices may point into a decompressed
+            // buffer that is freed when the RecordBatchIterator is deinit'd
+            // (e.g. Redpanda sends Snappy-compressed batches).
+            const val_copy = try self.allocator.dupe(u8, val);
+            errdefer self.allocator.free(val_copy);
+            const key_copy = if (record.key) |k| try self.allocator.dupe(u8, k) else &.{};
+
             // Build ProcessingRecord
             const proc_record = ProcessingRecord{
-                .key = if (record.key) |k| k else &.{},
-                .value = val,
+                .key = key_copy,
+                .value = val_copy,
                 .event_time_ms = timestamp_ms,
                 .source = .{
                     .topic = self.config.topic,
@@ -632,7 +679,7 @@ pub const KafkaSource = struct {
                     },
                 },
                 .headers = &.{},
-                .owns_memory = false,
+                .owns_memory = true,
                 .tags = 0,
             };
 
@@ -652,8 +699,12 @@ pub const KafkaSource = struct {
     }
 
     fn drainPendingRecords(self: *KafkaSource) void {
-        // For records that own memory, we'd free them here.
-        // Current implementation uses non-owning records (data backed by recv buf).
+        for (self.pending_records.items) |rec| {
+            if (rec.owns_memory) {
+                if (rec.value.len > 0) self.allocator.free(rec.value);
+                if (rec.key.len > 0) self.allocator.free(rec.key);
+            }
+        }
         self.pending_records.clearRetainingCapacity();
     }
 };

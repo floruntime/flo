@@ -76,7 +76,7 @@ pub fn performSaslHandshake(
         const response_data = try conn.receive();
 
         // Parse response: error_code(i16) + enabled_mechanisms(array of string)
-        const header = try codec.decodeResponseHeader(response_data, 0);
+        const header = try codec.decodeResponseHeader(response_data, .SaslHandshake, 1, 0);
         var reader = KafkaReader.init(header.body);
         const error_code = try reader.readInt16();
 
@@ -121,7 +121,7 @@ pub fn performSaslHandshake(
         try conn.send(frame);
         const response_data = try conn.receive();
 
-        const header = try codec.decodeResponseHeader(response_data, 1);
+        const header = try codec.decodeResponseHeader(response_data, .SaslAuthenticate, 1, 1);
         var reader = KafkaReader.init(header.body);
         const error_code = try reader.readInt16();
 
@@ -400,7 +400,7 @@ fn sendSaslHandshakeRequest(conn: *BrokerConnection, mechanism: []const u8) !voi
     try conn.send(frame);
     const response_data = try conn.receive();
 
-    const header = try codec.decodeResponseHeader(response_data, 0);
+    const header = try codec.decodeResponseHeader(response_data, .SaslHandshake, 1, 0);
     var reader = KafkaReader.init(header.body);
     const error_code = try reader.readInt16();
 
@@ -439,7 +439,7 @@ fn sendSaslAuthenticateAndReceive(conn: *BrokerConnection, auth_bytes: []const u
     try conn.send(frame);
     const response_data = try conn.receive();
 
-    const header = try codec.decodeResponseHeader(response_data, corr_id);
+    const header = try codec.decodeResponseHeader(response_data, .SaslAuthenticate, 1, corr_id);
     var reader = KafkaReader.init(header.body);
     const error_code = try reader.readInt16();
 

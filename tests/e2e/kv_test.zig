@@ -48,8 +48,8 @@ test "e2e/kv: get non-existent key returns nil" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv get nonexistent --format table
-    var result = try ctx.cli.run(&.{ "kv", "get", "nonexistent", "--format", "table" });
+    // flo kv get nonexistent --output table
+    var result = try ctx.cli.run(&.{ "kv", "get", "nonexistent", "--output", "table" });
     defer result.deinit();
     try stdx.testing.assertContains(result, "(nil)");
 }
@@ -153,7 +153,7 @@ test "e2e/kv: delete" {
     try ctx.exec(&.{ "kv", "delete", "to_delete" });
 
     // Verify it's gone
-    var after = try ctx.cli.run(&.{ "kv", "get", "to_delete", "--format", "table" });
+    var after = try ctx.cli.run(&.{ "kv", "get", "to_delete", "--output", "table" });
     defer after.deinit();
     try stdx.testing.assertContains(after, "(nil)");
 }
@@ -179,8 +179,8 @@ test "e2e/kv: json output format" {
 
     try ctx.exec(&.{ "kv", "set", "json_key", "json value" });
 
-    // flo kv get json_key --format json
-    var result = try ctx.cli.run(&.{ "kv", "get", "json_key", "--format", "json" });
+    // flo kv get json_key --output json
+    var result = try ctx.cli.run(&.{ "kv", "get", "json_key", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -286,8 +286,8 @@ test "e2e/kv: set --cas with correct version succeeds" {
 
     try ctx.exec(&.{ "kv", "set", "cas_test_key", "initial" });
 
-    // flo kv get cas_test_key --format json (to get version)
-    const json_output = try ctx.execCapture(&.{ "kv", "get", "cas_test_key", "--format", "json" });
+    // flo kv get cas_test_key --output json (to get version)
+    const json_output = try ctx.execCapture(&.{ "kv", "get", "cas_test_key", "--output", "json" });
 
     const version = parseVersion(json_output) orelse return error.NoVersion;
     var version_buf: [32]u8 = undefined;
@@ -415,7 +415,7 @@ test "e2e/kv: set with TTL expires after timeout" {
     std.Thread.sleep(1500 * std.time.ns_per_ms);
 
     // Should be expired now
-    var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--format", "table" });
+    var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--output", "table" });
     defer after.deinit();
     try stdx.testing.assertContains(after, "(nil)");
 }
@@ -501,8 +501,8 @@ test "e2e/kv: delete then get returns nil" {
     try ctx.exec(&.{ "kv", "set", "delete_me", "value" });
     try ctx.exec(&.{ "kv", "delete", "delete_me" });
 
-    // flo kv get delete_me --format table
-    var result = try ctx.cli.run(&.{ "kv", "get", "delete_me", "--format", "table" });
+    // flo kv get delete_me --output table
+    var result = try ctx.cli.run(&.{ "kv", "get", "delete_me", "--output", "table" });
     defer result.deinit();
     try stdx.testing.assertContains(result, "(nil)");
 }
@@ -867,7 +867,7 @@ test "e2e/kv/cluster: conditional operations work across cluster" {
     try cluster.execOn(0, &.{ "kv", "set", "cas_cluster_key", "initial" });
 
     // Get version from node 2 (retry to tolerate replication delay)
-    const json_output = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cas_cluster_key", "--format", "json" }, 5, 500);
+    const json_output = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cas_cluster_key", "--output", "json" }, 5, 500);
     defer testing.allocator.free(json_output);
 
     const version = parseVersion(json_output) orelse return error.NoVersion;
@@ -898,7 +898,7 @@ test "e2e/kv/cluster: delete replicates across cluster" {
     try cluster.execOn(2, &.{ "kv", "delete", "to_delete_cluster" });
 
     // Verify deletion from node 1 (poll: GET returns stale value until delete replicates)
-    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--format", "table" }, "(nil)", 10, 500);
+    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--output", "table" }, "(nil)", 10, 500);
     defer testing.allocator.free(after);
 }
 
@@ -1104,7 +1104,7 @@ test "e2e/kv: delete in one namespace does not affect another" {
     try ctx.exec(&.{ "kv", "delete", "shared", "-n", "kv_del_a" });
 
     // Namespace A should be nil
-    var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--format", "table" });
+    var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--output", "table" });
     defer result_a.deinit();
     try stdx.testing.assertContains(result_a, "(nil)");
 
@@ -1259,8 +1259,8 @@ test "e2e/kv: mget basic — all keys exist" {
     try ctx.exec(&.{ "kv", "set", "mg_b", "beta" });
     try ctx.exec(&.{ "kv", "set", "mg_c", "gamma" });
 
-    // flo kv mget mg_a mg_b mg_c --format json
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_a", "mg_b", "mg_c", "--format", "json" });
+    // flo kv mget mg_a mg_b mg_c --output json
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_a", "mg_b", "mg_c", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1280,7 +1280,7 @@ test "e2e/kv: mget partial — some keys missing" {
     try ctx.exec(&.{ "kv", "set", "mg_exists2", "val2" });
 
     // mget with mix of existing and non-existing keys
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_exists1", "mg_missing", "mg_exists2", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_exists1", "mg_missing", "mg_exists2", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1296,7 +1296,7 @@ test "e2e/kv: mget all keys missing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "nope_a", "nope_b", "nope_c", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "nope_a", "nope_b", "nope_c", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1313,7 +1313,7 @@ test "e2e/kv: mget single key" {
 
     try ctx.exec(&.{ "kv", "set", "mg_single", "only" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_single", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_single", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1328,7 +1328,7 @@ test "e2e/kv: mget table format" {
     try ctx.exec(&.{ "kv", "set", "tbl_a", "apple" });
     try ctx.exec(&.{ "kv", "set", "tbl_b", "banana" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "tbl_a", "tbl_b", "--format", "table" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "tbl_a", "tbl_b", "--output", "table" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1347,7 +1347,7 @@ test "e2e/kv: mget reflects latest value after overwrite" {
     try ctx.exec(&.{ "kv", "set", "mg_ow", "original" });
     try ctx.exec(&.{ "kv", "set", "mg_ow", "updated" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_ow", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_ow", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1363,7 +1363,7 @@ test "e2e/kv: mget after delete shows nil" {
     try ctx.exec(&.{ "kv", "set", "mg_del_b", "vb" });
     try ctx.exec(&.{ "kv", "delete", "mg_del_a" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_del_a", "mg_del_b", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_del_a", "mg_del_b", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1402,7 +1402,7 @@ test "e2e/kv: mget across shards returns all results" {
     var result = try ctx.cli.run(&.{
         "kv",           "mget",      "alpha_cpu", "bravo_mem",
         "charlie_disk", "delta_net", "echo_iops", "foxtrot_lat",
-        "golf_tput",    "hotel_err", "--format",  "json",
+        "golf_tput",    "hotel_err", "--output",  "json",
     });
     defer result.deinit();
 
@@ -1425,7 +1425,7 @@ test "e2e/kv: mget across shards with partial hits" {
 
     var result = try ctx.cli.run(&.{
         "kv",          "mget",         "shard_hit_1", "shard_miss_2",
-        "shard_hit_3", "shard_miss_4", "--format",    "json",
+        "shard_hit_3", "shard_miss_4", "--output",    "json",
     });
     defer result.deinit();
 
@@ -1454,7 +1454,7 @@ test "e2e/kv: mget with namespace across shards" {
 
     // MGET in the named namespace — should NOT return default namespace values
     var result = try ctx.cli.run(&.{
-        "kv", "mget", "ns_key1", "ns_key2", "ns_key3", "-n", "mget_ns", "--format", "json",
+        "kv", "mget", "ns_key1", "ns_key2", "ns_key3", "-n", "mget_ns", "--output", "json",
     });
     defer result.deinit();
 
@@ -1483,7 +1483,7 @@ test "e2e/kv/cluster: mget after replication" {
 
     // MGET from node 1 — keys were written on node 0
     const result1 = try cluster.execCaptureOnWithRetry(1, &.{
-        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result1);
 
@@ -1493,7 +1493,7 @@ test "e2e/kv/cluster: mget after replication" {
 
     // MGET from node 2
     const result2 = try cluster.execCaptureOnWithRetry(2, &.{
-        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result2);
 
@@ -1517,7 +1517,7 @@ test "e2e/kv/cluster: mget reads from all nodes" {
     // MGET all three keys from each node
     for (0..3) |node| {
         const result = try cluster.execCaptureOnWithRetry(@intCast(node), &.{
-            "kv", "mget", "cmg_n0", "cmg_n1", "cmg_n2", "--format", "json",
+            "kv", "mget", "cmg_n0", "cmg_n1", "cmg_n2", "--output", "json",
         }, 5, 500);
         defer testing.allocator.free(result);
 
@@ -1540,7 +1540,7 @@ test "e2e/kv/cluster: mget with partial hits across cluster" {
 
     // MGET 4 keys (2 exist, 2 missing) from node 2
     const result = try cluster.execCaptureOnWithRetry(2, &.{
-        "kv", "mget", "cmg_hit_a", "cmg_miss_x", "cmg_hit_b", "cmg_miss_y", "--format", "json",
+        "kv", "mget", "cmg_hit_a", "cmg_miss_x", "cmg_hit_b", "cmg_miss_y", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result);
 
@@ -1570,7 +1570,7 @@ test "e2e/kv/cluster: mget after node failure" {
 
     // MGET from surviving node — data should be available
     const result = try cluster.execCaptureOnWithRetry(1, &.{
-        "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--format", "json",
+        "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--output", "json",
     }, 5, 1000);
     defer testing.allocator.free(result);
 

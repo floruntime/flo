@@ -237,7 +237,7 @@ fn buildBasicAuth(username: []const u8, password: []const u8, buf: *[256]u8) ?[]
 
 test "parseConfluentHeader valid" {
     const data = [_]u8{
-        0x00,             // magic byte
+        0x00, // magic byte
         0x00, 0x00, 0x00, 0x2A, // schema_id = 42
         'h', 'e', 'l', 'l', 'o', // payload
     };
@@ -318,7 +318,7 @@ test "buildBasicAuth" {
     var dec_buf: [128]u8 = undefined;
     const encoded = result["Basic ".len..];
     try std.base64.standard.Decoder.decode(&dec_buf, encoded);
-    const decoded = dec_buf[0..std.base64.standard.Decoder.calcSizeForSlice(encoded) catch unreachable];
+    const decoded = dec_buf[0 .. std.base64.standard.Decoder.calcSizeForSlice(encoded) catch unreachable];
     try std.testing.expectEqualStrings("alice:s3cret", decoded);
 }
 
