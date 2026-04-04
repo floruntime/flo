@@ -1161,8 +1161,7 @@ pub const ActionsHandler = struct {
     /// Persist an action registration.
     /// Value format: [version:u32][created_at_ns:u64][original_req_value...]
     /// Key is namespace-qualified (ns\x00name) so namespace can be recovered during replay.
-    fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) void {
-        _ = self;
+    fn persistRegister(_: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) void {
         var value_buf: [65536]u8 = undefined;
         if (4 + 8 + 1 + req_value.len > value_buf.len) return;
         std.mem.writeInt(u32, value_buf[0..4], version, .little);
@@ -1175,6 +1174,21 @@ pub const ActionsHandler = struct {
         var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
         _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, qkey, value) catch {};
+
+        // Write-through to KV projection: persist .kv_put for durability/replay,
+        // then putInternal for immediate live visibility.
+        var key_buf: [256]u8 = undefined;
+        const prefix = "_action:reg:";
+        if (prefix.len + name.len > key_buf.len) return;
+        @memcpy(key_buf[0..prefix.len], prefix);
+        @memcpy(key_buf[prefix.len .. prefix.len + name.len], name);
+        const kv_key = key_buf[0 .. prefix.len + name.len];
+
+        var val_buf: [512]u8 = undefined;
+        const kv_val = std.fmt.bufPrint(&val_buf, "{{\"version\":{d},\"type\":\"{s}\"}}", .{ version, action_type.toString() }) catch return;
+
+        _ = persistence.persistEntry(shard, .kv_put, Flags.NONE, namespace, kv_key, kv_val) catch {};
+        shard.kv_handler.putInternal(namespace, kv_key, kv_val);
     }
 
     /// Persist an action invocation (run creation).
@@ -1230,6 +1244,18 @@ pub const ActionsHandler = struct {
         var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
         _ = persistence.persistEntry(shard, .action_delete, Flags.TOMBSTONE, namespace, qkey, "") catch {};
+
+        // Write-through to KV projection: persist .kv_delete for durability/replay,
+        // then deleteInternal for immediate live visibility.
+        var key_buf: [256]u8 = undefined;
+        const prefix = "_action:reg:";
+        if (prefix.len + name.len > key_buf.len) return;
+        @memcpy(key_buf[0..prefix.len], prefix);
+        @memcpy(key_buf[prefix.len .. prefix.len + name.len], name);
+        const kv_key = key_buf[0 .. prefix.len + name.len];
+
+        _ = persistence.persistEntry(shard, .kv_delete, Flags.TOMBSTONE, namespace, kv_key, "") catch {};
+        shard.kv_handler.deleteInternal(namespace, kv_key);
     }
 
     /// Persist a run status update (complete, fail, retry).
@@ -1356,13 +1382,14 @@ pub const ActionsHandler = struct {
         }) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
+            return;
         };
     }
 
     /// Remove an action on replay of a delete entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
     fn replayDelete(self: *ActionsHandler, key: []const u8) void {
-        // Extract plain name from possibly qualified key
+        // Extract plain name and namespace from possibly qualified key
         var name = key;
         if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR)) |sep| {
             name = key[sep + 1 ..];

@@ -825,8 +825,7 @@ pub const ProcessingHandler = struct {
 
     /// Persist a processing_savepoint entry. Key = savepoint_id.
     /// Value format: [job_id_len:u16][job_id][records_at:u64][created_at_ms:i64]
-    fn persistSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) void {
-        _ = self;
+    fn persistSavepoint(_: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) void {
         var value_buf: [512]u8 = undefined;
         var off: usize = 0;
 
@@ -840,6 +839,21 @@ pub const ProcessingHandler = struct {
         off += 8;
 
         _ = persistence_mod.persistEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]) catch {};
+
+        // Write-through to KV projection: persist a .kv_put entry for durability/replay,
+        // then putInternal for immediate live visibility.
+        var kv_key_buf: [256]u8 = undefined;
+        const pfx = "_proc:checkpoint:";
+        if (pfx.len + job_id.len > kv_key_buf.len) return;
+        @memcpy(kv_key_buf[0..pfx.len], pfx);
+        @memcpy(kv_key_buf[pfx.len .. pfx.len + job_id.len], job_id);
+        const kv_key = kv_key_buf[0 .. pfx.len + job_id.len];
+
+        var val_buf: [512]u8 = undefined;
+        const kv_val = std.fmt.bufPrint(&val_buf, "{{\"savepoint_id\":\"{s}\",\"records_at\":{d},\"created_at_ms\":{d}}}", .{ sp_id, records_at, created_at_ms }) catch return;
+
+        _ = persistence_mod.persistEntry(shard, .kv_put, Flags.NONE, namespace, kv_key, kv_val) catch {};
+        shard.kv_handler.putInternal(namespace, kv_key, kv_val);
     }
 
     /// Persist a processing_rescale entry. Key = job_id, value = [parallelism:u32].
@@ -1204,7 +1218,12 @@ pub const ProcessingHandler = struct {
             .src_tag_hash = tag_hash,
             .src_stream = allocator.dupe(u8, src.stream) catch "",
             .src_namespace = allocator.dupe(u8, if (src.namespace.len > 0) src.namespace else "default") catch "",
-            .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
+            .src_poll_ms = if (src.kind == .kafka)
+                src.kafka_poll_interval_ms
+            else if (src.ts_poll_interval_ms > 0)
+                src.ts_poll_interval_ms
+            else
+                1000,
             .sinks = sink_configs,
             .ts_cursor_ns = 0,
             .stream_cursor_ts = 0,

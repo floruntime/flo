@@ -67,9 +67,11 @@ const stripNsPrefix = ns_keys.stripPrefix;
 const nsPrefix = ns_keys.namespacePrefix;
 
 /// Reserved key prefixes — operations on these are blocked for user requests.
+/// Subsystems write to their prefix via `putInternal`/`deleteInternal`.
 const RESERVED_PREFIXES = [_][]const u8{
     "_action:",
     "_worker:",
+    "_proc:",
     "_sys:",
     "_internal:",
     "_flo:",
@@ -95,11 +97,16 @@ pub const KVHandler = struct {
     /// Production writes use the Raft log index as their version.
     next_lsn: u64,
 
+    /// When true, scan/list operations include reserved-prefix keys (e.g. _proc:, _action:).
+    /// Set from config [kv] expose_internal_keys = true.
+    expose_internal_keys: bool,
+
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
             .next_lsn = 1,
+            .expose_internal_keys = false,
         };
     }
 
@@ -316,7 +323,8 @@ pub const KVHandler = struct {
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const kv: *KVProjection = @ptrCast(@alignCast(ctx));
+        const handler: *KVHandler = @ptrCast(@alignCast(ctx));
+        const kv = handler.kv;
         const S = struct {
             threadlocal var key_buf: [1024][]const u8 = undefined;
             threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
@@ -337,7 +345,7 @@ pub const KVHandler = struct {
         var count: usize = 0;
         for (S.key_buf[0..raw_count]) |key| {
             const stripped = stripNsPrefix(key, namespace);
-            if (!isReservedKey(stripped)) {
+            if (handler.expose_internal_keys or !isReservedKey(stripped)) {
                 S.key_buf[count] = stripped;
                 count += 1;
             }
@@ -782,7 +790,7 @@ pub const KVHandler = struct {
         // Filter out reserved keys and strip namespace prefix from results
         var filtered_count: usize = 0;
         for (out[0..found_count]) |entry| {
-            if (!isReservedKey(entry.key)) {
+            if (self.expose_internal_keys or !isReservedKey(entry.key)) {
                 var stripped = entry;
                 stripped.key = stripNsPrefix(entry.key, ns);
                 scan_buf[filtered_count] = stripped;
@@ -847,6 +855,42 @@ pub const KVHandler = struct {
         }
 
         return .{ .kv_history_result = .{ .data = data } };
+    }
+
+    // ── Internal KV API ─────────────────────────────────────────────────
+    //
+    // Subsystems (actions, processing, workers) use these to write internal
+    // state into the KV projection under reserved prefixes. This makes
+    // internal state observable via `kv list` when expose_internal_keys=true,
+    // and survives restarts when called from both the live path and
+    // the replay path.
+    //
+    // Key convention: _{subsystem}:{type}:{id}
+    //   _proc:checkpoint:{job_id}    — processing savepoints
+    //   _proc:job:{job_id}           — processing job records
+    //   _action:reg:{name}           — action registrations
+    //   _action:run:{run_id}         — action run records
+    //   _worker:reg:{worker_id}      — worker registrations
+
+    /// Write a key under a reserved prefix directly to the KV projection.
+    /// Bypasses the reserved-key check (callers are trusted subsystems).
+    /// Handles namespace qualification internally. Fire-and-forget.
+    pub fn putInternal(self: *KVHandler, namespace: []const u8, key: []const u8, value: []const u8) void {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, namespace, key) catch return;
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        self.kv.put(qkey, value, lsn, 0, timestamp, 0) catch {};
+    }
+
+    /// Delete a key under a reserved prefix directly from the KV projection.
+    /// Bypasses the reserved-key check. Fire-and-forget.
+    pub fn deleteInternal(self: *KVHandler, namespace: []const u8, key: []const u8) void {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, namespace, key) catch return;
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        self.kv.delete(qkey, lsn, 0, timestamp) catch {};
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
