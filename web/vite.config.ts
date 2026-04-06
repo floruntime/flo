@@ -35,7 +35,17 @@ export default defineConfig({
   build: {
     // Output to dist directory for production builds
     outDir: 'dist',
-    // Generate source maps for debugging
-    sourcemap: true,
+    // Source maps add ~4.4 MB to the embedded binary — off by default.
+    // Enable when needed: npm run build -- --sourcemap
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        // Split vendor chunks so large libs don't bloat the main bundle
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
+          'charts': ['recharts'],
+        },
+      },
+    },
   },
 })

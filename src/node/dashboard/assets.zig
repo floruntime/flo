@@ -6,13 +6,15 @@ const std = @import("std");
 pub const Asset = struct {
     content: []const u8,
     mime_type: []const u8,
+    is_precompressed: bool = false,
 };
 
-const asset_0 = @embedFile("dist/index.html");
-const asset_1 = @embedFile("dist/vite.svg");
-const asset_2 = @embedFile("dist/assets/index-Ct-xFt6d.css");
-const asset_3 = @embedFile("dist/assets/index-C65BRLHh.js");
-const asset_4 = @embedFile("dist/assets/index-C65BRLHh.js.map");
+const asset_0 = @embedFile("dist/index.html.gz");
+const asset_1 = @embedFile("dist/vite.svg.gz");
+const asset_2 = @embedFile("dist/assets/index-ClreHEfP.js.gz");
+const asset_3 = @embedFile("dist/assets/index-Ct-xFt6d.css.gz");
+const asset_4 = @embedFile("dist/assets/react-vendor-Bz-nhak5.js.gz");
+const asset_5 = @embedFile("dist/assets/charts-Dt8dzZJs.js.gz");
 
 pub fn get(path: []const u8) ?Asset {
     const mem = @import("std").mem;
@@ -20,18 +22,20 @@ pub fn get(path: []const u8) ?Asset {
     const lookup = if (normalized.len == 0) "index.html" else normalized;
 
     if (mem.eql(u8, lookup, "index.html")) {
-        return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8" };
+        return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8", .is_precompressed = true };
     } else if (mem.eql(u8, lookup, "vite.svg")) {
-        return .{ .content = asset_1, .mime_type = "image/svg+xml" };
+        return .{ .content = asset_1, .mime_type = "image/svg+xml", .is_precompressed = true };
+    } else if (mem.eql(u8, lookup, "assets/index-ClreHEfP.js")) {
+        return .{ .content = asset_2, .mime_type = "application/javascript; charset=utf-8", .is_precompressed = true };
     } else if (mem.eql(u8, lookup, "assets/index-Ct-xFt6d.css")) {
-        return .{ .content = asset_2, .mime_type = "text/css; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-C65BRLHh.js")) {
-        return .{ .content = asset_3, .mime_type = "application/javascript; charset=utf-8" };
-    } else if (mem.eql(u8, lookup, "assets/index-C65BRLHh.js.map")) {
-        return .{ .content = asset_4, .mime_type = "application/json" };
+        return .{ .content = asset_3, .mime_type = "text/css; charset=utf-8", .is_precompressed = true };
+    } else if (mem.eql(u8, lookup, "assets/react-vendor-Bz-nhak5.js")) {
+        return .{ .content = asset_4, .mime_type = "application/javascript; charset=utf-8", .is_precompressed = true };
+    } else if (mem.eql(u8, lookup, "assets/charts-Dt8dzZJs.js")) {
+        return .{ .content = asset_5, .mime_type = "application/javascript; charset=utf-8", .is_precompressed = true };
     } else {
         if (!mem.startsWith(u8, lookup, "api/")) {
-            return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8" };
+            return .{ .content = asset_0, .mime_type = "text/html; charset=utf-8", .is_precompressed = true };
         }
         return null;
     }

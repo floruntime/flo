@@ -212,6 +212,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         \\pub const Asset = struct {
         \\    content: []const u8,
         \\    mime_type: []const u8,
+        \\    is_precompressed: bool = false,
         \\};
         \\
         \\
@@ -241,14 +242,27 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     while (walker.next() catch null) |entry| {
         if (entry.kind != .file) continue;
         const file_path = entry.path;
+        // Skip source maps and previously-generated .gz files
+        if (std.mem.endsWith(u8, file_path, ".map")) continue;
+        if (std.mem.endsWith(u8, file_path, ".gz")) continue;
         const mime = getMimeType(file_path);
         const var_name = b.fmt("asset_{d}", .{asset_idx});
+        const compressible = isCompressible(file_path);
 
-        writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
-            var_name, file_path,
-        }) catch unreachable;
+        if (compressible) {
+            // Gzip the file at configure time and embed the compressed version
+            const gz_path = b.fmt("{s}.gz", .{file_path});
+            gzipFile(b.allocator, dist_dir, file_path, gz_path);
+            writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
+                var_name, gz_path,
+            }) catch unreachable;
+        } else {
+            writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
+                var_name, file_path,
+            }) catch unreachable;
+        }
 
-        const entry_line = b.fmt("{s}\x00{s}\x00{s}", .{ file_path, var_name, mime });
+        const entry_line = b.fmt("{s}\x00{s}\x00{s}\x00{d}", .{ file_path, var_name, mime, @as(u8, if (compressible) 1 else 0) });
         entries.append(b.allocator, entry_line) catch unreachable;
         asset_idx += 1;
     }
@@ -270,6 +284,8 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         const epath = it.next().?;
         const vname = it.next().?;
         const emime = it.next().?;
+        const compressed = it.next().?;
+        const is_gz = std.mem.eql(u8, compressed, "1");
 
         if (first) {
             writer.print("    if (mem.eql(u8, lookup, \"{s}\")) {{\n", .{epath}) catch unreachable;
@@ -277,7 +293,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         } else {
             writer.print("    }} else if (mem.eql(u8, lookup, \"{s}\")) {{\n", .{epath}) catch unreachable;
         }
-        writer.print("        return .{{ .content = {s}, .mime_type = \"{s}\" }};\n", .{ vname, emime }) catch unreachable;
+        writer.print("        return .{{ .content = {s}, .mime_type = \"{s}\", .is_precompressed = {s} }};\n", .{ vname, emime, if (is_gz) "true" else "false" }) catch unreachable;
     }
 
     // SPA fallback — serve index.html for non-API paths
@@ -293,8 +309,10 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
             const epath = it.next().?;
             const vname = it.next().?;
             const emime = it.next().?;
+            const compressed = it.next().?;
+            const is_gz = std.mem.eql(u8, compressed, "1");
             if (std.mem.eql(u8, epath, "index.html")) {
-                writer.print("            return .{{ .content = {s}, .mime_type = \"{s}\" }};\n", .{ vname, emime }) catch unreachable;
+                writer.print("            return .{{ .content = {s}, .mime_type = \"{s}\", .is_precompressed = {s} }};\n", .{ vname, emime, if (is_gz) "true" else "false" }) catch unreachable;
                 break;
             }
         }
@@ -340,6 +358,37 @@ fn getMimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
     if (std.mem.endsWith(u8, path, ".map")) return "application/json";
     return "application/octet-stream";
+}
+
+fn isCompressible(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".js") or
+        std.mem.endsWith(u8, path, ".css") or
+        std.mem.endsWith(u8, path, ".html") or
+        std.mem.endsWith(u8, path, ".svg") or
+        std.mem.endsWith(u8, path, ".json");
+}
+
+fn gzipFile(_: std.mem.Allocator, dir: std.fs.Dir, src_path: []const u8, dest_path: []const u8) void {
+    // Get absolute paths for the shell command
+    const dir_path = dir.realpathAlloc(std.heap.page_allocator, ".") catch return;
+    defer std.heap.page_allocator.free(dir_path);
+
+    const abs_src = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, src_path }) catch return;
+    defer std.heap.page_allocator.free(abs_src);
+
+    const abs_dest = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, dest_path }) catch return;
+    defer std.heap.page_allocator.free(abs_dest);
+
+    // Use shell redirection to write directly to file (avoids stdout buffer limits)
+    const cmd = std.fmt.allocPrint(std.heap.page_allocator, "gzip -9 -c \"{s}\" > \"{s}\"", .{ abs_src, abs_dest }) catch return;
+    defer std.heap.page_allocator.free(cmd);
+
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{ "sh", "-c", cmd },
+    }) catch return;
+    defer std.heap.page_allocator.free(result.stdout);
+    defer std.heap.page_allocator.free(result.stderr);
 }
 
 fn getGitVersion(b: *std.Build) []const u8 {

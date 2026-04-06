@@ -262,7 +262,11 @@ pub const DashboardServer = struct {
 
         // Try to get embedded asset (handles SPA routing internally)
         if (assets.get(path)) |asset| {
-            self.sendResponseRaw(client, .ok, asset.mime_type, asset.content, cors_headers);
+            if (asset.is_precompressed) {
+                self.sendResponsePrecompressed(client, .ok, asset.mime_type, asset.content, cors_headers);
+            } else {
+                self.sendResponseRaw(client, .ok, asset.mime_type, asset.content, cors_headers);
+            }
             return;
         }
 
@@ -281,6 +285,25 @@ pub const DashboardServer = struct {
             &hdr_buf,
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "{s}" ++
+                "Connection: close\r\n" ++
+                "\r\n",
+            .{ status.statusLine(), content_type, body_data.len, cors },
+        ) catch return;
+
+        _ = std.posix.write(client, response) catch return;
+        _ = std.posix.write(client, body_data) catch return;
+    }
+
+    fn sendResponsePrecompressed(_: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body_data: []const u8, cors_headers: ?[]const u8) void {
+        var hdr_buf: [1024]u8 = undefined;
+        const cors = cors_headers orelse "";
+        const response = std.fmt.bufPrint(
+            &hdr_buf,
+            "HTTP/1.1 {s}\r\n" ++
+                "Content-Type: {s}\r\n" ++
+                "Content-Encoding: gzip\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "{s}" ++
                 "Connection: close\r\n" ++
