@@ -855,6 +855,11 @@ pub const ActionsHandler = struct {
                 if (run.result_owned) |old| self.allocator.free(old);
                 run.result_owned = self.allocator.dupe(u8, result_data) catch null;
             }
+            // Clear any error from a previous failed attempt
+            if (run.error_owned) |old| {
+                self.allocator.free(old);
+                run.error_owned = null;
+            }
             // Persist run status update through Raft
             if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .completed, run.completed_at_ms, result_data, run.started_at_ms, run.worker_id_owned);
             return null; // success
