@@ -199,6 +199,44 @@ pub fn writeRunCountsJson(writer: anytype, counts: RunCounts) !void {
 }
 
 // =============================================================================
+// Percent-Decoding (for URL path segments)
+// =============================================================================
+
+/// Decode percent-encoded bytes in-place (e.g. `%2F` → `/`).
+/// Returns a slice into `buf` with the decoded content.
+/// If input has no `%` sequences, returns the original slice unchanged.
+pub fn percentDecode(buf: []u8, input: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, input, '%') == null) return input;
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const hi = hexVal(input[i + 1]);
+            const lo = hexVal(input[i + 2]);
+            if (hi != null and lo != null) {
+                buf[o] = (hi.? << 4) | lo.?;
+                o += 1;
+                i += 3;
+                continue;
+            }
+        }
+        buf[o] = input[i];
+        o += 1;
+        i += 1;
+    }
+    return buf[0..o];
+}
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

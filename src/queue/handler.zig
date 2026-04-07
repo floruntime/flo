@@ -31,6 +31,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
 const ReplayRegistry = persistence_mod.ReplayRegistry;
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 const CommandResult = result_mod.CommandResult;
 const QueueProjection = queue_mod.QueueProjection;
@@ -57,6 +58,9 @@ pub const QueueHandler = struct {
     /// Set after init by Shard.wireHandlerShardPtrs(). Required for Raft writes.
     shard_ptr: ?*anyopaque,
 
+    /// Global metrics registry (optional, set by runtime when dashboard is enabled).
+    metrics_registry: ?*MetricsRegistry,
+
     const MAX_DEQUEUE_BATCH: u32 = 100;
     const DEFAULT_DEQUEUE_COUNT: u32 = 1;
 
@@ -66,6 +70,7 @@ pub const QueueHandler = struct {
             .partition = partition,
             .allocator = allocator,
             .shard_ptr = null,
+            .metrics_registry = null,
         };
     }
 
@@ -296,6 +301,11 @@ pub const QueueHandler = struct {
         // Register the queue name so it appears in queue list
         const q_name_hash = router.nameHash(ns_hash, req.key);
         self.queue.registerQueue(q_name_hash, req.key, req.namespace) catch {};
+
+        // Register in global metrics registry for dashboard/Prometheus
+        if (self.metrics_registry) |mr| {
+            _ = mr.registerQueue(req.namespace, req.key) catch {};
+        }
 
         // Seq was assigned by the projection during apply
         const seq = self.queue.next_seq - 1;

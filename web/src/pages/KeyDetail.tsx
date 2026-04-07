@@ -169,6 +169,16 @@ export function KeyDetail() {
                 deleted: v.deleted,
             }));
 
+            // History API doesn't include values — inject current value
+            if (current.found && current.value !== undefined) {
+                const match = versions.find(v => v.version === current.version);
+                if (match) {
+                    match.value = current.value;
+                } else if (versions.length > 0) {
+                    versions[0].value = current.value;
+                }
+            }
+
             const latestVersion = versions.length > 0
                 ? Math.max(...versions.map(v => v.version))
                 : baseKey.current_version;

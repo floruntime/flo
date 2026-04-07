@@ -44,6 +44,7 @@ const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
 const log = @import("stdx").log;
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 const CommandResult = result_mod.CommandResult;
 const KVProjection = kv_mod.KVProjection;
@@ -95,11 +96,15 @@ pub const KVHandler = struct {
     /// Production writes use the Raft log index as their version.
     next_lsn: u64,
 
+    /// Global metrics registry (optional, set by runtime when dashboard is enabled).
+    metrics_registry: ?*MetricsRegistry,
+
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
             .next_lsn = 1,
+            .metrics_registry = null,
         };
     }
 
@@ -248,6 +253,11 @@ pub const KVHandler = struct {
 
         // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+
+        // Register KV namespace in global metrics registry for dashboard/Prometheus
+        if (shard.kv_handler.metrics_registry) |mr| {
+            _ = mr.registerKVNamespace(req.namespace) catch {};
+        }
 
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }

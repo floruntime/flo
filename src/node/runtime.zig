@@ -484,6 +484,13 @@ pub const Runtime = struct {
             metrics.* = MetricsRegistry.init(self.allocator);
             self.metrics_registry = metrics;
 
+            // Wire metrics registry into each shard's stream handler
+            if (self.shards) |s| {
+                for (s) |*shard| {
+                    shard.setMetricsRegistry(metrics);
+                }
+            }
+
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
 

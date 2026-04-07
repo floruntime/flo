@@ -14,6 +14,7 @@ const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const StreamProjection = @import("../../../projection/stream.zig").StreamProjection;
+const ns_keys = @import("../../../namespace/handler.zig");
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -43,19 +44,61 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // Read from MetricsRegistry when populated
+    // De-duplicate across shards
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    // Build namespace prefix for filtering (same logic as stream handler)
+    var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const ns_prefix = if (ns_filter) |ns| ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
+    const effective_ns = ns_filter orelse "default";
+
+    // Scan StreamProjection on each shard for registered stream names
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getStreamProjection(ctx, i)) |sp| {
+            var name_buf: [1024][]const u8 = undefined;
+            const count = sp.scanStreamNames(&name_buf);
+
+            for (name_buf[0..count]) |name| {
+                // Apply namespace filtering
+                const display_name = blk: {
+                    if (ns_prefix.len == 0) {
+                        // Default namespace — only bare names (no NUL separator)
+                        if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
+                        break :blk name;
+                    } else {
+                        if (!std.mem.startsWith(u8, name, ns_prefix)) continue;
+                        break :blk name[ns_prefix.len..];
+                    }
+                };
+
+                const gop = try seen.getOrPut(display_name);
+                if (!gop.found_existing) {
+                    const partitions = sp.getPartitionCount(display_name);
+                    try arr.next();
+                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                    try obj.begin();
+                    try obj.stringField("name", display_name);
+                    try obj.stringField("namespace", effective_ns);
+                    try obj.intField("partitions", partitions);
+                    try obj.intField("ingest_rate", 0);
+                    try obj.intField("reads", 0);
+                    try obj.stringField("retention", "7d");
+                    try obj.end();
+                }
+            }
+        }
+    }
+
+    // Also include any streams from MetricsRegistry (e.g. from metrics-only sources)
     {
         ctx.metrics.mutex.lock();
         defer ctx.metrics.mutex.unlock();
 
-        // Collect unique stream names from metrics
-        var seen = std.StringHashMap(void).init(allocator);
-        defer seen.deinit();
-
         var it = ctx.metrics.streams.iterator();
         while (it.next()) |entry| {
             const stream_entry = entry.value_ptr.*;
-            // Filter by namespace if specified
             if (ns_filter) |ns| {
                 if (!std.mem.eql(u8, stream_entry.namespace, ns)) continue;
             }

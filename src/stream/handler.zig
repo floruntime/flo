@@ -59,6 +59,7 @@ const EntryType = entry_mod.EntryType;
 const UAL = @import("../storage/ual/ual.zig").UAL;
 const persistence_mod = @import("../storage/persistence.zig");
 const ReplayRegistry = persistence_mod.ReplayRegistry;
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // StreamHandler
@@ -73,6 +74,9 @@ pub const StreamHandler = struct {
     /// Set after init by Shard.init. Required for persistEntry() Raft writes.
     shard_ptr: ?*anyopaque,
 
+    /// Global metrics registry (optional, set by runtime when dashboard is enabled).
+    metrics_registry: ?*MetricsRegistry,
+
     /// Maximum number of messages in a single read response.
     const MAX_READ_BATCH: usize = 1000;
     const DEFAULT_READ_BATCH: usize = 100;
@@ -83,6 +87,7 @@ pub const StreamHandler = struct {
             .partition = partition,
             .allocator = allocator,
             .shard_ptr = null,
+            .metrics_registry = null,
         };
     }
 
@@ -364,6 +369,11 @@ pub const StreamHandler = struct {
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
         self.stream.registerStream(ns_stream_name) catch {};
 
+        // Register in global metrics registry for dashboard/Prometheus
+        if (self.metrics_registry) |mr| {
+            _ = mr.registerStream(req.namespace, req.key, 0) catch {};
+        }
+
         return .{ .stream_append_ok = .{
             .sequence = stream_id.sequence,
             .timestamp_ms = @as(i64, @intCast(stream_id.timestamp_ms)),
@@ -567,6 +577,11 @@ pub const StreamHandler = struct {
                 }
             }
             self.stream.registerStreamMetadata(req.key, partition_count) catch {};
+
+            // Register in global metrics registry for dashboard/Prometheus
+            if (self.metrics_registry) |mr| {
+                _ = mr.registerStream(req.namespace, req.key, 0) catch {};
+            }
         }
         return .ok;
     }

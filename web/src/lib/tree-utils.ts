@@ -12,59 +12,60 @@ export interface TreeNode {
 }
 
 /**
- * Parse a key into segments based on common delimiters
+ * Parse a key into path segments using '/' and ':' as delimiters.
+ * Covers filesystem-style paths (checkpoints/abc) and Redis-style
+ * namespacing (user:123:profile). Other characters (-, .) are
+ * preserved so UUIDs and dotted names stay intact.
  */
 function parseKeySegments(key: string): string[] {
-    // Split by common delimiters: : / . -
-    const segments = key.split(/[:\/\.\-]/);
-    return segments.filter(s => s.length > 0);
+    return key.split(/[/:]/).filter(s => s.length > 0);
 }
 
 /**
- * Build a hierarchical tree structure from a flat list of keys
+ * Build a hierarchical tree structure from a flat list of keys.
+ * Uses a trie internally so that children are properly connected.
  */
 export function buildKeyTree(keys: KVKey[]): TreeNode[] {
-    const root: Map<string, TreeNode> = new Map();
+    interface TrieNode {
+        children: Map<string, TrieNode>;
+        keyData?: KVKey;
+    }
+
+    const root: TrieNode = { children: new Map() };
     const totalKeys = keys.length;
 
-    // Build tree structure
+    // Insert all keys into a trie
     keys.forEach(keyData => {
         const segments = parseKeySegments(keyData.key);
-        let currentLevel = root;
-        let currentPath = '';
-
-        segments.forEach((segment, index) => {
-            const isLastSegment = index === segments.length - 1;
-            currentPath = currentPath ? `${currentPath}:${segment}` : segment;
-
-            if (!currentLevel.has(segment)) {
-                const node: TreeNode = {
-                    name: segment,
-                    fullPath: currentPath,
-                    type: isLastSegment ? 'key' : 'folder',
-                    level: index,
-                    children: isLastSegment ? undefined : [],
-                    keyData: isLastSegment ? keyData : undefined,
-                };
-                currentLevel.set(segment, node);
+        let current = root;
+        segments.forEach((segment, i) => {
+            if (!current.children.has(segment)) {
+                current.children.set(segment, { children: new Map() });
             }
-
-            const node = currentLevel.get(segment)!;
-
-            // If this is not the last segment, traverse deeper
-            if (!isLastSegment && node.children) {
-                // Create children map if it doesn't exist
-                if (!node.children.length) {
-                    currentLevel = new Map();
-                } else {
-                    currentLevel = new Map(node.children.map(child => [child.name, child]));
-                }
+            current = current.children.get(segment)!;
+            if (i === segments.length - 1) {
+                current.keyData = keyData;
             }
         });
     });
 
-    // Convert map to array and calculate statistics
-    const treeArray = Array.from(root.values());
+    // Convert trie → TreeNode[]
+    function materialize(trieChildren: Map<string, TrieNode>, level: number, pathPrefix: string): TreeNode[] {
+        return Array.from(trieChildren.entries()).map(([name, trie]) => {
+            const fullPath = pathPrefix ? `${pathPrefix}/${name}` : name;
+            const hasChildren = trie.children.size > 0;
+            return {
+                name,
+                fullPath: trie.keyData ? trie.keyData.key : fullPath,
+                type: (hasChildren ? 'folder' : 'key') as 'folder' | 'key',
+                level,
+                children: hasChildren ? materialize(trie.children, level + 1, fullPath) : undefined,
+                keyData: trie.keyData,
+            };
+        });
+    }
+
+    const treeArray = materialize(root.children, 0, '');
     calculateTreeStats(treeArray, totalKeys);
 
     return treeArray;

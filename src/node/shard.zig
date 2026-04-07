@@ -88,6 +88,7 @@ const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
 const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const NodeId = @import("../raft/node.zig").NodeId;
 pub const run_id_mod = @import("run_id.zig");
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -219,6 +220,9 @@ pub const Shard = struct {
 
     /// Self-routing run ID generator (per-shard, single-threaded).
     run_id_gen: run_id_mod.Generator,
+
+    /// Global metrics registry (optional, set by runtime when dashboard is enabled).
+    metrics_registry: ?*MetricsRegistry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -481,6 +485,7 @@ pub const Shard = struct {
             .coordinator = null,
             .replay_registry = replay_registry,
             .run_id_gen = .{},
+            .metrics_registry = null,
         };
     }
 
@@ -508,6 +513,15 @@ pub const Shard = struct {
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
+    }
+
+    /// Wire the global MetricsRegistry into this shard and its handlers.
+    /// Called by runtime after the registry is created.
+    pub fn setMetricsRegistry(self: *Shard, registry: *MetricsRegistry) void {
+        self.metrics_registry = registry;
+        self.stream_handler.metrics_registry = registry;
+        self.queue_handler.metrics_registry = registry;
+        self.kv_handler.metrics_registry = registry;
     }
 
     pub fn deinit(self: *Shard) void {

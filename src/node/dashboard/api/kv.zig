@@ -15,6 +15,7 @@ const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const kv_mod = @import("../../../projection/kv.zig");
 const KVProjection = kv_mod.KVProjection;
+const ns_keys = @import("../../../namespace/handler.zig");
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -101,6 +102,10 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
         var keys_arr = try outer.arrayField("keys");
         try keys_arr.begin();
 
+        // Build namespace prefix for filtering (same logic as KV handler)
+        var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
+
         // Scan keys from shard projections
         const n = shardCount(ctx);
         for (0..n) |i| {
@@ -109,12 +114,25 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
                 while (it.next()) |entry| {
                     if (entry.value_ptr.tombstone) continue;
                     const key = entry.key_ptr.*;
-                    if (prefix.len > 0 and !std.mem.startsWith(u8, key, prefix)) continue;
+
+                    // Filter by namespace and strip prefix
+                    const display_key = blk: {
+                        if (ns_prefix.len == 0) {
+                            // Default namespace — only bare keys (no NUL separator)
+                            if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
+                            break :blk key;
+                        } else {
+                            if (!std.mem.startsWith(u8, key, ns_prefix)) continue;
+                            break :blk key[ns_prefix.len..];
+                        }
+                    };
+
+                    if (prefix.len > 0 and !std.mem.startsWith(u8, display_key, prefix)) continue;
                     if (total >= limit) break;
                     try keys_arr.next();
                     var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try kobj.begin();
-                    try kobj.stringField("key", key);
+                    try kobj.stringField("key", display_key);
                     try kobj.intField("size", @as(i64, @intCast(entry.value_ptr.value.len)));
                     try kobj.intField("version", entry.value_ptr.lsn);
                     try kobj.end();
@@ -149,12 +167,16 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
 
+    // Namespace-qualify the key for projection lookup
+    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch key;
+
     // Search across shard projections for the key
     var found = false;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getKVProjection(ctx, i)) |kv| {
-            if (kv.get(key)) |entry| {
+            if (kv.get(qkey)) |entry| {
                 found = true;
                 try obj.boolField("found", true);
                 try obj.stringField("value", entry.value);
@@ -202,8 +224,11 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getKVProjection(ctx, i)) |kv| {
+            // Namespace-qualify the key for projection lookup
+            var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+            const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch key;
             var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
-            const hist_n = kv.getHistory(key, &hist_buf);
+            const hist_n = kv.getHistory(qkey, &hist_buf);
             if (hist_n > 0) {
                 for (hist_buf[0..hist_n]) |ver| {
                     try arr.next();
