@@ -87,6 +87,7 @@ pub const ActionsHandler = struct {
         version: u32,
         enabled: bool,
         created_at_ns: u64,
+        max_retries: u32 = 3,
     };
 
     pub const RunRecord = struct {
@@ -105,6 +106,8 @@ pub const ActionsHandler = struct {
         created_at_ms: i64,
         started_at_ms: ?i64,
         completed_at_ms: ?i64,
+        attempt: u32 = 0,
+        max_retries: u32 = 3,
     };
 
     pub fn init(allocator: Allocator) ActionsHandler {
@@ -378,6 +381,7 @@ pub const ActionsHandler = struct {
         created_at_ms: i64,
         caller_run_id: ?[]const u8 = null,
         caller_workflow_name: ?[]const u8 = null,
+        attempt: u32 = 1,
     };
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
@@ -404,11 +408,12 @@ pub const ActionsHandler = struct {
 
             run.status = .running;
             run.started_at_ms = std.time.milliTimestamp();
+            run.attempt += 1;
             if (worker_id.len > 0) {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned };
+            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned, .attempt = run.attempt };
         }
         return null;
     }
@@ -466,7 +471,12 @@ pub const ActionsHandler = struct {
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
 
         // Parse action_type from first byte of value (client wire format)
+        // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32]
         const action_type = if (req.value.len > 0) ActionType.fromU8(req.value[0]) else .user;
+        const max_retries: u32 = if (req.value.len >= 9)
+            std.mem.readInt(u32, req.value[5..9], .little)
+        else
+            3; // default
 
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
@@ -475,6 +485,7 @@ pub const ActionsHandler = struct {
             .version = version,
             .enabled = true,
             .created_at_ns = now_ns,
+            .max_retries = max_retries,
         }) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
@@ -549,6 +560,9 @@ pub const ActionsHandler = struct {
         else
             null;
 
+        // Look up max_retries from the action's registration
+        const action_max_retries: u32 = if (self.actions.get(action_name)) |arec| arec.max_retries else 3;
+
         const now_ms: i64 = std.time.milliTimestamp();
 
         self.runs.put(owned_run_id, .{
@@ -560,6 +574,7 @@ pub const ActionsHandler = struct {
             .created_at_ms = now_ms,
             .started_at_ms = null,
             .completed_at_ms = null,
+            .max_retries = action_max_retries,
         }) catch {
             self.allocator.free(owned_run_id);
             self.allocator.free(owned_action_name);
@@ -599,8 +614,8 @@ pub const ActionsHandler = struct {
                 .started_at = run.started_at_ms,
                 .completed_at = run.completed_at_ms,
                 .output = null,
-                .error_message = null,
-                .retry_count = 0,
+                .error_message = run.error_owned,
+                .retry_count = if (run.attempt > 0) run.attempt - 1 else 0,
             } };
         }
 
@@ -941,8 +956,8 @@ pub const ActionsHandler = struct {
                 if (run.error_owned) |old| self.allocator.free(old);
                 run.error_owned = self.allocator.dupe(u8, error_message) catch null;
             }
-            if (retry) {
-                // Put back to pending for retry
+            if (retry and run.attempt < run.max_retries) {
+                // Put back to pending for retry (within limit)
                 run.status = .pending;
                 run.started_at_ms = null;
                 if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "", null, run.worker_id_owned);
@@ -1630,8 +1645,8 @@ fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: A
     // created_at
     std.mem.writeInt(i64, buf[pos..][0..8], task.created_at_ms, .little);
     pos += 8;
-    // attempt (always 1 for initial assignment)
-    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    // attempt (tracked across retries)
+    std.mem.writeInt(u32, buf[pos..][0..4], task.attempt, .little);
     pos += 4;
     // has_caller flag + optional caller block
     buf[pos] = has_caller;
