@@ -231,9 +231,10 @@ pub const ActionsHandler = struct {
                 if (err_msg) |msg| {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
                 } else {
-                    // Update worker stats (extract action_name from value header)
+                    // Update worker stats on the shard that owns the worker registration
                     const action_name = parseLeadingName(req.value);
-                    shard.worker_handler.recordCompletion(req.key, action_name);
+                    const ws = resolveWorkerShard(shard, req.namespace, req.key);
+                    ws.worker_handler.recordCompletion(req.key, action_name);
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 }
             },
@@ -242,9 +243,10 @@ pub const ActionsHandler = struct {
                 if (err_msg) |msg| {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
                 } else {
-                    // Update worker stats (extract action_name from value header)
+                    // Update worker stats on the shard that owns the worker registration
                     const action_name = parseLeadingName(req.value);
-                    shard.worker_handler.recordFailure(req.key, action_name);
+                    const ws = resolveWorkerShard(shard, req.namespace, req.key);
+                    ws.worker_handler.recordFailure(req.key, action_name);
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 }
             },
@@ -360,6 +362,26 @@ pub const ActionsHandler = struct {
     /// Returns the target shard (may be self). O(1).
     fn resolveActionShard(shard: *Shard, namespace: []const u8, action_name: []const u8) *Shard {
         const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const target = shard.router.route(hash);
+        return switch (target) {
+            .local => shard,
+            .shard => |t| {
+                if (shard.peer_shards) |peers| {
+                    if (t.shard_id < peers.len) return peers[t.shard_id];
+                }
+                return shard;
+            },
+            .remote => shard,
+        };
+    }
+
+    /// Resolve which shard owns a given worker_id via hash routing.
+    /// worker_register is pre-routed by hash(namespace, worker_id), so
+    /// the WorkerRecord lives on a potentially different shard than the
+    /// action that completed.
+    fn resolveWorkerShard(shard: *Shard, namespace: []const u8, worker_id: []const u8) *Shard {
+        const ns = if (namespace.len == 0) "default" else namespace;
+        const hash = router.hashKeyWithNamespace(ns, worker_id);
         const target = shard.router.route(hash);
         return switch (target) {
             .local => shard,
