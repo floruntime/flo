@@ -111,7 +111,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_create, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_join, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_leave, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_read, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_read, dispatchGroupRead, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_ack, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_nack, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_delete, dispatchStream, preRouteByStream);
@@ -205,6 +205,7 @@ pub const StreamHandler = struct {
                 shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 if (req.key.len > 0) {
                     shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
+                    shard.waiter_pool.notify(.stream_group_read, req.key, @import("../node/shard.zig").resolveGroupReadWaiter, @ptrCast(shard));
                 }
             },
             else => {},
@@ -261,6 +262,62 @@ pub const StreamHandler = struct {
         }
 
         // Non-blocking read — standard path
+        const cmd_result = shard.stream_handler.handleCommand(req);
+        defer shard.stream_handler.freeResult(cmd_result);
+        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
+    /// Dedicated dispatch for stream_group_read — supports blocking via block_ms.
+    ///
+    /// Mirrors `dispatchRead` but for consumer group reads.  When no messages
+    /// are available and `block_ms` is set, registers a waiter that gets woken
+    /// when new data is appended to the stream (see `dispatchAppend`).
+    fn dispatchGroupRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        const block_ms = req.getBlockMs();
+
+        if (block_ms) |bms| {
+            // Try reading first — if data exists, return immediately
+            const cmd_result = shard.stream_handler.handleCommand(req);
+
+            switch (cmd_result) {
+                .group_messages => |m| {
+                    // Check if we got any actual messages (count > 0)
+                    if (m.data.len > 4) {
+                        const count = std.mem.readInt(u32, m.data[0..4], .little);
+                        if (count > 0) {
+                            defer shard.stream_handler.freeResult(cmd_result);
+                            sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+                            return;
+                        }
+                    }
+                    // No data — register a blocking waiter
+                    shard.stream_handler.freeResult(cmd_result);
+                },
+                else => {
+                    // Error or other result — send immediately
+                    defer shard.stream_handler.freeResult(cmd_result);
+                    sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+                    return;
+                },
+            }
+
+            // Register waiter — woken by dispatchAppend or expired by timeout
+            _ = shard.waiter_pool.register(.{
+                .kind = .stream_group_read,
+                .fd = conn.fd,
+                .request_id = req.header.request_id,
+                .key = req.key,
+                .min_version = shard.defaultPartition().ual.max_index,
+                .timeout_ms = bms,
+            });
+            conn.response_deferred = true;
+            return;
+        }
+
+        // Non-blocking group read — standard path
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);

@@ -1863,6 +1863,11 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             shard.sendOkResponse(conn, waiter.request_id, "");
             shard.flushToClient(waiter.fd);
         },
+        .stream_group_read => {
+            // Group read blocking timeout → empty messages response (0 records)
+            shard.sendOkResponse(conn, waiter.request_id, "");
+            shard.flushToClient(waiter.fd);
+        },
     }
 }
 
@@ -1909,6 +1914,29 @@ pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count]) catch return false;
     defer shard.stream_handler.allocator.free(data);
     shard.sendOkResponse(conn, waiter.request_id, data);
+    shard.flushToClient(waiter.fd);
+    return true;
+}
+
+/// Group read waiter resolver: wake the client so it retries its group read.
+///
+/// Unlike `resolveStreamWaiter` which reads directly from the projection,
+/// group reads require PEL state management (consumer tracking, ack deadlines)
+/// that only `handleGroupRead` handles correctly.  Instead of duplicating that
+/// logic, we send an empty OK response to break the client's blocking poll.
+/// The client immediately retries `stream_group_read` and gets data through
+/// the normal `handleGroupRead` code path.
+pub fn resolveGroupReadWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const partition = shard.defaultPartition();
+
+    // Only wake if there have been new UAL writes since registration
+    if (partition.ual.max_index <= waiter.min_version) return false;
+
+    const conn = shard.getConnection(waiter.fd) orelse return true; // connection gone, remove waiter
+
+    // Send empty OK — client will retry and get data via handleGroupRead
+    shard.sendOkResponse(conn, waiter.request_id, "");
     shard.flushToClient(waiter.fd);
     return true;
 }

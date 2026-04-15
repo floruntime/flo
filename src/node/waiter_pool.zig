@@ -80,6 +80,9 @@ pub const WaiterKind = enum(u8) {
 
     /// Action await — blocks until an action task is dispatched.
     action_await,
+
+    /// Stream group read — blocks until new messages arrive for a consumer group.
+    stream_group_read,
 };
 
 /// A single pending waiter registration.
