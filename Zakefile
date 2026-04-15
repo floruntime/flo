@@ -253,6 +253,66 @@ check:
         zig fmt --check src/ bench/ tests/ && echo "✓ Formatting OK" || echo "⚠ Run 'zake fmt' to format"
 
 # ============================================================================
+# Docker
+# ============================================================================
+
+## Build Docker image (local, for docker-compose)
+docker.build:
+    flag: --tag|-t [string="latest"] "Image tag (default: latest)"
+    script:
+        echo "Building Docker image as flo:{{tag}}..."
+        docker build -t flo:{{tag}} .
+        docker images | grep flo
+        echo "✓ Docker image built: flo:{{tag}}"
+        echo ""
+        echo "To use in docker-compose, update image: flo:{{tag}}"
+
+## Build Docker image (release optimized)
+docker.build.release:
+    flag: --tag|-t [string="latest"] "Image tag (default: latest)"
+    script:
+        echo "Building release Docker image as flo-release:{{tag}}..."
+        docker build -t flo-release:{{tag}} .
+        docker images | grep flo-release
+        echo "✓ Release Docker image built: flo-release:{{tag}}"
+
+## Run flo in Docker locally
+docker.run:
+    flag: --port|-p [string="9000"] "Port mapping (default: 9000)"
+    flag: --tag|-t [string="latest"] "Image tag (default: latest)"
+    script:
+        echo "Running flo:{{tag}} on port {{port}}..."
+        docker run -d \
+            --name flo-local \
+            -p {{port}}:9000 \
+            -p 9001:9001 \
+            -p 9002:9002 \
+            -v flo-data:/data/flo \
+            flo:{{tag}}
+        echo "✓ Flo container running"
+        echo ""
+        echo "Ports:"
+        echo "  Client API:  http://localhost:{{port}}"
+        echo "  Metrics:     http://localhost:9001"
+        echo "  Dashboard:   http://localhost:9002"
+        echo ""
+        echo "To stop: docker stop flo-local && docker rm flo-local"
+
+## Stop and remove local Docker container
+docker.stop:
+    script:
+        echo "Stopping flo container..."
+        docker stop flo-local 2>/dev/null || true
+        docker rm flo-local 2>/dev/null || true
+        echo "✓ Flo container stopped"
+
+## View Docker image sizes
+docker.ls:
+    script:
+        echo "Flo Docker images:"
+        docker images | grep -E "flo|REPOSITORY"
+
+# ============================================================================
 # Complete Workflows
 # ============================================================================
 
