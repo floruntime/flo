@@ -97,7 +97,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
 // ---------------------------------------------------------------------------
 
 fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -118,11 +118,9 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
             while (it.next()) |entry| {
                 const rec = entry.value_ptr;
                 const map_key = entry.key_ptr.*;
-                // Filter by namespace if specified (map key is "namespace:name")
-                if (ns_filter) |ns| {
-                    if (std.mem.indexOfScalar(u8, map_key, ':')) |colon| {
-                        if (!std.mem.eql(u8, map_key[0..colon], ns)) continue;
-                    }
+                // Filter by namespace (defaults to "default", map key is "namespace:name")
+                if (std.mem.indexOfScalar(u8, map_key, ':')) |colon| {
+                    if (!std.mem.eql(u8, map_key[0..colon], ns_filter)) continue;
                 }
                 const gop = try seen.getOrPut(rec.name_owned);
                 if (!gop.found_existing) {
@@ -280,7 +278,7 @@ fn disableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContex
 fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const workflow_filter = h.parseQueryParam([]const u8, query_string, "workflow");
     const status_filter = h.parseQueryParam([]const u8, query_string, "status");
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const limit = h.parseQueryParam(u64, query_string, "limit") orelse 100;
     const search_query = h.parseQueryParam([]const u8, query_string, "search");
     const cursor = h.parseQueryParam([]const u8, query_string, "cursor");
@@ -314,11 +312,9 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
             while (it.next()) |entry| {
                 const run = entry.value_ptr;
                 const map_key = entry.key_ptr.*;
-                // Filter by namespace if specified (map key is "namespace:run_id")
-                if (ns_filter) |ns| {
-                    if (std.mem.indexOfScalar(u8, map_key, ':')) |colon| {
-                        if (!std.mem.eql(u8, map_key[0..colon], ns)) continue;
-                    }
+                // Filter by namespace (defaults to "default", map key is "namespace:run_id")
+                if (std.mem.indexOfScalar(u8, map_key, ':')) |colon| {
+                    if (!std.mem.eql(u8, map_key[0..colon], ns_filter)) continue;
                 }
                 // Filter by workflow name if specified
                 if (workflow_filter) |wf| {

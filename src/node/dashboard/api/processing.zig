@@ -72,7 +72,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
 }
 
 fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
     const writer = json_buf.writer(allocator);
@@ -93,10 +93,8 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
                 const job = entry.value_ptr;
                 const gop = try seen.getOrPut(job.job_id_owned);
                 if (!gop.found_existing) {
-                    // Filter by namespace if specified
-                    if (ns_filter) |ns| {
-                        if (!std.mem.eql(u8, job.namespace_owned, ns)) continue;
-                    }
+                    // Filter by namespace (defaults to "default")
+                    if (!std.mem.eql(u8, job.namespace_owned, ns_filter)) continue;
                     try arr.next();
                     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try obj.begin();

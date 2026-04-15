@@ -27,7 +27,7 @@ fn shardCount(ctx: *DashboardContext) usize {
 
 /// GET /workers — List registered workers across all shards
 pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_buf: std.ArrayList(u8) = .empty;
     errdefer json_buf.deinit(allocator);
@@ -47,10 +47,8 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
             var it = wh.workers.iterator();
             while (it.next()) |entry| {
                 const w = entry.value_ptr;
-                // Filter by namespace if requested
-                if (ns_filter) |ns| {
-                    if (!std.mem.eql(u8, w.namespace_owned, ns)) continue;
-                }
+                // Filter by namespace (defaults to "default")
+                if (!std.mem.eql(u8, w.namespace_owned, ns_filter)) continue;
                 const gop = try seen.getOrPut(w.id_owned);
                 if (!gop.found_existing) {
                     try arr.next();
