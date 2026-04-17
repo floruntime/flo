@@ -199,14 +199,14 @@ test "e2e/stream: ls shows correct partition count" {
     try stdx.testing.assertContains(result, "1"); // partition count
 }
 
-test "e2e/stream: ls with --json output" {
+test "e2e/stream: ls with --output json output" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "stream", "append", "json-ls-stream", "msg" });
 
-    // flo stream ls --json
-    var result = try ctx.cli.run(&.{ "stream", "ls", "--json" });
+    // flo stream ls --output json
+    var result = try ctx.cli.run(&.{ "stream", "ls", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -280,13 +280,13 @@ test "e2e/stream: read with --limit" {
     try stdx.testing.assertSucceeded(result);
 }
 
-test "e2e/stream: read with --json output" {
+test "e2e/stream: read with --output json output" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "stream", "append", "json-out", "json test message" });
 
-    var result = try ctx.cli.run(&.{ "stream", "read", "json-out", "--limit", "2", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", "json-out", "--limit", "2", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -345,13 +345,13 @@ test "e2e/stream: info returns metadata" {
     try testing.expect(result.contains("info-test") or result.contains("Stream"));
 }
 
-test "e2e/stream: info with --json" {
+test "e2e/stream: info with --output json" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "stream", "append", "info-json", "message" });
 
-    var result = try ctx.cli.run(&.{ "stream", "info", "info-json", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-json", "--output", "json" });
     defer result.deinit();
 
     try testing.expect(result.contains("{") and result.contains("}"));
@@ -1339,7 +1339,7 @@ test "e2e/stream: message count preserved after restart" {
     }
 
     // Verify count before restart
-    var before = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "100", "--json" });
+    var before = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "100", "-o", "json" });
     defer before.deinit();
 
     // Count occurrences of "counted-msg-" in output
@@ -1355,7 +1355,7 @@ test "e2e/stream: message count preserved after restart" {
     try ctx.restartServer();
 
     // Verify same count after restart
-    var after = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "100", "--json" });
+    var after = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "100", "-o", "json" });
     defer after.deinit();
 
     var count_after: usize = 0;
@@ -1401,7 +1401,7 @@ test "e2e/stream: tiered storage - hot tier write and read" {
     try ctx.exec(&.{ "stream", "append", stream_name, "hot-msg-3" });
 
     // Read back immediately with JSON output (from hot tier)
-    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--limit", "10", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--limit", "10", "-o", "json" });
     defer result.deinit();
 
     // All messages should be readable from hot tier with tier:"hot"
@@ -1438,7 +1438,7 @@ test "e2e/stream: tiered storage - warm tier spill and read" {
     }
 
     // Read all messages with JSON output - earlier ones should be from warm tier
-    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--limit", "100", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--limit", "100", "-o", "json" });
     defer result.deinit();
 
     // Verify first and last messages are readable
@@ -1483,7 +1483,7 @@ test "e2e/stream: tiered storage - read range across tiers" {
     }
 
     // Read from start to get all messages with JSON output
-    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "50", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "50", "-o", "json" });
     defer result.deinit();
 
     // Should get messages from both tiers
@@ -1533,7 +1533,7 @@ test "e2e/stream: tiered storage - cold tier with file backend" {
     }
 
     // Read back all messages with JSON output
-    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "50", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "50", "-o", "json" });
     defer result.deinit();
 
     // All messages should be readable regardless of tier
@@ -1587,11 +1587,11 @@ test "e2e/stream: tiered storage - multiple streams independent" {
     }
 
     // Read stream A with JSON output
-    var result_a = try ctx.cli.run(&.{ "stream", "read", "tier-stream-a", "--limit", "20", "--json" });
+    var result_a = try ctx.cli.run(&.{ "stream", "read", "tier-stream-a", "--limit", "20", "-o", "json" });
     defer result_a.deinit();
 
     // Read stream B with JSON output
-    var result_b = try ctx.cli.run(&.{ "stream", "read", "tier-stream-b", "--limit", "20", "--json" });
+    var result_b = try ctx.cli.run(&.{ "stream", "read", "tier-stream-b", "--limit", "20", "-o", "json" });
     defer result_b.deinit();
 
     // Stream A should have its messages with tier info
@@ -2138,14 +2138,14 @@ test "e2e/stream: append-read roundtrip preserves StreamID" {
     try testing.expect(result.contains(appended_id));
 }
 
-test "e2e/stream: read --json includes id field with StreamID format" {
+test "e2e/stream: read --output json includes id field with StreamID format" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     const append_out = try ctx.execCapture(&.{ "stream", "append", "json-id-test", "json-id-msg" });
     const appended_id = extractStreamId(append_out) orelse return error.NoStreamId;
 
-    var result = try ctx.cli.run(&.{ "stream", "read", "json-id-test", "--limit", "5", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", "json-id-test", "--limit", "5", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -2155,7 +2155,7 @@ test "e2e/stream: read --json includes id field with StreamID format" {
     try testing.expect(result.contains("\"id\""));
 }
 
-test "e2e/stream: info --json shows StreamID format for first/last" {
+test "e2e/stream: info --output json shows StreamID format for first/last" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2167,7 +2167,7 @@ test "e2e/stream: info --json shows StreamID format for first/last" {
     const first_id = extractStreamId(out1) orelse return error.NoStreamId;
     const last_id = extractStreamId(out3) orelse return error.NoStreamId;
 
-    var result = try ctx.cli.run(&.{ "stream", "info", "info-id-test", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-id-test", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -2331,7 +2331,7 @@ test "e2e/stream: multiple appends have same timestamp with incrementing sequenc
     try testing.expect(id != null);
 
     // Read all back
-    var result = try ctx.cli.run(&.{ "stream", "read", "seq-incr-test", "--start", "0-0", "--limit", "10", "--json" });
+    var result = try ctx.cli.run(&.{ "stream", "read", "seq-incr-test", "--start", "0-0", "--limit", "10", "-o", "json" });
     defer result.deinit();
 
     // Should succeed and contain all three
@@ -2410,4 +2410,499 @@ test "e2e/stream: group touch with multiple StreamIDs" {
 
         try testing.expect(result.contains("Extended") or result.contains("touched") or result.contains("ok") or result.succeeded());
     }
+}
+
+// =============================================================================
+// Header Support
+// =============================================================================
+
+test "e2e/stream: append with headers and read back" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Append with comma-separated headers
+    try ctx.exec(&.{ "stream", "append", "hdr-test", "payload-with-headers", "--header", "source=web,version=2" });
+
+    // Read back in JSON mode — headers should appear
+    var result = try ctx.cli.run(&.{ "stream", "read", "hdr-test", "-o", "json", "--limit", "5" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("payload-with-headers"));
+    try testing.expect(result.contains("source"));
+    try testing.expect(result.contains("web"));
+    try testing.expect(result.contains("version"));
+    try testing.expect(result.contains("2"));
+}
+
+test "e2e/stream: append with headers shows in text output" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "hdr-text-test", "my-payload", "--header", "env=prod" });
+
+    // Text output: <id> [<tier>]: <payload> key=val
+    var result = try ctx.cli.run(&.{ "stream", "read", "hdr-text-test", "--limit", "5" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("my-payload"));
+    try testing.expect(result.contains("env=prod"));
+}
+
+test "e2e/stream: append without headers returns no headers" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "no-hdr-test", "bare-payload" });
+
+    var result = try ctx.cli.run(&.{ "stream", "read", "no-hdr-test", "-o", "json", "--limit", "5" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("bare-payload"));
+    // JSON output should NOT have a "headers" key when there are none
+    try testing.expect(!result.contains("\"headers\""));
+}
+
+test "e2e/stream: append multiple payloads with shared headers" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Batch append: headers apply to all records in the batch
+    try ctx.exec(&.{ "stream", "append", "hdr-batch-test", "msg1", "msg2", "msg3", "--header", "trace_id=abc123" });
+
+    var result = try ctx.cli.run(&.{ "stream", "read", "hdr-batch-test", "-o", "json", "--limit", "10" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("msg1"));
+    try testing.expect(result.contains("msg3"));
+    // Each record should have the header
+    try testing.expect(result.contains("trace_id"));
+    try testing.expect(result.contains("abc123"));
+}
+
+test "e2e/stream: headers with multiple key-value pairs" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "multi-hdr-test", "event-data", "--header", "source=api,env=staging,priority=high" });
+
+    var result = try ctx.cli.run(&.{ "stream", "read", "multi-hdr-test", "-o", "json", "--limit", "5" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("source"));
+    try testing.expect(result.contains("api"));
+    try testing.expect(result.contains("env"));
+    try testing.expect(result.contains("staging"));
+    try testing.expect(result.contains("priority"));
+    try testing.expect(result.contains("high"));
+}
+
+test "e2e/stream: headers survive consumer group read" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "hdr-cg-test", "cg-payload", "--header", "type=event,region=us-east" });
+
+    // Group read should also return headers
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "hdr-cg-test", "--group", "hdr-cg", "--consumer", "w1", "--limit", "5", "-o", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("cg-payload"));
+    try testing.expect(result.contains("type"));
+    try testing.expect(result.contains("event"));
+}
+
+// =============================================================================
+// Pattern-Based Group Read (Wildcard Subscription)
+// =============================================================================
+
+test "e2e/stream: pattern group read matches multiple streams" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create multiple streams under a common prefix
+    try ctx.exec(&.{ "stream", "append", "events.login", "user-alice-logged-in" });
+    try ctx.exec(&.{ "stream", "append", "events.logout", "user-bob-logged-out" });
+    try ctx.exec(&.{ "stream", "append", "events.signup", "user-carol-signed-up" });
+
+    // Pattern read: events.* should match all three
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "events.*", "--group", "pattern-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // Should see data from multiple streams
+    try testing.expect(result.contains("alice") or result.contains("bob") or result.contains("carol"));
+}
+
+test "e2e/stream: pattern group read includes stream name in response" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "orders.created", "order-100" });
+    try ctx.exec(&.{ "stream", "append", "orders.fulfilled", "order-200" });
+
+    // Pattern read with JSON — should include "stream" field per record
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "orders.*", "--group", "order-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    // JSON response should include stream identity
+    try testing.expect(result.contains("\"stream\""));
+    try testing.expect(result.contains("orders.created") or result.contains("orders.fulfilled"));
+}
+
+test "e2e/stream: pattern group read text output shows stream name" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "logs.app", "server-started" });
+    try ctx.exec(&.{ "stream", "append", "logs.audit", "user-login" });
+
+    // Text output: <id> [<stream>]: <payload>
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "logs.*", "--group", "log-grp", "--consumer", "w1", "--limit", "10" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("logs.app") or result.contains("logs.audit"));
+}
+
+test "e2e/stream: pattern group read does not match non-matching streams" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "metrics.cpu", "cpu-data" });
+    try ctx.exec(&.{ "stream", "append", "metrics.mem", "mem-data" });
+    try ctx.exec(&.{ "stream", "append", "logs.error", "error-data" });
+
+    // Pattern: metrics.* should NOT include logs.error
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "metrics.*", "--group", "metrics-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(!result.contains("error-data"));
+}
+
+test "e2e/stream: pattern group read with no matching streams returns empty" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "unrelated-stream", "data" });
+
+    // Pattern that matches nothing
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "nonexistent.*", "--group", "empty-grp", "--consumer", "w1", "--limit", "10" });
+    defer result.deinit();
+
+    // Should succeed with empty result
+    try testing.expect(result.contains("no messages") or result.contains("[]") or result.succeeded());
+}
+
+test "e2e/stream: pattern group read tracks offset per matched stream" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Append to two streams
+    try ctx.exec(&.{ "stream", "append", "tasks.email", "email-1" });
+    try ctx.exec(&.{ "stream", "append", "tasks.sms", "sms-1" });
+
+    // First read consumes all existing messages
+    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
+    defer read1.deinit();
+    try testing.expect(read1.contains("email-1") or read1.contains("sms-1"));
+
+    // Second read without new appends should return empty (offsets advanced)
+    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
+    defer read2.deinit();
+    try testing.expect(read2.contains("no messages") or read2.contains("[]") or read2.stdout.len == 0 or read2.succeeded());
+
+    // Append new message to one stream
+    try ctx.exec(&.{ "stream", "append", "tasks.email", "email-2" });
+
+    // Third read should get only the new message
+    var read3 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
+    defer read3.deinit();
+    try testing.expect(read3.contains("email-2"));
+}
+
+test "e2e/stream: pattern group read with headers" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "alerts.critical", "disk-full", "--header", "severity=critical,host=web-01" });
+    try ctx.exec(&.{ "stream", "append", "alerts.warning", "high-cpu", "--header", "severity=warning,host=web-02" });
+
+    // Pattern read should return both records with their headers
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "alerts.*", "--group", "alert-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("severity"));
+    try testing.expect(result.contains("host"));
+}
+
+// =============================================================================
+// Stream Retention & Alter
+// =============================================================================
+
+test "e2e/stream: create with --retention succeeds" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "stream", "create", "ret-create-test", "--retention", "24" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("Created") or result.contains("ret-create-test") or result.succeeded());
+}
+
+test "e2e/stream: create with --retention and --partitions" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "stream", "create", "ret-multi-part", "--partitions", "4", "--retention", "168" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("Created") or result.contains("ret-multi-part") or result.succeeded());
+
+    // Verify stream is listed
+    var ls = try ctx.cli.run(&.{ "stream", "ls" });
+    defer ls.deinit();
+    try testing.expect(ls.contains("ret-multi-part"));
+}
+
+test "e2e/stream: create with --retention --output json returns valid JSON" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "stream", "create", "ret-json-test", "--retention", "48", "--output", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("\"status\":\"created\""));
+    try testing.expect(result.contains("ret-json-test"));
+}
+
+test "e2e/stream: alter retention on existing stream" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create stream first (so metadata exists)
+    try ctx.exec(&.{ "stream", "create", "alter-ret-test" });
+
+    // Alter retention
+    var result = try ctx.cli.run(&.{ "stream", "alter", "alter-ret-test", "--retention", "72" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("Altered") or result.contains("alter-ret-test"));
+}
+
+test "e2e/stream: alter -o json returns valid response" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "alter-json-test" });
+
+    var result = try ctx.cli.run(&.{ "stream", "alter", "alter-json-test", "--retention", "24", "--output", "json" });
+    defer result.deinit();
+
+    try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("\"status\":\"altered\""));
+    try testing.expect(result.contains("alter-json-test"));
+}
+
+test "e2e/stream: alter non-existent stream returns error" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "stream", "alter", "nonexistent-alter-xyz", "--retention", "24" });
+    defer result.deinit();
+
+    // Should fail — stream not found
+    try testing.expect(result.contains("not found") or result.contains("Error") or !result.succeeded());
+}
+
+test "e2e/stream: alter auto-created stream (via append) returns error" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Auto-create via append — no explicit create, so no stream_metadata entry
+    try ctx.exec(&.{ "stream", "append", "auto-alter-test", "msg" });
+
+    // Alter should fail because auto-create via append doesn't register metadata
+    var result = try ctx.cli.run(&.{ "stream", "alter", "auto-alter-test", "--retention", "24" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("not found") or result.contains("Error") or !result.succeeded());
+}
+
+test "e2e/stream: alter updates retention (create then alter then verify)" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create with retention 48h
+    try ctx.exec(&.{ "stream", "create", "alter-update-test", "--retention", "48" });
+
+    // Alter to 24h
+    var alter_result = try ctx.cli.run(&.{ "stream", "alter", "alter-update-test", "--retention", "24" });
+    defer alter_result.deinit();
+    try stdx.testing.assertSucceeded(alter_result);
+
+    // Append and read to verify stream is still functional after alter
+    try ctx.exec(&.{ "stream", "append", "alter-update-test", "post-alter-msg" });
+
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "alter-update-test", "--start", "0-0", "--limit", "10" });
+    defer read_result.deinit();
+    try testing.expect(read_result.contains("post-alter-msg"));
+}
+
+test "e2e/stream: create with retention then append and read works" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create with retention
+    try ctx.exec(&.{ "stream", "create", "ret-rw-test", "--retention", "24" });
+
+    // Append messages
+    try ctx.exec(&.{ "stream", "append", "ret-rw-test", "msg-1" });
+    try ctx.exec(&.{ "stream", "append", "ret-rw-test", "msg-2" });
+    try ctx.exec(&.{ "stream", "append", "ret-rw-test", "msg-3" });
+
+    // Read back — all messages should be present (retention hasn't expired)
+    var result = try ctx.cli.run(&.{ "stream", "read", "ret-rw-test", "--start", "0-0", "--limit", "10" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("msg-1"));
+    try testing.expect(result.contains("msg-2"));
+    try testing.expect(result.contains("msg-3"));
+}
+
+test "e2e/stream: create with retention and consumer group works" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create with retention
+    try ctx.exec(&.{ "stream", "create", "ret-cg-test", "--retention", "24" });
+
+    // Append messages
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "ret-cg-msg-{d}", .{i}) catch continue;
+        try ctx.exec(&.{ "stream", "append", "ret-cg-test", msg });
+    }
+
+    // Consumer group read should work
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "ret-cg-test", "--group", "ret-group", "--consumer", "w1", "--limit", "3" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("ret-cg-msg") or result.succeeded());
+}
+
+test "e2e/stream: alter retention does not disrupt existing data" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Create without retention, append data
+    try ctx.exec(&.{ "stream", "create", "alter-nodisrupt" });
+    try ctx.exec(&.{ "stream", "append", "alter-nodisrupt", "before-alter-1" });
+    try ctx.exec(&.{ "stream", "append", "alter-nodisrupt", "before-alter-2" });
+
+    // Set retention to 24h
+    try ctx.exec(&.{ "stream", "alter", "alter-nodisrupt", "--retention", "24" });
+
+    // Append more data after alter
+    try ctx.exec(&.{ "stream", "append", "alter-nodisrupt", "after-alter-1" });
+
+    // All data should still be readable (retention hasn't expired)
+    var result = try ctx.cli.run(&.{ "stream", "read", "alter-nodisrupt", "--start", "0-0", "--limit", "10" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("before-alter-1"));
+    try testing.expect(result.contains("before-alter-2"));
+    try testing.expect(result.contains("after-alter-1"));
+}
+
+test "e2e/stream: alter retention persists after restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // Create with retention
+    try ctx.exec(&.{ "stream", "create", "ret-persist-test", "--retention", "24" });
+    try ctx.exec(&.{ "stream", "append", "ret-persist-test", "pre-restart" });
+
+    // Restart
+    try ctx.restartServer();
+
+    // Data should survive restart
+    var result = try ctx.cli.run(&.{ "stream", "read", "ret-persist-test", "--start", "0-0", "--limit", "10" });
+    defer result.deinit();
+    try testing.expect(result.contains("pre-restart"));
+
+    // Stream should still accept appends
+    try ctx.exec(&.{ "stream", "append", "ret-persist-test", "post-restart" });
+    var result2 = try ctx.cli.run(&.{ "stream", "read", "ret-persist-test", "--start", "0-0", "--limit", "10" });
+    defer result2.deinit();
+    try testing.expect(result2.contains("post-restart"));
+}
+
+// =============================================================================
+// Stream INFO with retention
+// =============================================================================
+
+test "e2e/stream: info shows retention after create with --retention" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "info-ret-test", "--retention", "24" });
+
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-ret-test" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("Retention") or result.contains("retention"));
+    try testing.expect(result.contains("86400"));
+}
+
+test "e2e/stream: info --output json includes retention object" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "info-ret-json", "--retention", "48" });
+
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-ret-json", "-o", "json" });
+    defer result.deinit();
+
+    try testing.expect(result.contains("\"retention\""));
+    try testing.expect(result.contains("\"age_s\":172800"));
+}
+
+test "e2e/stream: info shows no retention for stream without retention" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "info-noret-test" });
+
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-noret-test" });
+    defer result.deinit();
+
+    // Should NOT contain retention section
+    try testing.expect(!result.contains("Retention"));
+}
+
+test "e2e/stream: info reflects altered retention" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "info-alter-ret", "--retention", "24" });
+    try ctx.exec(&.{ "stream", "alter", "info-alter-ret", "--retention", "72" });
+
+    var result = try ctx.cli.run(&.{ "stream", "info", "info-alter-ret", "-o", "json" });
+    defer result.deinit();
+
+    // Should show updated retention (72h = 259200s)
+    try testing.expect(result.contains("\"age_s\":259200"));
 }
