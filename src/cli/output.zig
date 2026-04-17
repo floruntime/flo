@@ -51,7 +51,7 @@ pub const Format = enum {
     }
 };
 
-/// Get the output format from the global --output flag.
+/// Get the output format from the global --output / -o flag.
 pub fn getFormat(ctx: *Context) Format {
     if (ctx.flagChanged("output")) {
         return Format.fromString(ctx.getString("output") orelse "table");

@@ -12,6 +12,7 @@ const commander = @import("../commander/mod.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
+const output = @import("../output.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -44,14 +45,13 @@ pub fn createStatusCommand(allocator: Allocator) !*commander.Command {
             "flo status --endpoint 127.0.0.1:9000",
             "flo status -e prod.example.com:9000",
         })
-        .boolFlag("json", 'j', "Output in JSON format")
         .action(wrapHandler(runStatus))
         .build();
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     if (!json_output) {
         ctx.print("Checking server at {s}...\n", .{endpoint});

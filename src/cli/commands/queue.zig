@@ -142,7 +142,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .about("List all queues")
                 .aliases(&.{"ls"})
                 .uintFlag("limit", 'l', 100, "Maximum queues to list")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runList)),
         )
         .build();

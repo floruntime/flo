@@ -44,7 +44,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     "flo cluster status --endpoint localhost:9000",
                     "flo cluster status --json",
                 })
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runStatus)),
         )
         .subcommand(
@@ -56,7 +55,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     "flo cluster members --endpoint localhost:9000",
                     "flo cluster members --json",
                 })
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runMembers)),
         )
         .subcommand(
@@ -174,7 +172,7 @@ fn sendRequest(
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     const ep = parseEndpoint(endpoint) catch {
         ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});
@@ -256,7 +254,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
 fn runMembers(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     const ep = parseEndpoint(endpoint) catch {
         ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});

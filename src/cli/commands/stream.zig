@@ -6,8 +6,9 @@
 //!   - Special values: "0" or "0-0" (beginning), "$" (latest/tail)
 //!
 //! Usage:
-//!   flo stream create <stream> [--partitions N]
-//!   flo stream append <stream> <payload>... [--header <key=value>]
+//!   flo stream create <stream> [--partitions N] [--retention N]
+//!   flo stream alter <stream> [--retention N]
+//!   flo stream append <stream> <payload>... [--header <k=v,k=v,...>]
 //!   flo stream read <stream> [--start <streamid>] [--limit <n>] [--follow] [--block <ms>]
 //!   flo stream info <stream>
 //!   flo stream trim <stream> [--before <streamid>] [--maxlen <n>]
@@ -57,15 +58,14 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"add"})
                 .examples(&.{
                     "flo stream append events 'Hello, World!'",
-                    "flo stream append logs '{\"level\":\"info\"}' --header type=json",
+                    "flo stream append logs '{\"level\":\"info\"}' --header source=web,version=2",
                     "flo stream append metrics value1 value2 value3",
                 })
                 .arg("stream", "Stream name")
                 .variadicArg("payloads", "Record payload(s) - can specify multiple")
-                .stringFlag("header", 'H', "", "Header key=value (repeatable)")
+                .stringFlag("header", 'H', "", "Headers as key=value pairs, comma-separated")
                 .uintFlag("partition", 'p', 0, "Target partition")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runAppend)),
         )
         .subcommand(
@@ -78,7 +78,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     "flo stream read events --start 1703350800000-0 --limit 50",
                     "flo stream read events --start 0-0 --end 1703350900000-0",
                     "flo stream read events --start 0-0 --follow",
-                    "flo stream read logs --json",
+                    "flo stream read logs --output json",
                 })
                 .arg("stream", "Stream name")
                 .stringFlag("start", 's', "0-0", "Starting StreamID (timestamp-sequence, 0-0=beginning, $=latest)")
@@ -88,7 +88,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("block", 'b', 0, "Block for new data (ms, 0=forever). Single read unlike --follow.")
                 .uintFlag("partition", 'P', 0, "Partition to read from (default: 0)")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing (reads from same partition as append)")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runRead)),
         )
         .subcommand(
@@ -102,7 +101,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .arg("stream", "Stream name")
                 .uintFlag("partitions", 'p', 1, "Number of partitions")
                 .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runCreate)),
         )
         .subcommand(
@@ -111,10 +109,9 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .about("Show stream information")
                 .examples(&.{
                     "flo stream info events",
-                    "flo stream info events --json",
+                    "flo stream info events --output json",
                 })
                 .arg("stream", "Stream name")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runInfo)),
         )
         .subcommand(
@@ -123,7 +120,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .about("List all streams")
                 .aliases(&.{"ls"})
                 .uintFlag("limit", 'l', 100, "Maximum streams to list")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -140,8 +136,19 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .uint64Flag("maxage", 0, 0, "Remove records older than this (seconds)")
                 .uint64Flag("maxbytes", 0, 0, "Trim to this size in bytes")
                 .boolFlag("dry-run", 'd', "Show what would be trimmed without trimming")
-                .boolFlag("json", 'j', "Output in JSON format")
                 .action(wrapHandler(runTrim)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("alter")
+                .about("Alter stream configuration")
+                .examples(&.{
+                    "flo stream alter events --retention 24",
+                    "flo stream alter logs --retention 168",
+                })
+                .arg("stream", "Stream name")
+                .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
+                .action(wrapHandler(runAlter)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -171,7 +178,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .uintFlag("max-deliver", 0, 0, "Max delivery attempts before DLQ (0=unlimited)")
                         .uintFlag("redeliver-delay", 0, 0, "Delay before NACK'd message visible (ms)")
                         .boolFlag("no-ack", 0, "Auto-ack on delivery (at-most-once)")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupRead)),
                 )
                 .subcommand(
@@ -185,7 +191,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (for correct pending key matching)")
                         .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to acknowledge")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupAck)),
                 )
                 .subcommand(
@@ -197,7 +202,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupInfo)),
                 )
                 .subcommand(
@@ -215,7 +219,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .about("Show pending messages in a consumer group")
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupPending)),
                 )
                 .subcommand(
@@ -231,7 +234,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("consumer", 'c', "", "Consumer ID (for correct pending key matching)")
                         .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to release")
                         .uintFlag("delay", 0, 0, "Redelivery delay (ms) before message visible")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupNack)),
                 )
                 .subcommand(
@@ -247,7 +249,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("consumer", 'c', "", "Consumer ID that owns the messages (required)")
                         .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to touch")
                         .uintFlag("extend", 0, 0, "Extra time (ms) to extend deadline (default: ack_timeout_ms)")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupTouch)),
                 )
                 .subcommand(
@@ -260,7 +261,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID to remove")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupLeave)),
                 )
                 .subcommand(
@@ -293,7 +293,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .uintFlag("max-deliver", 0, 10, "Max delivery attempts before DLQ (0=unlimited)")
                         .uintFlag("redeliver-delay", 0, 0, "Delay before NACK'd message visible (ms)")
                         .boolFlag("no-ack", 0, "Auto-ack on delivery (at-most-once)")
-                        .boolFlag("json", 'j', "Output in JSON format")
                         .action(wrapHandler(runGroupCreate)),
                 )
                 .subcommand(
@@ -313,18 +312,15 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     )
                     .examples(&.{
                         "flo stream group delete events --group processors",
-                        "flo stream group delete events --group mygroup --json",
+                        "flo stream group delete events --group mygroup --output json",
                     })
                     .arg("stream", "Stream name")
                     .stringFlag("group", 'g', "", "Consumer group name (required)")
-                    .boolFlag("json", 'j', "Output in JSON format")
                     .action(wrapHandler(runGroupDelete)),
             ),
         )
         .build();
 }
-
-
 
 fn runAppend(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
@@ -337,10 +333,49 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
     const partition_opt = ctx.getChangedUint("partition");
     const pk_raw = ctx.getString("partition-key");
     const partition_key: ?[]const u8 = if (pk_raw) |pk| (if (pk.len > 0) pk else null) else null;
+
+    // Parse --header "key1=val1,key2=val2" into Header slice
+    const Header = client_mod.stream.Header;
+    var parsed_headers: [64]Header = undefined;
+    var header_count: usize = 0;
+    if (ctx.getString("header")) |hdr_str| {
+        if (hdr_str.len > 0) {
+            var it = std.mem.splitScalar(u8, hdr_str, ',');
+            while (it.next()) |pair| {
+                const trimmed = std.mem.trim(u8, pair, " ");
+                if (trimmed.len == 0) continue;
+                if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+                    if (header_count >= 64) {
+                        ctx.printErr("Error: too many headers (max 64)\n", .{});
+                        return error.CommandFailed;
+                    }
+                    parsed_headers[header_count] = .{
+                        .key = trimmed[0..eq],
+                        .value = trimmed[eq + 1 ..],
+                    };
+                    header_count += 1;
+                } else {
+                    ctx.printErr("Error: invalid header format '{s}', expected key=value\n", .{trimmed});
+                    return error.CommandFailed;
+                }
+            }
+        }
+    }
+
+    // Apply the same headers to every payload in the batch
+    const rec_headers: []const Header = parsed_headers[0..header_count];
+    var per_payload_headers: [256][]const Header = undefined;
+    for (0..@min(payloads.len, 256)) |i| {
+        per_payload_headers[i] = rec_headers;
+    }
+    const headers_arg: ?[]const []const Header = if (header_count > 0)
+        per_payload_headers[0..payloads.len]
+    else
+        null;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -355,7 +390,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         namespace,
         stream,
         payloads,
-        null,
+        headers_arg,
         partition_key,
         if (partition_opt) |p| @intCast(p) else null,
     ) catch |err| {
@@ -399,7 +434,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const partition_key: ?[]const u8 = if (pk_raw) |pk| (if (pk.len > 0) pk else null) else null;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     // Parse StreamID from start string
     var current_start = StreamID.parse(start_str) catch {
@@ -530,11 +565,19 @@ fn parseAndPrintRecords(
         }
         const payload = reader.readLengthPrefixed(u32) orelse break;
         const header_count = reader.readU32() orelse break;
-        // Skip headers
+
+        // Read headers into stack-allocated buffers
+        var hdr_keys: [64][]const u8 = undefined;
+        var hdr_vals: [64][]const u8 = undefined;
+        const hdr_n = @min(header_count, 64);
         var h: u32 = 0;
         while (h < header_count) : (h += 1) {
-            _ = reader.readLengthPrefixed(u32) orelse break;
-            _ = reader.readLengthPrefixed(u32) orelse break;
+            const hk = reader.readLengthPrefixed(u32) orelse break;
+            const hv = reader.readLengthPrefixed(u32) orelse break;
+            if (h < 64) {
+                hdr_keys[h] = hk;
+                hdr_vals[h] = hv;
+            }
         }
 
         // Reconstruct StreamID from wire format fields
@@ -553,9 +596,28 @@ fn parseAndPrintRecords(
 
         if (json_output and !is_follow) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"tier\":\"{s}\",\"data\":\"{s}\"}}", .{ id_str, timestamp_ms, tier_str, payload });
+            if (hdr_n > 0) {
+                ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"tier\":\"{s}\",\"data\":\"{s}\",\"headers\":{{", .{ id_str, timestamp_ms, tier_str, payload });
+                var hi: u32 = 0;
+                while (hi < hdr_n) : (hi += 1) {
+                    if (hi > 0) ctx.print(",", .{});
+                    ctx.print("\"{s}\":\"{s}\"", .{ hdr_keys[hi], hdr_vals[hi] });
+                }
+                ctx.print("}}}}", .{});
+            } else {
+                ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"tier\":\"{s}\",\"data\":\"{s}\"}}", .{ id_str, timestamp_ms, tier_str, payload });
+            }
         } else {
-            ctx.print("{s} [{s}]: {s}\n", .{ id_str, tier_str, payload });
+            if (hdr_n > 0) {
+                ctx.print("{s} [{s}]: {s}", .{ id_str, tier_str, payload });
+                var hi: u32 = 0;
+                while (hi < hdr_n) : (hi += 1) {
+                    ctx.print(" {s}={s}", .{ hdr_keys[hi], hdr_vals[hi] });
+                }
+                ctx.print("\n", .{});
+            } else {
+                ctx.print("{s} [{s}]: {s}\n", .{ id_str, tier_str, payload });
+            }
         }
     }
 
@@ -573,7 +635,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     const retention = ctx.getUint("retention");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -604,12 +666,49 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     }
 }
 
+fn runAlter(ctx: *commander.Context) commander.Error!void {
+    const stream = ctx.getPositional("stream").?; // validated by commander
+
+    const retention = ctx.getUint("retention");
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
+    const json_output = output.getFormat(ctx) == .json;
+
+    // Convert retention hours to seconds for retention_age, or null
+    const retention_age: ?u64 = if (retention) |r| r * 3600 else null;
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    var response = client_mod.stream.alter(&client, namespace, stream, null, retention_age, null) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer response.deinit();
+
+    if (response.isError()) {
+        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    if (json_output) {
+        ctx.print("{{\"name\":\"{s}\",\"status\":\"altered\"}}\n", .{stream});
+    } else {
+        ctx.print("Altered stream: {s}\n", .{stream});
+    }
+}
+
 fn runInfo(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -631,7 +730,7 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    // Parse wire format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+    // Parse wire format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
     var first_ts: u64 = 0;
     var first_seq: u64 = 0;
     var last_ts: u64 = 0;
@@ -639,6 +738,9 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
     var msg_count: u64 = 0;
     var bytes: u64 = 0;
     var partitions: u32 = 1;
+    var retention_age_s: u64 = 0;
+    var retention_count: u64 = 0;
+    var retention_bytes: u64 = 0;
 
     if (response.data.len >= 52) {
         var reader = wire.WireReader.init(response.data);
@@ -649,6 +751,9 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         msg_count = reader.readU64() orelse 0;
         bytes = reader.readU64() orelse 0;
         partitions = reader.readU32() orelse 1;
+        retention_age_s = reader.readU64() orelse 0;
+        retention_count = reader.readU64() orelse 0;
+        retention_bytes = reader.readU64() orelse 0;
     }
 
     // Reconstruct full StreamIDs with timestamp + sequence
@@ -664,6 +769,24 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         if (msg_count > 0) {
             ctx.print(",\"first_id\":\"{s}\",\"last_id\":\"{s}\"", .{ first_str, last_str });
         }
+        if (retention_age_s > 0 or retention_count > 0 or retention_bytes > 0) {
+            ctx.print(",\"retention\":{{", .{});
+            var need_comma = false;
+            if (retention_age_s > 0) {
+                ctx.print("\"age_s\":{d}", .{retention_age_s});
+                need_comma = true;
+            }
+            if (retention_count > 0) {
+                if (need_comma) ctx.print(",", .{});
+                ctx.print("\"count\":{d}", .{retention_count});
+                need_comma = true;
+            }
+            if (retention_bytes > 0) {
+                if (need_comma) ctx.print(",", .{});
+                ctx.print("\"bytes\":{d}", .{retention_bytes});
+            }
+            ctx.print("}}", .{});
+        }
         ctx.print("}}\n", .{});
     } else {
         ctx.print("Stream: {s}\n", .{stream});
@@ -674,6 +797,12 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         if (msg_count > 0) {
             ctx.print("  First ID: {s}\n", .{first_str});
             ctx.print("  Last ID: {s}\n", .{last_str});
+        }
+        if (retention_age_s > 0 or retention_count > 0 or retention_bytes > 0) {
+            ctx.print("  Retention:\n", .{});
+            if (retention_age_s > 0) ctx.print("    Age: {d}s\n", .{retention_age_s});
+            if (retention_count > 0) ctx.print("    Count: {d}\n", .{retention_count});
+            if (retention_bytes > 0) ctx.print("    Bytes: {d}\n", .{retention_bytes});
         }
     }
 }
@@ -798,7 +927,7 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     const dry_run = ctx.getBool("dry-run");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     // Parse --before StreamID if provided
     var min_id: ?StreamID = null;
@@ -910,7 +1039,7 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
     const block = ctx.getChangedUint("block");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     // Parse consumer group options
     const mode_str = ctx.getString("mode") orelse "";
@@ -1012,15 +1141,25 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         _ = reader.readU8() orelse break; // tier
         _ = reader.readU32() orelse break; // partition
         const key_present = reader.readU8() orelse break;
+        var stream_name: ?[]const u8 = null;
         if (key_present != 0) {
-            _ = reader.readLengthPrefixed(u32) orelse break;
+            stream_name = reader.readLengthPrefixed(u32) orelse break;
         }
         const payload = reader.readLengthPrefixed(u32) orelse break;
         const header_count = reader.readU32() orelse break;
+
+        // Read headers
+        var hdr_keys: [64][]const u8 = undefined;
+        var hdr_vals: [64][]const u8 = undefined;
+        const hdr_n = @min(header_count, 64);
         var h: u32 = 0;
         while (h < header_count) : (h += 1) {
-            _ = reader.readLengthPrefixed(u32) orelse break;
-            _ = reader.readLengthPrefixed(u32) orelse break;
+            const hk = reader.readLengthPrefixed(u32) orelse break;
+            const hv = reader.readLengthPrefixed(u32) orelse break;
+            if (h < 64) {
+                hdr_keys[h] = hk;
+                hdr_vals[h] = hv;
+            }
         }
 
         const record_id = StreamID{ .timestamp_ms = @intCast(@as(u64, @bitCast(timestamp_ms))), .sequence = msg_sequence };
@@ -1029,9 +1168,32 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
 
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"data\":\"{s}\"}}", .{ id_str, timestamp_ms, payload });
+            ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d}", .{ id_str, timestamp_ms });
+            if (stream_name) |sn| {
+                ctx.print(",\"stream\":\"{s}\"", .{sn});
+            }
+            ctx.print(",\"data\":\"{s}\"", .{payload});
+            if (hdr_n > 0) {
+                ctx.print(",\"headers\":{{", .{});
+                var hi: u32 = 0;
+                while (hi < hdr_n) : (hi += 1) {
+                    if (hi > 0) ctx.print(",", .{});
+                    ctx.print("\"{s}\":\"{s}\"", .{ hdr_keys[hi], hdr_vals[hi] });
+                }
+                ctx.print("}}", .{});
+            }
+            ctx.print("}}", .{});
         } else {
-            ctx.print("{s}: {s}\n", .{ id_str, payload });
+            if (stream_name) |sn| {
+                ctx.print("{s} [{s}]: {s}", .{ id_str, sn, payload });
+            } else {
+                ctx.print("{s}: {s}", .{ id_str, payload });
+            }
+            var hi: u32 = 0;
+            while (hi < hdr_n) : (hi += 1) {
+                ctx.print(" {s}={s}", .{ hdr_keys[hi], hdr_vals[hi] });
+            }
+            ctx.print("\n", .{});
         }
     }
 
@@ -1057,7 +1219,7 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     // Parse comma-separated StreamIDs
     var ids: std.ArrayList(StreamID) = .empty;
@@ -1121,7 +1283,7 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -1162,7 +1324,7 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -1272,7 +1434,7 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
     const delay = ctx.getChangedUint("delay");
 
     // Parse StreamIDs for the wire protocol
@@ -1357,7 +1519,7 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
     const extend_ms = ctx.getChangedUint("extend");
 
     // Parse StreamIDs for the wire protocol
@@ -1423,7 +1585,7 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     // Parse mode string to enum value
     const mode_str = ctx.getString("mode") orelse "shared";
@@ -1496,7 +1658,7 @@ fn runGroupLeave(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -1535,7 +1697,7 @@ fn runGroupDelete(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = ctx.getBool("json");
+    const json_output = output.getFormat(ctx) == .json;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
