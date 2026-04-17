@@ -444,9 +444,22 @@ pub const ConsumerGroup = struct {
     }
 };
 
-/// Stream metadata — partition count and other per-stream config.
+/// Stream metadata — partition count, retention policy, and other per-stream config.
 pub const StreamMetadata = struct {
     partition_count: u32 = 1,
+    /// Pre-computed name hash for background trim lookups.
+    name_hash: u64 = 0,
+    /// Retention: max age in seconds (0 = forever).
+    retention_age_s: u64 = 0,
+    /// Retention: max record count (0 = unlimited).
+    retention_count: u64 = 0,
+    /// Retention: max bytes (0 = unlimited).
+    retention_bytes: u64 = 0,
+
+    /// Returns true if any retention policy is configured.
+    pub fn hasRetention(self: StreamMetadata) bool {
+        return self.retention_age_s > 0 or self.retention_count > 0 or self.retention_bytes > 0;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -679,6 +692,17 @@ pub const StreamProjection = struct {
         return trimmed;
     }
 
+    /// Resolve the StreamID of the Nth record in a stream (1-indexed).
+    /// Used by trim-by-count to convert a count to a deterministic StreamID
+    /// before persisting through Raft.
+    pub fn resolveNthRecordId(self: *const StreamProjection, name_hash: u64, count: u64) StreamID {
+        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+        const records = ss.records.items;
+        if (records.len == 0 or count == 0) return StreamID.MIN;
+        const idx = @min(count, records.len) - 1;
+        return records[idx].id;
+    }
+
     /// Deliver records from a named stream to a consumer group.
     /// Reads `count` records after the group's last_delivered_id, adds to PEL.
     /// Returns the StreamRecords delivered (fills buf, returns count).
@@ -747,15 +771,21 @@ pub const StreamProjection = struct {
         }
     }
 
-    /// Register (or update) partition metadata for a stream.
-    pub fn registerStreamMetadata(self: *StreamProjection, name: []const u8, partition_count: u32) !void {
+    /// Register (or update) metadata for a stream.
+    pub fn registerStreamMetadata(self: *StreamProjection, name: []const u8, meta: StreamMetadata) !void {
         if (name.len == 0) return;
         const gop = try self.stream_metadata.getOrPut(name);
         if (!gop.found_existing) {
             const owned = try self.allocator.dupe(u8, name);
             gop.key_ptr.* = owned;
         }
-        gop.value_ptr.* = .{ .partition_count = @max(1, partition_count) };
+        gop.value_ptr.* = .{
+            .partition_count = @max(1, meta.partition_count),
+            .name_hash = meta.name_hash,
+            .retention_age_s = meta.retention_age_s,
+            .retention_count = meta.retention_count,
+            .retention_bytes = meta.retention_bytes,
+        };
     }
 
     /// Get the partition count for a stream (defaults to 1).
@@ -882,6 +912,7 @@ pub const StreamProjection = struct {
     ///     [name_len: u16][name bytes]
     ///   [metadata_count: u32] then per stream metadata:
     ///     [name_len: u16][name bytes][partition_count: u32]
+    ///     [name_hash: u64][retention_age_s: u64][retention_count: u64][retention_bytes: u64]
     ///   [group_count: u32] then per consumer group:
     ///     [name_len: u16][name bytes][pel_count: u32][created_at_ns: u64]
     ///     [member_count: u32] then per member:
@@ -898,11 +929,11 @@ pub const StreamProjection = struct {
             total_size += 2 + key.len;
         }
 
-        // Stream metadata: count(4) + per entry(len_u16 + bytes + u32)
+        // Stream metadata: count(4) + per entry(len_u16 + bytes + u32 + 4*u64)
         total_size += 4;
         var sm_it = self.stream_metadata.iterator();
         while (sm_it.next()) |kv| {
-            total_size += 2 + kv.key_ptr.len + 4;
+            total_size += 2 + kv.key_ptr.len + 4 + 8 + 8 + 8 + 8;
         }
 
         // Groups: count(4) + per group(...)
@@ -934,18 +965,27 @@ pub const StreamProjection = struct {
             offset += key.len;
         }
 
-        // Stream metadata
+        // Stream metadata (includes retention fields)
         sm_it = self.stream_metadata.iterator();
         std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.stream_metadata.count()), .little);
         offset += 4;
         while (sm_it.next()) |kv| {
             const name = kv.key_ptr.*;
+            const meta = kv.value_ptr;
             std.mem.writeInt(u16, buf[offset..][0..2], @intCast(name.len), .little);
             offset += 2;
             @memcpy(buf[offset..][0..name.len], name);
             offset += name.len;
-            std.mem.writeInt(u32, buf[offset..][0..4], kv.value_ptr.partition_count, .little);
+            std.mem.writeInt(u32, buf[offset..][0..4], meta.partition_count, .little);
             offset += 4;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.name_hash, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.retention_age_s, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.retention_count, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], meta.retention_bytes, .little);
+            offset += 8;
         }
 
         // Groups
@@ -1007,7 +1047,7 @@ pub const StreamProjection = struct {
             try self.stream_names.put(name, {});
         }
 
-        // Stream metadata
+        // Stream metadata (includes retention fields)
         if (offset + 4 > data.len) return;
         const sm_count = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
@@ -1017,12 +1057,26 @@ pub const StreamProjection = struct {
             if (offset + 2 > data.len) return;
             const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
             offset += 2;
-            if (offset + name_len + 4 > data.len) return;
+            if (offset + name_len + 4 + 32 > data.len) return;
             const name = try self.allocator.dupe(u8, data[offset..][0..name_len]);
             offset += name_len;
             const partition_count = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
-            try self.stream_metadata.put(name, .{ .partition_count = partition_count });
+            const name_hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const retention_age_s = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const retention_count = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const retention_bytes = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            try self.stream_metadata.put(name, .{
+                .partition_count = partition_count,
+                .name_hash = name_hash,
+                .retention_age_s = retention_age_s,
+                .retention_count = retention_count,
+                .retention_bytes = retention_bytes,
+            });
         }
 
         // Consumer groups
@@ -1175,7 +1229,13 @@ test "stream: serialize/deserialize round-trip" {
     // Register stream names and metadata
     try s.registerStream("events");
     try s.registerStream("logs");
-    try s.registerStreamMetadata("events", 4);
+    try s.registerStreamMetadata("events", .{
+        .partition_count = 4,
+        .name_hash = 42,
+        .retention_age_s = 3600,
+        .retention_count = 1000,
+        .retention_bytes = 0,
+    });
 
     // Append records to a stream
     const hash: u64 = 42;
@@ -1201,9 +1261,13 @@ test "stream: serialize/deserialize round-trip" {
     try testing.expect(s2.stream_names.contains("logs"));
     try testing.expectEqual(@as(usize, 2), s2.streamCount());
 
-    // Verify metadata
+    // Verify metadata (including retention)
     const meta = s2.stream_metadata.get("events").?;
     try testing.expectEqual(@as(u32, 4), meta.partition_count);
+    try testing.expectEqual(@as(u64, 42), meta.name_hash);
+    try testing.expectEqual(@as(u64, 3600), meta.retention_age_s);
+    try testing.expectEqual(@as(u64, 1000), meta.retention_count);
+    try testing.expectEqual(@as(u64, 0), meta.retention_bytes);
 
     // Verify consumer group
     const group = s2.getGroup("my-group").?;

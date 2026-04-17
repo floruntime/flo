@@ -60,6 +60,7 @@
 
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
+const log = @import("stdx").log;
 
 /// Maximum concurrent waiters per shard across all subsystems.
 /// At 64 bytes per slot this is 16 KB — fits in L1 cache.
@@ -118,6 +119,10 @@ pub const Waiter = struct {
     /// Slot is occupied.
     active: bool,
 
+    /// Pattern waiter — key is a prefix for `startsWith` matching
+    /// instead of exact equality. Used by pattern group reads (e.g. `events.*`).
+    pattern: bool,
+
     /// Get the key slice.
     pub fn key(self: *const Waiter) []const u8 {
         return self.key_buf[0..self.key_len];
@@ -148,11 +153,15 @@ pub const WaiterPool = struct {
         key: []const u8,
         min_version: u64 = 0,
         timeout_ms: u32 = 0, // 0 = infinite
+        pattern: bool = false, // true = key is a prefix for startsWith matching
     };
 
     /// Register a new waiter.  Returns `true` on success, `false` if pool full or key too long.
     pub fn register(self: *WaiterPool, opts: RegisterOpts) bool {
-        if (self.count >= MAX_WAITERS) return false;
+        if (self.count >= MAX_WAITERS) {
+            log.warn("waiter pool full ({d}/{d}), blocking read dropped", .{ self.count, MAX_WAITERS });
+            return false;
+        }
         if (opts.key.len == 0 or opts.key.len > 256) return false;
 
         const now_ms = std.time.milliTimestamp();
@@ -171,6 +180,7 @@ pub const WaiterPool = struct {
         w.min_version = opts.min_version;
         w.expires_at_ms = expires;
         w.active = true;
+        w.pattern = opts.pattern;
         self.count += 1;
         return true;
     }
@@ -208,7 +218,11 @@ pub const WaiterPool = struct {
             }
 
             const wkey = w.key();
-            if (wkey.len == notify_key.len and std.mem.eql(u8, wkey, notify_key)) {
+            const matches = if (w.pattern)
+                std.mem.startsWith(u8, notify_key, wkey)
+            else
+                (wkey.len == notify_key.len and std.mem.eql(u8, wkey, notify_key));
+            if (matches) {
                 if (resolver(w, ctx)) {
                     self.swapRemove(i);
                     continue; // don't increment — slot was swapped

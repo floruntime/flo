@@ -50,7 +50,9 @@ const result_mod = @import("../protocol/result.zig");
 const CommandResult = result_mod.CommandResult;
 const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
-const StreamProjection = @import("../projection/stream.zig").StreamProjection;
+const stream_proj_mod = @import("../projection/stream.zig");
+const StreamProjection = stream_proj_mod.StreamProjection;
+const StreamID = stream_proj_mod.StreamID;
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
@@ -1015,6 +1017,15 @@ pub const Shard = struct {
                 @ptrCast(self),
             ) catch {};
         }
+
+        // Stream retention enforcement — runs every 10 seconds
+        self.task_scheduler.register(
+            "stream_retention",
+            10_000, // check every 10 seconds
+            1_000_000, // 1ms budget per invocation
+            streamRetentionTask,
+            @ptrCast(self),
+        ) catch {};
     }
 
     /// TaskScheduler callback: evict entries older than hot_flush_seconds
@@ -1029,6 +1040,51 @@ pub const Shard = struct {
             total_evicted += partition.ual.evictOlderThan(cutoff_ns);
         }
         return total_evicted;
+    }
+
+    /// TaskScheduler callback: enforce stream retention policies.
+    /// Computes trim targets locally, then persists through Raft so
+    /// replicas apply the same deterministic trims.
+    fn streamRetentionTask(ctx: *anyopaque, _: u64) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        const proj = self.stream_handler.stream;
+        const now_ms: u64 = @intCast(@max(0, std.time.milliTimestamp()));
+        var total_trimmed: u64 = 0;
+
+        var it = proj.stream_metadata.iterator();
+        while (it.next()) |kv| {
+            const meta = kv.value_ptr;
+            if (!meta.hasRetention()) continue;
+            const name_hash = meta.name_hash;
+            if (name_hash == 0) continue;
+
+            // Age-based retention: compute cutoff StreamID, persist trim through Raft
+            if (meta.retention_age_s > 0) {
+                const cutoff_ms = now_ms -| (meta.retention_age_s * 1000);
+                if (cutoff_ms > 0) {
+                    const cutoff_id = StreamID{ .timestamp_ms = cutoff_ms, .sequence = std.math.maxInt(u64) };
+                    // Only trim if there are records to remove
+                    const first_id = proj.streamFirstId(name_hash);
+                    if (!first_id.eql(StreamID.MIN) and !first_id.greaterThan(cutoff_id)) {
+                        total_trimmed += self.stream_handler.persistTrim(name_hash, cutoff_id);
+                    }
+                }
+            }
+
+            // Count-based retention: resolve Nth record ID, persist trim through Raft
+            if (meta.retention_count > 0) {
+                const count = proj.streamRecordCount(name_hash);
+                if (count > meta.retention_count) {
+                    const excess = count - meta.retention_count;
+                    const trim_id = proj.resolveNthRecordId(name_hash, excess);
+                    if (!trim_id.eql(StreamID.MIN)) {
+                        total_trimmed += self.stream_handler.persistTrim(name_hash, trim_id);
+                    }
+                }
+            }
+        }
+
+        return total_trimmed;
     }
 
     // ─── Event processing ────────────────────────────────────────────────
@@ -1911,7 +1967,7 @@ pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const conn = shard.getConnection(waiter.fd) orelse return true;
 
     // Serialize with full message format including payloads
-    const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count]) catch return false;
+    const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count], waiter.key()) catch return false;
     defer shard.stream_handler.allocator.free(data);
     shard.sendOkResponse(conn, waiter.request_id, data);
     shard.flushToClient(waiter.fd);

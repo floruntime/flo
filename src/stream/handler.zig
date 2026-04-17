@@ -106,6 +106,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_info, dispatchStream, preRouteByStream);
         dispatcher.registerWalk(.stream_list, dispatchStream, localScanStreams);
         dispatcher.registerWithRoute(.stream_create, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_alter, dispatchStream, preRouteByStream);
 
         // Consumer group operations (0x20–0x2C)
         dispatcher.registerWithRoute(.stream_group_create, dispatchStream, preRouteByStream);
@@ -305,13 +306,15 @@ pub const StreamHandler = struct {
             }
 
             // Register waiter — woken by dispatchAppend or expired by timeout
+            const is_pattern = req.key.len > 0 and req.key[req.key.len - 1] == '*';
             _ = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .fd = conn.fd,
                 .request_id = req.header.request_id,
-                .key = req.key,
+                .key = if (is_pattern) req.key[0 .. req.key.len - 1] else req.key,
                 .min_version = shard.defaultPartition().ual.max_index,
                 .timeout_ms = bms,
+                .pattern = is_pattern,
             });
             conn.response_deferred = true;
             return;
@@ -336,6 +339,7 @@ pub const StreamHandler = struct {
             .stream_info => self.handleInfo(req),
             .stream_list => self.handleList(req),
             .stream_create => self.handleCreate(req),
+            .stream_alter => self.handleAlter(req),
 
             // Consumer group operations
             .stream_group_create => self.handleGroupCreate(req),
@@ -495,7 +499,7 @@ pub const StreamHandler = struct {
         else
             self.stream.readStreamRange(name_hash, start_id, end_id, partition_filter, buf[0..capped]);
 
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count]) catch {
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
 
@@ -531,16 +535,13 @@ pub const StreamHandler = struct {
         }
 
         if (trim_id.eql(StreamID.MIN) and req.value.len > 0) {
-            // Bare integer: trim the first N records
+            // Bare integer: trim the first N records — resolve to a StreamID
             const count = std.fmt.parseInt(u64, req.value, 10) catch 0;
             if (count > 0) {
-                const deleted = self.stream.trimStreamByCount(name_hash, count);
-                const first_id = self.stream.streamFirstId(name_hash);
-                const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
-                return .{ .stream_trimmed = .{
-                    .deleted_count = deleted,
-                    .first_seq = first_seq,
-                } };
+                trim_id = self.stream.resolveNthRecordId(name_hash, count);
+                if (trim_id.eql(StreamID.MIN)) {
+                    return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
+                }
             }
         }
 
@@ -548,9 +549,9 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 
-        const deleted = self.stream.trimStream(name_hash, trim_id);
+        // Persist through Raft for durability and replication
+        const deleted = self.persistAndApplyTrim(req.namespace, name_hash, trim_id);
 
-        // Compute first_seq for response
         const first_id = self.stream.streamFirstId(name_hash);
         const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
 
@@ -571,6 +572,8 @@ pub const StreamHandler = struct {
         const last_id = self.stream.streamLastId(name_hash);
         const count = self.stream.streamRecordCount(name_hash);
 
+        const meta = self.stream.stream_metadata.get(req.key);
+
         return .{ .stream_info = .{
             .first_timestamp_ms = if (count > 0) first_id.timestamp_ms else 0,
             .first_seq = if (count > 0) first_id.sequence else 0,
@@ -579,6 +582,9 @@ pub const StreamHandler = struct {
             .count = count,
             .bytes = 0,
             .partition_count = pc,
+            .retention_age_s = if (meta) |m| m.retention_age_s else 0,
+            .retention_count = if (meta) |m| m.retention_count else 0,
+            .retention_bytes = if (meta) |m| m.retention_bytes else 0,
         } };
     }
 
@@ -633,7 +639,21 @@ pub const StreamHandler = struct {
                     if (pc > 0) partition_count = pc;
                 }
             }
-            self.stream.registerStreamMetadata(req.key, partition_count) catch {};
+
+            // Parse retention options from TLV
+            const retention = parseRetentionOptions(req);
+
+            // Compute name_hash for background trim lookups
+            const ns_hash = router.namespaceHash(req.namespace);
+            const name_hash = router.nameHash(ns_hash, req.key);
+
+            self.stream.registerStreamMetadata(req.key, .{
+                .partition_count = partition_count,
+                .name_hash = name_hash,
+                .retention_age_s = retention.age_s,
+                .retention_count = retention.count,
+                .retention_bytes = retention.bytes,
+            }) catch {};
 
             // Register in global metrics registry for dashboard/Prometheus
             if (self.metrics_registry) |mr| {
@@ -641,6 +661,58 @@ pub const StreamHandler = struct {
             }
         }
         return .ok;
+    }
+
+    // ── ALTER ───────────────────────────────────────────────────────────
+
+    fn handleAlter(self: *StreamHandler, req: Request) CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
+        }
+
+        // Check stream exists
+        const existing = self.stream.stream_metadata.get(req.key) orelse {
+            return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
+        };
+
+        // Parse retention options from TLV
+        const retention = parseRetentionOptions(req);
+
+        // Merge: keep existing partition_count and name_hash, update retention
+        self.stream.registerStreamMetadata(req.key, .{
+            .partition_count = existing.partition_count,
+            .name_hash = existing.name_hash,
+            .retention_age_s = if (retention.age_s > 0) retention.age_s else existing.retention_age_s,
+            .retention_count = if (retention.count > 0) retention.count else existing.retention_count,
+            .retention_bytes = if (retention.bytes > 0) retention.bytes else existing.retention_bytes,
+        }) catch {};
+
+        return .ok;
+    }
+
+    /// Parse retention TLV options from a request.
+    fn parseRetentionOptions(req: Request) struct { age_s: u64, count: u64, bytes: u64 } {
+        var age_s: u64 = 0;
+        var count: u64 = 0;
+        var bytes: u64 = 0;
+
+        var iter = req.getOptionsIterator();
+        while (iter.next()) |opt| {
+            switch (opt.tag) {
+                .retention_age => {
+                    if (opt.asU64()) |v| age_s = v;
+                },
+                .retention_count => {
+                    if (opt.asU64()) |v| count = v;
+                },
+                .retention_bytes => {
+                    if (opt.asU64()) |v| bytes = v;
+                },
+                else => {},
+            }
+        }
+
+        return .{ .age_s = age_s, .count = count, .bytes = bytes };
     }
 
     // ── GROUP CREATE ────────────────────────────────────────────────────
@@ -752,6 +824,11 @@ pub const StreamHandler = struct {
     // ── GROUP READ ──────────────────────────────────────────────────────
 
     fn handleGroupRead(self: *StreamHandler, req: Request) CommandResult {
+        // Pattern group read: key ends with `*` (e.g. `events.*` or `*`)
+        if (req.key.len > 0 and req.key[req.key.len - 1] == '*') {
+            return self.handlePatternGroupRead(req);
+        }
+
         // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
         const pair = decodeGroupConsumer(req) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
@@ -785,8 +862,91 @@ pub const StreamHandler = struct {
             };
         };
 
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count]) catch {
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
+        };
+
+        return .{ .group_messages = .{ .data = data } };
+    }
+
+    /// Pattern group read — reads from all streams matching a prefix pattern.
+    ///
+    /// The key `events.*` matches all streams starting with `events.`.
+    /// A bare `*` matches all streams in the namespace.
+    /// Records from each matching stream carry the stream name as key identity.
+    fn handlePatternGroupRead(self: *StreamHandler, req: Request) CommandResult {
+        const pair = decodeGroupConsumer(req) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
+        };
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
+        const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
+
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ns = now_ms * 1_000_000;
+        self.stream.createGroup(group_name, now_ns) catch |err| {
+            if (err != error.AlreadyExists) {
+                return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
+            }
+        };
+        _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
+
+        const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
+        const capped = @min(limit, MAX_READ_BATCH);
+
+        // Strip trailing `*` to get the bare prefix (e.g. `events.*` → `events.`, `*` → ``)
+        const bare_prefix = req.key[0 .. req.key.len - 1];
+
+        // Build namespace-qualified prefix for filtering stream_names
+        var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const ns_prefix = ns_keys.namespacePrefix(&ns_buf, req.namespace);
+
+        // Scan all stream names from this shard's projection
+        var name_buf: [1024][]const u8 = undefined;
+        const raw_count = self.stream.scanStreamNames(&name_buf);
+
+        const ns_hash = router.namespaceHash(req.namespace);
+
+        // Collect records from all matching streams
+        var all_buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        // Track which stream each batch of records came from (for serialization)
+        var stream_names_out: [MAX_READ_BATCH][]const u8 = undefined;
+        var total: usize = 0;
+
+        for (name_buf[0..raw_count]) |qualified_name| {
+            if (total >= capped) break;
+
+            // Filter by namespace
+            const display_name = blk: {
+                if (ns_prefix.len == 0) {
+                    // Default namespace — only bare names (no NUL separator)
+                    if (std.mem.indexOfScalar(u8, qualified_name, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
+                    break :blk qualified_name;
+                } else {
+                    if (!std.mem.startsWith(u8, qualified_name, ns_prefix)) continue;
+                    break :blk qualified_name[ns_prefix.len..];
+                }
+            };
+
+            // Filter by pattern prefix
+            if (bare_prefix.len > 0 and !std.mem.startsWith(u8, display_name, bare_prefix)) continue;
+
+            // Compute name_hash for this stream
+            const name_hash = router.nameHash(ns_hash, display_name);
+
+            const remaining = capped - total;
+            const count = self.stream.groupDeliver(group_name, name_hash, consumer_id, remaining, now_ms, all_buf[total .. total + remaining]) catch continue;
+
+            // Tag each record with the stream name for serialization
+            for (total..total + count) |i| {
+                stream_names_out[i] = display_name;
+            }
+            total += count;
+        }
+
+        // Serialize combined results with per-record stream names
+        const data = self.serializePatternGroupRecords(all_buf[0..total], stream_names_out[0..total]) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "pattern group read serialization failed" } };
         };
 
         return .{ .group_messages = .{ .data = data } };
@@ -984,62 +1144,228 @@ pub const StreamHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Serialize StreamRecord entries (PEL-based reads) with full wire format.
-    /// Serialize StreamRecord entries with full wire format including payloads.
+    /// A resolved record ready for wire serialization.
+    /// Produced by expanding batch payloads from the UAL.
+    const ResolvedRecord = struct {
+        sequence: u64,
+        timestamp_ms: u64,
+        partition_index: u32,
+        tier: u8,
+        payload: []const u8,
+        /// Raw stored header bytes: [key_len:u16][key][val_len:u16][val]...
+        headers_raw: []const u8,
+        header_count: u32,
+    };
+
+    /// Expand StreamRecords into resolved records by unpacking batch payloads.
+    /// One StreamRecord may expand into N records if it contains a batch blob.
+    fn expandRecords(self: *StreamHandler, records: []const StreamRecord, out: []ResolvedRecord) usize {
+        var count: usize = 0;
+        for (records) |rec| {
+            if (count >= out.len) break;
+            const result = self.getPayloadAndTier(rec.ual_index);
+            var batch_buf: [100]UnpackedRecord = undefined;
+            const batch_n = unpackBatch(result.payload, &batch_buf);
+
+            for (batch_buf[0..batch_n], 0..) |br, j| {
+                if (count >= out.len) break;
+                out[count] = .{
+                    .sequence = rec.id.sequence + j,
+                    .timestamp_ms = rec.id.timestamp_ms,
+                    .partition_index = rec.partition_index,
+                    .tier = result.tier,
+                    .payload = br.payload,
+                    .headers_raw = br.headers_raw,
+                    .header_count = br.header_count,
+                };
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Compute re-serialized header size: stored format uses u16 lengths,
+    /// response format uses u32 — each header gains 4 bytes.
+    fn responseHeaderSize(hdr_count: u32, headers_raw_len: usize) usize {
+        return headers_raw_len + (hdr_count * 4);
+    }
+
+    /// Write re-serialized headers into buf at pos. Widens u16→u32 length fields.
+    /// Returns new pos after writing.
+    fn writeResponseHeaders(headers_raw: []const u8, hdr_count: u32, buf: []u8, start_pos: usize) usize {
+        var in_pos: usize = 0;
+        var pos = start_pos;
+        var h: u32 = 0;
+        while (h < hdr_count) : (h += 1) {
+            // key_len: u16 → u32
+            const key_len = std.mem.readInt(u16, headers_raw[in_pos..][0..2], .little);
+            in_pos += 2;
+            std.mem.writeInt(u32, buf[pos..][0..4], key_len, .little);
+            pos += 4;
+            @memcpy(buf[pos .. pos + key_len], headers_raw[in_pos .. in_pos + key_len]);
+            in_pos += key_len;
+            pos += key_len;
+            // val_len: u16 → u32
+            const val_len = std.mem.readInt(u16, headers_raw[in_pos..][0..2], .little);
+            in_pos += 2;
+            std.mem.writeInt(u32, buf[pos..][0..4], val_len, .little);
+            pos += 4;
+            @memcpy(buf[pos .. pos + val_len], headers_raw[in_pos .. in_pos + val_len]);
+            in_pos += val_len;
+            pos += val_len;
+        }
+        return pos;
+    }
+
+    /// Serialize StreamRecord entries with full wire format including payloads and headers.
     ///
     /// Wire format per record:
     ///   [sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
-    ///   [key_present:u8][payload_len:u32][payload bytes]
-    ///   [header_count:u32]
-    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord) ![]u8 {
+    ///   [key_present:u8]([key_len:u32][key bytes])?
+    ///   [payload_len:u32][payload bytes]
+    ///   [header_count:u32]([key_len:u32][key][val_len:u32][val])*
+    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, stream_name: []const u8) ![]u8 {
+        const key_size: usize = if (stream_name.len > 0) 1 + 4 + stream_name.len else 1;
+
+        // Expand batch payloads into individual records
+        var expanded: [MAX_READ_BATCH]ResolvedRecord = undefined;
+        const expanded_count = self.expandRecords(records, &expanded);
+
+        // Compute total buffer size
         var total: usize = 4; // count header
-        for (records) |rec| {
-            const result = self.getPayloadAndTier(rec.ual_index);
-            total += 8 + 8 + 1 + 4 + 1 + 4 + result.payload.len + 4;
+        for (expanded[0..expanded_count]) |e| {
+            const hdr_size = responseHeaderSize(e.header_count, e.headers_raw.len);
+            total += 8 + 8 + 1 + 4 + key_size + 4 + e.payload.len + 4 + hdr_size;
         }
 
         const buf = try self.allocator.alloc(u8, total);
         errdefer self.allocator.free(buf);
 
         var pos: usize = 0;
-
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(records.len), .little);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(expanded_count), .little);
         pos += 4;
 
-        for (records) |rec| {
-            const result = self.getPayloadAndTier(rec.ual_index);
-
-            // sequence (StreamID.sequence)
-            std.mem.writeInt(u64, buf[pos..][0..8], rec.id.sequence, .little);
+        for (expanded[0..expanded_count]) |e| {
+            std.mem.writeInt(u64, buf[pos..][0..8], e.sequence, .little);
             pos += 8;
-
-            // timestamp_ms (StreamID.timestamp_ms as i64 for wire compat)
-            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(rec.id.timestamp_ms)), .little);
+            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(e.timestamp_ms)), .little);
             pos += 8;
-
-            // tier
-            buf[pos] = result.tier;
+            buf[pos] = e.tier;
             pos += 1;
-
-            // partition index
-            std.mem.writeInt(u32, buf[pos..][0..4], rec.partition_index, .little);
+            std.mem.writeInt(u32, buf[pos..][0..4], e.partition_index, .little);
             pos += 4;
 
-            // key_present
-            buf[pos] = 0;
-            pos += 1;
-
-            // payload
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(result.payload.len), .little);
-            pos += 4;
-            if (result.payload.len > 0) {
-                @memcpy(buf[pos .. pos + result.payload.len], result.payload);
-                pos += result.payload.len;
+            // key (stream name for multi-stream / pattern reads)
+            if (stream_name.len > 0) {
+                buf[pos] = 1;
+                pos += 1;
+                std.mem.writeInt(u32, buf[pos..][0..4], @intCast(stream_name.len), .little);
+                pos += 4;
+                @memcpy(buf[pos .. pos + stream_name.len], stream_name);
+                pos += stream_name.len;
+            } else {
+                buf[pos] = 0;
+                pos += 1;
             }
 
-            // header_count
-            std.mem.writeInt(u32, buf[pos..][0..4], 0, .little);
+            // payload (clean, without batch wrapper)
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.payload.len), .little);
             pos += 4;
+            if (e.payload.len > 0) {
+                @memcpy(buf[pos .. pos + e.payload.len], e.payload);
+                pos += e.payload.len;
+            }
+
+            // headers
+            std.mem.writeInt(u32, buf[pos..][0..4], e.header_count, .little);
+            pos += 4;
+            if (e.header_count > 0) {
+                pos = writeResponseHeaders(e.headers_raw, e.header_count, buf, pos);
+            }
+        }
+
+        return buf;
+    }
+
+    /// Serialize pattern group read results where each record has its own stream name.
+    /// Same wire format as serializeStreamRecordsWithPayloads but with per-record keys.
+    fn serializePatternGroupRecords(self: *StreamHandler, records: []const StreamRecord, stream_names_in: []const []const u8) ![]u8 {
+        // Expand batch payloads into individual records
+        var expanded: [MAX_READ_BATCH]ResolvedRecord = undefined;
+        const expanded_count = self.expandRecords(records, &expanded);
+
+        // Build per-record stream name mapping (expand names alongside records)
+        var exp_names: [MAX_READ_BATCH][]const u8 = undefined;
+        {
+            var idx: usize = 0;
+            var exp_idx: usize = 0;
+            for (records, 0..) |_, ri| {
+                if (ri >= stream_names_in.len) break;
+                const name = stream_names_in[ri];
+                const result_payload = blk: {
+                    const result = self.getPayloadAndTier(records[ri].ual_index);
+                    var batch_buf: [100]UnpackedRecord = undefined;
+                    const n = unpackBatch(result.payload, &batch_buf);
+                    break :blk if (n > 0) n else 1;
+                };
+                var j: usize = 0;
+                while (j < result_payload and exp_idx < expanded_count) : ({
+                    j += 1;
+                    exp_idx += 1;
+                }) {
+                    exp_names[exp_idx] = name;
+                }
+                idx += 1;
+            }
+        }
+
+        // Compute total buffer size
+        var total: usize = 4;
+        for (expanded[0..expanded_count], 0..) |e, i| {
+            const name = exp_names[i];
+            const key_size: usize = 1 + 4 + name.len;
+            const hdr_size = responseHeaderSize(e.header_count, e.headers_raw.len);
+            total += 8 + 8 + 1 + 4 + key_size + 4 + e.payload.len + 4 + hdr_size;
+        }
+
+        const buf = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(buf);
+
+        var pos: usize = 0;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(expanded_count), .little);
+        pos += 4;
+
+        for (expanded[0..expanded_count], 0..) |e, i| {
+            const name = exp_names[i];
+
+            std.mem.writeInt(u64, buf[pos..][0..8], e.sequence, .little);
+            pos += 8;
+            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(e.timestamp_ms)), .little);
+            pos += 8;
+            buf[pos] = e.tier;
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], e.partition_index, .little);
+            pos += 4;
+
+            buf[pos] = 1;
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(name.len), .little);
+            pos += 4;
+            @memcpy(buf[pos .. pos + name.len], name);
+            pos += name.len;
+
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.payload.len), .little);
+            pos += 4;
+            if (e.payload.len > 0) {
+                @memcpy(buf[pos .. pos + e.payload.len], e.payload);
+                pos += e.payload.len;
+            }
+
+            std.mem.writeInt(u32, buf[pos..][0..4], e.header_count, .little);
+            pos += 4;
+            if (e.header_count > 0) {
+                pos = writeResponseHeaders(e.headers_raw, e.header_count, buf, pos);
+            }
         }
 
         return buf;
@@ -1047,18 +1373,31 @@ pub const StreamHandler = struct {
 
     /// Append payload to a named stream (used by processing pipelines).
     /// Computes the namespace-qualified name hash for proper stream isolation.
+    /// Wraps the payload in batch format for consistency with all other appends.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !u64 {
+        // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
+        const batch_size = 4 + 4 + payload.len + 2;
+        const batch_buf = try self.allocator.alloc(u8, batch_size);
+        defer self.allocator.free(batch_buf);
+        std.mem.writeInt(u32, batch_buf[0..4], 1, .little); // count=1
+        std.mem.writeInt(u32, batch_buf[4..8], @intCast(payload.len), .little);
+        if (payload.len > 0) {
+            @memcpy(batch_buf[8 .. 8 + payload.len], payload);
+        }
+        std.mem.writeInt(u16, batch_buf[8 + payload.len ..][0..2], 0, .little); // header_count=0
+        const batch_value = batch_buf[0..batch_size];
+
         // Persist through Raft for durability and replication
         if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
-            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, payload) catch {};
+            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, batch_value) catch {};
         }
 
         // Apply locally: append to partition UAL + warm store
         const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + payload.len;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + batch_value.len;
         const payload_buf = try self.allocator.alloc(u8, payload_size);
         defer self.allocator.free(payload_buf);
 
@@ -1072,7 +1411,7 @@ pub const StreamHandler = struct {
             timestamp_ns,
             ns_hash_u32,
             stream_name,
-            payload,
+            batch_value,
             payload_buf,
         ) orelse return error.EntryBuildFailed;
 
@@ -1109,20 +1448,11 @@ pub const StreamHandler = struct {
             if (count >= capped) break;
             const result = self.getPayloadAndTier(rec.ual_index);
             if (result.payload.len > 0) {
-                // CLI stream appends use batch wire format:
-                //   [record_count:u32][payload_len:u32][payload][header_count:u16]...
-                // Internal appends (e.g., processing sinks) store raw payloads.
-                // Try to unpack batch format; fall back to raw value.
-                var batch_buf: [100][]const u8 = undefined;
-                const batch_n = unpackBatchPayloads(result.payload, &batch_buf);
-                if (batch_n > 0) {
-                    for (batch_buf[0..batch_n]) |p| {
-                        if (count >= capped) break;
-                        results[count] = p;
-                        count += 1;
-                    }
-                } else {
-                    results[count] = result.payload;
+                var batch_buf: [100]UnpackedRecord = undefined;
+                const batch_n = unpackBatch(result.payload, &batch_buf);
+                for (batch_buf[0..batch_n]) |br| {
+                    if (count >= capped) break;
+                    results[count] = br.payload;
                     count += 1;
                 }
             }
@@ -1134,11 +1464,17 @@ pub const StreamHandler = struct {
         return .{ .payloads = out, .last_id = last_id };
     }
 
-    /// Try to unpack a batch-format stream value into individual record payloads.
-    /// Batch wire format: [count:u32] then per record: [len:u32][data][hdr_count:u16][headers...]
-    /// Returns 0 if value is not valid batch format (caller should use value as-is).
-    fn unpackBatchPayloads(value: []const u8, out: [][]const u8) usize {
-        // Minimum batch: 4 (count) + 4 (len) + 0 (data) + 2 (hdrs) = 10 bytes
+    /// A single record extracted from a batch blob, with payload and raw header bytes.
+    const UnpackedRecord = struct {
+        payload: []const u8,
+        /// Raw header bytes in wire format: [key_len:u16][key][val_len:u16][val]...
+        headers_raw: []const u8,
+        header_count: u32,
+    };
+
+    /// Parse a stored value as batch format and extract individual records
+    /// with their payloads AND headers.  Returns 0 if value is not valid batch format.
+    fn unpackBatch(value: []const u8, out: []UnpackedRecord) usize {
         if (value.len < 10) return 0;
 
         const record_count = std.mem.readInt(u32, value[0..4], .little);
@@ -1154,17 +1490,15 @@ pub const StreamHandler = struct {
             pos += 4;
 
             if (pos + payload_len > value.len) return 0;
-            if (count < out.len) {
-                out[count] = value[pos .. pos + payload_len];
-                count += 1;
-            }
+            const payload = value[pos .. pos + payload_len];
             pos += payload_len;
 
-            // Skip header_count + headers
+            // Parse header_count and capture raw header bytes
             if (pos + 2 > value.len) return 0;
             const hdr_count = std.mem.readInt(u16, value[pos..][0..2], .little);
             pos += 2;
 
+            const headers_start = pos;
             var h: u16 = 0;
             while (h < hdr_count) : (h += 1) {
                 if (pos + 2 > value.len) return 0;
@@ -1172,17 +1506,24 @@ pub const StreamHandler = struct {
                 pos += 2;
                 if (pos + hkey_len > value.len) return 0;
                 pos += hkey_len;
-                if (pos + 4 > value.len) return 0;
-                const hval_len = std.mem.readInt(u32, value[pos..][0..4], .little);
-                pos += 4;
+                if (pos + 2 > value.len) return 0;
+                const hval_len = std.mem.readInt(u16, value[pos..][0..2], .little);
+                pos += 2;
                 if (pos + hval_len > value.len) return 0;
                 pos += hval_len;
             }
+
+            if (count < out.len) {
+                out[count] = .{
+                    .payload = payload,
+                    .headers_raw = value[headers_start..pos],
+                    .header_count = hdr_count,
+                };
+                count += 1;
+            }
         }
 
-        // Exact match validates this was truly batch format
         if (pos != value.len) return 0;
-
         return count;
     }
 
@@ -1240,7 +1581,47 @@ pub const StreamHandler = struct {
                 self.stream.registerStream(cmd.key) catch {};
             }
         }
-        // stream_trim doesn't need replay — trimmed entries are simply absent
+
+        if (etype == .stream_trim) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                if (cmd.key.len >= 16) {
+                    const ts = std.mem.readInt(u64, cmd.key[0..8], .little);
+                    const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
+                    const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
+                    _ = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
+                }
+            }
+        }
+    }
+
+    // ── Trim Persistence ────────────────────────────────────────────────
+
+    /// Encode a trim as a stream_trim entry and persist through Raft.
+    /// Format: key = [timestamp_ms:u64 LE][sequence:u64 LE], value = [name_hash:u64 LE]
+    /// After Raft commit, applies the trim locally to the projection.
+    /// Returns the number of records trimmed locally.
+    fn persistAndApplyTrim(self: *StreamHandler, namespace: []const u8, name_hash: u64, trim_id: StreamID) u64 {
+        // Encode trim target as the entry key (16 bytes) and name_hash as value (8 bytes)
+        var key_buf: [16]u8 = undefined;
+        std.mem.writeInt(u64, key_buf[0..8], trim_id.timestamp_ms, .little);
+        std.mem.writeInt(u64, key_buf[8..16], trim_id.sequence, .little);
+
+        var val_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, val_buf[0..8], name_hash, .little);
+
+        // Persist through Raft — on commit, replicas will see this via replayEntry
+        if (self.shard_ptr) |sptr| {
+            const shard = shardFromPtr(sptr);
+            _ = persistence_mod.persistEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf) catch {};
+        }
+
+        // Apply locally: trim the projection
+        return self.stream.trimStream(name_hash, trim_id);
+    }
+
+    /// Public interface for background tasks (retention enforcer) to persist trims.
+    pub fn persistTrim(self: *StreamHandler, name_hash: u64, trim_id: StreamID) u64 {
+        return self.persistAndApplyTrim("", name_hash, trim_id);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1380,8 +1761,8 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, m.data);
         },
         .stream_info => |i| {
-            // Serialize: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
-            var buf: [52]u8 = undefined;
+            // Serialize: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
+            var buf: [76]u8 = undefined;
             var off: usize = 0;
             std.mem.writeInt(u64, buf[off..][0..8], i.first_timestamp_ms, .little);
             off += 8;
@@ -1396,6 +1777,12 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             std.mem.writeInt(u64, buf[off..][0..8], i.bytes, .little);
             off += 8;
             std.mem.writeInt(u32, buf[off..][0..4], i.partition_count, .little);
+            off += 4;
+            std.mem.writeInt(u64, buf[off..][0..8], i.retention_age_s, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.retention_count, .little);
+            off += 8;
+            std.mem.writeInt(u64, buf[off..][0..8], i.retention_bytes, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
         .stream_trimmed => |t| {
@@ -1535,6 +1922,44 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     };
 }
 
+/// Build a batch-format value for a single payload with no headers.
+/// Batch format: [count:u32][payload_len:u32][payload][header_count:u16]
+fn makeBatchValue(buf: []u8, payload: []const u8) []const u8 {
+    const total = 4 + 4 + payload.len + 2;
+    std.mem.writeInt(u32, buf[0..4], 1, .little);
+    std.mem.writeInt(u32, buf[4..8], @intCast(payload.len), .little);
+    if (payload.len > 0) {
+        @memcpy(buf[8 .. 8 + payload.len], payload);
+    }
+    std.mem.writeInt(u16, buf[8 + payload.len ..][0..2], 0, .little);
+    return buf[0..total];
+}
+
+/// Build a batch-format value for a single payload with one header.
+/// Batch format: [count:u32][payload_len:u32][payload][header_count:u16][key_len:u16][key][val_len:u16][val]
+fn makeBatchValueWithHeader(buf: []u8, payload: []const u8, hdr_key: []const u8, hdr_val: []const u8) []const u8 {
+    const total = 4 + 4 + payload.len + 2 + 2 + hdr_key.len + 2 + hdr_val.len;
+    var pos: usize = 0;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(payload.len), .little);
+    pos += 4;
+    if (payload.len > 0) {
+        @memcpy(buf[pos .. pos + payload.len], payload);
+        pos += payload.len;
+    }
+    std.mem.writeInt(u16, buf[pos..][0..2], 1, .little); // header_count=1
+    pos += 2;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(hdr_key.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + hdr_key.len], hdr_key);
+    pos += hdr_key.len;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(hdr_val.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + hdr_val.len], hdr_val);
+    return buf[0..total];
+}
+
 test "stream handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     StreamHandler.register(&dispatcher);
@@ -1558,8 +1983,9 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_info)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_pending)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_touch)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
-    try testing.expectEqual(@as(u16, 16), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 17), dispatcher.handler_count);
 }
 
 test "stream handler: append" {
@@ -1571,7 +1997,9 @@ test "stream handler: append" {
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const result = handler.handleCommand(makeRequest(.stream_append, "events", "payload1", ""));
+    var vbuf1: [64]u8 = undefined;
+    const val1 = makeBatchValue(&vbuf1, "payload1");
+    const result = handler.handleCommand(makeRequest(.stream_append, "events", val1, ""));
     var first_ts: i64 = 0;
     switch (result) {
         .stream_append_ok => |a| {
@@ -1583,7 +2011,9 @@ test "stream handler: append" {
     }
 
     // Second append
-    const r2 = handler.handleCommand(makeRequest(.stream_append, "events", "payload2", ""));
+    var vbuf2: [64]u8 = undefined;
+    const val2 = makeBatchValue(&vbuf2, "payload2");
+    const r2 = handler.handleCommand(makeRequest(.stream_append, "events", val2, ""));
     switch (r2) {
         .stream_append_ok => |a| {
             // Must have a valid timestamp; sequence may differ based on timing
@@ -1601,7 +2031,9 @@ test "stream handler: append empty stream name" {
 
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
-    const result = handler.handleCommand(makeRequest(.stream_append, "", "data", ""));
+    var vbuf_data: [64]u8 = undefined;
+    const val_data = makeBatchValue(&vbuf_data, "data");
+    const result = handler.handleCommand(makeRequest(.stream_append, "", val_data, ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
@@ -1618,9 +2050,12 @@ test "stream handler: read" {
     defer handler.deinit();
 
     // Append 3 messages
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "a", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "b", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "c", ""));
+    var vbuf_a: [64]u8 = undefined;
+    var vbuf_b: [64]u8 = undefined;
+    var vbuf_c: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbuf_a, "a"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbuf_b, "b"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbuf_c, "c"), ""));
 
     // Read all
     const result = handler.handleCommand(makeRequest(.stream_read, "s1", "", ""));
@@ -1648,11 +2083,16 @@ test "stream handler: read with limit" {
     defer handler.deinit();
 
     // Append 5 messages
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "1", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "2", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "3", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "4", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "5", ""));
+    var vb1: [64]u8 = undefined;
+    var vb2: [64]u8 = undefined;
+    var vb3: [64]u8 = undefined;
+    var vb4: [64]u8 = undefined;
+    var vb5: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb1, "1"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb2, "2"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb3, "3"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb4, "4"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb5, "5"), ""));
 
     // Read with limit 2
     var opts_buf: [32]u8 = undefined;
@@ -1681,11 +2121,16 @@ test "stream handler: trim" {
     defer handler.deinit();
 
     // Append 5 messages
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "a", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "b", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "c", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "d", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "e", ""));
+    var vba: [64]u8 = undefined;
+    var vbb: [64]u8 = undefined;
+    var vbc: [64]u8 = undefined;
+    var vbd: [64]u8 = undefined;
+    var vbe: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vba, "a"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbb, "b"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbc, "c"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbd, "d"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbe, "e"), ""));
 
     // Trim first 3 records (bare value = count-based trim)
     const result = handler.handleCommand(makeRequest(.stream_trim, "s1", "3", ""));
@@ -1707,8 +2152,10 @@ test "stream handler: info" {
     defer handler.deinit();
 
     // Append some messages
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "a", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "b", ""));
+    var vinfo_a: [64]u8 = undefined;
+    var vinfo_b: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vinfo_a, "a"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vinfo_b, "b"), ""));
 
     const result = handler.handleCommand(makeRequest(.stream_info, "s1", "", ""));
     switch (result) {
@@ -1803,9 +2250,12 @@ test "stream handler: group read and ack" {
     defer handler.deinit();
 
     // Append messages
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "msg1", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "msg2", ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "msg3", ""));
+    var vm1: [64]u8 = undefined;
+    var vm2: [64]u8 = undefined;
+    var vm3: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm1, "msg1"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm2, "msg2"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm3, "msg3"), ""));
 
     // Create group
     _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", "cg1", ""));
@@ -1838,7 +2288,8 @@ test "stream handler: group read and ack" {
     }
 
     // Append a new message
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", "msg4", ""));
+    var vm4: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm4, "msg4"), ""));
 
     // Third read — delivers only the new msg4
     const read3_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));

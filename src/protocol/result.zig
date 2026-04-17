@@ -124,7 +124,7 @@ pub const CommandResult = union(enum) {
     },
 
     /// Stream info response
-    /// Wire format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+    /// Wire format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
     stream_info: struct {
         first_timestamp_ms: u64 = 0,
         first_seq: u64 = 0,
@@ -133,6 +133,9 @@ pub const CommandResult = union(enum) {
         count: u64,
         bytes: u64,
         partition_count: u32 = 1,
+        retention_age_s: u64 = 0,
+        retention_count: u64 = 0,
+        retention_bytes: u64 = 0,
     },
 
     /// Stream trim response
@@ -963,7 +966,7 @@ pub const CommandResult = union(enum) {
 
             .stream_append_ok => 1 + 8 + 8,
             .stream_messages => |m| 1 + 4 + m.data.len + 16, // tag + len + data + next_timestamp_ms + next_sequence
-            .stream_info => 1 + 8 + 8 + 8 + 8 + 8 + 8 + 4, // tag + first_ts + first_seq + last_ts + last_seq + count + bytes + partition_count
+            .stream_info => 1 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8, // tag + first_ts + first_seq + last_ts + last_seq + count + bytes + partition_count + retention_age_s + retention_count + retention_bytes
             .stream_trimmed => 1 + 8 + 8, // tag + deleted_count + first_seq
             .subscribed => 1 + 8 + 8, // tag + subscription_id + start_seq
             .unsubscribed => 1 + 8, // tag + subscription_id
@@ -1140,6 +1143,9 @@ pub const CommandResult = union(enum) {
                 try writer.writeInt(u64, i.count, .little);
                 try writer.writeInt(u64, i.bytes, .little);
                 try writer.writeInt(u32, i.partition_count, .little);
+                try writer.writeInt(u64, i.retention_age_s, .little);
+                try writer.writeInt(u64, i.retention_count, .little);
+                try writer.writeInt(u64, i.retention_bytes, .little);
             },
             .stream_trimmed => |t| {
                 try writer.writeInt(u64, t.deleted_count, .little);
@@ -1463,6 +1469,9 @@ pub const CommandResult = union(enum) {
                 .count = try reader.readInt(u64, .little),
                 .bytes = try reader.readInt(u64, .little),
                 .partition_count = try reader.readInt(u32, .little),
+                .retention_age_s = try reader.readInt(u64, .little),
+                .retention_count = try reader.readInt(u64, .little),
+                .retention_bytes = try reader.readInt(u64, .little),
             } },
             .stream_trimmed => .{ .stream_trimmed = .{
                 .deleted_count = try reader.readInt(u64, .little),
