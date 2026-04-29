@@ -51,12 +51,11 @@ test "e2e/action: register with all options" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo action register handler --type user --owner myteam --timeout 60000 --retries 5
+    // flo action register handler --owner myteam --timeout 60000 --retries 5
     try ctx.exec(&.{
         "action",    "register",  "handler",
-        "--type",    "user",      "--owner",
-        "myteam",    "--timeout", "60000",
-        "--retries", "5",
+        "--owner",   "myteam",    "--timeout",
+        "60000",     "--retries", "5",
     });
 }
 

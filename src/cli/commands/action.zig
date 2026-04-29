@@ -922,18 +922,18 @@ fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| {
         ctx.printErr("Connection failed: {}\n", .{err});
-        return;
+        return error.CommandFailed;
     };
 
     var result = client_mod.action.workerDrain(&client, namespace, worker_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
-        return;
+        return error.CommandFailed;
     };
     defer result.deinit();
 
     if (result.isError()) {
         ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
+        return error.CommandFailed;
     }
 
     ctx.print("Draining worker: {s}\n", .{worker_id});
@@ -949,23 +949,23 @@ fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| {
         ctx.printErr("Connection failed: {}\n", .{err});
-        return;
+        return error.CommandFailed;
     };
 
     var result = client_mod.action.workerInfo(&client, namespace, worker_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
-        return;
+        return error.CommandFailed;
     };
     defer result.deinit();
 
     if (result.isError()) {
         ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
+        return error.CommandFailed;
     }
 
     const data = result.asRawData() orelse {
         ctx.printErr("No data returned\n", .{});
-        return;
+        return error.CommandFailed;
     };
 
     // Parse worker_record wire format
