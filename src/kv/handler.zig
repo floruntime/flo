@@ -119,6 +119,15 @@ pub const KVHandler = struct {
         dispatcher.registerWalk(.kv_scan, dispatchScan, localScanKeys);
         dispatcher.register(.kv_history, dispatchHistory);
         dispatcher.register(.kv_mget, dispatchMget);
+
+        // Extended KV operations.
+        dispatcher.registerWithRoute(.kv_incr, dispatchIncr, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_touch, dispatchTouch, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_persist, dispatchPersist, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_exists, dispatchExists, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_json_get, dispatchJsonGet, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_json_set, dispatchJsonSet, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_json_del, dispatchJsonDel, preRouteByKey);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -310,6 +319,376 @@ pub const KVHandler = struct {
         shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         log.debug("KV DELETE: key={s}", .{req.key});
+        sendKVResponse(shard, conn, req.header.request_id, .ok);
+    }
+
+    // ── Extended KV: INCR / TOUCH / PERSIST / EXISTS / JSON ────────────
+
+    /// INCR — atomic counter. Wire format:
+    ///   value field = 8-byte i64 little-endian delta (default 1 if empty).
+    /// Response: kv_value with value = 8-byte i64 LE new counter.
+    fn dispatchIncr(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+        if (req.key.len == 0) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "key is required" } });
+            return;
+        }
+        if (isReservedKey(req.key)) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
+            return;
+        }
+
+        // Parse delta — empty value defaults to +1.
+        var delta: i64 = 1;
+        if (req.value.len == 8) {
+            delta = std.mem.readInt(i64, req.value[0..8], .little);
+        } else if (req.value.len != 0) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "incr: value must be empty or 8-byte i64 LE" } });
+            return;
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        // Reject INCR against an existing non-counter value (string of != 8 bytes).
+        if (shard.kv_handler.*.kv.getRaw(qkey)) |existing| {
+            if (!existing.tombstone and existing.value.len != 8) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } });
+                return;
+            }
+        }
+
+        // Encode delta in the entry value field.
+        var val_buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &val_buf, delta, .little);
+
+        _ = proposeKVEntryWithValue(shard, .kv_incr, req, qkey, &val_buf) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        applyCommittedEntries(shard);
+        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } });
+            return;
+        };
+        // Surface overflow to the client: applyIncr swallowed it during apply.
+        if (entry.value.len != 8) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "incr: counter corrupted" } });
+            return;
+        }
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = entry.value, .version = entry.version } });
+    }
+
+    /// TOUCH — update TTL of an existing key.
+    /// Wire format: value = 8-byte u64 LE ttl_seconds (0 = clear / PERSIST).
+    fn dispatchTouch(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        touchOrPersist(shard_ptr, conn_ptr, req, false);
+    }
+
+    /// PERSIST — clear TTL on an existing key. Ignores any value payload.
+    fn dispatchPersist(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        touchOrPersist(shard_ptr, conn_ptr, req, true);
+    }
+
+    fn touchOrPersist(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request, force_persist: bool) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+        if (req.key.len == 0) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "key is required" } });
+            return;
+        }
+        if (isReservedKey(req.key)) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
+            return;
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        // Pre-check existence so we can return not-found without a useless
+        // Raft round-trip.
+        if (shard.kv_handler.*.kv.get(qkey) == null) {
+            sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+            return;
+        }
+
+        // Compute absolute expiry_ns from ttl_seconds, or 0 to clear.
+        var expiry_ns: u64 = 0;
+        if (!force_persist) {
+            var ttl_seconds: u64 = 0;
+            if (req.value.len == 8) {
+                ttl_seconds = std.mem.readInt(u64, req.value[0..8], .little);
+            } else if (req.value.len != 0) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "touch: value must be empty or 8-byte u64 LE" } });
+                return;
+            }
+            if (ttl_seconds > 0) {
+                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+                expiry_ns = now_ns + ttl_seconds * 1_000_000_000;
+            }
+        }
+
+        var val_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &val_buf, expiry_ns, .little);
+
+        _ = proposeKVEntryWithValue(shard, .kv_touch, req, qkey, &val_buf) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        applyCommittedEntries(shard);
+        sendKVResponse(shard, conn, req.header.request_id, .ok);
+    }
+
+    /// EXISTS — return a 1-byte payload (0x00 or 0x01) wrapped in a kv_value
+    /// envelope. version field is 0 when missing, otherwise the entry version.
+    fn dispatchExists(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        const S = struct {
+            threadlocal var byte: [1]u8 = undefined;
+        };
+        if (shard.kv_handler.*.kv.get(qkey)) |entry| {
+            S.byte[0] = 1;
+            sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = S.byte[0..1], .version = entry.version } });
+        } else {
+            S.byte[0] = 0;
+            sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = S.byte[0..1], .version = 0 } });
+        }
+    }
+
+    /// JSON.GET — extract a path from a JSON-encoded value.
+    /// Wire format: key = the KV key, value = the path expression (e.g. "$.name").
+    fn dispatchJsonGet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+            return;
+        };
+
+        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
+
+        const json_path = @import("../util/json_path.zig");
+        const result_bytes = json_path.jsonPathGet(shard.kv_handler.*.allocator, entry.value, path) catch |err| {
+            const cmd: CommandResult = switch (err) {
+                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, cmd);
+            return;
+        };
+        defer shard.kv_handler.*.allocator.free(result_bytes);
+
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = result_bytes, .version = entry.version } });
+    }
+
+    /// JSON.SET — set the JSON value at `path` (read-modify-write through Raft).
+    /// Wire format: key = KV key, value = `[path_len:u16][path][json]`.
+    fn dispatchJsonSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+        if (isReservedKey(req.key)) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
+            return;
+        }
+
+        // Parse [path_len:u16][path][json] from value.
+        if (req.value.len < 2) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: missing path_len" } });
+            return;
+        }
+        const path_len = std.mem.readInt(u16, req.value[0..2], .little);
+        if (req.value.len < 2 + path_len) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: truncated path" } });
+            return;
+        }
+        const path = req.value[2 .. 2 + path_len];
+        const new_json = req.value[2 + path_len ..];
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        const json_path = @import("../util/json_path.zig");
+        const allocator = shard.kv_handler.*.allocator;
+
+        // Compute new document. Root path on a missing key creates a new doc.
+        const merged: []u8 = blk: {
+            if (shard.kv_handler.*.kv.get(qkey)) |entry| {
+                break :blk json_path.jsonPathSet(allocator, entry.value, path, new_json) catch |err| {
+                    const cmd: CommandResult = switch (err) {
+                        error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                        error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                        error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+                    };
+                    sendKVResponse(shard, conn, req.header.request_id, cmd);
+                    return;
+                };
+            }
+            // No existing key. Only "$" makes sense — replace whole doc.
+            if (path.len != 1 or path[0] != '$') {
+                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+                return;
+            }
+            // Validate it's well-formed JSON before persisting.
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, new_json, .{}) catch {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "invalid json document" } });
+                return;
+            };
+            parsed.deinit();
+            break :blk allocator.dupe(u8, new_json) catch {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "out of memory" } });
+                return;
+            };
+        };
+        defer allocator.free(merged);
+
+        _ = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        applyCommittedEntries(shard);
+        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+
+        const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_put_ok = .{ .version = version } });
+    }
+
+    /// JSON.DEL — remove a path. Path "$" deletes the whole key.
+    /// Wire format: key = KV key, value = path expression.
+    fn dispatchJsonDel(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        if (validateKeySize(req.namespace, req.key)) |err_msg| {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
+            return;
+        }
+        if (isReservedKey(req.key)) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
+            return;
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
+            return;
+        };
+
+        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
+
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+            return;
+        };
+
+        // Path "$" → delete the entire key (use kv_delete entry).
+        if (path.len == 1 and path[0] == '$') {
+            _ = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| {
+                const result: CommandResult = switch (err) {
+                    error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                    else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+                };
+                sendKVResponse(shard, conn, req.header.request_id, result);
+                return;
+            };
+            applyCommittedEntries(shard);
+            shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+            sendKVResponse(shard, conn, req.header.request_id, .ok);
+            return;
+        }
+
+        // Sub-path → read-modify-write as kv_put.
+        const json_path = @import("../util/json_path.zig");
+        const allocator = shard.kv_handler.*.allocator;
+        const merged = json_path.jsonPathDel(allocator, entry.value, path) catch |err| {
+            const cmd: CommandResult = switch (err) {
+                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, cmd);
+            return;
+        };
+        defer allocator.free(merged);
+
+        _ = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        applyCommittedEntries(shard);
+        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
@@ -524,9 +903,22 @@ pub const KVHandler = struct {
     /// After this returns successfully, call `applyCommittedEntries()` to apply
     /// any newly committed entries to the KV projection.
     fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request, qualified_key: []const u8) !@import("../raft/node.zig").ProposeResult {
+        const value: []const u8 = if (entry_type == .kv_delete) &[_]u8{} else req.value;
+        return proposeKVEntryWithValue(shard, entry_type, req, qualified_key, value);
+    }
+
+    /// Like `proposeKVEntry` but uses a caller-supplied value override instead
+    /// of `req.value`. Used by INCR (8-byte i64 LE delta) and TOUCH/PERSIST
+    /// (8-byte u64 LE absolute expiry_ns).
+    fn proposeKVEntryWithValue(
+        shard: *Shard,
+        entry_type: entry_mod.EntryType,
+        req: Request,
+        qualified_key: []const u8,
+        value: []const u8,
+    ) !@import("../raft/node.zig").ProposeResult {
         // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
         var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
-        const value = if (entry_type == .kv_delete) &[_]u8{} else req.value;
         const cmd = entry_mod.CommandPayload{
             .namespace_hash = router.namespaceHash(req.namespace),
             .key_length = @intCast(qualified_key.len),
@@ -602,6 +994,13 @@ pub const KVHandler = struct {
             .kv_delete => self.handleDeleteDirect(req),
             .kv_scan => self.handleScan(req),
             .kv_history => self.handleHistory(req),
+            .kv_incr => self.handleIncrDirect(req),
+            .kv_touch => self.handleTouchDirect(req, false),
+            .kv_persist => self.handleTouchDirect(req, true),
+            .kv_exists => self.handleExistsDirect(req),
+            .kv_json_get => self.handleJsonGetDirect(req),
+            .kv_json_set => self.handleJsonSetDirect(req),
+            .kv_json_del => self.handleJsonDelDirect(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown KV opcode" } },
         };
     }
@@ -859,6 +1258,201 @@ pub const KVHandler = struct {
         }
 
         return .{ .kv_history_result = .{ .data = data } };
+    }
+
+    // ── Extended KV (Direct/RESP path — bypasses Raft) ─────────────────
+
+    /// Direct INCR — operates on local KV. Used by RESP path. Default delta = 1
+    /// when the value field is empty. Returns kv_value with 8-byte i64 LE.
+    fn handleIncrDirect(self: *KVHandler, req: Request) CommandResult {
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+
+        var delta: i64 = 1;
+        if (req.value.len == 8) {
+            delta = std.mem.readInt(i64, req.value[0..8], .little);
+        } else if (req.value.len != 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "incr: value must be empty or 8-byte i64 LE" } };
+        }
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        if (self.kv.getRaw(qkey)) |existing| {
+            if (!existing.tombstone and existing.value.len != 8) {
+                return .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } };
+            }
+        }
+
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        _ = self.kv.applyIncr(qkey, delta, lsn, 0, timestamp) catch |err| {
+            return switch (err) {
+                error.Overflow => .{ .err = .{ .code = .invalid_request, .message = "counter overflow" } },
+                error.NotACounter => .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } },
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+            };
+        };
+
+        const entry = self.kv.get(qkey) orelse
+            return .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } };
+        return .{ .kv_value = .{ .value = entry.value, .version = entry.version } };
+    }
+
+    /// Direct TOUCH/PERSIST — operates on local KV.
+    fn handleTouchDirect(self: *KVHandler, req: Request, force_persist: bool) CommandResult {
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        if (self.kv.get(qkey) == null) return .kv_not_found;
+
+        var expiry_ns: u64 = 0;
+        if (!force_persist) {
+            var ttl_seconds: u64 = 0;
+            if (req.value.len == 8) {
+                ttl_seconds = std.mem.readInt(u64, req.value[0..8], .little);
+            } else if (req.value.len != 0) {
+                return .{ .err = .{ .code = .invalid_request, .message = "touch: value must be empty or 8-byte u64 LE" } };
+            }
+            if (ttl_seconds > 0) {
+                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+                expiry_ns = now_ns + ttl_seconds * 1_000_000_000;
+            }
+        }
+
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        self.kv.applyTouch(qkey, expiry_ns, lsn, 0, timestamp) catch |err| switch (err) {
+            error.NotFound => return .kv_not_found,
+        };
+        return .ok;
+    }
+
+    /// Direct EXISTS — returns kv_value with single byte 0/1.
+    fn handleExistsDirect(self: *KVHandler, req: Request) CommandResult {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        const S = struct {
+            threadlocal var byte: [1]u8 = undefined;
+        };
+        if (self.kv.get(qkey)) |entry| {
+            S.byte[0] = 1;
+            return .{ .kv_value = .{ .value = S.byte[0..1], .version = entry.version } };
+        }
+        S.byte[0] = 0;
+        return .{ .kv_value = .{ .value = S.byte[0..1], .version = 0 } };
+    }
+
+    /// Direct JSON.GET — owned bytes are returned via kv_value.value but the
+    /// allocation lives until the next handler call. Caller (RESP path)
+    /// serializes the response synchronously before this can be reused.
+    fn handleJsonGetDirect(self: *KVHandler, req: Request) CommandResult {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        const entry = self.kv.get(qkey) orelse return .kv_not_found;
+
+        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
+        const json_path = @import("../util/json_path.zig");
+        const result_bytes = json_path.jsonPathGet(self.allocator, entry.value, path) catch |err| {
+            return switch (err) {
+                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+            };
+        };
+
+        // Stash the allocation so freeResult() can free it.
+        return .{ .kv_scan_result = .{ .data = result_bytes } };
+    }
+
+    /// Direct JSON.SET — value layout: [path_len:u16][path][json].
+    fn handleJsonSetDirect(self: *KVHandler, req: Request) CommandResult {
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+
+        if (req.value.len < 2) return .{ .err = .{ .code = .invalid_request, .message = "json_set: missing path_len" } };
+        const path_len = std.mem.readInt(u16, req.value[0..2], .little);
+        if (req.value.len < 2 + path_len) return .{ .err = .{ .code = .invalid_request, .message = "json_set: truncated path" } };
+        const path = req.value[2 .. 2 + path_len];
+        const new_json = req.value[2 + path_len ..];
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        const json_path = @import("../util/json_path.zig");
+
+        const merged: []u8 = blk: {
+            if (self.kv.get(qkey)) |entry| {
+                break :blk json_path.jsonPathSet(self.allocator, entry.value, path, new_json) catch |err| {
+                    return switch (err) {
+                        error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                        error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                        error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+                    };
+                };
+            }
+            if (path.len != 1 or path[0] != '$') return .kv_not_found;
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, new_json, .{}) catch
+                return .{ .err = .{ .code = .invalid_request, .message = "invalid json document" } };
+            parsed.deinit();
+            break :blk self.allocator.dupe(u8, new_json) catch
+                return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
+        };
+        defer self.allocator.free(merged);
+
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        self.kv.put(qkey, merged, lsn, 0, timestamp, 0) catch
+            return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
+        const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
+        return .{ .kv_put_ok = .{ .version = version } };
+    }
+
+    /// Direct JSON.DEL.
+    fn handleJsonDelDirect(self: *KVHandler, req: Request) CommandResult {
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
+        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
+
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+
+        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
+        const entry = self.kv.get(qkey) orelse return .kv_not_found;
+
+        if (path.len == 1 and path[0] == '$') {
+            const lsn = self.nextLsn();
+            const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+            self.kv.delete(qkey, lsn, 0, timestamp) catch
+                return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
+            return .ok;
+        }
+
+        const json_path = @import("../util/json_path.zig");
+        const merged = json_path.jsonPathDel(self.allocator, entry.value, path) catch |err| {
+            return switch (err) {
+                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
+                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
+            };
+        };
+        defer self.allocator.free(merged);
+
+        const lsn = self.nextLsn();
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        self.kv.put(qkey, merged, lsn, 0, timestamp, 0) catch
+            return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
+        return .ok;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1433,6 +2027,15 @@ test "kv handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_history)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_mget)] != null);
 
+    // New extended KV opcodes (KV_ENHANCEMENTS phase 1).
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_incr)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_touch)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_persist)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_exists)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_get)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_set)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_del)] != null);
+
     // Verify pre-route hooks
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_get)] != null);
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_put)] != null);
@@ -1440,8 +2043,8 @@ test "kv handler: dispatcher registration" {
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_history)] == null); // no routing for history
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_mget)] == null); // multi-key, no pre-route
 
-    // 6 handlers registered
-    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
+    // 6 original + 7 new extended = 13 handlers registered
+    try testing.expectEqual(@as(u16, 13), dispatcher.handler_count);
 }
 
 test "kv handler: pre-route by key" {

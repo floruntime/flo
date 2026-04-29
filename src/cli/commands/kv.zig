@@ -121,6 +121,86 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("limit", 'l', 10, "Maximum entries to show")
                 .action(wrapHandler(runHistory)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("incr")
+                .about("Atomically increment a counter")
+                .examples(&.{
+                    "flo kv incr counter",
+                    "flo kv incr counter --by 5",
+                    "flo kv incr counter --by -1",
+                })
+                .arg("key", "Counter key")
+                .int64Flag("by", 'b', 1, "Delta to add (may be negative)")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runIncr)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("touch")
+                .about("Update the TTL of an existing key")
+                .examples(&.{
+                    "flo kv touch session:abc --ttl 3600",
+                    "flo kv touch session:abc --ttl 0  # clears the TTL",
+                })
+                .arg("key", "Key whose TTL to update")
+                .uint64Flag("ttl", 0, 0, "New TTL in seconds (0 clears)")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runTouch)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("persist")
+                .about("Remove the TTL on an existing key")
+                .arg("key", "Key whose TTL to clear")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runPersist)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("exists")
+                .about("Check whether a key exists (exit 0 = yes, 1 = no)")
+                .arg("key", "Key to check")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runExists)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("json-get")
+                .about("Extract a JSONPath subtree from a JSON-encoded value")
+                .examples(&.{
+                    "flo kv json-get user:123",
+                    "flo kv json-get user:123 --path '$.name'",
+                    "flo kv json-get user:123 --path '$.addresses[0].city'",
+                })
+                .arg("key", "Key holding the JSON document")
+                .stringFlag("path", 'p', "$", "JSONPath expression")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runJsonGet)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("json-set")
+                .about("Set a JSON value at the given path (read-modify-write)")
+                .examples(&.{
+                    "flo kv json-set user:123 '{\"name\":\"alice\"}'",
+                    "flo kv json-set user:123 '\"bob\"' --path '$.name'",
+                })
+                .arg("key", "Key holding the JSON document")
+                .arg("value", "Replacement value (must itself be valid JSON)")
+                .stringFlag("path", 'p', "$", "JSONPath expression")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runJsonSet)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("json-del")
+                .about("Delete a JSON path. Path '$' deletes the whole key.")
+                .arg("key", "Key holding the JSON document")
+                .stringFlag("path", 'p', "$", "JSONPath expression")
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .action(wrapHandler(runJsonDel)),
+        )
         .build();
 }
 
@@ -591,6 +671,216 @@ fn outputKvResult(ctx: *commander.Context, format: output.Format, key: []const u
             }
         },
     }
+}
+
+// ==================== Extended KV Operations ====================
+
+fn dialClient(ctx: *commander.Context) commander.Error!Client {
+    const endpoint = cli_config.getEndpoint(ctx);
+    var client = Client.init(ctx.allocator, endpoint);
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
+        client.deinit();
+        return error.CommandFailed;
+    };
+    return client;
+}
+
+fn optionalRoutingKey(ctx: *commander.Context) ?[]const u8 {
+    const rk = ctx.getString("routing-key") orelse return null;
+    return if (rk.len > 0) rk else null;
+}
+
+fn runIncr(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const delta: i64 = ctx.getInt64("by") orelse 1;
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.incr(&client, namespace, key, delta, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const value = result.asString() orelse {
+        ctx.printErr("Error: empty counter response\n", .{});
+        return error.CommandFailed;
+    };
+    if (value.len != 8) {
+        ctx.printErr("Error: malformed counter response\n", .{});
+        return error.CommandFailed;
+    }
+    const counter = std.mem.readInt(i64, value[0..8], .little);
+    ctx.print("{d}\n", .{counter});
+}
+
+fn runTouch(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const ttl: u64 = ctx.getUint64("ttl") orelse 0;
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        ctx.printErr("Key not found\n", .{});
+        return error.CommandFailed;
+    }
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("OK\n", .{});
+}
+
+fn runPersist(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.persist(&client, namespace, key, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        ctx.printErr("Key not found\n", .{});
+        return error.CommandFailed;
+    }
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("OK\n", .{});
+}
+
+fn runExists(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.exists(&client, namespace, key, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const value = result.asString() orelse "";
+    const present = value.len == 1 and value[0] == 1;
+    if (present) {
+        ctx.print("1\n", .{});
+    } else {
+        ctx.print("0\n", .{});
+        return error.CommandFailed; // exit 1 — useful for shell `if`
+    }
+}
+
+fn runJsonGet(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const path = ctx.getString("path") orelse "$";
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.jsonGet(&client, namespace, key, path, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        ctx.printErr("Not found\n", .{});
+        return error.CommandFailed;
+    }
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("{s}\n", .{result.asString() orelse ""});
+}
+
+fn runJsonSet(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const value = ctx.getPositional("value").?;
+    const path = ctx.getString("path") orelse "$";
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.jsonSet(&client, namespace, key, path, value, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        ctx.printErr("Path not found\n", .{});
+        return error.CommandFailed;
+    }
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("OK\n", .{});
+}
+
+fn runJsonDel(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key").?;
+    const path = ctx.getString("path") orelse "$";
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = optionalRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.jsonDel(&client, namespace, key, path, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        ctx.printErr("Path not found\n", .{});
+        return error.CommandFailed;
+    }
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("OK\n", .{});
 }
 
 // ==================== Testing ====================

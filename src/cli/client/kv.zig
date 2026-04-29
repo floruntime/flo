@@ -152,3 +152,101 @@ pub fn mget(client: *Client, namespace: []const u8, keys: []const []const u8) !R
 
     return client.sendRequest(.kv_mget, namespace, "", value_buf[0..offset]);
 }
+
+// ── Extended KV Operations (KV_ENHANCEMENTS phase 1) ─────────────────────
+
+/// INCR — atomic counter increment. Wire format: value is 8-byte i64 LE delta.
+/// Pass delta=0 to read-only increment-by-zero is rejected; default to 1 if 0.
+/// Returns kv_value with 8-byte i64 LE counter value.
+pub fn incr(client: *Client, namespace: []const u8, key: []const u8, delta: i64, routing_key: ?[]const u8) !Response {
+    var val_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &val_buf, delta, .little);
+
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_incr, namespace, key, &val_buf, builder.getOptions());
+    }
+    return client.sendRequest(.kv_incr, namespace, key, &val_buf);
+}
+
+/// TOUCH — update an existing key's TTL. ttl_seconds=0 clears the TTL (same as PERSIST).
+pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_seconds: u64, routing_key: ?[]const u8) !Response {
+    var val_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &val_buf, ttl_seconds, .little);
+
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_touch, namespace, key, &val_buf, builder.getOptions());
+    }
+    return client.sendRequest(.kv_touch, namespace, key, &val_buf);
+}
+
+/// PERSIST — clear the TTL on an existing key. No value payload required.
+pub fn persist(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8) !Response {
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_persist, namespace, key, "", builder.getOptions());
+    }
+    return client.sendRequest(.kv_persist, namespace, key, "");
+}
+
+/// EXISTS — check whether a key exists. Returns kv_value with a single byte: 0x01 if present, 0x00 if absent.
+pub fn exists(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8) !Response {
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_exists, namespace, key, "", builder.getOptions());
+    }
+    return client.sendRequest(.kv_exists, namespace, key, "");
+}
+
+/// JSON.GET — extract a JSONPath subtree from a JSON-encoded value.
+/// Path syntax: $, $.field, $.a.b, $.arr[0]. Defaults to "$" if empty.
+pub fn jsonGet(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, routing_key: ?[]const u8) !Response {
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_json_get, namespace, key, path, builder.getOptions());
+    }
+    return client.sendRequest(.kv_json_get, namespace, key, path);
+}
+
+/// JSON.SET — set a JSON value at `path` (read-modify-write).
+/// Wire format: value = [path_len:u16][path][json].
+pub fn jsonSet(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, json_value: []const u8, routing_key: ?[]const u8) !Response {
+    if (path.len > 0xFFFF) return error.PathTooLong;
+    const total = 2 + path.len + json_value.len;
+    const buf = try client.allocator.alloc(u8, total);
+    defer client.allocator.free(buf);
+
+    std.mem.writeInt(u16, buf[0..2], @intCast(path.len), .little);
+    @memcpy(buf[2 .. 2 + path.len], path);
+    @memcpy(buf[2 + path.len ..], json_value);
+
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_json_set, namespace, key, buf, builder.getOptions());
+    }
+    return client.sendRequest(.kv_json_set, namespace, key, buf);
+}
+
+/// JSON.DEL — remove the value at `path`. Path "$" deletes the entire key.
+pub fn jsonDel(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, routing_key: ?[]const u8) !Response {
+    if (routing_key) |rk| {
+        var options_buf: [64]u8 = undefined;
+        var builder = proto.OptionsBuilder.init(&options_buf);
+        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
+        return client.sendRequestWithOptions(.kv_json_del, namespace, key, path, builder.getOptions());
+    }
+    return client.sendRequest(.kv_json_del, namespace, key, path);
+}

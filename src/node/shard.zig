@@ -1348,6 +1348,7 @@ pub const Shard = struct {
 
         // Dispatch to the appropriate handler and get CommandResult
         const cmd_result = self.handleRespOpcode(cmd.opcode, req);
+        defer self.kv_handler.freeResult(cmd_result);
 
         // Translate CommandResult → RESP and serialize
         const resp_value = resp_mod.translateResult(cmd_result);
@@ -1370,6 +1371,13 @@ pub const Shard = struct {
             .kv_get => self.kv_handler.handleCommand(req),
             .kv_put => self.kv_handler.handleCommand(req),
             .kv_delete => self.kv_handler.handleCommand(req),
+            .kv_incr => self.kv_handler.handleCommand(req),
+            .kv_touch => self.kv_handler.handleCommand(req),
+            .kv_persist => self.kv_handler.handleCommand(req),
+            .kv_exists => self.kv_handler.handleCommand(req),
+            .kv_json_get => self.kv_handler.handleCommand(req),
+            .kv_json_set => self.kv_handler.handleCommand(req),
+            .kv_json_del => self.kv_handler.handleCommand(req),
             .stream_append => self.stream_handler.handleCommand(req),
             .stream_read => self.stream_handler.handleCommand(req),
             .queue_enqueue => self.queue_handler.handleCommand(req),

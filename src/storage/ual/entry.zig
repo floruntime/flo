@@ -61,6 +61,8 @@ pub const EntryType = enum(u8) {
     kv_put = 0x01,
     kv_delete = 0x02,
     kv_batch = 0x03,
+    kv_incr = 0x04,
+    kv_touch = 0x05,
 
     // ── Stream ──
     stream_append = 0x10,
@@ -115,7 +117,7 @@ pub const EntryType = enum(u8) {
     /// Returns true if this type carries a key-value command payload.
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
-            .kv_put, .kv_delete, .kv_batch => true,
+            .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_touch => true,
             .stream_append, .stream_trim => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => true,
             .ts_write, .ts_write_batch => true,

@@ -83,10 +83,22 @@ pub const OpCode = enum(u16) {
     kv_put_response = 0x108,
     kv_scan_response = 0x109,
     kv_history_response = 0x10A,
+    // ── KV Extended (atomic counters, JSON ops) ─────────────────────────
+    kv_incr = 0x10B,
+    kv_json_get = 0x10C,
+    kv_json_set = 0x10D,
+    kv_json_del = 0x10E,
 
     kv_begin_txn = 0x110,
     kv_commit_txn = 0x111,
     kv_rollback_txn = 0x112,
+    // ── KV Extended (TTL lifecycle, exists) ─────────────────────────────
+    kv_touch = 0x113,
+    kv_persist = 0x114,
+    kv_exists = 0x115,
+    kv_incr_response = 0x116,
+    kv_json_response = 0x117,
+    kv_exists_response = 0x118,
 
     kv_snapshot_create = 0x120,
     kv_snapshot_get = 0x121,

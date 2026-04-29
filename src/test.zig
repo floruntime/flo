@@ -10,6 +10,7 @@ test {
 test {
     _ = @import("util/checksum.zig");
     _ = @import("util/json.zig");
+    _ = @import("util/json_path.zig");
     _ = @import("util/validation.zig");
 }
 

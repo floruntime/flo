@@ -510,6 +510,102 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
             .key = try allocator.dupe(u8, queue_name),
             .value = "",
         } };
+    } else if (std.mem.eql(u8, cmd, "INCR") or std.mem.eql(u8, cmd, "DECR")) {
+        if (arr.len < 2) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const delta: i64 = if (std.mem.eql(u8, cmd, "INCR")) 1 else -1;
+        const buf = try allocator.alloc(u8, 8);
+        std.mem.writeInt(i64, buf[0..8], delta, .little);
+        return .{ .command = .{
+            .opcode = .kv_incr,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = buf,
+        } };
+    } else if (std.mem.eql(u8, cmd, "INCRBY") or std.mem.eql(u8, cmd, "DECRBY")) {
+        if (arr.len < 3) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const raw = getInteger(arr[2]) orelse return error.InvalidCommand;
+        const delta: i64 = if (std.mem.eql(u8, cmd, "INCRBY")) raw else -raw;
+        const buf = try allocator.alloc(u8, 8);
+        std.mem.writeInt(i64, buf[0..8], delta, .little);
+        return .{ .command = .{
+            .opcode = .kv_incr,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = buf,
+        } };
+    } else if (std.mem.eql(u8, cmd, "EXPIRE") or std.mem.eql(u8, cmd, "PEXPIRE")) {
+        if (arr.len < 3) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const raw = getInteger(arr[2]) orelse return error.InvalidCommand;
+        if (raw < 0) return error.InvalidCommand;
+        const ttl_seconds: u64 = if (std.mem.eql(u8, cmd, "EXPIRE"))
+            @intCast(raw)
+        else
+            @intCast(@divTrunc(raw, 1000));
+        const buf = try allocator.alloc(u8, 8);
+        std.mem.writeInt(u64, buf[0..8], ttl_seconds, .little);
+        return .{ .command = .{
+            .opcode = .kv_touch,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = buf,
+        } };
+    } else if (std.mem.eql(u8, cmd, "PERSIST")) {
+        if (arr.len < 2) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        return .{ .command = .{
+            .opcode = .kv_persist,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = "",
+        } };
+    } else if (std.mem.eql(u8, cmd, "EXISTS")) {
+        if (arr.len < 2) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        return .{ .command = .{
+            .opcode = .kv_exists,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = "",
+        } };
+    } else if (std.ascii.eqlIgnoreCase(cmd_name, "JSON.GET")) {
+        if (arr.len < 2) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const path: []const u8 = if (arr.len >= 3) (getBulkString(arr[2]) orelse "$") else "$";
+        return .{ .command = .{
+            .opcode = .kv_json_get,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = try allocator.dupe(u8, path),
+        } };
+    } else if (std.ascii.eqlIgnoreCase(cmd_name, "JSON.SET")) {
+        if (arr.len < 4) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const path = getBulkString(arr[2]) orelse return error.InvalidCommand;
+        const json = getBulkString(arr[3]) orelse return error.InvalidCommand;
+        if (path.len > std.math.maxInt(u16)) return error.InvalidCommand;
+        const buf = try allocator.alloc(u8, 2 + path.len + json.len);
+        std.mem.writeInt(u16, buf[0..2], @intCast(path.len), .little);
+        @memcpy(buf[2 .. 2 + path.len], path);
+        @memcpy(buf[2 + path.len ..], json);
+        return .{ .command = .{
+            .opcode = .kv_json_set,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = buf,
+        } };
+    } else if (std.ascii.eqlIgnoreCase(cmd_name, "JSON.DEL") or std.ascii.eqlIgnoreCase(cmd_name, "JSON.FORGET")) {
+        if (arr.len < 2) return error.InvalidCommand;
+        const key = getBulkString(arr[1]) orelse return error.InvalidCommand;
+        const path: []const u8 = if (arr.len >= 3) (getBulkString(arr[2]) orelse "$") else "$";
+        return .{ .command = .{
+            .opcode = .kv_json_del,
+            .namespace = namespace,
+            .key = try allocator.dupe(u8, key),
+            .value = try allocator.dupe(u8, path),
+        } };
     } else {
         return error.UnknownCommand;
     }
@@ -542,10 +638,26 @@ pub fn translateResult(result: CommandResult) RespValue {
         .pong => .{ .simple_string = "PONG" },
         .err => |e| .{ .error_string = e.message },
 
-        .kv_value => |v| .{ .bulk_string = v.value },
+        .kv_value => |v| blk: {
+            // INCR/INCRBY/DECR/DECRBY return 8-byte i64 LE — translate to RESP integer.
+            // EXISTS returns 1-byte — translate to RESP integer.
+            if (v.value.len == 8) {
+                break :blk .{ .integer = std.mem.readInt(i64, v.value[0..8], .little) };
+            }
+            if (v.value.len == 1 and (v.value[0] == 0 or v.value[0] == 1)) {
+                break :blk .{ .integer = @intCast(v.value[0]) };
+            }
+            break :blk .{ .bulk_string = v.value };
+        },
         .kv_not_found => .{ .null_bulk = {} },
         .kv_put_ok => .{ .simple_string = "OK" },
         .kv_cas_failed => .{ .error_string = "ERR CAS version mismatch" },
+        .kv_condition_not_met => .{ .null_bulk = {} },
+        .kv_scan_result => |r| blk: {
+            // Used by JSON.GET — payload is the JSON bytes.
+            if (r.data.len == 0) break :blk .{ .null_bulk = {} };
+            break :blk .{ .bulk_string = r.data };
+        },
 
         .stream_append_ok => |a| .{ .integer = @intCast(a.sequence) },
         .stream_messages => |m| blk: {
@@ -744,4 +856,176 @@ test "translateCommand LPUSH maps to queue enqueue" {
     try std.testing.expectEqual(proto.OpCode.queue_enqueue, cmd.opcode);
     try std.testing.expectEqualStrings("tasks", cmd.key);
     try std.testing.expectEqualStrings("work", cmd.value);
+}
+
+test "translateCommand INCR encodes 8-byte LE +1" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$4\r\nINCR\r\n$3\r\ncnt\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_incr, cmd.opcode);
+    try std.testing.expectEqualStrings("cnt", cmd.key);
+    try std.testing.expectEqual(@as(usize, 8), cmd.value.len);
+    try std.testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, cmd.value[0..8], .little));
+}
+
+test "translateCommand INCRBY encodes signed delta" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*3\r\n$6\r\nINCRBY\r\n$3\r\ncnt\r\n$2\r\n42\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_incr, cmd.opcode);
+    try std.testing.expectEqual(@as(i64, 42), std.mem.readInt(i64, cmd.value[0..8], .little));
+}
+
+test "translateCommand DECR encodes -1" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$4\r\nDECR\r\n$3\r\ncnt\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_incr, cmd.opcode);
+    try std.testing.expectEqual(@as(i64, -1), std.mem.readInt(i64, cmd.value[0..8], .little));
+}
+
+test "translateCommand EXPIRE encodes seconds as u64 LE" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$2\r\n60\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_touch, cmd.opcode);
+    try std.testing.expectEqual(@as(u64, 60), std.mem.readInt(u64, cmd.value[0..8], .little));
+}
+
+test "translateCommand PEXPIRE converts ms to seconds" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*3\r\n$7\r\nPEXPIRE\r\n$3\r\nfoo\r\n$5\r\n60000\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_touch, cmd.opcode);
+    try std.testing.expectEqual(@as(u64, 60), std.mem.readInt(u64, cmd.value[0..8], .little));
+}
+
+test "translateCommand PERSIST" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$7\r\nPERSIST\r\n$3\r\nfoo\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+
+    try std.testing.expectEqual(proto.OpCode.kv_persist, cmd.opcode);
+    try std.testing.expectEqualStrings("foo", cmd.key);
+}
+
+test "translateCommand EXISTS" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$6\r\nEXISTS\r\n$3\r\nfoo\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+
+    try std.testing.expectEqual(proto.OpCode.kv_exists, cmd.opcode);
+}
+
+test "translateCommand JSON.SET encodes [path_len:u16][path][json]" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*4\r\n$8\r\nJSON.SET\r\n$3\r\ndoc\r\n$1\r\n$\r\n$12\r\n{\"name\":\"x\"}\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_json_set, cmd.opcode);
+    const path_len = std.mem.readInt(u16, cmd.value[0..2], .little);
+    try std.testing.expectEqual(@as(u16, 1), path_len);
+    try std.testing.expectEqualStrings("$", cmd.value[2 .. 2 + path_len]);
+    try std.testing.expectEqualStrings("{\"name\":\"x\"}", cmd.value[2 + path_len ..]);
+}
+
+test "translateCommand JSON.GET path defaults to $" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*2\r\n$8\r\nJSON.GET\r\n$3\r\ndoc\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_json_get, cmd.opcode);
+    try std.testing.expectEqualStrings("$", cmd.value);
+}
+
+test "translateCommand JSON.DEL" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    var result = (try parser.parse("*3\r\n$8\r\nJSON.DEL\r\n$3\r\ndoc\r\n$5\r\n$.foo\r\n")).?;
+    defer freeValue(allocator, &result.value);
+
+    const translated = try translateCommand(allocator, result.value, "default");
+    const cmd = translated.command;
+    defer allocator.free(cmd.key);
+    defer allocator.free(cmd.value);
+
+    try std.testing.expectEqual(proto.OpCode.kv_json_del, cmd.opcode);
+    try std.testing.expectEqualStrings("$.foo", cmd.value);
 }

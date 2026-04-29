@@ -27,6 +27,17 @@ const CommandPayload = entry_mod.CommandPayload;
 // KV Entry — stored in the hash map
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Logical type of a stored value. Used to distinguish opaque strings from
+/// integer counters (which support atomic INCR/DECR semantics) and JSON
+/// documents (which are still stored as strings but are conceptually
+/// structured).  Persisted in snapshots with backward-compatibility:
+/// snapshots written before this field existed are decoded as `.string`.
+pub const ValueType = enum(u8) {
+    string = 0,
+    counter = 1,
+    json = 2,
+};
+
 pub const KVEntry = struct {
     /// The key (owned, allocated).
     key: []const u8,
@@ -44,6 +55,8 @@ pub const KVEntry = struct {
     expiry_ns: u64,
     /// Whether this entry is a tombstone (deleted).
     tombstone: bool,
+    /// Logical value type.
+    value_type: ValueType = .string,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +165,11 @@ pub const KVProjection = struct {
 
     /// Put a key-value pair. expiry_ns = 0 means no expiration.
     pub fn put(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64, expiry_ns: u64) !void {
+        return self.putWithType(key, value, lsn, term, timestamp_ns, expiry_ns, .string);
+    }
+
+    /// Put a key-value pair, specifying the logical value type.
+    pub fn putWithType(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64, expiry_ns: u64, value_type: ValueType) !void {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
@@ -172,6 +190,7 @@ pub const KVProjection = struct {
             existing.timestamp_ns = timestamp_ns;
             existing.expiry_ns = expiry_ns;
             existing.tombstone = false;
+            existing.value_type = value_type;
             self.memory_used += owned_value.len;
         } else {
             try self.map.put(owned_key, .{
@@ -183,6 +202,7 @@ pub const KVProjection = struct {
                 .timestamp_ns = timestamp_ns,
                 .expiry_ns = expiry_ns,
                 .tombstone = false,
+                .value_type = value_type,
             });
             self.memory_used += owned_key.len + owned_value.len;
         }
@@ -237,6 +257,44 @@ pub const KVProjection = struct {
             self.memory_used += owned_key.len;
         }
         self.stats.deletes += 1;
+    }
+
+    // ─── Atomic counters ──────────────────────────────────────────────────
+
+    /// Apply an atomic increment by `delta` to `key`. If the key does not
+    /// exist, it is created with value `delta`. If the key exists, its value
+    /// is parsed as an i64 (little-endian, 8 bytes) and incremented. Returns
+    /// the new value. Returns error.NotACounter if the existing value is not
+    /// the expected width, and error.Overflow on signed-integer overflow.
+    pub fn applyIncr(self: *KVProjection, key: []const u8, delta: i64, lsn: u64, term: u64, timestamp_ns: u64) !i64 {
+        var current: i64 = 0;
+        if (self.map.getPtr(key)) |existing| {
+            if (!existing.tombstone) {
+                if (existing.value.len != 8) return error.NotACounter;
+                current = std.mem.readInt(i64, existing.value[0..8], .little);
+            }
+        }
+
+        const result = std.math.add(i64, current, delta) catch return error.Overflow;
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &buf, result, .little);
+        try self.putWithType(key, &buf, lsn, term, timestamp_ns, 0, .counter);
+        return result;
+    }
+
+    // ─── TTL lifecycle ─────────────────────────────────────────────────────
+
+    /// Update the TTL of an existing key without rewriting the value.
+    /// `expiry_ns = 0` clears the TTL (PERSIST). Updates lsn/term/timestamp_ns
+    /// but leaves `version` unchanged (TTL changes are not value mutations).
+    /// Returns error.NotFound if the key does not exist or is tombstoned.
+    pub fn applyTouch(self: *KVProjection, key: []const u8, expiry_ns: u64, lsn: u64, term: u64, timestamp_ns: u64) !void {
+        const existing = self.map.getPtr(key) orelse return error.NotFound;
+        if (existing.tombstone) return error.NotFound;
+        existing.expiry_ns = expiry_ns;
+        existing.lsn = lsn;
+        existing.term = term;
+        existing.timestamp_ns = timestamp_ns;
     }
 
     /// Scan all live (non-tombstone) entries. Results are unsorted.
@@ -515,6 +573,45 @@ pub const KVProjection = struct {
                     extractExpiry(entry, &cmd),
                 );
             },
+            .kv_incr => {
+                // Payload: CommandPayload where value is the 8-byte i64 LE delta.
+                const cmd = CommandPayload.deserialize(entry.payload) orelse
+                    return error.InvalidPayload;
+                if (cmd.value.len != 8) return error.InvalidPayload;
+                const delta = std.mem.readInt(i64, cmd.value[0..8], .little);
+                _ = self.applyIncr(
+                    cmd.key,
+                    delta,
+                    entry.header.index,
+                    entry.header.term,
+                    entry.header.timestamp_ns,
+                ) catch |err| switch (err) {
+                    // Overflow / NotACounter on replay are non-fatal: skip the
+                    // entry rather than crash the projection. The original
+                    // proposer surfaced the error to the client at apply time.
+                    error.Overflow, error.NotACounter => {},
+                    else => return err,
+                };
+            },
+            .kv_touch => {
+                // Payload: CommandPayload where value is the 8-byte u64 LE expiry_ns
+                // (0 = clear TTL / PERSIST).
+                const cmd = CommandPayload.deserialize(entry.payload) orelse
+                    return error.InvalidPayload;
+                if (cmd.value.len != 8) return error.InvalidPayload;
+                const expiry_ns = std.mem.readInt(u64, cmd.value[0..8], .little);
+                self.applyTouch(
+                    cmd.key,
+                    expiry_ns,
+                    entry.header.index,
+                    entry.header.term,
+                    entry.header.timestamp_ns,
+                ) catch |err| switch (err) {
+                    // TOUCH/PERSIST on a missing key is a no-op on the apply path —
+                    // the proposer already returned not-found to the client.
+                    error.NotFound => {},
+                };
+            },
             else => {},
         }
 
@@ -571,17 +668,24 @@ pub const KVProjection = struct {
     /// Format: [entry_count: u64] then per entry:
     ///   [key_len: u32][value_len: u32][lsn: u64][version: u64][term: u64]
     ///   [timestamp_ns: u64][expiry_ns: u64][flags: u8]
+    ///   [value_type: u8]   (only if flags & FLAG_HAS_VALUE_TYPE)
     ///   [key bytes][value bytes]
+    /// flags bit 0 = tombstone, bit 1 = has_value_type byte present.
+    /// Older snapshots (without bit 1) decode value_type as `.string`.
     /// Caller owns the returned slice.
     pub fn serialize(self: *KVProjection, allocator: Allocator) ![]u8 {
+        const FLAG_TOMBSTONE: u8 = 0x01;
+        const FLAG_HAS_VALUE_TYPE: u8 = 0x02;
+
         // Calculate total size
         const entry_count = self.map.count();
         var total_size: usize = 8; // entry_count: u64
         var it = self.map.iterator();
         while (it.next()) |kv| {
             const entry = kv.value_ptr;
-            // key_len(4) + value_len(4) + lsn(8) + version(8) + term(8) + timestamp_ns(8) + expiry_ns(8) + flags(1)
-            total_size += 49 + entry.key.len + entry.value.len;
+            // key_len(4) + value_len(4) + lsn(8) + version(8) + term(8)
+            //   + timestamp_ns(8) + expiry_ns(8) + flags(1) + value_type(1)
+            total_size += 50 + entry.key.len + entry.value.len;
         }
 
         const buf = try allocator.alloc(u8, total_size);
@@ -612,7 +716,11 @@ pub const KVProjection = struct {
             offset += 8;
             std.mem.writeInt(u64, buf[offset..][0..8], entry.expiry_ns, .little);
             offset += 8;
-            buf[offset] = if (entry.tombstone) 1 else 0;
+            var flags: u8 = FLAG_HAS_VALUE_TYPE;
+            if (entry.tombstone) flags |= FLAG_TOMBSTONE;
+            buf[offset] = flags;
+            offset += 1;
+            buf[offset] = @intFromEnum(entry.value_type);
             offset += 1;
 
             @memcpy(buf[offset..][0..entry.key.len], entry.key);
@@ -629,6 +737,9 @@ pub const KVProjection = struct {
     /// Restore KV projection state from serialized bytes.
     /// Clears all existing state before restoring.
     pub fn deserialize(self: *KVProjection, data: []const u8) !void {
+        const FLAG_TOMBSTONE: u8 = 0x01;
+        const FLAG_HAS_VALUE_TYPE: u8 = 0x02;
+
         // Clear existing state
         var old_it = self.map.iterator();
         while (old_it.next()) |kv| {
@@ -661,8 +772,17 @@ pub const KVProjection = struct {
             offset += 8;
             const expiry_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
-            const tombstone = data[offset] != 0;
+            const flags = data[offset];
             offset += 1;
+            const tombstone = (flags & FLAG_TOMBSTONE) != 0;
+
+            var value_type: ValueType = .string;
+            if ((flags & FLAG_HAS_VALUE_TYPE) != 0) {
+                if (offset + 1 > data.len) return error.InvalidPayload;
+                const vt_byte = data[offset];
+                offset += 1;
+                value_type = std.enums.fromInt(ValueType, vt_byte) orelse .string;
+            }
 
             if (offset + key_len + value_len > data.len) return error.InvalidPayload;
 
@@ -690,6 +810,7 @@ pub const KVProjection = struct {
                 .timestamp_ns = timestamp_ns,
                 .expiry_ns = expiry_ns,
                 .tombstone = tombstone,
+                .value_type = value_type,
             });
             self.memory_used += owned_key.len + owned_value.len;
         }

@@ -145,3 +145,86 @@ test "integration: KV projection scan with prefix" {
     try testing.expectEqualStrings("session:xyz", session_results[0].key);
     try testing.expectEqualStrings("active", session_results[0].value);
 }
+
+test "integration: KV INCR creates counter and increments" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    const v1 = try kv.applyIncr("counter", 1, 1, 1, 0);
+    try testing.expectEqual(@as(i64, 1), v1);
+
+    const v2 = try kv.applyIncr("counter", 41, 2, 1, 0);
+    try testing.expectEqual(@as(i64, 42), v2);
+
+    const v3 = try kv.applyIncr("counter", -10, 3, 1, 0);
+    try testing.expectEqual(@as(i64, 32), v3);
+
+    const entry = kv.get("counter").?;
+    try testing.expectEqual(@as(usize, 8), entry.value.len);
+    try testing.expectEqual(@as(i64, 32), std.mem.readInt(i64, entry.value[0..8], .little));
+}
+
+test "integration: KV INCR rejects non-counter values" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    try kv.put("notcounter", "hello", 1, 1, 0, 0);
+    try testing.expectError(error.NotACounter, kv.applyIncr("notcounter", 1, 2, 1, 0));
+}
+
+test "integration: KV INCR overflow detection" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    var max_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &max_buf, std.math.maxInt(i64), .little);
+    try kv.putWithType("big", &max_buf, 1, 1, 0, 0, src.projection.kv.ValueType.counter);
+
+    try testing.expectError(error.Overflow, kv.applyIncr("big", 1, 2, 1, 0));
+}
+
+test "integration: KV TOUCH updates expiry" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
+    try kv.put("doc", "data", 1, 1, now, 0);
+
+    try kv.applyTouch("doc", now + std.time.ns_per_s, 2, 1, now);
+    const entry = kv.get("doc").?;
+    try testing.expectEqual(now + std.time.ns_per_s, entry.expiry_ns);
+
+    // Persist (expiry=0)
+    try kv.applyTouch("doc", 0, 3, 1, now);
+    const after = kv.get("doc").?;
+    try testing.expectEqual(@as(u64, 0), after.expiry_ns);
+}
+
+test "integration: KV TOUCH on missing key" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    try testing.expectError(error.NotFound, kv.applyTouch("nope", 0, 1, 1, 0));
+}
+
+test "integration: KV snapshot round-trip preserves value_type" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+
+    _ = try kv.applyIncr("counter", 100, 1, 1, 0);
+    try kv.put("string", "hello", 2, 1, 0, 0);
+    try kv.put("json", "{\"k\":1}", 3, 1, 0, 0);
+
+    const snapshot = try kv.serialize(testing.allocator);
+    defer testing.allocator.free(snapshot);
+
+    var kv2 = KVProjection.init(testing.allocator, 0);
+    defer kv2.deinit();
+    try kv2.deserialize(snapshot);
+
+    const counter = kv2.get("counter").?;
+    try testing.expectEqual(src.projection.kv.ValueType.counter, counter.value_type);
+    try testing.expectEqual(@as(i64, 100), std.mem.readInt(i64, counter.value[0..8], .little));
+
+    const string_entry = kv2.get("string").?;
+    try testing.expectEqual(src.projection.kv.ValueType.string, string_entry.value_type);
+}

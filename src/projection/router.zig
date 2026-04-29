@@ -236,6 +236,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
     return switch (entry_type) {
         // KV + consumer group state
         .kv_put, .kv_delete, .kv_batch => .kv,
+        .kv_incr, .kv_touch => .kv,
         .cg_commit, .cg_create, .cg_delete => .kv,
 
         // Queue
