@@ -30,8 +30,7 @@ const CommandPayload = entry_mod.CommandPayload;
 /// Logical type of a stored value. Used to distinguish opaque strings from
 /// integer counters (which support atomic INCR/DECR semantics) and JSON
 /// documents (which are still stored as strings but are conceptually
-/// structured).  Persisted in snapshots with backward-compatibility:
-/// snapshots written before this field existed are decoded as `.string`.
+/// structured).
 pub const ValueType = enum(u8) {
     string = 0,
     counter = 1,
@@ -667,15 +666,12 @@ pub const KVProjection = struct {
     /// Serialize the full KV projection state to a byte buffer.
     /// Format: [entry_count: u64] then per entry:
     ///   [key_len: u32][value_len: u32][lsn: u64][version: u64][term: u64]
-    ///   [timestamp_ns: u64][expiry_ns: u64][flags: u8]
-    ///   [value_type: u8]   (only if flags & FLAG_HAS_VALUE_TYPE)
+    ///   [timestamp_ns: u64][expiry_ns: u64][flags: u8][value_type: u8]
     ///   [key bytes][value bytes]
-    /// flags bit 0 = tombstone, bit 1 = has_value_type byte present.
-    /// Older snapshots (without bit 1) decode value_type as `.string`.
+    /// flags bit 0 = tombstone.
     /// Caller owns the returned slice.
     pub fn serialize(self: *KVProjection, allocator: Allocator) ![]u8 {
         const FLAG_TOMBSTONE: u8 = 0x01;
-        const FLAG_HAS_VALUE_TYPE: u8 = 0x02;
 
         // Calculate total size
         const entry_count = self.map.count();
@@ -716,9 +712,7 @@ pub const KVProjection = struct {
             offset += 8;
             std.mem.writeInt(u64, buf[offset..][0..8], entry.expiry_ns, .little);
             offset += 8;
-            var flags: u8 = FLAG_HAS_VALUE_TYPE;
-            if (entry.tombstone) flags |= FLAG_TOMBSTONE;
-            buf[offset] = flags;
+            buf[offset] = if (entry.tombstone) FLAG_TOMBSTONE else 0;
             offset += 1;
             buf[offset] = @intFromEnum(entry.value_type);
             offset += 1;
@@ -738,7 +732,6 @@ pub const KVProjection = struct {
     /// Clears all existing state before restoring.
     pub fn deserialize(self: *KVProjection, data: []const u8) !void {
         const FLAG_TOMBSTONE: u8 = 0x01;
-        const FLAG_HAS_VALUE_TYPE: u8 = 0x02;
 
         // Clear existing state
         var old_it = self.map.iterator();
@@ -756,7 +749,7 @@ pub const KVProjection = struct {
 
         var i: u64 = 0;
         while (i < entry_count) : (i += 1) {
-            if (offset + 49 > data.len) return error.InvalidPayload;
+            if (offset + 50 > data.len) return error.InvalidPayload;
 
             const key_len = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
@@ -775,14 +768,9 @@ pub const KVProjection = struct {
             const flags = data[offset];
             offset += 1;
             const tombstone = (flags & FLAG_TOMBSTONE) != 0;
-
-            var value_type: ValueType = .string;
-            if ((flags & FLAG_HAS_VALUE_TYPE) != 0) {
-                if (offset + 1 > data.len) return error.InvalidPayload;
-                const vt_byte = data[offset];
-                offset += 1;
-                value_type = std.enums.fromInt(ValueType, vt_byte) orelse .string;
-            }
+            const vt_byte = data[offset];
+            offset += 1;
+            const value_type: ValueType = std.enums.fromInt(ValueType, vt_byte) orelse return error.InvalidPayload;
 
             if (offset + key_len + value_len > data.len) return error.InvalidPayload;
 
