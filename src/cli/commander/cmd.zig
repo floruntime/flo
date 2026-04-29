@@ -265,7 +265,7 @@ pub fn Cli(comptime root_spec: CmdSpec) type {
             const args = if (config.args) |a| a else blk: {
                 var arg_iter = try std.process.argsWithAllocator(allocator);
                 defer arg_iter.deinit();
-                var list: std.ArrayListUnmanaged([]const u8) = .{};
+                var list: std.ArrayListUnmanaged([]const u8) = .empty;
                 while (arg_iter.next()) |arg| {
                     try list.append(allocator, try allocator.dupe(u8, arg));
                 }
@@ -285,7 +285,7 @@ pub fn Cli(comptime root_spec: CmdSpec) type {
 
         fn runImpl(comptime handlers: anytype, allocator: Allocator, args: []const []const u8) !void {
             var global_flags: GlobalFlags = .{};
-            var remaining: std.ArrayListUnmanaged([]const u8) = .{};
+            var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
             defer remaining.deinit(allocator);
 
             var i: usize = 0;

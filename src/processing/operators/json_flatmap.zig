@@ -178,7 +178,7 @@ pub const JsonFlatMapOperator = struct {
         else
             expr;
 
-        var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
+        var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
         var iter = std.mem.splitScalar(u8, path, '.');
         while (iter.next()) |seg| {
             try seg_list.append(allocator, seg);
@@ -193,7 +193,7 @@ pub const JsonFlatMapOperator = struct {
         else
             expr;
 
-        var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
+        var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
         var iter = std.mem.splitScalar(u8, path, '.');
         while (iter.next()) |seg| {
             try seg_list.append(allocator, try allocator.dupe(u8, seg));
@@ -219,7 +219,7 @@ pub const JsonFlatMapOperator = struct {
     }
 
     fn serializeJsonValue(allocator: Allocator, value: std.json.Value) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
         try writeJsonValue(&buf, allocator, value);
         return try allocator.dupe(u8, buf.items);

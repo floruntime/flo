@@ -138,8 +138,8 @@ pub const PartitionTable = struct {
     pub fn init(allocator: Allocator, local_node_id: NodeId) PartitionTable {
         return .{
             .allocator = allocator,
-            .assignments = .{},
-            .node_partitions = .{},
+            .assignments = .empty,
+            .node_partitions = .empty,
             .epoch = 0,
             .local_node_id = local_node_id,
             .count = 0,
@@ -354,7 +354,7 @@ pub const PartitionTable = struct {
 
     /// Serialize the entire table for snapshot transfer
     pub fn serialize(self: *const PartitionTable, allocator: Allocator) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         // Version(1) + epoch(8) + count(4)
@@ -458,7 +458,7 @@ pub const PartitionTable = struct {
     fn addToNodeIndex(self: *PartitionTable, node_id: NodeId, key: PackedKey) !void {
         const gop = try self.node_partitions.getOrPut(self.allocator, node_id);
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
         // Check for duplicates
         for (gop.value_ptr.items) |existing| {

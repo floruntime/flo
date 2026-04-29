@@ -67,10 +67,10 @@ pub const Topology = struct {
     pub fn init(allocator: Allocator, name: []const u8) Self {
         return .{
             .name = name,
-            .operators = .{},
+            .operators = .empty,
             .source_ref = null,
             .sink_ref = null,
-            .nodes = .{},
+            .nodes = .empty,
             .allocator = allocator,
         };
     }

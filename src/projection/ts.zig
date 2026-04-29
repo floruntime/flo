@@ -149,7 +149,7 @@ fn seriesKeyHash(key: SeriesKey) u64 {
 }
 
 fn seriesKeyToString(allocator: Allocator, key: SeriesKey) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, key.measurement);
     try buf.append(allocator, 0);

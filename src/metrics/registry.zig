@@ -383,7 +383,7 @@ pub const ServerMetrics = struct {
 
     pub fn init() ServerMetrics {
         return .{
-            .start_time_ms = std.time.milliTimestamp(),
+            .start_time_ms = @import("stdx").time.milliTimestamp(),
         };
     }
 
@@ -416,7 +416,7 @@ pub const ServerMetrics = struct {
     }
 
     pub fn uptimeSeconds(self: *const ServerMetrics) u64 {
-        const now = std.time.milliTimestamp();
+        const now = @import("stdx").time.milliTimestamp();
         return @intCast(@divFloor(now - self.start_time_ms, 1000));
     }
 
@@ -626,7 +626,7 @@ pub const MetricsRegistry = struct {
     /// Number of configured shards (0 until initShards() is called)
     num_shards: u32,
 
-    mutex: std.Thread.Mutex,
+    mutex: @import("stdx").Mutex,
 
     pub const StreamEntry = struct {
         namespace: []const u8,
@@ -663,7 +663,7 @@ pub const MetricsRegistry = struct {
             .processing = ProcessingMetrics.init(),
             .shard_counters = null,
             .num_shards = 0,
-            .mutex = std.Thread.Mutex{},
+            .mutex = @import("stdx").Mutex{},
         };
     }
 
@@ -893,9 +893,9 @@ pub const MetricsRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var buf = std.ArrayList(u8){};
-        errdefer buf.deinit(allocator);
-        const writer = buf.writer(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const writer = &aw.writer;
 
         // Export server metrics first
         try writeServerMetrics(writer, self.server.snapshot());
@@ -956,7 +956,7 @@ pub const MetricsRegistry = struct {
         // Export processing metrics
         try writeProcessingMetrics(writer, self.processing.snapshot());
 
-        return buf.toOwnedSlice(allocator);
+        return aw.toOwnedSlice();
     }
 
     /// Get stream count (for monitoring/debugging)

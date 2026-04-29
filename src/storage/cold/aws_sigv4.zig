@@ -75,8 +75,8 @@ pub fn signRequest(
 
     // Create canonical request
     var canonical_buf: [4096]u8 = undefined;
-    var canonical_fbs = std.io.fixedBufferStream(&canonical_buf);
-    const canonical_writer = canonical_fbs.writer();
+    var canonical_fbs: std.Io.Writer = .fixed(&canonical_buf);
+    const canonical_writer = &canonical_fbs;
 
     // HTTPMethod
     canonical_writer.writeAll(method) catch {};
@@ -112,7 +112,7 @@ pub fn signRequest(
     // HashedPayload
     canonical_writer.writeAll(result.x_amz_content_sha256[0..contentHashLen(&result.x_amz_content_sha256)]) catch {};
 
-    const canonical_request = canonical_fbs.getWritten();
+    const canonical_request = canonical_fbs.buffered();
 
     // Hash canonical request
     var canonical_hash: [Sha256.digest_length]u8 = undefined;
@@ -121,8 +121,8 @@ pub fn signRequest(
 
     // Create string to sign
     var sts_buf: [512]u8 = undefined;
-    var sts_fbs = std.io.fixedBufferStream(&sts_buf);
-    const sts_writer = sts_fbs.writer();
+    var sts_fbs: std.Io.Writer = .fixed(&sts_buf);
+    const sts_writer = &sts_fbs;
 
     sts_writer.writeAll("AWS4-HMAC-SHA256\n") catch {};
     sts_writer.writeAll(&datetime) catch {};
@@ -133,7 +133,7 @@ pub fn signRequest(
     sts_writer.print("/{s}/s3/aws4_request\n", .{region}) catch {};
     sts_writer.writeAll(&canonical_hash_hex) catch {};
 
-    const string_to_sign = sts_fbs.getWritten();
+    const string_to_sign = sts_fbs.buffered();
 
     // Calculate signing key
     // kSecret = "AWS4" + SecretAccessKey
@@ -164,8 +164,8 @@ pub fn signRequest(
     const signature_hex = bytesToHex(&signature);
 
     // Build Authorization header
-    var auth_fbs = std.io.fixedBufferStream(&result.authorization);
-    const auth_writer = auth_fbs.writer();
+    var auth_fbs: std.Io.Writer = .fixed(&result.authorization);
+    const auth_writer = &auth_fbs;
 
     auth_writer.print("AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/s3/aws4_request, SignedHeaders={s}, Signature={s}", .{
         credentials.access_key_id,
@@ -175,7 +175,7 @@ pub fn signRequest(
         &signature_hex,
     }) catch {};
 
-    result.authorization_len = auth_fbs.pos;
+    result.authorization_len = auth_fbs.end;
 
     return result;
 }

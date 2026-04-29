@@ -67,15 +67,17 @@ pub const SegmentReader = struct {
 
     /// Open a segment from a file.
     pub fn initFromFile(allocator: std.mem.Allocator, path: []const u8) !struct { reader: SegmentReader, buf: []u8 } {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const stdx = @import("stdx");
+        const io = stdx.io.instance();
+        const file = try stdx.fs.openFile(path, .{});
+        defer stdx.fs.closeFile(file);
 
-        const stat = try file.stat();
-        const buf = try allocator.alloc(u8, stat.size);
+        const file_size = try file.length(io);
+        const buf = try allocator.alloc(u8, @intCast(file_size));
         errdefer allocator.free(buf);
 
-        const read = try file.readAll(buf);
-        if (read != stat.size) {
+        const read = try stdx.fs.readAll(file, buf);
+        if (read != file_size) {
             allocator.free(buf);
             return error.ShortRead;
         }

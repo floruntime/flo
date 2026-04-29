@@ -419,8 +419,8 @@ test "Level.parse" {
 
 test "formatText basic" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     const fields = [_]Field{
         Field.str("user", "alice"),
@@ -436,7 +436,7 @@ test "formatText basic" {
 
     try formatText(&entry, .{ .colors = false, .short_timestamp = true }, writer);
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "INF") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "test message") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "user=") != null);
@@ -445,8 +445,8 @@ test "formatText basic" {
 
 test "formatJson basic" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     const fields = [_]Field{
         Field.str("user", "alice"),
@@ -462,7 +462,7 @@ test "formatJson basic" {
 
     try formatJson(&entry, .{}, writer);
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"level\":\"INFO\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"msg\":\"test message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"user\":\"alice\"") != null);

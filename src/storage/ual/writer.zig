@@ -174,14 +174,14 @@ pub const SegmentWriter = struct {
         var tmp_buf: [520]u8 = undefined;
         const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.PathTooLong;
 
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(sealed);
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, sealed);
 
         // Rename into place
-        std.fs.cwd().rename(tmp_path, path) catch |err| {
+        @import("stdx").fs.rename(tmp_path, path) catch |err| {
             // If rename fails, try to clean up tmp
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+            @import("stdx").fs.deleteFile(tmp_path) catch {};
             return err;
         };
 

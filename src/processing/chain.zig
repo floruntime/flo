@@ -250,7 +250,7 @@ pub const Chain = struct {
             .collector = &self.collectors[op_index],
             .metrics = &self.metrics[op_index],
             .allocator = self.allocator,
-            .current_processing_time_ms = std.time.milliTimestamp(),
+            .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .current_watermark_ms = self.current_watermark_ms,
             .operator_name = operators[op_index].getName(),
         };

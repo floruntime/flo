@@ -14,6 +14,7 @@
 //! - If crash after snapshot but before UAL compact: harmless extra entries
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const checksum_mod = @import("../util/checksum.zig");
 
@@ -204,7 +205,7 @@ pub const SnapshotBuilder = struct {
 
     /// Seal and write atomically to a directory.
     /// Writes `{index:0>10}-{timestamp}.fsnap` and updates MANIFEST.
-    pub fn writeToDir(self: *SnapshotBuilder, dir: std.fs.Dir) !void {
+    pub fn writeToDir(self: *SnapshotBuilder, dir: stdx.fs.Dir) !void {
         const data = try self.seal();
         defer self.allocator.free(data);
 
@@ -215,15 +216,16 @@ pub const SnapshotBuilder = struct {
         const tmp_name = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{filename}) catch return error.NameTooLong;
 
         // Write to .tmp
+        const io = stdx.io.instance();
         {
-            const file = try dir.createFile(tmp_name, .{});
-            defer file.close();
-            try file.writeAll(data);
-            try file.sync();
+            const file = try dir.createFile(io, tmp_name, .{});
+            defer stdx.fs.closeFile(file);
+            try stdx.fs.writeAll(file, data);
+            try file.sync(io);
         }
 
         // Atomic rename
-        try dir.rename(tmp_name, filename);
+        try dir.rename(tmp_name, dir, filename, io);
 
         // Update MANIFEST
         try writeManifest(dir, filename);
@@ -345,24 +347,26 @@ pub fn parseSnapshotFilename(name: []const u8) ?SnapshotInfo {
 }
 
 /// Atomically write a MANIFEST file pointing to the given snapshot filename.
-pub fn writeManifest(dir: std.fs.Dir, filename: []const u8) !void {
+pub fn writeManifest(dir: stdx.fs.Dir, filename: []const u8) !void {
+    const io = stdx.io.instance();
     {
-        const file = try dir.createFile("MANIFEST.tmp", .{});
-        defer file.close();
-        try file.writeAll(filename);
-        try file.sync();
+        const file = try dir.createFile(io, "MANIFEST.tmp", .{});
+        defer stdx.fs.closeFile(file);
+        try stdx.fs.writeAll(file, filename);
+        try stdx.fs.sync(file);
     }
-    try dir.rename("MANIFEST.tmp", "MANIFEST");
+    try dir.rename("MANIFEST.tmp", dir, "MANIFEST", io);
 }
 
 /// Read the current snapshot filename from MANIFEST. Returns null if no MANIFEST exists.
-pub fn readManifest(dir: std.fs.Dir, buf: []u8) !?[]const u8 {
-    const file = dir.openFile("MANIFEST", .{}) catch |err| switch (err) {
+pub fn readManifest(dir: stdx.fs.Dir, buf: []u8) !?[]const u8 {
+    const io = stdx.io.instance();
+    const file = dir.openFile(io, "MANIFEST", .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
-    const n = try file.readAll(buf);
+    defer stdx.fs.closeFile(file);
+    const n = try stdx.fs.readAll(file, buf);
     if (n == 0) return null;
     // Trim trailing whitespace
     var end = n;
@@ -377,32 +381,33 @@ pub const SnapshotLoad = struct { data: []u8, reader: SnapshotReader };
 
 /// Load a snapshot by filename from a directory.
 /// Returns the raw snapshot bytes. Caller owns the allocation.
-pub fn loadSnapshotByName(allocator: Allocator, dir: std.fs.Dir, filename: []const u8) !?SnapshotLoad {
+pub fn loadSnapshotByName(allocator: Allocator, dir: stdx.fs.Dir, filename: []const u8) !?SnapshotLoad {
     return loadSnapshotFile(allocator, dir, filename);
 }
 
 /// Load the latest snapshot from a directory (reads MANIFEST for the filename).
 /// Returns the raw snapshot bytes. Caller owns the allocation.
-pub fn loadLatestSnapshot(allocator: Allocator, dir: std.fs.Dir) !?SnapshotLoad {
+pub fn loadLatestSnapshot(allocator: Allocator, dir: stdx.fs.Dir) !?SnapshotLoad {
     var manifest_buf: [256]u8 = undefined;
     const filename = try readManifest(dir, &manifest_buf) orelse return null;
     return loadSnapshotFile(allocator, dir, filename);
 }
 
-fn loadSnapshotFile(allocator: Allocator, dir: std.fs.Dir, filename: []const u8) !?SnapshotLoad {
+fn loadSnapshotFile(allocator: Allocator, dir: stdx.fs.Dir, filename: []const u8) !?SnapshotLoad {
+    const io = stdx.io.instance();
 
-    const file = dir.openFile(filename, .{}) catch |err| switch (err) {
+    const file = dir.openFile(io, filename, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
+    defer stdx.fs.closeFile(file);
 
-    const stat = try file.stat();
-    const data = try allocator.alloc(u8, stat.size);
+    const file_size = try file.length(io);
+    const data = try allocator.alloc(u8, @intCast(file_size));
     errdefer allocator.free(data);
 
-    const bytes_read = try file.readAll(data);
-    if (bytes_read != stat.size) {
+    const bytes_read = try stdx.fs.readAll(file, data);
+    if (bytes_read != file_size) {
         allocator.free(data);
         return null;
     }

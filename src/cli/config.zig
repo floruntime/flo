@@ -9,13 +9,13 @@ const commander = @import("commander/mod.zig");
 /// Default endpoint for CLI commands.
 /// Precedence: FLO_ENDPOINT env → "127.0.0.1:9000"
 pub fn getDefaultEndpoint() []const u8 {
-    return std.posix.getenv("FLO_ENDPOINT") orelse "127.0.0.1:9000";
+    return @import("stdx").io.getenv("FLO_ENDPOINT") orelse "127.0.0.1:9000";
 }
 
 /// Default namespace for CLI commands.
 /// Precedence: FLO_NAMESPACE env → "default"
 pub fn getDefaultNamespace() []const u8 {
-    return std.posix.getenv("FLO_NAMESPACE") orelse "default";
+    return @import("stdx").io.getenv("FLO_NAMESPACE") orelse "default";
 }
 
 /// Static buffer for --port constructed endpoint (CLI is single-threaded).
@@ -36,9 +36,9 @@ pub fn getEndpoint(ctx: *commander.Context) []const u8 {
         }
     }
     // FLO_ENDPOINT env
-    if (std.posix.getenv("FLO_ENDPOINT")) |ep| return ep;
+    if (@import("stdx").io.getenv("FLO_ENDPOINT")) |ep| return ep;
     // FLO_PORT env
-    if (std.posix.getenv("FLO_PORT")) |port_str| {
+    if (@import("stdx").io.getenv("FLO_PORT")) |port_str| {
         if (std.fmt.parseInt(u16, port_str, 10)) |_| {
             return std.fmt.bufPrint(&port_endpoint_buf, "127.0.0.1:{s}", .{port_str}) catch
                 return "127.0.0.1:9000";
@@ -68,7 +68,7 @@ pub const Config = struct {
     contexts: std.StringHashMap(Context),
 
     // Track owned strings for cleanup
-    _owned_strings: std.ArrayListUnmanaged([]const u8) = .{},
+    _owned_strings: std.ArrayListUnmanaged([]const u8) = .empty,
 
     const config_dir = ".flo";
     const config_file = "config.json";
@@ -157,11 +157,11 @@ pub const Config = struct {
         var config = Config.init(allocator);
         errdefer config.deinit();
 
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const home = @import("stdx").io.getenv("HOME") orelse return error.NoHomeDirectory;
         const config_path = try std.fs.path.join(allocator, &.{ home, config_dir, config_file });
         defer allocator.free(config_path);
 
-        const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(config_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 // Return defaults with local context
                 try config.setContext("local", "localhost:9000", null);
@@ -169,9 +169,9 @@ pub const Config = struct {
             }
             return err;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try @import("stdx").fs.readToEndAlloc(file, allocator, 1024 * 1024);
         defer allocator.free(content);
 
         // Parse JSON
@@ -225,21 +225,20 @@ pub const Config = struct {
 
     /// Save config to ~/.flo/config.json
     pub fn save(self: *const Config) !void {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const home = @import("stdx").io.getenv("HOME") orelse return error.NoHomeDirectory;
 
         // Create ~/.flo directory if it doesn't exist
         const dir_path = try std.fs.path.join(self.allocator, &.{ home, config_dir });
         defer self.allocator.free(dir_path);
 
-        std.fs.makeDirAbsolute(dir_path) catch |err| {
+        @import("stdx").fs.makePath(dir_path) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
         // Build JSON
-        var json_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer json_buf.deinit(self.allocator);
-
-        var writer = json_buf.writer(self.allocator);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
         try writer.writeAll("{\n");
         try writer.print("  \"current_context\": \"{s}\",\n", .{self.current_context});
         try writer.writeAll("  \"contexts\": {\n");
@@ -270,10 +269,10 @@ pub const Config = struct {
         const config_path = try std.fs.path.join(self.allocator, &.{ home, config_dir, config_file });
         defer self.allocator.free(config_path);
 
-        const file = try std.fs.createFileAbsolute(config_path, .{});
-        defer file.close();
+        const file = try @import("stdx").fs.createFile(config_path, .{});
+        defer @import("stdx").fs.closeFile(file);
 
-        try file.writeAll(json_buf.items);
+        try @import("stdx").fs.writeAll(file, aw.written());
     }
 
     /// Print config summary

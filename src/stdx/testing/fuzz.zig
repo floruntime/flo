@@ -16,7 +16,7 @@ pub const FuzzOptions = struct {
 };
 
 pub fn fuzz(allocator: std.mem.Allocator, options: FuzzOptions) !void {
-    var prng = PRNG.init(if (options.seed == 0) @intCast(std.time.milliTimestamp()) else options.seed);
+    var prng = PRNG.init(if (options.seed == 0) @intCast(@import("stdx").time.milliTimestamp()) else options.seed);
 
     std.log.info("Starting fuzzer: iterations={} seed={}", .{ options.iterations, options.seed });
 

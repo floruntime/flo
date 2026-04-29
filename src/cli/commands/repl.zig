@@ -99,7 +99,7 @@ fn runRepl(ctx: *commander.Context) commander.Error!void {
 
         // Flush stdout - use std.posix for write operations
         // (std.io.getStdOut was renamed in Zig 0.15)
-        _ = std.posix.write(std.posix.STDOUT_FILENO, "") catch {};
+        _ = @import("stdx").io.writeFd(std.posix.STDOUT_FILENO, "");
 
         // Read line from stdin
         const line = readLine(stdin_fd, &line_buf) catch |err| {

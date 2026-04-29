@@ -39,13 +39,13 @@ pub const SystemManifest = struct {
         const path = try std.fs.path.join(allocator, &.{ data_path, FILENAME });
         defer allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(path, .{}) catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        const content = try file.readToEndAlloc(allocator, 4096);
+        const content = try @import("stdx").fs.readToEndAlloc(file, allocator, 4096);
         defer allocator.free(content);
 
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -82,20 +82,20 @@ pub const SystemManifest = struct {
         defer allocator.free(path);
 
         // Build JSON manually for clean formatting
-        var buf: std.ArrayListUnmanaged(u8) = .{};
-        defer buf.deinit(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
 
-        const w = buf.writer(allocator);
+        const w = &aw.writer;
         try w.writeAll("{\n");
         try w.print("  \"shards\": {d},\n", .{shards});
         try w.print("  \"partitions\": {d},\n", .{partitions});
-        try w.print("  \"created_at\": {d},\n", .{std.time.timestamp()});
+        try w.print("  \"created_at\": {d},\n", .{@import("stdx").time.milliTimestamp()});
         try w.print("  \"version\": \"{s}\"\n", .{CURRENT_VERSION});
         try w.writeAll("}\n");
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(buf.items);
+        const file = try @import("stdx").fs.createFile(path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, aw.written());
     }
 
     /// Validate that the running configuration matches manifested topology.
@@ -156,7 +156,7 @@ pub fn ensureTopology(
     requested_partitions: u32,
 ) !void {
     // Ensure data directory exists
-    std.fs.cwd().makePath(data_path) catch |err| {
+    @import("stdx").fs.makePath(data_path) catch |err| {
         if (err != error.PathAlreadyExists) {
             log.err("failed to create data directory: {s} err={any}", .{ data_path, err });
             return err;
@@ -190,7 +190,7 @@ test "create and load manifest" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     try SystemManifest.create(allocator, path, 8, 256);
@@ -243,7 +243,7 @@ test "ensureTopology creates new manifest" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     try ensureTopology(allocator, path, 4, 128);

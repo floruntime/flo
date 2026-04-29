@@ -114,7 +114,7 @@ pub const Parser = struct {
         return .{
             .allocator = allocator,
             .state = .start,
-            .stack = .{},
+            .stack = .empty,
         };
     }
 
@@ -224,7 +224,7 @@ pub const Parser = struct {
                 offset = 1 + line_end + 2;
                 const element_count: usize = @intCast(count);
 
-                var elements: std.ArrayListUnmanaged(RespValue) = .{};
+                var elements: std.ArrayListUnmanaged(RespValue) = .empty;
                 errdefer {
                     for (elements.items) |*v| freeValue(self.allocator, v);
                     elements.deinit(self.allocator);
@@ -269,7 +269,7 @@ pub fn freeValue(allocator: Allocator, value: *RespValue) void {
 
 /// Serialize a RESP value to bytes
 pub fn serialize(allocator: Allocator, value: RespValue) ![]u8 {
-    var buffer: std.ArrayListUnmanaged(u8) = .{};
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buffer.deinit(allocator);
 
     try serializeInto(allocator, &buffer, value);
@@ -438,7 +438,7 @@ pub fn translateCommand(allocator: Allocator, value: RespValue, namespace: []con
         const stream_name = getBulkString(arr[1]) orelse return error.InvalidCommand;
         // arr[2] is the ID (* for auto-generate)
         // Remaining are field-value pairs concatenated as payload
-        var payload: std.ArrayListUnmanaged(u8) = .{};
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(allocator);
 
         var j: usize = 3;

@@ -450,7 +450,7 @@ pub const Forwarder = struct {
     /// Caller should send error responses to the affected connections.
     pub fn sweepTimeouts(self: *Forwarder, now_ms: i64, timed_out: *std.ArrayListUnmanaged(PendingRequest)) !u32 {
         var count: u32 = 0;
-        var to_remove: std.ArrayListUnmanaged(u64) = .{};
+        var to_remove: std.ArrayListUnmanaged(u64) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var iter = self.pending.iterator();
@@ -652,7 +652,7 @@ test "Forwarder timeout sweep" {
     try testing.expectEqual(@as(u32, 3), fwd.pendingCount());
 
     // Sweep at t=1500 — nothing timed out yet
-    var timed_out: std.ArrayListUnmanaged(PendingRequest) = .{};
+    var timed_out: std.ArrayListUnmanaged(PendingRequest) = .empty;
     defer timed_out.deinit(testing.allocator);
 
     const count1 = try fwd.sweepTimeouts(1500, &timed_out);

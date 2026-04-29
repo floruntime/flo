@@ -147,7 +147,7 @@ pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator:
     input = input[measurement_end..];
 
     // Parse tags (optional, starts with comma)
-    var tags: std.ArrayListUnmanaged(ParsedTag) = .{};
+    var tags: std.ArrayListUnmanaged(ParsedTag) = .empty;
     if (input.len > 0 and input[0] == ',') {
         input = input[1..]; // skip comma
         while (true) {
@@ -175,7 +175,7 @@ pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator:
     }
 
     // Parse fields (required, at least one)
-    var fields: std.ArrayListUnmanaged(ParsedField) = .{};
+    var fields: std.ArrayListUnmanaged(ParsedField) = .empty;
     while (true) {
         const field = parseField(input) catch |err| {
             fields.deinit(allocator);
@@ -225,8 +225,8 @@ pub fn parseLines(input: []const u8, allocator: Allocator) !ParseResult {
 
 /// Parse multiple lines with explicit timestamp precision.
 pub fn parseLinesWithPrecision(input: []const u8, precision: Precision, allocator: Allocator) !ParseResult {
-    var lines: std.ArrayListUnmanaged(ParsedLine) = .{};
-    var errors: std.ArrayListUnmanaged(ParseError) = .{};
+    var lines: std.ArrayListUnmanaged(ParsedLine) = .empty;
+    var errors: std.ArrayListUnmanaged(ParseError) = .empty;
 
     var line_number: u32 = 0;
     var iter = std.mem.splitScalar(u8, input, '\n');
@@ -241,7 +241,7 @@ pub fn parseLinesWithPrecision(input: []const u8, precision: Precision, allocato
 
         // Skip empty lines and comments
         if (line.len == 0) continue;
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
         const parsed = parseLineWithPrecision(line, precision, allocator) catch {

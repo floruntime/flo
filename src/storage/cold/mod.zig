@@ -127,7 +127,7 @@ test "cold storage: polymorphism — noop vs file" {
     const file_backend = file_b.asBackend();
     defer {
         file_backend.deinitBackend();
-        std.fs.cwd().deleteTree("/tmp/test_cold_mod_poly") catch {};
+        @import("stdx").fs.deleteTree("/tmp/test_cold_mod_poly") catch {};
     }
 
     // Upload then download should work

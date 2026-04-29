@@ -19,6 +19,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("../../mod.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -28,7 +29,7 @@ pub const ServerProcess = struct {
     const Self = @This();
 
     allocator: Allocator,
-    process: ?std.process.Child,
+    process: ?stdx.process.Child,
     port: u16,
     dashboard_port: u16,
     metrics_port: u16,
@@ -161,7 +162,7 @@ pub const ServerProcess = struct {
         errdefer self.tmp_dir.cleanup();
 
         // Get absolute path to temp directory
-        self.data_dir = try self.tmp_dir.dir.realpathAlloc(allocator, ".");
+        self.data_dir = try stdx.fs.dirRealpathAlloc(self.tmp_dir.dir, allocator, ".");
         errdefer allocator.free(self.data_dir);
 
         // Create config file path (content written at start time when we know ports)
@@ -227,8 +228,8 @@ pub const ServerProcess = struct {
 
         // Write config file with actual ports
         var config_buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&config_buf);
-        const config_writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&config_buf);
+        const config_writer = &fbs;
 
         // Storage section with durability + tier settings
         try config_writer.print("[storage]\ndurability = \"{s}\"\n", .{self.config.durability.toConfigString()});
@@ -276,18 +277,19 @@ pub const ServerProcess = struct {
             }
         }
 
-        const config_file = try self.tmp_dir.dir.createFile("flo.toml", .{});
-        defer config_file.close();
-        try config_file.writeAll(fbs.getWritten());
+        const config_file = try self.tmp_dir.dir.createFile(stdx.io.instance(), "flo.toml", .{});
+        defer stdx.fs.closeFile(config_file);
+        try stdx.fs.writeAll(config_file, fbs.buffered());
 
         // Open log file for output redirection
-        var log_file = try std.fs.createFileAbsolute(self.log_file_path, .{
+        var log_file = try stdx.fs.createFileAbsolute(self.log_file_path, .{
             .truncate = true,
         });
+        _ = &log_file;
         // Track ownership: once handed to the logging thread, the thread owns
         // the fd and will close it. We must NOT double-close on error paths.
         var log_file_handed_off = false;
-        errdefer if (!log_file_handed_off) log_file.close();
+        errdefer if (!log_file_handed_off) stdx.fs.closeFile(log_file);
 
         // Build dynamic argv with cluster options
         const port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.port});
@@ -343,7 +345,7 @@ pub const ServerProcess = struct {
             try argv_list.appendSlice(self.allocator, &.{ "--join", join });
         }
 
-        var child = std.process.Child.init(argv_list.items, self.allocator);
+        var child = stdx.process.Child.init(argv_list.items, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -386,44 +388,44 @@ pub const ServerProcess = struct {
             const pid = proc.id;
 
             // Send SIGTERM for graceful shutdown
-            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            _ = std.c.kill(pid, .TERM);
 
             // Wait for graceful shutdown (check if process exits naturally)
-            const grace_start = std.time.milliTimestamp();
+            const grace_start = stdx.time.milliTimestamp();
             var gracefully_exited = false;
 
-            while (std.time.milliTimestamp() - grace_start < @as(i64, @intCast(SHUTDOWN_GRACE_PERIOD_MS))) {
+            while (stdx.time.milliTimestamp() - grace_start < @as(i64, @intCast(SHUTDOWN_GRACE_PERIOD_MS))) {
                 // Try non-blocking wait to see if process exited
-                const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
-                if (result.pid == pid) {
+                var status: c_int = 0;
+                const result_pid = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
+                if (result_pid == pid) {
                     gracefully_exited = true;
                     break;
                 }
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                stdx.time.sleep(50 * std.time.ns_per_ms);
             }
 
             // Force kill if not gracefully exited
             if (!gracefully_exited) {
                 // Server didn't respond to SIGTERM, force kill
-                _ = std.posix.kill(pid, std.posix.SIG.KILL) catch {
-                    return; // Can't kill process, abandon cleanup
-                };
+                _ = std.c.kill(pid, .KILL);
 
                 // Wait for process to die (blocking wait with timeout)
-                const kill_start = std.time.milliTimestamp();
-                while (std.time.milliTimestamp() - kill_start < 1000) { // 1 second max
-                    const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
-                    if (result.pid == pid) {
+                const kill_start = stdx.time.milliTimestamp();
+                while (stdx.time.milliTimestamp() - kill_start < 1000) { // 1 second max
+                    var status: c_int = 0;
+                    const result_pid = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
+                    if (result_pid == pid) {
                         break;
                     }
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    stdx.time.sleep(10 * std.time.ns_per_ms);
                 }
             }
 
             // Brief wait for OS resource release (only needed after forced kill;
             // each test uses unique ports via findFreePort, so minimal delay suffices)
             if (!gracefully_exited) {
-                std.Thread.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
+                stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
             }
 
             // Join the log thread — process kill closes pipes, unblocking reads
@@ -444,13 +446,13 @@ pub const ServerProcess = struct {
 
     /// Read server logs (returns owned slice - caller must free)
     pub fn readLogs(self: *Self) ![]const u8 {
-        const file = std.fs.openFileAbsolute(self.log_file_path, .{}) catch |err| {
+        const file = stdx.fs.openFileAbsolute(self.log_file_path, .{}) catch |err| {
             if (err == error.FileNotFound) return try self.allocator.dupe(u8, "");
             return err;
         };
-        defer file.close();
+        defer stdx.fs.closeFile(file);
 
-        return file.readToEndAlloc(self.allocator, 10 * 1024 * 1024); // Max 10MB
+        return stdx.fs.readToEndAlloc(file, self.allocator, 10 * 1024 * 1024); // Max 10MB
     }
 
     /// Check if server logs contain a specific string
@@ -516,7 +518,7 @@ pub const ServerProcess = struct {
             bootstrap_file,
         };
 
-        var child = std.process.Child.init(argv, self.allocator);
+        var child = stdx.process.Child.init(argv, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -540,7 +542,7 @@ pub const ServerProcess = struct {
         }
 
         // Read the key from the output file
-        const key_raw = std.fs.cwd().readFileAlloc(self.allocator, bootstrap_file, 1024) catch {
+        const key_raw = stdx.fs.readFileAlloc(self.allocator, bootstrap_file, 1024) catch {
             // Fall back to parsing stdout if file read fails
             const out = std.mem.trim(u8, stdout_list.items, &std.ascii.whitespace);
             // Extract the key token starting with "flo_sk_"
@@ -560,11 +562,11 @@ pub const ServerProcess = struct {
     /// Force kill the server process
     fn forceKill(self: *Self) void {
         if (self.process) |*proc| {
-            _ = std.posix.kill(proc.id, std.posix.SIG.KILL) catch {};
+            _ = std.c.kill(proc.id, .KILL);
             _ = proc.wait() catch {};
 
             // Wait for OS to release resources
-            std.Thread.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
+            stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
 
             // Join log thread after process is dead
             if (self.log_thread) |thread| {
@@ -579,9 +581,9 @@ pub const ServerProcess = struct {
 
     /// Wait for server to be ready (accepting TCP connections)
     fn waitForReady(self: *Self, timeout_ms: u64) !void {
-        const start_time = std.time.milliTimestamp();
+        const start_time = stdx.time.milliTimestamp();
 
-        while (std.time.milliTimestamp() - start_time < @as(i64, @intCast(timeout_ms))) {
+        while (stdx.time.milliTimestamp() - start_time < @as(i64, @intCast(timeout_ms))) {
             // Check main port — this is always required
             const main_ready = self.tryConnect(self.port);
 
@@ -600,7 +602,7 @@ pub const ServerProcess = struct {
                 return;
             }
 
-            std.Thread.sleep(READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
+            stdx.time.sleep(READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
         }
 
         return error.ServerNotReady;
@@ -609,8 +611,8 @@ pub const ServerProcess = struct {
     /// Try to establish a TCP connection to a port
     fn tryConnect(self: *Self, port: u16) bool {
         _ = self;
-        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-        const stream = std.net.tcpConnectToAddress(addr) catch {
+        const addr = stdx.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        const stream = stdx.net.tcpConnectToAddress(addr) catch {
             return false;
         };
         stream.close();
@@ -670,19 +672,21 @@ pub const ServerProcess = struct {
 
 /// Find a free TCP port by binding to port 0
 fn findFreePort() !u16 {
-    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(sock);
+    const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (sock < 0) return error.SocketFailed;
+    defer _ = std.c.close(sock);
 
     // Allow reuse of TIME_WAIT ports — critical when running hundreds of tests
     // back-to-back, each spawning/stopping server processes
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    var on: c_int = 1;
+    _ = std.c.setsockopt(sock, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int));
 
-    var addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    try std.posix.bind(sock, &addr.any, @sizeOf(std.posix.sockaddr.in));
+    var addr = stdx.net.SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, 0);
+    if (std.c.bind(sock, addr.anyPtr(), addr.anyLen()) != 0) return error.BindFailed;
 
     var bound_addr: std.posix.sockaddr align(4) = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    try std.posix.getsockname(sock, &bound_addr, &len);
+    if (std.c.getsockname(sock, &bound_addr, &len) != 0) return error.GetSocknameFailed;
 
     // Extract port from sockaddr_in
     const addr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound_addr));
@@ -700,23 +704,35 @@ fn findFloBinary(allocator: Allocator) ![]const u8 {
     };
 
     for (paths_to_try) |rel_path| {
-        const abs_path = std.fs.cwd().realpathAlloc(allocator, rel_path) catch continue;
+        const abs_path = stdx.fs.realpathAlloc(allocator, rel_path) catch continue;
         // Verify it exists (access check for existence)
-        std.fs.cwd().access(rel_path, .{}) catch {
+        stdx.fs.access(rel_path, .{}) catch {
             allocator.free(abs_path);
             continue;
         };
         return abs_path;
     }
 
-    // Try to find from current exe path
-    const self_exe = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(self_exe);
+    // Try to find from current exe path (best-effort, macOS via _NSGetExecutablePath)
+    var exe_buf: [4096]u8 = undefined;
+    const self_exe = blk: {
+        if (builtin.os.tag == .macos) {
+            var len: u32 = exe_buf.len;
+            if (std.c._NSGetExecutablePath(&exe_buf, &len) != 0) return error.FloBinaryNotFound;
+            break :blk std.mem.sliceTo(&exe_buf, 0);
+        } else if (builtin.os.tag == .linux) {
+            const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+            if (n <= 0) return error.FloBinaryNotFound;
+            break :blk exe_buf[0..@intCast(n)];
+        } else {
+            return error.FloBinaryNotFound;
+        }
+    };
 
     const dir = std.fs.path.dirname(self_exe) orelse return error.FloBinaryNotFound;
     const flo_path = try std.fs.path.join(allocator, &.{ dir, "flo" });
 
-    std.fs.cwd().access(flo_path, .{}) catch {
+    stdx.fs.access(flo_path, .{}) catch {
         allocator.free(flo_path);
         return error.FloBinaryNotFound;
     };
@@ -746,8 +762,8 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 /// Uses poll() to read both stdout and stderr concurrently, preventing
 /// the classic pipe deadlock where the server blocks writing to one pipe
 /// while we're blocked reading the other.
-fn logServerOutput(log_file: std.fs.File, stdout_fd: std.posix.fd_t, stderr_fd: std.posix.fd_t) void {
-    defer log_file.close();
+fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: std.posix.fd_t) void {
+    defer stdx.fs.closeFile(log_file);
 
     var fds = [_]std.posix.pollfd{
         .{ .fd = stdout_fd, .events = std.posix.POLL.IN, .revents = 0 },
@@ -775,7 +791,7 @@ fn logServerOutput(log_file: std.fs.File, stdout_fd: std.posix.fd_t, stderr_fd: 
                     open_count -= 1;
                     continue;
                 }
-                _ = log_file.write(buf[0..n]) catch {};
+                stdx.fs.writeAll(log_file, buf[0..n]) catch {};
             } else if (pfd.revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
                 pfd.fd = -1;
                 open_count -= 1;

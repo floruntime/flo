@@ -29,9 +29,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -59,7 +59,7 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /workers/:id — Single worker detail
@@ -68,11 +68,11 @@ pub fn getWorkerDetail(allocator: Allocator, worker_id: []const u8, ctx: *Dashbo
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
             if (shard.worker_handler.workers.getPtr(worker_id)) |w| {
-                var json_buf: std.ArrayList(u8) = .empty;
-                errdefer json_buf.deinit(allocator);
-                const writer = json_buf.writer(allocator);
+                var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
                 try writeWorkerJson(writer, w);
-                return try json_buf.toOwnedSlice(allocator);
+                return try json_aw.toOwnedSlice();
             }
         }
     }

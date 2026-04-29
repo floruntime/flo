@@ -159,11 +159,11 @@ pub const WireWriter = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return .{ .buffer = .{}, .allocator = allocator };
+        return .{ .buffer = .empty, .allocator = allocator };
     }
 
     pub fn initCapacity(allocator: Allocator, capacity: usize) !Self {
-        var buffer: std.ArrayListUnmanaged(u8) = .{};
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
         try buffer.ensureTotalCapacity(allocator, capacity);
         return .{ .buffer = buffer, .allocator = allocator };
     }

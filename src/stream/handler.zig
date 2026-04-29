@@ -390,7 +390,7 @@ pub const StreamHandler = struct {
         }
 
         // Apply locally: append to partition UAL (for stream reads) + projection router
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + payload_value.len;
@@ -740,7 +740,7 @@ pub const StreamHandler = struct {
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, wire_format);
 
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
         self.stream.createGroup(group_name, now_ns) catch |err| {
             return switch (err) {
@@ -779,7 +779,7 @@ pub const StreamHandler = struct {
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
         // Auto-create group if it doesn't exist
         self.stream.createGroup(group_name, now_ns) catch |err| {
@@ -838,7 +838,7 @@ pub const StreamHandler = struct {
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         // Auto-create group and join consumer if not exists
-        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         const now_ns = now_ms * 1_000_000;
         self.stream.createGroup(group_name, now_ns) catch |err| {
             if (err != error.AlreadyExists) {
@@ -882,7 +882,7 @@ pub const StreamHandler = struct {
         const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
-        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         const now_ns = now_ms * 1_000_000;
         self.stream.createGroup(group_name, now_ns) catch |err| {
             if (err != error.AlreadyExists) {
@@ -1027,7 +1027,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         }
 
-        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         if (id_count > 0) {
             _ = self.stream.groupNack(group_name, ids[0..id_count], now_ms) catch |err| {
                 return switch (err) {
@@ -1119,7 +1119,7 @@ pub const StreamHandler = struct {
             }
         }
 
-        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         var touched_count: u32 = 0;
         if (id_count > 0) {
             touched_count = self.stream.groupTouch(group_name, ids[0..id_count], now_ms) catch |err| {
@@ -1394,7 +1394,7 @@ pub const StreamHandler = struct {
         }
 
         // Apply locally: append to partition UAL + warm store
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + batch_value.len;

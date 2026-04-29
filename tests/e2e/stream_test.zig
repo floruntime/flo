@@ -955,7 +955,7 @@ test "e2e/stream: blocking read returns data when appended" {
     defer reader.deinit();
 
     // Give the blocking read time to register
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append data while reader is blocking
     try ctx.exec(&.{ "stream", "append", stream_name, "blocking-msg-1" });
@@ -980,7 +980,7 @@ test "e2e/stream: blocking read with infinite timeout receives data" {
     defer reader.deinit();
 
     // Give the blocking read time to register
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append data to unblock the reader
     try ctx.exec(&.{ "stream", "append", stream_name, "infinite-wait-msg" });
@@ -1038,7 +1038,7 @@ test "e2e/stream: blocking read multiple messages" {
     defer reader.deinit();
 
     // Give the blocking read time to register
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append multiple messages
     try ctx.exec(&.{ "stream", "append", stream_name, "multi-msg-1" });
@@ -1068,7 +1068,7 @@ test "e2e/stream: blocking read with --follow receives new data" {
     defer reader.deinit();
 
     // Give the follow read time to register
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append data while reader is following
     try ctx.exec(&.{ "stream", "append", stream_name, "follow-msg" });
@@ -1098,7 +1098,7 @@ test "e2e/stream: blocking read from tail receives new data" {
     defer reader.deinit();
 
     // Give the blocking read time to register
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append new data — this should unblock the reader
     try ctx.exec(&.{ "stream", "append", stream_name, "new-tail-data" });
@@ -1126,7 +1126,7 @@ test "e2e/stream: blocking read on different streams independent" {
     var reader_b = try ctx.cli.runAsync(&.{ "stream", "read", stream_b, "--block", "5000", "--start", "0-0", "--limit", "5" });
     defer reader_b.deinit();
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append to stream A only
     try ctx.exec(&.{ "stream", "append", stream_a, "only-in-a" });

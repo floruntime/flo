@@ -25,7 +25,9 @@ test "integration: reactor add and remove sources" {
     // Create 10 pipes and register the read ends with the reactor
     var pipes: [10][2]posix.fd_t = undefined;
     for (0..10) |i| {
-        pipes[i] = try posix.pipe();
+        var fds: [2]c_int = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        pipes[i] = .{ fds[0], fds[1] };
     }
 
     // Register all 10 read-end fds
@@ -44,9 +46,9 @@ test "integration: reactor add and remove sources" {
     }
 
     // Write to a few pipes and verify poll picks them up
-    _ = try posix.write(pipes[0][1], "A");
-    _ = try posix.write(pipes[5][1], "B");
-    _ = try posix.write(pipes[9][1], "C");
+    _ = std.c.write(pipes[0][1], "A", 1);
+    _ = std.c.write(pipes[5][1], "B", 1);
+    _ = std.c.write(pipes[9][1], "C", 1);
 
     const events = try reactor.poll(100);
     try testing.expect(events.len >= 3);
@@ -78,8 +80,8 @@ test "integration: reactor add and remove sources" {
 
     // Clean up pipes
     for (0..10) |i| {
-        posix.close(pipes[i][0]);
-        posix.close(pipes[i][1]);
+        _ = std.c.close(pipes[i][0]);
+        _ = std.c.close(pipes[i][1]);
     }
 
     // A poll after removal should return 0 events (no sources)

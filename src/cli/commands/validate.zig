@@ -188,7 +188,7 @@ fn printWorkflowFieldHints(ctx: *commander.Context, content: []const u8) void {
 fn yamlHasKey(content: []const u8, key: []const u8) bool {
     var iter = mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
-        const trimmed = mem.trimLeft(u8, line, " \t");
+        const trimmed = mem.trimStart(u8, line, " \t");
         if (mem.startsWith(u8, trimmed, key)) return true;
     }
     return false;
@@ -198,7 +198,7 @@ fn yamlHasKey(content: []const u8, key: []const u8) bool {
 fn yamlLineHasKey(content: []const u8, key: []const u8) bool {
     var iter = mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
-        const trimmed = mem.trimLeft(u8, line, " \t-");
+        const trimmed = mem.trimStart(u8, line, " \t-");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         if (mem.startsWith(u8, trimmed, key)) return true;
     }
@@ -209,11 +209,11 @@ fn yamlLineHasKey(content: []const u8, key: []const u8) bool {
 fn yamlHasArrayItemKey(content: []const u8, key: []const u8) bool {
     var iter = mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
-        const trimmed = mem.trimLeft(u8, line, " \t");
+        const trimmed = mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         // Must be an array item line
         if (!mem.startsWith(u8, trimmed, "- ")) continue;
-        const item = mem.trimLeft(u8, trimmed[2..], " \t");
+        const item = mem.trimStart(u8, trimmed[2..], " \t");
         if (mem.startsWith(u8, item, key) and item.len > key.len and item[key.len] == ':') return true;
     }
     return false;
@@ -393,13 +393,13 @@ fn processingParseErrorString(err: proc_parser.ParseError) []const u8 {
 // =============================================================================
 
 fn readFile(ctx: *commander.Context, file_path: []const u8) ?[]u8 {
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+    const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {
         ctx.printErr("Failed to open file '{s}': {}\n", .{ file_path, err });
         return null;
     };
-    defer file.close();
+    defer @import("stdx").fs.closeFile(file);
 
-    return file.readToEndAlloc(ctx.allocator, 4 * 1024 * 1024) catch |err| {
+    return @import("stdx").fs.readToEndAlloc(file, ctx.allocator, 4 * 1024 * 1024) catch |err| {
         ctx.printErr("Failed to read file: {}\n", .{err});
         return null;
     };

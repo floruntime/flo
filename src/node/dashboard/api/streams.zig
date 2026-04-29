@@ -37,9 +37,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -119,15 +119,15 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /streams/:name - Stream detail with partitions and consumer groups
 pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -198,7 +198,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /streams/:name/messages - Paginated messages
@@ -218,9 +218,9 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
         break :blk StreamID{ .timestamp_ms = ts, .sequence = seq };
     } else StreamID.MIN;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -275,15 +275,15 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
     try obj.intField("total_count", total_count);
     try obj.intField("total_bytes", 0);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /streams/:name/groups/:group - Consumer group detail
 pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -343,7 +343,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /streams/:name/groups/:group/members - Consumer group members (flat array)
@@ -351,9 +351,9 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     _ = query_string;
     _ = stream_name;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -378,7 +378,7 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /streams/:name/groups/:group/pending - Pending messages
@@ -386,9 +386,9 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     _ = query_string;
     _ = stream_name;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     const PendingEntry = @import("../../../projection/stream.zig").PendingEntry;
 
@@ -428,7 +428,7 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     try pending_arr.end();
     try obj.intField("count", pel_count);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

@@ -50,7 +50,7 @@ pub fn resolve(allocator: Allocator, input: []const u8, opts: Options) Allocator
         return allocator.dupe(u8, input);
     }
 
-    var result: std.ArrayList(u8) = .{};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     var i: usize = 0;
@@ -104,7 +104,7 @@ fn resolveExpr(expr: []const u8, opts: Options) ?[]const u8 {
 
 /// Resolve an environment variable.
 fn resolveEnv(key: []const u8) ?[]const u8 {
-    // std.posix.getenv requires a null-terminated string.
+    // @import("stdx").io.getenv requires a null-terminated string.
     // The key comes from a parsed YAML string which is part of a larger
     // buffer — it may not be sentinel-terminated. However, getenv on
     // POSIX iterates environ and does a prefix match, so we can use
@@ -128,18 +128,18 @@ fn resolveSecret(key: []const u8, opts: Options) ?[]const u8 {
     @memcpy(buf[prefix.len .. prefix.len + key.len], key);
     buf[prefix.len + key.len] = 0;
     const env_name: [:0]const u8 = buf[0 .. prefix.len + key.len :0];
-    return std.posix.getenv(env_name);
+    return @import("stdx").io.getenv(env_name);
 }
 
 /// Look up an environment variable from a non-sentinel-terminated slice.
-/// Uses std.posix.getenv with a stack-copied sentinel-terminated copy.
+/// Uses @import("stdx").io.getenv with a stack-copied sentinel-terminated copy.
 fn getEnvSlice(key: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
     if (key.len >= buf.len) return null;
     @memcpy(buf[0..key.len], key);
     buf[key.len] = 0;
     const name: [:0]const u8 = buf[0..key.len :0];
-    return std.posix.getenv(name);
+    return @import("stdx").io.getenv(name);
 }
 
 // ============================================================================
@@ -220,12 +220,12 @@ test "missing env var left verbatim" {
 test "multiple substitutions" {
     const alloc = std.testing.allocator;
     // Use HOME which is always set
-    const home = std.posix.getenv("HOME") orelse return;
+    const home = @import("stdx").io.getenv("HOME") orelse return;
     const input = "${env.HOME}/data/${env.HOME}/more";
     const result = try resolve(alloc, input, .{});
     defer alloc.free(result);
 
-    var expected: std.ArrayList(u8) = .{};
+    var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(alloc);
     try expected.appendSlice(alloc, home);
     try expected.appendSlice(alloc, "/data/");

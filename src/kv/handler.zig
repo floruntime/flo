@@ -324,7 +324,7 @@ pub const KVHandler = struct {
         namespace: []const u8,
         filter: []const u8,
         _: ?[]const u8,
-        _: u32,
+        limit: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const kv: *KVProjection = @ptrCast(@alignCast(ctx));
         const S = struct {
@@ -345,7 +345,9 @@ pub const KVHandler = struct {
 
         // Strip namespace prefix and filter reserved keys in-place
         var count: usize = 0;
+        const cap: usize = if (limit > 0) @intCast(limit) else S.key_buf.len;
         for (S.key_buf[0..raw_count]) |key| {
+            if (count >= cap) break;
             const stripped = stripNsPrefix(key, namespace);
             if (!isReservedKey(stripped)) {
                 S.key_buf[count] = stripped;
@@ -540,7 +542,7 @@ pub const KVHandler = struct {
             flags |= entry_mod.Flags.TOMBSTONE;
         }
 
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
         if (entry_type == .kv_put) {
             if (req.getTtlSeconds()) |ttl_secs| {
@@ -664,7 +666,7 @@ pub const KVHandler = struct {
         }
 
         const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
             if (ttl_secs == 0) break :blk 0;
             break :blk timestamp + ttl_secs * 1_000_000_000;
@@ -694,7 +696,7 @@ pub const KVHandler = struct {
             return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
         const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         self.kv.delete(qkey, lsn, 0, timestamp) catch {
             return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
         };

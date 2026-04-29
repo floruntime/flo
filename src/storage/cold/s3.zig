@@ -239,7 +239,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "PUT",
             uri_path,
@@ -322,7 +322,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "GET",
             uri_path,
@@ -388,7 +388,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "PUT",
             uri_path,
@@ -452,7 +452,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "GET",
             uri_path,
@@ -509,7 +509,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "HEAD",
             uri_path,
@@ -554,7 +554,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "DELETE",
             uri_path,
@@ -611,7 +611,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "GET",
             uri_path,
@@ -660,7 +660,7 @@ pub const S3Backend = struct {
         var host_buf: [256]u8 = undefined;
         const signing_host = self.getSigningHost(&host_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const signed = aws_sigv4.signRequest(
             "HEAD",
             uri_path,

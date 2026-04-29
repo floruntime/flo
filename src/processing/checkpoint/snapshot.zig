@@ -60,10 +60,10 @@ pub const CheckpointSnapshot = struct {
         operators: []const Operator,
         source: ?Source,
     ) !Self {
-        const timestamp_ms = std.time.milliTimestamp();
+        const timestamp_ms = @import("stdx").time.milliTimestamp();
 
         // Snapshot each operator
-        var states: std.ArrayListUnmanaged(OperatorStateEntry) = .{};
+        var states: std.ArrayListUnmanaged(OperatorStateEntry) = .empty;
         errdefer {
             for (states.items) |*s| s.deinit(allocator);
             states.deinit(allocator);

@@ -90,8 +90,8 @@ pub const Table = struct {
     pub fn init(allocator: Allocator) Table {
         return .{
             .allocator = allocator,
-            .columns = std.ArrayList(Column){},
-            .rows = std.ArrayList([]const []const u8){},
+            .columns = .empty,
+            .rows = .empty,
         };
     }
 
@@ -366,7 +366,7 @@ fn skipField(reader: *WireReader, col: WireColumn) void {
 
 /// Format an i64 millisecond timestamp as a relative time string.
 fn formatRelativeTimeBuf(ms: i64, buf: *[24]u8) []const u8 {
-    const now = std.time.milliTimestamp();
+    const now = @import("stdx").time.milliTimestamp();
     const diff = now - ms;
     if (diff < 0) return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
     if (diff < 1000) return std.fmt.bufPrint(buf, "{d}ms ago", .{diff}) catch "?";
@@ -593,7 +593,7 @@ pub const KeyValuePrinter = struct {
     pub fn init(allocator: Allocator) KeyValuePrinter {
         return .{
             .allocator = allocator,
-            .pairs = std.ArrayList(struct { key: []const u8, value: []const u8 }){},
+            .pairs = .empty,
         };
     }
 

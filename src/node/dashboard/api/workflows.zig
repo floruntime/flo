@@ -99,9 +99,9 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
 fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -149,7 +149,7 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn createDefinition(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
@@ -157,9 +157,9 @@ fn createDefinition(allocator: Allocator, body: []const u8, ctx: *DashboardConte
 
     if (body.len == 0) return try h.jsonError(allocator, "Empty definition body");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -167,13 +167,13 @@ fn createDefinition(allocator: Allocator, body: []const u8, ctx: *DashboardConte
     try obj.stringField("status", "not_wired");
     try obj.intField("body_size", @as(i64, @intCast(body.len)));
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn getDefinition(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Search shards for this definition
     var found_rec: ?*const WorkflowHandler.DefinitionRecord = null;
@@ -236,15 +236,15 @@ fn getDefinition(allocator: Allocator, name: []const u8, ctx: *DashboardContext)
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn enableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -252,15 +252,15 @@ fn enableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContext
     try obj.boolField("enabled", true);
     try obj.stringField("status", "not_wired");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn disableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -268,7 +268,7 @@ fn disableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContex
     try obj.boolField("enabled", false);
     try obj.stringField("status", "not_wired");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // ---------------------------------------------------------------------------
@@ -283,9 +283,9 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     const search_query = h.parseQueryParam([]const u8, query_string, "search");
     const cursor = h.parseQueryParam([]const u8, query_string, "cursor");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Lowercase the search query for case-insensitive matching
     var search_lower_buf: [256]u8 = undefined;
@@ -439,7 +439,7 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn startRun(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
@@ -447,22 +447,22 @@ fn startRun(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]c
 
     if (body.len == 0) return try h.jsonError(allocator, "Empty run request body");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("status", "not_wired");
     try obj.intField("body_size", @as(i64, @intCast(body.len)));
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn getRunStatus(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Search for the run across shards
     const n = shardCount(ctx);
@@ -571,7 +571,7 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext
                 // History count
                 try obj.intField("history_event_count", @as(i64, @intCast(run.history.items.len)));
                 try obj.end();
-                return try json_buf.toOwnedSlice(allocator);
+                return try json_aw.toOwnedSlice();
             }
         }
     }
@@ -582,13 +582,13 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext
     try obj.stringField("error", "Run not found");
     try obj.stringField("run_id", run_id);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn getRunHistory(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -630,30 +630,30 @@ fn getRunHistory(allocator: Allocator, run_id: []const u8, ctx: *DashboardContex
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn cancelRun(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("run_id", run_id);
     try obj.stringField("status", "not_wired");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn signalRun(allocator: Allocator, run_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -661,7 +661,7 @@ fn signalRun(allocator: Allocator, run_id: []const u8, body: []const u8, ctx: *D
     try obj.stringField("status", "not_wired");
     try obj.intField("signal_size", @as(i64, @intCast(body.len)));
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================
@@ -845,7 +845,7 @@ fn resolveSearchAttrPath(
             return .{ .string = run.run_id_owned };
         }
         if (std.mem.eql(u8, field, "timestamp")) {
-            return .{ .integer = std.time.milliTimestamp() };
+            return .{ .integer = @import("stdx").time.milliTimestamp() };
         }
         return null;
     }

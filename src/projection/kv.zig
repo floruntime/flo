@@ -195,7 +195,7 @@ pub const KVProjection = struct {
         const entry = self.map.getPtr(key) orelse return null;
         if (entry.tombstone) return null;
         // Check TTL
-        if (entry.expiry_ns > 0 and entry.expiry_ns <= std.time.nanoTimestamp()) {
+        if (entry.expiry_ns > 0 and entry.expiry_ns <= @import("stdx").time.nanoTimestamp()) {
             // Lazily expire — don't remove yet, just return null
             return null;
         }
@@ -243,7 +243,7 @@ pub const KVProjection = struct {
     /// Caller provides a bounded output buffer.
     pub fn scan(self: *KVProjection, out: []ScanEntry) usize {
         self.stats.scans += 1;
-        const now = std.time.nanoTimestamp();
+        const now = @import("stdx").time.nanoTimestamp();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
@@ -264,7 +264,7 @@ pub const KVProjection = struct {
     /// Scan entries matching a key prefix.
     pub fn scanPrefix(self: *KVProjection, prefix: []const u8, out: []ScanEntry) usize {
         self.stats.scans += 1;
-        const now = std.time.nanoTimestamp();
+        const now = @import("stdx").time.nanoTimestamp();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
@@ -292,7 +292,7 @@ pub const KVProjection = struct {
     /// projection while references are alive (guaranteed by single-threaded shard).
     pub fn scanKeyNames(self: *KVProjection, prefix: []const u8, out: [][]const u8) usize {
         self.stats.scans += 1;
-        const now = std.time.nanoTimestamp();
+        const now = @import("stdx").time.nanoTimestamp();
         var n_found: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
@@ -375,7 +375,7 @@ pub const KVProjection = struct {
 
         const gop = try self.version_chains.getOrPut(existing.key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
         var chain = gop.value_ptr;
 
@@ -439,7 +439,7 @@ pub const KVProjection = struct {
                 freed += 1;
             }
             entry.value_ptr.deinit(self.allocator);
-            entry.value_ptr.* = .{};
+            entry.value_ptr.* = .empty;
         }
         return freed;
     }

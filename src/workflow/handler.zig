@@ -65,7 +65,7 @@ pub const WorkflowHandler = struct {
 
     /// Mutex for cross-shard thread safety. Acquired when this handler is
     /// accessed from a different shard's thread via forwardToShard dispatch.
-    mu: std.Thread.Mutex,
+    mu: @import("stdx").Mutex,
 
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
@@ -515,7 +515,7 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         self.definitions.put(ns_key, .{
             .name_owned = owned_name,
@@ -737,7 +737,7 @@ pub const WorkflowHandler = struct {
         else
             null;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         var run = RunRecord{
             .run_id_owned = owned_run_id,
@@ -850,7 +850,7 @@ pub const WorkflowHandler = struct {
         else
             null;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         run.signals.append(self.allocator, .{
             .signal_type_owned = owned_sig_type,
@@ -913,7 +913,7 @@ pub const WorkflowHandler = struct {
             return;
         };
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
         self.completeRun(shard, run_ns_key, run, .cancelled, reason, now_ms);
 
@@ -948,8 +948,8 @@ pub const WorkflowHandler = struct {
         // [has_wait_signal:u8][wait_signal_len:u16][wait_signal]?
         const current_step = run.current_step_name_owned orelse "start";
         var wire_buf: [16384]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&wire_buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&wire_buf);
+        const w = &fbs;
         w.writeInt(u16, @intCast(run.run_id_owned.len), .little) catch return;
         w.writeAll(run.run_id_owned) catch return;
         w.writeInt(u16, @intCast(run.workflow_name_owned.len), .little) catch return;
@@ -990,7 +990,7 @@ pub const WorkflowHandler = struct {
             w.writeByte(0) catch return;
         }
 
-        shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+        shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
     }
 
     // ── HISTORY ─────────────────────────────────────────────────────────
@@ -1163,7 +1163,7 @@ pub const WorkflowHandler = struct {
         } else null;
 
         // Collect matching runs with sort key
-        var runs_list: std.ArrayListUnmanaged(RunInfo) = .{};
+        var runs_list: std.ArrayListUnmanaged(RunInfo) = .empty;
         defer runs_list.deinit(self.allocator);
 
         // Cross-shard aggregation: when workflow_name is empty, search all shards.
@@ -1365,7 +1365,7 @@ pub const WorkflowHandler = struct {
 
         // Collect matching definitions
         const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
-        var defs: std.ArrayListUnmanaged(DefInfo) = .{};
+        var defs: std.ArrayListUnmanaged(DefInfo) = .empty;
         defer defs.deinit(self.allocator);
 
         var dit = self.definitions.iterator();
@@ -1452,7 +1452,7 @@ pub const WorkflowHandler = struct {
         var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
         defer def.deinit(self.allocator);
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
         var steps_executed: u32 = 0;
 
         // Initialize step_outputs if needed
@@ -1922,7 +1922,7 @@ pub const WorkflowHandler = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // Collect keys of runs that need resuming (can't modify map while iterating)
         var resume_keys: [64][]const u8 = undefined;
@@ -2321,10 +2321,10 @@ pub const WorkflowHandler = struct {
             run.run_id_owned,
         );
 
-        var buf: std.ArrayList(u8) = .empty;
-        const w = buf.writer(self.allocator);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        const w: *std.Io.Writer = &aw.writer;
         w.writeByte('{') catch {
-            buf.deinit(self.allocator);
+            aw.deinit();
             return null;
         };
 
@@ -2348,11 +2348,11 @@ pub const WorkflowHandler = struct {
         }
 
         w.writeByte('}') catch {
-            buf.deinit(self.allocator);
+            aw.deinit();
             return null;
         };
-        return buf.toOwnedSlice(self.allocator) catch {
-            buf.deinit(self.allocator);
+        return aw.toOwnedSlice() catch {
+            aw.deinit();
             return null;
         };
     }
@@ -2509,7 +2509,7 @@ pub const WorkflowHandler = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         var it = self.schedules.iterator();
         while (it.next()) |entry| {
@@ -2547,7 +2547,7 @@ pub const WorkflowHandler = struct {
         shard: *Shard,
         schedule: *const ScheduleState,
     ) void {
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const input = schedule.input_owned orelse "{}";
 
         // Generate run ID with embedded partition bits
@@ -2632,7 +2632,7 @@ pub const WorkflowHandler = struct {
     /// Poll all active stream triggers and start workflow runs for new events.
     /// Called from shard.tick() on every reactor cycle.
     pub fn tickStreamTriggers(self: *WorkflowHandler, shard: *Shard) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
 
         var it = self.stream_triggers.iterator();
         while (it.next()) |entry| {
@@ -2731,7 +2731,7 @@ pub const WorkflowHandler = struct {
         trigger: *const StreamTriggerState,
         input: []const u8,
     ) void {
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
@@ -3428,7 +3428,7 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
             else => if (c < 0x20) {
-                try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+                try writer.print("\\u{x:0>4}", .{c});
             } else {
                 try writer.writeByte(c);
             },
@@ -3609,7 +3609,7 @@ fn completeTestAction(actions: *ActionsHandler, run_id: []const u8) void {
 fn completeTestActionWith(actions: *ActionsHandler, run_id: []const u8, outcome: []const u8) void {
     const run = actions.runs.getPtr(run_id) orelse return;
     run.status = .completed;
-    run.completed_at_ms = std.time.milliTimestamp();
+    run.completed_at_ms = @import("stdx").time.milliTimestamp();
     if (run.outcome_owned) |old| actions.allocator.free(old);
     run.outcome_owned = actions.allocator.dupe(u8, outcome) catch null;
 }

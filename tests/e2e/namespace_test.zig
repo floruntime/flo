@@ -203,7 +203,7 @@ test "e2e/namespace: delete with --force removes namespace and all kv keys" {
     try ctx.exec(&.{ "ns", "delete", "force_delete_ns", "--force" });
 
     // Wait for async deletion task to complete
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -250,7 +250,7 @@ test "e2e/namespace: force delete removes all kv keys" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion to complete
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -287,7 +287,7 @@ test "e2e/namespace: force delete with many kv keys" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion (may take multiple task iterations)
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -335,7 +335,7 @@ test "e2e/namespace: force delete removes streams" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -373,7 +373,7 @@ test "e2e/namespace: force delete removes stream consumer groups" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion
-    std.Thread.sleep(2000 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -429,7 +429,7 @@ test "e2e/namespace: force delete removes queues" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -463,7 +463,7 @@ test "e2e/namespace: force delete removes queue messages" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Recreate namespace and queue
     try ctx.exec(&.{ "ns", "create", ns });
@@ -503,7 +503,7 @@ test "e2e/namespace: force delete removes all resource types" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for async deletion to complete all phases
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -542,7 +542,7 @@ test "e2e/namespace: force delete is idempotent" {
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
 
     // Wait for deletion
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Second delete should fail (namespace gone)
     var result = try ctx.cli.run(&.{ "ns", "delete", ns, "--force" });
@@ -565,7 +565,7 @@ test "e2e/namespace: other namespaces unaffected by force delete" {
     try ctx.exec(&.{ "ns", "delete", "ns_delete", "--force" });
 
     // Wait for deletion
-    std.Thread.sleep(700 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
 
     // Other namespace should be intact
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -642,7 +642,7 @@ test "e2e/namespace/cluster: non-empty namespace delete fails" {
     // If node 0 is a follower, it forwards the kv set to the leader;
     // the leader commits and responds, but node 0 may not have applied
     // the commit (which sets the namespace data flag) yet.
-    std.Thread.sleep(1000 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(1000 * std.time.ns_per_ms);
 
     // Try to delete without --force - should fail
     const result = try cluster.execCaptureAnyOn(0, &.{ "ns", "delete", "nonempty_cluster" });

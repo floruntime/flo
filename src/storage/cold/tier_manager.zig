@@ -111,14 +111,14 @@ pub const ColdTierManager = struct {
     ///
     pub fn archiveSegmentFile(self: *Self, segment_path: []const u8) !void {
         // Read segment file
-        const file = std.fs.cwd().openFile(segment_path, .{}) catch return ColdTierError.SegmentNotFound;
-        defer file.close();
+        const file = @import("stdx").fs.openFile(segment_path, .{}) catch return ColdTierError.SegmentNotFound;
+        defer @import("stdx").fs.closeFile(file);
 
-        const stat = file.stat() catch return ColdTierError.IoError;
+        const stat = @import("stdx").fs.statHandle(file) catch return ColdTierError.IoError;
         const data = self.allocator.alloc(u8, stat.size) catch return ColdTierError.OutOfMemory;
         defer self.allocator.free(data);
 
-        const bytes_read = file.readAll(data) catch return ColdTierError.IoError;
+        const bytes_read = @import("stdx").fs.readAll(file, data) catch return ColdTierError.IoError;
         if (bytes_read != stat.size) return ColdTierError.SegmentNotFound;
 
         return self.archiveSegmentData(data, segment_path);
@@ -227,17 +227,17 @@ pub const ColdTierManager = struct {
         const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}/cold.fcold.tmp", .{dir_path}) catch return error.InvalidManifest;
 
         // Ensure dir exists
-        std.fs.cwd().makePath(dir_path) catch {};
+        @import("stdx").fs.makePath(dir_path) catch {};
 
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch return error.InvalidManifest;
-        file.writeAll(data) catch {
-            file.close();
+        const file = @import("stdx").fs.createFile(tmp_path, .{}) catch return error.InvalidManifest;
+        @import("stdx").fs.writeAll(file, data) catch {
+            @import("stdx").fs.closeFile(file);
             return error.InvalidManifest;
         };
-        file.sync() catch {};
-        file.close();
+        @import("stdx").fs.sync(file) catch {};
+        @import("stdx").fs.closeFile(file);
 
-        std.fs.cwd().rename(tmp_path, manifest_path) catch return error.InvalidManifest;
+        @import("stdx").fs.rename(tmp_path, manifest_path) catch return error.InvalidManifest;
     }
 
     /// Load the manifest from a local directory.
@@ -245,14 +245,14 @@ pub const ColdTierManager = struct {
         var path_buf: [512]u8 = undefined;
         const manifest_path = std.fmt.bufPrint(&path_buf, "{s}/cold.fcold", .{dir_path}) catch return error.InvalidManifest;
 
-        const file = std.fs.cwd().openFile(manifest_path, .{}) catch return; // No manifest = fresh start
-        defer file.close();
+        const file = @import("stdx").fs.openFile(manifest_path, .{}) catch return; // No manifest = fresh start
+        defer @import("stdx").fs.closeFile(file);
 
-        const stat = file.stat() catch return error.InvalidManifest;
+        const stat = @import("stdx").fs.statHandle(file) catch return error.InvalidManifest;
         const data = self.allocator.alloc(u8, stat.size) catch return error.OutOfMemory;
         defer self.allocator.free(data);
 
-        const bytes_read = file.readAll(data) catch return error.InvalidManifest;
+        const bytes_read = @import("stdx").fs.readAll(file, data) catch return error.InvalidManifest;
         if (bytes_read != stat.size) return error.InvalidManifest;
 
         // Replace current manifest
@@ -266,12 +266,12 @@ pub const ColdTierManager = struct {
     /// that are not already in the manifest.
     /// Returns the number of segments archived.
     pub fn archiveWarmSegments(self: *Self, shard_dir: []const u8) !u64 {
-        var dir = std.fs.cwd().openDir(shard_dir, .{ .iterate = true }) catch return 0;
-        defer dir.close();
+        var dir = @import("stdx").fs.openDir(shard_dir, .{ .iterate = true }) catch return 0;
+        defer @import("stdx").fs.closeDir(dir);
 
         var archived: u64 = 0;
         var iter = dir.iterate();
-        while (iter.next() catch null) |de| {
+        while (iter.next(@import("stdx").io.instance()) catch null) |de| {
             if (de.kind != .file) continue;
             if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
 
@@ -280,13 +280,13 @@ pub const ColdTierManager = struct {
             const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ shard_dir, de.name }) catch continue;
 
             // Read segment header to check if already archived
-            const file = std.fs.cwd().openFile(full_path, .{}) catch continue;
+            const file = @import("stdx").fs.openFile(full_path, .{}) catch continue;
             var hdr_bytes: [segment_mod.HEADER_SIZE]u8 = undefined;
-            const n = file.readAll(&hdr_bytes) catch {
-                file.close();
+            const n = @import("stdx").fs.readAll(file, &hdr_bytes) catch {
+                @import("stdx").fs.closeFile(file);
                 continue;
             };
-            file.close();
+            @import("stdx").fs.closeFile(file);
 
             if (n < segment_mod.HEADER_SIZE) continue;
 
@@ -351,10 +351,10 @@ test "ColdTierManager: archive and download round-trip" {
     const cold_dir = "/tmp/test_cold_tier_backend";
 
     // Cleanup
-    std.fs.cwd().deleteTree(test_dir) catch {};
-    std.fs.cwd().deleteTree(cold_dir) catch {};
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
-    defer std.fs.cwd().deleteTree(cold_dir) catch {};
+    @import("stdx").fs.deleteTree(test_dir) catch {};
+    @import("stdx").fs.deleteTree(cold_dir) catch {};
+    defer @import("stdx").fs.deleteTree(test_dir) catch {};
+    defer @import("stdx").fs.deleteTree(cold_dir) catch {};
 
     // Create a file backend for cold storage
     const file_backend = try FileBackend.init(allocator, .{
@@ -377,13 +377,13 @@ test "ColdTierManager: archive and download round-trip" {
     defer allocator.free(seg_data);
 
     // Write segment to a local file (simulating warm tier)
-    std.fs.cwd().makePath(test_dir) catch {};
+    @import("stdx").fs.makePath(test_dir) catch {};
     const seg_path = try std.fmt.allocPrint(allocator, "{s}/0000000001.flseg", .{test_dir});
     defer allocator.free(seg_path);
     {
-        const file = try std.fs.cwd().createFile(seg_path, .{});
-        defer file.close();
-        try file.writeAll(seg_data);
+        const file = try @import("stdx").fs.createFile(seg_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, seg_data);
     }
 
     // Archive the segment
@@ -414,10 +414,10 @@ test "ColdTierManager: manifest save and load persistence" {
     const test_dir = "/tmp/test_cold_tier_manifest_persist";
     const cold_dir = "/tmp/test_cold_tier_manifest_backend";
 
-    std.fs.cwd().deleteTree(test_dir) catch {};
-    std.fs.cwd().deleteTree(cold_dir) catch {};
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
-    defer std.fs.cwd().deleteTree(cold_dir) catch {};
+    @import("stdx").fs.deleteTree(test_dir) catch {};
+    @import("stdx").fs.deleteTree(cold_dir) catch {};
+    defer @import("stdx").fs.deleteTree(test_dir) catch {};
+    defer @import("stdx").fs.deleteTree(cold_dir) catch {};
 
     const file_backend = try FileBackend.init(allocator, .{
         .base_path = cold_dir,
@@ -465,12 +465,12 @@ test "ColdTierManager: archiveWarmSegments scans directory" {
     const warm_dir = "/tmp/test_cold_tier_warm_scan";
     const cold_dir = "/tmp/test_cold_tier_scan_backend";
 
-    std.fs.cwd().deleteTree(warm_dir) catch {};
-    std.fs.cwd().deleteTree(cold_dir) catch {};
-    defer std.fs.cwd().deleteTree(warm_dir) catch {};
-    defer std.fs.cwd().deleteTree(cold_dir) catch {};
+    @import("stdx").fs.deleteTree(warm_dir) catch {};
+    @import("stdx").fs.deleteTree(cold_dir) catch {};
+    defer @import("stdx").fs.deleteTree(warm_dir) catch {};
+    defer @import("stdx").fs.deleteTree(cold_dir) catch {};
 
-    std.fs.cwd().makePath(warm_dir) catch {};
+    @import("stdx").fs.makePath(warm_dir) catch {};
 
     // Create two segment files in the warm directory
     var writer1 = SegmentWriter.init(allocator, 0, .none);
@@ -518,8 +518,8 @@ test "ColdTierManager: downloadSegment not found" {
     const allocator = testing.allocator;
     const cold_dir = "/tmp/test_cold_tier_notfound";
 
-    std.fs.cwd().deleteTree(cold_dir) catch {};
-    defer std.fs.cwd().deleteTree(cold_dir) catch {};
+    @import("stdx").fs.deleteTree(cold_dir) catch {};
+    defer @import("stdx").fs.deleteTree(cold_dir) catch {};
 
     const file_backend = try FileBackend.init(allocator, .{
         .base_path = cold_dir,

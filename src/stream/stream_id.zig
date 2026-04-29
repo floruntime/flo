@@ -242,7 +242,7 @@ pub const StreamIdGenerator = struct {
     /// - Monotonically increasing (never generates duplicate or lower ID)
     /// - Clock skew safe (if clock goes backward, uses previous timestamp + seq)
     pub fn next(self: *StreamIdGenerator) StreamID {
-        const now_ms = @as(u64, @intCast(std.time.milliTimestamp()));
+        const now_ms = @as(u64, @intCast(@import("stdx").time.milliTimestamp()));
 
         // Load current state
         const last_ts = self.last_timestamp_ms.load(.acquire);
@@ -282,7 +282,7 @@ pub const StreamIdGenerator = struct {
     pub fn nextBatch(self: *StreamIdGenerator, count: usize) !struct { first: StreamID, last: StreamID } {
         if (count == 0) return error.EmptyBatch;
 
-        const now_ms = @as(u64, @intCast(std.time.milliTimestamp()));
+        const now_ms = @as(u64, @intCast(@import("stdx").time.milliTimestamp()));
 
         // Load current state
         const last_ts = self.last_timestamp_ms.load(.acquire);

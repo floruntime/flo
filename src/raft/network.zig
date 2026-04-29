@@ -23,6 +23,85 @@ const Entry = entry_mod.Entry;
 const RaftHeader = transport.RaftHeader;
 const HEADER_SIZE = transport.HEADER_SIZE;
 const Inbox = inbox_mod.Inbox;
+
+// --- 0.16 compat: thin wrappers around std.c.* with std.posix-style errors ---
+// std.posix.{socket,connect,bind,listen,accept,close,write} were removed; the
+// libc functions still work and we link libc.
+
+const SocketError = error{ SocketCreateFailed, OutOfMemory, SystemResources, Unexpected };
+fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
+    // macOS rejects SOCK.NONBLOCK / SOCK.CLOEXEC in the socket() type field
+    // (returns EPROTONOSUPPORT). Strip them and apply via fcntl after creation.
+    const builtin = @import("builtin");
+    const strip_mask: u32 = if (builtin.os.tag == .macos)
+        posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC
+    else
+        0;
+    const want_nonblock = (sock_type & posix.SOCK.NONBLOCK) != 0;
+    const want_cloexec = (sock_type & posix.SOCK.CLOEXEC) != 0;
+    const real_type = sock_type & ~strip_mask;
+
+    const rc = std.c.socket(@intCast(family), @intCast(real_type), @intCast(protocol));
+    if (rc < 0) return error.SocketCreateFailed;
+    const fd: posix.socket_t = @intCast(rc);
+
+    if (builtin.os.tag == .macos) {
+        if (want_nonblock) {
+            const F_GETFL: c_int = 3;
+            const F_SETFL: c_int = 4;
+            const O_NONBLOCK: c_int = 4;
+            const flags = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
+            if (flags >= 0) _ = std.c.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        if (want_cloexec) {
+            const F_SETFD: c_int = 2;
+            const FD_CLOEXEC: c_int = 1;
+            _ = std.c.fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+    }
+    return fd;
+}
+fn sysClose(fd: posix.socket_t) void {
+    _ = std.c.close(fd);
+}
+fn sysBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{BindFailed}!void {
+    if (std.c.bind(fd, addr, len) != 0) return error.BindFailed;
+}
+fn sysListen(fd: posix.socket_t, backlog: u31) error{ListenFailed}!void {
+    if (std.c.listen(fd, backlog) != 0) return error.ListenFailed;
+}
+fn sysConnect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{ConnectFailed}!void {
+    if (std.c.connect(fd, addr, len) != 0) return error.ConnectFailed;
+}
+fn sysAccept(fd: posix.socket_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t, _: u32) error{AcceptFailed}!posix.socket_t {
+    const rc = std.c.accept(fd, addr, len);
+    if (rc < 0) return error.AcceptFailed;
+    return @intCast(rc);
+}
+fn sysWrite(fd: posix.socket_t, buf: []const u8) error{WriteFailed}!usize {
+    const rc = std.c.write(fd, buf.ptr, buf.len);
+    if (rc < 0) return error.WriteFailed;
+    return @intCast(rc);
+}
+
+const SocketAddr = struct {
+    sa: posix.sockaddr.in,
+
+    fn initIp4(ip4: [4]u8, port: u16) SocketAddr {
+        return .{ .sa = .{
+            .family = std.c.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast(ip4),
+            .zero = .{0} ** 8,
+        } };
+    }
+    fn anyPtr(self: *const SocketAddr) *const posix.sockaddr {
+        return @ptrCast(&self.sa);
+    }
+    fn anyLen(_: SocketAddr) posix.socklen_t {
+        return @sizeOf(posix.sockaddr.in);
+    }
+};
 const InboxMessage = inbox_mod.Message;
 
 pub const MAX_PEERS = 7;
@@ -62,7 +141,7 @@ pub const RaftNetwork = struct {
     peer_count: u8,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
-    mutex: std.Thread.Mutex,
+    mutex: @import("stdx").Mutex,
     pending: std.ArrayListUnmanaged([]u8),
     shard_inbox: ?*Inbox,
     /// Raft ports of peers we should connect to (from peer exchange).
@@ -70,15 +149,15 @@ pub const RaftNetwork = struct {
     pending_peer_count: u8,
 
     pub fn init(allocator: Allocator, node_id: u32, listen_port: u16, main_port: u16) !RaftNetwork {
-        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(fd);
+        const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        errdefer sysClose(fd);
 
         const opt_val: i32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&opt_val));
 
-        const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, listen_port);
-        try posix.bind(fd, &addr.any, addr.getOsSockLen());
-        try posix.listen(fd, 16);
+        const addr = SocketAddr.initIp4(.{ 0, 0, 0, 0 }, listen_port);
+        try sysBind(fd, addr.anyPtr(), addr.anyLen());
+        try sysListen(fd, 16);
 
         return .{
             .allocator = allocator,
@@ -100,14 +179,14 @@ pub const RaftNetwork = struct {
 
     pub fn deinit(self: *RaftNetwork) void {
         self.stop();
-        posix.close(self.listener_fd);
+        sysClose(self.listener_fd);
         for (self.pending.items) |data| {
             self.allocator.free(data);
         }
         self.pending.deinit(self.allocator);
         for (&self.peers) |*p| {
             if (p.active) {
-                posix.close(p.fd);
+                sysClose(p.fd);
                 p.active = false;
             }
         }
@@ -119,10 +198,10 @@ pub const RaftNetwork = struct {
 
     pub fn connectToPeer(self: *RaftNetwork, host: []const u8, port: u16) !void {
         const addr = try parseAddress(host, port);
-        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-        errdefer posix.close(fd);
+        const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        errdefer sysClose(fd);
 
-        try posix.connect(fd, &addr.any, addr.getOsSockLen());
+        try sysConnect(fd, addr.anyPtr(), addr.anyLen());
 
         // Send join request
         var payload: [JOIN_REQ_SIZE]u8 = undefined;
@@ -132,7 +211,7 @@ pub const RaftNetwork = struct {
 
         var msg_buf: [HEADER_SIZE + JOIN_REQ_SIZE]u8 = undefined;
         _ = frameCustomMessage(MSG_JOIN_REQUEST, 0, self.node_id, &payload, &msg_buf);
-        _ = try posix.write(fd, &msg_buf);
+        _ = try sysWrite(fd, &msg_buf);
 
         // Read join response
         var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
@@ -177,7 +256,7 @@ pub const RaftNetwork = struct {
             self.readFromPeers();
             self.flushPending();
             self.connectPendingPeers();
-            std.Thread.sleep(TICK_INTERVAL_MS * std.time.ns_per_ms);
+            @import("stdx").time.sleep(TICK_INTERVAL_MS * std.time.ns_per_ms);
         }
     }
 
@@ -185,22 +264,22 @@ pub const RaftNetwork = struct {
         while (true) {
             var client_addr: posix.sockaddr = undefined;
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-            const client_fd = posix.accept(self.listener_fd, &client_addr, &addr_len, 0) catch return;
+            const client_fd = sysAccept(self.listener_fd, &client_addr, &addr_len, 0) catch return;
 
             // Read join request with timeout
             var req_buf: [HEADER_SIZE + JOIN_REQ_SIZE + 16]u8 = undefined;
             const n = readWithTimeout(client_fd, &req_buf, 2000) catch {
-                posix.close(client_fd);
+                sysClose(client_fd);
                 continue;
             };
             if (n < HEADER_SIZE + JOIN_REQ_SIZE) {
-                posix.close(client_fd);
+                sysClose(client_fd);
                 continue;
             }
 
             const hdr = RaftHeader.fromBytes(req_buf[0..HEADER_SIZE]);
             if (hdr.msg_type != MSG_JOIN_REQUEST) {
-                posix.close(client_fd);
+                sysClose(client_fd);
                 continue;
             }
 
@@ -213,14 +292,14 @@ pub const RaftNetwork = struct {
 
             var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
             _ = frameCustomMessage(MSG_JOIN_RESPONSE, 0, self.node_id, &resp_payload, &resp_buf);
-            _ = posix.write(client_fd, &resp_buf) catch {
-                posix.close(client_fd);
+            _ = sysWrite(client_fd, &resp_buf) catch {
+                sysClose(client_fd);
                 continue;
             };
 
             // Reject duplicate connections — keep existing connection
             if (self.hasPeer(peer_node_id)) {
-                posix.close(client_fd);
+                sysClose(client_fd);
                 continue;
             }
 
@@ -237,7 +316,7 @@ pub const RaftNetwork = struct {
             }
 
             setNonBlocking(client_fd) catch {
-                posix.close(client_fd);
+                sysClose(client_fd);
                 continue;
             };
 
@@ -252,7 +331,7 @@ pub const RaftNetwork = struct {
         std.mem.writeInt(u16, payload[4..6], peer_raft_port, .little);
         var buf: [HEADER_SIZE + PEER_INFO_SIZE]u8 = undefined;
         const total = frameCustomMessage(MSG_PEER_INFO, 0, self.node_id, &payload, &buf);
-        _ = posix.write(fd, buf[0..total]) catch {};
+        _ = sysWrite(fd, buf[0..total]) catch {};
     }
 
     fn readFromPeers(self: *RaftNetwork) void {
@@ -265,13 +344,13 @@ pub const RaftNetwork = struct {
             }
             const n = posix.read(p.fd, space) catch |err| {
                 if (err == error.WouldBlock) continue;
-                posix.close(p.fd);
+                sysClose(p.fd);
                 p.active = false;
                 if (self.peer_count > 0) self.peer_count -= 1;
                 continue;
             };
             if (n == 0) {
-                posix.close(p.fd);
+                sysClose(p.fd);
                 p.active = false;
                 if (self.peer_count > 0) self.peer_count -= 1;
                 continue;
@@ -331,7 +410,7 @@ pub const RaftNetwork = struct {
             if (!p.active) continue;
             if (p.fd == sender_fd) continue;
             if (p.node_id == source_node) continue;
-            _ = posix.write(p.fd, msg_buf[0..total]) catch {};
+            _ = sysWrite(p.fd, msg_buf[0..total]) catch {};
         }
     }
 
@@ -355,7 +434,7 @@ pub const RaftNetwork = struct {
             const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, self.node_id, entry_data, &msg_buf);
             for (&self.peers) |*p| {
                 if (!p.active) continue;
-                _ = posix.write(p.fd, msg_buf[0..total]) catch {};
+                _ = sysWrite(p.fd, msg_buf[0..total]) catch {};
             }
         }
     }
@@ -389,10 +468,10 @@ pub const RaftNetwork = struct {
     /// for mesh connections discovered via peer exchange.
     fn connectToPeerNonBlocking(self: *RaftNetwork, host: []const u8, port: u16) void {
         const addr = parseAddress(host, port) catch return;
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+        const fd = sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-            posix.close(fd);
+        sysConnect(fd, addr.anyPtr(), addr.anyLen()) catch {
+            sysClose(fd);
             return;
         };
 
@@ -404,25 +483,25 @@ pub const RaftNetwork = struct {
 
         var msg_buf: [HEADER_SIZE + JOIN_REQ_SIZE]u8 = undefined;
         _ = frameCustomMessage(MSG_JOIN_REQUEST, 0, self.node_id, &payload, &msg_buf);
-        _ = posix.write(fd, &msg_buf) catch {
-            posix.close(fd);
+        _ = sysWrite(fd, &msg_buf) catch {
+            sysClose(fd);
             return;
         };
 
         // Read join response (short timeout since it's local)
         var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
         const n = readWithTimeout(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE], 1000) catch {
-            posix.close(fd);
+            sysClose(fd);
             return;
         };
         if (n < HEADER_SIZE) {
-            posix.close(fd);
+            sysClose(fd);
             return;
         }
 
         const resp_hdr = RaftHeader.fromBytes(resp_buf[0..HEADER_SIZE]);
         if (resp_hdr.msg_type != MSG_JOIN_RESPONSE) {
-            posix.close(fd);
+            sysClose(fd);
             return;
         }
 
@@ -430,12 +509,12 @@ pub const RaftNetwork = struct {
 
         // Double-check: don't add duplicate
         if (self.hasPeer(peer_node_id)) {
-            posix.close(fd);
+            sysClose(fd);
             return;
         }
 
         setNonBlocking(fd) catch {
-            posix.close(fd);
+            sysClose(fd);
             return;
         };
         self.addPeerByFd(peer_node_id, fd, port);
@@ -471,7 +550,7 @@ pub const RaftNetwork = struct {
             }
         }
         // No free slots
-        posix.close(fd);
+        sysClose(fd);
     }
 
     /// Check if we already have a connection to a peer with the given node_id.
@@ -493,7 +572,7 @@ pub fn generateNodeId(port: u16) u32 {
     return if (h == 0) 1 else h;
 }
 
-fn parseAddress(host: []const u8, port: u16) !std.net.Address {
+fn parseAddress(host: []const u8, port: u16) !SocketAddr {
     var ip4: [4]u8 = .{ 127, 0, 0, 1 };
     if (host.len > 0 and !std.mem.eql(u8, host, "localhost")) {
         var parts = std.mem.splitScalar(u8, host, '.');
@@ -505,7 +584,7 @@ fn parseAddress(host: []const u8, port: u16) !std.net.Address {
         }
         if (idx != 4) return error.InvalidAddress;
     }
-    return std.net.Address.initIp4(ip4, port);
+    return SocketAddr.initIp4(ip4, port);
 }
 
 fn frameCustomMessage(msg_type: u8, group_id: u32, source_node: u32, payload: []const u8, buf: []u8) usize {
@@ -534,9 +613,10 @@ fn setNonBlocking(fd: posix.socket_t) !void {
     // F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x0004 on macOS
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
-    const O_NONBLOCK: usize = 0x0004;
-    const current = try posix.fcntl(fd, F_GETFL, 0);
-    _ = try posix.fcntl(fd, F_SETFL, current | O_NONBLOCK);
+    const O_NONBLOCK: c_int = 0x0004;
+    const current = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (current < 0) return error.FcntlFailed;
+    if (std.c.fcntl(fd, F_SETFL, current | O_NONBLOCK) < 0) return error.FcntlFailed;
 }
 
 fn readWithTimeout(fd: posix.socket_t, buf: []u8, timeout_ms: i32) !usize {
@@ -578,7 +658,7 @@ test "raft network: generateNodeId different ports" {
 
 test "raft network: parseAddress" {
     const addr = try parseAddress("127.0.0.1", 9500);
-    try testing.expectEqual(@as(u16, 9500), addr.getPort());
+    try testing.expectEqual(@as(u16, 9500), std.mem.bigToNative(u16, addr.sa.port));
 }
 
 test "raft network: frameCustomMessage roundtrip" {

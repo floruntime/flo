@@ -74,8 +74,8 @@ const Pool = struct {
 
     fn init(allocator: std.mem.Allocator, slab_size: usize, initial_count: usize) !Pool {
         var pool = Pool{
-            .free_list = .{},
-            .all_chunks = .{},
+            .free_list = .empty,
+            .all_chunks = .empty,
             .slab_size = slab_size,
         };
 
@@ -166,7 +166,7 @@ pub const SlabAllocator = struct {
         return .{
             .pools = pools,
             .allocator = allocator,
-            .fallback_allocs = .{},
+            .fallback_allocs = .empty,
         };
     }
 

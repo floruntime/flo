@@ -267,7 +267,7 @@ fn runWatch(ctx: *commander.Context) commander.Error!void {
         // Block for messages with 1 second timeout
         var result = client_mod.queue.dequeue(&client, namespace, queue, 1, 30000, 1000) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            @import("stdx").time.sleep(1 * std.time.ns_per_s);
             continue;
         };
         defer result.deinit();
@@ -535,7 +535,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Accumulate raw row bytes from paginated wire responses.
     // Server sends: [count:u32]([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*[has_more:u8][cursor_len:u16][cursor]?
-    var row_bytes: std.ArrayListUnmanaged(u8) = .{};
+    var row_bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer row_bytes.deinit(ctx.allocator);
     var entry_count: u32 = 0;
 

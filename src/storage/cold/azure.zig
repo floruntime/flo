@@ -228,8 +228,8 @@ pub const AzureBackend = struct {
 
         // Build string to sign
         var sts_buf: [2048]u8 = undefined;
-        var sts_fbs = std.io.fixedBufferStream(&sts_buf);
-        const sts_writer = sts_fbs.writer();
+        var sts_fbs: std.Io.Writer = .fixed(&sts_buf);
+        const sts_writer = &sts_fbs;
 
         // VERB
         sts_writer.writeAll(method) catch return null;
@@ -269,7 +269,7 @@ pub const AzureBackend = struct {
         // CanonicalizedResource
         sts_writer.print("/{s}/{s}/{s}", .{ self.account_name, self.container, blob_name }) catch return null;
 
-        const string_to_sign = sts_fbs.getWritten();
+        const string_to_sign = sts_fbs.buffered();
 
         // HMAC-SHA256
         var signature: [HmacSha256.mac_length]u8 = undefined;
@@ -354,7 +354,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [10]http_client.Header = undefined;
@@ -427,7 +427,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;
@@ -484,7 +484,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [10]http_client.Header = undefined;
@@ -538,7 +538,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;
@@ -588,7 +588,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;
@@ -626,7 +626,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;
@@ -663,7 +663,7 @@ pub const AzureBackend = struct {
         var url_buf: [MAX_URL_LEN]u8 = undefined;
         const url = self.buildListUrl(prefix, &url_buf) catch return error.InvalidKey;
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;
@@ -699,7 +699,7 @@ pub const AzureBackend = struct {
         var blob_buf: [MAX_URL_LEN]u8 = undefined;
         const blob_name = self.buildBlobName(key, &blob_buf);
 
-        const timestamp = std.time.timestamp();
+        const timestamp = @import("stdx").time.milliTimestamp();
         const ms_date = formatMsDate(timestamp);
 
         var headers: [5]http_client.Header = undefined;

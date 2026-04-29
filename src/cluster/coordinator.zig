@@ -672,7 +672,7 @@ pub const Coordinator = struct {
             .name = owned_name,
             .partition_count = partition_count,
             .replication_factor = replication_factor,
-            .created_at_ns = @as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000,
+            .created_at_ns = @as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000,
             .deleted = false,
         });
         log.debug("Coordinator: created namespace={s}, partitions={d}", .{ name, partition_count });
@@ -803,7 +803,7 @@ pub const Coordinator = struct {
 
     /// Serialize coordinator state for snapshot transfer
     pub fn takeSnapshot(self: *const Coordinator, allocator: Allocator) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         // Format v2: version(1) + ns_count(4) + [ns entries with settings] + node_count(4) + [node entries]

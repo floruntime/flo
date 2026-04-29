@@ -68,7 +68,7 @@ pub const CollectingSink = struct {
     pub fn init(allocator: Allocator, name: []const u8) Self {
         return .{
             .name = name,
-            .records = .{},
+            .records = .empty,
             .allocator = allocator,
             .flush_count = 0,
         };

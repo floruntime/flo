@@ -29,6 +29,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("../../mod.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ServerProcess = @import("server.zig").ServerProcess;
@@ -40,21 +41,23 @@ fn cleanupStaleProcesses() void {
     // Use pkill to kill any lingering flo processes
     // This is a best-effort cleanup - ignore errors
     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
-        var pkill = std.process.Child.init(&.{ "pkill", "-9", "-f", "flo server" }, std.heap.page_allocator);
-        pkill.stdin_behavior = .Ignore;
-        pkill.stdout_behavior = .Ignore;
-        pkill.stderr_behavior = .Ignore;
-        _ = pkill.spawnAndWait() catch {};
+        const io = stdx.io.instance();
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "pkill", "-9", "-f", "flo server" },
+        })) |r| {
+            std.heap.page_allocator.free(r.stdout);
+            std.heap.page_allocator.free(r.stderr);
+        } else |_| {}
 
-        // Also try killall for any direct flo processes
-        var killall = std.process.Child.init(&.{ "pkill", "-9", "flo" }, std.heap.page_allocator);
-        killall.stdin_behavior = .Ignore;
-        killall.stdout_behavior = .Ignore;
-        killall.stderr_behavior = .Ignore;
-        _ = killall.spawnAndWait() catch {};
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "pkill", "-9", "flo" },
+        })) |r| {
+            std.heap.page_allocator.free(r.stdout);
+            std.heap.page_allocator.free(r.stderr);
+        } else |_| {}
 
         // Brief wait for processes to terminate and release resources
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        stdx.time.sleep(500 * std.time.ns_per_ms);
     }
 }
 
@@ -68,7 +71,7 @@ fn startServerWithRetry(server: *ServerProcess) !void {
             attempt += 1;
             if (attempt >= max_retries) return err;
             std.debug.print("[cluster] Server start attempt {d}/{d} failed, retrying...\n", .{ attempt, max_retries });
-            std.Thread.sleep(1000 * std.time.ns_per_ms);
+            stdx.time.sleep(1000 * std.time.ns_per_ms);
             continue;
         };
         return;
@@ -123,7 +126,7 @@ pub const ClusterContext = struct {
         // This helps prevent port conflicts when tests run back-to-back
         if (config.pre_test_cooldown_ms > 0) {
             std.debug.print("[cluster] Pre-test cooldown: waiting {d}ms for TCP cleanup...\n", .{config.pre_test_cooldown_ms});
-            std.Thread.sleep(config.pre_test_cooldown_ms * std.time.ns_per_ms);
+            stdx.time.sleep(config.pre_test_cooldown_ms * std.time.ns_per_ms);
         }
 
         var self = Self{
@@ -178,7 +181,7 @@ pub const ClusterContext = struct {
         }
 
         // Give cluster time to form (Raft election + replication setup)
-        std.Thread.sleep(config.formation_delay_ns);
+        stdx.time.sleep(config.formation_delay_ns);
 
         return self;
     }
@@ -265,7 +268,7 @@ pub const ClusterContext = struct {
             self.execOn(node, args) catch |err| {
                 attempts += 1;
                 if (attempts > max_retries) return err;
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                stdx.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             };
             return;
@@ -281,7 +284,7 @@ pub const ClusterContext = struct {
             return self.execCaptureOn(node, args) catch |err| {
                 attempts += 1;
                 if (attempts > max_retries) return err;
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                stdx.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             };
         }
@@ -297,14 +300,14 @@ pub const ClusterContext = struct {
             const output = self.execCaptureOn(node, args) catch |err| {
                 attempts += 1;
                 if (attempts > max_retries) return err;
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                stdx.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             };
             if (std.mem.indexOf(u8, output, expected) != null) return output;
             self.allocator.free(output);
             attempts += 1;
             if (attempts > max_retries) return error.CommandFailed;
-            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            stdx.time.sleep(delay_ms * std.time.ns_per_ms);
         }
     }
 
@@ -316,14 +319,14 @@ pub const ClusterContext = struct {
             const output = self.execCaptureAnyOn(node, args) catch |err| {
                 attempts += 1;
                 if (attempts > max_retries) return err;
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                stdx.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             };
             if (std.mem.indexOf(u8, output, expected) != null) return output;
             self.allocator.free(output);
             attempts += 1;
             if (attempts > max_retries) return error.CommandFailed;
-            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            stdx.time.sleep(delay_ms * std.time.ns_per_ms);
         }
     }
 
@@ -342,7 +345,7 @@ pub const ClusterContext = struct {
         try server.start();
 
         // Small delay for node to rejoin cluster
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        stdx.time.sleep(500 * std.time.ns_per_ms);
     }
 
     /// Get the number of running nodes
@@ -376,7 +379,7 @@ pub const ClusterContext = struct {
 
         for (0..self.node_count) |i| {
             if (self.servers[i]) |s| {
-                const log_file = std.fs.openFileAbsolute(s.log_file_path, .{}) catch |e| {
+                const log_file = stdx.fs.openFileAbsolute(s.log_file_path, .{}) catch |e| {
                     try output.appendSlice(self.allocator, "--- Node ");
                     try output.append(self.allocator, @as(u8, @intCast(i)) + '0');
                     try output.appendSlice(self.allocator, " log: Could not open: ");
@@ -384,7 +387,7 @@ pub const ClusterContext = struct {
                     try output.appendSlice(self.allocator, " ---\n");
                     continue;
                 };
-                defer log_file.close();
+                defer stdx.fs.closeFile(log_file);
 
                 // Write header
                 try output.appendSlice(self.allocator, "\n--- Node ");

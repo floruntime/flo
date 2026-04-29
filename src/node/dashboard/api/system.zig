@@ -23,9 +23,9 @@ pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     var uptime_buf: [64]u8 = undefined;
     const uptime_str = std.fmt.bufPrint(&uptime_buf, "{d}d {d}h {d}m", .{ days, hours, mins }) catch "0d 0h 0m";
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     const rps = if (uptime_secs > 0) server_metrics.commands_total / uptime_secs else 0;
 
@@ -60,16 +60,16 @@ pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     try nodes_arr.end();
     try obj.end();
 
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /metrics - Metrics in JSON format
 pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     const server_metrics = ctx.metrics.server.snapshot();
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -104,7 +104,7 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     try wf_obj.end();
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

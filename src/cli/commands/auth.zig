@@ -227,7 +227,7 @@ fn parseExpiresIn(duration: []const u8) !i64 {
         else => return error.InvalidFormat,
     };
 
-    return std.time.timestamp() + seconds;
+    return @import("stdx").time.timestamp() + seconds;
 }
 
 // ==================== Testing ====================
@@ -240,7 +240,7 @@ test "create auth command" {
 }
 
 test "parseExpiresIn" {
-    const now = std.time.timestamp();
+    const now = @import("stdx").time.timestamp();
 
     const result_30d = try parseExpiresIn("30d");
     try std.testing.expect(result_30d > now);

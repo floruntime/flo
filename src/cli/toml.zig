@@ -265,7 +265,7 @@ pub const Parser = struct {
 
         const num_str = self.input[start..self.pos];
         // Remove underscores for parsing
-        var clean: std.ArrayListUnmanaged(u8) = .{};
+        var clean: std.ArrayListUnmanaged(u8) = .empty;
         defer clean.deinit(self.allocator);
         for (num_str) |ch| {
             if (ch != '_') {
@@ -330,8 +330,8 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!Table {
 
 /// Parse a TOML file into a Table
 pub fn parseFile(allocator: Allocator, path: []const u8) !Table {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try @import("stdx").fs.openFile(path, .{});
+    defer @import("stdx").fs.closeFile(file);
 
     const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
     defer allocator.free(content);

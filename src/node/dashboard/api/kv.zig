@@ -32,9 +32,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 
 /// GET /kv/namespaces - List all KV namespaces with stats
 pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -61,7 +61,7 @@ pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8
                 try obj.end();
             }
             try arr.end();
-            return try json_buf.toOwnedSlice(allocator);
+            return try json_aw.toOwnedSlice();
         }
     }
 
@@ -80,7 +80,7 @@ pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /kv/namespaces/:ns/keys - Scan/list keys in a namespace
@@ -90,9 +90,9 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
     const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
     const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var outer = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try outer.begin();
@@ -150,7 +150,7 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
     try outer.stringField("namespace", namespace);
     try outer.end();
 
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /kv/namespaces/:ns/keys/:key - Get a specific key's value
@@ -158,9 +158,9 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
 pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = h.parseQueryParam(u64, query_string, "version");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -199,7 +199,7 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /kv/namespaces/:ns/keys/:key/history - Version history
@@ -208,9 +208,9 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = h.parseQueryParam(u32, query_string, "limit");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -251,7 +251,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     try arr.end();
     try obj.intField("version_count", version_count);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// PUT /kv/namespaces/:ns/keys/:key - Set a key's value
@@ -261,9 +261,9 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
 
     // Write operations require Raft proposal — not safe from dashboard thread.
     // Return stub acknowledgement for now.
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -272,7 +272,7 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
     try obj.boolField("ok", true);
     try obj.intField("version", 1);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// DELETE /kv/namespaces/:ns/keys/:key - Delete a key
@@ -281,9 +281,9 @@ pub fn deleteKVKey(allocator: Allocator, namespace: []const u8, key: []const u8,
 
     // Write operations require Raft proposal — not safe from dashboard thread.
     // Return stub acknowledgement for now.
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -291,7 +291,7 @@ pub fn deleteKVKey(allocator: Allocator, namespace: []const u8, key: []const u8,
     try obj.stringField("namespace", namespace);
     try obj.boolField("ok", true);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

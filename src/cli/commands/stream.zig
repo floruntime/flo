@@ -823,7 +823,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     // Accumulate raw row bytes from paginated wire responses.
     // Server sends: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]?
     // We copy the raw row bytes (between count and trailer) and track names for dedup.
-    var row_bytes: std.ArrayListUnmanaged(u8) = .{};
+    var row_bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer row_bytes.deinit(ctx.allocator);
     var entry_count: u32 = 0;
 

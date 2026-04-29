@@ -109,7 +109,7 @@ pub const CompletionQueue = struct {
 
     /// Completed requests waiting to be processed
     completions: std.ArrayList(Completion),
-    mutex: std.Thread.Mutex,
+    mutex: @import("stdx").Mutex,
     allocator: std.mem.Allocator,
 
     pub const Completion = struct {
@@ -119,7 +119,7 @@ pub const CompletionQueue = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .completions = std.ArrayList(Completion){},
+            .completions = .empty,
             .mutex = .{},
             .allocator = allocator,
         };
@@ -191,7 +191,7 @@ pub const RequestBuilder = struct {
             .context = context,
             .callback = callback,
             .id = id,
-            .timestamp = std.time.nanoTimestamp(),
+            .timestamp = @import("stdx").time.nanoTimestamp(),
         };
     }
 
@@ -208,7 +208,7 @@ pub const RequestBuilder = struct {
             .context = context,
             .callback = callback,
             .id = id,
-            .timestamp = std.time.nanoTimestamp(),
+            .timestamp = @import("stdx").time.nanoTimestamp(),
         };
     }
 
@@ -225,7 +225,7 @@ pub const RequestBuilder = struct {
             .context = context,
             .callback = callback,
             .id = id,
-            .timestamp = std.time.nanoTimestamp(),
+            .timestamp = @import("stdx").time.nanoTimestamp(),
         };
     }
 
@@ -244,7 +244,7 @@ pub const RequestBuilder = struct {
             .context = context,
             .callback = callback,
             .id = id,
-            .timestamp = std.time.nanoTimestamp(),
+            .timestamp = @import("stdx").time.nanoTimestamp(),
         };
     }
 };

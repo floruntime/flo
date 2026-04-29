@@ -112,7 +112,7 @@ pub const Waiter = struct {
     ///   - Worker: 0 (trigger on any task for this action)
     min_version: u64,
 
-    /// Deadline as `std.time.milliTimestamp()`.
+    /// Deadline as `@import("stdx").time.milliTimestamp()`.
     /// `maxInt(i64)` = no timeout (infinite wait).
     expires_at_ms: i64,
 
@@ -164,7 +164,7 @@ pub const WaiterPool = struct {
         }
         if (opts.key.len == 0 or opts.key.len > 256) return false;
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         const expires: i64 = if (opts.timeout_ms == 0)
             std.math.maxInt(i64)
         else
@@ -260,7 +260,7 @@ pub const WaiterPool = struct {
     /// The `on_timeout` callback sends the appropriate "no data" response
     /// for the waiter's kind (not_found for KV, empty list for stream, etc.)
     pub fn expireTimeouts(self: *WaiterPool, on_timeout: TimeoutFn, ctx: *anyopaque) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];

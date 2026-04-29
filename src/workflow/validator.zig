@@ -403,7 +403,7 @@ fn validateReachability(result: *ValidationResult, def: *const WorkflowDefinitio
     var visited = std.StringHashMap(void).init(result.allocator);
     defer visited.deinit();
 
-    var queue: std.ArrayList([]const u8) = .{};
+    var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(result.allocator);
 
     // Start with the start step's transitions
@@ -774,7 +774,7 @@ fn isValidActionReference(target: []const u8) bool {
 
 /// Format a validation result as a human-readable string
 pub fn formatResult(allocator: Allocator, result: *const ValidationResult) ![]u8 {
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
     const writer = output.writer(allocator);

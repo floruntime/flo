@@ -1066,8 +1066,8 @@ pub const CommandResult = union(enum) {
 
     /// Serialize result to buffer for cross-core messaging
     pub fn serializeInto(self: CommandResult, buffer: []u8) void {
-        var stream = std.io.fixedBufferStream(buffer);
-        self.serialize(stream.writer()) catch unreachable;
+        var stream: std.Io.Writer = .fixed(buffer);
+        self.serialize(&stream) catch unreachable;
     }
 
     fn serialize(self: CommandResult, writer: anytype) !void {
@@ -1392,12 +1392,12 @@ pub const CommandResult = union(enum) {
 
     /// Deserialize result from buffer
     pub fn deserialize(buffer: []const u8, allocator: Allocator) !CommandResult {
-        var stream = std.io.fixedBufferStream(buffer);
-        return deserializeFromReader(stream.reader(), allocator);
+        var stream: std.Io.Reader = .fixed(buffer);
+        return deserializeFromReader(&stream, allocator);
     }
 
     fn deserializeFromReader(reader: anytype, allocator: Allocator) !CommandResult {
-        const tag_byte = try reader.readByte();
+        const tag_byte = try reader.takeByte();
         const tag: std.meta.Tag(CommandResult) = @enumFromInt(tag_byte);
 
         return switch (tag) {
@@ -1405,9 +1405,9 @@ pub const CommandResult = union(enum) {
             .pending => .{ .pending = {} },
             .pong => .{ .pong = {} },
             .auth_ok => blk: {
-                const has_user_id = try reader.readByte();
+                const has_user_id = try reader.takeByte();
                 const user_id: ?[]const u8 = if (has_user_id == 1) try readSlice(reader, allocator) else null;
-                const has_namespace = try reader.readByte();
+                const has_namespace = try reader.takeByte();
                 const namespace: ?[]const u8 = if (has_namespace == 1) try readSlice(reader, allocator) else null;
                 break :blk .{ .auth_ok = .{ .user_id = user_id, .namespace = namespace } };
             },
@@ -1417,16 +1417,16 @@ pub const CommandResult = union(enum) {
             .kv_snapshot_released => .{ .kv_snapshot_released = {} },
             .kv_condition_not_met => .{ .kv_condition_not_met = {} },
             .kv_txn_committed => .{ .kv_txn_committed = .{
-                .operations = try reader.readInt(u32, .little),
+                .operations = try reader.takeInt(u32, .little),
             } },
             .kv_snapshot_created => .{ .kv_snapshot_created = .{
-                .snapshot_id = try reader.readInt(u64, .little),
-                .lsn = try reader.readInt(u64, .little),
+                .snapshot_id = try reader.takeInt(u64, .little),
+                .lsn = try reader.takeInt(u64, .little),
             } },
 
             .err => .{
                 .err = .{
-                    .code = @enumFromInt(try reader.readInt(u16, .little)),
+                    .code = @enumFromInt(try reader.takeInt(u16, .little)),
                     .message = try readSlice(reader, allocator),
                     .allocated = true, // Mark as allocated since we read from network
                 },
@@ -1434,13 +1434,13 @@ pub const CommandResult = union(enum) {
 
             .kv_value => .{ .kv_value = .{
                 .value = try readSlice(reader, allocator),
-                .version = try reader.readInt(u64, .little),
+                .version = try reader.takeInt(u64, .little),
             } },
             .kv_put_ok => .{ .kv_put_ok = .{
-                .version = try reader.readInt(u64, .little),
+                .version = try reader.takeInt(u64, .little),
             } },
             .kv_cas_failed => .{ .kv_cas_failed = .{
-                .current_version = try reader.readInt(u64, .little),
+                .current_version = try reader.takeInt(u64, .little),
             } },
             .kv_scan_result => .{ .kv_scan_result = .{
                 .data = try readSlice(reader, allocator),
@@ -1453,36 +1453,36 @@ pub const CommandResult = union(enum) {
             } },
 
             .stream_append_ok => .{ .stream_append_ok = .{
-                .sequence = try reader.readInt(u64, .little),
-                .timestamp_ms = try reader.readInt(i64, .little),
+                .sequence = try reader.takeInt(u64, .little),
+                .timestamp_ms = try reader.takeInt(i64, .little),
             } },
             .stream_messages => .{ .stream_messages = .{
                 .data = try readSlice(reader, allocator),
-                .next_timestamp_ms = try reader.readInt(u64, .little),
-                .next_sequence = try reader.readInt(u64, .little),
+                .next_timestamp_ms = try reader.takeInt(u64, .little),
+                .next_sequence = try reader.takeInt(u64, .little),
             } },
             .stream_info => .{ .stream_info = .{
-                .first_timestamp_ms = try reader.readInt(u64, .little),
-                .first_seq = try reader.readInt(u64, .little),
-                .last_timestamp_ms = try reader.readInt(u64, .little),
-                .last_seq = try reader.readInt(u64, .little),
-                .count = try reader.readInt(u64, .little),
-                .bytes = try reader.readInt(u64, .little),
-                .partition_count = try reader.readInt(u32, .little),
-                .retention_age_s = try reader.readInt(u64, .little),
-                .retention_count = try reader.readInt(u64, .little),
-                .retention_bytes = try reader.readInt(u64, .little),
+                .first_timestamp_ms = try reader.takeInt(u64, .little),
+                .first_seq = try reader.takeInt(u64, .little),
+                .last_timestamp_ms = try reader.takeInt(u64, .little),
+                .last_seq = try reader.takeInt(u64, .little),
+                .count = try reader.takeInt(u64, .little),
+                .bytes = try reader.takeInt(u64, .little),
+                .partition_count = try reader.takeInt(u32, .little),
+                .retention_age_s = try reader.takeInt(u64, .little),
+                .retention_count = try reader.takeInt(u64, .little),
+                .retention_bytes = try reader.takeInt(u64, .little),
             } },
             .stream_trimmed => .{ .stream_trimmed = .{
-                .deleted_count = try reader.readInt(u64, .little),
-                .first_seq = try reader.readInt(u64, .little),
+                .deleted_count = try reader.takeInt(u64, .little),
+                .first_seq = try reader.takeInt(u64, .little),
             } },
             .subscribed => .{ .subscribed = .{
-                .subscription_id = try reader.readInt(u64, .little),
-                .start_seq = try reader.readInt(u64, .little),
+                .subscription_id = try reader.takeInt(u64, .little),
+                .start_seq = try reader.takeInt(u64, .little),
             } },
             .unsubscribed => .{ .unsubscribed = .{
-                .subscription_id = try reader.readInt(u64, .little),
+                .subscription_id = try reader.takeInt(u64, .little),
             } },
             .streams_listed => .{ .streams_listed = .{
                 .data = try readSlice(reader, allocator),
@@ -1493,11 +1493,11 @@ pub const CommandResult = union(enum) {
             } },
 
             .group_joined => blk: {
-                const gen_id = try reader.readInt(u64, .little);
-                const count = try reader.readInt(u32, .little);
+                const gen_id = try reader.takeInt(u64, .little);
+                const count = try reader.takeInt(u32, .little);
                 const partitions = try allocator.alloc(u32, count);
                 for (partitions) |*p| {
-                    p.* = try reader.readInt(u32, .little);
+                    p.* = try reader.takeInt(u32, .little);
                 }
                 break :blk .{ .group_joined = .{
                     .generation_id = gen_id,
@@ -1532,7 +1532,7 @@ pub const CommandResult = union(enum) {
                 .data = try readSlice(reader, allocator),
             } },
             .queue_touched => .{ .queue_touched = .{
-                .count = try reader.readInt(u32, .little),
+                .count = try reader.takeInt(u32, .little),
             } },
             .queues_listed => .{ .queues_listed = .{
                 .data = try readSlice(reader, allocator),
@@ -1545,9 +1545,9 @@ pub const CommandResult = union(enum) {
             } },
             .action_invoked => blk: {
                 const run_id = try readSlice(reader, allocator);
-                const has_pos = try reader.readByte() != 0;
-                const queue_pos = if (has_pos) try reader.readInt(u32, .little) else null;
-                const has_output = (reader.readByte() catch 0) != 0;
+                const has_pos = try reader.takeByte() != 0;
+                const queue_pos = if (has_pos) try reader.takeInt(u32, .little) else null;
+                const has_output = (reader.takeByte() catch 0) != 0;
                 if (has_output) {
                     // Skip output bytes for wire compatibility
                     const out = try readSlice(reader, allocator);
@@ -1561,13 +1561,13 @@ pub const CommandResult = union(enum) {
             },
             .action_run_status => .{ .action_run_status = .{
                 .run_id = try readSlice(reader, allocator),
-                .status = @enumFromInt(try reader.readByte()),
-                .created_at = try reader.readInt(i64, .little),
+                .status = @enumFromInt(try reader.takeByte()),
+                .created_at = try reader.takeInt(i64, .little),
                 .started_at = try readOptionalI64(reader),
                 .completed_at = try readOptionalI64(reader),
                 .output = try readOptionalSlice(reader, allocator),
                 .error_message = try readOptionalSlice(reader, allocator),
-                .retry_count = try reader.readInt(u32, .little),
+                .retry_count = try reader.takeInt(u32, .little),
                 .allocated = true,
             } },
             .action_list_result => .{ .action_list_result = .{
@@ -1578,18 +1578,18 @@ pub const CommandResult = union(enum) {
 
             .worker_registered => .{ .worker_registered = .{
                 .worker_id = try readSlice(reader, allocator),
-                .heartbeat_interval_ms = try reader.readInt(u32, .little),
+                .heartbeat_interval_ms = try reader.takeInt(u32, .little),
                 .allocated = true,
             } },
             .task_assignment => blk: {
-                const present = try reader.readByte() != 0;
+                const present = try reader.takeByte() != 0;
                 if (present) {
                     break :blk .{ .task_assignment = .{
                         .task_id = try readSlice(reader, allocator),
                         .task_type = try readSlice(reader, allocator),
                         .payload = try readSlice(reader, allocator),
-                        .created_at = try reader.readInt(i64, .little),
-                        .attempt = try reader.readInt(u32, .little),
+                        .created_at = try reader.takeInt(i64, .little),
+                        .attempt = try reader.takeInt(u32, .little),
                     } };
                 }
                 break :blk .{ .task_assignment = null };
@@ -1605,7 +1605,7 @@ pub const CommandResult = union(enum) {
             } },
             .workflow_started => .{ .workflow_started = .{
                 .run_id = try readSlice(reader, allocator),
-                .already_exists = try reader.readByte() != 0,
+                .already_exists = try reader.takeByte() != 0,
                 .allocated = true,
             } },
             .workflow_signaled => .{ .workflow_signaled = {} },
@@ -1631,18 +1631,18 @@ pub const CommandResult = union(enum) {
 
             // Cluster results
             .cluster_status => .{ .cluster_status = .{
-                .node_id = try reader.readInt(u32, .little),
-                .leader_id = try reader.readInt(u32, .little),
-                .term = try reader.readInt(u64, .little),
-                .state = @enumFromInt(try reader.readByte()),
-                .member_count = try reader.readInt(u32, .little),
+                .node_id = try reader.takeInt(u32, .little),
+                .leader_id = try reader.takeInt(u32, .little),
+                .term = try reader.takeInt(u64, .little),
+                .state = @enumFromInt(try reader.takeByte()),
+                .member_count = try reader.takeInt(u32, .little),
             } },
             .cluster_members => .{ .cluster_members = .{
                 .data = try readSlice(reader, allocator),
             } },
             .cluster_join_ok => .{ .cluster_join_ok = .{
-                .assigned_node_id = try reader.readInt(u32, .little),
-                .leader_id = try reader.readInt(u32, .little),
+                .assigned_node_id = try reader.takeInt(u32, .little),
+                .leader_id = try reader.takeInt(u32, .little),
             } },
 
             // Namespace results
@@ -1653,11 +1653,10 @@ pub const CommandResult = union(enum) {
                 .allocated = true,
             } },
             .namespace_info => blk: {
-                const exists = (try reader.readByte()) != 0;
-                const name_len = try reader.readInt(u16, .little);
+                const exists = (try reader.takeByte()) != 0;
+                const name_len = try reader.takeInt(u16, .little);
                 const name = try allocator.alloc(u8, name_len);
-                const bytes_read = try reader.readAll(name);
-                if (bytes_read != name_len) return error.UnexpectedEndOfStream;
+                try reader.readSliceAll(name);
                 break :blk .{ .namespace_info = .{
                     .exists = exists,
                     .name = name,
@@ -1691,9 +1690,9 @@ pub const CommandResult = union(enum) {
 
             // Time-series results
             .ts_write_ok => .{ .ts_write_ok = .{
-                .series_hash = try reader.readInt(u64, .little),
-                .timestamp_ms = try reader.readInt(i64, .little),
-                .sequence = try reader.readInt(u64, .little),
+                .series_hash = try reader.takeInt(u64, .little),
+                .timestamp_ms = try reader.takeInt(i64, .little),
+                .sequence = try reader.takeInt(u64, .little),
             } },
             .ts_read_result => .{ .ts_read_result = .{
                 .data = try readSlice(reader, allocator),
@@ -1714,12 +1713,12 @@ pub const CommandResult = union(enum) {
     }
 
     fn deserializeStreamMessage(reader: anytype, allocator: Allocator) !StreamMessage {
-        const sequence = try reader.readInt(u64, .little);
-        const timestamp_ms = try reader.readInt(i64, .little);
-        const partition = try reader.readInt(u32, .little);
+        const sequence = try reader.takeInt(u64, .little);
+        const timestamp_ms = try reader.takeInt(i64, .little);
+        const partition = try reader.takeInt(u32, .little);
         const key = try readOptionalSlice(reader, allocator);
         const payload = try readSlice(reader, allocator);
-        const header_count = try reader.readInt(u32, .little);
+        const header_count = try reader.takeInt(u32, .little);
         var headers: ?[]Header = null;
         if (header_count > 0) {
             const hdrs = try allocator.alloc(Header, header_count);
@@ -1740,15 +1739,14 @@ pub const CommandResult = union(enum) {
     }
 
     fn readSlice(reader: anytype, allocator: Allocator) ![]const u8 {
-        const len = try reader.readInt(u32, .little);
+        const len = try reader.takeInt(u32, .little);
         const slice = try allocator.alloc(u8, len);
-        const bytes_read = try reader.readAll(slice);
-        if (bytes_read != len) return error.UnexpectedEndOfStream;
+        try reader.readSliceAll(slice);
         return slice;
     }
 
     fn readOptionalSlice(reader: anytype, allocator: Allocator) !?[]const u8 {
-        const present = try reader.readByte();
+        const present = try reader.takeByte();
         if (present != 0) {
             return try readSlice(reader, allocator);
         }
@@ -1756,9 +1754,9 @@ pub const CommandResult = union(enum) {
     }
 
     fn readOptionalI64(reader: anytype) !?i64 {
-        const present = try reader.readByte();
+        const present = try reader.takeByte();
         if (present != 0) {
-            return try reader.readInt(i64, .little);
+            return try reader.takeInt(i64, .little);
         }
         return null;
     }

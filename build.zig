@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// A single-threaded `std.Io` instance used at build configure time for
+/// `std.process.run`, `std.Io.Dir`, etc. Constructed once per build.zig run.
+var build_threaded_io: std.Io.Threaded = .init_single_threaded;
+
+fn buildIo() std.Io {
+    return build_threaded_io.io();
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
@@ -8,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     // stdx: standard library extensions (logging, etc.)
     const stdx_module = b.createModule(.{
-        .root_source_file = b.path("src/stdx.zig"),
+        .root_source_file = b.path("src/stdx/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -31,11 +39,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
     exe.root_module.addImport("stdx", stdx_module);
     exe.root_module.addOptions("build_options", build_options);
-    exe.linkLibC();
 
     b.installArtifact(exe);
 
@@ -87,13 +95,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     unit_tests.root_module.addImport("src", src_module);
     unit_tests.root_module.addImport("stdx", stdx_module);
     unit_tests.root_module.addOptions("build_options", build_options);
-    unit_tests.linkLibC();
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -104,13 +112,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/e2e/mod.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
     e2e_tests.root_module.addOptions("build_options", build_options);
-    e2e_tests.linkLibC();
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
@@ -122,13 +130,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/integration/mod.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     integration_tests.root_module.addImport("src", src_module);
     integration_tests.root_module.addImport("stdx", stdx_module);
     integration_tests.root_module.addOptions("build_options", build_options);
-    integration_tests.linkLibC();
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
@@ -163,11 +171,11 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(def.source),
                 .target = target,
                 .optimize = .ReleaseFast,
+                .link_libc = true,
             }),
         });
         bench_exe.root_module.addImport("src", src_module);
         bench_exe.root_module.addImport("stdx", stdx_module);
-        bench_exe.linkLibC();
         const install_bench = b.addInstallArtifact(bench_exe, .{});
         bench_step.dependOn(&install_bench.step);
     }
@@ -199,8 +207,9 @@ pub fn build(b: *std.Build) void {
 /// Called at build-configure time; the resulting assets.zig is @import'd
 /// by http_server.zig via relative path.
 fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
-    var assets_code: std.ArrayListUnmanaged(u8) = .empty;
-    const writer = assets_code.writer(b.allocator);
+    var aw: std.Io.Writer.Allocating = .init(b.allocator);
+    defer aw.deinit();
+    const writer = &aw.writer;
 
     // Module header
     writer.writeAll(
@@ -222,7 +231,8 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     var asset_idx: usize = 0;
 
     const dist_path = "src/node/dashboard/dist";
-    var dist_dir = std.fs.cwd().openDir(dist_path, .{ .iterate = true }) catch |err| {
+    const io = buildIo();
+    var dist_dir = std.Io.Dir.cwd().openDir(io, dist_path, .{ .iterate = true }) catch |err| {
         std.debug.print("Warning: Cannot open {s}: {}. Run 'zake build.dashboard' first.\n", .{ dist_path, err });
         // Return a minimal stub so compilation succeeds without assets.
         writer.writeAll(
@@ -231,15 +241,15 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
             \\    return null;
             \\}
         ) catch unreachable;
-        writeAssetsFile(assets_code.items);
+        writeAssetsFile(aw.written());
         return b.createModule(.{ .root_source_file = b.path("src/node/dashboard/assets.zig") });
     };
-    defer dist_dir.close();
+    defer dist_dir.close(io);
 
     var walker = dist_dir.walk(b.allocator) catch unreachable;
     defer walker.deinit();
 
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         const file_path = entry.path;
         // Skip source maps and previously-generated .gz files
@@ -332,7 +342,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         ) catch unreachable;
     }
 
-    writeAssetsFile(assets_code.items);
+    writeAssetsFile(aw.written());
     std.debug.print("Dashboard: Embedded {d} assets from {s}\n", .{ asset_idx, dist_path });
 
     return b.createModule(.{ .root_source_file = b.path("src/node/dashboard/assets.zig") });
@@ -340,9 +350,13 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
 
 fn writeAssetsFile(content: []const u8) void {
     const assets_path = "src/node/dashboard/assets.zig";
-    var file = std.fs.cwd().createFile(assets_path, .{}) catch unreachable;
-    defer file.close();
-    file.writeAll(content) catch unreachable;
+    const io = buildIo();
+    var file = std.Io.Dir.cwd().createFile(io, assets_path, .{}) catch unreachable;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    fw.interface.writeAll(content) catch unreachable;
+    fw.interface.flush() catch unreachable;
 }
 
 fn getMimeType(path: []const u8) []const u8 {
@@ -368,10 +382,12 @@ fn isCompressible(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".json");
 }
 
-fn gzipFile(_: std.mem.Allocator, dir: std.fs.Dir, src_path: []const u8, dest_path: []const u8) void {
-    // Get absolute paths for the shell command
-    const dir_path = dir.realpathAlloc(std.heap.page_allocator, ".") catch return;
-    defer std.heap.page_allocator.free(dir_path);
+fn gzipFile(_: std.mem.Allocator, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) void {
+    const io = buildIo();
+    // Get absolute path of the source dir for the shell command
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = dir.realPath(io, &path_buf) catch return;
+    const dir_path = path_buf[0..dir_path_len];
 
     const abs_src = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, src_path }) catch return;
     defer std.heap.page_allocator.free(abs_src);
@@ -383,8 +399,7 @@ fn gzipFile(_: std.mem.Allocator, dir: std.fs.Dir, src_path: []const u8, dest_pa
     const cmd = std.fmt.allocPrint(std.heap.page_allocator, "gzip -9 -c \"{s}\" > \"{s}\"", .{ abs_src, abs_dest }) catch return;
     defer std.heap.page_allocator.free(cmd);
 
-    const result = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
+    const result = std.process.run(std.heap.page_allocator, buildIo(), .{
         .argv = &.{ "sh", "-c", cmd },
     }) catch return;
     defer std.heap.page_allocator.free(result.stdout);
@@ -395,8 +410,7 @@ fn getGitVersion(b: *std.Build) []const u8 {
     const version_override = b.option([]const u8, "version", "Override version string");
     if (version_override) |v| return v;
 
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
+    const result = std.process.run(b.allocator, buildIo(), .{
         .argv = &.{ "git", "describe", "--tags", "--always", "--dirty" },
     }) catch return "dev";
 

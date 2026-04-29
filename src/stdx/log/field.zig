@@ -89,9 +89,9 @@ pub const Field = struct {
         return .{ .key = key, .value = .{ .duration_ns = ns } };
     }
 
-    /// Create a duration field from std.time.Timer.
-    pub fn durationFrom(key: []const u8, timer: std.time.Timer) Field {
-        return duration(key, @intCast(timer.read()));
+    /// Create a duration field from a stdx.time.Timer.
+    pub fn durationFrom(key: []const u8, timer: @import("../time.zig").Timer) Field {
+        return duration(key, timer.read());
     }
 
     /// Create a timestamp field (unix epoch nanoseconds).
@@ -101,7 +101,7 @@ pub const Field = struct {
 
     /// Create a timestamp field from current time.
     pub fn now(key: []const u8) Field {
-        return timestamp(key, std.time.nanoTimestamp());
+        return timestamp(key, @import("../time.zig").nanoTimestamp());
     }
 
     /// Create a binary/bytes field (will be hex encoded).
@@ -332,12 +332,21 @@ test "Field.component" {
 
 test "Field.formatValue duration" {
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     const f = Field.duration("elapsed", 1_500_000); // 1.5ms
     try f.formatValue(writer);
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expectEqualStrings("1.50ms", output);
+}
+
+test "Field.durationFrom with Timer" {
+    const time = @import("../time.zig");
+    const timer = time.Timer.start();
+    time.sleep(1 * std.time.ns_per_ms); // sleep 1ms
+    const f = Field.durationFrom("elapsed", timer);
+    try std.testing.expectEqualStrings("elapsed", f.key);
+    try std.testing.expect(f.value.duration_ns >= 1_000_000); // at least 1ms
 }

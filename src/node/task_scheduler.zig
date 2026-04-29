@@ -115,7 +115,7 @@ pub const TaskScheduler = struct {
     /// Called from the Reactor loop on each tick. Returns the number
     /// of tasks that were executed.
     pub fn tick(self: *TaskScheduler, total_budget_ns: u64) u32 {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         var executed: u32 = 0;
         var budget_remaining: u64 = total_budget_ns;
 

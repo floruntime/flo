@@ -50,7 +50,7 @@ pub const BarrierAligner = struct {
         records: std.ArrayListUnmanaged(ProcessingRecord),
 
         pub fn init() RecordBuffer {
-            return .{ .records = .{} };
+            return .{ .records = .empty };
         }
 
         pub fn deinit(self: *RecordBuffer, allocator: Allocator) void {
@@ -61,9 +61,9 @@ pub const BarrierAligner = struct {
             try self.records.append(allocator, rec);
         }
 
-        pub fn drain(self: *RecordBuffer) []const ProcessingRecord {
-            const items = self.records.items;
-            self.records = .{};
+        pub fn drain(self: *RecordBuffer, allocator: Allocator) ![]ProcessingRecord {
+            const items = try self.records.toOwnedSlice(allocator);
+            self.records = .empty;
             return items;
         }
     };
@@ -138,15 +138,15 @@ pub const BarrierAligner = struct {
     /// Returns the records in input order. Caller should process these
     /// before continuing with new records.
     pub fn drainBuffered(self: *Self, allocator: Allocator) ![]ProcessingRecord {
-        var result: std.ArrayListUnmanaged(ProcessingRecord) = .{};
+        var result: std.ArrayListUnmanaged(ProcessingRecord) = .empty;
         errdefer result.deinit(allocator);
 
         for (self.input_buffers) |*buf| {
-            const drained = buf.drain();
+            const drained = try buf.drain(allocator);
             for (drained) |rec| {
                 try result.append(allocator, rec);
             }
-            // Drain returned the backing array, free it
+            // Drain returned ownership of the backing array, free it
             allocator.free(drained);
         }
 

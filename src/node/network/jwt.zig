@@ -205,7 +205,7 @@ pub fn parseUnsafe(allocator: Allocator, token: []const u8) JwtError!JwtClaims {
 /// Check if a token has expired
 pub fn isExpired(claims: *const JwtClaims) bool {
     if (claims.exp) |exp| {
-        const now = std.time.timestamp();
+        const now = @import("stdx").time.milliTimestamp();
         return now > exp;
     }
     return false; // No expiration = never expires
@@ -390,7 +390,7 @@ fn extractJsonNumber(json: []const u8, key: []const u8) ?i64 {
 
 /// Parse JSON string array: "scope1","scope2" -> ["scope1", "scope2"]
 fn parseJsonStringArray(allocator: Allocator, content: []const u8) ![]const []const u8 {
-    var scopes = std.ArrayListUnmanaged([]const u8){};
+    var scopes: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (scopes.items) |s| allocator.free(s);
         scopes.deinit(allocator);
@@ -465,7 +465,7 @@ test "isExpired" {
         .user_id = null,
         .namespace = null,
         .scopes = &.{},
-        .exp = std.time.timestamp() + 3600, // 1 hour from now
+        .exp = @import("stdx").time.milliTimestamp() + 3600, // 1 hour from now
     };
 
     var no_exp_claims = JwtClaims{
@@ -514,7 +514,7 @@ test "verifyAndParseEs256 full token flow" {
     const Encoder = std.base64.url_safe_no_pad.Encoder;
 
     // Generate key pair and build a JwksClient with the EC key
-    const kp = EcdsaP256.KeyPair.generate();
+    const kp = EcdsaP256.KeyPair.generate(@import("stdx").io.instance());
     const sec1 = kp.public_key.toUncompressedSec1();
 
     var jwks = JwksClient.init(allocator, "https://example.supabase.co/.well-known/jwks.json");

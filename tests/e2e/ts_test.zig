@@ -137,16 +137,16 @@ test "e2e/ts: write batch from file" {
     // Create a temp line-protocol file
     const tmp_path = "/tmp/flo-e2e-ts-batch.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file,
             \\cpu,host=web-01 user=72.5,system=7.4 1708700400000
             \\cpu,host=web-02 user=55.3,system=12.1 1708700400000
             \\memory,host=web-01 used=4096 1708700400000
             \\
         );
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
 
     // flo ts write --batch --file /tmp/flo-e2e-ts-batch.txt --precision ms
     const output = try ctx.execCapture(&.{

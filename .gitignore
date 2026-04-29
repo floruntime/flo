@@ -38,3 +38,4 @@ src/node/dashboard/dist/
 # Dashboard generated files
 src/node/dashboard/dist/
 src/node/dashboard/assets.zig
+.tools/

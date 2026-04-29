@@ -43,7 +43,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const File = std.fs.File;
+const File = std.posix.fd_t;
 
 /// Value types for flags
 pub const ValueType = enum {
@@ -468,14 +468,14 @@ pub const Context = struct {
     pub fn print(self: *Context, comptime fmt: []const u8, fmtargs: anytype) void {
         var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = self.stdout_file.write(msg) catch {};
+        _ = @import("stdx").io.writeFd(self.stdout_file, msg);
     }
 
     /// Print to stderr (unbuffered)
     pub fn printErr(self: *Context, comptime fmt: []const u8, fmtargs: anytype) void {
         var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = self.stderr_file.write(msg) catch {};
+        _ = @import("stdx").io.writeFd(self.stderr_file, msg);
     }
 };
 
@@ -619,13 +619,13 @@ pub const Command = struct {
             .persistent_post_run = opts.persistent_post_run,
             .args_validator = opts.args_validator,
             .parent = null,
-            .commands = .{},
-            .command_map = .{},
-            .flags = .{},
-            .persistent_flags = .{},
-            .positional_args = .{},
-            .stdout_file = File.stdout(),
-            .stderr_file = File.stderr(),
+            .commands = .empty,
+            .command_map = .empty,
+            .flags = .empty,
+            .persistent_flags = .empty,
+            .positional_args = .empty,
+            .stdout_file = std.posix.STDOUT_FILENO,
+            .stderr_file = std.posix.STDERR_FILENO,
             .user_data = opts.user_data,
             .footer_text = opts.footer_text,
             .help_sections = opts.help_sections,
@@ -863,7 +863,7 @@ pub const Command = struct {
 
     /// Get the full command path (e.g., "app server start")
     pub fn commandPath(self: *Command, allocator: Allocator) ![]const u8 {
-        var parts = std.ArrayListUnmanaged([]const u8){};
+        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer parts.deinit(allocator);
 
         var cmd: ?*Command = self;
@@ -879,14 +879,14 @@ pub const Command = struct {
     pub fn printf(self: *Command, comptime fmt: []const u8, fmtargs: anytype) void {
         var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = self.stdout_file.write(msg) catch {};
+        _ = @import("stdx").io.writeFd(self.stdout_file, msg);
     }
 
     /// Print to stderr (unbuffered)
     pub fn printErrf(self: *Command, comptime fmt: []const u8, fmtargs: anytype) void {
         var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = self.stderr_file.write(msg) catch {};
+        _ = @import("stdx").io.writeFd(self.stderr_file, msg);
     }
 
     // ==================== Execution ====================
@@ -936,7 +936,7 @@ pub const Command = struct {
 
         // Find the target command and parse flags
         var target: *Command = self;
-        var remaining_args = std.ArrayListUnmanaged([]const u8){};
+        var remaining_args: std.ArrayListUnmanaged([]const u8) = .empty;
         defer remaining_args.deinit(self.allocator);
 
         var i: usize = 0;
@@ -1333,7 +1333,7 @@ pub const Command = struct {
 
         if (has_visible_commands) {
             // Collect unique groups
-            var groups = std.ArrayListUnmanaged([]const u8){};
+            var groups: std.ArrayListUnmanaged([]const u8) = .empty;
             defer groups.deinit(self.allocator);
 
             for (self.commands.items) |cmd| {
@@ -1473,7 +1473,7 @@ pub const Command = struct {
 
     fn printFlagsHelp(self: *Command) void {
         // Collect all flags (local + inherited persistent)
-        var all_flags = std.ArrayListUnmanaged(*const Flag){};
+        var all_flags: std.ArrayListUnmanaged(*const Flag) = .empty;
         defer all_flags.deinit(self.allocator);
 
         // Local flags

@@ -31,9 +31,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -119,16 +119,16 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /actions/:name — Action detail (metadata, trigger info, run counts, workers, recent runs)
 pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Search shards for this action (matching namespace)
     var found_rec: ?*const ActionsHandler.ActionRecord = null;
@@ -337,7 +337,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /actions/:name/runs — Execution history
@@ -347,9 +347,9 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
     _ = ns_filter; // runs are already filtered by action name
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -433,7 +433,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// POST /actions/:name/invoke — Invoke action
@@ -441,9 +441,9 @@ pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, qu
     _ = query_string;
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -452,7 +452,7 @@ pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, qu
     try obj.stringField("status", "not_wired");
     try obj.intField("input_size", @as(i64, @intCast(body.len)));
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

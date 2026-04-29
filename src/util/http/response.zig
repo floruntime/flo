@@ -212,7 +212,7 @@ pub const HttpResponse = struct {
 
     /// Convenience: serialize and return owned slice
     pub fn toBytes(self: *const HttpResponse, allocator: std.mem.Allocator) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
         try self.serialize(allocator, &buf);
         return buf.toOwnedSlice(allocator);
@@ -237,7 +237,7 @@ pub fn jsonError(allocator: std.mem.Allocator, status: StatusCode, message: []co
     _ = resp.setStatus(status).setContentType(.json);
 
     // Build error JSON - allocate body through response's allocator
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
     try writer.print("{{\"error\":\"{s}\",\"status\":{d}}}", .{ message, @intFromEnum(status) });
@@ -319,8 +319,8 @@ pub fn sseHeaders(allocator: std.mem.Allocator) HttpResponse {
 /// Format response headers into a fixed buffer (no allocator needed).
 /// Returns the slice of the buffer that was written, or null if buffer too small.
 pub fn formatResponseHeaders(buf: []u8, status: StatusCode, content_type: ContentType, body_len: usize) ?[]const u8 {
-    var stream = std.io.fixedBufferStream(buf);
-    const writer = stream.writer();
+    var stream: std.Io.Writer = .fixed(buf);
+    const writer = &stream;
 
     writer.print("HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
         status.statusLine(),
@@ -328,7 +328,7 @@ pub fn formatResponseHeaders(buf: []u8, status: StatusCode, content_type: Conten
         body_len,
     }) catch return null;
 
-    return stream.getWritten();
+    return stream.buffered();
 }
 
 /// Write a complete HTTP response to a socket (lightweight, for simple servers).

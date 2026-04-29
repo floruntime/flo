@@ -173,9 +173,9 @@ pub const HttpRunner = struct {
     /// Make a POST request with JSON body
     pub fn postJson(self: *Self, path: []const u8, json_body: anytype) !HttpResponse {
         var buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        fbs.writer().print("{f}", .{std.json.fmt(json_body, .{})}) catch return error.JsonSerializationFailed;
-        const body = fbs.getWritten();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        fbs.print("{f}", .{std.json.fmt(json_body, .{})}) catch return error.JsonSerializationFailed;
+        const body = fbs.buffered();
 
         const headers = &[_][2][]const u8{
             .{ "Content-Type", "application/json" },
@@ -236,14 +236,14 @@ pub const HttpRunner = struct {
         extra_headers: ?[]const [2][]const u8,
     ) !HttpResponse {
         // Connect to server
-        const addr = std.net.Address.initIp4(parseIp4(self.host) catch .{ 127, 0, 0, 1 }, self.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = @import("../../net.zig").Address.initIp4(parseIp4(self.host) catch .{ 127, 0, 0, 1 }, self.port);
+        const stream = try @import("../../net.zig").tcpConnectToAddress(addr);
         defer stream.close();
 
         // Build request in a buffer
         var request_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&request_buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&request_buf);
+        const writer = &fbs;
 
         // Request line
         try writer.print("{s} {s} HTTP/1.1\r\n", .{ method.toString(), path });
@@ -270,7 +270,7 @@ pub const HttpRunner = struct {
         try writer.writeAll("\r\n");
 
         // Send request headers
-        _ = try stream.write(fbs.getWritten());
+        _ = try stream.write(fbs.buffered());
 
         // Send body if present
         if (body) |b| {

@@ -99,7 +99,7 @@ pub fn persistEntry(
     };
     const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
 
-    const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+    const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
     const propose_result = try shard.raft_node.propose(
         entry_type,

@@ -9,7 +9,7 @@
 | CPU | Apple M-series (ARM64) |
 | RAM | 16+ GB |
 | OS | macOS |
-| Zig | 0.15.2 |
+| Zig | 0.16.0 |
 | Build | ReleaseFast |
 
 ## Results
@@ -18,25 +18,25 @@
 
 | Operation | Ops/sec | ns/op | Notes |
 |-----------|---------|-------|-------|
-| Append | 12.9M | 77 | 4 MB ring, 30-byte payloads |
-| Read | 46.1M | 21 | Hot ring, index lookup |
+| Append | 11.2M | 89 | 4 MB ring, 30-byte payloads |
+| Read | 33.0M | 30 | Hot ring, index lookup |
 
 ### KVProjection
 
 | Operation | Ops/sec | ns/op | Notes |
 |-----------|---------|-------|-------|
-| Put | 4.4M | 225 | 100K keys, 30-byte values |
-| Get | 11.9M | 84 | Hash table lookup |
-| Delete | 9.9M | 100 | Tombstone write |
-| Scan (100) | 6.0M | 165 | Batch scan, 100K table |
-| ScanPrefix | 540K | 1850 | 14-byte prefix match |
+| Put | 6.0M | 165 | 100K keys, 30-byte values |
+| Get | 17.9M | 55 | Hash table lookup |
+| Delete | 4.0M | 247 | Tombstone write |
+| Scan (100) | 6.0M | 167 | Batch scan, 100K table |
+| ScanPrefix | 544K | 1837 | 14-byte prefix match |
 
 ### Inbox (MPSC Ring)
 
 | Operation | Msg/sec | ns/msg | Notes |
 |-----------|---------|--------|-------|
-| SPSC | 28.5M | 35 | 64K ring, burst mode |
-| Send-only | 34.2M | 29 | 1M ring, no drain |
+| SPSC | 14.9M | 67 | 1M ring, burst mode |
+| Send-only | 15.4M | 64 | 1M ring, no drain |
 
 ## Comparison with Old Architecture
 

@@ -343,7 +343,7 @@ pub const Partition = struct {
     /// Returns the sealed snapshot bytes. Caller owns the allocation.
     pub fn snapshot(self: *Partition) ![]u8 {
         const applied = self.router.applied_index;
-        const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         log.debug("Partition: taking snapshot, partition_id={d}, applied_index={d}", .{ self.id, applied });
 
         var builder = snapshot_mod.SnapshotBuilder.init(

@@ -71,7 +71,7 @@ pub const SessionWindowManager = struct {
         if (!gop.found_existing) {
             // New key — allocate owned copy for the map key
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
             try gop.value_ptr.append(self.allocator, new_window);
             return new_window;
         }

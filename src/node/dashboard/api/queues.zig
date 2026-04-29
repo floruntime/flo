@@ -31,9 +31,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 
 /// GET /queues - List all queues
 pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -67,15 +67,15 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /queues/:name - Queue detail
 pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -118,7 +118,7 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /queues/:name/messages - Queue messages with status filter
@@ -128,9 +128,9 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
     const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
     const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -174,7 +174,7 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
     try obj.intField("total", total);
     try obj.stringField("queue", queue_name);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /queues/:name/dlq - Dead-letter queue entries
@@ -183,9 +183,9 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
     const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
     const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -218,7 +218,7 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
     try obj.intField("count", entry_count);
     try obj.stringField("queue", queue_name);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// POST /queues/:name/dlq/:seq/requeue - Requeue a DLQ entry
@@ -227,16 +227,16 @@ pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []
     _ = queue_name;
     _ = seq_str;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// DELETE /queues/:name/dlq/:seq - Delete a DLQ entry
@@ -245,16 +245,16 @@ pub fn deleteDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []c
     _ = queue_name;
     _ = seq_str;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// POST /queues/:name/purge - Purge all messages from queue
@@ -262,9 +262,9 @@ pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, ctx: *DashboardC
     _ = ctx;
     _ = queue_name;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -272,7 +272,7 @@ pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, ctx: *DashboardC
     try obj.boolField("ok", true);
     try obj.intField("purged", 0);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

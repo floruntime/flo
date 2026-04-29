@@ -30,7 +30,7 @@ pub const OutputCollector = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{
-            .records = .{},
+            .records = .empty,
             .allocator = allocator,
             .emit_count = 0,
         };

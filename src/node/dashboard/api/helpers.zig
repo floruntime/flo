@@ -40,14 +40,14 @@ pub const DashboardContext = struct {
             .allocator = allocator,
             .metrics = metrics,
             .num_shards = num_shards,
-            .start_time = std.time.timestamp(),
+            .start_time = @import("stdx").time.milliTimestamp(),
             .shard_ptrs = null,
         };
     }
 
     /// Get uptime in seconds
     pub fn uptimeSeconds(self: *const DashboardContext) u64 {
-        const now = std.time.timestamp();
+        const now = @import("stdx").time.milliTimestamp();
         const diff = now - self.start_time;
         return if (diff > 0) @intCast(diff) else 0;
     }
@@ -157,16 +157,15 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
 
 /// Create JSON error response: {"error":"<message>"}
 pub fn jsonError(allocator: Allocator, message: []const u8) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("error", message);
     try obj.end();
 
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

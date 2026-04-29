@@ -73,9 +73,9 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
 
 fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -113,16 +113,16 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -130,7 +130,7 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
     try obj.stringField("status", "unknown");
     try obj.intField("parallelism", 0);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn submitJob(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
@@ -138,24 +138,24 @@ fn submitJob(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]
 
     if (body.len == 0) return try h.jsonError(allocator, "Empty job definition");
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("status", "not_wired");
     try obj.intField("body_size", @as(i64, @intCast(body.len)));
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn stopJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -163,15 +163,15 @@ fn stopJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]
     try obj.stringField("job_id", job_id);
     try obj.stringField("state", "STOPPED");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn cancelJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -179,15 +179,15 @@ fn cancelJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) !
     try obj.stringField("job_id", job_id);
     try obj.stringField("state", "CANCELLED");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn createSavepoint(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -196,16 +196,16 @@ fn createSavepoint(allocator: Allocator, job_id: []const u8, ctx: *DashboardCont
     try obj.stringField("job_id", job_id);
     try obj.stringField("savepoint_id", "");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn restoreJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
     _ = body;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -214,16 +214,16 @@ fn restoreJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *
     try obj.stringField("job_id", job_id);
     try obj.stringField("state", "RUNNING");
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn rescaleJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
     _ = body;
 
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -232,7 +232,7 @@ fn rescaleJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *
     try obj.stringField("job_id", job_id);
     try obj.intField("parallelism", 1);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

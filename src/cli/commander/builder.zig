@@ -117,10 +117,10 @@ pub const Builder = struct {
     args_validator: ?ArgValidatorFn = null,
 
     // Collected items (using ArrayListUnmanaged for Zig 0.15 compatibility)
-    flags_list: std.ArrayListUnmanaged(FlagDef) = .{},
-    subcommands_list: std.ArrayListUnmanaged(*Builder) = .{},
-    args_list: std.ArrayListUnmanaged(cobra.Arg) = .{},
-    prebuilt_commands: std.ArrayListUnmanaged(*Command) = .{},
+    flags_list: std.ArrayListUnmanaged(FlagDef) = .empty,
+    subcommands_list: std.ArrayListUnmanaged(*Builder) = .empty,
+    args_list: std.ArrayListUnmanaged(cobra.Arg) = .empty,
+    prebuilt_commands: std.ArrayListUnmanaged(*Command) = .empty,
 
     // User data
     user_data: ?*anyopaque = null,
@@ -134,10 +134,10 @@ pub const Builder = struct {
         const builder = allocator.create(Builder) catch @panic("out of memory");
         builder.* = Builder{
             .allocator = allocator,
-            .flags_list = .{},
-            .subcommands_list = .{},
-            .args_list = .{},
-            .prebuilt_commands = .{},
+            .flags_list = .empty,
+            .subcommands_list = .empty,
+            .args_list = .empty,
+            .prebuilt_commands = .empty,
         };
         return builder;
     }

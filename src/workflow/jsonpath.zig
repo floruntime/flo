@@ -52,7 +52,7 @@ pub const PathResolver = struct {
             .input = input,
             .step_outputs = step_outputs,
             .run_id = run_id,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = @import("stdx").time.milliTimestamp(),
         };
     }
 
@@ -252,12 +252,12 @@ fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.js
             return .{ .string = try allocator.dupe(u8, s) };
         },
         .object => |obj| {
-            var new_obj = std.json.ObjectMap.init(allocator);
+            var new_obj: std.json.ObjectMap = .empty;
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
                 const resolved_val = try resolveJsonValue(allocator, resolver, entry.value_ptr.*);
-                try new_obj.put(owned_key, resolved_val);
+                try new_obj.put(allocator, owned_key, resolved_val);
             }
             return .{ .object = new_obj };
         },
@@ -278,12 +278,12 @@ fn cloneJsonValue(allocator: Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         .object => |obj| {
-            var new_obj = std.json.ObjectMap.init(allocator);
+            var new_obj: std.json.ObjectMap = .empty;
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 const cloned_key = try allocator.dupe(u8, entry.key_ptr.*);
                 const cloned_val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(cloned_key, cloned_val);
+                try new_obj.put(allocator, cloned_key, cloned_val);
             }
             return .{ .object = new_obj };
         },
@@ -310,9 +310,9 @@ fn freeJsonValue(allocator: Allocator, value: std.json.Value) void {
                 allocator.free(entry.key_ptr.*);
                 freeJsonValue(allocator, entry.value_ptr.*);
             }
-            // ObjectMap = StringArrayHashMap(Value) (Managed — deinit takes no allocator)
+            // ObjectMap = StringArrayHashMap(Value) (unmanaged in 0.16 — deinit takes allocator)
             var mut_obj = obj;
-            mut_obj.deinit();
+            mut_obj.deinit(allocator);
         },
         .array => |arr| {
             for (arr.items) |item| {

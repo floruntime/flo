@@ -411,7 +411,7 @@ pub const ProcessingHandler = struct {
             return;
         };
 
-        const now = std.time.milliTimestamp();
+        const now = @import("stdx").time.milliTimestamp();
 
         const record = JobRecord{
             .job_id_owned = owned_id,
@@ -544,8 +544,8 @@ pub const ProcessingHandler = struct {
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
             var buf: [4096]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            const w = fbs.writer();
+            var fbs: std.Io.Writer = .fixed(&buf);
+            const w = &fbs;
             w.writeInt(u16, @intCast(job.job_id_owned.len), .little) catch return;
             w.writeAll(job.job_id_owned) catch return;
             w.writeInt(u16, @intCast(job.name_owned.len), .little) catch return;
@@ -555,7 +555,7 @@ pub const ProcessingHandler = struct {
             w.writeInt(u32, job.batch_size, .little) catch return;
             w.writeInt(u64, job.records_processed, .little) catch return;
             w.writeInt(i64, job.created_at_ms, .little) catch return;
-            shard.sendOkResponse(conn, req.header.request_id, fbs.getWritten());
+            shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -578,7 +578,7 @@ pub const ProcessingHandler = struct {
 
         // Collect matching jobs
         const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
-        var jobs: std.ArrayListUnmanaged(JobInfo) = .{};
+        var jobs: std.ArrayListUnmanaged(JobInfo) = .empty;
         defer jobs.deinit(self.allocator);
 
         var jit = self.jobs.iterator();
@@ -671,7 +671,7 @@ pub const ProcessingHandler = struct {
                 return;
             };
 
-            const now = std.time.milliTimestamp();
+            const now = @import("stdx").time.milliTimestamp();
 
             self.savepoints.put(owned_sp_id, .{
                 .savepoint_id_owned = owned_sp_id,
@@ -1158,7 +1158,7 @@ pub const ProcessingHandler = struct {
     /// Drive all running pipelines: poll sources, push to sinks.
     /// Called from Shard.tick() on each reactor iteration.
     pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
 
         var it = self.pipelines.iterator();
         while (it.next()) |entry| {
@@ -1249,7 +1249,7 @@ pub const ProcessingHandler = struct {
 
         for (result.payloads) |payload| {
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
-            const output_records = applyOperatorChain(pipe.operators, payload, std.time.milliTimestamp(), shard.allocator) catch null;
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), shard.allocator) catch null;
 
             if (output_records) |records| {
                 defer shard.allocator.free(records);
@@ -1284,7 +1284,7 @@ pub const ProcessingHandler = struct {
             .collector = &collector,
             .metrics = &metrics,
             .allocator = allocator,
-            .current_processing_time_ms = std.time.milliTimestamp(),
+            .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .current_watermark_ms = event_time_ms,
             .operator_name = "",
         };
@@ -1369,7 +1369,7 @@ pub const ProcessingHandler = struct {
                     const value = extractJsonFloat(payload, snk.value_field) orelse
                         std.fmt.parseFloat(f64, payload) catch 0.0;
                     const ual_idx = shard.ts_handler.nextUalIndex();
-                    const now_ns: u64 = @intCast(@as(u64, @bitCast(std.time.milliTimestamp())) * 1_000_000);
+                    const now_ns: u64 = @intCast(@as(u64, @bitCast(@import("stdx").time.milliTimestamp())) * 1_000_000);
                     const tag_hash_val = extractJsonTagHash(payload, snk.measurement);
                     shard.ts_handler.ts.insert(
                         snk.measurement,

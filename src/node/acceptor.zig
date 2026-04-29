@@ -76,17 +76,18 @@ pub const Acceptor = struct {
 
     /// Bind and listen on the given port. Returns the listen fd.
     pub fn listen(self: *Acceptor, port: u16) !void {
-        const addr = try std.net.Address.resolveIp("0.0.0.0", port);
+        const stdx_net = @import("stdx").net;
+        const addr = stdx_net.SocketAddrV4.initIp4(.{ 0, 0, 0, 0 }, port);
 
         const flags: u32 = std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK;
-        const fd = try std.posix.socket(addr.any.family, flags, std.posix.IPPROTO.TCP);
-        errdefer std.posix.close(fd);
+        const fd = try stdx_net.sysSocket(std.posix.AF.INET, flags, std.posix.IPPROTO.TCP);
+        errdefer _ = std.c.close(fd);
 
         // SO_REUSEADDR for fast restart
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
-        try std.posix.bind(fd, &addr.any, addr.getOsSockLen());
-        try std.posix.listen(fd, 128);
+        try stdx_net.sysBind(fd, addr.anyPtr(), addr.anyLen());
+        try stdx_net.sysListen(fd, 128);
 
         self.listen_fd = fd;
         log.debug("Acceptor listening on 0.0.0.0:{d} fd={d} shard_count={d}", .{ port, fd, self.shard_count });
@@ -95,11 +96,21 @@ pub const Acceptor = struct {
     /// Accept one connection and route it to the correct shard.
     /// Returns the target shard_id, or null if no connection was pending.
     pub fn acceptOne(self: *Acceptor) !?u16 {
-        const client_fd = std.posix.accept(self.listen_fd, null, null, std.posix.SOCK.NONBLOCK) catch |err| {
-            if (err == error.WouldBlock) return null;
+        const stdx_net = @import("stdx").net;
+        const client_fd = stdx_net.sysAccept(self.listen_fd, null, null, std.posix.SOCK.NONBLOCK) catch |err| {
+            if (err == error.AcceptFailed) {
+                // Could be WouldBlock — surface as null
+                const errno = std.posix.errno(@as(c_int, -1));
+                if (errno == .AGAIN) return null;
+                return err;
+            }
             return err;
         };
-        errdefer std.posix.close(client_fd);
+        errdefer _ = std.c.close(client_fd);
+
+        // Make socket non-blocking explicitly (since SOCK.NONBLOCK on accept
+        // is not portable across all macOS releases).
+        stdx_net.sysFcntlSetNonblocking(client_fd) catch {};
 
         // TCP_NODELAY
         setTcpNodelay(client_fd);
@@ -213,7 +224,7 @@ pub const Acceptor = struct {
     fn handoff(self: *Acceptor, client_fd: i32, shard_id: u16) !void {
         const pipe_fd = self.shard_pipes[shard_id];
         const fd_bytes = std.mem.asBytes(&client_fd);
-        const written = try std.posix.write(pipe_fd, fd_bytes);
+        const written = try @import("stdx").net.sysWrite(pipe_fd, fd_bytes);
         if (written != @sizeOf(i32)) return error.ShortWrite;
     }
 
@@ -225,7 +236,7 @@ pub const Acceptor = struct {
     /// Close the listen socket.
     pub fn close(self: *Acceptor) void {
         if (self.listen_fd >= 0) {
-            std.posix.close(self.listen_fd);
+            _ = std.c.close(self.listen_fd);
             self.listen_fd = -1;
         }
     }
@@ -305,13 +316,13 @@ test "Acceptor: extractKeyFromPayload — too short" {
 
 test "Acceptor: listen and accept via TCP" {
     // Create shard pipes
-    const pipe0 = try std.posix.pipe();
-    defer std.posix.close(pipe0[0]);
-    defer std.posix.close(pipe0[1]);
+    const pipe0 = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe0[0]);
+    defer _ = std.c.close(pipe0[1]);
 
-    const pipe1 = try std.posix.pipe();
-    defer std.posix.close(pipe1[0]);
-    defer std.posix.close(pipe1[1]);
+    const pipe1 = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe1[0]);
+    defer _ = std.c.close(pipe1[1]);
 
     var shard_pipes = [_]i32{ pipe0[1], pipe1[1] };
     const router = Router.init(4096, 2, 0);
@@ -324,15 +335,16 @@ test "Acceptor: listen and accept via TCP" {
     // Get the port we bound to
     var addr: std.posix.sockaddr.in = undefined;
     var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(addr));
-    try std.posix.getsockname(acceptor.listen_fd, @ptrCast(&addr), &addr_len);
+    if (std.c.getsockname(acceptor.listen_fd, @ptrCast(&addr), &addr_len) != 0) return error.GetsocknameFailed;
     const port = std.mem.bigToNative(u16, addr.port);
 
     // Connect a client
-    const client = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
-    defer std.posix.close(client);
+    const stdx_net = @import("stdx").net;
+    const client = try stdx_net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    defer _ = std.c.close(client);
 
-    var connect_addr = std.net.Address.resolveIp("127.0.0.1", port) catch unreachable;
-    try std.posix.connect(client, &connect_addr.any, connect_addr.getOsSockLen());
+    const connect_addr = stdx_net.SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, port);
+    try stdx_net.sysConnect(client, connect_addr.anyPtr(), connect_addr.anyLen());
 
     // Accept and route — the listen socket is NONBLOCK so we poll briefly
     // to allow the kernel TCP handshake to complete on the server side.
@@ -340,7 +352,7 @@ test "Acceptor: listen and accept via TCP" {
     for (0..200) |_| {
         target = try acceptor.acceptOne();
         if (target != null) break;
-        std.Thread.sleep(1_000_000); // 1ms
+        @import("stdx").time.sleep(1_000_000); // 1ms
     }
     try std.testing.expect(target != null);
 
@@ -351,7 +363,7 @@ test "Acceptor: listen and accept via TCP" {
     try std.testing.expectEqual(@as(usize, @sizeOf(i32)), n);
 
     const handed_fd = std.mem.bytesAsValue(i32, &fd_buf).*;
-    defer std.posix.close(handed_fd);
+    defer _ = std.c.close(handed_fd);
     try std.testing.expect(handed_fd >= 0);
 
     try std.testing.expectEqual(@as(u64, 1), acceptor.accepted_total);

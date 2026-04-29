@@ -157,8 +157,8 @@ pub fn ShardWalker(comptime ResultT: type) type {
                 const ctx = contexts[@intCast(current_shard)];
                 const scan = self.local_scan(ctx, namespace, filter, local_cursor, remaining);
 
-                // Copy results into buffer
-                const to_copy = @min(scan.items.len, result_buf.len - collected);
+                // Copy results into buffer (bounded by remaining to prevent underflow)
+                const to_copy = @min(scan.items.len, @min(result_buf.len - collected, remaining));
                 if (to_copy > 0) {
                     @memcpy(result_buf[collected .. collected + to_copy], scan.items[0..to_copy]);
                     collected += to_copy;

@@ -152,8 +152,8 @@ pub const HttpClient = struct {
 
         // Build request
         var request_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&request_buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&request_buf);
+        const writer = &fbs;
 
         // Request line
         const path = if (uri.path.percent_encoded.len > 0) uri.path.percent_encoded else "/";
@@ -190,7 +190,7 @@ pub const HttpClient = struct {
         writer.writeAll("\r\n") catch return error.OutOfMemory;
 
         // Send request headers
-        const header_bytes = fbs.getWritten();
+        const header_bytes = fbs.buffered();
         stream.writeAll(header_bytes) catch return error.SendFailed;
 
         // Send body
@@ -344,8 +344,8 @@ pub const HttpClient = struct {
 
         // Build and send request
         var request_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&request_buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&request_buf);
+        const writer = &fbs;
 
         const path = if (uri.path.percent_encoded.len > 0) uri.path.percent_encoded else "/";
         writer.print("{s} {s}", .{ req.method.toString(), path }) catch return error.OutOfMemory;
@@ -375,7 +375,7 @@ pub const HttpClient = struct {
 
         writer.writeAll("\r\n") catch return error.OutOfMemory;
 
-        stream.writeAll(fbs.getWritten()) catch return error.SendFailed;
+        stream.writeAll(fbs.buffered()) catch return error.SendFailed;
 
         if (req.body) |body| {
             stream.writeAll(body) catch return error.SendFailed;

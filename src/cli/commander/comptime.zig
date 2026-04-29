@@ -101,7 +101,7 @@ fn countParams(str: []const u8) usize {
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, str, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed, "-") or std.mem.startsWith(u8, trimmed, "<")) {
             count += 1;
         }
@@ -113,7 +113,7 @@ fn countParams(str: []const u8) usize {
 fn parseParamLine(line: []const u8) !Param(Help) {
     var param = Param(Help){ .id = .{} };
     var i: usize = 0;
-    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    const trimmed = std.mem.trimStart(u8, line, " \t");
 
     if (trimmed.len == 0) return error.EmptyLine;
 
@@ -130,7 +130,7 @@ fn parseParamLine(line: []const u8) !Param(Help) {
             i = end + 1;
         }
         // Parse description after whitespace
-        const rest = std.mem.trimLeft(u8, trimmed[i..], " \t");
+        const rest = std.mem.trimStart(u8, trimmed[i..], " \t");
         param.id.desc = rest;
         return param;
     }
@@ -200,7 +200,7 @@ pub fn parseParams(comptime str: []const u8) [countParams(str)]Param(Help) {
 
     var it = std.mem.splitScalar(u8, str, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "-") and !std.mem.startsWith(u8, trimmed, "<")) continue;
 
@@ -289,7 +289,9 @@ fn Arguments(
     comptime params: []const Param(Help),
     comptime value_parsers: anytype,
 ) type {
-    var fields: [params.len]std.builtin.Type.StructField = undefined;
+    var field_names: [params.len][]const u8 = undefined;
+    var field_types: [params.len]type = undefined;
+    var field_attrs: [params.len]std.builtin.Type.StructField.Attributes = undefined;
     var field_count: usize = 0;
 
     for (params) |param| {
@@ -321,22 +323,23 @@ fn Arguments(
             .many => @ptrCast(&@as([]const ParserResultType(param.id.val, value_parsers), &.{})),
         };
 
-        fields[field_count] = .{
-            .name = name,
-            .type = FieldType,
+        field_names[field_count] = name;
+        field_types[field_count] = FieldType;
+        field_attrs[field_count] = .{
             .default_value_ptr = default_value,
-            .is_comptime = false,
-            .alignment = @alignOf(FieldType),
+            .@"comptime" = false,
+            .@"align" = @alignOf(FieldType),
         };
         field_count += 1;
     }
 
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = fields[0..field_count],
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    return @Struct(
+        .auto,
+        null,
+        field_names[0..field_count],
+        field_types[0..field_count],
+        field_attrs[0..field_count],
+    );
 }
 
 /// Generate the Positionals tuple type based on parameters
@@ -344,7 +347,7 @@ fn Positionals(
     comptime params: []const Param(Help),
     comptime value_parsers: anytype,
 ) type {
-    var fields: [params.len]std.builtin.Type.StructField = undefined;
+    var field_types: [params.len]type = undefined;
     var field_count: usize = 0;
 
     for (params) |param| {
@@ -359,13 +362,7 @@ fn Positionals(
             .many => []const BaseType,
         };
 
-        fields[field_count] = .{
-            .name = std.fmt.comptimePrint("{d}", .{field_count}),
-            .type = FieldType,
-            .default_value_ptr = null, // Tuples can't have default values
-            .is_comptime = false,
-            .alignment = @alignOf(FieldType),
-        };
+        field_types[field_count] = FieldType;
         field_count += 1;
     }
 
@@ -373,12 +370,7 @@ fn Positionals(
         return struct {};
     }
 
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = fields[0..field_count],
-        .decls = &.{},
-        .is_tuple = true,
-    } });
+    return @Tuple(field_types[0..field_count]);
 }
 
 /// Initialize positionals with default values
@@ -825,10 +817,10 @@ test "help output" {
     );
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try printHelp(&params, stream.writer());
+    var stream: std.Io.Writer = .fixed(&buf);
+    try printHelp(&params, &stream);
 
-    const output = stream.getWritten();
+    const output = stream.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "--help") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--port") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<str>") != null);

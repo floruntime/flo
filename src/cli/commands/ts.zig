@@ -182,7 +182,7 @@ fn parseTimeArg(s: []const u8) ?i64 {
     const unit = s[s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = @import("stdx").time.milliTimestamp();
 
     return switch (unit) {
         's' => now_ms - num * 1000,
@@ -329,13 +329,13 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
 
     if (file_path.len > 0) {
         // Read from file
-        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {
             ctx.printErr("Cannot open file '{s}': {}\n", .{ file_path, err });
             return error.CommandFailed;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        line_data = file.readToEndAlloc(ctx.allocator, 10 * 1024 * 1024) catch |err| {
+        line_data = @import("stdx").fs.readToEndAlloc(file, ctx.allocator, 10 * 1024 * 1024) catch |err| {
             ctx.printErr("Failed to read file: {}\n", .{err});
             return error.CommandFailed;
         };

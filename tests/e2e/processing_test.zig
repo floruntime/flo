@@ -395,7 +395,7 @@ fn readStreamBlocking(ctx: *stdx.testing.TestContext, stream_name: []const u8, n
             return true;
         }
 
-        std.Thread.sleep(poll_interval_ns);
+        @import("stdx").time.sleep(poll_interval_ns);
     }
 
     // One final attempt after all sleeps
@@ -412,7 +412,7 @@ fn pollForJobState(ctx: *stdx.testing.TestContext, job_id: []const u8, ns: []con
     const max_attempts = timeout_ms / 200;
 
     for (0..max_attempts) |_| {
-        std.Thread.sleep(poll_interval_ns);
+        @import("stdx").time.sleep(poll_interval_ns);
 
         var result = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", ns });
         defer result.deinit();
@@ -667,7 +667,7 @@ test "e2e/processing: pipeline processes data appended after job submission" {
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
     // Give the job a moment to start ticking (source will be exhausted initially)
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Step 2: Now append data — the job should pick it up on subsequent ticks
     try ctx.exec(&.{ "stream", "append", "late-input", "late-arrival-1", "-n", "proc_late" });
@@ -949,7 +949,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
             "ts",       "read",    measurement,
             "-n",       ns,        "--from",
             "0",        "--limit", "100",
-            "--format", "json",
+            "--output", "json",
         });
         defer result.deinit();
 
@@ -957,7 +957,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
             return true;
         }
 
-        std.Thread.sleep(poll_interval_ns);
+        @import("stdx").time.sleep(poll_interval_ns);
     }
 
     // One final attempt
@@ -965,7 +965,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
         "ts",       "read",    measurement,
         "-n",       ns,        "--from",
         "0",        "--limit", "100",
-        "--format", "json",
+        "--output", "json",
     });
     defer result.deinit();
 
@@ -1023,7 +1023,7 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
     // Step 4: Verify data via `flo ts read` with tag filter
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_cpu_metrics", "-n",  "proc_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--limit",          "100", "--format",    "json",
+        "--from", "0",    "--limit",          "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1087,7 +1087,7 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
     // Read with sensor tag filter
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_temp", "-n",  "proc_tsscal", "--tags", "sensor=A1",
-        "--from", "0",    "--limit",   "100", "--format",    "json",
+        "--from", "0",    "--limit",   "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1125,7 +1125,7 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
     // Give the job time to start its tick loop
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Step 2: Now append data — should be picked up on subsequent ticks
     try ctx.exec(&.{ "stream", "append", "ts-late-input", "{\"host\":\"db-01\",\"load_avg\":3.14}", "-n", "proc_tslate" });
@@ -1143,7 +1143,7 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
     // Verify via read
     var read_result = try ctx.cli.run(&.{
         "ts",     "read", "proc_late_metric", "-n",  "proc_tslate", "--tags", "host=db-01",
-        "--from", "0",    "--limit",          "100", "--format",    "json",
+        "--from", "0",    "--limit",          "100", "--output",    "json",
     });
     defer read_result.deinit();
 
@@ -1194,7 +1194,7 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
     // Verify via `flo ts query` with aggregation
     var query_result = try ctx.cli.run(&.{
         "ts",     "query", "proc_requests", "-n", "proc_tsagg", "--tags", "region=us",
-        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--format",
+        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--output",
         "json",
     });
     defer query_result.deinit();
@@ -1301,7 +1301,7 @@ test "e2e/processing: ts source - late data written after job starts" {
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
     // Give the job time to start ticking (source will see no data initially)
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Step 2: Now write TS data — the source should pick it up on subsequent polls
     try ctx.exec(&.{ "ts", "write", "src_late_cpu", "--tags", "host=db-01", "--value", "3.14", "-n", "proc_tsslat" });
@@ -1428,7 +1428,7 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         "ts",       "read",       "derived_temp",
         "-n",       "proc_ts2ts", "--from",
         "0",        "--limit",    "100",
-        "--format", "json",
+        "--output", "json",
     });
     defer read_result.deinit();
 
@@ -2356,7 +2356,7 @@ test "e2e/processing: kv_lookup filter drops all when no matching keys exist" {
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
     // Wait a bit for the pipeline to process the records
-    std.Thread.sleep(2000 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
 
     // Verify the job is RUNNING and has processed records (even if filtered)
     var status_result = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_kvnone" });
@@ -2409,7 +2409,7 @@ test "e2e/processing: kv_lookup late KV write — records written after KV seed 
     try ctx.exec(&.{ "kv", "set", "acct:eve", "verified", "-n", "proc_kvlate" });
 
     // Step 3: Wait briefly for KV to be available, then append stream data
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
     try ctx.exec(&.{ "stream", "append", "kvl-input", "{\"account_id\":\"eve\",\"event\":\"deposit\"}", "-n", "proc_kvlate" });
     try ctx.exec(&.{ "stream", "append", "kvl-input", "{\"account_id\":\"mallory\",\"event\":\"withdraw\"}", "-n", "proc_kvlate" });
 

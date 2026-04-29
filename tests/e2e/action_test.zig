@@ -385,7 +385,7 @@ fn pollUntilSuccess(ctx: *stdx.testing.TestContext, args: []const []const u8, ti
     if (last.succeeded()) return last;
     for (1..max_attempts) |_| {
         last.deinit();
-        std.Thread.sleep(interval_ns);
+        @import("stdx").time.sleep(interval_ns);
         last = try ctx.cli.run(args);
         if (last.succeeded()) return last;
     }
@@ -400,7 +400,7 @@ fn pollForOutput(ctx: *stdx.testing.TestContext, args: []const []const u8, needl
     if (last.succeeded() and last.stdoutContains(needle)) return last;
     for (1..max_attempts) |_| {
         last.deinit();
-        std.Thread.sleep(interval_ns);
+        @import("stdx").time.sleep(interval_ns);
         last = try ctx.cli.run(args);
         if (last.succeeded() and last.stdoutContains(needle)) return last;
     }
@@ -1060,7 +1060,7 @@ test "e2e/action/labels/blocking: matching worker receives task via blocking" {
     }.run, .{ ctx, action_name, worker_id, &thread_result });
 
     // 4. Wait for worker to start blocking
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // 5. Invoke with matching labels
     const invoke_output = try ctx.execCapture(&.{
@@ -1141,7 +1141,7 @@ test "e2e/action/blocking: worker await blocks until task arrives" {
     }.run, .{ ctx, action_name, worker_id, &thread_result });
 
     // 4. Wait a bit to ensure worker is blocking
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // 5. Now invoke the action - this should wake up the blocked worker
     const invoke_output = try ctx.execCapture(&.{

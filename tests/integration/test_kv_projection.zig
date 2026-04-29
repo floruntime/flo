@@ -77,14 +77,14 @@ test "integration: KV projection TTL expiry" {
     defer kv.deinit();
 
     // Put a key with a very short TTL (expires 1 ns in the future)
-    const now: u64 = @intCast(std.time.nanoTimestamp());
+    const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
     try kv.put("ephemeral", "gone-soon", 1, 1, now, now + 1);
 
     // Also put a key with no TTL for comparison
     try kv.put("permanent", "stays-forever", 2, 1, now, 0);
 
     // Sleep 2ms to ensure the TTL expires
-    std.Thread.sleep(2 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(2 * std.time.ns_per_ms);
 
     // Expired key should return null
     try testing.expect(kv.get("ephemeral") == null);

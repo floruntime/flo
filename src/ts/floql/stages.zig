@@ -254,13 +254,13 @@ pub fn applyGroupBy(input: SeriesSet, tag: []const u8, allocator: Allocator) Sta
 
     // --- Phase 1: bucket series indices by tag value ---
     // Map: tag_value -> list of indices into input.series
-    var groups = std.StringArrayHashMap(std.ArrayListUnmanaged(usize)).init(allocator);
+    var groups: std.array_hash_map.String(std.ArrayListUnmanaged(usize)) = .empty;
     defer {
         var it = groups.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(allocator);
         }
-        groups.deinit();
+        groups.deinit(allocator);
     }
 
     for (input.series, 0..) |s, idx| {
@@ -273,9 +273,9 @@ pub fn applyGroupBy(input: SeriesSet, tag: []const u8, allocator: Allocator) Sta
             }
         }
 
-        const gop = groups.getOrPut(tag_value) catch return error.OutOfMemory;
+        const gop = groups.getOrPut(allocator, tag_value) catch return error.OutOfMemory;
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
         gop.value_ptr.append(allocator, idx) catch return error.OutOfMemory;
     }
@@ -299,7 +299,7 @@ pub fn applyGroupBy(input: SeriesSet, tag: []const u8, allocator: Allocator) Sta
         }) catch return error.OutOfMemory;
 
         // Merge points from all group members
-        var merged_points: std.ArrayListUnmanaged(DataPoint) = .{};
+        var merged_points: std.ArrayListUnmanaged(DataPoint) = .empty;
         for (member_indices) |si| {
             for (input.series[si].points) |p| {
                 merged_points.append(allocator, p) catch return error.OutOfMemory;

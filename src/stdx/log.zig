@@ -86,7 +86,7 @@ var global: struct {
 pub fn configure(config: Config) void {
     global.level = config.level;
     global.format = config.format;
-    global.use_colors = config.colors orelse std.fs.File.stdout().isTty();
+    global.use_colors = config.colors orelse (std.c.isatty(std.posix.STDOUT_FILENO) != 0);
     global.show_timestamp = config.show_timestamp;
     global.show_caller = config.show_caller;
 }
@@ -179,12 +179,12 @@ pub inline fn fatalWith(comptime msg: []const u8, fields: anytype) void {
 // =============================================================================
 
 /// Create a scoped logger. The scope is baked in at comptime - no runtime cost.
-pub fn scoped(comptime scope: @Type(.enum_literal)) ScopedLogger(scope) {
+pub fn scoped(comptime scope: @EnumLiteral()) ScopedLogger(scope) {
     return .{};
 }
 
 /// A logger with a compile-time scope tag.
-pub fn ScopedLogger(comptime scope: @Type(.enum_literal)) type {
+pub fn ScopedLogger(comptime scope: @EnumLiteral()) type {
     return struct {
         const Self = @This();
         const scope_name = @tagName(scope);
@@ -248,7 +248,7 @@ pub fn ScopedLogger(comptime scope: @Type(.enum_literal)) type {
 }
 
 /// A scoped logger with attached context fields (still zero-allocation).
-pub fn ContextScope(comptime scope: @Type(.enum_literal), comptime ContextFields: type) type {
+pub fn ContextScope(comptime scope: @EnumLiteral(), comptime ContextFields: type) type {
     return struct {
         const Self = @This();
         const scope_name = @tagName(scope);
@@ -408,10 +408,10 @@ fn writeFmtEntry(
     src: std.builtin.SourceLocation,
 ) void {
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
-    const timestamp = std.time.nanoTimestamp();
+    const timestamp = @import("time.zig").nanoTimestamp();
 
     const caller: ?format.Caller = if (global.show_caller)
         .{ .file = src.file, .line = src.line, .fn_name = src.fn_name }
@@ -424,13 +424,13 @@ fn writeFmtEntry(
         .compact => formatFmtCompactEntry(writer, level, fmt, args, fields),
     }
 
-    const output_bytes = fbs.getWritten();
+    const output_bytes = fbs.buffered();
     const use_stderr = (level == .err or level == .fatal);
 
     if (use_stderr) {
-        _ = std.fs.File.stderr().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDERR_FILENO, output_bytes);
     } else {
-        _ = std.fs.File.stdout().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDOUT_FILENO, output_bytes);
     }
 }
 
@@ -443,10 +443,10 @@ fn writeEntry(
 ) void {
     // Stack buffer - no heap allocation
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
-    const timestamp = std.time.nanoTimestamp();
+    const timestamp = @import("time.zig").nanoTimestamp();
 
     // Build caller info if enabled
     const caller: ?format.Caller = if (global.show_caller)
@@ -462,13 +462,13 @@ fn writeEntry(
     }
 
     // Write to stdout/stderr
-    const output_bytes = fbs.getWritten();
+    const output_bytes = fbs.buffered();
     const use_stderr = (level == .err or level == .fatal);
 
     if (use_stderr) {
-        _ = std.fs.File.stderr().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDERR_FILENO, output_bytes);
     } else {
-        _ = std.fs.File.stdout().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDOUT_FILENO, output_bytes);
     }
 }
 
@@ -738,7 +738,7 @@ fn formatFmtCompactEntry(
 /// Use in main.zig: `pub const std_options = .{ .logFn = log.stdLogFn };`
 pub fn stdLogFn(
     comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime fmt: []const u8,
     args: anytype,
 ) void {
@@ -756,10 +756,10 @@ pub fn stdLogFn(
 
     // Stack buffer for output
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
-    const timestamp = std.time.nanoTimestamp();
+    const timestamp = @import("time.zig").nanoTimestamp();
     const colors = global.use_colors;
 
     // Simple text format for std.log bridge
@@ -786,12 +786,12 @@ pub fn stdLogFn(
     writer.writeAll(msg) catch {};
     writer.writeByte('\n') catch {};
 
-    const output_bytes = fbs.getWritten();
+    const output_bytes = fbs.buffered();
     const use_stderr = (log_level == .err or log_level == .fatal);
     if (use_stderr) {
-        _ = std.fs.File.stderr().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDERR_FILENO, output_bytes);
     } else {
-        _ = std.fs.File.stdout().write(output_bytes) catch {};
+        _ = @import("io.zig").writeFd(std.posix.STDOUT_FILENO, output_bytes);
     }
 }
 
@@ -823,7 +823,7 @@ pub const TestLogger = struct {
     /// Log to this buffer instead of stdout.
     pub fn logTo(self: *TestLogger, level: Level, comptime msg: []const u8, fields: anytype) void {
         const w = self.buffer.writer(self.allocator);
-        formatTextEntry(w, level, msg, std.time.nanoTimestamp(), null, fields);
+        formatTextEntry(w, level, msg, @import("time.zig").nanoTimestamp(), null, fields);
     }
 };
 
@@ -901,7 +901,7 @@ test "test logger buffer" {
         Field.str("key", "value"),
     });
 
-    const output = test_log.getWritten();
+    const output = test_log.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "test message") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "key=") != null);
 }

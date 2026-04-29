@@ -167,7 +167,7 @@ pub const JsonAggregateOperator = struct {
             else
                 expr;
 
-            var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
+            var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
             var iter = std.mem.splitScalar(u8, field_path, '.');
             while (iter.next()) |seg| {
                 if (seg.len > 0) try seg_list.append(allocator, try allocator.dupe(u8, seg));

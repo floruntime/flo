@@ -184,7 +184,7 @@ pub fn parse(backing_allocator: std.mem.Allocator, data: []const u8) ParseError!
     }
 
     // Parse headers
-    var headers: std.ArrayListUnmanaged(Header) = .{};
+    var headers: std.ArrayListUnmanaged(Header) = .empty;
     var content_length: ?usize = null;
     var content_type: ?[]const u8 = null;
     var authorization: ?[]const u8 = null;

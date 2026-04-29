@@ -29,7 +29,6 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Run the CLI
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    _ = args; // We'll use process args directly
 
     // Create commands from dedicated modules
     const server = try commands.createServerCommand(allocator);
@@ -156,12 +155,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .build();
     defer root.deinit();
 
-    // Collect args into a slice (include program name - execute() handles skipping it)
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    // Pass through the args slice provided by main (Juicy Main).
+    const argv = args;
 
     // Execute
-    root.execute(argv) catch |err| {
+    root.executeSlice(argv) catch |err| {
         switch (err) {
             error.HelpRequested, error.VersionRequested => {},
             error.CommandFailed => {
@@ -170,9 +168,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             },
             else => {
                 var stderr_buf: [512]u8 = undefined;
-                var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-                stderr_writer.interface.print("Error: {}\n", .{err}) catch {};
-                stderr_writer.interface.flush() catch {};
+                const msg = std.fmt.bufPrint(&stderr_buf, "Error: {}\n", .{err}) catch "Error\n";
+                _ = @import("stdx").io.writeFd(std.posix.STDERR_FILENO, msg);
                 std.process.exit(1);
             },
         }
@@ -280,7 +277,7 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
     // Generate default flo.toml
     const default_config = server_config.generateDefaultConfig();
 
-    const file = std.fs.cwd().createFile("flo.toml", .{ .exclusive = true }) catch |err| {
+    const file = @import("stdx").fs.createFile("flo.toml", .{ .exclusive = true }) catch |err| {
         if (err == error.PathAlreadyExists) {
             ctx.printErr("Error: flo.toml already exists\n", .{});
             return error.CommandFailed;
@@ -288,9 +285,9 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
         ctx.printErr("Error creating flo.toml: {}\n", .{err});
         return error.CommandFailed;
     };
-    defer file.close();
+    defer @import("stdx").fs.closeFile(file);
 
-    file.writeAll(default_config) catch |err| {
+    @import("stdx").fs.writeAll(file, default_config) catch |err| {
         ctx.printErr("Error writing flo.toml: {}\n", .{err});
         return error.CommandFailed;
     };

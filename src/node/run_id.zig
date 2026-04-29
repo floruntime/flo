@@ -175,7 +175,7 @@ pub fn hexDecode(encoded: []const u8) ?u64 {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn currentMs() u64 {
-    const now: u64 = @bitCast(std.time.milliTimestamp());
+    const now: u64 = @bitCast(@import("stdx").time.milliTimestamp());
     if (now < EPOCH_MS) return 0;
     return now - EPOCH_MS;
 }

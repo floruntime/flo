@@ -481,10 +481,14 @@ test "integration: partition table node removal reassignment" {
     const ns_hash: u32 = 0x1234;
     try table.assignNamespace(ns_hash, 6, &.{ 1, 2, 3 }, 1);
 
-    // Node 3 is leaving — reassign its partitions to remaining nodes
-    const node3_parts = table.partitionsForNode(3);
-    const node3_count = node3_parts.len;
+    // Node 3 is leaving — reassign its partitions to remaining nodes.
+    // Copy the slice first because partitionsForNode returns a view into
+    // internal storage that gets invalidated when we call table.assign().
+    const node3_parts_view = table.partitionsForNode(3);
+    const node3_count = node3_parts_view.len;
     try testing.expect(node3_count > 0);
+    const node3_parts = try alloc.dupe(@TypeOf(node3_parts_view[0]), node3_parts_view);
+    defer alloc.free(node3_parts);
 
     // Manually reassign node 3's partitions to nodes 1 and 2
     // (This simulates what the coordinator would do on node removal)
@@ -606,7 +610,7 @@ test "integration: forwarder timeout sweep" {
     try testing.expectEqual(@as(u32, 2), fwd.pendingCount());
 
     // Sweep timeouts well after the default 5s timeout
-    var timed_out: std.ArrayListUnmanaged(PendingRequest) = .{};
+    var timed_out: std.ArrayListUnmanaged(PendingRequest) = .empty;
     defer timed_out.deinit(alloc);
     const count = try fwd.sweepTimeouts(10_000, &timed_out);
     try testing.expectEqual(@as(u32, 2), count);

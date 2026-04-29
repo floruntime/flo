@@ -218,13 +218,13 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
         owned = true;
     } else {
         // Read from file
-        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {
             ctx.printErr("Failed to open file '{s}': {}\n", .{ file_path, err });
             return error.CommandFailed;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        definition = file.readToEndAlloc(ctx.allocator, 1024 * 1024) catch |err| {
+        definition = @import("stdx").fs.readToEndAlloc(file, ctx.allocator, 1024 * 1024) catch |err| {
             ctx.printErr("Failed to read file: {}\n", .{err});
             return error.CommandFailed;
         };

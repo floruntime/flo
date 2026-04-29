@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const src = @import("src");
+const stdx = @import("stdx");
 
 const UAL = src.storage.ual.ual.UAL;
 const entry_mod = src.storage.ual.entry;
@@ -19,7 +20,7 @@ fn benchAppend(ual: *UAL) void {
             0,
             1,
             @as(u64, @intCast(i)) + 1,
-            @intCast(std.time.nanoTimestamp()),
+            @intCast(stdx.time.nanoTimestamp()),
             payload,
         );
         _ = ual.append(&entry) catch {};
@@ -42,7 +43,7 @@ fn benchRead(ual: *const UAL) void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -64,9 +65,9 @@ pub fn main() !void {
         ual.deinit();
         ual = try UAL.init(allocator, 4 * 1024 * 1024, 0);
 
-        const start = std.time.nanoTimestamp();
+        const start = stdx.time.nanoTimestamp();
         benchAppend(&ual);
-        const elapsed = std.time.nanoTimestamp() - start;
+        const elapsed = stdx.time.nanoTimestamp() - start;
 
         const elapsed_ns: u64 = @intCast(elapsed);
         const ops_per_sec = @as(u64, BENCH_ITERS) * 1_000_000_000 / elapsed_ns;
@@ -77,9 +78,9 @@ pub fn main() !void {
         });
 
         // ── Read Benchmark ──
-        const read_start = std.time.nanoTimestamp();
+        const read_start = stdx.time.nanoTimestamp();
         benchRead(&ual);
-        const read_elapsed = std.time.nanoTimestamp() - read_start;
+        const read_elapsed = stdx.time.nanoTimestamp() - read_start;
 
         const read_ns: u64 = @intCast(read_elapsed);
         const read_iters: u64 = @intCast(@min(BENCH_ITERS, ual.max_index - ual.min_live_index + 1));

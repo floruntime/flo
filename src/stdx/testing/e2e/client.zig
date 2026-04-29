@@ -105,23 +105,23 @@ pub const AsyncCommand = struct {
     /// Wait for command to complete with a timeout. Kills the process if it exceeds the timeout.
     /// Useful for tests involving --follow mode or infinite blocking reads.
     pub fn waitWithTimeout(self: *Self, timeout_ms: u64) !CommandResult {
-        const start = std.time.milliTimestamp();
+        const start = @import("../../time.zig").milliTimestamp();
         while (!self.completed.load(.acquire)) {
-            const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+            const elapsed = @as(u64, @intCast(@import("../../time.zig").milliTimestamp() - start));
             if (elapsed >= timeout_ms) {
                 // Kill the child process to unblock the thread
                 const pid = self.child_pid.load(.acquire);
                 if (pid > 0) {
-                    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+                    _ = std.c.kill(@intCast(pid), .TERM);
                     // Give it 500ms to die, then SIGKILL
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    @import("../../time.zig").sleep(500 * std.time.ns_per_ms);
                     if (!self.completed.load(.acquire)) {
-                        std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+                        _ = std.c.kill(@intCast(pid), .KILL);
                     }
                 }
                 break;
             }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            @import("../../time.zig").sleep(50 * std.time.ns_per_ms);
         }
         self.thread.join();
         if (self.err) |e| return e;
@@ -246,7 +246,7 @@ pub const CliRunner = struct {
 
     /// Thread function to execute command
     fn runCommandThread(async_cmd: *AsyncCommand, allocator: Allocator) void {
-        var child = std.process.Child.init(async_cmd.argv, allocator);
+        var child = @import("../../process.zig").Child.init(async_cmd.argv, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -340,7 +340,7 @@ pub const CliRunner = struct {
         }
 
         // Execute command
-        var child = std.process.Child.init(argv, self.allocator);
+        var child = @import("../../process.zig").Child.init(argv, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -382,7 +382,7 @@ pub const CliRunner = struct {
             argv[1 + i] = arg;
         }
 
-        var child = std.process.Child.init(argv, self.allocator);
+        var child = @import("../../process.zig").Child.init(argv, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;

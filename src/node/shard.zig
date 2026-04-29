@@ -335,19 +335,19 @@ pub const Shard = struct {
             errdefer allocator.free(shard_dir);
 
             // Ensure shard dir and subdirectories exist
-            std.fs.cwd().makePath(shard_dir) catch |err| {
+            @import("stdx").fs.makePath(shard_dir) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
             const segs_dir_path = try std.fmt.allocPrint(allocator, "{s}/segs", .{shard_dir});
             defer allocator.free(segs_dir_path);
-            std.fs.cwd().makePath(segs_dir_path) catch |err| {
+            @import("stdx").fs.makePath(segs_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
             const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
             defer allocator.free(snaps_dir_path);
-            std.fs.cwd().makePath(snaps_dir_path) catch |err| {
+            @import("stdx").fs.makePath(snaps_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
@@ -364,9 +364,9 @@ pub const Shard = struct {
 
                     // Step 1: Load snapshot if referenced
                     if (sm.latest_snapshot) |snap_name| {
-                        if (std.fs.cwd().openDir(snaps_dir_path, .{})) |snap_dir_handle| {
-                            var snap_dir = snap_dir_handle;
-                            defer snap_dir.close();
+                        if (@import("stdx").fs.openDir(snaps_dir_path, .{})) |snap_dir_handle| {
+                            const snap_dir = snap_dir_handle;
+                            defer @import("stdx").fs.closeDir(snap_dir);
 
                             if (snapshot_mod.loadSnapshotByName(allocator, snap_dir, snap_name)) |maybe_snap| {
                                 if (maybe_snap) |snap| {
@@ -533,7 +533,7 @@ pub const Shard = struct {
             const fd = entry.key_ptr.*;
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
-            posix.close(fd);
+            _ = std.c.close(fd);
         }
         self.connections.deinit(self.allocator);
 
@@ -617,9 +617,9 @@ pub const Shard = struct {
         const snap_dir_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snaps", .{dir_path}) catch return false;
 
         // Ensure snapshots directory exists
-        std.fs.cwd().makePath(snap_dir_path) catch return false;
+        @import("stdx").fs.makePath(snap_dir_path) catch return false;
 
-        var snap_dir = std.fs.cwd().openDir(snap_dir_path, .{}) catch return false;
+        var snap_dir = @import("stdx").fs.openDir(snap_dir_path, .{}) catch return false;
         defer snap_dir.close();
 
         // Snapshot each partition
@@ -632,7 +632,7 @@ pub const Shard = struct {
             const filename = snapshot_mod.snapshotFilename(
                 &name_buf,
                 partition.router.applied_index,
-                @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000,
+                @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000,
             );
 
             // Write atomically: .tmp → sync → rename
@@ -682,7 +682,7 @@ pub const Shard = struct {
         self.waiter_pool.removeByFd(fd);
         self.reactor.removeSource(fd);
         self.removeConnection(fd);
-        posix.close(fd);
+        _ = std.c.close(fd);
     }
 
     /// Get a connection by fd.
@@ -737,7 +737,7 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "no forwarder configured");
             return;
         };
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         const result = fwd.forward(
             node_id,
             req.header.request_id,
@@ -1032,7 +1032,7 @@ pub const Shard = struct {
     /// from every partition's UAL hot ring.
     fn hotFlushTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
-        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const now_ns: u64 = @intCast(@import("stdx").time.nanoTimestamp());
         const cutoff_ns = now_ns -| (self.hot_flush_seconds * std.time.ns_per_s);
 
         var total_evicted: u64 = 0;
@@ -1048,7 +1048,7 @@ pub const Shard = struct {
     fn streamRetentionTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const proj = self.stream_handler.stream;
-        const now_ms: u64 = @intCast(@max(0, std.time.milliTimestamp()));
+        const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
         var total_trimmed: u64 = 0;
 
         var it = proj.stream_metadata.iterator();
@@ -1131,7 +1131,7 @@ pub const Shard = struct {
             const client_fd: i32 = @as(*align(1) const i32, @ptrCast(&fd_buf)).*;
 
             _ = self.addConnection(client_fd) catch {
-                posix.close(client_fd);
+                _ = std.c.close(client_fd);
                 continue;
             };
 
@@ -1141,7 +1141,7 @@ pub const Shard = struct {
                 .interests = .{ .readable = true },
             }) catch {
                 self.removeConnection(client_fd);
-                posix.close(client_fd);
+                _ = std.c.close(client_fd);
             };
         }
     }
@@ -1394,7 +1394,7 @@ pub const Shard = struct {
 
         while (conn.hasPendingWrites()) {
             const data = conn.pendingWriteData();
-            const written = posix.write(fd, data) catch |err| {
+            const written = @import("stdx").io.tryWriteFd(fd, data) catch |err| {
                 if (err == error.WouldBlock) {
                     // Socket buffer full — arm writable and return
                     self.reactor.armWritable(fd) catch {};
@@ -1615,7 +1615,7 @@ fn serializeWalkProcessingJobs(
     namespace: []const u8,
 ) ![]u8 {
     const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
-    var jobs: std.ArrayListUnmanaged(JobInfo) = .{};
+    var jobs: std.ArrayListUnmanaged(JobInfo) = .empty;
     defer jobs.deinit(allocator);
 
     const req_ns = if (namespace.len > 0) namespace else "default";
@@ -1701,7 +1701,7 @@ fn serializeWalkWorkflowDefs(
 ) ![]u8 {
     // First pass: collect matching definitions and compute size
     const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
-    var defs: std.ArrayListUnmanaged(DefInfo) = .{};
+    var defs: std.ArrayListUnmanaged(DefInfo) = .empty;
     defer defs.deinit(allocator);
 
     for (names) |name| {
@@ -2003,7 +2003,7 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const partition = shard.defaultPartition();
 
-    const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+    const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
     partition.queue.expireLeases(now_ns);
 
     // min_version holds the pre-computed queue_name_hash
@@ -2081,11 +2081,12 @@ fn replaySegments(
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
 ) void {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = @import("stdx").fs.openDir(dir_path, .{ .iterate = true }) catch return;
+    defer @import("stdx").fs.closeDir(dir);
 
+    const io = @import("stdx").io.instance();
     var iter = dir.iterate();
-    while (iter.next() catch null) |de| {
+    while (iter.next(io) catch null) |de| {
         if (de.kind != .file) continue;
         // Match .flseg extension
         if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
@@ -2141,9 +2142,9 @@ fn replaySegments(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "Shard: init and deinit" {
-    const pipe_fds = try std.posix.pipe();
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
 
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
@@ -2154,17 +2155,17 @@ test "Shard: init and deinit" {
 }
 
 test "Shard: add and remove connections" {
-    const pipe_fds = try std.posix.pipe();
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
 
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
-    const conn_pipe = try std.posix.pipe();
-    defer std.posix.close(conn_pipe[0]);
-    defer std.posix.close(conn_pipe[1]);
+    const conn_pipe = try @import("stdx").io.pipe();
+    defer _ = std.c.close(conn_pipe[0]);
+    defer _ = std.c.close(conn_pipe[1]);
 
     const conn = try shard.addConnection(conn_pipe[0]);
     try std.testing.expectEqual(@as(u32, 1), shard.connectionCount());
@@ -2175,9 +2176,9 @@ test "Shard: add and remove connections" {
 }
 
 test "Shard: dispatch ping via pipe-based connection" {
-    const pipe_fds = try std.posix.pipe();
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
 
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();
@@ -2196,9 +2197,9 @@ test "Shard: dispatch ping via pipe-based connection" {
     shard.dispatcher.register(.ping, PingTracker.handlePing);
 
     // Create a fake connection
-    const conn_pipe = try std.posix.pipe();
+    const conn_pipe = try @import("stdx").io.pipe();
     // Note: conn_pipe[0] is owned by shard (closed in deinit), only close write end
-    defer std.posix.close(conn_pipe[1]);
+    defer _ = std.c.close(conn_pipe[1]);
 
     const conn = try shard.addConnection(conn_pipe[0]);
 
@@ -2223,9 +2224,9 @@ test "Shard: dispatch ping via pipe-based connection" {
 }
 
 test "Shard: inbox shutdown message" {
-    const pipe_fds = try std.posix.pipe();
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
 
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
     defer shard.deinit();

@@ -105,7 +105,7 @@ pub const ServerConfig = struct {
 
     // Memory management
     allocator: Allocator,
-    _owned_strings: std.ArrayListUnmanaged([]const u8) = .{},
+    _owned_strings: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub const LogLevel = enum {
         debug,

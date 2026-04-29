@@ -141,9 +141,9 @@ test "integration: cold tier — UAL segment archival round-trip" {
     var cold_tmp = testing.tmpDir(.{});
     defer cold_tmp.cleanup();
 
-    const warm_dir = try warm_tmp.dir.realpathAlloc(allocator, ".");
+    const warm_dir = try @import("stdx").fs.dirRealpathAlloc(warm_tmp.dir, allocator, ".");
     defer allocator.free(warm_dir);
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
 
     // Create 3 warm UAL segments with mixed entry types (KV + stream)
@@ -157,10 +157,10 @@ test "integration: cold tier — UAL segment archival round-trip" {
     // Verify 3 .flseg files on disk
     {
         var flseg_count: usize = 0;
-        var dir = try std.fs.cwd().openDir(warm_dir, .{ .iterate = true });
-        defer dir.close();
+        var dir = try @import("stdx").fs.openDir(warm_dir, .{ .iterate = true });
+        defer @import("stdx").fs.closeDir(dir);
         var iter = dir.iterate();
-        while (try iter.next()) |de| {
+        while (try iter.next(@import("stdx").io.instance())) |de| {
             if (std.mem.endsWith(u8, de.name, ".flseg")) flseg_count += 1;
         }
         try testing.expectEqual(@as(usize, 3), flseg_count);
@@ -200,13 +200,13 @@ test "integration: cold tier — UAL segment archival round-trip" {
         defer allocator.free(cold_fs_dir);
 
         var cold_file_count: usize = 0;
-        var dir = std.fs.cwd().openDir(cold_fs_dir, .{ .iterate = true }) catch |err| {
+        var dir = @import("stdx").fs.openDir(cold_fs_dir, .{ .iterate = true }) catch |err| {
             std.debug.print("Failed to open cold dir: {}\n", .{err});
             return error.TestUnexpectedResult;
         };
-        defer dir.close();
+        defer @import("stdx").fs.closeDir(dir);
         var iter = dir.iterate();
-        while (try iter.next()) |de| {
+        while (try iter.next(@import("stdx").io.instance())) |de| {
             if (std.mem.endsWith(u8, de.name, ".flseg")) cold_file_count += 1;
         }
         try testing.expectEqual(@as(usize, 3), cold_file_count);
@@ -257,9 +257,9 @@ test "integration: cold tier — on-demand stream read from cold" {
     var cold_tmp = testing.tmpDir(.{});
     defer cold_tmp.cleanup();
 
-    const warm_dir = try warm_tmp.dir.realpathAlloc(allocator, ".");
+    const warm_dir = try @import("stdx").fs.dirRealpathAlloc(warm_tmp.dir, allocator, ".");
     defer allocator.free(warm_dir);
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
 
     // Write stream_append entries to a segment and archive it to cold
@@ -343,9 +343,9 @@ test "integration: cold tier — KV MVCC version lookup from cold" {
     var cold_tmp = testing.tmpDir(.{});
     defer cold_tmp.cleanup();
 
-    const warm_dir = try warm_tmp.dir.realpathAlloc(allocator, ".");
+    const warm_dir = try @import("stdx").fs.dirRealpathAlloc(warm_tmp.dir, allocator, ".");
     defer allocator.free(warm_dir);
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
 
     // Write KV entries: same key "user:42" written 10 times (MVCC versions)
@@ -437,9 +437,9 @@ test "integration: cold tier — normal recovery does NOT touch cold" {
     var manifest_tmp = testing.tmpDir(.{});
     defer manifest_tmp.cleanup();
 
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
-    const manifest_dir = try manifest_tmp.dir.realpathAlloc(allocator, ".");
+    const manifest_dir = try @import("stdx").fs.dirRealpathAlloc(manifest_tmp.dir, allocator, ".");
     defer allocator.free(manifest_dir);
 
     const file_backend = try FileBackend.init(allocator, .{
@@ -504,9 +504,9 @@ test "integration: cold tier — idempotent archival (re-scan does not duplicate
     var cold_tmp = testing.tmpDir(.{});
     defer cold_tmp.cleanup();
 
-    const warm_dir = try warm_tmp.dir.realpathAlloc(allocator, ".");
+    const warm_dir = try @import("stdx").fs.dirRealpathAlloc(warm_tmp.dir, allocator, ".");
     defer allocator.free(warm_dir);
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
 
     // Write one segment
@@ -551,9 +551,9 @@ test "integration: cold tier — manifest persists across restarts" {
     var manifest_tmp = testing.tmpDir(.{});
     defer manifest_tmp.cleanup();
 
-    const cold_dir = try cold_tmp.dir.realpathAlloc(allocator, ".");
+    const cold_dir = try @import("stdx").fs.dirRealpathAlloc(cold_tmp.dir, allocator, ".");
     defer allocator.free(cold_dir);
-    const manifest_dir = try manifest_tmp.dir.realpathAlloc(allocator, ".");
+    const manifest_dir = try @import("stdx").fs.dirRealpathAlloc(manifest_tmp.dir, allocator, ".");
     defer allocator.free(manifest_dir);
 
     const file_backend = try FileBackend.init(allocator, .{

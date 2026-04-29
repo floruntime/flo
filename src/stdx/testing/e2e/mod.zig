@@ -29,6 +29,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("../../mod.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -143,7 +144,7 @@ pub const TestContext = struct {
                 attempt += 1;
                 if (attempt >= max_startup_retries) return err;
                 std.debug.print("[TestContext] Server start failed (attempt {d}/{d}), retrying...\n", .{ attempt, max_startup_retries });
-                std.Thread.sleep(1000 * std.time.ns_per_ms);
+                stdx.time.sleep(1000 * std.time.ns_per_ms);
                 continue;
             };
             break;

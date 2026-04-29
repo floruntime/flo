@@ -57,7 +57,7 @@ pub const ShardManifest = struct {
     /// Filename of the latest snapshot (e.g. "0000001000-1234567890.fsnap").
     latest_snapshot: ?[]const u8 = null,
     /// Cold storage entries — segments archived to S3/Azure/file.
-    cold_segments: std.ArrayListUnmanaged(ColdSegment) = .{},
+    cold_segments: std.ArrayListUnmanaged(ColdSegment) = .empty,
 
     const FILENAME = "MANIFEST";
 
@@ -77,13 +77,13 @@ pub const ShardManifest = struct {
         const path = try std.fs.path.join(allocator, &.{ shard_dir, FILENAME });
         defer allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(path, .{}) catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+        const content = try @import("stdx").fs.readToEndAlloc(file, allocator, 1024 * 1024); // 1MB max
         defer allocator.free(content);
 
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -132,10 +132,10 @@ pub const ShardManifest = struct {
 
     /// Atomically write shard manifest to `{shard_dir}/MANIFEST`.
     pub fn save(self: *const ShardManifest, allocator: Allocator, shard_dir: []const u8) !void {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
-        defer buf.deinit(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
 
-        const w = buf.writer(allocator);
+        const w = &aw.writer;
         try w.writeAll("{\n");
 
         // latest_snapshot
@@ -175,12 +175,12 @@ pub const ShardManifest = struct {
         const tmp_path = try std.fs.path.join(allocator, &.{ shard_dir, FILENAME ++ ".tmp" });
         defer allocator.free(tmp_path);
 
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(buf.items);
-        try file.sync();
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, aw.written());
+        try @import("stdx").fs.sync(file);
 
-        try std.fs.cwd().rename(tmp_path, manifest_path);
+        try @import("stdx").fs.rename(tmp_path, manifest_path);
     }
 
     // ─── Convenience: update only latest_snapshot ────────────────────
@@ -218,7 +218,7 @@ test "shard manifest: save and load round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     // Save a manifest
@@ -261,7 +261,7 @@ test "shard manifest: load returns null for missing file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     const result = try ShardManifest.load(allocator, path);
@@ -274,7 +274,7 @@ test "shard manifest: empty manifest round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     const sm = ShardManifest{};
@@ -293,7 +293,7 @@ test "shard manifest: setLatestSnapshot creates if missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     // No MANIFEST exists yet — setLatestSnapshot creates one
@@ -311,7 +311,7 @@ test "shard manifest: setLatestSnapshot preserves cold segments" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
     // First: save a manifest with cold segments

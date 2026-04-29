@@ -664,23 +664,23 @@ pub const StepBuilder = struct {
 pub fn writeTempYaml(allocator: Allocator, yaml: []const u8, filename: []const u8) ![]const u8 {
     const tmp_dir = "/tmp/flo-e2e-tests";
 
-    // Create directory if needed
-    std.fs.makeDirAbsolute(tmp_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
+    // Create directory if needed (best-effort — ignore if it exists)
+    var path_buf: [256]u8 = undefined;
+    const path0 = try std.fmt.bufPrintZ(&path_buf, "{s}", .{tmp_dir});
+    _ = std.c.mkdir(path0.ptr, 0o755);
 
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, filename });
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(yaml);
+    const file = try @import("../../fs.zig").createFileAbsolute(path, .{});
+    defer @import("../../fs.zig").closeFile(file);
+    try @import("../../fs.zig").writeAll(file, yaml);
 
     return path;
 }
 
 /// Clean up temp file
 pub fn cleanupTempFile(allocator: Allocator, path: []const u8) void {
-    std.fs.deleteFileAbsolute(path) catch {};
+    @import("../../fs.zig").deleteFileAbsolute(path) catch {};
     allocator.free(path);
 }
 

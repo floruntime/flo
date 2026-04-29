@@ -38,13 +38,16 @@ pub fn configureLogging(format_str: ?[]const u8, level_str: ?[]const u8) void {
     });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // Bind the stdx.io facade to the Init-provided Io for boundary code.
+    @import("stdx").io.bootFromInit(init.io);
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Convert process arguments into the [][]const u8 slice form that the
+    // existing CLI expects.
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = try init.gpa.alloc([]const u8, raw_args.len);
+    defer init.gpa.free(args);
+    for (raw_args, 0..) |a, i| args[i] = a;
 
-    try cli.run(allocator, args);
+    try cli.run(init.gpa, args);
 }

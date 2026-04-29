@@ -49,7 +49,7 @@ test "e2e/kv: get non-existent key returns nil" {
     defer ctx.deinit();
 
     // flo kv get nonexistent --format table
-    var result = try ctx.cli.run(&.{ "kv", "get", "nonexistent", "--format", "table" });
+    var result = try ctx.cli.run(&.{ "kv", "get", "nonexistent", "--output", "table" });
     defer result.deinit();
     try stdx.testing.assertContains(result, "(nil)");
 }
@@ -153,7 +153,7 @@ test "e2e/kv: delete" {
     try ctx.exec(&.{ "kv", "delete", "to_delete" });
 
     // Verify it's gone
-    var after = try ctx.cli.run(&.{ "kv", "get", "to_delete", "--format", "table" });
+    var after = try ctx.cli.run(&.{ "kv", "get", "to_delete", "--output", "table" });
     defer after.deinit();
     try stdx.testing.assertContains(after, "(nil)");
 }
@@ -180,7 +180,7 @@ test "e2e/kv: json output format" {
     try ctx.exec(&.{ "kv", "set", "json_key", "json value" });
 
     // flo kv get json_key --format json
-    var result = try ctx.cli.run(&.{ "kv", "get", "json_key", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "get", "json_key", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -287,7 +287,7 @@ test "e2e/kv: set --cas with correct version succeeds" {
     try ctx.exec(&.{ "kv", "set", "cas_test_key", "initial" });
 
     // flo kv get cas_test_key --format json (to get version)
-    const json_output = try ctx.execCapture(&.{ "kv", "get", "cas_test_key", "--format", "json" });
+    const json_output = try ctx.execCapture(&.{ "kv", "get", "cas_test_key", "--output", "json" });
 
     const version = parseVersion(json_output) orelse return error.NoVersion;
     var version_buf: [32]u8 = undefined;
@@ -412,10 +412,10 @@ test "e2e/kv: set with TTL expires after timeout" {
     try testing.expect(std.mem.indexOf(u8, before, "ttl_value") != null);
 
     // Wait for expiration (1.5 seconds to be safe)
-    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
 
     // Should be expired now
-    var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--format", "table" });
+    var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--output", "table" });
     defer after.deinit();
     try stdx.testing.assertContains(after, "(nil)");
 }
@@ -428,7 +428,7 @@ test "e2e/kv: set with TTL 0 means no expiration" {
     try ctx.exec(&.{ "kv", "set", "no_ttl_key", "permanent_value", "--ttl", "0" });
 
     // Small wait to verify it doesn't expire immediately
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     // Should still be readable
     const value = try ctx.execCapture(&.{ "kv", "get", "no_ttl_key" });
@@ -446,7 +446,7 @@ test "e2e/kv: overwrite resets TTL" {
     try ctx.exec(&.{ "kv", "set", "ttl_reset_key", "updated" });
 
     // Wait past original TTL
-    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
 
     // Should still exist (TTL was reset)
     const value = try ctx.execCapture(&.{ "kv", "get", "ttl_reset_key" });
@@ -470,7 +470,7 @@ test "e2e/kv: TTL with conditional --nx" {
     try stdx.testing.assertFailed(result);
 
     // Wait for expiration
-    std.Thread.sleep(2500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(2500 * std.time.ns_per_ms);
 
     // Now should be able to set with --nx
     try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "third", "--ttl", "2", "--nx" });
@@ -502,7 +502,7 @@ test "e2e/kv: delete then get returns nil" {
     try ctx.exec(&.{ "kv", "delete", "delete_me" });
 
     // flo kv get delete_me --format table
-    var result = try ctx.cli.run(&.{ "kv", "get", "delete_me", "--format", "table" });
+    var result = try ctx.cli.run(&.{ "kv", "get", "delete_me", "--output", "table" });
     defer result.deinit();
     try stdx.testing.assertContains(result, "(nil)");
 }
@@ -698,7 +698,7 @@ test "e2e/kv/cluster: write on node1 readable from node2 and node3" {
     try cluster.execOn(0, &.{ "kv", "set", "cluster_key_1", "value_from_node1" });
 
     // Small delay for replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Read from node 2
     const value2 = try cluster.execCaptureOn(1, &.{ "kv", "get", "cluster_key_1" });
@@ -719,7 +719,7 @@ test "e2e/kv/cluster: data available after node1 dies" {
     try cluster.execOn(0, &.{ "kv", "set", "survive_key", "must_survive" });
 
     // Small delay for replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Verify replication before killing
     const before_value = try cluster.execCaptureOn(1, &.{ "kv", "get", "survive_key" });
@@ -729,10 +729,10 @@ test "e2e/kv/cluster: data available after node1 dies" {
     cluster.stopNode(0);
 
     // Small delay for signal propagation
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Give cluster time to detect failure and re-elect leader
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    @import("stdx").time.sleep(2 * std.time.ns_per_s);
 
     // Data should still be readable from node 2
     const value2 = try cluster.execCaptureOn(1, &.{ "kv", "get", "survive_key" });
@@ -762,13 +762,13 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     std.debug.print("Write to node 0 succeeded\n", .{});
 
     // Small delay for replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Kill node 1 (seed/original leader)
-    const kill_time = std.time.milliTimestamp();
+    const kill_time = stdx.time.milliTimestamp();
     std.debug.print("Killing node 0... (time={d})\n", .{kill_time});
     cluster.stopNode(0);
-    const kill_done_time = std.time.milliTimestamp();
+    const kill_done_time = stdx.time.milliTimestamp();
     std.debug.print("Kill complete after {d}ms\n", .{kill_done_time - kill_time});
 
     // Give cluster time to elect new leader
@@ -780,8 +780,8 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     // - Peer connections to re-establish (backoff can add latency)
     // - Raft commit to complete (needs majority acknowledgment)
     std.debug.print("Waiting 10 seconds for new leader election...\n", .{});
-    std.Thread.sleep(10 * std.time.ns_per_s);
-    const write_attempt_time = std.time.milliTimestamp();
+    @import("stdx").time.sleep(10 * std.time.ns_per_s);
+    const write_attempt_time = stdx.time.milliTimestamp();
     std.debug.print("10s wait complete, attempting write (total time since kill: {d}ms)\n", .{write_attempt_time - kill_time});
 
     // New writes should work via node 2 (which should become leader or forward to new leader)
@@ -795,7 +795,7 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     for (retry_delays, 0..) |delay, attempt| {
         if (attempt > 0) {
             std.debug.print("Retry attempt {d} (waiting {d}s)...\n", .{ attempt + 1, delay });
-            std.Thread.sleep(delay * std.time.ns_per_s);
+            @import("stdx").time.sleep(delay * std.time.ns_per_s);
         }
         cluster.execOn(1, &.{ "kv", "set", "after_failure", "new_value" }) catch |err| {
             last_err = err;
@@ -810,14 +810,14 @@ test "e2e/kv/cluster: writes continue after leader failure" {
         for (0..3) |i| {
             if (cluster.servers[i]) |s| {
                 std.debug.print("\n--- Node {d} log ({s}) ---\n", .{ i, s.log_file_path });
-                const log_file = std.fs.openFileAbsolute(s.log_file_path, .{}) catch |e| {
+                const log_file = stdx.fs.openFileAbsolute(s.log_file_path, .{}) catch |e| {
                     std.debug.print("Could not open: {}\n", .{e});
                     continue;
                 };
-                defer log_file.close();
+                defer stdx.fs.closeFile(log_file);
                 // Use a larger buffer to capture more logs (256KB)
                 var buf: [262144]u8 = undefined;
-                const n = log_file.readAll(&buf) catch 0;
+                const n = stdx.fs.readAll(log_file, &buf) catch 0;
                 std.debug.print("{s}\n", .{buf[0..n]});
             }
         }
@@ -867,7 +867,7 @@ test "e2e/kv/cluster: conditional operations work across cluster" {
     try cluster.execOn(0, &.{ "kv", "set", "cas_cluster_key", "initial" });
 
     // Get version from node 2 (retry to tolerate replication delay)
-    const json_output = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cas_cluster_key", "--format", "json" }, 5, 500);
+    const json_output = try cluster.execCaptureOnWithRetry(1, &.{ "kv", "get", "cas_cluster_key", "--output", "json" }, 5, 500);
     defer testing.allocator.free(json_output);
 
     const version = parseVersion(json_output) orelse return error.NoVersion;
@@ -898,7 +898,7 @@ test "e2e/kv/cluster: delete replicates across cluster" {
     try cluster.execOn(2, &.{ "kv", "delete", "to_delete_cluster" });
 
     // Verify deletion from node 1 (poll: GET returns stale value until delete replicates)
-    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--format", "table" }, "(nil)", 10, 500);
+    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--output", "table" }, "(nil)", 10, 500);
     defer testing.allocator.free(after);
 }
 
@@ -918,7 +918,7 @@ test "e2e/kv: blocking get receives value when key is set" {
     defer async_get.deinit();
 
     // Small delay to ensure blocking GET is registered
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     // Set the key from another "client"
     try ctx.exec(&.{ "kv", "set", key, value });
@@ -944,7 +944,7 @@ test "e2e/kv: blocking get with infinite timeout receives value" {
     defer async_get.deinit();
 
     // Small delay to ensure blocking GET is registered
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     // Set the key
     try ctx.exec(&.{ "kv", "set", key, value });
@@ -977,7 +977,7 @@ test "e2e/kv: blocking get on existing key waits for update" {
     defer async_get.deinit();
 
     // Small delay to ensure watcher is registered
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     // Update the key to trigger the watcher
     try ctx.exec(&.{ "kv", "set", key, updated_value });
@@ -1104,7 +1104,7 @@ test "e2e/kv: delete in one namespace does not affect another" {
     try ctx.exec(&.{ "kv", "delete", "shared", "-n", "kv_del_a" });
 
     // Namespace A should be nil
-    var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--format", "table" });
+    var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--output", "table" });
     defer result_a.deinit();
     try stdx.testing.assertContains(result_a, "(nil)");
 
@@ -1260,7 +1260,7 @@ test "e2e/kv: mget basic — all keys exist" {
     try ctx.exec(&.{ "kv", "set", "mg_c", "gamma" });
 
     // flo kv mget mg_a mg_b mg_c --format json
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_a", "mg_b", "mg_c", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_a", "mg_b", "mg_c", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1280,7 +1280,7 @@ test "e2e/kv: mget partial — some keys missing" {
     try ctx.exec(&.{ "kv", "set", "mg_exists2", "val2" });
 
     // mget with mix of existing and non-existing keys
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_exists1", "mg_missing", "mg_exists2", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_exists1", "mg_missing", "mg_exists2", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1296,7 +1296,7 @@ test "e2e/kv: mget all keys missing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "nope_a", "nope_b", "nope_c", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "nope_a", "nope_b", "nope_c", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1313,7 +1313,7 @@ test "e2e/kv: mget single key" {
 
     try ctx.exec(&.{ "kv", "set", "mg_single", "only" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_single", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_single", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1328,7 +1328,7 @@ test "e2e/kv: mget table format" {
     try ctx.exec(&.{ "kv", "set", "tbl_a", "apple" });
     try ctx.exec(&.{ "kv", "set", "tbl_b", "banana" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "tbl_a", "tbl_b", "--format", "table" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "tbl_a", "tbl_b", "--output", "table" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1347,7 +1347,7 @@ test "e2e/kv: mget reflects latest value after overwrite" {
     try ctx.exec(&.{ "kv", "set", "mg_ow", "original" });
     try ctx.exec(&.{ "kv", "set", "mg_ow", "updated" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_ow", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_ow", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1363,7 +1363,7 @@ test "e2e/kv: mget after delete shows nil" {
     try ctx.exec(&.{ "kv", "set", "mg_del_b", "vb" });
     try ctx.exec(&.{ "kv", "delete", "mg_del_a" });
 
-    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_del_a", "mg_del_b", "--format", "json" });
+    var result = try ctx.cli.run(&.{ "kv", "mget", "mg_del_a", "mg_del_b", "--output", "json" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1402,7 +1402,7 @@ test "e2e/kv: mget across shards returns all results" {
     var result = try ctx.cli.run(&.{
         "kv",           "mget",      "alpha_cpu", "bravo_mem",
         "charlie_disk", "delta_net", "echo_iops", "foxtrot_lat",
-        "golf_tput",    "hotel_err", "--format",  "json",
+        "golf_tput",    "hotel_err", "--output",  "json",
     });
     defer result.deinit();
 
@@ -1425,7 +1425,7 @@ test "e2e/kv: mget across shards with partial hits" {
 
     var result = try ctx.cli.run(&.{
         "kv",          "mget",         "shard_hit_1", "shard_miss_2",
-        "shard_hit_3", "shard_miss_4", "--format",    "json",
+        "shard_hit_3", "shard_miss_4", "--output",    "json",
     });
     defer result.deinit();
 
@@ -1454,7 +1454,7 @@ test "e2e/kv: mget with namespace across shards" {
 
     // MGET in the named namespace — should NOT return default namespace values
     var result = try ctx.cli.run(&.{
-        "kv", "mget", "ns_key1", "ns_key2", "ns_key3", "-n", "mget_ns", "--format", "json",
+        "kv", "mget", "ns_key1", "ns_key2", "ns_key3", "-n", "mget_ns", "--output", "json",
     });
     defer result.deinit();
 
@@ -1479,11 +1479,11 @@ test "e2e/kv/cluster: mget after replication" {
     try cluster.execOn(0, &.{ "kv", "set", "cmg_c", "cluster_gamma" });
 
     // Allow replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // MGET from node 1 — keys were written on node 0
     const result1 = try cluster.execCaptureOnWithRetry(1, &.{
-        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result1);
 
@@ -1493,7 +1493,7 @@ test "e2e/kv/cluster: mget after replication" {
 
     // MGET from node 2
     const result2 = try cluster.execCaptureOnWithRetry(2, &.{
-        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--format", "json",
+        "kv", "mget", "cmg_a", "cmg_b", "cmg_c", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result2);
 
@@ -1512,12 +1512,12 @@ test "e2e/kv/cluster: mget reads from all nodes" {
     try cluster.execOn(2, &.{ "kv", "set", "cmg_n2", "from_node2" });
 
     // Allow replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // MGET all three keys from each node
     for (0..3) |node| {
         const result = try cluster.execCaptureOnWithRetry(@intCast(node), &.{
-            "kv", "mget", "cmg_n0", "cmg_n1", "cmg_n2", "--format", "json",
+            "kv", "mget", "cmg_n0", "cmg_n1", "cmg_n2", "--output", "json",
         }, 5, 500);
         defer testing.allocator.free(result);
 
@@ -1536,11 +1536,11 @@ test "e2e/kv/cluster: mget with partial hits across cluster" {
     try cluster.execOn(1, &.{ "kv", "set", "cmg_hit_b", "found_b" });
 
     // Allow replication
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // MGET 4 keys (2 exist, 2 missing) from node 2
     const result = try cluster.execCaptureOnWithRetry(2, &.{
-        "kv", "mget", "cmg_hit_a", "cmg_miss_x", "cmg_hit_b", "cmg_miss_y", "--format", "json",
+        "kv", "mget", "cmg_hit_a", "cmg_miss_x", "cmg_hit_b", "cmg_miss_y", "--output", "json",
     }, 5, 500);
     defer testing.allocator.free(result);
 
@@ -1560,17 +1560,17 @@ test "e2e/kv/cluster: mget after node failure" {
     try cluster.execOn(0, &.{ "kv", "set", "cmg_survive_b", "survives_b" });
 
     // Allow replication to all 3 nodes
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Kill node 0
     cluster.stopNode(0);
 
     // Allow re-election
-    std.Thread.sleep(3 * std.time.ns_per_s);
+    @import("stdx").time.sleep(3 * std.time.ns_per_s);
 
     // MGET from surviving node — data should be available
     const result = try cluster.execCaptureOnWithRetry(1, &.{
-        "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--format", "json",
+        "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--output", "json",
     }, 5, 1000);
     defer testing.allocator.free(result);
 

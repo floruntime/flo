@@ -211,7 +211,7 @@ pub const NamespaceHandler = struct {
         } else {
             // Auto-create namespace entry (e.g., "default" on first bare-namespace write)
             const key = self.allocator.dupe(u8, effective) catch return;
-            const timestamp = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+            const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
             self.namespaces.put(key, .{
                 .created_at_ns = timestamp,
                 .data_count = 1,
@@ -242,7 +242,7 @@ pub const NamespaceHandler = struct {
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) void {
         if (self.namespaces.contains(name)) return; // idempotent
         const owned = self.allocator.dupe(u8, name) catch return;
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
         self.namespaces.put(owned, .{ .created_at_ns = now_ns }) catch {
             self.allocator.free(owned);
         };
@@ -555,7 +555,7 @@ pub const NamespaceHandler = struct {
         };
         errdefer self.allocator.free(owned_name);
 
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
         self.namespaces.put(owned_name, .{
             .created_at_ns = now_ns,

@@ -34,9 +34,9 @@ fn shardCount(ctx: *DashboardContext) usize {
 
 /// GET /namespaces - List all namespaces with resource counts
 pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -125,7 +125,7 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// POST /namespaces — Create a new namespace (direct integration with shard 0 namespace handler)
@@ -154,15 +154,15 @@ pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardCo
     shard.namespace_handler.applyCreate(name);
 
     // Return success
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", name);
     try obj.boolField("ok", true);
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 fn extractName(body: []const u8) ?[]const u8 {
@@ -208,9 +208,9 @@ fn isReservedNamespace(name: []const u8) bool {
 
 /// GET /namespaces/:name - Namespace detail with resource arrays
 pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -318,14 +318,14 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /namespaces/:ns/streams - Streams in namespace
 pub fn getNamespaceStreams(allocator: Allocator, namespace: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -356,14 +356,14 @@ pub fn getNamespaceStreams(allocator: Allocator, namespace: []const u8, ctx: *Da
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /namespaces/:ns/queues - Queues in namespace
 pub fn getNamespaceQueues(allocator: Allocator, namespace: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
@@ -389,14 +389,14 @@ pub fn getNamespaceQueues(allocator: Allocator, namespace: []const u8, ctx: *Das
     }
 
     try arr.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 /// GET /namespaces/:ns/kv - KV stats for namespace (also used for /kv/namespaces/:ns)
 pub fn getNamespaceKV(allocator: Allocator, namespace: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var json_buf: std.ArrayList(u8) = .empty;
-    errdefer json_buf.deinit(allocator);
-    const writer = json_buf.writer(allocator);
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -432,7 +432,7 @@ pub fn getNamespaceKV(allocator: Allocator, namespace: []const u8, ctx: *Dashboa
     }
 
     try obj.end();
-    return try json_buf.toOwnedSlice(allocator);
+    return try json_aw.toOwnedSlice();
 }
 
 // =============================================================================

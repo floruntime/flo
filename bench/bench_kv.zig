@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const src = @import("src");
+const stdx = @import("stdx");
 
 const KVProjection = src.projection.kv.KVProjection;
 
@@ -67,7 +68,7 @@ fn benchScanPrefix(kv: *KVProjection, iters: usize) void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -78,9 +79,9 @@ pub fn main() !void {
         var kv = KVProjection.init(allocator, 0);
         defer kv.deinit();
 
-        const start = std.time.nanoTimestamp();
+        const start = stdx.time.nanoTimestamp();
         try benchPut(&kv);
-        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const elapsed_ns: u64 = @intCast(stdx.time.nanoTimestamp() - start);
         const ops = @as(u64, BENCH_ITERS) * 1_000_000_000 / elapsed_ns;
         std.debug.print("  KV Put:       {d:>12} ops/sec  ({d} ns/op, {d} keys)\n", .{
             ops, elapsed_ns / BENCH_ITERS, BENCH_ITERS,
@@ -88,9 +89,9 @@ pub fn main() !void {
 
         // ── Get Benchmark (keys are hot) ──
         {
-            const gstart = std.time.nanoTimestamp();
+            const gstart = stdx.time.nanoTimestamp();
             benchGet(&kv);
-            const gel: u64 = @intCast(std.time.nanoTimestamp() - gstart);
+            const gel: u64 = @intCast(stdx.time.nanoTimestamp() - gstart);
             const gops = @as(u64, BENCH_ITERS) * 1_000_000_000 / gel;
             std.debug.print("  KV Get:       {d:>12} ops/sec  ({d} ns/op)\n", .{
                 gops, gel / BENCH_ITERS,
@@ -100,9 +101,9 @@ pub fn main() !void {
         // ── Scan Benchmark (full table scan) ──
         {
             const scan_iters: usize = 10_000;
-            const sstart = std.time.nanoTimestamp();
+            const sstart = stdx.time.nanoTimestamp();
             benchScan(&kv, scan_iters);
-            const sel: u64 = @intCast(std.time.nanoTimestamp() - sstart);
+            const sel: u64 = @intCast(stdx.time.nanoTimestamp() - sstart);
             const sops = @as(u64, scan_iters) * 1_000_000_000 / sel;
             std.debug.print("  KV Scan:      {d:>12} ops/sec  ({d} ns/op, batch=100)\n", .{
                 sops, sel / scan_iters,
@@ -112,9 +113,9 @@ pub fn main() !void {
         // ── ScanPrefix Benchmark ──
         {
             const prefix_iters: usize = 10_000;
-            const pstart = std.time.nanoTimestamp();
+            const pstart = stdx.time.nanoTimestamp();
             benchScanPrefix(&kv, prefix_iters);
-            const pel: u64 = @intCast(std.time.nanoTimestamp() - pstart);
+            const pel: u64 = @intCast(stdx.time.nanoTimestamp() - pstart);
             const pops = @as(u64, prefix_iters) * 1_000_000_000 / pel;
             std.debug.print("  KV ScanPfx:   {d:>12} ops/sec  ({d} ns/op, prefix=14B)\n", .{
                 pops, pel / prefix_iters,
@@ -123,9 +124,9 @@ pub fn main() !void {
 
         // ── Delete Benchmark ──
         {
-            const dstart = std.time.nanoTimestamp();
+            const dstart = stdx.time.nanoTimestamp();
             try benchDelete(&kv);
-            const del: u64 = @intCast(std.time.nanoTimestamp() - dstart);
+            const del: u64 = @intCast(stdx.time.nanoTimestamp() - dstart);
             const dops = @as(u64, BENCH_ITERS) * 1_000_000_000 / del;
             std.debug.print("  KV Delete:    {d:>12} ops/sec  ({d} ns/op)\n", .{
                 dops, del / BENCH_ITERS,

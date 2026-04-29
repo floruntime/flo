@@ -236,7 +236,7 @@ pub const QueueHandler = struct {
         }
 
         const priority: u32 = if (req.getPriority()) |p| @as(u32, p) else 0;
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
 
         // Build value: [priority:u32][payload]
@@ -326,7 +326,7 @@ pub const QueueHandler = struct {
 
         const count = req.getCount() orelse DEFAULT_DEQUEUE_COUNT;
         const capped = @min(count, MAX_DEQUEUE_BATCH);
-        const now_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const queue_name_hash = router.nameHash(ns_hash, req.key);
 
@@ -384,7 +384,7 @@ pub const QueueHandler = struct {
         }
 
         // Apply locally
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
 
@@ -434,7 +434,7 @@ pub const QueueHandler = struct {
         }
 
         // Apply locally
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
 
@@ -640,7 +640,7 @@ pub const QueueHandler = struct {
         }
 
         // Apply locally
-        const timestamp_ns = @as(u64, @intCast(std.time.milliTimestamp())) * 1_000_000;
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;

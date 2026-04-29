@@ -456,7 +456,7 @@ fn parseTransitions(allocator: Allocator, obj: JsonValue) ParseError![]Transitio
         return allocator.alloc(Transition, 0) catch return ParseError.OutOfMemory;
     };
 
-    var transitions: std.ArrayList(Transition) = .{};
+    var transitions: std.ArrayList(Transition) = .empty;
     errdefer {
         for (transitions.items) |*t| {
             t.deinit(allocator);
@@ -486,7 +486,7 @@ fn parseSteps(allocator: Allocator, root: JsonValue) ParseError![]NamedStep {
         return allocator.alloc(NamedStep, 0) catch return ParseError.OutOfMemory;
     };
 
-    var steps: std.ArrayList(NamedStep) = .{};
+    var steps: std.ArrayList(NamedStep) = .empty;
     errdefer {
         for (steps.items) |*s| {
             s.deinit(allocator);
@@ -517,7 +517,7 @@ fn parseTerminals(allocator: Allocator, root: JsonValue) ParseError![]Terminal {
         return allocator.alloc(Terminal, 0) catch return ParseError.OutOfMemory;
     };
 
-    var terminals: std.ArrayList(Terminal) = .{};
+    var terminals: std.ArrayList(Terminal) = .empty;
     errdefer {
         for (terminals.items) |*t| {
             t.deinit(allocator);

@@ -329,10 +329,10 @@ pub const WaitContext = struct {
 
     /// Encode to wire format
     pub fn encode(self: WaitContext, allocator: Allocator) Allocator.Error![]u8 {
-        var buf: std.ArrayList(u8) = .{};
-        errdefer buf.deinit(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
 
-        const writer = buf.writer(allocator);
+        const writer = &aw.writer;
 
         // Version
         writer.writeByte(WIRE_VERSION) catch return error.OutOfMemory;
@@ -417,7 +417,7 @@ pub const WaitContext = struct {
             writer.writeByte(0) catch return error.OutOfMemory;
         }
 
-        return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        return aw.toOwnedSlice() catch return error.OutOfMemory;
     }
 
     /// Decode from wire format
@@ -994,7 +994,7 @@ pub const RunSnapshot = struct {
 
     /// Serialize to wire format
     pub fn encode(self: RunSnapshot, allocator: Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         // Version
@@ -1261,7 +1261,7 @@ pub const Signal = struct {
     }
 
     pub fn encode(self: Signal, allocator: Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.append(allocator, WIRE_VERSION);
@@ -1363,7 +1363,7 @@ pub const Timer = struct {
     }
 
     pub fn encode(self: Timer, allocator: Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.append(allocator, WIRE_VERSION);

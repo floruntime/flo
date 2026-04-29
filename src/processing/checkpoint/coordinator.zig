@@ -82,7 +82,7 @@ pub const CheckpointCoordinator = struct {
 
         const checkpoint_id = self.next_checkpoint_id;
         self.next_checkpoint_id += 1;
-        const now = std.time.milliTimestamp();
+        const now = @import("stdx").time.milliTimestamp();
 
         // Create pending tracking
         self.pending = .{

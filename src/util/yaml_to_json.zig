@@ -61,8 +61,8 @@ const Converter = struct {
         // Parse lines
         var iter = mem.splitScalar(u8, yaml, '\n');
         while (iter.next()) |raw_line| {
-            const line = mem.trimRight(u8, raw_line, " \t\r");
-            const content = mem.trimLeft(u8, line, " \t");
+            const line = mem.trimEnd(u8, raw_line, " \t\r");
+            const content = mem.trimStart(u8, line, " \t");
 
             // Skip empty lines and comments
             if (content.len == 0) continue;
@@ -118,7 +118,7 @@ const Converter = struct {
                 self.output.append(self.allocator, ':') catch return ConvertError.OutOfMemory;
 
                 const after_colon = if (colon_pos + 1 < line.content.len)
-                    mem.trimLeft(u8, line.content[colon_pos + 1 ..], " \t")
+                    mem.trimStart(u8, line.content[colon_pos + 1 ..], " \t")
                 else
                     "";
 
@@ -182,7 +182,7 @@ const Converter = struct {
                 }
                 first = false;
 
-                const item_content = mem.trimLeft(u8, line.content[1..], " \t");
+                const item_content = mem.trimStart(u8, line.content[1..], " \t");
 
                 if (item_content.len == 0) {
                     // Array item with value on next line
@@ -225,7 +225,7 @@ const Converter = struct {
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         const line = self.lines.items[start];
-        const item_content = mem.trimLeft(u8, line.content[1..], " \t");
+        const item_content = mem.trimStart(u8, line.content[1..], " \t");
         const item_indent = line.indent;
 
         var i = start;
@@ -239,7 +239,7 @@ const Converter = struct {
             first_property = false;
 
             const after_colon = if (colon_pos + 1 < item_content.len)
-                mem.trimLeft(u8, item_content[colon_pos + 1 ..], " \t")
+                mem.trimStart(u8, item_content[colon_pos + 1 ..], " \t")
             else
                 "";
 
@@ -293,7 +293,7 @@ const Converter = struct {
                 self.output.append(self.allocator, ':') catch return ConvertError.OutOfMemory;
 
                 const after_colon = if (colon_pos + 1 < prop_line.content.len)
-                    mem.trimLeft(u8, prop_line.content[colon_pos + 1 ..], " \t")
+                    mem.trimStart(u8, prop_line.content[colon_pos + 1 ..], " \t")
                 else
                     "";
 
@@ -411,7 +411,7 @@ const Converter = struct {
         var i: usize = 1;
         while (i < value.len) : (i += 1) {
             if (value[i] == '#' and value[i - 1] == ' ') {
-                return mem.trimRight(u8, value[0 .. i - 1], " \t");
+                return mem.trimEnd(u8, value[0 .. i - 1], " \t");
             }
         }
         return value;

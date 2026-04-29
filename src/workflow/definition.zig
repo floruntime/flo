@@ -144,7 +144,7 @@ pub const PollConfig = struct {
                 const base_multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
                 const base_delay = self.base_delay_ms *| base_multiplier;
                 // Add up to 25% jitter
-                var rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+                var rng = std.Random.DefaultPrng.init(@intCast(@import("stdx").time.milliTimestamp()));
                 const jitter = rng.random().intRangeAtMost(u32, 0, base_delay / 4);
                 break :blk base_delay +| jitter;
             },
@@ -1180,7 +1180,7 @@ pub const WorkflowDefinition = struct {
 
     /// Serialize to wire format
     pub fn encode(self: WorkflowDefinition, allocator: Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.append(allocator, WIRE_VERSION);

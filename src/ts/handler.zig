@@ -312,7 +312,7 @@ pub const TSHandler = struct {
         }
 
         // Resolve time range
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
         var from_ns: u64 = 0;
         var to_ns: u64 = std.math.maxInt(u64);
         if (query.source.range.duration_ms > 0) {
@@ -439,7 +439,7 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "invalid retention duration" } };
         };
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         const cutoff_ms = now_ms - duration_ms;
         const cutoff_ns: u64 = if (cutoff_ms > 0)
             @intCast(@as(u64, @bitCast(cutoff_ms)) * 1_000_000)
@@ -460,7 +460,7 @@ pub const TSHandler = struct {
     }
 
     fn serverTimestampNs() u64 {
-        return @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+        return @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
     }
 
     pub fn freeResult(self: *TSHandler, cmd_result: CommandResult) void {

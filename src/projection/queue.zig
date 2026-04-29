@@ -185,8 +185,8 @@ pub const QueueProjection = struct {
         return .{
             .allocator = allocator,
             .messages = std.AutoHashMap(u64, Message).init(allocator),
-            .ready_heap = std.PriorityQueue(HeapItem, void, heapCompare).init(allocator, {}),
-            .lease_heap = std.PriorityQueue(LeaseItem, void, leaseCompare).init(allocator, {}),
+            .ready_heap = .empty,
+            .lease_heap = .empty,
             .dlq = .empty,
             .dlq_limit = config.dlq_limit,
             .known_queues = std.AutoHashMap(u64, QueueMeta).init(allocator),
@@ -207,8 +207,8 @@ pub const QueueProjection = struct {
             }
         }
         self.messages.deinit();
-        self.ready_heap.deinit();
-        self.lease_heap.deinit();
+        self.ready_heap.deinit(self.allocator);
+        self.lease_heap.deinit(self.allocator);
         self.dlq.deinit(self.allocator);
         // Free known queue name/namespace copies
         var q_it = self.known_queues.iterator();
@@ -272,7 +272,7 @@ pub const QueueProjection = struct {
         };
 
         try self.messages.put(seq, msg);
-        try self.ready_heap.add(.{ .seq = seq, .priority = priority });
+        try self.ready_heap.push(self.allocator, .{ .seq = seq, .priority = priority });
 
         // Update known-queue stats
         if (self.known_queues.getPtr(queue_name_hash)) |meta| {
@@ -313,7 +313,7 @@ pub const QueueProjection = struct {
         var skipped_count: usize = 0;
         var found: ?DequeueResult = null;
 
-        while (self.ready_heap.removeOrNull()) |item| {
+        while (self.ready_heap.pop()) |item| {
             if (self.messages.getPtr(item.seq)) |msg| {
                 if (msg.state != .ready) continue; // stale heap entry
 
@@ -324,7 +324,7 @@ pub const QueueProjection = struct {
                         skipped_count += 1;
                     } else {
                         // Too many skipped — re-add and give up
-                        self.ready_heap.add(item) catch {};
+                        self.ready_heap.push(self.allocator, item) catch {};
                         break;
                     }
                     continue;
@@ -335,7 +335,7 @@ pub const QueueProjection = struct {
                 msg.attempts += 1;
                 msg.lease_expiry_ns = now_ns + self.default_lease_ns;
 
-                try self.lease_heap.add(.{
+                try self.lease_heap.push(self.allocator, .{
                     .seq = msg.seq,
                     .expiry_ns = msg.lease_expiry_ns,
                 });
@@ -361,7 +361,7 @@ pub const QueueProjection = struct {
 
         // Re-push any skipped items
         for (skipped_buf[0..skipped_count]) |item| {
-            self.ready_heap.add(item) catch {};
+            self.ready_heap.push(self.allocator, item) catch {};
         }
 
         return found;
@@ -387,7 +387,7 @@ pub const QueueProjection = struct {
                 // Re-enqueue
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
-                try self.ready_heap.add(.{ .seq = msg.seq, .priority = msg.priority });
+                try self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority });
             }
             self.stats.nacked += 1;
         }
@@ -430,7 +430,7 @@ pub const QueueProjection = struct {
     pub fn expireLeases(self: *QueueProjection, now_ns: u64) void {
         while (self.lease_heap.peek()) |top| {
             if (top.expiry_ns > now_ns) break;
-            _ = self.lease_heap.remove();
+            _ = self.lease_heap.popIndex(0);
 
             if (self.messages.getPtr(top.seq)) |msg| {
                 if (msg.state != .leased) continue; // already acked/nacked
@@ -439,7 +439,7 @@ pub const QueueProjection = struct {
                 // Return to ready
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
-                self.ready_heap.add(.{ .seq = msg.seq, .priority = msg.priority }) catch {};
+                self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority }) catch {};
 
                 self.stats.leases_expired += 1;
             }
@@ -729,9 +729,9 @@ pub const QueueProjection = struct {
 
             // Rebuild heaps from message state
             if (state == .ready) {
-                try self.ready_heap.add(.{ .seq = seq, .priority = priority });
+                try self.ready_heap.push(self.allocator, .{ .seq = seq, .priority = priority });
             } else if (state == .leased and lease_expiry_ns > 0) {
-                try self.lease_heap.add(.{ .seq = seq, .expiry_ns = lease_expiry_ns });
+                try self.lease_heap.push(self.allocator, .{ .seq = seq, .expiry_ns = lease_expiry_ns });
             }
         }
 

@@ -104,7 +104,7 @@ pub const Response = struct {
 pub const Client = struct {
     allocator: Allocator,
     endpoint: []const u8,
-    stream: ?std.net.Stream = null,
+    stream: ?@import("stdx").net.Stream = null,
     builder: RequestBuilder,
 
     const Self = @This();
@@ -143,7 +143,7 @@ pub const Client = struct {
 
         // Connect
         const address = try resolveEndpointAddress(host, port);
-        self.stream = std.net.tcpConnectToAddress(address) catch |err| {
+        self.stream = @import("stdx").net.tcpConnectToAddress(address) catch |err| {
             return switch (err) {
                 error.ConnectionRefused => error.ConnectionRefused,
                 error.ConnectionTimedOut => error.ConnectionTimedOut,
@@ -244,7 +244,7 @@ pub const Client = struct {
 };
 
 /// Read exactly n bytes from the stream
-fn readExact(stream: std.net.Stream, buf: []u8) !void {
+fn readExact(stream: @import("stdx").net.Stream, buf: []u8) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const bytes_read = stream.read(buf[total..]) catch |err| {
@@ -259,17 +259,17 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
 }
 
 /// Resolve a host (which may be a hostname like `localhost` or an IP) into
-/// a std.net.Address suitable for tcpConnectToAddress. This is split out to
+/// a @import("stdx").net.Address suitable for tcpConnectToAddress. This is split out to
 /// make it easy to unit test the hostname handling logic without opening a
 /// network socket.
-pub fn resolveEndpointAddress(host: []const u8, port: u16) !std.net.Address {
+pub fn resolveEndpointAddress(host: []const u8, port: u16) !@import("stdx").net.Address {
     // First try numeric parsing (IPv4 / IPv6 literal)
-    const parse_result = std.net.Address.parseIp(host, port) catch {
+    const parse_result = @import("stdx").net.Address.parseIp(host, port) catch {
         // If parsing failed because this is not a numeric IP literal, try
         // resolving via DNS (getAddressList). Use a temporary allocator arena
         // — getAddressList abstracts platform differences and returns usable
-        // std.net.Address values for both IPv4 and IPv6.
-        var addr_list = try std.net.getAddressList(std.heap.page_allocator, host, port);
+        // @import("stdx").net.Address values for both IPv4 and IPv6.
+        var addr_list = try @import("stdx").net.getAddressList(std.heap.page_allocator, host, port);
         defer addr_list.deinit();
 
         if (addr_list.addrs.len == 0) return error.HostLacksNetworkAddresses;
@@ -277,7 +277,7 @@ pub fn resolveEndpointAddress(host: []const u8, port: u16) !std.net.Address {
         // Prefer IPv4 addresses if present, otherwise return the first address.
         var idx: usize = 0;
         while (idx < addr_list.addrs.len) : (idx += 1) {
-            if (addr_list.addrs[idx].any.family == std.posix.AF.INET) {
+            if (addr_list.addrs[idx].inner == .ip4) {
                 return addr_list.addrs[idx];
             }
         }

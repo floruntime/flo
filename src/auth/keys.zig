@@ -78,7 +78,7 @@ pub const ApiKey = struct {
 
     pub fn isExpired(self: *const ApiKey) bool {
         if (self.expires_at == 0) return false;
-        return std.time.timestamp() > self.expires_at;
+        return @import("stdx").time.milliTimestamp() > self.expires_at;
     }
 
     pub fn isValid(self: *const ApiKey) bool {
@@ -185,7 +185,7 @@ pub fn generateKey(
 ) !struct { plaintext: []const u8, key: ApiKey } {
     // Generate random bytes
     var rand_buf: [random_bytes]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    try @import("stdx").io.instance().randomSecure(&rand_buf);
 
     // Hex-encode the random part
     const hex_buf = std.fmt.bytesToHex(rand_buf, .lower);
@@ -203,7 +203,7 @@ pub fn generateKey(
         .name_len = 0,
         .hash = hashKey(plaintext),
         .role = role,
-        .created_at = std.time.timestamp(),
+        .created_at = @import("stdx").time.milliTimestamp(),
         .expires_at = expires_at,
         .revoked = false,
     };
@@ -229,7 +229,7 @@ pub fn generateKey(
 /// Returns 32 random bytes.
 pub fn generateSigningSecret() [32]u8 {
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    @import("stdx").io.instance().randomSecure(&secret) catch @panic("randomSecure failed");
     return secret;
 }
 

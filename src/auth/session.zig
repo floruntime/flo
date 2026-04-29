@@ -41,15 +41,15 @@ pub fn issueSessionToken(
     signing_secret: []const u8,
     ttl_seconds: i64,
 ) ![]const u8 {
-    const now = std.time.timestamp();
+    const now = @import("stdx").time.milliTimestamp();
     const exp = now + ttl_seconds;
 
     // Header: {"alg":"HS256","typ":"JWT"}
     const header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 
     // Build payload JSON
-    var payload_buf: [512]u8 = undefined;
-    const payload_json = std.fmt.bufPrint(&payload_buf, "{{\"sub\":\"{s}\",\"role\":\"{s}\",\"iat\":{d},\"exp\":{d}}}", .{
+    var issue_payload_buf: [512]u8 = undefined;
+    const payload_json = std.fmt.bufPrint(&issue_payload_buf, "{{\"sub\":\"{s}\",\"role\":\"{s}\",\"iat\":{d},\"exp\":{d}}}", .{
         key_id,
         role.toString(),
         now,
@@ -82,6 +82,12 @@ pub fn issueSessionToken(
 
 /// Verify a session token and extract claims.
 /// Returns SessionError on invalid/expired tokens.
+///
+/// NOTE: `claims.sub` is a slice into a threadlocal buffer that remains
+/// valid until the next `verifySessionToken` call on this thread. Copy it
+/// if you need to retain it across calls.
+threadlocal var payload_buf: [512]u8 = undefined;
+
 pub fn verifySessionToken(
     signing_secret: []const u8,
     token: []const u8,
@@ -112,9 +118,10 @@ pub fn verifySessionToken(
         return SessionError.InvalidSignature;
     }
 
-    // Decode payload
+    // Decode payload — buffer is threadlocal so the returned slice in
+    // claims.sub remains valid until the next verifySessionToken call on
+    // this thread.
     const payload_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_b64) catch return SessionError.MalformedToken;
-    var payload_buf: [512]u8 = undefined;
     if (payload_len > payload_buf.len) return SessionError.MalformedToken;
     std.base64.url_safe_no_pad.Decoder.decode(payload_buf[0..payload_len], payload_b64) catch return SessionError.MalformedToken;
     const payload_json = payload_buf[0..payload_len];
@@ -127,7 +134,7 @@ pub fn verifySessionToken(
     const exp = extractJsonNumber(payload_json, "\"exp\"") orelse return SessionError.MalformedToken;
 
     // Check expiration
-    const now = std.time.timestamp();
+    const now = @import("stdx").time.milliTimestamp();
     if (now > exp) return SessionError.TokenExpired;
 
     return .{

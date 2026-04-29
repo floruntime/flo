@@ -11,7 +11,7 @@ const commander = @import("../commander/mod.zig");
 const proto = @import("../../protocol/proto.zig");
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
-const net = std.net;
+const net = @import("stdx").net;
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {

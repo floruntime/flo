@@ -77,7 +77,7 @@ pub const JsonMapOperator = struct {
         name: []const u8,
         config_entries: []const ConfigEntry,
     ) !Self {
-        var mappings_list: std.ArrayListUnmanaged(Mapping) = .{};
+        var mappings_list: std.ArrayListUnmanaged(Mapping) = .empty;
         errdefer {
             for (mappings_list.items) |m| {
                 allocator.free(m.output_field);
@@ -96,7 +96,7 @@ pub const JsonMapOperator = struct {
             const source: Mapping.Source = if (std.mem.startsWith(u8, entry.value, "$.")) blk: {
                 // JSONPath extraction — split into segments (owned copies)
                 const field_path = entry.value[2..];
-                var seg_list: std.ArrayListUnmanaged([]const u8) = .{};
+                var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
                 var iter = std.mem.splitScalar(u8, field_path, '.');
                 while (iter.next()) |seg| {
                     try seg_list.append(allocator, try allocator.dupe(u8, seg));
@@ -175,7 +175,7 @@ pub const JsonMapOperator = struct {
         defer parsed.deinit();
 
         // Build output JSON object
-        var output_buf: std.ArrayListUnmanaged(u8) = .{};
+        var output_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer output_buf.deinit(self.allocator);
 
         try output_buf.append(self.allocator, '{');

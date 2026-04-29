@@ -627,7 +627,7 @@ test "e2e/queue: ls shows multiple queues from different operations" {
     // Brief pause to let the server fully process all queue registrations
     // Under heavy system load (full 410-test suite), back-to-back CLI
     // commands can outpace the server's internal bookkeeping
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     var result = try ctx.cli.run(&.{ "queue", "ls" });
     defer result.deinit();

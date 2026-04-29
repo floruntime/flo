@@ -413,10 +413,10 @@ test "e2e/workflow: dotted key format produces valid YAML" {
     defer cleanupTempFile(testing.allocator, path);
 
     // Verify file was written and contains nested YAML
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try @import("stdx").fs.openFileAbsolute(path, .{});
+    defer @import("stdx").fs.closeFile(file);
     var buf: [1024]u8 = undefined;
-    const n = try file.readAll(&buf);
+    const n = try @import("stdx").fs.readAll(file, &buf);
     const content = buf[0..n];
     try testing.expect(std.mem.indexOf(u8, content, "name: import-test") != null);
     try testing.expect(std.mem.indexOf(u8, content, "start:") != null);
@@ -429,11 +429,11 @@ test "e2e/workflow: temp file helpers work" {
     defer cleanupTempFile(testing.allocator, path);
 
     // Verify file was written
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try @import("stdx").fs.openFileAbsolute(path, .{});
+    defer @import("stdx").fs.closeFile(file);
 
     var buf: [256]u8 = undefined;
-    const bytes_read = try file.readAll(&buf);
+    const bytes_read = try @import("stdx").fs.readAll(file, &buf);
     try testing.expectEqualStrings(yaml, buf[0..bytes_read]);
 }
 
@@ -884,7 +884,7 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
     try stdx.testing.assertSucceeded(complete_result);
 
     // 7. Give the workflow a moment to process completion, then check status
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     var final_status = try ctx.cli.run(&.{ "workflow", "status", run_id });
     defer final_status.deinit();
@@ -1015,7 +1015,7 @@ test "e2e/workflow: start parent workflow invokes child" {
     try stdx.testing.assertSucceeded(start_result);
 
     // Check parent status - should be waiting for child
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
 
     var status_result = try ctx.cli.run(&.{
         "workflow", "status", "parent-run-001",
@@ -1308,7 +1308,7 @@ test "e2e/workflow: timeout enforcement" {
     }
 
     // Wait for the 2s signal timeout to fire (3s to be safe)
-    std.Thread.sleep(3000 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(3000 * std.time.ns_per_ms);
 
     // Workflow should have timed out: wait-forever's onTimeout → flo.Failed
     var status = try ctx.cli.run(&.{ "workflow", "status", "e2e3-timeout-run" });
@@ -1356,7 +1356,7 @@ test "e2e/workflow: E2E-4 signal delivery resumes waiting workflow" {
     try stdx.testing.assertSucceeded(start);
 
     // Brief pause for execution
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Check status — should be waiting (or running, depending on action stub)
     var status1 = try ctx.cli.run(&.{ "workflow", "status", "e2e4-signal-run" });
@@ -1375,7 +1375,7 @@ test "e2e/workflow: E2E-4 signal delivery resumes waiting workflow" {
     // If the workflow is in a state that accepts signals, this succeeds
     if (signal.succeeded()) {
         // Give time for signal processing
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
         // Check final status
         var status2 = try ctx.cli.run(&.{ "workflow", "status", "e2e4-signal-run" });
@@ -1415,7 +1415,7 @@ test "e2e/workflow: E2E-5 history retrieval after workflow execution" {
     });
 
     // Brief pause for execution
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Retrieve history
     var history_result = try ctx.cli.run(&.{
@@ -1452,7 +1452,7 @@ test "e2e/workflow: E2E-5b history with limit parameter" {
         "--run-id", "e2e5b-hist-run",
     });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Retrieve history with limit
     var history_result = try ctx.cli.run(&.{
@@ -1569,7 +1569,7 @@ test "e2e/workflow: E2E-7 action completion triggers workflow resume" {
             try stdx.testing.assertSucceeded(complete);
 
             // Allow time for workflow to resume after action completion
-            std.Thread.sleep(500 * std.time.ns_per_ms);
+            @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
             // Check workflow final status
             var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
@@ -1629,7 +1629,7 @@ test "e2e/workflow: E2E-8 child completion resumes parent" {
     try stdx.testing.assertSucceeded(start);
 
     // Wait for child workflow to be spawned and potentially complete
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Check parent status — should show progress (waiting on child or further)
     var status = try ctx.cli.run(&.{ "workflow", "status", "e2e8-parent-run" });
@@ -1686,7 +1686,7 @@ test "e2e/workflow: E2E-9 cascading cancellation parent cancels child" {
     });
 
     // Wait for child to be spawned
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Cancel parent — should cascade to child
     var cancel = try ctx.cli.run(&.{
@@ -1743,7 +1743,7 @@ test "e2e/workflow: E2E-10 poll backoff for action completion" {
     });
 
     // Simulate a delayed worker (wait 1s before completing)
-    std.Thread.sleep(1000 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(1000 * std.time.ns_per_ms);
 
     // Worker picks up and completes
     var await_result = try ctx.cli.run(&.{
@@ -1763,7 +1763,7 @@ test "e2e/workflow: E2E-10 poll backoff for action completion" {
             });
 
             // Wait for poll cycle to pick up completion
-            std.Thread.sleep(1000 * std.time.ns_per_ms);
+            @import("stdx").time.sleep(1000 * std.time.ns_per_ms);
 
             var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
             defer status.deinit();
@@ -1940,7 +1940,7 @@ test "e2e/workflow: E2E-13 max child depth enforcement" {
     try stdx.testing.assertSucceeded(start);
 
     // Wait for chain to execute
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     var status = try ctx.cli.run(&.{ "workflow", "status", "e2e13-root-run" });
     defer status.deinit();
@@ -1983,7 +1983,7 @@ test "e2e/workflow: E2E-14 jsonpath input resolution between steps" {
     defer start.deinit();
     try stdx.testing.assertSucceeded(start);
 
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Verify workflow progressed
     var status = try ctx.cli.run(&.{ "workflow", "status", "e2e14-jsonpath-run" });
@@ -2027,7 +2027,7 @@ test "e2e/workflow: E2E-15 persistence survives server restart" {
     });
 
     // Wait for it to reach waiting state
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 
     // Verify it exists before restart
     var pre_status = try ctx.cli.run(&.{ "workflow", "status", "e2e15-persist-run" });
@@ -2038,7 +2038,7 @@ test "e2e/workflow: E2E-15 persistence survives server restart" {
     try ctx.restartServer();
 
     // Wait for server to fully start and restore state
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
 
     // Verify workflow run survives restart (via KV persistence)
     var post_status = try ctx.cli.run(&.{ "workflow", "status", "e2e15-persist-run" });
@@ -2079,7 +2079,7 @@ test "e2e/workflow: E2E-16a GET /api/workflows returns data" {
         "--run-id", "e2e16-dash-run",
     });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Query dashboard API
     var http = try ctx.createDashboardHttp();
@@ -2118,7 +2118,7 @@ test "e2e/workflow: E2E-16b GET /api/workflows/:run_id returns status" {
         "--run-id", "e2e16b-run",
     });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
@@ -2155,7 +2155,7 @@ test "e2e/workflow: E2E-16c GET /api/workflows/:run_id/history returns events" {
         "--run-id", "e2e16c-run",
     });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
@@ -2205,7 +2205,7 @@ test "e2e/workflow: E2E-17 definition overwrite safety" {
         "--run-id", "e2e17-v1-run",
     });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Verify v1 run exists
     var v1_status = try ctx.cli.run(&.{ "workflow", "status", "e2e17-v1-run" });

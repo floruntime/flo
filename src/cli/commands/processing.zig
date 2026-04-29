@@ -140,7 +140,7 @@ fn runSubmit(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
 
     // Read the YAML file
-    const yaml = std.fs.cwd().readFileAlloc(ctx.allocator, file_path, 1024 * 1024) catch |err| {
+    const yaml = @import("stdx").fs.readFileAlloc(ctx.allocator, file_path, 1024 * 1024) catch |err| {
         ctx.printErr("Failed to read file '{s}': {}\n", .{ file_path, err });
         return error.CommandFailed;
     };

@@ -438,7 +438,7 @@ pub const Metrics = struct {
 
         /// Format snapshot as Prometheus-style text
         pub fn formatPrometheus(self: Snapshot, allocator: std.mem.Allocator, namespace: []const u8, queue: []const u8) ![]u8 {
-            var buf: std.ArrayListUnmanaged(u8) = .{};
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
             errdefer buf.deinit(allocator);
 
             const writer = buf.writer(allocator);

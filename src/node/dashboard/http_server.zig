@@ -63,15 +63,15 @@ pub const DashboardServer = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
         if (self.listener) |sock| {
-            std.posix.close(sock);
+            _ = std.c.close(sock);
             self.listener = null;
         }
     }
 
     pub fn start(self: *Self) !void {
         // Create listening socket
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        errdefer std.posix.close(sock);
+        const sock = try @import("stdx").net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        errdefer _ = std.c.close(sock);
 
         // Allow address reuse
         const one: u32 = 1;
@@ -84,9 +84,9 @@ pub const DashboardServer = struct {
         };
 
         // Bind to configured address and port
-        const addr = std.net.Address.initIp4(bind_ip, self.config.port);
-        try std.posix.bind(sock, &addr.any, addr.getOsSockLen());
-        try std.posix.listen(sock, 64);
+        const addr = @import("stdx").net.SocketAddrV4.initIp4(bind_ip, self.config.port);
+        try @import("stdx").net.sysBind(sock, addr.anyPtr(), addr.anyLen());
+        try @import("stdx").net.sysListen(sock, 64);
 
         self.listener = sock;
         self.running.store(true, .release);
@@ -106,8 +106,8 @@ pub const DashboardServer = struct {
         // Close listener to unblock accept
         if (self.listener) |sock| {
             // Shutdown first to interrupt any blocked accept()
-            std.posix.shutdown(sock, .both) catch {};
-            std.posix.close(sock);
+            _ = std.c.shutdown(sock, 2);
+            _ = std.c.close(sock);
             self.listener = null;
         }
 
@@ -127,7 +127,7 @@ pub const DashboardServer = struct {
             var client_addr: std.posix.sockaddr = undefined;
             var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
 
-            const client = std.posix.accept(listener, &client_addr, &addr_len, 0) catch |err| {
+            const client = @import("stdx").net.sysAccept(listener, &client_addr, &addr_len, 0) catch |err| {
                 if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                     // Server shutting down
                     break;
@@ -151,11 +151,11 @@ pub const DashboardServer = struct {
             // defer runs, so we must tolerate any errno.
             const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
             _ = std.c.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &linger, @sizeOf(@TypeOf(linger)));
-            std.posix.close(client);
+            _ = std.c.close(client);
         }
 
         var buf: [8192]u8 = undefined;
-        const n = std.posix.read(client, &buf) catch return;
+        const n = @import("stdx").net.sysRead(client, &buf) catch return;
         if (n == 0) return;
 
         const request = buf[0..n];
@@ -292,8 +292,8 @@ pub const DashboardServer = struct {
             .{ status.statusLine(), content_type, body_data.len, cors },
         ) catch return;
 
-        _ = std.posix.write(client, response) catch return;
-        _ = std.posix.write(client, body_data) catch return;
+        _ = @import("stdx").net.sysWrite(client, response) catch return;
+        _ = @import("stdx").net.sysWrite(client, body_data) catch return;
     }
 
     fn sendResponsePrecompressed(_: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body_data: []const u8, cors_headers: ?[]const u8) void {
@@ -311,8 +311,8 @@ pub const DashboardServer = struct {
             .{ status.statusLine(), content_type, body_data.len, cors },
         ) catch return;
 
-        _ = std.posix.write(client, response) catch return;
-        _ = std.posix.write(client, body_data) catch return;
+        _ = @import("stdx").net.sysWrite(client, response) catch return;
+        _ = @import("stdx").net.sysWrite(client, body_data) catch return;
     }
 
     fn sendError(self: *Self, client: std.posix.socket_t, status: http.StatusCode, message: []const u8) void {
@@ -352,7 +352,7 @@ pub const DashboardServer = struct {
                 "\r\n",
             .{cors},
         ) catch return;
-        _ = std.posix.write(client, response) catch return;
+        _ = @import("stdx").net.sysWrite(client, response) catch return;
     }
 
     /// Handle POST/DELETE /api/v1/auth/session — exchange API key for session token.
@@ -424,7 +424,7 @@ pub const DashboardServer = struct {
         const sock = self.listener orelse return error.NotListening;
         var addr: std.posix.sockaddr.in = undefined;
         var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        try std.posix.getsockname(sock, @ptrCast(&addr), &len);
+        try (if (std.c.getsockname(sock, @ptrCast(&addr), &len) != 0) error.GetsocknameFailed else {});
         return std.mem.bigToNative(u16, addr.port);
     }
 };

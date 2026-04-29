@@ -319,7 +319,7 @@ pub const Connection = struct {
         var write_buf = try RingBuffer.init(allocator);
         errdefer write_buf.deinit();
 
-        const now = std.time.milliTimestamp();
+        const now = @import("stdx").time.milliTimestamp();
         return .{
             .fd = fd,
             .protocol = .unknown,
@@ -386,7 +386,7 @@ pub const Connection = struct {
     /// Record a dispatched request.
     pub fn recordRequest(self: *Connection) void {
         self.requests_total += 1;
-        self.last_active = std.time.milliTimestamp();
+        self.last_active = @import("stdx").time.milliTimestamp();
     }
 
     /// Record a forwarded request.

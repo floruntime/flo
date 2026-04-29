@@ -214,7 +214,7 @@ pub const WorkerHandler = struct {
         }
 
         // Parse process list
-        var processes: std.ArrayList(ProcessInfo) = .{};
+        var processes: std.ArrayList(ProcessInfo) = .empty;
         if (offset + 2 <= value.len) {
             const process_count = std.mem.readInt(u16, value[offset..][0..2], .little);
             offset += 2;
@@ -275,7 +275,7 @@ pub const WorkerHandler = struct {
             self.freeWorkerRecord(&old_val);
         }
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         const owned_id = self.allocator.dupe(u8, req.key) catch {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
@@ -322,7 +322,7 @@ pub const WorkerHandler = struct {
     /// Returns the worker's current status (so the SDK can detect draining).
     fn handleHeartbeat(self: *WorkerHandler, req: Request) ?WorkerStatus {
         const worker = self.workers.getPtr(req.key) orelse return null;
-        worker.last_heartbeat_ms = std.time.milliTimestamp();
+        worker.last_heartbeat_ms = @import("stdx").time.milliTimestamp();
 
         // Don't reset draining→active — drain is sticky until deregister
         if (worker.status != .draining) {
@@ -354,7 +354,7 @@ pub const WorkerHandler = struct {
 
     /// Update status of stale workers (called periodically from shard tick).
     pub fn checkHealth(self: *WorkerHandler) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr;
@@ -399,7 +399,7 @@ pub const WorkerHandler = struct {
 
     /// Update per-process stats after a run.
     fn updateProcessRun(_: *WorkerHandler, w: *WorkerRecord, name: []const u8, is_failure: bool) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("stdx").time.milliTimestamp();
         for (w.processes.items) |*p| {
             if (std.mem.eql(u8, p.name_owned, name)) {
                 if (is_failure) {

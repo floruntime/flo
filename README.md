@@ -543,7 +543,7 @@ bench/                       # Benchmarks
 
 ## Building from Source
 
-Requires [Zig 0.15.2+](https://ziglang.org/download/).
+Requires [Zig 0.16.0+](https://ziglang.org/download/).
 
 ```bash
 git clone https://github.com/floruntime/flo.git

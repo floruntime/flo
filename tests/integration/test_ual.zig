@@ -10,7 +10,7 @@ const EntryType = entry_mod.EntryType;
 const HEADER_SIZE = entry_mod.HEADER_SIZE;
 
 fn makeEntry(index: u64, payload: []const u8) Entry {
-    return entry_mod.buildEntry(.kv_put, 0, 1, index, @intCast(std.time.nanoTimestamp()), payload);
+    return entry_mod.buildEntry(.kv_put, 0, 1, index, @intCast(@import("stdx").time.nanoTimestamp()), payload);
 }
 
 test "integration: UAL append and read back" {

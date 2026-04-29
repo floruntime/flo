@@ -231,15 +231,15 @@ pub fn ObjectBuilder(comptime WriterType: type) type {
 /// Usage: printJson(ctx, allocator, my_struct, .{});
 /// Or: printJson(ctx, allocator, data, .{ .whitespace = .indent_2 });
 pub fn printJson(ctx: anytype, allocator: Allocator, value: anytype, comptime options: std.json.Stringify.Options) void {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    list.writer(allocator).print("{f}", .{std.json.fmt(value, options)}) catch |err| {
+    aw.writer.print("{f}", .{std.json.fmt(value, options)}) catch |err| {
         ctx.print("Error serializing JSON: {}\n", .{err});
         return;
     };
 
-    ctx.print("{s}\n", .{list.items});
+    ctx.print("{s}\n", .{aw.written()});
 }
 
 /// Print any value as compact JSON (no whitespace)
@@ -254,12 +254,12 @@ pub fn printPretty(ctx: anytype, allocator: Allocator, value: anytype) void {
 
 /// Serialize any value to a JSON string (caller owns returned memory)
 pub fn stringify(allocator: Allocator, value: anytype, comptime options: std.json.Stringify.Options) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
-    try list.writer(allocator).print("{f}", .{std.json.fmt(value, options)});
+    try aw.writer.print("{f}", .{std.json.fmt(value, options)});
 
-    return list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Serialize to compact JSON string
@@ -283,17 +283,17 @@ pub fn writeValue(writer: anytype, value: anytype, comptime options: std.json.St
 
 test "writeString adds quotes and escapes" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     try writeString(writer, "hello\nworld");
-    try std.testing.expectEqualStrings("\"hello\\nworld\"", fbs.getWritten());
+    try std.testing.expectEqualStrings("\"hello\\nworld\"", fbs.buffered());
 }
 
 test "ObjectBuilder builds valid JSON" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     var obj = ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -302,14 +302,14 @@ test "ObjectBuilder builds valid JSON" {
     try obj.boolField("active", true);
     try obj.end();
 
-    try std.testing.expectEqualStrings("{\"name\":\"test\",\"count\":42,\"active\":true}", fbs.getWritten());
+    try std.testing.expectEqualStrings("{\"name\":\"test\",\"count\":42,\"active\":true}", fbs.buffered());
 }
 
 test "ObjectBuilder with HashMap iteration" {
     const allocator = std.testing.allocator;
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     // Create a string->string hashmap
     var map = std.StringHashMap([]const u8).init(allocator);
@@ -323,7 +323,7 @@ test "ObjectBuilder with HashMap iteration" {
     try obj.writeStringHashMap(&map);
     try obj.end();
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     // HashMap iteration order isn't guaranteed, so check both possible orderings
     const valid1 = std.mem.eql(u8, output, "{\"key1\":\"value1\",\"key2\":\"value2\"}");
     const valid2 = std.mem.eql(u8, output, "{\"key2\":\"value2\",\"key1\":\"value1\"}");
@@ -333,8 +333,8 @@ test "ObjectBuilder with HashMap iteration" {
 test "ObjectBuilder with int HashMap" {
     const allocator = std.testing.allocator;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     var map = std.StringHashMap(u64).init(allocator);
     defer map.deinit();
@@ -347,7 +347,7 @@ test "ObjectBuilder with int HashMap" {
     try obj.writeIntHashMap(&map);
     try obj.end();
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     // Check it contains both entries (order varies)
     try std.testing.expect(std.mem.indexOf(u8, output, "\"count\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"total\":100") != null);
@@ -355,15 +355,15 @@ test "ObjectBuilder with int HashMap" {
 
 test "ArrayBuilder with string slice" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     var arr = ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
     try arr.writeStringSlice(&.{ "a", "b", "c" });
     try arr.end();
 
-    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\"]", fbs.getWritten());
+    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\"]", fbs.buffered());
 }
 
 test "stringify produces valid JSON" {
@@ -383,8 +383,8 @@ test "stringify produces valid JSON" {
 
 test "nested object and array fields" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const writer = &fbs;
 
     var obj = ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -404,6 +404,6 @@ test "nested object and array fields" {
 
     try std.testing.expectEqualStrings(
         "{\"type\":\"record\",\"metadata\":{\"version\":\"1.0\"},\"tags\":[\"important\",\"v2\"]}",
-        fbs.getWritten(),
+        fbs.buffered(),
     );
 }

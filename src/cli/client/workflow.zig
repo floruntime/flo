@@ -49,8 +49,8 @@ pub fn start(
     run_id: ?[]const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write version with length prefix
     try writer.writeInt(u16, @intCast(workflow_version.len), .little);
@@ -81,7 +81,7 @@ pub fn start(
     // Write input
     try writer.writeAll(input);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.workflow_start, namespace, workflow_name, value);
 }
 
@@ -98,8 +98,8 @@ pub fn signal(
     payload: ?[]const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write signal_type with length prefix
     try writer.writeInt(u16, @intCast(signal_type.len), .little);
@@ -110,7 +110,7 @@ pub fn signal(
         try writer.writeAll(p);
     }
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.workflow_signal, namespace, run_id, value);
 }
 
@@ -153,12 +153,12 @@ pub fn history(
     limit: u32,
 ) !Response {
     var value_buf: [8]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     try writer.writeInt(u32, limit, .little);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.workflow_history, namespace, run_id, value);
 }
 
@@ -177,8 +177,8 @@ pub fn listRuns(
     search: ?[]const u8,
 ) !Response {
     var value_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write limit
     try writer.writeInt(u32, limit, .little);
@@ -207,7 +207,7 @@ pub fn listRuns(
         try writer.writeInt(u16, 0, .little);
     }
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.workflow_list_runs, namespace, workflow_name, value);
 }
 

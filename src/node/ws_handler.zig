@@ -152,11 +152,11 @@ pub const WebSocketSession = struct {
             .state = .awaiting_upgrade,
             .handler = ws.WebSocketHandler.init(allocator),
             .rate_limit = .{},
-            .subscriptions = .{},
+            .subscriptions = .empty,
             .user_id = null,
             .namespace = "default",
             .last_ping_sent = 0,
-            .last_pong_received = std.time.milliTimestamp(),
+            .last_pong_received = @import("stdx").time.milliTimestamp(),
         };
     }
 
@@ -321,7 +321,7 @@ pub fn processData(
     return switch (frame_result.result) {
         .binary_payload => |payload| blk: {
             // Rate limit check
-            const now = std.time.milliTimestamp();
+            const now = @import("stdx").time.milliTimestamp();
             if (!session.rate_limit.check(now)) {
                 break :blk .{ .err = Error.RateLimited };
             }
@@ -350,7 +350,7 @@ pub fn processData(
         },
         .ping => |ping_data| .{ .pong = ping_data },
         .pong => blk: {
-            session.last_pong_received = std.time.milliTimestamp();
+            session.last_pong_received = @import("stdx").time.milliTimestamp();
             break :blk .{ .need_more = {} };
         },
         .close => |code| blk: {

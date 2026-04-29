@@ -130,7 +130,7 @@ pub const JwksClient = struct {
         defer self.allocator.free(body);
 
         try self.parseJwks(body);
-        self.last_fetch_ms = std.time.milliTimestamp();
+        self.last_fetch_ms = @import("stdx").time.milliTimestamp();
     }
 
     /// Parse JWKS JSON and extract signing keys (RSA and EC).
@@ -641,7 +641,7 @@ test "verifyEs256 accepts valid signature" {
     const Encoder = std.base64.url_safe_no_pad.Encoder;
 
     // Generate an ECDSA P-256 key pair and extract public key
-    const kp = EcdsaP256.KeyPair.generate();
+    const kp = EcdsaP256.KeyPair.generate(@import("stdx").io.instance());
     const sec1 = kp.public_key.toUncompressedSec1();
 
     var client = JwksClient.init(allocator, "https://example.com/jwks");
@@ -676,7 +676,7 @@ test "verifyEs256 rejects tampered signature" {
     const allocator = std.testing.allocator;
     const Encoder = std.base64.url_safe_no_pad.Encoder;
 
-    const kp = EcdsaP256.KeyPair.generate();
+    const kp = EcdsaP256.KeyPair.generate(@import("stdx").io.instance());
     const sec1 = kp.public_key.toUncompressedSec1();
 
     var client = JwksClient.init(allocator, "https://example.com/jwks");
@@ -710,7 +710,7 @@ test "verifyEs256 rejects unknown kid" {
     const allocator = std.testing.allocator;
     const Encoder = std.base64.url_safe_no_pad.Encoder;
 
-    const kp = EcdsaP256.KeyPair.generate();
+    const kp = EcdsaP256.KeyPair.generate(@import("stdx").io.instance());
     const sec1 = kp.public_key.toUncompressedSec1();
 
     var client = JwksClient.init(allocator, "https://example.com/jwks");

@@ -38,7 +38,7 @@ pub const HttpMetricsServer = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
         if (self.listener) |sock| {
-            std.posix.close(sock);
+            _ = std.c.close(sock);
             self.listener = null;
         }
     }
@@ -46,7 +46,7 @@ pub const HttpMetricsServer = struct {
     pub fn start(self: *Self) !void {
         // Create listening socket
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        errdefer std.posix.close(sock);
+        errdefer _ = std.c.close(sock);
 
         // Allow address reuse
         const one: u32 = 1;
@@ -75,7 +75,7 @@ pub const HttpMetricsServer = struct {
         if (self.listener) |sock| {
             // Shutdown first to interrupt any blocked accept()
             std.posix.shutdown(sock, .both) catch {};
-            std.posix.close(sock);
+            _ = std.c.close(sock);
             self.listener = null;
         }
 
@@ -106,7 +106,7 @@ pub const HttpMetricsServer = struct {
                 // Graceful close: use SO_LINGER to ensure send buffer is flushed
                 const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
                 std.posix.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
-                std.posix.close(client);
+                _ = std.c.close(client);
             }
 
             self.handleRequest(client) catch |err| {

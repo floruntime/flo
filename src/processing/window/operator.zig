@@ -66,7 +66,7 @@ pub const WindowOperator = struct {
             .trigger = trigger,
             .window_fn = window_fn,
             .allocator = allocator,
-            .active_windows = .{},
+            .active_windows = .empty,
         };
     }
 

@@ -41,8 +41,8 @@ pub fn register(
     _: ?[]const u8, // wasm_module_bytes - removed
 ) !Response {
     var value_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     try writer.writeByte(action_type);
     try writer.writeInt(u32, timeout_ms orelse 30_000, .little);
@@ -54,7 +54,7 @@ pub fn register(
     try writer.writeByte(0); // no trigger_stream
     try writer.writeByte(0); // no trigger_group
 
-    return client.sendRequest(.action_register, namespace, action_name, fbs.getWritten());
+    return client.sendRequest(.action_register, namespace, action_name, fbs.buffered());
 }
 
 /// Invoke an action
@@ -71,8 +71,8 @@ pub fn invoke(
     required_labels: ?[]const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write priority
     try writer.writeByte(priority orelse 10);
@@ -104,7 +104,7 @@ pub fn invoke(
     // Write input (rest of value)
     try writer.writeAll(input);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.action_invoke, namespace, action_name, value);
 }
 
@@ -155,8 +155,8 @@ pub fn workerRegister(
     labels: ?[]const u8,
 ) !Response {
     var value_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Worker type: 0 = action
     try writer.writeByte(0);
@@ -184,7 +184,7 @@ pub fn workerRegister(
     // No machine_id from CLI (server auto-generates)
     try writer.writeByte(0);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.worker_register, namespace, worker_id, value);
 }
 
@@ -202,8 +202,8 @@ pub fn workerAwait(
     _: ?u32, // max_tasks - not used
 ) !Response {
     var value_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write task_types count
     try writer.writeInt(u32, @intCast(task_types.len), .little);
@@ -214,7 +214,7 @@ pub fn workerAwait(
         try writer.writeAll(tt);
     }
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
 
     // Build options for block_ms and timeout_ms
     var options_buf: [32]u8 = undefined;
@@ -249,8 +249,8 @@ pub fn workerTouch(
     extend_ms: ?u32,
 ) !Response {
     var value_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write action_name
     try writer.writeInt(u16, @intCast(action_name.len), .little);
@@ -263,7 +263,7 @@ pub fn workerTouch(
     // Write extend_ms
     try writer.writeInt(u32, extend_ms orelse 30_000, .little);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.action_touch, namespace, worker_id, value);
 }
 
@@ -279,8 +279,8 @@ pub fn workerComplete(
     result: []const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write action_name
     try writer.writeInt(u16, @intCast(action_name.len), .little);
@@ -299,7 +299,7 @@ pub fn workerComplete(
     try writer.writeInt(u16, @intCast(result.len), .little);
     try writer.writeAll(result);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.action_complete, namespace, worker_id, value);
 }
 
@@ -316,8 +316,8 @@ pub fn workerFail(
     retry: bool,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write action_name
     try writer.writeInt(u16, @intCast(action_name.len), .little);
@@ -333,7 +333,7 @@ pub fn workerFail(
     // Write error_message
     try writer.writeAll(error_message);
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.action_fail, namespace, worker_id, value);
 }
 
@@ -347,8 +347,8 @@ pub fn workerList(
     cursor: ?[]const u8,
 ) !Response {
     var value_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&value_buf);
-    const writer = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&value_buf);
+    const writer = &fbs;
 
     // Write limit (default 100)
     try writer.writeInt(u32, limit orelse 100, .little);
@@ -358,7 +358,7 @@ pub fn workerList(
         _ = writer.write(c) catch return error.BufferOverflow;
     }
 
-    const value = fbs.getWritten();
+    const value = fbs.buffered();
     return client.sendRequest(.worker_list, namespace, "", value);
 }
 

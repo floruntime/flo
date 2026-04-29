@@ -123,15 +123,15 @@ pub const KvLookupOperator = struct {
         // Store segment index ranges temporarily (start, end) for each json_path part.
         // We'll rebase them against the final segment_storage slice after toOwnedSlice.
         const IndexRange = struct { start: usize, end: usize };
-        var parts_list: std.ArrayListUnmanaged(TemplatePart) = .{};
+        var parts_list: std.ArrayListUnmanaged(TemplatePart) = .empty;
         errdefer parts_list.deinit(allocator);
-        var ranges_list: std.ArrayListUnmanaged(IndexRange) = .{};
+        var ranges_list: std.ArrayListUnmanaged(IndexRange) = .empty;
         errdefer ranges_list.deinit(allocator);
-        var all_segments: std.ArrayListUnmanaged([]const u8) = .{};
+        var all_segments: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer all_segments.deinit(allocator);
 
         // Accumulate all json_path segment characters for bulk duplication
-        var seg_chars: std.ArrayListUnmanaged(u8) = .{};
+        var seg_chars: std.ArrayListUnmanaged(u8) = .empty;
         errdefer seg_chars.deinit(allocator);
 
         // Parse the template: split on ${...} placeholders

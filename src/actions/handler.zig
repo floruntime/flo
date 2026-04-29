@@ -72,7 +72,7 @@ pub const ActionsHandler = struct {
     runs: std.StringHashMap(RunRecord),
 
     /// Mutex protecting runs for cross-shard access.
-    runs_mu: std.Thread.Mutex = .{},
+    runs_mu: @import("stdx").Mutex = .{},
 
     /// Monotonic counter used to produce unique run IDs when shard is null (tests).
     null_shard_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -429,7 +429,7 @@ pub const ActionsHandler = struct {
             }
 
             run.status = .running;
-            run.started_at_ms = std.time.milliTimestamp();
+            run.started_at_ms = @import("stdx").time.milliTimestamp();
             run.attempt += 1;
             if (worker_id.len > 0) {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
@@ -490,7 +490,7 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
         };
 
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, std.time.milliTimestamp()))) * 1_000_000);
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
         // Parse action_type from first byte of value (client wire format)
         // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32]
@@ -555,7 +555,7 @@ pub const ActionsHandler = struct {
             // Monotonic counter so concurrent null-shard invocations (tests)
             // don't collide when called within the same millisecond.
             const seq = self.null_shard_seq.fetchAdd(1, .monotonic);
-            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ std.time.milliTimestamp(), seq }) catch "act-0";
+            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ @import("stdx").time.milliTimestamp(), seq }) catch "act-0";
         };
 
         // Duplicate for storage
@@ -585,7 +585,7 @@ pub const ActionsHandler = struct {
         // Look up max_retries from the action's registration
         const action_max_retries: u32 = if (self.actions.get(action_name)) |arec| arec.max_retries else 3;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
@@ -876,7 +876,7 @@ pub const ActionsHandler = struct {
         // Find and update the run
         if (self.runs.getPtr(task_id)) |run| {
             run.status = .completed;
-            run.completed_at_ms = std.time.milliTimestamp();
+            run.completed_at_ms = @import("stdx").time.milliTimestamp();
             // Store worker_id from req.key
             if (req.key.len > 0) {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
@@ -928,7 +928,7 @@ pub const ActionsHandler = struct {
         // Find and touch the run — reset started_at to extend the lease
         if (self.runs.getPtr(task_id)) |run| {
             if (run.status == .running) {
-                run.started_at_ms = std.time.milliTimestamp();
+                run.started_at_ms = @import("stdx").time.milliTimestamp();
                 return null; // success
             }
             return "run not in running state";
@@ -985,7 +985,7 @@ pub const ActionsHandler = struct {
                 if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "", null, run.worker_id_owned);
             } else {
                 run.status = .failed;
-                run.completed_at_ms = std.time.milliTimestamp();
+                run.completed_at_ms = @import("stdx").time.milliTimestamp();
                 if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .failed, run.completed_at_ms, "", run.started_at_ms, run.worker_id_owned);
             }
             return null; // success
@@ -1099,7 +1099,7 @@ pub const ActionsHandler = struct {
         else
             null;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // Lock around runs map mutation (cross-shard invokeByNameWithId may race).
         // We must release the lock before notifyAny because that calls
@@ -1160,7 +1160,7 @@ pub const ActionsHandler = struct {
         else
             null;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
@@ -1852,19 +1852,19 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
         .action_invoked => |i| {
             // Wire format: [run_id_len:u16][run_id][has_output:u8]
             var buf: [4096]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            const writer = fbs.writer();
+            var fbs: std.Io.Writer = .fixed(&buf);
+            const writer = &fbs;
             writer.writeInt(u16, @intCast(i.run_id.len), .little) catch return;
             writer.writeAll(i.run_id) catch return;
             writer.writeByte(0) catch return; // has_output (always false)
-            shard.sendOkResponse(conn, request_id, fbs.getWritten());
+            shard.sendOkResponse(conn, request_id, fbs.buffered());
         },
         .action_run_status => |s| {
             // Serialize run status fields into a buffer using the same wire
             // format as CommandResult.serialize (result.zig).
             var buf: [4096]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            const writer = fbs.writer();
+            var fbs: std.Io.Writer = .fixed(&buf);
+            const writer = &fbs;
             // run_id
             writer.writeInt(u32, @intCast(s.run_id.len), .little) catch return;
             writer.writeAll(s.run_id) catch return;
@@ -1904,7 +1904,7 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             }
             // retry_count
             writer.writeInt(u32, s.retry_count, .little) catch return;
-            shard.sendOkResponse(conn, request_id, fbs.getWritten());
+            shard.sendOkResponse(conn, request_id, fbs.buffered());
         },
         .action_list_result => |l| {
             shard.sendOkResponse(conn, request_id, l.data);

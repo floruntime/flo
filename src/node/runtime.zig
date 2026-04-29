@@ -254,8 +254,8 @@ pub const Runtime = struct {
         // Clean up pipes
         if (self.pipes) |pipes| {
             for (pipes) |pipe| {
-                if (pipe[0] >= 0) std.posix.close(pipe[0]);
-                if (pipe[1] >= 0) std.posix.close(pipe[1]);
+                if (pipe[0] >= 0) _ = std.c.close(pipe[0]);
+                if (pipe[1] >= 0) _ = std.c.close(pipe[1]);
             }
             self.allocator.free(pipes);
         }
@@ -330,8 +330,8 @@ pub const Runtime = struct {
         var pipes_created: usize = 0;
         errdefer {
             for (0..pipes_created) |i| {
-                std.posix.close(pipes[i][0]);
-                std.posix.close(pipes[i][1]);
+                _ = std.c.close(pipes[i][0]);
+                _ = std.c.close(pipes[i][1]);
             }
             self.allocator.free(pipes);
             self.pipes = null;
@@ -340,7 +340,13 @@ pub const Runtime = struct {
         for (0..self.shard_count) |i| {
             // Non-blocking read end so shard's acceptFromPipe drain loop
             // returns WouldBlock instead of blocking when pipe is empty.
-            const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
+            var fds: [2]std.posix.fd_t = undefined;
+            if (std.c.pipe(&fds) != 0) return error.SystemResources;
+            // Mark both ends non-blocking via fcntl.
+            const F = std.posix.F;
+            const O = std.posix.O;
+            const r_flags = std.c.fcntl(fds[0], F.GETFL, @as(c_int, 0));
+            _ = std.c.fcntl(fds[0], F.SETFL, r_flags | @as(c_int, @bitCast(O{ .NONBLOCK = true })));
             pipes[i] = .{ fds[0], fds[1] };
             pipes_created += 1;
         }
@@ -460,7 +466,7 @@ pub const Runtime = struct {
                 var attempt: usize = 0;
                 while (attempt < 30) : (attempt += 1) {
                     rn.connectToPeer("127.0.0.1", seed_port) catch {
-                        std.Thread.sleep(200 * std.time.ns_per_ms);
+                        @import("stdx").time.sleep(200 * std.time.ns_per_ms);
                         continue;
                     };
                     break;
@@ -742,7 +748,7 @@ fn acceptorThread(acc: *Acceptor) void {
     while (acc.running.load(.acquire)) {
         _ = acc.acceptOne() catch {};
         // Small yield to avoid busy-spin when no connections pending
-        std.Thread.sleep(100_000); // 100μs
+        @import("stdx").time.sleep(100_000); // 100μs
     }
 }
 
@@ -808,7 +814,7 @@ test "Runtime: boot 2 shards and shutdown" {
     try std.testing.expectEqual(@as(usize, 2), runtime.shards.?.len);
 
     // Let it run briefly
-    std.Thread.sleep(10_000_000); // 10ms
+    @import("stdx").time.sleep(10_000_000); // 10ms
 
     runtime.stop();
     try std.testing.expect(!runtime.started);

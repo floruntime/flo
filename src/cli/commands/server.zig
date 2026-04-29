@@ -139,7 +139,7 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 
 fn setupSignalHandlers() void {
     const handler = struct {
-        fn handle(_: c_int) callconv(.c) void {
+        fn handle(_: std.c.SIG) callconv(.c) void {
             shutdown_requested.store(true, .release);
         }
     }.handle;
@@ -164,7 +164,7 @@ fn setupSignalHandlers() void {
 
     // DEBUG: Add handlers for crash signals to see what kills the process
     const crash_handler = struct {
-        fn handle(sig: c_int) callconv(.c) noreturn {
+        fn handle(sig: std.c.SIG) callconv(.c) noreturn {
             const pid = std.c.getpid();
             const sig_name = switch (sig) {
                 std.posix.SIG.SEGV => "SIGSEGV",
@@ -175,17 +175,17 @@ fn setupSignalHandlers() void {
                 std.posix.SIG.HUP => "SIGHUP",
                 else => "UNKNOWN",
             };
-            std.debug.print("\n=== CRASH SIGNAL {s} (sig={d}) received by PID {d} ===\n", .{ sig_name, sig, pid });
+            std.debug.print("\n=== CRASH SIGNAL {s} (sig={d}) received by PID {d} ===\n", .{ sig_name, @intFromEnum(sig), pid });
             // Re-raise the signal to get core dump/default behavior
             const default_act = std.posix.Sigaction{
                 .handler = .{ .handler = std.posix.SIG.DFL },
                 .mask = std.posix.sigemptyset(),
                 .flags = 0,
             };
-            std.posix.sigaction(@intCast(sig), &default_act, null);
-            _ = std.posix.raise(@intCast(sig)) catch {};
+            std.posix.sigaction(sig, &default_act, null);
+            _ = std.posix.raise(sig) catch {};
             // If raise failed, just exit
-            std.posix.exit(128 + @as(u8, @intCast(sig)));
+            std.c.exit(@as(c_int, @intCast(128 + @intFromEnum(sig))));
         }
     }.handle;
 
@@ -206,7 +206,7 @@ fn setupSignalHandlers() void {
 /// Expand ~ to home directory in path
 fn expandTilde(allocator: Allocator, path: []const u8) ![]const u8 {
     if (path.len > 0 and path[0] == '~') {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const home = @import("stdx").io.getenv("HOME") orelse return error.NoHomeDirectory;
         if (path.len == 1) {
             return try allocator.dupe(u8, home);
         }
@@ -229,15 +229,15 @@ fn writePidFile(data_dir: []const u8) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pid_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ data_dir, PID_FILENAME }) catch return error.PathTooLong;
 
-    const file = std.fs.cwd().createFile(pid_path, .{}) catch |err| {
+    const file = @import("stdx").fs.createFile(pid_path, .{}) catch |err| {
         std.log.err("Failed to create PID file: {}", .{err});
         return err;
     };
-    defer file.close();
+    defer @import("stdx").fs.closeFile(file);
 
     var buf: [20]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch return error.InvalidPid;
-    file.writeAll(pid_str) catch |err| {
+    @import("stdx").fs.writeAll(file, pid_str) catch |err| {
         std.log.err("Failed to write PID file: {}", .{err});
         return err;
     };
@@ -247,29 +247,29 @@ fn readPidFile(allocator: Allocator, data_dir: []const u8) !?posix.pid_t {
     const pid_path = try getPidFilePath(allocator, data_dir);
     defer allocator.free(pid_path);
 
-    const file = std.fs.cwd().openFile(pid_path, .{}) catch |err| {
+    const file = @import("stdx").fs.openFile(pid_path, .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
-    defer file.close();
+    defer @import("stdx").fs.closeFile(file);
 
     var buf: [20]u8 = undefined;
-    const len = file.readAll(&buf) catch return null;
+    const len = @import("stdx").fs.readAll(file, &buf) catch return null;
     if (len == 0) return null;
 
-    const pid_str = std.mem.trimRight(u8, buf[0..len], &[_]u8{ '\n', '\r', ' ' });
+    const pid_str = std.mem.trimEnd(u8, buf[0..len], &[_]u8{ '\n', '\r', ' ' });
     return std.fmt.parseInt(posix.pid_t, pid_str, 10) catch null;
 }
 
 fn removePidFile(data_dir: []const u8) void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pid_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ data_dir, PID_FILENAME }) catch return;
-    std.fs.cwd().deleteFile(pid_path) catch {};
+    @import("stdx").fs.deleteFile(pid_path) catch {};
 }
 
 fn isProcessRunning(pid: posix.pid_t) bool {
     // Send signal 0 to check if process exists
-    posix.kill(pid, 0) catch |err| {
+    posix.kill(pid, @enumFromInt(0)) catch |err| {
         // ESRCH means process doesn't exist
         return err != error.NoSuchProcess;
     };
@@ -433,7 +433,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     ctx.print("\n", .{});
 
     // Ensure data directory exists
-    std.fs.cwd().makePath(expanded_data_dir) catch |err| {
+    @import("stdx").fs.makePath(expanded_data_dir) catch |err| {
         if (err != error.PathAlreadyExists) {
             ctx.printErr("Error creating data directory '{s}': {}\n", .{ expanded_data_dir, err });
             return error.CommandFailed;
@@ -476,7 +476,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 
     // Wait for shutdown signal
     while (!shutdown_requested.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        @import("stdx").time.sleep(100 * std.time.ns_per_ms);
     }
 
     ctx.print("\nShutting down...\n", .{});
@@ -523,7 +523,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
     }
 
     // Send signal to stop server
-    const sig: u6 = if (force) posix.SIG.KILL else posix.SIG.TERM;
+    const sig: std.c.SIG = if (force) posix.SIG.KILL else posix.SIG.TERM;
     const sig_name: []const u8 = if (force) "SIGKILL" else "SIGTERM";
 
     ctx.print("Sending {s} to server (PID {d})...\n", .{ sig_name, server_pid });
@@ -538,7 +538,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
         ctx.print("Waiting for server to stop...\n", .{});
         var waited: u32 = 0;
         while (waited < 300) : (waited += 1) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            @import("stdx").time.sleep(100 * std.time.ns_per_ms);
             if (!isProcessRunning(server_pid)) {
                 ctx.print("Server stopped.\n", .{});
                 return;
@@ -590,10 +590,10 @@ fn runServerStatus(ctx: *commander.Context) commander.Error!void {
         };
         defer allocator.free(manifest_path);
 
-        if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
-            defer file.close();
+        if (@import("stdx").fs.openFile(manifest_path, .{})) |file| {
+            defer @import("stdx").fs.closeFile(file);
             var buf: [256]u8 = undefined;
-            const bytes_read = file.readAll(&buf) catch 0;
+            const bytes_read = @import("stdx").fs.readAll(file, &buf) catch 0;
             if (bytes_read > 0) {
                 // Simple parse for shard_count - look for "shard_count":
                 const content = buf[0..bytes_read];
@@ -637,12 +637,12 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     ctx.print("Fetching metrics from {s}:{d}...\n", .{ resolved_host, port });
 
     // Make HTTP request to /metrics endpoint
-    const address = std.net.Address.parseIp4(resolved_host, port) catch {
+    const address = @import("stdx").net.Address.parseIp4(resolved_host, port) catch {
         ctx.printErr("Error: Invalid address: {s}\n", .{resolved_host});
         return error.CommandFailed;
     };
 
-    const stream = std.net.tcpConnectToAddress(address) catch |err| {
+    const stream = @import("stdx").net.tcpConnectToAddress(address) catch |err| {
         ctx.printErr("Connection failed: {}\n", .{err});
         ctx.printErr("Is the Flo metrics server running at {s}:{d}?\n", .{ resolved_host, port });
         return error.CommandFailed;
@@ -711,7 +711,7 @@ fn runBootstrap(ctx: *commander.Context) commander.Error!void {
     defer allocator.free(data_dir);
 
     // Ensure data directory exists
-    std.fs.cwd().makePath(data_dir) catch |err| {
+    @import("stdx").fs.makePath(data_dir) catch |err| {
         ctx.printErr("Error creating data directory: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -723,7 +723,7 @@ fn runBootstrap(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    if (std.fs.cwd().access(marker_path, .{})) |_| {
+    if (@import("stdx").fs.access(marker_path, .{})) |_| {
         ctx.printErr("Error: server already bootstrapped\n", .{});
         ctx.printErr("  Marker file: {s}\n", .{marker_path});
         ctx.printErr("  Bootstrap can only be performed once.\n", .{});
@@ -756,11 +756,11 @@ fn runBootstrap(ctx: *commander.Context) commander.Error!void {
     };
     defer allocator.free(keys_list);
 
-    const marker_file = std.fs.cwd().createFile(marker_path, .{ .exclusive = true }) catch |err| {
+    const marker_file = @import("stdx").fs.createFile(marker_path, .{ .exclusive = true }) catch |err| {
         ctx.printErr("Error creating bootstrap marker: {}\n", .{err});
         return error.CommandFailed;
     };
-    defer marker_file.close();
+    defer @import("stdx").fs.closeFile(marker_file);
 
     // Write serialized key + signing secret
     if (keys_list.len > 0) {
@@ -769,12 +769,12 @@ fn runBootstrap(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error serializing key\n", .{});
             return error.CommandFailed;
         };
-        marker_file.writeAll(key_data) catch |err| {
+        @import("stdx").fs.writeAll(marker_file, key_data) catch |err| {
             ctx.printErr("Error writing bootstrap data: {}\n", .{err});
             return error.CommandFailed;
         };
     }
-    marker_file.writeAll(signing_secret) catch |err| {
+    @import("stdx").fs.writeAll(marker_file, signing_secret) catch |err| {
         ctx.printErr("Error writing signing secret: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -788,16 +788,16 @@ fn runBootstrap(ctx: *commander.Context) commander.Error!void {
             };
             defer allocator.free(expanded);
 
-            const out_file = std.fs.cwd().createFile(expanded, .{ .exclusive = true }) catch |err| {
+            const out_file = @import("stdx").fs.createFile(expanded, .{ .exclusive = true }) catch |err| {
                 ctx.printErr("Error creating output file '{s}': {}\n", .{ expanded, err });
                 return error.CommandFailed;
             };
-            defer out_file.close();
-            out_file.writeAll(root_key) catch |err| {
+            defer @import("stdx").fs.closeFile(out_file);
+            @import("stdx").fs.writeAll(out_file, root_key) catch |err| {
                 ctx.printErr("Error writing key: {}\n", .{err});
                 return error.CommandFailed;
             };
-            out_file.writeAll("\n") catch {};
+            @import("stdx").fs.writeAll(out_file, "\n") catch {};
 
             ctx.print("Bootstrap complete.\n", .{});
             ctx.print("  Root key written to: {s}\n", .{expanded});

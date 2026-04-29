@@ -6,6 +6,25 @@ const std = @import("std");
 /// Usage: stdx.log.info("Server starting on port {d}", .{9000});
 pub const log = @import("log.zig");
 
+/// Process-wide `std.Io` facade — see `io.zig`.
+pub const io = @import("io.zig");
+
+/// Wall-clock time helpers (replacement for `std.time.nanoTimestamp` etc).
+pub const time = @import("time.zig");
+
+/// File system shim — wraps `std.Io.Dir`/`File` so call sites don't need
+/// to thread `Io` through their signatures. Boundary code only.
+pub const fs = @import("fs.zig");
+
+/// Synchronous TCP networking shim — replaces removed `std.net` for the
+/// CLI client and other boundary code.
+pub const net = @import("net.zig");
+
+/// Sync primitives shim — `@import("stdx").Mutex` was removed in 0.16.
+pub const sync = @import("sync.zig");
+pub const process = @import("process.zig");
+pub const Mutex = sync.Mutex;
+
 pub const testing = @import("testing/e2e/mod.zig");
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.

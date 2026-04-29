@@ -65,7 +65,7 @@ pub const FileBackend = struct {
 
         // Create base directory if requested
         if (file_config.create_dirs) {
-            std.fs.cwd().makePath(base_path) catch |err| {
+            @import("stdx").fs.makePath(base_path) catch |err| {
                 // Ignore if already exists
                 if (err != error.PathAlreadyExists) {
                     allocator.free(base_path);
@@ -109,7 +109,7 @@ pub const FileBackend = struct {
     /// Ensure parent directory exists
     fn ensureParentDir(full_path: []const u8) BackendError!void {
         if (std.fs.path.dirname(full_path)) |dir| {
-            std.fs.cwd().makePath(dir) catch |err| {
+            @import("stdx").fs.makePath(dir) catch |err| {
                 if (err != error.PathAlreadyExists) {
                     return error.IoError;
                 }
@@ -150,10 +150,10 @@ pub const FileBackend = struct {
         }
 
         // Write to temp file first (atomic write pattern)
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch {
+        const file = @import("stdx").fs.createFile(tmp_path, .{}) catch {
             return error.IoError;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
         // Stream data in chunks - memory bounded
         var chunk_buf: [DEFAULT_CHUNK_SIZE]u8 = undefined;
@@ -161,23 +161,23 @@ pub const FileBackend = struct {
             const n = try source.read(&chunk_buf);
             if (n == 0) break;
 
-            file.writeAll(chunk_buf[0..n]) catch {
-                std.fs.cwd().deleteFile(tmp_path) catch {};
+            @import("stdx").fs.writeAll(file, chunk_buf[0..n]) catch {
+                @import("stdx").fs.deleteFile(tmp_path) catch {};
                 return error.IoError;
             };
         }
 
         // Sync to disk if configured
         if (self.cfg.sync_on_write) {
-            file.sync() catch {
-                std.fs.cwd().deleteFile(tmp_path) catch {};
+            @import("stdx").fs.sync(file) catch {
+                @import("stdx").fs.deleteFile(tmp_path) catch {};
                 return error.IoError;
             };
         }
 
         // Atomic rename to final path
-        std.fs.cwd().rename(tmp_path, full_path) catch {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        @import("stdx").fs.rename(tmp_path, full_path) catch {
+            @import("stdx").fs.deleteFile(tmp_path) catch {};
             return error.IoError;
         };
     }
@@ -190,19 +190,19 @@ pub const FileBackend = struct {
         var path_buf: [MAX_PATH_LEN]u8 = undefined;
         const full_path = try self.buildPath(key, &path_buf);
 
-        const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(full_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => error.ObjectNotFound,
                 error.AccessDenied => error.AccessDenied,
                 else => error.IoError,
             };
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
         // Stream data in chunks - memory bounded
         var chunk_buf: [DEFAULT_CHUNK_SIZE]u8 = undefined;
         while (true) {
-            const n = file.read(&chunk_buf) catch {
+            const n = @import("stdx").fs.readBytes(file, &chunk_buf) catch {
                 return error.IoError;
             };
             if (n == 0) break;
@@ -226,28 +226,28 @@ pub const FileBackend = struct {
         }
 
         // Write to temp file first (atomic write pattern)
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch {
+        const file = @import("stdx").fs.createFile(tmp_path, .{}) catch {
             return error.IoError;
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
-        file.writeAll(data) catch {
+        @import("stdx").fs.writeAll(file, data) catch {
             // Clean up temp file on error
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+            @import("stdx").fs.deleteFile(tmp_path) catch {};
             return error.IoError;
         };
 
         // Sync to disk if configured
         if (self.cfg.sync_on_write) {
-            file.sync() catch {
-                std.fs.cwd().deleteFile(tmp_path) catch {};
+            @import("stdx").fs.sync(file) catch {
+                @import("stdx").fs.deleteFile(tmp_path) catch {};
                 return error.IoError;
             };
         }
 
         // Atomic rename to final path
-        std.fs.cwd().rename(tmp_path, full_path) catch {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        @import("stdx").fs.rename(tmp_path, full_path) catch {
+            @import("stdx").fs.deleteFile(tmp_path) catch {};
             return error.IoError;
         };
     }
@@ -258,17 +258,17 @@ pub const FileBackend = struct {
         var path_buf: [MAX_PATH_LEN]u8 = undefined;
         const full_path = try self.buildPath(key, &path_buf);
 
-        const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
+        const file = @import("stdx").fs.openFile(full_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => error.ObjectNotFound,
                 error.AccessDenied => error.AccessDenied,
                 else => error.IoError,
             };
         };
-        defer file.close();
+        defer @import("stdx").fs.closeFile(file);
 
         // Get file size to check buffer
-        const stat = file.stat() catch {
+        const stat = @import("stdx").fs.statHandle(file) catch {
             return error.IoError;
         };
 
@@ -276,7 +276,7 @@ pub const FileBackend = struct {
             return error.BufferTooSmall;
         }
 
-        const bytes_read = file.readAll(buffer) catch {
+        const bytes_read = @import("stdx").fs.readAll(file, buffer) catch {
             return error.IoError;
         };
 
@@ -289,7 +289,7 @@ pub const FileBackend = struct {
         var path_buf: [MAX_PATH_LEN]u8 = undefined;
         const full_path = try self.buildPath(key, &path_buf);
 
-        std.fs.cwd().access(full_path, .{}) catch |err| {
+        @import("stdx").fs.access(full_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => false,
                 else => error.IoError,
@@ -305,7 +305,7 @@ pub const FileBackend = struct {
         var path_buf: [MAX_PATH_LEN]u8 = undefined;
         const full_path = try self.buildPath(key, &path_buf);
 
-        std.fs.cwd().deleteFile(full_path) catch |err| {
+        @import("stdx").fs.deleteFile(full_path) catch |err| {
             return switch (err) {
                 error.FileNotFound => error.ObjectNotFound,
                 error.AccessDenied => error.AccessDenied,
@@ -329,7 +329,7 @@ pub const FileBackend = struct {
 
         if (prefix_ends_with_slash) {
             // "flash/" -> list all files in flash/ directory
-            dir_path = std.mem.trimRight(u8, search_path, "/");
+            dir_path = std.mem.trimEnd(u8, search_path, "/");
             file_prefix = "";
         } else {
             // "flash/segment-" -> list files in flash/ starting with "segment-"
@@ -346,18 +346,18 @@ pub const FileBackend = struct {
         }
 
         // Open directory
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
+        var dir = @import("stdx").fs.openDir(dir_path, .{ .iterate = true }) catch |err| {
             return switch (err) {
                 error.FileNotFound => (allocator.alloc(ObjectInfo, 0) catch return error.OutOfMemory),
                 error.NotDir => (allocator.alloc(ObjectInfo, 0) catch return error.OutOfMemory),
                 else => error.IoError,
             };
         };
-        defer dir.close();
+        defer @import("stdx").fs.closeDir(dir);
 
         // Iterate and collect matching entries
         var iter = dir.iterate();
-        while (iter.next() catch return error.IoError) |entry| {
+        while (iter.next(@import("stdx").io.instance()) catch return error.IoError) |entry| {
             // Skip directories, only list files
             if (entry.kind == .directory) continue;
 
@@ -368,7 +368,7 @@ pub const FileBackend = struct {
 
             // Build the full key (relative to base_path)
             var key_buf: [MAX_PATH_LEN]u8 = undefined;
-            const relative_dir = std.mem.trimLeft(u8, dir_path[self.base_path.len..], "/");
+            const relative_dir = std.mem.trimStart(u8, dir_path[self.base_path.len..], "/");
             const key = if (relative_dir.len > 0)
                 std.fmt.bufPrint(&key_buf, "{s}/{s}", .{ relative_dir, entry.name }) catch continue
             else
@@ -378,7 +378,7 @@ pub const FileBackend = struct {
             var full_file_path_buf: [MAX_PATH_LEN]u8 = undefined;
             const full_file_path = std.fmt.bufPrint(&full_file_path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
 
-            const stat = std.fs.cwd().statFile(full_file_path) catch continue;
+            const stat = @import("stdx").fs.statFile(full_file_path, .{}) catch continue;
 
             const key_dupe = allocator.dupe(u8, key) catch return error.OutOfMemory;
             errdefer allocator.free(key_dupe);
@@ -386,7 +386,7 @@ pub const FileBackend = struct {
             results.append(allocator, .{
                 .key = key_dupe,
                 .size = stat.size,
-                .last_modified = @intCast(@divFloor(stat.mtime, std.time.ns_per_ms)),
+                .last_modified = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms)),
             }) catch return error.OutOfMemory;
         }
 
@@ -399,7 +399,7 @@ pub const FileBackend = struct {
         var path_buf: [MAX_PATH_LEN]u8 = undefined;
         const full_path = try self.buildPath(key, &path_buf);
 
-        const stat = std.fs.cwd().statFile(full_path) catch |err| {
+        const stat = @import("stdx").fs.statFile(full_path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => null,
                 else => error.IoError,
@@ -408,7 +408,7 @@ pub const FileBackend = struct {
 
         return ObjectMetadata{
             .size = stat.size,
-            .last_modified = @intCast(@divFloor(stat.mtime, std.time.ns_per_ms)),
+            .last_modified = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms)),
         };
     }
 
@@ -436,8 +436,8 @@ test "FileBackend: upload and download round-trip" {
     const allocator = testing.allocator;
 
     // Clean up test directory
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend",
@@ -460,8 +460,8 @@ test "FileBackend: upload and download round-trip" {
 test "FileBackend: exists" {
     const allocator = testing.allocator;
 
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_exists") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_exists") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_exists") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_exists") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend_exists",
@@ -486,8 +486,8 @@ test "FileBackend: exists" {
 test "FileBackend: delete" {
     const allocator = testing.allocator;
 
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_delete") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_delete") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_delete") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_delete") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend_delete",
@@ -513,8 +513,8 @@ test "FileBackend: delete" {
 test "FileBackend: head metadata" {
     const allocator = testing.allocator;
 
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_head") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_head") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_head") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_head") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend_head",
@@ -540,8 +540,8 @@ test "FileBackend: head metadata" {
 test "FileBackend: streaming upload and download" {
     const allocator = testing.allocator;
 
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_stream") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_stream") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_stream") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_stream") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend_stream",
@@ -569,8 +569,8 @@ test "FileBackend: streaming upload and download" {
 test "FileBackend: list objects" {
     const allocator = testing.allocator;
 
-    std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_list") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_cold_file_backend_list") catch {};
+    @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_list") catch {};
+    defer @import("stdx").fs.deleteTree("/tmp/test_cold_file_backend_list") catch {};
 
     var fb = try FileBackend.init(allocator, .{
         .base_path = "/tmp/test_cold_file_backend_list",

@@ -173,7 +173,7 @@ pub const WebSocketHandler = struct {
         return .{
             .allocator = allocator,
             .state = .ready,
-            .fragment_buffer = .{},
+            .fragment_buffer = .empty,
             .fragment_opcode = null,
         };
     }

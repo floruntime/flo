@@ -29,6 +29,39 @@ const TIMEOUT_SENTINEL: u64 = std.math.maxInt(u64);
 /// CQEs with this flag set in user_data are filtered out — not real poll events.
 const INTERNAL_FLAG: u64 = 1 << 63;
 
+// ───── Compatibility wrappers (Zig 0.16: posix.k* functions removed) ─────
+
+const KEventError = error{ Interrupted, Unexpected, SystemResources };
+
+inline fn kqueueCreate() KEventError!i32 {
+    const fd = std.c.kqueue();
+    if (fd < 0) return error.SystemResources;
+    return fd;
+}
+
+inline fn keventCall(
+    kq: i32,
+    changes: []const posix.Kevent,
+    events: []posix.Kevent,
+    timeout: ?*const posix.timespec,
+) KEventError!usize {
+    const rc = std.c.kevent(
+        kq,
+        changes.ptr,
+        @intCast(changes.len),
+        events.ptr,
+        @intCast(events.len),
+        timeout,
+    );
+    if (rc < 0) {
+        return switch (std.posix.errno(@as(c_int, -1))) {
+            .INTR => error.Interrupted,
+            else => error.Unexpected,
+        };
+    }
+    return @intCast(rc);
+}
+
 /// Tags for event source identification.
 /// Each registered fd carries a tag so the shard loop can dispatch correctly.
 pub const Tag = enum(u8) {
@@ -108,7 +141,7 @@ pub const Reactor = struct {
 
     pub fn init(allocator: Allocator) !Self {
         if (comptime is_bsd) {
-            const kq = try posix.kqueue();
+            const kq = try kqueueCreate();
             return .{
                 .poll_fd = kq,
                 .allocator = allocator,
@@ -139,14 +172,14 @@ pub const Reactor = struct {
             // Close all timerfd file descriptors
             var it = self.timer_fds.valueIterator();
             while (it.next()) |tfd_ptr| {
-                posix.close(tfd_ptr.*);
+                _ = std.c.close(tfd_ptr.*);
             }
             self.timer_fds.deinit();
             self.ring.deinit();
         }
         self.sources.deinit();
         if (comptime is_bsd) {
-            posix.close(self.poll_fd);
+            _ = std.c.close(self.poll_fd);
         }
     }
 
@@ -189,7 +222,7 @@ pub const Reactor = struct {
                 if (comptime is_bsd) {
                     var changelist: [1]posix.Kevent = undefined;
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
-                    _ = try posix.kevent(self.poll_fd, &changelist, &.{}, null);
+                    _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
                     const mask = linux.POLL.IN | linux.POLL.OUT;
                     const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
@@ -208,7 +241,7 @@ pub const Reactor = struct {
                 if (comptime is_bsd) {
                     var changelist: [1]posix.Kevent = undefined;
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0);
-                    _ = try posix.kevent(self.poll_fd, &changelist, &.{}, null);
+                    _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
                     const mask = if (source.interests.readable) linux.POLL.IN else @as(u32, 0);
                     if (mask == 0) {
@@ -239,10 +272,10 @@ pub const Reactor = struct {
                 .data = @intCast(interval_ms),
                 .udata = ident,
             };
-            _ = try posix.kevent(self.poll_fd, &changelist, &.{}, null);
+            _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
         } else if (comptime is_linux) {
             const tfd = try posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
-            errdefer posix.close(tfd);
+            errdefer _ = std.c.close(tfd);
 
             // Convert interval_ms to itimerspec (repeating timer)
             const secs: i64 = @intCast(interval_ms / 1000);
@@ -310,7 +343,7 @@ pub const Reactor = struct {
         }
 
         if (nchanges > 0) {
-            _ = try posix.kevent(self.poll_fd, changelist[0..nchanges], &.{}, null);
+            _ = try keventCall(self.poll_fd, changelist[0..nchanges], &.{}, null);
         }
     }
 
@@ -318,7 +351,7 @@ pub const Reactor = struct {
         var changelist: [2]posix.Kevent = undefined;
         changelist[0] = makeKevent(fd, posix.system.EVFILT.READ, posix.system.EV.DELETE, 0);
         changelist[1] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0);
-        _ = posix.kevent(self.poll_fd, &changelist, &.{}, null) catch {};
+        _ = keventCall(self.poll_fd, &changelist, &.{}, null) catch {};
     }
 
     fn kqueueModifyInterests(self: *Self, fd: i32, interests: Interests, source: *EventSource) !void {
@@ -342,7 +375,7 @@ pub const Reactor = struct {
         }
 
         if (nchanges > 0) {
-            _ = try posix.kevent(self.poll_fd, changelist[0..nchanges], &.{}, null);
+            _ = try keventCall(self.poll_fd, changelist[0..nchanges], &.{}, null);
         }
     }
 
@@ -352,7 +385,7 @@ pub const Reactor = struct {
             .nsec = @intCast((@as(u64, ms) % 1000) * 1_000_000),
         } else null;
 
-        const nready = posix.kevent(
+        const nready = keventCall(
             self.poll_fd,
             &.{}, // no changes
             &self.kqueue_buf,
@@ -544,10 +577,10 @@ test "Reactor: register pipe fd, verify callback fires" {
     const allocator = std.testing.allocator;
 
     // Create a pipe
-    const pipe = try posix.pipe();
+    const pipe = try @import("stdx").io.pipe();
     defer {
-        posix.close(pipe[0]);
-        posix.close(pipe[1]);
+        _ = std.c.close(pipe[0]);
+        _ = std.c.close(pipe[1]);
     }
 
     var reactor = try Reactor.init(allocator);
@@ -562,7 +595,7 @@ test "Reactor: register pipe fd, verify callback fires" {
     });
 
     // Write a byte to make the pipe readable
-    _ = try posix.write(pipe[1], "X");
+    _ = std.c.write(pipe[1], "X", 1);
 
     // Poll — should fire
     const events = try reactor.poll(100);
@@ -588,7 +621,7 @@ test "Reactor: timer fires" {
     try reactor.addTimer(99, 10);
 
     // Sleep a bit then poll
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    @import("stdx").time.sleep(20 * std.time.ns_per_ms);
 
     const events = try reactor.poll(50);
     var timer_fired = false;
@@ -603,10 +636,10 @@ test "Reactor: timer fires" {
 test "Reactor: add and remove source" {
     const allocator = std.testing.allocator;
 
-    const pipe = try posix.pipe();
+    const pipe = try @import("stdx").io.pipe();
     defer {
-        posix.close(pipe[0]);
-        posix.close(pipe[1]);
+        _ = std.c.close(pipe[0]);
+        _ = std.c.close(pipe[1]);
     }
 
     var reactor = try Reactor.init(allocator);
@@ -629,10 +662,10 @@ test "Reactor: add and remove source" {
 test "Reactor: arm and disarm writable" {
     const allocator = std.testing.allocator;
 
-    const pipe = try posix.pipe();
+    const pipe = try @import("stdx").io.pipe();
     defer {
-        posix.close(pipe[0]);
-        posix.close(pipe[1]);
+        _ = std.c.close(pipe[0]);
+        _ = std.c.close(pipe[1]);
     }
 
     var reactor = try Reactor.init(allocator);
