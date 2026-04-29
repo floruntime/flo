@@ -602,7 +602,16 @@ pub const KVHandler = struct {
         };
         defer shard.kv_handler.*.allocator.free(result_bytes);
 
-        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = result_bytes, .version = entry.version } });
+        // Wire format: [version:u64 LE][result_bytes] — clients receive the
+        // document version alongside the extracted JSON sub-value.
+        const out = shard.kv_handler.*.allocator.alloc(u8, 8 + result_bytes.len) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "out of memory" } });
+            return;
+        };
+        defer shard.kv_handler.*.allocator.free(out);
+        std.mem.writeInt(u64, out[0..8], entry.version, .little);
+        if (result_bytes.len > 0) @memcpy(out[8..], result_bytes);
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_scan_result = .{ .data = out } });
     }
 
     /// JSON.SET — set the JSON value at `path` (read-modify-write through Raft).
@@ -1724,7 +1733,17 @@ pub const KVHandler = struct {
         };
 
         // Stash the allocation so freeResult() can free it.
-        return .{ .kv_scan_result = .{ .data = result_bytes } };
+        // Wire format: [version:u64 LE][result_bytes] — gives clients the
+        // document version for CAS/causality, same shape as the RESP-style
+        // version-prefixed envelope used by GET.
+        const out = self.allocator.alloc(u8, 8 + result_bytes.len) catch {
+            self.allocator.free(result_bytes);
+            return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
+        };
+        std.mem.writeInt(u64, out[0..8], entry.version, .little);
+        if (result_bytes.len > 0) @memcpy(out[8..], result_bytes);
+        self.allocator.free(result_bytes);
+        return .{ .kv_scan_result = .{ .data = out } };
     }
 
     /// Direct JSON.SET — value layout: [path_len:u16][path][json].
@@ -1805,7 +1824,8 @@ pub const KVHandler = struct {
         const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         self.kv.put(qkey, merged, lsn, 0, timestamp, 0) catch
             return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
-        return .ok;
+        const new_version = if (self.kv.get(qkey)) |new_entry| new_entry.version else 1;
+        return .{ .kv_put_ok = .{ .version = new_version } };
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
