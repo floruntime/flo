@@ -1577,3 +1577,200 @@ test "e2e/kv/cluster: mget after node failure" {
     try testing.expect(std.mem.indexOf(u8, result, "survives_a") != null);
     try testing.expect(std.mem.indexOf(u8, result, "survives_b") != null);
 }
+
+// =============================================================================
+// New KV Operations: INCR / TOUCH / PERSIST / EXISTS / JSON.*
+// Drives the CLI binary against a live server (CLI → TCP → handler → projection).
+// =============================================================================
+
+test "e2e/kv: incr creates and increments counter" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // First incr creates the counter at 1.
+    const v1 = try ctx.execCapture(&.{ "kv", "incr", "counter" });
+    try testing.expect(std.mem.indexOf(u8, v1, "1") != null);
+
+    // Default delta is +1.
+    const v2 = try ctx.execCapture(&.{ "kv", "incr", "counter" });
+    try testing.expect(std.mem.indexOf(u8, v2, "2") != null);
+
+    // --by adds an explicit delta.
+    const v3 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--by", "40" });
+    try testing.expect(std.mem.indexOf(u8, v3, "42") != null);
+
+    // Negative delta decrements.
+    const v4 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--by", "-2" });
+    try testing.expect(std.mem.indexOf(u8, v4, "40") != null);
+}
+
+test "e2e/kv: incr rejects non-counter values" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // SET a string value, then INCR should fail.
+    try ctx.exec(&.{ "kv", "set", "not_a_counter", "hello" });
+
+    var result = try ctx.cli.run(&.{ "kv", "incr", "not_a_counter" });
+    defer result.deinit();
+    try stdx.testing.assertFailed(result);
+}
+
+test "e2e/kv: exists returns 1 for existing, 0 for missing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "present", "yes" });
+
+    // Present key → exit 0, stdout "1".
+    var ok = try ctx.cli.run(&.{ "kv", "exists", "present" });
+    defer ok.deinit();
+    try stdx.testing.assertSucceeded(ok);
+    try stdx.testing.assertStdoutContains(ok, "1");
+
+    // Missing key → exit 1, stdout "0".
+    var missing = try ctx.cli.run(&.{ "kv", "exists", "absent" });
+    defer missing.deinit();
+    try stdx.testing.assertFailed(missing);
+    try stdx.testing.assertStdoutContains(missing, "0");
+}
+
+test "e2e/kv: touch sets ttl, persist clears it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "session", "active" });
+
+    // touch with --ttl 3600 (server-side; we don't sleep — just verify ack).
+    var touch_ok = try ctx.cli.run(&.{ "kv", "touch", "session", "--ttl", "3600" });
+    defer touch_ok.deinit();
+    try stdx.testing.assertSucceeded(touch_ok);
+    try stdx.testing.assertStdoutContains(touch_ok, "OK");
+
+    // persist removes the TTL.
+    var persist_ok = try ctx.cli.run(&.{ "kv", "persist", "session" });
+    defer persist_ok.deinit();
+    try stdx.testing.assertSucceeded(persist_ok);
+    try stdx.testing.assertStdoutContains(persist_ok, "OK");
+
+    // Value still readable.
+    const value = try ctx.execCapture(&.{ "kv", "get", "session" });
+    try testing.expect(std.mem.indexOf(u8, value, "active") != null);
+}
+
+test "e2e/kv: touch on missing key fails" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "kv", "touch", "nosuch", "--ttl", "60" });
+    defer result.deinit();
+    try stdx.testing.assertFailed(result);
+}
+
+test "e2e/kv: persist on missing key fails" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "kv", "persist", "nosuch" });
+    defer result.deinit();
+    try stdx.testing.assertFailed(result);
+}
+
+test "e2e/kv: json-set + json-get round trip" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Set a full JSON document at root.
+    try ctx.exec(&.{ "kv", "json-set", "user:1", "{\"name\":\"alice\",\"age\":30}" });
+
+    // json-get with default path "$" returns full doc.
+    const root = try ctx.execCapture(&.{ "kv", "json-get", "user:1" });
+    try testing.expect(std.mem.indexOf(u8, root, "alice") != null);
+    try testing.expect(std.mem.indexOf(u8, root, "30") != null);
+
+    // json-get with explicit path returns the field.
+    const name = try ctx.execCapture(&.{ "kv", "json-get", "user:1", "--path", "$.name" });
+    try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
+}
+
+test "e2e/kv: json-set updates nested field" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "json-set", "user:2", "{\"profile\":{\"name\":\"alice\",\"age\":30}}" });
+
+    // Update nested field.
+    try ctx.exec(&.{ "kv", "json-set", "user:2", "31", "--path", "$.profile.age" });
+
+    const age = try ctx.execCapture(&.{ "kv", "json-get", "user:2", "--path", "$.profile.age" });
+    try testing.expect(std.mem.indexOf(u8, age, "31") != null);
+
+    // Original sibling still present.
+    const name = try ctx.execCapture(&.{ "kv", "json-get", "user:2", "--path", "$.profile.name" });
+    try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
+}
+
+test "e2e/kv: json-del removes field, leaves rest intact" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "json-set", "doc", "{\"a\":1,\"b\":2,\"c\":3}" });
+    try ctx.exec(&.{ "kv", "json-del", "doc", "--path", "$.b" });
+
+    // $.b is gone.
+    var missing = try ctx.cli.run(&.{ "kv", "json-get", "doc", "--path", "$.b" });
+    defer missing.deinit();
+    try stdx.testing.assertFailed(missing);
+
+    // $.a and $.c remain.
+    const a = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.a" });
+    try testing.expect(std.mem.indexOf(u8, a, "1") != null);
+    const c = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.c" });
+    try testing.expect(std.mem.indexOf(u8, c, "3") != null);
+}
+
+test "e2e/kv: json array index access and update" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "json-set", "doc", "{\"tags\":[\"red\",\"green\",\"blue\"]}" });
+
+    const tag = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.tags[1]" });
+    try testing.expect(std.mem.indexOf(u8, tag, "green") != null);
+
+    try ctx.exec(&.{ "kv", "json-set", "doc", "\"yellow\"", "--path", "$.tags[1]" });
+
+    const tag_after = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.tags[1]" });
+    try testing.expect(std.mem.indexOf(u8, tag_after, "yellow") != null);
+}
+
+test "e2e/kv: json-get invalid path errors" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "json-set", "doc2", "{\"a\":1}" });
+
+    // Path missing leading $ is rejected.
+    var bad = try ctx.cli.run(&.{ "kv", "json-get", "doc2", "--path", "no.dollar" });
+    defer bad.deinit();
+    try stdx.testing.assertFailed(bad);
+
+    // Missing field returns failure.
+    var missing = try ctx.cli.run(&.{ "kv", "json-get", "doc2", "--path", "$.nope" });
+    defer missing.deinit();
+    try stdx.testing.assertFailed(missing);
+}
+
+test "e2e/kv: json-del root removes whole key" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "json-set", "ephemeral", "{\"x\":1}" });
+    try ctx.exec(&.{ "kv", "json-del", "ephemeral" });
+
+    // Key should now be missing.
+    var result = try ctx.cli.run(&.{ "kv", "exists", "ephemeral" });
+    defer result.deinit();
+    try stdx.testing.assertFailed(result);
+    try stdx.testing.assertStdoutContains(result, "0");
+}

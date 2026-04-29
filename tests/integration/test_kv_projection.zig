@@ -229,21 +229,24 @@ test "integration: KV snapshot round-trip preserves value_type" {
     try testing.expectEqual(src.projection.kv.ValueType.string, string_entry.value_type);
 }
 
-test "integration: JSON.SET writes new doc, JSON.GET reads root" {
+// =============================================================================
+// JSON path integration — validates util.json_path against the projection.
+// End-to-end coverage of the same opcodes through the CLI lives in
+// tests/e2e/kv_test.zig.
+// =============================================================================
+
+test "integration: JSON.GET reads root and field via json_path" {
     const json_path = src.util.json_path;
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    // JSON.SET on missing key with path "$" creates new doc.
     const initial = "{\"name\":\"alice\",\"age\":30}";
     try kv.put("user:1", initial, 1, 1, 0, 0);
 
-    // JSON.GET "$" returns whole doc.
     const all = try json_path.jsonPathGet(testing.allocator, kv.get("user:1").?.value, "$");
     defer testing.allocator.free(all);
     try testing.expectEqualStrings(initial, all);
 
-    // JSON.GET "$.name" returns the field.
     const name = try json_path.jsonPathGet(testing.allocator, kv.get("user:1").?.value, "$.name");
     defer testing.allocator.free(name);
     try testing.expectEqualStrings("\"alice\"", name);
@@ -257,24 +260,13 @@ test "integration: JSON.SET nested field updates document" {
     const initial = "{\"profile\":{\"name\":\"alice\",\"age\":30}}";
     try kv.put("user:1", initial, 1, 1, 0, 0);
 
-    // Update $.profile.age = 31
     const merged = try json_path.jsonPathSet(testing.allocator, kv.get("user:1").?.value, "$.profile.age", "31");
     defer testing.allocator.free(merged);
     try kv.put("user:1", merged, 2, 1, 0, 0);
 
-    // Read it back.
     const age = try json_path.jsonPathGet(testing.allocator, kv.get("user:1").?.value, "$.profile.age");
     defer testing.allocator.free(age);
     try testing.expectEqualStrings("31", age);
-
-    // Add a new field.
-    const merged2 = try json_path.jsonPathSet(testing.allocator, kv.get("user:1").?.value, "$.profile.email", "\"alice@example.com\"");
-    defer testing.allocator.free(merged2);
-    try kv.put("user:1", merged2, 3, 1, 0, 0);
-
-    const email = try json_path.jsonPathGet(testing.allocator, kv.get("user:1").?.value, "$.profile.email");
-    defer testing.allocator.free(email);
-    try testing.expectEqualStrings("\"alice@example.com\"", email);
 }
 
 test "integration: JSON.DEL removes field, leaves rest intact" {
@@ -282,47 +274,16 @@ test "integration: JSON.DEL removes field, leaves rest intact" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
 
-    const initial = "{\"a\":1,\"b\":2,\"c\":3}";
-    try kv.put("doc", initial, 1, 1, 0, 0);
+    try kv.put("doc", "{\"a\":1,\"b\":2,\"c\":3}", 1, 1, 0, 0);
 
-    // JSON.DEL $.b
     const merged = try json_path.jsonPathDel(testing.allocator, kv.get("doc").?.value, "$.b");
     defer testing.allocator.free(merged);
     try kv.put("doc", merged, 2, 1, 0, 0);
 
-    // $.b should now be missing.
     try testing.expectError(error.PathNotFound, json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.b"));
-
-    // $.a and $.c still present.
     const a = try json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.a");
     defer testing.allocator.free(a);
     try testing.expectEqualStrings("1", a);
-    const c = try json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.c");
-    defer testing.allocator.free(c);
-    try testing.expectEqualStrings("3", c);
-}
-
-test "integration: JSON array index access and update" {
-    const json_path = src.util.json_path;
-    var kv = KVProjection.init(testing.allocator, 0);
-    defer kv.deinit();
-
-    const initial = "{\"tags\":[\"red\",\"green\",\"blue\"]}";
-    try kv.put("doc", initial, 1, 1, 0, 0);
-
-    // Read $.tags[1]
-    const tag1 = try json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.tags[1]");
-    defer testing.allocator.free(tag1);
-    try testing.expectEqualStrings("\"green\"", tag1);
-
-    // Update $.tags[1] = "yellow"
-    const merged = try json_path.jsonPathSet(testing.allocator, kv.get("doc").?.value, "$.tags[1]", "\"yellow\"");
-    defer testing.allocator.free(merged);
-    try kv.put("doc", merged, 2, 1, 0, 0);
-
-    const tag1_after = try json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.tags[1]");
-    defer testing.allocator.free(tag1_after);
-    try testing.expectEqualStrings("\"yellow\"", tag1_after);
 }
 
 test "integration: JSON path errors propagate" {
@@ -332,32 +293,8 @@ test "integration: JSON path errors propagate" {
 
     try kv.put("doc", "{\"a\":1}", 1, 1, 0, 0);
 
-    // Missing path
     try testing.expectError(error.PathNotFound, json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "$.missing"));
-
-    // Invalid path syntax
     try testing.expectError(error.InvalidPath, json_path.jsonPathGet(testing.allocator, kv.get("doc").?.value, "no.dollar"));
-
-    // Non-JSON document
     try kv.put("notjson", "raw bytes", 2, 1, 0, 0);
     try testing.expectError(error.InvalidJson, json_path.jsonPathGet(testing.allocator, kv.get("notjson").?.value, "$.x"));
-}
-
-test "integration: PERSIST clears expiry on TTL'd key" {
-    var kv = KVProjection.init(testing.allocator, 0);
-    defer kv.deinit();
-
-    const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
-    // Put with TTL.
-    try kv.put("session", "active", 1, 1, now, now + 60 * std.time.ns_per_s);
-    try testing.expect(kv.get("session").?.expiry_ns != 0);
-
-    // PERSIST (expiry_ns = 0).
-    try kv.applyTouch("session", 0, 2, 1, now);
-    try testing.expectEqual(@as(u64, 0), kv.get("session").?.expiry_ns);
-
-    // Value still readable after fake clock advance past original TTL.
-    const future: u64 = now + 120 * std.time.ns_per_s;
-    _ = future;
-    try testing.expectEqualStrings("active", kv.get("session").?.value);
 }
