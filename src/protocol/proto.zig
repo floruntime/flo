@@ -88,10 +88,6 @@ pub const OpCode = enum(u16) {
     kv_json_get = 0x10C,
     kv_json_set = 0x10D,
     kv_json_del = 0x10E,
-
-    kv_begin_txn = 0x110,
-    kv_commit_txn = 0x111,
-    kv_rollback_txn = 0x112,
     // ── KV Extended (TTL lifecycle, exists) ─────────────────────────────
     kv_touch = 0x113,
     kv_persist = 0x114,
@@ -99,11 +95,6 @@ pub const OpCode = enum(u16) {
     kv_incr_response = 0x116,
     kv_json_response = 0x117,
     kv_exists_response = 0x118,
-
-    kv_snapshot_create = 0x120,
-    kv_snapshot_get = 0x121,
-    kv_snapshot_release = 0x122,
-    kv_snapshot_create_response = 0x123,
 
     // ── Streams (0x130 – 0x14F) ──────────────────────────────────────────────
     stream_append = 0x130,

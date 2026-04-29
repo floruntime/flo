@@ -1512,8 +1512,13 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             const serialized = resp.serialize(&buf) catch return;
             _ = conn.queueWrite(serialized);
         },
-        .kv_put_ok => {
-            shard.sendOkResponse(conn, request_id, "");
+        .kv_put_ok => |v| {
+            // Wire: [version:u64 LE]. Clients use this for CAS without a History round-trip.
+            var resp = proto.Response.init(request_id, .ok, "");
+            resp.prefix = v.version;
+            var buf: [128]u8 = undefined;
+            const serialized = resp.serialize(&buf) catch return;
+            _ = conn.queueWrite(serialized);
         },
         .ok => {
             shard.sendOkResponse(conn, request_id, "");
@@ -1562,7 +1567,6 @@ fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
         .kv_key_too_large => .bad_request,
         .kv_value_too_large => .bad_request,
         .kv_namespace_not_found => .not_found,
-        .kv_txn_conflict => .conflict,
         .conflict => .conflict,
         else => .internal_error,
     };

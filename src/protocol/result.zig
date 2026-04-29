@@ -83,26 +83,6 @@ pub const CommandResult = union(enum) {
         data: []const u8,
     },
 
-    /// Transaction started successfully
-    kv_txn_started: void,
-
-    /// Transaction committed with operation count
-    kv_txn_committed: struct {
-        operations: u32,
-    },
-
-    /// Transaction rolled back
-    kv_txn_rolled_back: void,
-
-    /// Snapshot created successfully
-    kv_snapshot_created: struct {
-        snapshot_id: u64,
-        lsn: u64,
-    },
-
-    /// Snapshot released successfully
-    kv_snapshot_released: void,
-
     // =========================================================================
     // Layer 1: Stream Responses
     // =========================================================================
@@ -548,11 +528,6 @@ pub const CommandResult = union(enum) {
         kv_key_too_large = 0x0100,
         kv_value_too_large = 0x0101,
         kv_namespace_not_found = 0x0102,
-        kv_txn_already_active = 0x0110,
-        kv_txn_not_active = 0x0111,
-        kv_txn_cross_core = 0x0112,
-        kv_txn_conflict = 0x0113, // Optimistic locking conflict detected
-        kv_snapshot_not_found = 0x0120, // Snapshot ID not found
 
         // Stream errors (0x0200-0x02FF)
         stream_not_found = 0x0200,
@@ -867,9 +842,6 @@ pub const CommandResult = union(enum) {
             .kv_scan_result => .kv_scan_response,
             .kv_history_result => .kv_history_response,
             .kv_mget_result => .kv_mget_response,
-            .kv_txn_started, .kv_txn_committed, .kv_txn_rolled_back => .ok,
-            .kv_snapshot_created => .kv_snapshot_create_response,
-            .kv_snapshot_released => .ok,
 
             .stream_append_ok => .stream_append_response,
             .stream_messages => .stream_read_response,
@@ -950,14 +922,12 @@ pub const CommandResult = union(enum) {
     /// Calculate serialized size for cross-core messaging
     pub fn serializedSize(self: CommandResult) usize {
         return switch (self) {
-            .ok, .pending, .pong, .kv_not_found, .kv_txn_started, .kv_txn_rolled_back, .kv_snapshot_released, .kv_condition_not_met => 1,
+            .ok, .pending, .pong, .kv_not_found, .kv_condition_not_met => 1,
             .auth_ok => |a| 1 + 1 + (if (a.user_id) |u| 4 + u.len else @as(usize, 0)) + 1 + (if (a.namespace) |n| 4 + n.len else @as(usize, 0)),
-            .kv_txn_committed => 1 + 4,
-            .kv_snapshot_created => 1 + 8 + 8,
             .err => |e| 1 + 2 + 4 + e.message.len,
 
             .kv_value => |v| 1 + 4 + v.value.len + 8,
-            .kv_put_ok => |v| 1 + 8 + if (v.version > 0) @as(usize, 0) else 0,
+            .kv_put_ok => 1 + 8,
             .kv_cas_failed => 1 + 8,
             // Pre-serialized types: tag + length prefix + data blob
             .kv_scan_result => |r| 1 + 4 + r.data.len,
@@ -1075,7 +1045,7 @@ pub const CommandResult = union(enum) {
         try writer.writeByte(@intFromEnum(std.meta.activeTag(self)));
 
         switch (self) {
-            .ok, .pending, .pong, .kv_not_found, .kv_txn_started, .kv_txn_rolled_back, .kv_snapshot_released, .kv_condition_not_met => {},
+            .ok, .pending, .pong, .kv_not_found, .kv_condition_not_met => {},
             .auth_ok => |a| {
                 // Write has_user_id flag + optional user_id
                 if (a.user_id) |uid| {
@@ -1091,13 +1061,6 @@ pub const CommandResult = union(enum) {
                 } else {
                     try writer.writeByte(0);
                 }
-            },
-            .kv_txn_committed => |c| {
-                try writer.writeInt(u32, c.operations, .little);
-            },
-            .kv_snapshot_created => |s| {
-                try writer.writeInt(u64, s.snapshot_id, .little);
-                try writer.writeInt(u64, s.lsn, .little);
             },
 
             .err => |e| {
@@ -1412,17 +1375,7 @@ pub const CommandResult = union(enum) {
                 break :blk .{ .auth_ok = .{ .user_id = user_id, .namespace = namespace } };
             },
             .kv_not_found => .{ .kv_not_found = {} },
-            .kv_txn_started => .{ .kv_txn_started = {} },
-            .kv_txn_rolled_back => .{ .kv_txn_rolled_back = {} },
-            .kv_snapshot_released => .{ .kv_snapshot_released = {} },
             .kv_condition_not_met => .{ .kv_condition_not_met = {} },
-            .kv_txn_committed => .{ .kv_txn_committed = .{
-                .operations = try reader.takeInt(u32, .little),
-            } },
-            .kv_snapshot_created => .{ .kv_snapshot_created = .{
-                .snapshot_id = try reader.takeInt(u64, .little),
-                .lsn = try reader.takeInt(u64, .little),
-            } },
 
             .err => .{
                 .err = .{

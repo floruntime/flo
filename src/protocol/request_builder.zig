@@ -89,18 +89,6 @@ pub const RequestBuilder = struct {
         return self.deleteNamespace("default", key);
     }
 
-    pub fn beginTransaction(self: *RequestBuilder) Request {
-        return self.beginTransactionNamespace("default");
-    }
-
-    pub fn commitTransaction(self: *RequestBuilder) Request {
-        return self.commitTransactionNamespace("default");
-    }
-
-    pub fn rollbackTransaction(self: *RequestBuilder) Request {
-        return self.rollbackTransactionNamespace("default");
-    }
-
     // =========================================================================
     // Durability
     // =========================================================================
@@ -198,66 +186,6 @@ pub const RequestBuilder = struct {
             },
             .namespace = namespace,
             .key = key,
-            .value = &[_]u8{},
-        };
-    }
-
-    pub fn beginTransactionNamespace(self: *RequestBuilder, namespace: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_begin_txn),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
-            .namespace = namespace,
-            .key = &[_]u8{},
-            .value = &[_]u8{},
-        };
-    }
-
-    pub fn commitTransactionNamespace(self: *RequestBuilder, namespace: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_commit_txn),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
-            .namespace = namespace,
-            .key = &[_]u8{},
-            .value = &[_]u8{},
-        };
-    }
-
-    pub fn rollbackTransactionNamespace(self: *RequestBuilder, namespace: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_rollback_txn),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
-            .namespace = namespace,
-            .key = &[_]u8{},
             .value = &[_]u8{},
         };
     }
