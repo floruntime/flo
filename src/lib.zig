@@ -52,6 +52,7 @@ pub const config = @import("config/mod.zig");
 pub const util = struct {
     pub const checksum = @import("util/checksum.zig");
     pub const json = @import("util/json.zig");
+    pub const json_path = @import("util/json_path.zig");
     pub const validation = @import("util/validation.zig");
     pub const constants = @import("util/constants.zig");
 };
