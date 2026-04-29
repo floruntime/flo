@@ -98,6 +98,27 @@ pub const Response = struct {
             _ => "Unknown error",
         };
     }
+
+    /// Decode a kv_txn_response carrying a `kv_txn_begin_ok` payload.
+    /// Wire payload: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE].
+    /// Returns null if the response is not a valid begin-ok envelope.
+    pub fn getTxnBeginResult(self: Response) ?struct { txn_id: u64, pinned_hash: u64 } {
+        if (self.status != .ok or self.data.len < 17 or self.data[0] != 0) return null;
+        return .{
+            .txn_id = std.mem.readInt(u64, self.data[1..9], .little),
+            .pinned_hash = std.mem.readInt(u64, self.data[9..17], .little),
+        };
+    }
+
+    /// Decode a kv_txn_response carrying a `kv_txn_commit_ok` payload.
+    /// Wire payload: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE].
+    pub fn getTxnCommitResult(self: Response) ?struct { commit_index: u64, op_count: u16 } {
+        if (self.status != .ok or self.data.len < 11 or self.data[0] != 1) return null;
+        return .{
+            .commit_index = std.mem.readInt(u64, self.data[1..9], .little),
+            .op_count = std.mem.readInt(u16, self.data[9..11], .little),
+        };
+    }
 };
 
 /// Flo Protocol Client

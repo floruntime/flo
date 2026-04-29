@@ -54,6 +54,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("wait", 'w', 0, "Wait until key exists (ms, 0=forever)")
                 .uintFlag("block", 'b', 0, "Block for changes (ms, 0=forever)")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runGet)),
         )
         .subcommand(
@@ -87,6 +88,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .boolFlag("xx", 0, "Only set if key DOES exist")
                 .uint64Flag("cas", 0, 0, "Compare-and-swap version (only set if current version matches)")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runSet)),
         )
         .subcommand(
@@ -96,6 +98,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"del"})
                 .arg("key", "Key to delete")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -133,6 +136,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .arg("key", "Counter key")
                 .int64Flag("by", 'b', 1, "Delta to add (may be negative)")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runIncr)),
         )
         .subcommand(
@@ -146,6 +150,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .arg("key", "Key whose TTL to update")
                 .uint64Flag("ttl", 0, 0, "New TTL in seconds (0 clears)")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runTouch)),
         )
         .subcommand(
@@ -154,6 +159,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .about("Remove the TTL on an existing key")
                 .arg("key", "Key whose TTL to clear")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runPersist)),
         )
         .subcommand(
@@ -162,6 +168,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .about("Check whether a key exists (exit 0 = yes, 1 = no)")
                 .arg("key", "Key to check")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
+                .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runExists)),
         )
         .subcommand(
@@ -204,6 +211,36 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
                 .action(wrapHandler(runJsonDel)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("begin")
+                .about("Open a per-shard transaction pinned to --routing-key")
+                .examples(&.{
+                    "flo kv begin --routing-key user:123",
+                    "flo kv begin -r tenant-A",
+                })
+                .stringFlag("routing-key", 'r', "", "Routing key the txn pins to (required)")
+                .action(wrapHandler(runTxnBegin)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("commit")
+                .about("Commit a per-shard transaction (atomic batch apply)")
+                .examples(&.{
+                    "flo kv commit 42 --routing-key user:123",
+                })
+                .arg("txn-id", "Transaction ID returned by `kv begin`")
+                .stringFlag("routing-key", 'r', "", "Routing key used at BEGIN (required)")
+                .action(wrapHandler(runTxnCommit)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("rollback")
+                .about("Discard a per-shard transaction's buffered ops")
+                .arg("txn-id", "Transaction ID returned by `kv begin`")
+                .stringFlag("routing-key", 'r', "", "Routing key used at BEGIN (required)")
+                .action(wrapHandler(runTxnRollback)),
+        )
         .build();
 }
 
@@ -221,6 +258,7 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
         const rk = ctx.getString("routing-key") orelse break :blk null;
         break :blk if (rk.len > 0) rk else null;
     };
+    const txn_id = optionalTxnId(ctx);
 
     // Cannot use both --wait and --block
     if (wait_ms != null and block_ms != null) {
@@ -247,7 +285,7 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.kv.get(&client, namespace, key, wait_ms, block_ms, routing_key) catch |err| {
+    var result = client_mod.kv.get(&client, namespace, key, wait_ms, block_ms, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -317,6 +355,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
         .if_exists = xx,
         .cas_version = cas,
         .routing_key = routing_key,
+        .txn_id = optionalTxnId(ctx),
     }) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
@@ -351,6 +390,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
         const rk = ctx.getString("routing-key") orelse break :blk null;
         break :blk if (rk.len > 0) rk else null;
     };
+    const txn_id = optionalTxnId(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -360,7 +400,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.kv.delete(&client, namespace, key, routing_key) catch |err| {
+    var result = client_mod.kv.delete(&client, namespace, key, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -695,16 +735,24 @@ fn optionalRoutingKey(ctx: *commander.Context) ?[]const u8 {
     return if (rk.len > 0) rk else null;
 }
 
+/// Read the `--txn` flag if the command defined it. Returns null when the
+/// flag is absent or zero (zero is reserved as "not in a transaction").
+fn optionalTxnId(ctx: *commander.Context) ?u64 {
+    const v = ctx.getChangedUint64("txn") orelse return null;
+    return if (v == 0) null else v;
+}
+
 fn runIncr(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?;
     const delta: i64 = ctx.getInt64("by") orelse 1;
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
+    const txn_id = optionalTxnId(ctx);
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.incr(&client, namespace, key, delta, routing_key) catch |err| {
+    var result = client_mod.kv.incr(&client, namespace, key, delta, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -732,11 +780,12 @@ fn runTouch(ctx: *commander.Context) commander.Error!void {
     const ttl: u64 = ctx.getUint64("ttl") orelse 0;
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
+    const txn_id = optionalTxnId(ctx);
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key) catch |err| {
+    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -757,11 +806,12 @@ fn runPersist(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?;
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
+    const txn_id = optionalTxnId(ctx);
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.persist(&client, namespace, key, routing_key) catch |err| {
+    var result = client_mod.kv.persist(&client, namespace, key, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -782,11 +832,12 @@ fn runExists(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?;
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
+    const txn_id = optionalTxnId(ctx);
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.exists(&client, namespace, key, routing_key) catch |err| {
+    var result = client_mod.kv.exists(&client, namespace, key, routing_key, txn_id) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -896,4 +947,95 @@ test "create kv command" {
 
     try std.testing.expectEqualStrings("kv", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 4);
+}
+
+// ── Per-Shard Transaction Subcommands ────────────────────────────────────
+
+fn requireRoutingKey(ctx: *commander.Context) commander.Error![]const u8 {
+    const rk = ctx.getString("routing-key") orelse "";
+    if (rk.len == 0) {
+        ctx.printErr("Error: --routing-key is required for transaction commands\n", .{});
+        return error.CommandFailed;
+    }
+    return rk;
+}
+
+fn runTxnBegin(ctx: *commander.Context) commander.Error!void {
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = try requireRoutingKey(ctx);
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.beginTxn(&client, namespace, routing_key) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const begin = result.getTxnBeginResult() orelse {
+        ctx.printErr("Error: malformed begin response\n", .{});
+        return error.CommandFailed;
+    };
+    ctx.print("txn_id={d} pinned_hash={d}\n", .{ begin.txn_id, begin.pinned_hash });
+}
+
+fn runTxnCommit(ctx: *commander.Context) commander.Error!void {
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = try requireRoutingKey(ctx);
+    const txn_str = ctx.getPositional("txn-id").?;
+    const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
+        ctx.printErr("Error: invalid txn-id '{s}'\n", .{txn_str});
+        return error.CommandFailed;
+    };
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.commitTxn(&client, namespace, routing_key, txn_id) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    const commit = result.getTxnCommitResult() orelse {
+        ctx.printErr("Error: malformed commit response\n", .{});
+        return error.CommandFailed;
+    };
+    ctx.print("OK ops={d} commit_index={d}\n", .{ commit.op_count, commit.commit_index });
+}
+
+fn runTxnRollback(ctx: *commander.Context) commander.Error!void {
+    const namespace = cli_config.getNamespace(ctx);
+    const routing_key = try requireRoutingKey(ctx);
+    const txn_str = ctx.getPositional("txn-id").?;
+    const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
+        ctx.printErr("Error: invalid txn-id '{s}'\n", .{txn_str});
+        return error.CommandFailed;
+    };
+
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var result = client_mod.kv.rollbackTxn(&client, namespace, routing_key, txn_id) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer result.deinit();
+
+    if (result.isError()) {
+        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
+        return error.CommandFailed;
+    }
+    ctx.print("OK\n", .{});
 }

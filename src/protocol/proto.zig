@@ -88,6 +88,14 @@ pub const OpCode = enum(u16) {
     kv_json_get = 0x10C,
     kv_json_set = 0x10D,
     kv_json_del = 0x10E,
+    // ── KV Per-Shard Transactions ───────────────────────────────────────
+    // Pinned to a single partition at BEGIN (via routing_key on the request key).
+    // All ops inside a txn carry txn_id (TLV option 0x09). Cross-shard ops
+    // fail fast with kv_txn_cross_shard. COMMIT emits one batched UAL entry
+    // (EntryType.kv_batch); ROLLBACK discards the in-memory write set.
+    kv_begin_txn = 0x110,
+    kv_commit_txn = 0x111,
+    kv_rollback_txn = 0x112,
     // ── KV Extended (TTL lifecycle, exists) ─────────────────────────────
     kv_touch = 0x113,
     kv_persist = 0x114,
@@ -95,6 +103,7 @@ pub const OpCode = enum(u16) {
     kv_incr_response = 0x116,
     kv_json_response = 0x117,
     kv_exists_response = 0x118,
+    kv_txn_response = 0x119, // BEGIN reply (carries txn_id + pinned_hash); COMMIT/ROLLBACK reply (status only)
 
     // ── Streams (0x130 – 0x14F) ──────────────────────────────────────────────
     stream_append = 0x130,
@@ -291,6 +300,7 @@ pub const OptionTag = enum(u8) {
     keys_only = 0x06, // u8: Skip values in scan response (0/1)
     cursor = 0x07, // bytes: Pagination cursor (ShardWalker format)
     routing_key = 0x08, // string: Explicit routing key for shard co-location (overrides key-based routing)
+    txn_id = 0x09, // u64: Per-shard transaction ID (returned by kv_begin_txn)
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255, higher = more urgent)

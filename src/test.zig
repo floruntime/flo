@@ -85,6 +85,7 @@ test {
 // Handlers
 test {
     _ = @import("kv/handler.zig");
+    _ = @import("kv/txn.zig");
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
     _ = @import("ts/handler.zig");

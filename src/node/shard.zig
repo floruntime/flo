@@ -555,6 +555,7 @@ pub const Shard = struct {
         }
 
         // Clean up handlers (they don't own projections — partitions do)
+        self.kv_handler.deinit();
         self.allocator.destroy(self.kv_handler);
         self.stream_handler.deinit();
         self.allocator.destroy(self.stream_handler);
@@ -670,6 +671,8 @@ pub const Shard = struct {
     /// Remove and clean up a connection (does NOT close the fd).
     pub fn removeConnection(self: *Shard, fd: i32) void {
         if (self.connections.fetchRemove(fd)) |kv| {
+            // Roll back any KV transactions still owned by this connection.
+            _ = self.kv_handler.txn_table.dropByConnection(kv.value.id);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
         }

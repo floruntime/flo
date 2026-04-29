@@ -43,6 +43,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
+const txn_mod = @import("./txn.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
@@ -99,13 +100,22 @@ pub const KVHandler = struct {
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
 
+    /// Per-shard transaction table. Lives next to the projection — same
+    /// thread, no locks. Tracks open BEGIN'd txns until COMMIT/ROLLBACK.
+    txn_table: txn_mod.TxnTable,
+
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
             .next_lsn = 1,
             .metrics_registry = null,
+            .txn_table = txn_mod.TxnTable.init(allocator),
         };
+    }
+
+    pub fn deinit(self: *KVHandler) void {
+        self.txn_table.deinit();
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -128,6 +138,13 @@ pub const KVHandler = struct {
         dispatcher.registerWithRoute(.kv_json_get, dispatchJsonGet, preRouteByKey);
         dispatcher.registerWithRoute(.kv_json_set, dispatchJsonSet, preRouteByKey);
         dispatcher.registerWithRoute(.kv_json_del, dispatchJsonDel, preRouteByKey);
+
+        // Per-shard transactions. BEGIN pins the txn to the partition that
+        // owns the routing key; COMMIT/ROLLBACK then route to the same shard
+        // by passing the routing key (the CLI carries it forward).
+        dispatcher.registerWithRoute(.kv_begin_txn, dispatchBeginTxn, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_commit_txn, dispatchCommitTxn, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_rollback_txn, dispatchRollbackTxn, preRouteByKey);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -208,6 +225,20 @@ pub const KVHandler = struct {
         }
 
         // Normal non-blocking GET.
+        // Inside a transaction? Check buffered ops first (read-your-writes).
+        switch (tryReadInTxn(shard, conn, req, qkey)) {
+            .none => {},
+            .err => return,
+            .deleted => {
+                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+                return;
+            },
+            .value => |v| {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = v, .version = 0 } });
+                return;
+            },
+            .miss => {}, // fall through to projection lookup
+        }
         const cmd_result = shard.kv_handler.*.handleCommand(req);
         defer shard.kv_handler.*.freeResult(cmd_result);
         log.debug("KV GET: key={s}, hit={}", .{ req.key, cmd_result != .kv_not_found });
@@ -238,6 +269,18 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, err_result);
             return;
         }
+
+        // Compute absolute expiry_ns for any TTL the request carries.
+        var put_expiry_ns: u64 = 0;
+        if (req.getTtlSeconds()) |ttl_secs| {
+            if (ttl_secs > 0) {
+                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+                put_expiry_ns = now_ns + ttl_secs * 1_000_000_000;
+            }
+        }
+
+        // Inside a transaction? Buffer instead of proposing.
+        if (tryHandleInTxn(shard, conn, req, qkey, .put, req.value, put_expiry_ns)) return;
 
         // Build CommandPayload and propose through Raft (uses qualified key)
         _ = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| {
@@ -301,6 +344,9 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
             return;
         }
+
+        // Inside a transaction? Buffer the delete.
+        if (tryHandleInTxn(shard, conn, req, qkey, .delete, &[_]u8{}, 0)) return;
 
         // Propose the delete through Raft (qualified key)
         _ = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| {
@@ -370,6 +416,9 @@ pub const KVHandler = struct {
         // Encode delta in the entry value field.
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &val_buf, delta, .little);
+
+        // Inside a transaction? Buffer the increment.
+        if (tryHandleInTxn(shard, conn, req, qkey, .incr, &val_buf, 0)) return;
 
         _ = proposeKVEntryWithValue(shard, .kv_incr, req, qkey, &val_buf) catch |err| {
             const result: CommandResult = switch (err) {
@@ -455,6 +504,10 @@ pub const KVHandler = struct {
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &val_buf, expiry_ns, .little);
 
+        // Inside a transaction? Buffer touch/persist.
+        const txn_op_kind: txn_mod.TxnOpKind = if (force_persist) .persist else .touch;
+        if (tryHandleInTxn(shard, conn, req, qkey, txn_op_kind, &val_buf, expiry_ns)) return;
+
         _ = proposeKVEntryWithValue(shard, .kv_touch, req, qkey, &val_buf) catch |err| {
             const result: CommandResult = switch (err) {
                 error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
@@ -488,6 +541,22 @@ pub const KVHandler = struct {
         const S = struct {
             threadlocal var byte: [1]u8 = undefined;
         };
+        // Inside a transaction? Check buffered ops first.
+        switch (tryReadInTxn(shard, conn, req, qkey)) {
+            .none => {},
+            .err => return,
+            .deleted => {
+                S.byte[0] = 0;
+                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = S.byte[0..1], .version = 0 } });
+                return;
+            },
+            .value => {
+                S.byte[0] = 1;
+                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = S.byte[0..1], .version = 0 } });
+                return;
+            },
+            .miss => {},
+        }
         if (shard.kv_handler.*.kv.get(qkey)) |entry| {
             S.byte[0] = 1;
             sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = S.byte[0..1], .version = entry.version } });
@@ -979,6 +1048,290 @@ pub const KVHandler = struct {
                 raft.last_applied = next_idx;
             }
         }
+    }
+
+    // ── Per-Shard Transactions ─────────────────────────────────────────
+    //
+    // A transaction is opened with BEGIN(routing_key). The dispatcher's
+    // `preRouteByKey` hook routes BEGIN to the partition that owns
+    // `hash(namespace, routing_key)`. The TxnState stores that hash as
+    // `pinned_hash`, and every subsequent op carrying `txn_id` must hash
+    // to the same value or fail with `kv_txn_cross_shard`.
+    //
+    // Buffered ops are kept in `TxnTable.appendOp` (key/value owned by the
+    // table). On COMMIT we serialize the entire write set as one `kv_batch`
+    // UAL entry and propose it through Raft \u2014 atomicity is the same as any
+    // single Raft propose. ROLLBACK simply drops the in-memory state.
+
+    fn dispatchBeginTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        const routing_key: []const u8 = if (req.findOption(.routing_key)) |opt|
+            opt.asString()
+        else
+            req.key;
+
+        if (routing_key.len == 0) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .invalid_request,
+                .message = "BEGIN: routing key required (use --routing-key or supply key)",
+            } });
+            return;
+        }
+
+        const pinned_hash = router.hashKeyWithNamespace(req.namespace, routing_key);
+        const ns_hash = router.namespaceHash(req.namespace);
+
+        // owner_conn_id = 0 means "unowned" — txn outlives the originating
+        // connection. Stateless CLI clients open a fresh TCP connection per
+        // command, so binding to conn.id would auto-rollback at command exit.
+        // Connection-bound txns can be added later via an explicit option.
+        const txn_id = shard.kv_handler.*.txn_table.begin(pinned_hash, ns_hash, 0) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.TooManyOpenTxns => .{ .err = .{ .code = .kv_txn_too_large, .message = "too many open transactions" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "begin failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        log.debug("KV BEGIN: txn_id={d} pinned_hash={x} ns_hash={x}", .{ txn_id, pinned_hash, ns_hash });
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_txn_begin_ok = .{
+            .txn_id = txn_id,
+            .pinned_hash = pinned_hash,
+        } });
+    }
+
+    fn dispatchCommitTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        const txn_id = extractTxnId(req) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .invalid_request,
+                .message = "COMMIT: txn_id required",
+            } });
+            return;
+        };
+
+        const txn_table = &shard.kv_handler.*.txn_table;
+        const txn_state = txn_table.get(txn_id) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .kv_txn_unknown,
+                .message = "transaction not found",
+            } });
+            return;
+        };
+
+        const op_count: u16 = @intCast(txn_state.ops.items.len);
+
+        // Empty commit is a no-op success \u2014 just drop the txn.
+        if (op_count == 0) {
+            txn_table.drop(txn_id);
+            sendKVResponse(shard, conn, req.header.request_id, .{ .kv_txn_commit_ok = .{
+                .commit_index = shard.raft_node.commit_index,
+                .op_count = 0,
+            } });
+            return;
+        }
+
+        // Serialize the batched op list. Heap-allocate \u2014 it can exceed stack
+        // and we already enforce MAX_PAYLOAD_PER_TXN on append.
+        const need = txn_mod.batchPayloadSize(txn_state.ops.items);
+        const payload_buf = shard.kv_handler.*.allocator.alloc(u8, need) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "commit: oom" } });
+            return;
+        };
+        defer shard.kv_handler.*.allocator.free(payload_buf);
+
+        const written = txn_mod.serializeBatch(payload_buf, txn_state.namespace_hash, txn_state.ops.items) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "commit: serialize failed" } });
+            return;
+        };
+
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        const propose_result = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..written]) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
+                else => .{ .err = .{ .code = .internal_error, .message = "commit: propose failed" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return;
+        };
+
+        // Broadcast to peers (mirrors proposeKVEntryWithValue).
+        if (shard.raft_network) |rn| {
+            if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
+                var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
+                if (committed_entry.serialize(&entry_buf)) |serialized_len| {
+                    rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
+                }
+            }
+        }
+
+        applyCommittedEntries(shard);
+
+        // Drop the txn state \u2014 it's now durably committed.
+        txn_table.drop(txn_id);
+
+        log.debug("KV COMMIT: txn_id={d} ops={d} commit_index={d}", .{ txn_id, op_count, propose_result.index });
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_txn_commit_ok = .{
+            .commit_index = propose_result.index,
+            .op_count = op_count,
+        } });
+    }
+
+    fn dispatchRollbackTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        const txn_id = extractTxnId(req) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .invalid_request,
+                .message = "ROLLBACK: txn_id required",
+            } });
+            return;
+        };
+
+        const txn_table = &shard.kv_handler.*.txn_table;
+        if (txn_table.get(txn_id) == null) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .kv_txn_unknown,
+                .message = "transaction not found",
+            } });
+            return;
+        }
+        txn_table.drop(txn_id);
+        log.debug("KV ROLLBACK: txn_id={d}", .{txn_id});
+        sendKVResponse(shard, conn, req.header.request_id, .ok);
+    }
+
+    /// Extract the transaction id from a request. Looks first at the
+    /// `txn_id` TLV option, then falls back to the value field as an
+    /// 8-byte little-endian u64 (CLI convenience).
+    fn extractTxnId(req: Request) ?u64 {
+        if (req.findOption(.txn_id)) |opt| {
+            if (opt.asU64()) |v| return v;
+        }
+        if (req.value.len == 8) return std.mem.readInt(u64, req.value[0..8], .little);
+        return null;
+    }
+
+    /// If the request carries a `txn_id` option, append it to the matching
+    /// txn (for write ops) or surface read-your-writes (for read ops) and
+    /// return true \u2014 the caller should not run the normal Raft path.
+    /// Returns false when there is no txn_id, in which case the caller
+    /// proceeds with normal dispatch.
+    ///
+    /// On any txn-related error (unknown txn, cross-shard, too large, etc.)
+    /// this also returns true \u2014 the error response has already been sent.
+    fn tryHandleInTxn(
+        shard: *Shard,
+        conn: *Connection,
+        req: Request,
+        qkey: []const u8,
+        op_kind: txn_mod.TxnOpKind,
+        op_value: []const u8,
+        expiry_ns: u64,
+    ) bool {
+        const txn_opt = req.findOption(.txn_id) orelse return false;
+        const txn_id = txn_opt.asU64() orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "txn_id option must be u64" } });
+            return true;
+        };
+
+        const txn_table = &shard.kv_handler.*.txn_table;
+        const txn_state = txn_table.get(txn_id) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
+            return true;
+        };
+
+        // Cross-shard guard: req must hash to the txn's pinned partition.
+        const expected_hash = preRouteByKey(req) orelse 0;
+        if (txn_state.pinned_hash != expected_hash) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .kv_txn_cross_shard,
+                .message = "key hashes to a different partition than the transaction",
+            } });
+            return true;
+        }
+
+        // Single-namespace guard.
+        const req_ns_hash = router.namespaceHash(req.namespace);
+        if (txn_state.namespace_hash != req_ns_hash) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
+                .code = .kv_txn_unsupported_op,
+                .message = "transaction is bound to a different namespace",
+            } });
+            return true;
+        }
+
+        // Read-your-writes for GET/EXISTS: check the buffered op log first.
+        // For reads, op_kind is `.put` placeholder \u2014 caller will indicate via op_value.len?
+        // We use a dedicated branch in the per-handler call sites instead.
+
+        txn_table.appendOp(txn_id, op_kind, qkey, op_value, expiry_ns) catch |err| {
+            const result: CommandResult = switch (err) {
+                error.TxnTooLarge => .{ .err = .{ .code = .kv_txn_too_large, .message = "transaction op or payload limit exceeded" } },
+                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "oom buffering txn op" } },
+            };
+            sendKVResponse(shard, conn, req.header.request_id, result);
+            return true;
+        };
+
+        // Synthesize a per-op response. Real version will be assigned at COMMIT.
+        const synthetic: CommandResult = switch (op_kind) {
+            .put => .{ .kv_put_ok = .{ .version = 0 } },
+            .delete, .touch, .persist => .ok,
+            .incr => .{ .kv_value = .{ .value = op_value, .version = 0 } },
+        };
+        sendKVResponse(shard, conn, req.header.request_id, synthetic);
+        return true;
+    }
+
+    /// Read-your-writes path: look up `qkey` in the buffered op log of the
+    /// current txn (if any). Returns:
+    ///   .none      \u2014 no txn id on the request, caller proceeds with normal read
+    ///   .deleted   \u2014 txn has a buffered delete for this key (return not_found)
+    ///   .value     \u2014 txn has a buffered put; slice borrows from the txn buffer
+    ///   .miss      \u2014 has txn but no buffered op for this key, fall through to projection
+    ///   .err       \u2014 txn-id error (unknown/cross-shard); response already sent
+    const TxnReadOutcome = union(enum) {
+        none,
+        deleted,
+        value: []const u8,
+        miss,
+        err,
+    };
+    fn tryReadInTxn(shard: *Shard, conn: *Connection, req: Request, qkey: []const u8) TxnReadOutcome {
+        const txn_opt = req.findOption(.txn_id) orelse return .none;
+        const txn_id = txn_opt.asU64() orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "txn_id option must be u64" } });
+            return .err;
+        };
+        const txn_table = &shard.kv_handler.*.txn_table;
+        const txn_state = txn_table.get(txn_id) orelse {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
+            return .err;
+        };
+        const expected_hash = preRouteByKey(req) orelse 0;
+        if (txn_state.pinned_hash != expected_hash) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_cross_shard, .message = "key hashes to a different partition than the transaction" } });
+            return .err;
+        }
+        const req_ns_hash = router.namespaceHash(req.namespace);
+        if (txn_state.namespace_hash != req_ns_hash) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unsupported_op, .message = "transaction is bound to a different namespace" } });
+            return .err;
+        }
+        const last = txn_table.lastOpForKey(txn_id, qkey) orelse return .miss;
+        return switch (last.kind) {
+            .delete => .deleted,
+            .put => .{ .value = last.value },
+            // For touch/persist/incr, the value isn't authoritative \u2014 fall through.
+            .touch, .persist, .incr => .miss,
+        };
     }
 
     // ── Core Command Logic ─────────────────────────────────────────────
@@ -1544,6 +1897,22 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
         .kv_mget_result => |batch| {
             shard.sendOkResponse(conn, request_id, batch.data);
         },
+        .kv_txn_begin_ok => |t| {
+            // Wire payload: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE]
+            var buf: [17]u8 = undefined;
+            buf[0] = 0;
+            std.mem.writeInt(u64, buf[1..9], t.txn_id, .little);
+            std.mem.writeInt(u64, buf[9..17], t.pinned_hash, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
+        .kv_txn_commit_ok => |c| {
+            // Wire payload: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE]
+            var buf: [11]u8 = undefined;
+            buf[0] = 1;
+            std.mem.writeInt(u64, buf[1..9], c.commit_index, .little);
+            std.mem.writeInt(u16, buf[9..11], c.op_count, .little);
+            shard.sendOkResponse(conn, request_id, &buf);
+        },
         .err => |e| {
             const status = errorCodeToStatus(e.code);
             shard.sendErrorResponse(conn, request_id, status, e.message);
@@ -1567,6 +1936,11 @@ fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
         .kv_key_too_large => .bad_request,
         .kv_value_too_large => .bad_request,
         .kv_namespace_not_found => .not_found,
+        .kv_txn_unknown => .not_found,
+        .kv_txn_cross_shard => .bad_request,
+        .kv_txn_too_large => .bad_request,
+        .kv_txn_timeout => .internal_error,
+        .kv_txn_unsupported_op => .bad_request,
         .conflict => .conflict,
         else => .internal_error,
     };
@@ -2047,8 +2421,8 @@ test "kv handler: dispatcher registration" {
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_history)] == null); // no routing for history
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_mget)] == null); // multi-key, no pre-route
 
-    // 6 original + 7 new extended = 13 handlers registered
-    try testing.expectEqual(@as(u16, 13), dispatcher.handler_count);
+    // 6 original + 7 extended + 3 txn = 16 handlers registered
+    try testing.expectEqual(@as(u16, 16), dispatcher.handler_count);
 }
 
 test "kv handler: pre-route by key" {

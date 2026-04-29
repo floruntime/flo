@@ -83,6 +83,22 @@ pub const CommandResult = union(enum) {
         data: []const u8,
     },
 
+    /// kv_begin_txn reply.
+    /// Wire format: [txn_id:u64 LE][pinned_hash:u64 LE]
+    kv_txn_begin_ok: struct {
+        txn_id: u64,
+        pinned_hash: u64,
+    },
+
+    /// kv_commit_txn reply (success). Carries the index assigned by Raft to
+    /// the batched UAL entry — clients can use it as a watermark for "all my
+    /// writes are now visible".
+    /// Wire format: [commit_index:u64 LE][op_count:u16 LE]
+    kv_txn_commit_ok: struct {
+        commit_index: u64,
+        op_count: u16,
+    },
+
     // =========================================================================
     // Layer 1: Stream Responses
     // =========================================================================
@@ -528,6 +544,11 @@ pub const CommandResult = union(enum) {
         kv_key_too_large = 0x0100,
         kv_value_too_large = 0x0101,
         kv_namespace_not_found = 0x0102,
+        kv_txn_unknown = 0x0110, // unknown or already-finalized txn id
+        kv_txn_cross_shard = 0x0111, // op key doesn't hash to txn's pinned partition
+        kv_txn_too_large = 0x0112, // exceeded ops/payload cap inside txn
+        kv_txn_timeout = 0x0113, // txn idle/total timeout reached server-side
+        kv_txn_unsupported_op = 0x0114, // op not allowed inside a txn (scan, mget, json, history)
 
         // Stream errors (0x0200-0x02FF)
         stream_not_found = 0x0200,
@@ -842,6 +863,7 @@ pub const CommandResult = union(enum) {
             .kv_scan_result => .kv_scan_response,
             .kv_history_result => .kv_history_response,
             .kv_mget_result => .kv_mget_response,
+            .kv_txn_begin_ok, .kv_txn_commit_ok => .kv_txn_response,
 
             .stream_append_ok => .stream_append_response,
             .stream_messages => .stream_read_response,
@@ -933,6 +955,9 @@ pub const CommandResult = union(enum) {
             .kv_scan_result => |r| 1 + 4 + r.data.len,
             .kv_history_result => |h| 1 + 4 + h.data.len,
             .kv_mget_result => |b| 1 + 4 + b.data.len,
+            // Txn responses: tag + variant_byte + payload (BEGIN: 16, COMMIT: 10)
+            .kv_txn_begin_ok => 1 + 1 + 8 + 8,
+            .kv_txn_commit_ok => 1 + 1 + 8 + 2,
 
             .stream_append_ok => 1 + 8 + 8,
             .stream_messages => |m| 1 + 4 + m.data.len + 16, // tag + len + data + next_timestamp_ms + next_sequence
@@ -1087,6 +1112,19 @@ pub const CommandResult = union(enum) {
             },
             .kv_mget_result => |b| {
                 try writeSlice(writer, b.data);
+            },
+
+            .kv_txn_begin_ok => |t| {
+                // Variant byte 0 = begin (txn_id + pinned_hash)
+                try writer.writeByte(0);
+                try writer.writeInt(u64, t.txn_id, .little);
+                try writer.writeInt(u64, t.pinned_hash, .little);
+            },
+            .kv_txn_commit_ok => |c| {
+                // Variant byte 1 = commit (commit_index + op_count)
+                try writer.writeByte(1);
+                try writer.writeInt(u64, c.commit_index, .little);
+                try writer.writeInt(u16, c.op_count, .little);
             },
 
             .stream_append_ok => |a| {
@@ -1404,6 +1442,19 @@ pub const CommandResult = union(enum) {
             .kv_mget_result => .{ .kv_mget_result = .{
                 .data = try readSlice(reader, allocator),
             } },
+
+            .kv_txn_begin_ok, .kv_txn_commit_ok => blk: {
+                const variant = try reader.takeByte();
+                if (variant == 0) {
+                    const txn_id = try reader.takeInt(u64, .little);
+                    const pinned_hash = try reader.takeInt(u64, .little);
+                    break :blk .{ .kv_txn_begin_ok = .{ .txn_id = txn_id, .pinned_hash = pinned_hash } };
+                } else if (variant == 1) {
+                    const idx = try reader.takeInt(u64, .little);
+                    const op_count = try reader.takeInt(u16, .little);
+                    break :blk .{ .kv_txn_commit_ok = .{ .commit_index = idx, .op_count = op_count } };
+                } else return error.InvalidResultData;
+            },
 
             .stream_append_ok => .{ .stream_append_ok = .{
                 .sequence = try reader.takeInt(u64, .little),

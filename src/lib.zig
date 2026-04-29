@@ -37,6 +37,14 @@ pub const raft = @import("raft/mod.zig");
 pub const projection = @import("projection/mod.zig");
 
 // =============================================================================
+// KV subsystem internals (handler + per-shard txn table)
+// =============================================================================
+pub const kv = struct {
+    pub const handler = @import("kv/handler.zig");
+    pub const txn = @import("kv/txn.zig");
+};
+
+// =============================================================================
 // Cluster: Controller Raft, Partition Table, Gossip (NEW)
 // =============================================================================
 pub const cluster = @import("cluster/mod.zig");

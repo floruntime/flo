@@ -1793,3 +1793,72 @@ test "e2e/kv: json-get/set/del aliases work alongside canonical jget/jset/jdel" 
     defer missing.deinit();
     try stdx.testing.assertFailed(missing);
 }
+
+// =============================================================================
+// Per-Shard Transactions (BEGIN / COMMIT / ROLLBACK)
+// =============================================================================
+
+test "e2e/kv: txn begin/put/get-RYW/commit/get" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // BEGIN — pin to a routing key.
+    const begin_out = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "tenant-A" });
+    // Output: "txn_id=<N> pinned_hash=<M>\n"
+    const tid_prefix = "txn_id=";
+    const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
+    var end = idx + tid_prefix.len;
+    while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
+    const tid_str = begin_out[idx + tid_prefix.len .. end];
+    try testing.expect(tid_str.len > 0);
+
+    // Stage two writes inside the txn — they should not be visible outside.
+    try ctx.exec(&.{ "kv", "set", "txn:k1", "v1", "--routing-key", "tenant-A", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "txn:k2", "v2", "--routing-key", "tenant-A", "--txn", tid_str });
+
+    // RYW: a GET inside the same txn must see staged value.
+    const ryw = try ctx.execCapture(&.{ "kv", "get", "txn:k1", "--routing-key", "tenant-A", "--txn", tid_str });
+    try testing.expect(std.mem.indexOf(u8, ryw, "v1") != null);
+
+    // Outside the txn, the staged value must not yet be visible.
+    var pre_commit = try ctx.cli.run(&.{ "kv", "get", "txn:k1", "--output", "table" });
+    defer pre_commit.deinit();
+    try stdx.testing.assertContains(pre_commit, "(nil)");
+
+    // COMMIT — values become visible.
+    const commit_out = try ctx.execCapture(&.{ "kv", "commit", tid_str, "--routing-key", "tenant-A" });
+    try testing.expect(std.mem.indexOf(u8, commit_out, "ops=2") != null);
+
+    const post = try ctx.execCapture(&.{ "kv", "get", "txn:k1" });
+    try testing.expect(std.mem.indexOf(u8, post, "v1") != null);
+    const post2 = try ctx.execCapture(&.{ "kv", "get", "txn:k2" });
+    try testing.expect(std.mem.indexOf(u8, post2, "v2") != null);
+}
+
+test "e2e/kv: txn rollback discards staged ops" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const begin_out = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "rb-tenant" });
+    const tid_prefix = "txn_id=";
+    const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
+    var end = idx + tid_prefix.len;
+    while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
+    const tid_str = begin_out[idx + tid_prefix.len .. end];
+
+    try ctx.exec(&.{ "kv", "set", "rb:k", "should-not-persist", "--routing-key", "rb-tenant", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "rollback", tid_str, "--routing-key", "rb-tenant" });
+
+    var result = try ctx.cli.run(&.{ "kv", "get", "rb:k", "--output", "table" });
+    defer result.deinit();
+    try stdx.testing.assertContains(result, "(nil)");
+}
+
+test "e2e/kv: txn unknown id is rejected" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var result = try ctx.cli.run(&.{ "kv", "set", "ghost", "value", "--routing-key", "ghost-tenant", "--txn", "99999" });
+    defer result.deinit();
+    try stdx.testing.assertFailed(result);
+}

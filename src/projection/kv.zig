@@ -560,17 +560,59 @@ pub const KVProjection = struct {
                 );
             },
             .kv_batch => {
-                // Batch entries contain multiple ops — for now, treat as single put
-                const cmd = CommandPayload.deserialize(entry.payload) orelse
-                    return error.InvalidPayload;
-                try self.put(
-                    cmd.key,
-                    cmd.value,
-                    entry.header.index,
-                    entry.header.term,
-                    entry.header.timestamp_ns,
-                    extractExpiry(entry, &cmd),
-                );
+                // Per-shard transaction commit. Iterate the batched op list
+                // and apply each op against the projection. Atomicity comes
+                // from this whole entry being one Raft propose.
+                const txn = @import("../kv/txn.zig");
+                var it = txn.iterateBatch(entry.payload) orelse return error.InvalidPayload;
+                while (it.next()) |op| {
+                    switch (op.kind) {
+                        .put => try self.put(
+                            op.key,
+                            op.value,
+                            entry.header.index,
+                            entry.header.term,
+                            entry.header.timestamp_ns,
+                            op.expiry_ns,
+                        ),
+                        .delete => try self.delete(
+                            op.key,
+                            entry.header.index,
+                            entry.header.term,
+                            entry.header.timestamp_ns,
+                        ),
+                        .incr => {
+                            if (op.value.len != 8) return error.InvalidPayload;
+                            const delta = std.mem.readInt(i64, op.value[0..8], .little);
+                            _ = self.applyIncr(
+                                op.key,
+                                delta,
+                                entry.header.index,
+                                entry.header.term,
+                                entry.header.timestamp_ns,
+                            ) catch |err| switch (err) {
+                                // Same swallow-on-replay policy as standalone kv_incr.
+                                error.Overflow, error.NotACounter => {},
+                                else => return err,
+                            };
+                        },
+                        .touch, .persist => {
+                            const expiry_ns: u64 = if (op.kind == .persist) 0 else blk: {
+                                if (op.value.len != 8) return error.InvalidPayload;
+                                break :blk std.mem.readInt(u64, op.value[0..8], .little);
+                            };
+                            self.applyTouch(
+                                op.key,
+                                expiry_ns,
+                                entry.header.index,
+                                entry.header.term,
+                                entry.header.timestamp_ns,
+                            ) catch |err| switch (err) {
+                                error.NotFound => {},
+                            };
+                        },
+                    }
+                }
             },
             .kv_incr => {
                 // Payload: CommandPayload where value is the 8-byte i64 LE delta.

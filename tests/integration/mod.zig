@@ -26,4 +26,5 @@ test {
     _ = @import("test_cold_tier.zig");
     _ = @import("test_raft_failover.zig");
     _ = @import("test_cluster.zig");
+    _ = @import("test_kv_txn.zig");
 }
