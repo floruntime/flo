@@ -166,12 +166,13 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("json-get")
+                .name("jget")
+                .alias("json-get")
                 .about("Extract a JSONPath subtree from a JSON-encoded value")
                 .examples(&.{
-                    "flo kv json-get user:123",
-                    "flo kv json-get user:123 --path '$.name'",
-                    "flo kv json-get user:123 --path '$.addresses[0].city'",
+                    "flo kv jget user:123",
+                    "flo kv jget user:123 --path '$.name'",
+                    "flo kv jget user:123 --path '$.addresses[0].city'",
                 })
                 .arg("key", "Key holding the JSON document")
                 .stringFlag("path", 'p', "$", "JSONPath expression")
@@ -180,11 +181,12 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("json-set")
+                .name("jset")
+                .alias("json-set")
                 .about("Set a JSON value at the given path (read-modify-write)")
                 .examples(&.{
-                    "flo kv json-set user:123 '{\"name\":\"alice\"}'",
-                    "flo kv json-set user:123 '\"bob\"' --path '$.name'",
+                    "flo kv jset user:123 '{\"name\":\"alice\"}'",
+                    "flo kv jset user:123 '\"bob\"' --path '$.name'",
                 })
                 .arg("key", "Key holding the JSON document")
                 .arg("value", "Replacement value (must itself be valid JSON)")
@@ -194,7 +196,8 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("json-del")
+                .name("jdel")
+                .alias("json-del")
                 .about("Delete a JSON path. Path '$' deletes the whole key.")
                 .arg("key", "Key holding the JSON document")
                 .stringFlag("path", 'p', "$", "JSONPath expression")

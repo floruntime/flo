@@ -1676,56 +1676,56 @@ test "e2e/kv: persist on missing key fails" {
     try stdx.testing.assertFailed(result);
 }
 
-test "e2e/kv: json-set + json-get round trip" {
+test "e2e/kv: jset + jget round trip" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // Set a full JSON document at root.
-    try ctx.exec(&.{ "kv", "json-set", "user:1", "{\"name\":\"alice\",\"age\":30}" });
+    try ctx.exec(&.{ "kv", "jset", "user:1", "{\"name\":\"alice\",\"age\":30}" });
 
-    // json-get with default path "$" returns full doc.
-    const root = try ctx.execCapture(&.{ "kv", "json-get", "user:1" });
+    // jget with default path "$" returns full doc.
+    const root = try ctx.execCapture(&.{ "kv", "jget", "user:1" });
     try testing.expect(std.mem.indexOf(u8, root, "alice") != null);
     try testing.expect(std.mem.indexOf(u8, root, "30") != null);
 
-    // json-get with explicit path returns the field.
-    const name = try ctx.execCapture(&.{ "kv", "json-get", "user:1", "--path", "$.name" });
+    // jget with explicit path returns the field.
+    const name = try ctx.execCapture(&.{ "kv", "jget", "user:1", "--path", "$.name" });
     try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
 }
 
-test "e2e/kv: json-set updates nested field" {
+test "e2e/kv: jset updates nested field" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "json-set", "user:2", "{\"profile\":{\"name\":\"alice\",\"age\":30}}" });
+    try ctx.exec(&.{ "kv", "jset", "user:2", "{\"profile\":{\"name\":\"alice\",\"age\":30}}" });
 
     // Update nested field.
-    try ctx.exec(&.{ "kv", "json-set", "user:2", "31", "--path", "$.profile.age" });
+    try ctx.exec(&.{ "kv", "jset", "user:2", "31", "--path", "$.profile.age" });
 
-    const age = try ctx.execCapture(&.{ "kv", "json-get", "user:2", "--path", "$.profile.age" });
+    const age = try ctx.execCapture(&.{ "kv", "jget", "user:2", "--path", "$.profile.age" });
     try testing.expect(std.mem.indexOf(u8, age, "31") != null);
 
     // Original sibling still present.
-    const name = try ctx.execCapture(&.{ "kv", "json-get", "user:2", "--path", "$.profile.name" });
+    const name = try ctx.execCapture(&.{ "kv", "jget", "user:2", "--path", "$.profile.name" });
     try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
 }
 
-test "e2e/kv: json-del removes field, leaves rest intact" {
+test "e2e/kv: jdel removes field, leaves rest intact" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "json-set", "doc", "{\"a\":1,\"b\":2,\"c\":3}" });
-    try ctx.exec(&.{ "kv", "json-del", "doc", "--path", "$.b" });
+    try ctx.exec(&.{ "kv", "jset", "doc", "{\"a\":1,\"b\":2,\"c\":3}" });
+    try ctx.exec(&.{ "kv", "jdel", "doc", "--path", "$.b" });
 
     // $.b is gone.
-    var missing = try ctx.cli.run(&.{ "kv", "json-get", "doc", "--path", "$.b" });
+    var missing = try ctx.cli.run(&.{ "kv", "jget", "doc", "--path", "$.b" });
     defer missing.deinit();
     try stdx.testing.assertFailed(missing);
 
     // $.a and $.c remain.
-    const a = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.a" });
+    const a = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.a" });
     try testing.expect(std.mem.indexOf(u8, a, "1") != null);
-    const c = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.c" });
+    const c = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.c" });
     try testing.expect(std.mem.indexOf(u8, c, "3") != null);
 }
 
@@ -1733,44 +1733,63 @@ test "e2e/kv: json array index access and update" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "json-set", "doc", "{\"tags\":[\"red\",\"green\",\"blue\"]}" });
+    try ctx.exec(&.{ "kv", "jset", "doc", "{\"tags\":[\"red\",\"green\",\"blue\"]}" });
 
-    const tag = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.tags[1]" });
+    const tag = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.tags[1]" });
     try testing.expect(std.mem.indexOf(u8, tag, "green") != null);
 
-    try ctx.exec(&.{ "kv", "json-set", "doc", "\"yellow\"", "--path", "$.tags[1]" });
+    try ctx.exec(&.{ "kv", "jset", "doc", "\"yellow\"", "--path", "$.tags[1]" });
 
-    const tag_after = try ctx.execCapture(&.{ "kv", "json-get", "doc", "--path", "$.tags[1]" });
+    const tag_after = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.tags[1]" });
     try testing.expect(std.mem.indexOf(u8, tag_after, "yellow") != null);
 }
 
-test "e2e/kv: json-get invalid path errors" {
+test "e2e/kv: jget invalid path errors" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "json-set", "doc2", "{\"a\":1}" });
+    try ctx.exec(&.{ "kv", "jset", "doc2", "{\"a\":1}" });
 
     // Path missing leading $ is rejected.
-    var bad = try ctx.cli.run(&.{ "kv", "json-get", "doc2", "--path", "no.dollar" });
+    var bad = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "no.dollar" });
     defer bad.deinit();
     try stdx.testing.assertFailed(bad);
 
     // Missing field returns failure.
-    var missing = try ctx.cli.run(&.{ "kv", "json-get", "doc2", "--path", "$.nope" });
+    var missing = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "$.nope" });
     defer missing.deinit();
     try stdx.testing.assertFailed(missing);
 }
 
-test "e2e/kv: json-del root removes whole key" {
+test "e2e/kv: jdel root removes whole key" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "json-set", "ephemeral", "{\"x\":1}" });
-    try ctx.exec(&.{ "kv", "json-del", "ephemeral" });
+    try ctx.exec(&.{ "kv", "jset", "ephemeral", "{\"x\":1}" });
+    try ctx.exec(&.{ "kv", "jdel", "ephemeral" });
 
     // Key should now be missing.
     var result = try ctx.cli.run(&.{ "kv", "exists", "ephemeral" });
     defer result.deinit();
     try stdx.testing.assertFailed(result);
     try stdx.testing.assertStdoutContains(result, "0");
+}
+
+test "e2e/kv: json-get/set/del aliases work alongside canonical jget/jset/jdel" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Write with the alias, read with the canonical (and vice versa).
+    try ctx.exec(&.{ "kv", "json-set", "alias_doc", "{\"x\":1}" });
+    const v1 = try ctx.execCapture(&.{ "kv", "jget", "alias_doc", "--path", "$.x" });
+    try testing.expect(std.mem.indexOf(u8, v1, "1") != null);
+
+    try ctx.exec(&.{ "kv", "jset", "alias_doc", "2", "--path", "$.x" });
+    const v2 = try ctx.execCapture(&.{ "kv", "json-get", "alias_doc", "--path", "$.x" });
+    try testing.expect(std.mem.indexOf(u8, v2, "2") != null);
+
+    try ctx.exec(&.{ "kv", "json-del", "alias_doc" });
+    var missing = try ctx.cli.run(&.{ "kv", "exists", "alias_doc" });
+    defer missing.deinit();
+    try stdx.testing.assertFailed(missing);
 }
