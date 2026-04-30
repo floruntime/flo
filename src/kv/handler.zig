@@ -340,9 +340,18 @@ pub const KVHandler = struct {
         }
 
         // Check the key exists before proposing a delete (qualified key)
-        if (shard.kv_handler.*.kv.get(qkey) == null) {
+        const existing_for_delete = shard.kv_handler.*.kv.get(qkey);
+        if (existing_for_delete == null) {
             sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
             return;
+        }
+
+        // CAS check — only the holder of the expected version may delete.
+        if (req.getCasVersion()) |expected_version| {
+            if (existing_for_delete.?.version != expected_version) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_cas_failed = .{ .current_version = existing_for_delete.?.version } });
+                return;
+            }
         }
 
         // Inside a transaction? Buffer the delete.
@@ -480,9 +489,18 @@ pub const KVHandler = struct {
 
         // Pre-check existence so we can return not-found without a useless
         // Raft round-trip.
-        if (shard.kv_handler.*.kv.get(qkey) == null) {
+        const existing_for_touch = shard.kv_handler.*.kv.get(qkey);
+        if (existing_for_touch == null) {
             sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
             return;
+        }
+
+        // CAS check — only the holder of the expected version may touch/persist.
+        if (req.getCasVersion()) |expected_version| {
+            if (existing_for_touch.?.version != expected_version) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_cas_failed = .{ .current_version = existing_for_touch.?.version } });
+                return;
+            }
         }
 
         // Compute absolute expiry_ns from ttl_seconds, or 0 to clear.
@@ -1456,6 +1474,19 @@ pub const KVHandler = struct {
         const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
             return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
+        // CAS check — only the holder of the expected version may delete.
+        if (req.getCasVersion()) |expected_version| {
+            if (self.kv.get(qkey)) |entry| {
+                if (entry.version != expected_version) {
+                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
+                }
+            } else {
+                if (expected_version != 0) {
+                    return .{ .kv_cas_failed = .{ .current_version = 0 } };
+                }
+            }
+        }
+
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         self.kv.delete(qkey, lsn, 0, timestamp) catch {
@@ -1671,7 +1702,14 @@ pub const KVHandler = struct {
         const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
             return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
 
-        if (self.kv.get(qkey) == null) return .kv_not_found;
+        const existing = self.kv.get(qkey) orelse return .kv_not_found;
+
+        // CAS check — only the holder of the expected version may touch/persist.
+        if (req.getCasVersion()) |expected_version| {
+            if (existing.version != expected_version) {
+                return .{ .kv_cas_failed = .{ .current_version = existing.version } };
+            }
+        }
 
         var expiry_ns: u64 = 0;
         if (!force_persist) {
