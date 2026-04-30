@@ -259,20 +259,28 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         const var_name = b.fmt("asset_{d}", .{asset_idx});
         const compressible = isCompressible(file_path);
 
+        var is_precompressed: u8 = 0;
         if (compressible) {
-            // Gzip the file at configure time and embed the compressed version
+            // Gzip the file at configure time and embed the compressed version.
+            // Fall back to raw embed if gzip is not available.
             const gz_path = b.fmt("{s}.gz", .{file_path});
-            gzipFile(b.allocator, dist_dir, file_path, gz_path);
-            writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
-                var_name, gz_path,
-            }) catch unreachable;
+            if (gzipFile(b.allocator, dist_dir, file_path, gz_path)) {
+                writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
+                    var_name, gz_path,
+                }) catch unreachable;
+                is_precompressed = 1;
+            } else {
+                writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
+                    var_name, file_path,
+                }) catch unreachable;
+            }
         } else {
             writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
                 var_name, file_path,
             }) catch unreachable;
         }
 
-        const entry_line = b.fmt("{s}\x00{s}\x00{s}\x00{d}", .{ file_path, var_name, mime, @as(u8, if (compressible) 1 else 0) });
+        const entry_line = b.fmt("{s}\x00{s}\x00{s}\x00{d}", .{ file_path, var_name, mime, is_precompressed });
         entries.append(b.allocator, entry_line) catch unreachable;
         asset_idx += 1;
     }
@@ -382,28 +390,25 @@ fn isCompressible(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".json");
 }
 
-fn gzipFile(_: std.mem.Allocator, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) void {
+fn gzipFile(_: std.mem.Allocator, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) bool {
     const io = buildIo();
-    // Get absolute path of the source dir for the shell command
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = dir.realPath(io, &path_buf) catch return;
+    const dir_path_len = dir.realPath(io, &path_buf) catch return false;
     const dir_path = path_buf[0..dir_path_len];
 
-    const abs_src = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, src_path }) catch return;
+    const abs_src = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, src_path }) catch return false;
     defer std.heap.page_allocator.free(abs_src);
 
-    const abs_dest = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, dest_path }) catch return;
+    const abs_dest = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, dest_path }) catch return false;
     defer std.heap.page_allocator.free(abs_dest);
 
-    // Use shell redirection to write directly to file (avoids stdout buffer limits)
-    const cmd = std.fmt.allocPrint(std.heap.page_allocator, "gzip -9 -c \"{s}\" > \"{s}\"", .{ abs_src, abs_dest }) catch return;
+    const cmd = std.fmt.allocPrint(std.heap.page_allocator, "gzip -9 -c \"{s}\" > \"{s}\"", .{ abs_src, abs_dest }) catch return false;
     defer std.heap.page_allocator.free(cmd);
 
-    const result = std.process.run(std.heap.page_allocator, buildIo(), .{
+    _ = std.process.run(std.heap.page_allocator, buildIo(), .{
         .argv = &.{ "sh", "-c", cmd },
-    }) catch return;
-    defer std.heap.page_allocator.free(result.stdout);
-    defer std.heap.page_allocator.free(result.stderr);
+    }) catch return false;
+    return true;
 }
 
 fn getGitVersion(b: *std.Build) []const u8 {

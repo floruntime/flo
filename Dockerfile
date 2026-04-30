@@ -19,6 +19,7 @@ RUN apk add --no-cache \
     curl \
     xz \
     tar \
+    gzip \
     build-base \
     linux-headers
 
@@ -29,8 +30,8 @@ RUN case "${BUILDPLATFORM}" in \
       */arm64) ZIG_ARCH="aarch64" ;; \
       *)       ZIG_ARCH="x86_64"  ;; \
     esac && \
-curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
-        ln -s "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
+    ln -s "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
 
 WORKDIR /build
 
