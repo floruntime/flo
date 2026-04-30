@@ -90,12 +90,13 @@ pub fn set(client: *Client, namespace: []const u8, key: []const u8, value: []con
 }
 
 /// Execute a DEL command
-pub fn delete(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64) !Response {
-    if (routing_key != null or txn_id != null) {
+pub fn delete(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
+    if (routing_key != null or txn_id != null or cas_version != null) {
         var options_buf: [96]u8 = undefined;
         var builder = proto.OptionsBuilder.init(&options_buf);
         if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
         if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
+        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
         return client.sendRequestWithOptions(.kv_delete, namespace, key, "", builder.getOptions());
     }
     return client.sendRequest(.kv_delete, namespace, key, "");
@@ -182,27 +183,29 @@ pub fn incr(client: *Client, namespace: []const u8, key: []const u8, delta: i64,
 }
 
 /// TOUCH — update an existing key's TTL. ttl_seconds=0 clears the TTL (same as PERSIST).
-pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_seconds: u64, routing_key: ?[]const u8, txn_id: ?u64) !Response {
+pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_seconds: u64, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
     var val_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &val_buf, ttl_seconds, .little);
 
-    if (routing_key != null or txn_id != null) {
+    if (routing_key != null or txn_id != null or cas_version != null) {
         var options_buf: [96]u8 = undefined;
         var builder = proto.OptionsBuilder.init(&options_buf);
         if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
         if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
+        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
         return client.sendRequestWithOptions(.kv_touch, namespace, key, &val_buf, builder.getOptions());
     }
     return client.sendRequest(.kv_touch, namespace, key, &val_buf);
 }
 
 /// PERSIST — clear the TTL on an existing key. No value payload required.
-pub fn persist(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64) !Response {
-    if (routing_key != null or txn_id != null) {
+pub fn persist(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
+    if (routing_key != null or txn_id != null or cas_version != null) {
         var options_buf: [96]u8 = undefined;
         var builder = proto.OptionsBuilder.init(&options_buf);
         if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
         if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
+        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
         return client.sendRequestWithOptions(.kv_persist, namespace, key, "", builder.getOptions());
     }
     return client.sendRequest(.kv_persist, namespace, key, "");

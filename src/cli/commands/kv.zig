@@ -99,6 +99,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .arg("key", "Key to delete")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
+                .uint64Flag("cas", 0, 0, "Compare-and-swap version (only delete if current version matches)")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -151,6 +152,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .uint64Flag("ttl", 0, 0, "New TTL in seconds (0 clears)")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
+                .uint64Flag("cas", 0, 0, "Compare-and-swap version (only touch if current version matches)")
                 .action(wrapHandler(runTouch)),
         )
         .subcommand(
@@ -160,6 +162,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .arg("key", "Key whose TTL to clear")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
+                .uint64Flag("cas", 0, 0, "Compare-and-swap version (only persist if current version matches)")
                 .action(wrapHandler(runPersist)),
         )
         .subcommand(
@@ -384,6 +387,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
+    const cas = ctx.getChangedUint64("cas");
 
     // --routing-key: explicit shard co-location (same routing as {tag} in key name)
     const routing_key: ?[]const u8 = blk: {
@@ -400,11 +404,16 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.kv.delete(&client, namespace, key, routing_key, txn_id) catch |err| {
+    var result = client_mod.kv.delete(&client, namespace, key, routing_key, txn_id, cas) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
     defer result.deinit();
+
+    if (cas != null and result.isConflict()) {
+        ctx.printErr("Version mismatch\n", .{});
+        return error.CommandFailed;
+    }
 
     if (result.isError()) {
         ctx.printErr("Error: {s}\n", .{result.errorMessage()});
@@ -781,16 +790,21 @@ fn runTouch(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
     const txn_id = optionalTxnId(ctx);
+    const cas = ctx.getChangedUint64("cas");
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key, txn_id) catch |err| {
+    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key, txn_id, cas) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
     defer result.deinit();
 
+    if (cas != null and result.isConflict()) {
+        ctx.printErr("Version mismatch\n", .{});
+        return error.CommandFailed;
+    }
     if (result.isNotFound()) {
         ctx.printErr("Key not found\n", .{});
         return error.CommandFailed;
@@ -807,16 +821,21 @@ fn runPersist(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
     const txn_id = optionalTxnId(ctx);
+    const cas = ctx.getChangedUint64("cas");
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.persist(&client, namespace, key, routing_key, txn_id) catch |err| {
+    var result = client_mod.kv.persist(&client, namespace, key, routing_key, txn_id, cas) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
     defer result.deinit();
 
+    if (cas != null and result.isConflict()) {
+        ctx.printErr("Version mismatch\n", .{});
+        return error.CommandFailed;
+    }
     if (result.isNotFound()) {
         ctx.printErr("Key not found\n", .{});
         return error.CommandFailed;

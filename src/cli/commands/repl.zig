@@ -263,7 +263,7 @@ fn executeDel(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    var result = client_mod.kv.delete(client, namespace, key, null, null) catch |err| {
+    var result = client_mod.kv.delete(client, namespace, key, null, null, null) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };

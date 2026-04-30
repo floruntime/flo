@@ -23,14 +23,14 @@ RUN apk add --no-cache \
     linux-headers
 
 # Install Zig for the BUILD platform (native, never emulated)
-ARG ZIG_VERSION=0.15.2
+ARG ZIG_VERSION=0.16.0
 ARG BUILDPLATFORM
 RUN case "${BUILDPLATFORM}" in \
       */arm64) ZIG_ARCH="aarch64" ;; \
       *)       ZIG_ARCH="x86_64"  ;; \
     esac && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
-    ln -s "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
+        ln -s "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
 
 WORKDIR /build
 
