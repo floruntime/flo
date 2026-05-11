@@ -59,7 +59,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            ZIG_VERSION=0.15.2
+            ZIG_VERSION=0.16.0
             FLO_VERSION=${{ steps.version.outputs.VERSION }}
 
       # Attestation disabled - GITHUB_TOKEN lacks permission to create attestations
