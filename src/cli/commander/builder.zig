@@ -190,15 +190,6 @@ pub const Builder = struct {
         return self;
     }
 
-    /// Add alias (single)
-    pub fn alias(self: *Builder, a: []const u8) *Builder {
-        // For single alias, we need to create an array
-        const arr = self.allocator.alloc([]const u8, 1) catch return self;
-        arr[0] = a;
-        self.cmd_aliases = arr;
-        return self;
-    }
-
     /// Add examples
     pub fn examples(self: *Builder, e: []const []const u8) *Builder {
         self.cmd_examples = e;
