@@ -177,7 +177,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("jget")
-                .aliases(&.{"json-get"})
+                .alias("json-get")
                 .about("Extract a JSONPath subtree from a JSON-encoded value")
                 .examples(&.{
                     "flo kv jget user:123",
@@ -192,7 +192,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("jset")
-                .aliases(&.{"json-set"})
+                .alias("json-set")
                 .about("Set a JSON value at the given path (read-modify-write)")
                 .examples(&.{
                     "flo kv jset user:123 '{\"name\":\"alice\"}'",
@@ -207,7 +207,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("jdel")
-                .aliases(&.{"json-del"})
+                .alias("json-del")
                 .about("Delete a JSON path. Path '$' deletes the whole key.")
                 .arg("key", "Key holding the JSON document")
                 .stringFlag("path", 'p', "$", "JSONPath expression")

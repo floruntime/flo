@@ -101,6 +101,9 @@ pub const Builder = struct {
     cmd_version: ?[]const u8 = null,
     cmd_usage: ?[]const u8 = null,
     cmd_aliases: []const []const u8 = &.{},
+    /// Inline storage for the single-alias case, so .alias() needs
+    /// no heap allocation. Only used when set via .alias().
+    single_alias_buf: [1][]const u8 = undefined,
     cmd_examples: []const []const u8 = &.{},
     cmd_deprecated: ?[]const u8 = null,
     cmd_group: []const u8 = "",
@@ -184,9 +187,17 @@ pub const Builder = struct {
         return self;
     }
 
-    /// Add aliases
+    /// Add aliases (caller-owned slice; typically a static literal)
     pub fn aliases(self: *Builder, a: []const []const u8) *Builder {
         self.cmd_aliases = a;
+        return self;
+    }
+
+    /// Add a single alias. Stored in an inline 1-slot buffer; ownership
+    /// of the alias array is transferred to the Command in build().
+    pub fn alias(self: *Builder, a: []const u8) *Builder {
+        self.single_alias_buf[0] = a;
+        self.cmd_aliases = self.single_alias_buf[0..1];
         return self;
     }
 

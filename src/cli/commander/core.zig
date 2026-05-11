@@ -596,13 +596,25 @@ pub const Command = struct {
     pub fn init(allocator: Allocator, opts: CommandOptions) *Command {
         const cmd = allocator.create(Command) catch @panic("out of memory");
 
+        // Dupe the aliases outer slice so Command owns it consistently,
+        // regardless of whether the caller passed a static literal, an
+        // inline Builder buffer, or a heap-allocated array. Inner
+        // strings remain caller-owned (typically literals).
+        const owned_aliases: []const []const u8 = if (opts.aliases.len == 0)
+            &.{}
+        else blk: {
+            const buf = allocator.alloc([]const u8, opts.aliases.len) catch @panic("out of memory");
+            @memcpy(buf, opts.aliases);
+            break :blk buf;
+        };
+
         cmd.* = Command{
             .allocator = allocator,
             .name = opts.name,
             .short = opts.short,
             .long = opts.long,
             .examples = opts.examples,
-            .aliases = opts.aliases,
+            .aliases = owned_aliases,
             .usage = opts.usage,
             .version = opts.version,
             .deprecated = opts.deprecated,
@@ -647,6 +659,9 @@ pub const Command = struct {
         self.flags.deinit(self.allocator);
         self.persistent_flags.deinit(self.allocator);
         self.positional_args.deinit(self.allocator);
+        // Aliases outer slice is owned by us (Builder dupes it in build()).
+        // Inner strings are caller-owned (typically literals) and not freed.
+        if (self.aliases.len != 0) self.allocator.free(self.aliases);
         self.allocator.destroy(self);
     }
 
