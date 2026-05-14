@@ -62,17 +62,21 @@ RUN case "${TARGETPLATFORM}" in \
 # Stage 3: Runtime image
 FROM alpine:3.19
 
-# Install runtime dependencies (curl for healthcheck; nc is built into busybox)
+# Install runtime dependencies (curl for healthcheck; nc is built into busybox;
+# su-exec for dropping privileges in the entrypoint after fixing volume ownership)
 RUN apk add --no-cache \
     ca-certificates \
-    curl
+    curl \
+    su-exec
 
 # Create data directory
 RUN mkdir -p /data/flo
 
-# Copy the binary and default config from builder
+# Copy the binary, default config, and entrypoint from builder
 COPY --from=zig-builder /build/zig-out/bin/flo /usr/local/bin/flo
 COPY examples/docker-compose/flo.toml /etc/flo/flo.toml
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose ports: 9000=API, 9001=Metrics (port+1), 9002=Dashboard (port+2)
 # Raft (port+500) and Gossip (port+600) only needed for clustering
@@ -85,14 +89,14 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
      || nc -z localhost 9000 \
      || exit 1
 
-# Run as non-root user
+# Create the flo user; the image runs as root so the entrypoint can chown a
+# freshly-mounted /data/flo before dropping to uid 1000 via su-exec. When no
+# volume is mounted the Dockerfile-baked ownership below is what flo uses.
 RUN addgroup -g 1000 flo && \
     adduser -D -u 1000 -G flo flo && \
     chown -R flo:flo /data/flo /etc/flo
 
-USER flo
-
 VOLUME ["/data/flo"]
 
-ENTRYPOINT ["/usr/local/bin/flo"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["server", "start", "-c", "/etc/flo/flo.toml"]
