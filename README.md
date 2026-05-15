@@ -97,6 +97,13 @@ volumes:
 docker compose up -d
 ```
 
+> **Note:** The image's `ENTRYPOINT` is a small shim that fixes ownership on a
+> freshly-mounted `/data/flo` (root-owned by default on new ext4/xfs volumes),
+> then drops to uid 1000 via `su-exec`. Don't override it from your orchestrator
+> — use `command:` / `CMD` for arguments, not `entrypoint:`. Overriding it
+> bypasses the chown and either traps you on `error.AccessDenied` or leaves flo
+> running as root.
+
 ### Try It Out (CLI)
 
 ```bash
