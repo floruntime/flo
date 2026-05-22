@@ -194,6 +194,7 @@ pub const QueueHandler = struct {
             _ = shard.waiter_pool.register(.{
                 .kind = .queue_dequeue,
                 .fd = conn.fd,
+                .owner_shard = conn.owner_shard,
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .min_version = q_hash,

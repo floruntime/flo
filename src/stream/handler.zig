@@ -253,6 +253,7 @@ pub const StreamHandler = struct {
             _ = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
+                .owner_shard = conn.owner_shard,
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .min_version = shard.defaultPartition().ual.max_index,
@@ -307,15 +308,22 @@ pub const StreamHandler = struct {
 
             // Register waiter — woken by dispatchAppend or expired by timeout
             const is_pattern = req.key.len > 0 and req.key[req.key.len - 1] == '*';
-            _ = shard.waiter_pool.register(.{
+            const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .fd = conn.fd,
+                .owner_shard = conn.owner_shard,
                 .request_id = req.header.request_id,
                 .key = if (is_pattern) req.key[0 .. req.key.len - 1] else req.key,
                 .min_version = shard.defaultPartition().ual.max_index,
                 .timeout_ms = bms,
                 .pattern = is_pattern,
             });
+            if (!registered) {
+                // Pool full — send an empty result now rather than deferring a
+                // response that has no waiter to ever complete it.
+                shard.sendOkResponse(conn, req.header.request_id, "");
+                return;
+            }
             conn.response_deferred = true;
             return;
         }

@@ -332,6 +332,7 @@ pub const ActionsHandler = struct {
         _ = shard.waiter_pool.register(.{
             .kind = .action_await,
             .fd = conn.fd,
+            .owner_shard = conn.owner_shard,
             .request_id = req.header.request_id,
             .key = compound_key_buf[0..total_len],
             .min_version = (@as(u64, ns_len) << 16) | @as(u64, action_len),
@@ -351,7 +352,7 @@ pub const ActionsHandler = struct {
             const target = resolveActionShard(shard, namespace, name);
             if (target.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
                 shard.worker_handler.recordTaskAssigned(worker_id);
-                sendTaskAssignment(shard, conn, req.header.request_id, task);
+                sendTaskAssignment(shard, conn.owner_shard, conn.fd, req.header.request_id, task);
                 return true;
             }
         }
@@ -1608,9 +1609,7 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
 
     // Try to claim a pending run for the primary action name — hash-routed O(1)
     if (claimFromTargetShard(shard, namespace, action_name, worker_labels, worker_id)) |task| {
-        const conn = shard.getConnection(waiter.fd) orelse return true;
-        sendTaskAssignment(shard, conn, waiter.request_id, task);
-        shard.flushToClient(waiter.fd);
+        sendTaskAssignment(shard, waiter.owner_shard, waiter.fd, waiter.request_id, task);
         return true;
     }
 
@@ -1621,9 +1620,7 @@ fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
             // Skip the primary name we already tried
             if (std.mem.eql(u8, process.name_owned, action_name)) continue;
             if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
-                const conn = shard.getConnection(waiter.fd) orelse return true;
-                sendTaskAssignment(shard, conn, waiter.request_id, task);
-                shard.flushToClient(waiter.fd);
+                sendTaskAssignment(shard, waiter.owner_shard, waiter.fd, waiter.request_id, task);
                 return true;
             }
         }
@@ -1641,7 +1638,7 @@ fn claimFromTargetShard(shard: *Shard, namespace: []const u8, action_name: []con
 
 /// Send a task assignment response in the full wire format:
 ///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
-fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+fn sendTaskAssignment(shard: *Shard, owner_shard: u8, fd: i32, request_id: u64, task: ActionsHandler.ClaimedTask) void {
     const payload = task.input orelse "";
     const caller_run_id = task.caller_run_id orelse "";
     const caller_wf_name = task.caller_workflow_name orelse "";
@@ -1650,7 +1647,7 @@ fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: A
     var buf: [8192]u8 = undefined;
     const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len;
     if (total > buf.len) {
-        shard.sendOkResponse(conn, request_id, task.run_id);
+        shard.deliverDeferredResponse(owner_shard, fd, request_id, .ok, task.run_id);
         return;
     }
     var pos: usize = 0;
@@ -1687,7 +1684,7 @@ fn sendTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: A
     if (payload.len > 0) {
         @memcpy(buf[pos .. pos + payload.len], payload);
     }
-    shard.sendOkResponse(conn, request_id, buf[0..total]);
+    shard.deliverDeferredResponse(owner_shard, fd, request_id, .ok, buf[0..total]);
 }
 
 /// Extract the first task type (action name) from the action_await value.

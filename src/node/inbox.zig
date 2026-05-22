@@ -38,6 +38,8 @@ pub const Tag = enum(u8) {
     // ── Request / Response ──
     forward_request, // request routed to this shard for execution
     forward_response, // response from another shard back to connection owner
+    deferred_response, // blocking-read response resolved on a data shard,
+    // delivered to the connection-owning shard for the socket write
 
     // ── Connection Lifecycle ──
     connection_handoff, // Acceptor handing off a new connection

@@ -98,6 +98,10 @@ pub const Waiter = struct {
     /// Connection file descriptor.
     fd: i32,
 
+    /// Shard that owns the connection. The waiter itself lives on the data
+    /// shard; resolving it must marshal the response to this shard's thread.
+    owner_shard: u8,
+
     /// Original request ID — needed for matching the response.
     request_id: u64,
 
@@ -149,6 +153,7 @@ pub const WaiterPool = struct {
     pub const RegisterOpts = struct {
         kind: WaiterKind,
         fd: i32,
+        owner_shard: u8 = 0,
         request_id: u64,
         key: []const u8,
         min_version: u64 = 0,
@@ -173,6 +178,7 @@ pub const WaiterPool = struct {
         var w = &self.waiters[self.count];
         w.kind = opts.kind;
         w.fd = opts.fd;
+        w.owner_shard = opts.owner_shard;
         w.request_id = opts.request_id;
         w.key_buf = undefined;
         @memcpy(w.key_buf[0..opts.key.len], opts.key);

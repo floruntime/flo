@@ -309,11 +309,17 @@ pub const Connection = struct {
     /// Unique connection ID within the shard.
     id: u32,
 
+    /// ID of the shard that owns this connection (accepted it and owns its
+    /// fd, buffers, and reactor registration). Blocking-read waiters carry
+    /// this so a deferred response produced on another (data) shard can be
+    /// marshalled back to the owning shard's thread for the socket write.
+    owner_shard: u8,
+
     /// Set by handlers that intentionally defer the response (e.g. blocking GET).
     /// processRequests checks this to suppress the default "not implemented" error.
     response_deferred: bool,
 
-    pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32) !Connection {
+    pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32, owner_shard: u8) !Connection {
         var read_buf = try RingBuffer.init(allocator);
         errdefer read_buf.deinit();
         var write_buf = try RingBuffer.init(allocator);
@@ -334,6 +340,7 @@ pub const Connection = struct {
             .last_active = now,
             .write_armed = false,
             .id = conn_id,
+            .owner_shard = owner_shard,
             .response_deferred = false,
         };
     }
@@ -485,7 +492,7 @@ test "Connection: RingBuffer wrap-around" {
 }
 
 test "Connection: write coalescing" {
-    var conn = try Connection.init(std.testing.allocator, 42, 1);
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
     defer conn.deinit();
 
     // Queue multiple small writes
@@ -506,7 +513,7 @@ test "Connection: write coalescing" {
 }
 
 test "Connection: state transitions" {
-    var conn = try Connection.init(std.testing.allocator, 42, 1);
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
     defer conn.deinit();
 
     try std.testing.expectEqual(State.active, conn.state);
@@ -519,7 +526,7 @@ test "Connection: state transitions" {
 }
 
 test "Connection: detect protocol from read buffer" {
-    var conn = try Connection.init(std.testing.allocator, 42, 1);
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
     defer conn.deinit();
 
     // Write binary magic into read buffer
@@ -529,7 +536,7 @@ test "Connection: detect protocol from read buffer" {
 }
 
 test "Connection: detect RESP from read buffer" {
-    var conn = try Connection.init(std.testing.allocator, 42, 1);
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
     defer conn.deinit();
 
     _ = conn.read_buf.write("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
