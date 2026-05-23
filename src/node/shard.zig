@@ -916,14 +916,21 @@ pub const Shard = struct {
     /// Write a deferred blocking-read response that was resolved on another
     /// (data) shard. Runs on this shard's thread — this shard owns the
     /// connection — so the socket write is single-threaded as required.
+    ///
+    /// `msg.sequence` is packed `(conn_id << 32) | fd`. The conn_id check
+    /// guards against fd reuse: if the original connection has closed and the
+    /// fd was reassigned to a new connection, drop the response instead of
+    /// delivering it to the wrong client.
     fn deliverInboundResponse(self: *Shard, msg: InboxMessage) void {
         const ptr = msg.payload_ptr orelse return;
         const data: [*]u8 = @ptrCast(ptr);
         defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
         if (msg.payload_len == 0) return;
 
-        const fd: i32 = @intCast(msg.sequence);
+        const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
+        const conn_id: u32 = @truncate(msg.sequence >> 32);
         const conn = self.getConnection(fd) orelse return; // connection gone
+        if (conn.id != conn_id) return; // fd reused for a new connection
         _ = conn.queueWrite(data[0..msg.payload_len]);
         self.flushToClient(fd);
     }
@@ -1459,10 +1466,16 @@ pub const Shard = struct {
     /// this shard, write directly. Otherwise marshal the bytes to the owning
     /// shard's inbox so the socket write happens on the owning thread — never
     /// touch another shard's connection from here.
-    pub fn deliverDeferred(self: *Shard, owner_shard: u8, fd: i32, bytes: []const u8) void {
-        const my_id: u8 = @intCast(self.id);
+    ///
+    /// `conn_id` is the connection's generation id at waiter-registration
+    /// time. We verify it against the live connection before writing so that
+    /// fd reuse (close + accept at the same fd) cannot misdirect a stale
+    /// blocking-read response to the wrong client.
+    pub fn deliverDeferred(self: *Shard, owner_shard: u16, fd: i32, conn_id: u32, bytes: []const u8) void {
+        const my_id: u16 = @intCast(self.id);
         if (owner_shard == my_id) {
             const conn = self.getConnection(fd) orelse return;
+            if (conn.id != conn_id) return; // fd was reused for a new connection
             _ = conn.queueWrite(bytes);
             self.flushToClient(fd);
             return;
@@ -1476,11 +1489,16 @@ pub const Shard = struct {
             return;
         };
         @memcpy(payload, bytes);
+        // Pack (conn_id << 32) | fd into the inbox sequence field so the
+        // receiver can verify the connection generation. fd is i32 but
+        // always positive — masking to u32 is safe.
+        const fd_bits: u64 = @as(u32, @bitCast(fd));
+        const seq: u64 = (@as(u64, conn_id) << 32) | fd_bits;
         const ok = peers[owner_shard].inbox.send(.{
             .tag = .deferred_response,
-            .src_shard = my_id,
+            .src_shard = @intCast(my_id),
             .payload_len = @intCast(payload.len),
-            .sequence = @intCast(fd),
+            .sequence = seq,
             .payload_ptr = payload.ptr,
         });
         if (!ok) {
@@ -1490,10 +1508,10 @@ pub const Shard = struct {
     }
 
     /// Serialize a status+data response and deliver it via `deliverDeferred`.
-    pub fn deliverDeferredResponse(self: *Shard, owner_shard: u8, fd: i32, request_id: u64, status: proto.StatusCode, data: []const u8) void {
+    pub fn deliverDeferredResponse(self: *Shard, owner_shard: u16, fd: i32, conn_id: u32, request_id: u64, status: proto.StatusCode, data: []const u8) void {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch return;
-        self.deliverDeferred(owner_shard, fd, serialized);
+        self.deliverDeferred(owner_shard, fd, conn_id, serialized);
     }
 
     /// Send an OK response with data payload on a connection.
@@ -1969,17 +1987,17 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
     switch (waiter.kind) {
         .kv_get => {
             // KV blocking GET timeout → not_found
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .not_found, "");
+            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .not_found, "");
         },
         .queue_dequeue => {
             // Queue blocking dequeue timeout → empty messages response (count = 0)
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, 0, .little);
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .ok, &buf);
+            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, &buf);
         },
         // stream_read / action_await / stream_group_read → empty OK response
         .stream_read, .action_await, .stream_group_read => {
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .ok, "");
+            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, "");
         },
     }
 }
@@ -1996,7 +2014,7 @@ pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
     var buf: [MAX_BUF]u8 = undefined;
     if (resp.serialize(&buf)) |serialized| {
-        shard.deliverDeferred(waiter.owner_shard, waiter.fd, serialized);
+        shard.deliverDeferred(waiter.owner_shard, waiter.fd, waiter.conn_id, serialized);
     } else |_| {}
     return true;
 }
@@ -2022,7 +2040,7 @@ pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     // Serialize with full message format including payloads
     const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count], waiter.key()) catch return false;
     defer shard.stream_handler.allocator.free(data);
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .ok, data);
+    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
     return true;
 }
 
@@ -2042,7 +2060,7 @@ pub fn resolveGroupReadWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     if (partition.ual.max_index <= waiter.min_version) return false;
 
     // Send empty OK — client will retry and get data via handleGroupRead
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .ok, "");
+    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, "");
     return true;
 }
 
@@ -2091,7 +2109,7 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
         }
     }
 
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.request_id, .ok, data);
+    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
     return true;
 }
 

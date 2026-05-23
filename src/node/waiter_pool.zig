@@ -100,7 +100,13 @@ pub const Waiter = struct {
 
     /// Shard that owns the connection. The waiter itself lives on the data
     /// shard; resolving it must marshal the response to this shard's thread.
-    owner_shard: u8,
+    owner_shard: u16,
+
+    /// Connection generation id at registration time. The owner shard
+    /// verifies this against the live connection on delivery so that fd
+    /// reuse (close + accept of a new connection at the same fd) can't
+    /// misdirect a stale blocking-read response to the wrong client.
+    conn_id: u32,
 
     /// Original request ID — needed for matching the response.
     request_id: u64,
@@ -153,7 +159,14 @@ pub const WaiterPool = struct {
     pub const RegisterOpts = struct {
         kind: WaiterKind,
         fd: i32,
-        owner_shard: u8 = 0,
+        /// Shard that owns the connection (its fd, buffers, reactor entry).
+        /// Required — no default, because a wrong value silently routes
+        /// the deferred response to the wrong shard's connection table.
+        owner_shard: u16,
+        /// Connection generation id, used by the owner shard to detect
+        /// fd reuse before writing a stale response. Required for the
+        /// same reason as `owner_shard`.
+        conn_id: u32,
         request_id: u64,
         key: []const u8,
         min_version: u64 = 0,
@@ -179,6 +192,7 @@ pub const WaiterPool = struct {
         w.kind = opts.kind;
         w.fd = opts.fd;
         w.owner_shard = opts.owner_shard;
+        w.conn_id = opts.conn_id;
         w.request_id = opts.request_id;
         w.key_buf = undefined;
         @memcpy(w.key_buf[0..opts.key.len], opts.key);
@@ -336,6 +350,8 @@ test "WaiterPool: register and count" {
     const ok = pool.register(.{
         .kind = .kv_get,
         .fd = 10,
+        .owner_shard = 0,
+        .conn_id = 1,
         .request_id = 1,
         .key = "mykey",
         .timeout_ms = 5000,
@@ -351,6 +367,8 @@ test "WaiterPool: register rejects empty key" {
     const ok = pool.register(.{
         .kind = .kv_get,
         .fd = 10,
+        .owner_shard = 0,
+        .conn_id = 1,
         .request_id = 1,
         .key = "",
         .timeout_ms = 5000,
@@ -361,9 +379,9 @@ test "WaiterPool: register rejects empty key" {
 
 test "WaiterPool: removeByFd cleans up" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .request_id = 1, .key = "a" });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 10, .request_id = 2, .key = "b" });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .request_id = 3, .key = "c" });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a" });
+    _ = pool.register(.{ .kind = .stream_read, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 2, .key = "b" });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 3, .key = "c" });
     try std.testing.expectEqual(@as(u16, 3), pool.totalActive());
 
     pool.removeByFd(10);
@@ -373,9 +391,9 @@ test "WaiterPool: removeByFd cleans up" {
 
 test "WaiterPool: notify wakes matching waiters" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .request_id = 1, .key = "mykey", .min_version = 0 });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .request_id = 2, .key = "other", .min_version = 0 });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 30, .request_id = 3, .key = "mykey", .min_version = 0 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 0 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 2, .key = "other", .min_version = 0 });
+    _ = pool.register(.{ .kind = .stream_read, .fd = 30, .owner_shard = 0, .conn_id = 3, .request_id = 3, .key = "mykey", .min_version = 0 });
 
     // Resolver that always satisfies
     const always_resolve = struct {
@@ -395,7 +413,7 @@ test "WaiterPool: notify wakes matching waiters" {
 
 test "WaiterPool: notify respects resolver returning false" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .request_id = 1, .key = "mykey", .min_version = 5 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 5 });
 
     // Resolver that never satisfies (version too low)
     const never_resolve = struct {

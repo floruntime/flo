@@ -313,13 +313,13 @@ pub const Connection = struct {
     /// fd, buffers, and reactor registration). Blocking-read waiters carry
     /// this so a deferred response produced on another (data) shard can be
     /// marshalled back to the owning shard's thread for the socket write.
-    owner_shard: u8,
+    owner_shard: u16,
 
     /// Set by handlers that intentionally defer the response (e.g. blocking GET).
     /// processRequests checks this to suppress the default "not implemented" error.
     response_deferred: bool,
 
-    pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32, owner_shard: u8) !Connection {
+    pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32, owner_shard: u16) !Connection {
         var read_buf = try RingBuffer.init(allocator);
         errdefer read_buf.deinit();
         var write_buf = try RingBuffer.init(allocator);

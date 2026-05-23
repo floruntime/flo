@@ -197,15 +197,20 @@ pub const KVHandler = struct {
                 return;
             }
             // Key absent — register waiter in unified pool; response sent when key is created.
-            _ = shard.waiter_pool.register(.{
+            const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
+                .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = qkey,
                 .min_version = 0,
                 .timeout_ms = bms,
             });
+            if (!registered) {
+                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+                return;
+            }
             conn.response_deferred = true;
             return;
         }
@@ -213,15 +218,20 @@ pub const KVHandler = struct {
         if (wait_ms) |wms| {
             // Watch-for-changes semantics: wait for version > current.
             const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 0;
-            _ = shard.waiter_pool.register(.{
+            const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
+                .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = qkey,
                 .min_version = current_version,
                 .timeout_ms = wms,
             });
+            if (!registered) {
+                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
+                return;
+            }
             conn.response_deferred = true;
             return;
         }

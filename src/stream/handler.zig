@@ -250,15 +250,22 @@ pub const StreamHandler = struct {
             }
 
             // Register waiter with UAL max index as version (monotonically increasing)
-            _ = shard.waiter_pool.register(.{
+            const registered = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
+                .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .min_version = shard.defaultPartition().ual.max_index,
                 .timeout_ms = bms,
             });
+            if (!registered) {
+                // Pool full — send an empty result now rather than deferring a
+                // response that has no waiter to ever complete it.
+                shard.sendOkResponse(conn, req.header.request_id, "");
+                return;
+            }
             conn.response_deferred = true;
             return;
         }
@@ -312,6 +319,7 @@ pub const StreamHandler = struct {
                 .kind = .stream_group_read,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
+                .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = if (is_pattern) req.key[0 .. req.key.len - 1] else req.key,
                 .min_version = shard.defaultPartition().ual.max_index,

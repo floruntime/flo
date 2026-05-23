@@ -191,15 +191,24 @@ pub const QueueHandler = struct {
             // Register waiter — store queue_name_hash in min_version for the resolver
             const ns_hash_w = router.namespaceHash(req.namespace);
             const q_hash = router.nameHash(ns_hash_w, req.key);
-            _ = shard.waiter_pool.register(.{
+            const registered = shard.waiter_pool.register(.{
                 .kind = .queue_dequeue,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
+                .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .min_version = q_hash,
                 .timeout_ms = bms,
             });
+            if (!registered) {
+                // Pool full — send empty result (count = 0) rather than deferring
+                // a response with no waiter to ever complete it.
+                var empty_buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &empty_buf, 0, .little);
+                shard.sendOkResponse(conn, req.header.request_id, &empty_buf);
+                return;
+            }
             conn.response_deferred = true;
             return;
         }
