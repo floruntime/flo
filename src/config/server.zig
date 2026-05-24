@@ -17,11 +17,18 @@ pub const Durability = enum(u8) {
     /// No persistence (for caching use cases)
     ephemeral = 2,
 
-    /// Parse durability from string (for CLI/config parsing)
+    /// Parse durability from string (for CLI/config parsing).
+    /// Unknown values fall back to `async_flush` for backward-compatible TOML.
     pub fn fromString(s: []const u8) Durability {
+        return parseDurability(s) catch .async_flush;
+    }
+
+    /// Parse durability from CLI input; rejects unknown values.
+    pub fn parseDurability(s: []const u8) error{InvalidDurability}!Durability {
         if (std.mem.eql(u8, s, "sync")) return .sync;
+        if (std.mem.eql(u8, s, "async_flush")) return .async_flush;
         if (std.mem.eql(u8, s, "ephemeral")) return .ephemeral;
-        return .async_flush; // default
+        return error.InvalidDurability;
     }
 };
 
@@ -460,6 +467,7 @@ pub fn loadWithOverrides(
     partition_count_override: ?u32,
     log_level_override: ?[]const u8,
     log_format_override: ?[]const u8,
+    durability_override: ?[]const u8,
 ) !ServerConfig {
     // Load base config
     var config = if (config_path) |path|
@@ -495,8 +503,24 @@ pub fn loadWithOverrides(
     if (log_format_override) |format| {
         config.log_format = ServerConfig.LogFormat.fromString(format);
     }
-    // Note: durability is intentionally NOT overridable via CLI
-    // It must be set in flo.toml to prevent accidental data loss
+    // Durability override via CLI is permitted but warned on downgrade.
+    // Historical note: durability was originally TOML-only to prevent an
+    // operator from accidentally starting with --durability ephemeral and
+    // silently losing data. Allowing the flag preserves test ergonomics and
+    // explicit overrides, but a warning is emitted when the CLI value is
+    // less durable than what the file says, so the choice is never silent.
+    if (durability_override) |d| {
+        if (d.len > 0) {
+            const requested = try Durability.parseDurability(d);
+            if (@intFromEnum(requested) > @intFromEnum(config.durability)) {
+                std.debug.print(
+                    "warning: --durability {s} is LESS durable than configured ({s}); data loss possible on restart\n",
+                    .{ d, @tagName(config.durability) },
+                );
+            }
+            config.durability = requested;
+        }
+    }
 
     return config;
 }
@@ -670,6 +694,20 @@ test "load default config" {
     try std.testing.expectEqualStrings("0.0.0.0", config.bind);
     try std.testing.expectEqualStrings("~/.flo/data", config.data_dir);
     try std.testing.expectEqual(@as(u16, 0), config.shards); // 0 = auto-detect
+}
+
+test "Durability.parseDurability accepts known values" {
+    try std.testing.expectEqual(Durability.sync, try Durability.parseDurability("sync"));
+    try std.testing.expectEqual(Durability.async_flush, try Durability.parseDurability("async_flush"));
+    try std.testing.expectEqual(Durability.ephemeral, try Durability.parseDurability("ephemeral"));
+    try std.testing.expectError(error.InvalidDurability, Durability.parseDurability("invalid"));
+}
+
+test "loadWithOverrides applies durability flag" {
+    const allocator = std.testing.allocator;
+    var config = try loadWithOverrides(allocator, null, null, null, null, null, null, null, "sync");
+    defer config.deinit();
+    try std.testing.expectEqual(Durability.sync, config.durability);
 }
 
 test "toRuntimeConfig conversion" {

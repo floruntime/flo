@@ -67,6 +67,7 @@ const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
 const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const Durability = @import("../config/server.zig").Durability;
 const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
 const entry_mod = @import("../storage/ual/entry.zig");
 const segment_mod = @import("../storage/ual/segment.zig");
@@ -175,6 +176,9 @@ pub const Shard = struct {
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
 
+    /// Storage durability — controls segment flush timing.
+    durability: Durability,
+
     /// Per-shard data directory path (owned, null if ephemeral).
     shard_data_dir: ?[]const u8,
 
@@ -236,6 +240,7 @@ pub const Shard = struct {
         ual_capacity: usize,
         max_hot_entries: u64,
         hot_flush_seconds: u64,
+        durability: Durability,
     ) !Shard {
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
@@ -421,9 +426,6 @@ pub const Shard = struct {
         // re-persisted (design: UAL → hot ring → flush to warm segments).
         // Only the Raft log UAL persists — partition.ual is a read cache
         // whose entries are already covered by the Raft log's persistence.
-        raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
-        raft_node.log.ual.on_append = ualPersistCallback;
-
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
         KVHandler.register(&dispatcher);
@@ -474,6 +476,7 @@ pub const Shard = struct {
             .processing_handler = processing_handler,
             .raft_node = raft_node,
             .segment_writer = seg_writer,
+            .durability = durability,
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
@@ -515,6 +518,28 @@ pub const Shard = struct {
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
+
+        // Feed Raft log entries to the segment writer; sync durability flushes immediately.
+        self.raft_node.log.ual.on_append_ctx = @ptrCast(self);
+        self.raft_node.log.ual.on_append = ualPersistCallback;
+    }
+
+    /// Flush buffered Raft log entries to a .flseg file under `shard_data_dir/segs/`.
+    pub fn flushSegmentToDisk(self: *Shard) !void {
+        if (self.shard_data_dir == null) return;
+        if (self.segment_writer.entry_count == 0) return;
+
+        var segs_buf: [512]u8 = undefined;
+        const segs_path = std.fmt.bufPrint(&segs_buf, "{s}/segs", .{self.shard_data_dir.?}) catch return;
+        try self.segment_writer.writeToFile(segs_path);
+        self.segment_writer.reset();
+    }
+
+    /// Flush segments when `durability == .sync` (after projections are applied).
+    pub fn syncFlushIfNeeded(self: *Shard) void {
+        if (self.durability == .sync) {
+            self.flushSegmentToDisk() catch {};
+        }
     }
 
     /// Wire the global MetricsRegistry into this shard and its handlers.
@@ -538,13 +563,7 @@ pub const Shard = struct {
         self.connections.deinit(self.allocator);
 
         // Flush pending entries to segment file on shutdown
-        if (self.shard_data_dir) |dir| {
-            if (self.segment_writer.entry_count > 0) {
-                var segs_buf: [512]u8 = undefined;
-                const segs_path = std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir}) catch dir;
-                self.segment_writer.writeToFile(segs_path) catch {};
-            }
-        }
+        self.flushSegmentToDisk() catch {};
 
         // Clean up SegmentWriter
         self.segment_writer.deinit();
@@ -1052,6 +1071,24 @@ pub const Shard = struct {
             streamRetentionTask,
             @ptrCast(self),
         ) catch {};
+
+        // Persist Raft log entries to .flseg files (async_flush durability).
+        if (self.shard_data_dir != null and self.durability == .async_flush) {
+            self.task_scheduler.register(
+                "segment_flush",
+                1_000, // flush at most once per second
+                2_000_000, // 2ms budget
+                segmentFlushTask,
+                @ptrCast(self),
+            ) catch {};
+        }
+    }
+
+    /// TaskScheduler callback: flush buffered Raft entries to disk.
+    fn segmentFlushTask(ctx: *anyopaque, _: u64) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        self.flushSegmentToDisk() catch {};
+        return 0;
     }
 
     /// TaskScheduler callback: evict entries older than hot_flush_seconds
@@ -2121,8 +2158,8 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 /// SegmentWriter so it's included in the next segment flush to disk.
 /// This is the designed hot → warm flush path (UNIFIED_STORAGE_DESIGN §4.3).
 fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
-    const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
-    writer.addEntry(entry) catch {};
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    shard.segment_writer.addEntry(entry) catch {};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2135,6 +2172,11 @@ fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
 /// since the ProjectionRouter skips stream entries (UAL direct reads by design).
 /// Tracks the maximum entry index seen for LSN restoration.
 ///
+const ReplaySegmentFile = struct {
+    first_index: u64,
+    path: []const u8,
+};
+
 /// If `replay_from` > 0, entries with index <= replay_from are skipped
 /// (already restored from a snapshot).
 fn replaySegments(
@@ -2148,56 +2190,83 @@ fn replaySegments(
     var dir = @import("stdx").fs.openDir(dir_path, .{ .iterate = true }) catch return;
     defer @import("stdx").fs.closeDir(dir);
 
+    var segment_files: std.ArrayListUnmanaged(ReplaySegmentFile) = .empty;
+    defer {
+        for (segment_files.items) |sf| allocator.free(sf.path);
+        segment_files.deinit(allocator);
+    }
+
     const io = @import("stdx").io.instance();
     var iter = dir.iterate();
     while (iter.next(io) catch null) |de| {
         if (de.kind != .file) continue;
-        // Match .flseg extension
         if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
+        const first_index = parseSegmentFilenameIndex(de.name) orelse continue;
 
-        // Build full path
-        var path_buf: [512]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, de.name }) catch continue;
+        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, de.name }) catch continue;
+        segment_files.append(allocator, .{ .first_index = first_index, .path = full_path }) catch {
+            allocator.free(full_path);
+        };
+    }
 
-        // Open and read the segment file
-        const result = SegmentReader.initFromFile(allocator, full_path) catch continue;
-        defer allocator.free(result.buf);
+    // Directory iteration order is undefined; replay in Raft index order so the
+    // projection router's applied_index guard does not skip lower-index entries.
+    std.mem.sort(ReplaySegmentFile, segment_files.items, {}, replaySegmentFileLessThan);
 
-        // Iterate entries and apply to partition (UAL + projections)
-        var offset: usize = 0;
-        const data_len = result.reader.data_end - result.reader.data_start;
-        while (offset < data_len) {
-            const seg_entry = result.reader.readEntryAt(offset) orelse break;
+    for (segment_files.items) |sf| {
+        replaySegmentFile(allocator, sf.path, partition, max_index, replay_registry, replay_from);
+    }
+}
 
-            // Skip entries already covered by snapshot
-            if (replay_from > 0 and seg_entry.header.index <= replay_from) {
-                // Still track max index for LSN restoration
-                if (seg_entry.header.index > max_index.*) {
-                    max_index.* = seg_entry.header.index;
-                }
-                offset += seg_entry.totalSize();
-                continue;
-            }
+fn replaySegmentFileLessThan(_: void, a: ReplaySegmentFile, b: ReplaySegmentFile) bool {
+    return a.first_index < b.first_index;
+}
 
-            // Apply to UAL + projection router (handles KV, queue, TS routing)
-            const ual_index = partition.apply(&seg_entry) catch {
-                offset += seg_entry.totalSize();
-                continue;
-            };
-            _ = ual_index;
+/// Parse the leading index from a segment filename (`{index:0>10}.flseg`).
+fn parseSegmentFilenameIndex(name: []const u8) ?u64 {
+    if (!std.mem.endsWith(u8, name, ".flseg")) return null;
+    const index_part = name[0 .. name.len - ".flseg".len];
+    return std.fmt.parseInt(u64, index_part, 10) catch null;
+}
 
-            // Dispatch to registered handlers (stream, queue, ts, workflow, namespace, actions, etc.)
-            // Replaces hardcoded if/else chains — handlers register their entry
-            // types with the ReplayRegistry during init.
-            _ = replay_registry.dispatch(&seg_entry);
+fn replaySegmentFile(
+    allocator: std.mem.Allocator,
+    full_path: []const u8,
+    partition: *Partition,
+    max_index: *u64,
+    replay_registry: *const ReplayRegistry,
+    replay_from: u64,
+) void {
+    const result = SegmentReader.initFromFile(allocator, full_path) catch return;
+    defer allocator.free(result.buf);
 
-            // Track max index for LSN restoration
+    var offset: usize = 0;
+    const data_len = result.reader.data_end - result.reader.data_start;
+    while (offset < data_len) {
+        const seg_entry = result.reader.readEntryAt(offset) orelse break;
+
+        // Skip entries already covered by snapshot
+        if (replay_from > 0 and seg_entry.header.index <= replay_from) {
             if (seg_entry.header.index > max_index.*) {
                 max_index.* = seg_entry.header.index;
             }
-
             offset += seg_entry.totalSize();
+            continue;
         }
+
+        const ual_index = partition.apply(&seg_entry) catch {
+            offset += seg_entry.totalSize();
+            continue;
+        };
+        _ = ual_index;
+
+        _ = replay_registry.dispatch(&seg_entry);
+
+        if (seg_entry.header.index > max_index.*) {
+            max_index.* = seg_entry.header.index;
+        }
+
+        offset += seg_entry.totalSize();
     }
 }
 
@@ -2210,7 +2279,7 @@ test "Shard: init and deinit" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
     defer shard.deinit();
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
@@ -2223,7 +2292,7 @@ test "Shard: add and remove connections" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
@@ -2244,7 +2313,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
     defer shard.deinit();
 
     // Track dispatched pings
@@ -2292,7 +2361,7 @@ test "Shard: inbox shutdown message" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
     defer shard.deinit();
 
     shard.running = true;
@@ -2314,4 +2383,14 @@ test "Shard: inbox shutdown message" {
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
     try std.testing.expect(!shard.running);
+}
+
+test "replay: segment filenames sort by first_index" {
+    try std.testing.expectEqual(@as(?u64, 2), parseSegmentFilenameIndex("0000000002.flseg"));
+    try std.testing.expectEqual(@as(?u64, 42), parseSegmentFilenameIndex("0000000042.flseg"));
+    try std.testing.expect(parseSegmentFilenameIndex("bad.flseg") == null);
+
+    const a = ReplaySegmentFile{ .first_index = 10, .path = "" };
+    const b = ReplaySegmentFile{ .first_index = 3, .path = "" };
+    try std.testing.expect(replaySegmentFileLessThan({}, b, a));
 }

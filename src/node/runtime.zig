@@ -387,6 +387,7 @@ pub const Runtime = struct {
                 self.config.tiered_log.hot_buffer_capacity,
                 self.config.tiered_log.max_hot_entries,
                 self.config.tiered_log.hot_flush_seconds,
+                self.config.durability,
             );
             shards_created += 1;
         }

@@ -61,6 +61,18 @@ pub const SegmentWriter = struct {
         self.sparse_index.deinit(self.allocator);
     }
 
+    /// Clear buffered entries after a segment has been flushed to disk.
+    pub fn reset(self: *SegmentWriter) void {
+        self.data.clearRetainingCapacity();
+        self.sparse_index.clearRetainingCapacity();
+        self.first_index = 0;
+        self.last_index = 0;
+        self.first_ts_ns = 0;
+        self.last_ts_ns = 0;
+        self.entry_count = 0;
+        self.entry_type_bitmap = 0;
+    }
+
     /// Add an entry to the segment.
     pub fn addEntry(self: *SegmentWriter, entry: *const Entry) !void {
         // Track sparse index (every Nth entry)

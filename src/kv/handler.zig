@@ -1074,6 +1074,13 @@ pub const KVHandler = struct {
     /// Apply all entries committed by Raft (commit_index > last_applied) to the
     /// KV projection. In single-node mode this is a tight synchronous loop since
     /// propose() advances commit_index immediately.
+    ///
+    /// Note: `kv.applyEntry` no-ops on non-KV entry types, so when this loop
+    /// drains multiple entries (e.g. when commit_index advances faster than
+    /// per-op apply calls), non-KV entries are silently skipped. Their
+    /// projection state is updated separately by the projection router at
+    /// `partition.apply` time (during propose) or by their owning handler's
+    /// own apply loop. Advancing `last_applied` past them here is intentional.
     fn applyCommittedEntries(shard: *Shard) void {
         const raft = shard.raft_node;
         while (raft.last_applied < raft.commit_index) {
@@ -1087,6 +1094,7 @@ pub const KVHandler = struct {
                 raft.last_applied = next_idx;
             }
         }
+        shard.syncFlushIfNeeded();
     }
 
     // ── Per-Shard Transactions ─────────────────────────────────────────

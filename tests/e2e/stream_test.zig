@@ -1269,6 +1269,58 @@ test "e2e/stream: multiple streams persist independently after restart" {
     try testing.expect(!result_b.contains("stream-a-data"));
 }
 
+test "e2e/stream: read data persists after restart (async_flush, graceful)" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .async_flush, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    const stream_name = "async-flush-persist";
+    try ctx.exec(&.{ "stream", "append", stream_name, "async-stream-value" });
+
+    try ctx.restartServer();
+
+    var after = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "10" });
+    defer after.deinit();
+    try testing.expect(after.contains("async-stream-value"));
+}
+
+test "e2e/stream: async_flush segment flush before restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .async_flush, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    const stream_name = "flush-stream";
+    try ctx.exec(&.{ "stream", "append", stream_name, "flush-msg" });
+
+    stdx.time.sleep(1_500 * std.time.ns_per_ms);
+
+    try ctx.restartServer();
+
+    var after = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "10" });
+    defer after.deinit();
+    try testing.expect(after.contains("flush-msg"));
+}
+
+test "e2e/stream: persists on same shard after kv set (regression)" {
+    // Regression: stream must survive replay when a kv_put shares the shard Raft log.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    const stream_name = "mixed-stream";
+    try ctx.exec(&.{ "kv", "set", "mixed-kv", "written-before-stream" });
+    try ctx.exec(&.{ "stream", "append", stream_name, "written-after-kv" });
+
+    try ctx.restartServer();
+
+    var after = try ctx.cli.run(&.{ "stream", "read", stream_name, "--start", "0-0", "--limit", "10" });
+    defer after.deinit();
+    try testing.expect(after.contains("written-after-kv"));
+}
+
 test "e2e/stream: immediate consistency after restart (regression)" {
     // Regression test: After server restart, rapid append/read cycles must
     // return consistent data immediately - no stale reads allowed.
