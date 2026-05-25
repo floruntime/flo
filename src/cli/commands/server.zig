@@ -60,12 +60,14 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     "flo server start --port 9000",
                     "flo server start --config /etc/flo/flo.toml",
                     "flo server start -p 9000 --data-dir /var/lib/flo",
+                    "flo server start --durability sync --data-dir /var/lib/flo",
                     "flo server start --join 192.168.1.10:9500",
                     "flo server start --join 192.168.1.10:9500,192.168.1.11:9500",
                 })
                 .stringFlag("config", 'c', "", "Path to flo.toml config file")
                 .uintFlag("port", 'p', 0, "TCP port to listen on (default: 9000)")
                 .stringFlag("data-dir", 'd', "", "Data directory for storage")
+                .stringFlag("durability", 0, "", "Storage durability: sync, async_flush, ephemeral")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
                 .uintFlag("partitions", 0, 0, "Number of virtual partitions (0=auto: max(4096, shards×32))")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
@@ -287,6 +289,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const partitions = ctx.getChangedUint("partitions");
     const log_level = ctx.getString("log-level");
     const log_format = ctx.getString("log-format");
+    const durability = ctx.getString("durability");
 
     // Cluster flags
     const join_addrs = ctx.getString("join");
@@ -310,8 +313,14 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         if (partitions) |p| @as(u32, @intCast(p)) else null,
         stdx.nullIfEmpty(u8, log_level),
         stdx.nullIfEmpty(u8, log_format),
+        stdx.nullIfEmpty(u8, durability),
     ) catch |err| {
-        ctx.printErr("Error loading configuration: {}\n", .{err});
+        switch (err) {
+            error.InvalidDurability => {
+                ctx.printErr("Invalid --durability value. Use: sync, async_flush, or ephemeral\n", .{});
+            },
+            else => ctx.printErr("Error loading configuration: {}\n", .{err}),
+        }
         return error.CommandFailed;
     };
     defer config.deinit();

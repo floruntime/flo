@@ -397,48 +397,17 @@ pub const StreamHandler = struct {
 
         const payload_value = if (req.value.len > 0) req.value else "";
 
-        // Persist through Raft for durability and replication
-        if (self.shard_ptr) |sptr| {
-            const shard = shardFromPtr(sptr);
-            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
-            };
-        }
-
-        // Apply locally: append to partition UAL (for stream reads) + projection router
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
-
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + payload_value.len;
-        const payload_buf = self.allocator.alloc(u8, payload_size) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+        // Persist through Raft, then apply the committed entry (same path as segment replay).
+        const sptr = self.shard_ptr orelse {
+            return .{ .err = .{ .code = .internal_error, .message = "shard not wired" } };
         };
-        defer self.allocator.free(payload_buf);
-
-        const entry = entry_mod.buildCommandEntry(
-            .stream_append,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            router.namespaceHash(req.namespace),
-            req.key,
-            payload_value,
-            payload_buf,
-        ) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+        const shard = shardFromPtr(sptr);
+        const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
         };
 
-        // Apply to partition UAL (for stream payload reads) + warm store
-        const ual_index = self.partition.apply(&entry) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-        };
-
-        // Track in per-stream state
-        const ns_hash = router.namespaceHash(req.namespace);
-        const name_hash = router.nameHash(ns_hash, req.key);
-        const stream_id = self.stream.appendToStream(name_hash, ual_index, partition_index) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "append failed" } };
+        const stream_id = self.applyCommittedStreamEntries(shard, raft_index, partition_index) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
 
         // Register stream name for listing (namespace-qualified)
@@ -1403,39 +1372,10 @@ pub const StreamHandler = struct {
         std.mem.writeInt(u16, batch_buf[8 + payload.len ..][0..2], 0, .little); // header_count=0
         const batch_value = batch_buf[0..batch_size];
 
-        // Persist through Raft for durability and replication
-        if (self.shard_ptr) |sptr| {
-            const shard = shardFromPtr(sptr);
-            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, batch_value) catch {};
-        }
-
-        // Apply locally: append to partition UAL + warm store
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
-
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + stream_name.len + batch_value.len;
-        const payload_buf = try self.allocator.alloc(u8, payload_size);
-        defer self.allocator.free(payload_buf);
-
-        const ns_hash_u32 = router.namespaceHash(namespace);
-
-        const entry = entry_mod.buildCommandEntry(
-            .stream_append,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash_u32,
-            stream_name,
-            batch_value,
-            payload_buf,
-        ) orelse return error.EntryBuildFailed;
-
-        const ual_index = try self.partition.apply(&entry);
-
-        // Track in per-stream state
-        const name_hash = router.nameHash(ns_hash_u32, stream_name);
-        const stream_id = try self.stream.appendToStream(name_hash, ual_index, 0);
+        const sptr = self.shard_ptr orelse return error.ShardPtrNotSet;
+        const shard = shardFromPtr(sptr);
+        const raft_index = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, batch_value);
+        const stream_id = try self.applyCommittedStreamEntries(shard, raft_index, 0);
 
         // Register the stream name so it appears in `stream list`
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -1572,6 +1512,51 @@ pub const StreamHandler = struct {
         }
     }
 
+    // ── Raft apply ──────────────────────────────────────────────────────
+
+    /// Apply committed Raft entries up to `through_index` for stream types.
+    /// Advances `last_applied` so stream indices stay aligned with the Raft log.
+    ///
+    /// Note: when this loop drains multiple entries (e.g. when commit_index
+    /// has advanced faster than per-op apply calls), non-stream entries are
+    /// silently skipped. Their projection state is updated separately by the
+    /// projection router at `partition.apply` time (during propose) or by
+    /// their owning handler's own apply loop. Advancing `last_applied` past
+    /// them here is intentional. Trim entries are likewise skipped — they
+    /// were already applied in-place by `persistAndApplyTrim`.
+    fn applyCommittedStreamEntries(
+        self: *StreamHandler,
+        shard: *Shard,
+        through_index: u64,
+        partition_index: u32,
+    ) !StreamID {
+        const raft = shard.raft_node;
+        var last_id = StreamID.MIN;
+
+        while (raft.last_applied < through_index) {
+            const next_idx = raft.last_applied + 1;
+            if (raft.log.getEntry(next_idx)) |entry| {
+                const etype: EntryType = @enumFromInt(entry.header.entry_type);
+                if (etype == .stream_append) {
+                    last_id = try self.applyStreamAppendEntry(&entry, partition_index);
+                }
+                // .stream_trim: applied in-place by persistAndApplyTrim; skip.
+                // other types: owned by another handler's apply loop; skip.
+            }
+            raft.last_applied = next_idx;
+        }
+
+        shard.syncFlushIfNeeded();
+        return last_id;
+    }
+
+    fn applyStreamAppendEntry(self: *StreamHandler, entry: *const entry_mod.Entry, partition_index: u32) !StreamID {
+        const ual_index = try self.partition.apply(entry);
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.InvalidPayload;
+        const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+        return self.stream.appendToStream(name_hash, ual_index, partition_index);
+    }
+
     // ── Replay ──────────────────────────────────────────────────────────
 
     /// Register stream entry types with the replay registry.
@@ -1584,15 +1569,18 @@ pub const StreamHandler = struct {
 
     /// Replay a stream entry — rebuild StreamProjection offset tracking
     /// and stream name registration from a persisted entry.
+    ///
+    /// `replaySegments` has already called `partition.apply(entry)` before
+    /// dispatch, so this callback must NOT re-apply — doing so would
+    /// double-write to the partition UAL ring and corrupt `entry_count`.
+    /// Use `entry.header.index` directly as the UAL index for stream lookups.
     fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
 
         if (etype == .stream_append) {
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                const ns_hash: u64 = @as(u64, cmd.namespace_hash);
-                const name_hash = std.hash.Wyhash.hash(ns_hash, cmd.key);
-                // Use the entry's index as the UAL index for stream reads
+                const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 _ = self.stream.appendToStream(name_hash, entry.header.index, 0) catch {};
                 self.stream.registerStream(cmd.key) catch {};
             }

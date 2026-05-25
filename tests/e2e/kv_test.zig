@@ -581,6 +581,52 @@ test "e2e/kv: data persists across server restart (sync durability)" {
     try testing.expect(std.mem.indexOf(u8, post, "post_restart_value") != null);
 }
 
+test "e2e/kv: data persists across restart (async_flush, graceful)" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .async_flush, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "async-kv", "async-kv-value" });
+    try ctx.restartServer();
+
+    const out = try ctx.execCapture(&.{ "kv", "get", "async-kv" });
+    try testing.expect(std.mem.indexOf(u8, out, "async-kv-value") != null);
+}
+
+test "e2e/kv: async_flush segment flush before restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .async_flush, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "flush-kv", "flush-val" });
+
+    // Wait for background segment_flush task (interval ~1s).
+    stdx.time.sleep(1_500 * std.time.ns_per_ms);
+
+    try ctx.restartServer();
+
+    const out = try ctx.execCapture(&.{ "kv", "get", "flush-kv" });
+    try testing.expect(std.mem.indexOf(u8, out, "flush-val") != null);
+}
+
+test "e2e/kv: persists on same shard after stream append (regression)" {
+    // Regression: KV must survive replay when a stream_append shares the shard Raft log.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync, .shards = 1 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "mixed-kv", "written-before-stream" });
+    try ctx.exec(&.{ "stream", "append", "mixed-stream", "written-after-kv" });
+
+    try ctx.restartServer();
+
+    const out = try ctx.execCapture(&.{ "kv", "get", "mixed-kv" });
+    try testing.expect(std.mem.indexOf(u8, out, "written-before-stream") != null);
+}
+
 test "e2e/kv: immediate consistency after restart (regression)" {
     // Regression test: After server restart, the first few GET/SET operations
     // were returning stale data before the system "stabilized".
