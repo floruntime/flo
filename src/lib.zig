@@ -97,3 +97,10 @@ pub const processing = struct {
 // Auth: API keys, session tokens, key store
 // =============================================================================
 pub const auth = @import("auth/mod.zig");
+
+// =============================================================================
+// CLI client primitives (raw TCP protocol client) — exposed for e2e/integration
+// tests that need to drive multiple concurrent connections against a live
+// server. Does NOT pull in the heavier `cli` commander/commands tree.
+// =============================================================================
+pub const cli_client = @import("cli/client/mod.zig");
