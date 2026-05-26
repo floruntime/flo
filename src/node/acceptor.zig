@@ -127,21 +127,39 @@ pub const Acceptor = struct {
     }
 
     /// Peek at the first bytes using MSG_PEEK and determine the target shard.
-    /// Uses a brief poll() to wait for data — the client may not have sent
-    /// the request yet immediately after the TCP handshake completes.
+    ///
+    /// We use a brief `poll()` to detect whether the client has already sent
+    /// bytes. If yes, we `MSG_PEEK` to extract the routing key. If the fd is
+    /// still idle after the wait, we **must not** call `MSG_PEEK` — under
+    /// Docker Desktop's userland proxy (vpnkit) on macOS, performing
+    /// `recvfrom(MSG_PEEK)` on an idle accepted fd corrupts the proxy's state
+    /// so that subsequent writes on sibling connections from the same source
+    /// IP are silently dropped (writes succeed at the container kernel, but
+    /// bytes never reach the client). Confirmed empirically: skipping the
+    /// `MSG_PEEK` for idle fds takes the docker dual-join from 0/5 → 5/5
+    /// passes; native (kqueue) is unaffected.
+    ///
+    /// Idle connections fall back to round-robin routing; if the request
+    /// later turns out to belong on a different shard, the async
+    /// `forwardToShard` inbox path forwards it to the data shard.
     fn peekAndRoute(self: *Acceptor, fd: i32) u16 {
         var peek_buf: [128]u8 = undefined;
 
-        // Wait up to 10 ms for data to arrive before peeking.
-        // Typically resolves in < 1 ms; prevents round-robin mis-routing
-        // when the client's first write hasn't reached the kernel buffer
-        // by the time the acceptor runs.
+        // Wait up to 10 ms for data to arrive. Typically resolves in < 1 ms.
         var fds = [_]std.posix.pollfd{.{
             .fd = fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
         _ = std.posix.poll(&fds, 10) catch {};
+
+        // Only call MSG_PEEK if poll reported readable data. An idle fd
+        // (no POLL.IN) gets round-robined without ever touching the
+        // kernel's recv buffer — see comment above.
+        const ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+        if (!ready) {
+            return self.roundRobin();
+        }
 
         const peeked = peekFd(fd, &peek_buf);
 

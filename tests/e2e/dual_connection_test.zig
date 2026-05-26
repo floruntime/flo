@@ -69,6 +69,48 @@ test "e2e/stream: FLO-093 control — single connection group_join is fast" {
     try testing.expect(elapsed < JOIN_BUDGET_MS);
 }
 
+test "e2e/stream: dual-conn group_join across many streams (cross-shard fanout)" {
+    // Exercises the async forward path: with shards=4 and stream names whose
+    // hashes spread across shards, every group_join is likely to route to a
+    // shard other than the connection's owner — i.e. through forwardToShard +
+    // inbox. Each must complete in <1s with an idle parent connection.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    const stream_names = [_][]const u8{
+        "fanout-a", "fanout-b", "fanout-c", "fanout-d",
+        "fanout-e", "fanout-f", "fanout-g", "fanout-h",
+    };
+    inline for (stream_names) |s| {
+        try ctx.exec(&.{ "stream", "append", s, "seed" });
+    }
+
+    var conn_a = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+    defer conn_a.deinit();
+    try conn_a.connect();
+
+    stdx.time.sleep(50 * std.time.ns_per_ms);
+
+    var conn_b = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+    defer conn_b.deinit();
+    try conn_b.connect();
+    conn_b.setReadTimeoutSec(JOIN_READ_TIMEOUT_SEC);
+
+    inline for (stream_names) |s| {
+        const t0 = stdx.time.milliTimestamp();
+        var resp = src.cli_client.stream.groupJoin(&conn_b, NS, s, GROUP, "fanout-consumer") catch |err| {
+            std.debug.print("\n[fanout] group_join on '{s}' failed: {s}\n", .{ s, @errorName(err) });
+            return err;
+        };
+        defer resp.deinit();
+        const elapsed = stdx.time.milliTimestamp() - t0;
+        try testing.expectEqual(@as(@TypeOf(resp.status), .ok), resp.status);
+        try testing.expect(elapsed < JOIN_BUDGET_MS);
+    }
+}
+
 test "e2e/stream: FLO-093 repro — dual-connection group_join completes <1s" {
     // shards=4 so the acceptor round-robins conn A and conn B onto different
     // reactor threads, forcing requests to traverse forwardToShard.

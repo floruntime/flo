@@ -213,6 +213,15 @@ pub const Shard = struct {
     /// Enables sending messages to other shards' inboxes.
     peer_inboxes: ?[]*Inbox,
 
+    /// Per-shard proxy Connection used to drive forwarded requests on this
+    /// shard's reactor thread. The real Connection lives on the owner shard;
+    /// this proxy carries (fd, conn_id, owner_shard) so handlers register
+    /// waiters with the correct routing target, and accumulates direct
+    /// responses in its `write_buf` for cross-shard delivery via the inbox.
+    /// Reused sequentially — safe because each shard's reactor is single-
+    /// threaded and `drainInbox` processes one message at a time.
+    forward_proxy: *Connection,
+
     /// Cluster partition table (null in single-node mode).
     partition_table: ?*PartitionTable,
 
@@ -250,6 +259,15 @@ pub const Shard = struct {
 
         var inbox = try Inbox.init(allocator, 1024);
         errdefer inbox.deinit();
+
+        // Forward-proxy Connection: drives requests forwarded from peer
+        // shards. fd=-1 means "no kernel socket" — handlers only touch
+        // write_buf / response_deferred / metadata, never the fd.
+        const forward_proxy = try allocator.create(Connection);
+        errdefer allocator.destroy(forward_proxy);
+        forward_proxy.* = try Connection.init(allocator, -1, 0, @as(u16, @intCast(shard_id)));
+        forward_proxy.protocol = .binary;
+        errdefer forward_proxy.deinit();
 
         // Create the default partition (1 per shard for now).
         // The partition owns UAL + ProjectionRouter + all four projections.
@@ -486,6 +504,7 @@ pub const Shard = struct {
             .forwarder = null,
             .peer_shards = null,
             .peer_inboxes = null,
+            .forward_proxy = forward_proxy,
             .partition_table = null,
             .coordinator = null,
             .replay_registry = replay_registry,
@@ -603,6 +622,9 @@ pub const Shard = struct {
         self.allocator.destroy(self.workflow_handler);
         self.processing_handler.deinit();
         self.allocator.destroy(self.processing_handler);
+
+        self.forward_proxy.deinit();
+        self.allocator.destroy(self.forward_proxy);
 
         self.inbox.deinit();
         self.slab.deinit();
@@ -790,12 +812,58 @@ pub const Shard = struct {
         }
     }
 
+    /// Allocate and re-serialize a parsed Request back to wire bytes so it
+    /// can be passed to another shard via the inbox. Mirrors the layout
+    /// `proto.Request.parse` consumes: header (32 B) + payload
+    /// `[ns_len:u16][ns][key_len:u16][key][value_len:u32][value][opts_len:u16][opts]`.
+    /// CRC is preserved from the original header so the receiver re-validates.
+    fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
+        const header_size = @sizeOf(proto.RequestHeader);
+        const total = header_size + req.header.payload_length;
+        const buf = try allocator.alloc(u8, total);
+        errdefer allocator.free(buf);
+
+        @memcpy(buf[0..header_size], std.mem.asBytes(&req.header));
+
+        var off: usize = header_size;
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.namespace.len), .little);
+        off += 2;
+        @memcpy(buf[off..][0..req.namespace.len], req.namespace);
+        off += req.namespace.len;
+
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.key.len), .little);
+        off += 2;
+        @memcpy(buf[off..][0..req.key.len], req.key);
+        off += req.key.len;
+
+        std.mem.writeInt(u32, buf[off..][0..4], @intCast(req.value.len), .little);
+        off += 4;
+        @memcpy(buf[off..][0..req.value.len], req.value);
+        off += req.value.len;
+
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.options.len), .little);
+        off += 2;
+        @memcpy(buf[off..][0..req.options.len], req.options);
+        off += req.options.len;
+
+        // Header.payload_length must match the recomposed payload exactly,
+        // otherwise the receiver's parse() will reject the message.
+        if (off != total) return error.RequestSerializationMismatch;
+
+        return buf;
+    }
+
     /// Forward a request to a different shard in single-node mode.
     ///
-    /// Uses the peer_shards array to dispatch on the target shard's handlers
-    /// directly from the current thread. Thread safety is provided by per-handler
-    /// mutexes (e.g., ActionsHandler.runs_mu). The response is written to the
-    /// connection on the current thread (same thread owns the connection).
+    /// Marshals the request to the target shard's inbox as a `forward_request`.
+    /// The target shard re-parses and dispatches the request on its own
+    /// reactor thread (its handlers' state is therefore only ever touched by
+    /// one thread). The response — direct bytes or a deferred blocking-read
+    /// completion — is shipped back to the owner shard via `deferred_response`
+    /// and written to the client there. See `runForwardedRequest`.
+    ///
+    /// If the target inbox is full, falls back to an `overloaded` error so
+    /// the client retries instead of hanging.
     fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request) void {
         const peers = self.peer_shards orelse {
             // No peer shards wired — fall back to local dispatch
@@ -806,8 +874,43 @@ pub const Shard = struct {
             self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
             return;
         }
+        if (target_shard_id == @as(u16, @intCast(self.id))) {
+            // Already on the right shard — dispatch locally.
+            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            return;
+        }
         const target = peers[target_shard_id];
-        target.dispatcher.dispatch(@ptrCast(target), @ptrCast(conn), req);
+
+        // Serialize request (header + recomposed payload) onto the heap so the
+        // target shard can re-parse it after the source buffer is gone.
+        const buf = serializeRequest(self.allocator, req) catch {
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "forward alloc failed");
+            return;
+        };
+
+        // Pack (conn_id << 32) | fd into sequence so the target/owner can
+        // verify the connection's generation before writing a response.
+        const fd_bits: u64 = @as(u32, @bitCast(conn.fd));
+        const seq: u64 = (@as(u64, conn.id) << 32) | fd_bits;
+
+        const ok = target.inbox.send(.{
+            .tag = .forward_request,
+            .src_shard = @intCast(self.id),
+            .payload_len = @intCast(buf.len),
+            .sequence = seq,
+            .payload_ptr = buf.ptr,
+        });
+        if (!ok) {
+            self.allocator.free(buf);
+            self.sendErrorResponse(conn, req.header.request_id, .overloaded, "forward inbox full");
+            return;
+        }
+
+        // The response will arrive asynchronously via the inbox. Suppress
+        // the "not implemented" guard in processRequests so the connection
+        // waits for the cross-shard reply rather than getting a stub error.
+        conn.recordForward();
+        conn.response_deferred = true;
     }
 
     // ─── Cross-Shard Walk ────────────────────────────────────────────────
@@ -928,7 +1031,67 @@ pub const Shard = struct {
             .raft_message => self.applyReplicatedEntry(msg),
             .action_invoke => self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self)),
             .deferred_response => self.deliverInboundResponse(msg),
+            .forward_request => self.runForwardedRequest(msg),
             else => {},
+        }
+    }
+
+    /// Drive a request that another shard forwarded to us. The request bytes
+    /// were marshalled into `msg.payload`; the connection's identity is packed
+    /// into `msg.sequence` as `(conn_id << 32) | fd`. `msg.src_shard` is the
+    /// shard that owns the connection.
+    ///
+    /// We re-parse the wire bytes, populate the per-shard `forward_proxy`
+    /// Connection with the owner's metadata, and dispatch on this shard's
+    /// reactor thread — so per-shard handler state is only ever touched by
+    /// the owning thread. Direct responses queued onto the proxy's write_buf
+    /// are then shipped back to the owner via `deliverDeferred`. Waiter-based
+    /// (blocking) responses already use the owner_shard/fd/conn_id captured
+    /// at registration time and round-trip via the existing FLO-093 path.
+    fn runForwardedRequest(self: *Shard, msg: InboxMessage) void {
+        const ptr = msg.payload_ptr orelse return;
+        const data: [*]u8 = @ptrCast(ptr);
+        defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
+        if (msg.payload_len == 0) return;
+
+        const bytes = data[0..msg.payload_len];
+        const req = proto.Request.parse(bytes) catch return;
+
+        const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
+        const conn_id: u32 = @truncate(msg.sequence >> 32);
+        const owner_shard: u16 = msg.src_shard;
+
+        // Reset the proxy for this dispatch. fd stays the *original* fd —
+        // it's not registered on this shard, but handlers only read it for
+        // waiter registration metadata, which is correct.
+        const proxy = self.forward_proxy;
+        proxy.fd = fd;
+        proxy.id = conn_id;
+        proxy.owner_shard = owner_shard;
+        proxy.protocol = .binary;
+        proxy.state = .active;
+        proxy.response_deferred = false;
+        proxy.write_buf.read_pos = 0;
+        proxy.write_buf.write_pos = 0;
+
+        proxy.recordRequest();
+        self.dispatcher.dispatch(@ptrCast(self), @ptrCast(proxy), req);
+
+        // Pull any queued direct response off the proxy and ship the bytes
+        // back to the owner. If the handler deferred the response (e.g. a
+        // blocking group_read registered a waiter), the waiter's later
+        // resolution will deliver via the same cross-shard inbox path.
+        const pending = proxy.write_buf.readable();
+        if (pending > 0) {
+            var temp_buf: [MAX_REQUEST_SIZE]u8 = undefined;
+            const n = proxy.write_buf.read(temp_buf[0..@min(pending, temp_buf.len)]);
+            self.deliverDeferred(owner_shard, fd, conn_id, temp_buf[0..n]);
+        } else if (!proxy.response_deferred) {
+            // Handler produced nothing — report not_implemented like the
+            // owner-side processRequests would.
+            var err_buf: [256]u8 = undefined;
+            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
+            self.deliverDeferred(owner_shard, fd, conn_id, serialized);
         }
     }
 
