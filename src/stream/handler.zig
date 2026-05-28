@@ -2169,7 +2169,8 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_configure_sweeper)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
-    try testing.expectEqual(@as(u16, 17), dispatcher.handler_count);
+    // 17 original + stream_group_claim + stream_group_configure_sweeper (FLO-102).
+    try testing.expectEqual(@as(u16, 19), dispatcher.handler_count);
 }
 
 test "stream handler: append" {
