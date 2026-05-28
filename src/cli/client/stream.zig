@@ -462,11 +462,57 @@ pub fn groupPending(
     stream: []const u8,
     group: []const u8,
 ) !Response {
-    // Wire format: [group_len:u16][group]
-    var writer = FixedWireWriter(256).init();
+    return groupPendingForConsumer(client, namespace, stream, group, null);
+}
+
+/// Get pending messages for a consumer group, optionally filtered to a
+/// single consumer's PEL. `consumer == null` returns the whole group's PEL.
+pub fn groupPendingForConsumer(
+    client: *Client,
+    namespace: []const u8,
+    stream: []const u8,
+    group: []const u8,
+    consumer: ?[]const u8,
+) !Response {
+    // Wire format: [group_len:u16][group]([consumer_len:u16][consumer])?
+    var writer = FixedWireWriter(512).init();
     try writer.writeLengthPrefixed(u16, group);
+    if (consumer) |c| {
+        try writer.writeLengthPrefixed(u16, c);
+    }
 
     return client.sendRequest(.stream_group_pending, namespace, stream, writer.bytes());
+}
+
+/// Claim pending entries (FLO-102) — cursor-based PEL scan.
+///
+/// Scans the group's PEL from `start_id` in StreamID order and claims up to
+/// `count` entries whose idle time ≥ `min_idle_ms` for `consumer`, returning
+/// the records (payload + headers) plus a trailing 16-byte next-cursor.
+///
+/// Drain own pending (reconnect): `min_idle_ms = 0`, `start_id = StreamID.MIN`.
+/// Steal from idle consumers (rebalance): `min_idle_ms > 0`.
+pub fn groupClaim(
+    client: *Client,
+    namespace: []const u8,
+    stream: []const u8,
+    group: []const u8,
+    consumer: []const u8,
+    min_idle_ms: u32,
+    start_id: StreamID,
+    count: u32,
+) !Response {
+    // Wire: [group_len:u16][group][consumer_len:u16][consumer]
+    //       [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32]
+    var writer = FixedWireWriter(512).init();
+    try writer.writeLengthPrefixed(u16, group);
+    try writer.writeLengthPrefixed(u16, consumer);
+    try writer.writeU32(min_idle_ms);
+    try writer.writeU64(start_id.timestamp_ms);
+    try writer.writeU64(start_id.sequence);
+    try writer.writeU32(count);
+
+    return client.sendRequest(.stream_group_claim, namespace, stream, writer.bytes());
 }
 
 /// Options for creating a consumer group

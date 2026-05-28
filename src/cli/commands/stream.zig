@@ -219,6 +219,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .about("Show pending messages in a consumer group")
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
+                        .stringFlag("consumer", 'c', "", "Filter to a single consumer's pending entries")
                         .action(wrapHandler(runGroupPending)),
                 )
                 .subcommand(
@@ -1334,8 +1335,11 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    // groupPending(client, namespace, stream, group)
-    var response = client_mod.stream.groupPending(&client, namespace, stream, group) catch |err| {
+    // Optional consumer filter
+    const consumer_filter = ctx.getString("consumer") orelse "";
+    const consumer_arg: ?[]const u8 = if (consumer_filter.len > 0) consumer_filter else null;
+
+    var response = client_mod.stream.groupPendingForConsumer(&client, namespace, stream, group, consumer_arg) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
