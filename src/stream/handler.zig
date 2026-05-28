@@ -2016,6 +2016,54 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     };
 }
 
+/// Build a wire-format group value: [group_len:u16][group].
+/// Forces the wire-format (namespace-qualified) decode path so it matches
+/// handleGroupClaim, which always qualifies.
+fn makeGroupValue(buf: []u8, group: []const u8) []const u8 {
+    std.mem.writeInt(u16, buf[0..2], @intCast(group.len), .little);
+    @memcpy(buf[2 .. 2 + group.len], group);
+    return buf[0 .. 2 + group.len];
+}
+
+/// Build a wire-format group+consumer value:
+/// [group_len:u16][group][consumer_len:u16][consumer].
+fn makeGroupConsumerValue(buf: []u8, group: []const u8, consumer: []const u8) []const u8 {
+    var pos: usize = 0;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(group.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + group.len], group);
+    pos += group.len;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(consumer.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + consumer.len], consumer);
+    pos += consumer.len;
+    return buf[0..pos];
+}
+
+/// Build a stream_group_claim wire value:
+/// [group_len:u16][group][consumer_len:u16][consumer]
+/// [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32].
+fn makeClaimValue(buf: []u8, group: []const u8, consumer: []const u8, min_idle_ms: u32, start_id: StreamID, count: u32) []const u8 {
+    var pos: usize = 0;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(group.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + group.len], group);
+    pos += group.len;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(consumer.len), .little);
+    pos += 2;
+    @memcpy(buf[pos .. pos + consumer.len], consumer);
+    pos += consumer.len;
+    std.mem.writeInt(u32, buf[pos..][0..4], min_idle_ms, .little);
+    pos += 4;
+    std.mem.writeInt(u64, buf[pos..][0..8], start_id.timestamp_ms, .little);
+    pos += 8;
+    std.mem.writeInt(u64, buf[pos..][0..8], start_id.sequence, .little);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], count, .little);
+    pos += 4;
+    return buf[0..pos];
+}
+
 /// Build a batch-format value for a single payload with no headers.
 /// Batch format: [count:u32][payload_len:u32][payload][header_count:u16]
 fn makeBatchValue(buf: []u8, payload: []const u8) []const u8 {
@@ -2410,6 +2458,86 @@ test "stream handler: group read and ack" {
     const ack_result = handler.handleCommand(ack_req);
     switch (ack_result) {
         .ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// NOTE: handler-level tests that need *delivered* records (append → group_read
+// → PEL) can't run in this minimal Partition harness — the append→Raft-apply
+// pipeline that materializes stream records is not wired here (the pre-existing
+// "group read and ack" test has the same limitation and returns 0 records).
+// The claim/pending *logic* over a populated PEL is covered by the projection
+// tests in projection/stream.zig; the full append→read→claim→ack round-trip is
+// covered by the Go SDK e2e test. The handler tests below exercise the wire
+// parse + response shape on an empty PEL, which needs no append pipeline.
+
+test "stream handler: group claim wire parse + empty response (FLO-102)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // Create the group (no deliveries → empty PEL).
+    var gbuf: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", makeGroupValue(&gbuf, "cg1"), ""));
+
+    // Claim against an empty PEL: 0 records, trailing cursor == StreamID.MAX.
+    var cbuf: [128]u8 = undefined;
+    const claim_result = handler.handleCommand(makeRequest(.stream_group_claim, "s1", makeClaimValue(&cbuf, "cg1", "worker", 0, StreamID.MIN, 10), ""));
+    switch (claim_result) {
+        .group_messages => |m| {
+            defer handler.freeResult(claim_result);
+            try testing.expect(m.data.len >= 4 + 16);
+            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, m.data[0..4], .little));
+            const cur_ts = std.mem.readInt(u64, m.data[m.data.len - 16 ..][0..8], .little);
+            const cur_seq = std.mem.readInt(u64, m.data[m.data.len - 8 ..][0..8], .little);
+            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cur_ts);
+            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cur_seq);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Claim on a non-existent group → group_not_found.
+    var cbuf2: [128]u8 = undefined;
+    const missing = handler.handleCommand(makeRequest(.stream_group_claim, "s1", makeClaimValue(&cbuf2, "nope", "worker", 0, StreamID.MIN, 10), ""));
+    switch (missing) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stream handler: group pending consumer filter wire parse (FLO-102)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var gbuf: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", makeGroupValue(&gbuf, "cg1"), ""));
+
+    // Empty PEL: both filtered and unfiltered pending parse and return 0.
+    var pbuf: [64]u8 = undefined;
+    const all = handler.handleCommand(makeRequest(.stream_group_pending, "s1", makeGroupValue(&pbuf, "cg1"), ""));
+    switch (all) {
+        .group_pending => |p| {
+            defer handler.freeResult(all);
+            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, p.data[0..4], .little));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const filtered = handler.handleCommand(makeRequest(.stream_group_pending, "s1", makeGroupConsumerValue(&pbuf, "cg1", "ca"), ""));
+    switch (filtered) {
+        .group_pending => |p| {
+            defer handler.freeResult(filtered);
+            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, p.data[0..4], .little));
+        },
         else => return error.TestUnexpectedResult,
     }
 }
