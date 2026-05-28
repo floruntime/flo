@@ -168,6 +168,30 @@ pub const StreamState = struct {
         return n;
     }
 
+    /// Resolve specific StreamIDs back to records. Output preserves the input
+    /// order; any ID not currently in the stream (trimmed, never appended, or
+    /// belonging to a different stream) is silently skipped. Returns the
+    /// number of records written to `buf`.
+    ///
+    /// Used by `stream_group_claim`: the projection's `ConsumerGroup.autoclaim`
+    /// returns just the IDs it claimed, and the wire handler resolves them to
+    /// full records (payload + headers) in one round-trip before sending the
+    /// response. Avoids a sparse `readRange` that would pull in unrelated IDs.
+    pub fn readByIds(self: *const StreamState, ids: []const StreamID, buf: []StreamRecord) usize {
+        const items = self.records.items;
+        if (items.len == 0) return 0;
+        var n: usize = 0;
+        for (ids) |id| {
+            if (n >= buf.len) break;
+            const idx = self.lowerBound(id);
+            if (idx >= items.len) continue;
+            if (!items[idx].id.eql(id)) continue;
+            buf[n] = items[idx];
+            n += 1;
+        }
+        return n;
+    }
+
     /// Number of live records.
     pub fn count(self: *const StreamState) usize {
         return self.records.items.len;
@@ -648,6 +672,16 @@ pub const StreamProjection = struct {
     pub fn readStreamAfter(self: *StreamProjection, name_hash: u64, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const ss = self.streams.getPtr(name_hash) orelse return 0;
         const n = ss.readAfter(after_id, filter_partition, buf);
+        self.stats.reads += n;
+        return n;
+    }
+
+    /// Resolve specific StreamIDs back to records (preserves input order, skips
+    /// missing IDs). Used by `stream_group_claim` to turn claimed PEL IDs into
+    /// full records (payload + headers) for the wire response.
+    pub fn readStreamByIds(self: *StreamProjection, name_hash: u64, ids: []const StreamID, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const n = ss.readByIds(ids, buf);
         self.stats.reads += n;
         return n;
     }
@@ -1317,6 +1351,42 @@ test "stream: StreamState append and read" {
     const n3 = ss.readAfter(id1, null, &buf);
     try testing.expectEqual(@as(usize, 2), n3);
     try testing.expect(buf[0].id.eql(id2));
+}
+
+test "stream: StreamState readByIds preserves order and skips missing" {
+    var ss = StreamState.init(42);
+    defer ss.deinit(testing.allocator);
+
+    const id1 = try ss.append(testing.allocator, 100, 0);
+    const id2 = try ss.append(testing.allocator, 101, 0);
+    const id3 = try ss.append(testing.allocator, 102, 0);
+    const id4 = try ss.append(testing.allocator, 103, 0);
+
+    // Sparse query: id3, id1 (out-of-order), id4 — should preserve input order
+    const query = [_]StreamID{ id3, id1, id4 };
+    var buf: [10]StreamRecord = undefined;
+    const n = ss.readByIds(&query, &buf);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expect(buf[0].id.eql(id3));
+    try testing.expect(buf[1].id.eql(id1));
+    try testing.expect(buf[2].id.eql(id4));
+
+    // Missing IDs are silently skipped
+    const fake = StreamID{ .timestamp_ms = 999_999_999, .sequence = 999 };
+    const query2 = [_]StreamID{ id2, fake, id3 };
+    const n2 = ss.readByIds(&query2, &buf);
+    try testing.expectEqual(@as(usize, 2), n2);
+    try testing.expect(buf[0].id.eql(id2));
+    try testing.expect(buf[1].id.eql(id3));
+
+    // Empty input
+    const empty: []const StreamID = &.{};
+    try testing.expectEqual(@as(usize, 0), ss.readByIds(empty, &buf));
+
+    // Buffer cap honored
+    const all = [_]StreamID{ id1, id2, id3, id4 };
+    var small: [2]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 2), ss.readByIds(&all, &small));
 }
 
 test "stream: StreamState trim" {
