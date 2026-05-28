@@ -1055,16 +1055,30 @@ pub const StreamHandler = struct {
     // ── GROUP PENDING ───────────────────────────────────────────────────
 
     fn handleGroupPending(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group]
+        // Wire format: [group_len:u16][group]  (consumer filter optional)
+        //   [group_len:u16][group][consumer_len:u16][consumer]
+        // The second length-prefixed field is optional; when present, the PEL
+        // is filtered to entries owned by that consumer. Old clients sending
+        // just [group_len][group] keep the previous unfiltered behavior.
+        var reader = WireReader.init(req.value);
         const decoded = decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
 
+        // Optional consumer filter (only valid for wire-format requests).
+        var consumer_filter: ?[]const u8 = null;
+        if (decoded.wire) {
+            _ = reader.readLengthPrefixed(u16); // skip group (already decoded)
+            if (reader.readLengthPrefixed(u16)) |c| {
+                if (c.len > 0) consumer_filter = c;
+            }
+        }
+
         // Get actual PEL entries
         var pel_buf: [MAX_READ_BATCH]PendingEntry = undefined;
-        const count = self.stream.groupPending(group_name, null, &pel_buf) catch |err| {
+        const count = self.stream.groupPending(group_name, consumer_filter, &pel_buf) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
