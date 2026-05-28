@@ -26,6 +26,12 @@ const CommandPayload = entry_mod.CommandPayload;
 pub const StreamID = stream_id_mod.StreamID;
 pub const StreamIdGenerator = stream_id_mod.StreamIdGenerator;
 
+/// Default consumer-group ack timeout: a delivered-but-unacked entry idle this
+/// long is re-nacked by the background sweeper (made claimable again).
+pub const DEFAULT_ACK_TIMEOUT_MS: u32 = 30_000;
+/// Default max delivery attempts before the sweeper drops a poison entry.
+pub const DEFAULT_MAX_DELIVER: u8 = 10;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Consumer Group Member
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -270,6 +276,15 @@ pub const ConsumerGroup = struct {
     pel: std.AutoArrayHashMapUnmanaged(u128, PendingEntry),
     /// Highest StreamID delivered to any consumer in this group.
     last_delivered_id: StreamID,
+    /// Idle time (ms) after which the background sweeper re-nacks a pending
+    /// entry (makes it claimable again). 0 = sweeper disabled for this group.
+    /// In-memory config — groups are not persisted (auto-created on read), so
+    /// this resets to the default on restart; see handleGroupCreate /
+    /// stream_group_configure_sweeper for runtime overrides. (FLO-102)
+    ack_timeout_ms: u32 = DEFAULT_ACK_TIMEOUT_MS,
+    /// Max delivery attempts before the sweeper drops an entry from the PEL
+    /// (poison-message guard). 0 = unlimited.
+    max_deliver: u8 = DEFAULT_MAX_DELIVER,
 
     pub fn init(allocator: Allocator, name: []const u8, created_at_ns: u64) !ConsumerGroup {
         const owned_name = try allocator.dupe(u8, name);
@@ -505,6 +520,66 @@ pub const ConsumerGroup = struct {
     /// Number of entries in the PEL.
     pub fn pelCount(self: *const ConsumerGroup) usize {
         return self.pel.count();
+    }
+
+    /// Update sweeper config. A value of `null` leaves that field unchanged.
+    pub fn configure(self: *ConsumerGroup, ack_timeout_ms: ?u32, max_deliver: ?u8) void {
+        if (ack_timeout_ms) |v| self.ack_timeout_ms = v;
+        if (max_deliver) |v| self.max_deliver = v;
+    }
+
+    /// Result of a sweeper pass over one group's PEL.
+    pub const SweepResult = struct {
+        /// Entries re-nacked (idle ≥ ack_timeout_ms): made claimable, delivery_count bumped.
+        renacked: u32 = 0,
+        /// Entries dropped from the PEL for exceeding max_deliver (poison).
+        dropped: u32 = 0,
+    };
+
+    /// Background-sweeper pass: for each PEL entry idle ≥ `ack_timeout_ms`,
+    /// either drop it (delivery_count > max_deliver, poison guard) or re-nack
+    /// it — reset the idle timer and bump delivery_count so a subsequent
+    /// claim/redelivery picks it up. No-op when ack_timeout_ms == 0.
+    ///
+    /// Dropped entries are removed with `fetchOrderedRemove` to preserve PEL
+    /// ordering (autoclaim's cursor invariant). Returns counts.
+    pub fn sweep(self: *ConsumerGroup, now_ms: u64) SweepResult {
+        if (self.ack_timeout_ms == 0) return .{};
+        var res: SweepResult = .{};
+
+        // Collect drop targets first; mutating the array map during iteration
+        // would invalidate the iterator.
+        var drop_buf: [256]u128 = undefined;
+        var drop_n: usize = 0;
+
+        var it = self.pel.iterator();
+        while (it.next()) |kv| {
+            const pe = kv.value_ptr;
+            const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
+            if (idle < self.ack_timeout_ms) continue;
+
+            if (self.max_deliver > 0 and pe.delivery_count >= self.max_deliver) {
+                if (drop_n < drop_buf.len) {
+                    drop_buf[drop_n] = kv.key_ptr.*;
+                    drop_n += 1;
+                }
+            } else {
+                // Re-nack: make the entry eligible for redelivery/claim.
+                pe.delivery_count += 1;
+                pe.last_delivery_ms = now_ms;
+                res.renacked += 1;
+            }
+        }
+
+        for (drop_buf[0..drop_n]) |key| {
+            if (self.pel.fetchOrderedRemove(key)) |kv| {
+                if (self.members.getPtr(kv.value.consumer)) |m| {
+                    if (m.pending_count > 0) m.pending_count -= 1;
+                }
+                res.dropped += 1;
+            }
+        }
+        return res;
     }
 };
 
@@ -831,6 +906,26 @@ pub const StreamProjection = struct {
     pub fn groupPelCount(self: *StreamProjection, group_name: []const u8) !usize {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         return group.pelCount();
+    }
+
+    /// Update a group's sweeper config (ack_timeout_ms / max_deliver).
+    /// `null` leaves a field unchanged.
+    pub fn configureGroup(self: *StreamProjection, group_name: []const u8, ack_timeout_ms: ?u32, max_deliver: ?u8) !void {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        group.configure(ack_timeout_ms, max_deliver);
+    }
+
+    /// Run the sweeper pass over every consumer group in this projection.
+    /// Returns the aggregate counts. Called from the shard's periodic task.
+    pub fn sweepAllGroups(self: *StreamProjection, now_ms: u64) ConsumerGroup.SweepResult {
+        var total: ConsumerGroup.SweepResult = .{};
+        var it = self.groups.iterator();
+        while (it.next()) |kv| {
+            const r = kv.value_ptr.sweep(now_ms);
+            total.renacked += r.renacked;
+            total.dropped += r.dropped;
+        }
+        return total;
     }
 
     // ─── Stream Name Registry ──────────────────────────────────────────────
@@ -1602,6 +1697,60 @@ test "stream: groupClaim transfers ownership" {
     var pel_buf: [10]PendingEntry = undefined;
     const n = try s.groupPending("mygroup", "c2", &pel_buf);
     try testing.expectEqual(@as(usize, 1), n);
+}
+
+test "stream: sweeper re-nacks idle entries then drops poison (FLO-102)" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 42;
+    _ = try s.appendToStream(hash, 100, 0);
+
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+    // Tight config: re-nack after 200ms idle, drop after 3 deliveries.
+    try s.configureGroup("g", 200, 3);
+
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf); // delivery_count=1, last=1000
+
+    // Not yet idle enough → no-op.
+    var r = s.sweepAllGroups(1100);
+    try testing.expectEqual(@as(u32, 0), r.renacked);
+    try testing.expectEqual(@as(u32, 0), r.dropped);
+
+    // Idle ≥ 200ms → re-nacked (delivery_count 1→2), still in PEL.
+    r = s.sweepAllGroups(1400);
+    try testing.expectEqual(@as(u32, 1), r.renacked);
+    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("g"));
+
+    // Re-nack again (2→3). Now delivery_count == max_deliver (3).
+    r = s.sweepAllGroups(1700);
+    try testing.expectEqual(@as(u32, 1), r.renacked);
+
+    // Next sweep: delivery_count (3) >= max_deliver (3) → dropped from PEL.
+    r = s.sweepAllGroups(2000);
+    try testing.expectEqual(@as(u32, 1), r.dropped);
+    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
+}
+
+test "stream: sweeper disabled when ack_timeout_ms is 0 (FLO-102)" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 7;
+    _ = try s.appendToStream(hash, 100, 0);
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+    try s.configureGroup("g", 0, 10); // ack_timeout_ms = 0 → sweeper off
+
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
+
+    const r = s.sweepAllGroups(1_000_000);
+    try testing.expectEqual(@as(u32, 0), r.renacked);
+    try testing.expectEqual(@as(u32, 0), r.dropped);
+    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("g"));
 }
 
 test "stream: groupAutoclaim auto-transfers idle entries" {
