@@ -261,8 +261,13 @@ pub const ConsumerGroup = struct {
     created_at_ns: u64,
     /// Allocator for member management.
     allocator: Allocator,
-    /// PEL — StreamID.order() → PendingEntry. Tracks delivered-but-unacked messages.
-    pel: std.AutoHashMap(u128, PendingEntry),
+    /// PEL — StreamID.order() → PendingEntry. Tracks delivered-but-unacked
+    /// messages. Array-backed so iteration order is stable for cursor-based
+    /// scans (`autoclaim` paginates with a `start_id` cursor). Inserts happen
+    /// at delivery time in monotonic StreamID order (`groupDeliver` reads
+    /// past `last_delivered_id`); removals use `fetchOrderedRemove` so the
+    /// order invariant is preserved.
+    pel: std.AutoArrayHashMapUnmanaged(u128, PendingEntry),
     /// Highest StreamID delivered to any consumer in this group.
     last_delivered_id: StreamID,
 
@@ -273,7 +278,7 @@ pub const ConsumerGroup = struct {
             .members = std.StringHashMap(Member).init(allocator),
             .created_at_ns = created_at_ns,
             .allocator = allocator,
-            .pel = std.AutoHashMap(u128, PendingEntry).init(allocator),
+            .pel = .empty,
             .last_delivered_id = StreamID.MIN,
         };
     }
@@ -284,7 +289,7 @@ pub const ConsumerGroup = struct {
             self.allocator.free(@constCast(kv.value_ptr.id));
         }
         self.members.deinit();
-        self.pel.deinit();
+        self.pel.deinit(self.allocator);
         self.allocator.free(@constCast(self.name));
     }
 
@@ -323,7 +328,7 @@ pub const ConsumerGroup = struct {
         var added: u32 = 0;
         for (records) |rec| {
             const key = rec.id.order();
-            const gop = try self.pel.getOrPut(key);
+            const gop = try self.pel.getOrPut(self.allocator, key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .{
                     .id = rec.id,
@@ -350,11 +355,15 @@ pub const ConsumerGroup = struct {
     }
 
     /// Acknowledge messages — remove from PEL. Returns count acked.
+    ///
+    /// Uses `fetchOrderedRemove` (not `fetchSwapRemove`) so the PEL stays
+    /// in insertion order, which equals StreamID order since deliveries
+    /// happen monotonically. `autoclaim`'s cursor-based scan depends on it.
     pub fn ack(self: *ConsumerGroup, ids: []const StreamID) u32 {
         var acked: u32 = 0;
         for (ids) |id| {
             const key = id.order();
-            if (self.pel.fetchRemove(key)) |kv| {
+            if (self.pel.fetchOrderedRemove(key)) |kv| {
                 if (self.members.getPtr(kv.value.consumer)) |m| {
                     if (m.pending_count > 0) m.pending_count -= 1;
                 }
@@ -404,33 +413,64 @@ pub const ConsumerGroup = struct {
         return claimed;
     }
 
-    /// Auto-claim idle PEL entries for a consumer. Returns count claimed and fills `out` with claimed IDs.
-    pub fn autoclaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) u32 {
+    /// Result of an `autoclaim` cursor scan.
+    pub const ClaimResult = struct {
+        /// Number of entries claimed (written to `out`).
+        count: u32,
+        /// Cursor to pass as `start_id` on the next call. `StreamID.MAX` means
+        /// the PEL has been fully scanned (no more entries past this batch).
+        next_cursor: StreamID,
+    };
+
+    /// Auto-claim PEL entries for a consumer, scanning in StreamID order from
+    /// `start_id`. Writes claimed IDs to `out`; returns the count plus a cursor
+    /// for the next page.
+    ///
+    /// Single cursor-based scan covers two use cases:
+    ///   * **Drain own pending** (reconnect): `new_consumer = me`, `min_idle_ms = 0`.
+    ///     Re-delivers entries this consumer already owns (bumps `delivery_count`,
+    ///     touches `last_delivery_ms`). Same-owner is **not** skipped — that's
+    ///     the whole point of the reconnect drain.
+    ///   * **Steal from idle consumers** (rebalance): `min_idle_ms > 0`.
+    ///     Transfers ownership to `new_consumer` for entries idle ≥ `min_idle_ms`.
+    ///     Entries that don't meet the idle threshold are passed over and the
+    ///     cursor advances past them (a scan covers each entry once).
+    ///
+    /// Relies on the array-backed PEL iterating in insertion order (== StreamID
+    /// order, since deliveries are monotonic and acks use `fetchOrderedRemove`).
+    pub fn autoclaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) ClaimResult {
         var result_count: u32 = 0;
         const start_order = start_id.order();
+        var next_cursor = StreamID.MAX;
         var it = self.pel.iterator();
         while (it.next()) |kv| {
-            if (result_count >= max_count or result_count >= out.len) break;
             if (kv.key_ptr.* < start_order) continue;
+            // Stop once the batch is full; the next unprocessed key becomes the
+            // cursor so the caller resumes exactly where we left off.
+            if (result_count >= max_count or result_count >= out.len) {
+                next_cursor = StreamID.fromOrder(kv.key_ptr.*);
+                break;
+            }
             const pe = kv.value_ptr;
-            // Skip entries already owned by the target consumer
-            if (std.mem.eql(u8, pe.consumer, new_consumer)) continue;
             const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
             if (idle >= min_idle_ms) {
-                if (self.members.getPtr(pe.consumer)) |m| {
-                    if (m.pending_count > 0) m.pending_count -= 1;
+                const same_owner = std.mem.eql(u8, pe.consumer, new_consumer);
+                if (!same_owner) {
+                    if (self.members.getPtr(pe.consumer)) |m| {
+                        if (m.pending_count > 0) m.pending_count -= 1;
+                    }
+                    pe.consumer = new_consumer;
+                    if (self.members.getPtr(new_consumer)) |m| {
+                        m.pending_count += 1;
+                    }
                 }
-                pe.consumer = new_consumer;
                 pe.last_delivery_ms = now_ms;
                 pe.delivery_count += 1;
-                if (self.members.getPtr(new_consumer)) |m| {
-                    m.pending_count += 1;
-                }
                 out[result_count] = pe.id;
                 result_count += 1;
             }
         }
-        return result_count;
+        return .{ .count = result_count, .next_cursor = next_cursor };
     }
 
     /// Touch pending entries — reset their idle timer.
@@ -769,8 +809,8 @@ pub const StreamProjection = struct {
         return group.claim(ids, consumer, min_idle_ms, now_ms);
     }
 
-    /// Auto-claim idle PEL entries in a consumer group.
-    pub fn groupAutoclaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !u32 {
+    /// Auto-claim PEL entries in a consumer group (cursor-based scan).
+    pub fn groupAutoclaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !ConsumerGroup.ClaimResult {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         return group.autoclaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
     }
@@ -1581,8 +1621,43 @@ test "stream: groupAutoclaim auto-transfers idle entries" {
 
     // Autoclaim after enough idle time (entries delivered at t=1000, now=5000, idle=4000ms)
     var out: [10]StreamID = undefined;
-    const claimed = try s.groupAutoclaim("mygroup", "c2", 3000, 5000, StreamID.MIN, 10, &out);
-    try testing.expectEqual(@as(u32, 2), claimed);
+    const res = try s.groupAutoclaim("mygroup", "c2", 3000, 5000, StreamID.MIN, 10, &out);
+    try testing.expectEqual(@as(u32, 2), res.count);
+    // Fully scanned → cursor is MAX
+    try testing.expect(res.next_cursor.eql(StreamID.MAX));
+
+    // Verify ownership transferred to c2
+    var pel_buf: [10]PendingEntry = undefined;
+    try testing.expectEqual(@as(usize, 2), try s.groupPending("mygroup", "c2", &pel_buf));
+}
+
+test "stream: groupAutoclaim drains own pending (reconnect) and paginates" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 77;
+    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStream(hash, 102, 0);
+
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "me", 1000);
+
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "me", 3, 1000, &rec_buf);
+
+    // Reconnect drain: min_idle_ms=0, same consumer — must return own entries
+    // (the old impl skipped same-owner and would return 0).
+    var out: [10]StreamID = undefined;
+    const page1 = try s.groupAutoclaim("g", "me", 0, 2000, StreamID.MIN, 2, &out);
+    try testing.expectEqual(@as(u32, 2), page1.count);
+    // Batch full at 2 < 3 entries → cursor points at the 3rd entry, not MAX
+    try testing.expect(!page1.next_cursor.eql(StreamID.MAX));
+
+    // Second page from the returned cursor picks up the remaining entry.
+    const page2 = try s.groupAutoclaim("g", "me", 0, 2000, page1.next_cursor, 10, &out);
+    try testing.expectEqual(@as(u32, 1), page2.count);
+    try testing.expect(page2.next_cursor.eql(StreamID.MAX));
 }
 
 test "stream: groupTouch resets idle timer" {

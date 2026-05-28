@@ -145,6 +145,14 @@ pub const StreamID = struct {
         return (@as(u128, self.timestamp_ms) << 64) | @as(u128, self.sequence);
     }
 
+    /// Inverse of `order` — reconstruct a StreamID from its u128 ordering key.
+    pub fn fromOrder(key: u128) StreamID {
+        return .{
+            .timestamp_ms = @intCast(key >> 64),
+            .sequence = @intCast(key & std.math.maxInt(u64)),
+        };
+    }
+
     /// Check if this ID is less than another
     pub fn lessThan(self: StreamID, other: StreamID) bool {
         return self.compare(other) == .lt;

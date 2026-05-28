@@ -119,6 +119,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_info, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_pending, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_touch, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_claim, dispatchStream, preRouteByStream);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -368,6 +369,7 @@ pub const StreamHandler = struct {
             .stream_group_info => self.handleGroupInfo(req),
             .stream_group_pending => self.handleGroupPending(req),
             .stream_group_touch => self.handleGroupTouch(req),
+            .stream_group_claim => self.handleGroupClaim(req),
 
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown stream opcode" } },
         };
@@ -1075,6 +1077,80 @@ pub const StreamHandler = struct {
         };
 
         return .{ .group_pending = .{ .data = data } };
+    }
+
+    // ── GROUP CLAIM ─────────────────────────────────────────────────────
+
+    /// Cursor-based PEL claim (FLO-102). Scans the group's pending entry list
+    /// from `start_id` in StreamID order, claims up to `count` entries whose
+    /// idle time ≥ `min_idle_ms` for `consumer`, and returns the full records
+    /// (payload + headers) plus a trailing 16-byte next-cursor.
+    ///
+    /// Wire (value):
+    ///   [group_len:u16][group]
+    ///   [consumer_len:u16][consumer]
+    ///   [min_idle_ms:u32]
+    ///   [start_id_ts:u64][start_id_seq:u64]
+    ///   [count:u32]
+    ///
+    /// Response (group_messages.data):
+    ///   <serializeStreamRecordsWithPayloads blob>
+    ///   [next_cursor_ts:u64][next_cursor_seq:u64]   ← 16-byte trailer
+    ///
+    /// `next_cursor == StreamID.MAX (max,max)` means the PEL has been fully
+    /// scanned. The SDK loops, feeding next_cursor back as start_id, until the
+    /// response carries zero records or the MAX sentinel.
+    ///
+    /// Drain-own-pending (reconnect) is `consumer = me`, `min_idle_ms = 0`,
+    /// `start_id = MIN`. Steal-from-idle (rebalance) is `min_idle_ms > 0`.
+    fn handleGroupClaim(self: *StreamHandler, req: Request) CommandResult {
+        var reader = WireReader.init(req.value);
+        const raw_group = reader.readLengthPrefixed(u16) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
+        };
+        const consumer_raw = reader.readLengthPrefixed(u16) orelse "";
+        const min_idle_ms: u64 = reader.readU32() orelse 0;
+        const start_ts = reader.readU64() orelse 0;
+        const start_seq = reader.readU64() orelse 0;
+        const count: u32 = reader.readU32() orelse DEFAULT_READ_BATCH;
+
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
+        const consumer_id = if (consumer_raw.len > 0) consumer_raw else "default";
+
+        const start_id = StreamID{ .timestamp_ms = start_ts, .sequence = start_seq };
+        const capped = @min(@as(usize, count), MAX_READ_BATCH);
+        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+
+        // Claim a page of PEL entries → IDs + next cursor.
+        var id_buf: [MAX_READ_BATCH]StreamID = undefined;
+        const claim_res = self.stream.groupAutoclaim(group_name, consumer_id, min_idle_ms, now_ms, start_id, capped, id_buf[0..capped]) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
+        };
+
+        // Resolve claimed IDs → full records (payload + headers) in one hop.
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
+        var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
+
+        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], req.key) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
+        };
+
+        // Append the 16-byte next-cursor to the records blob.
+        const data = self.allocator.alloc(u8, records_blob.len + 16) catch {
+            self.allocator.free(records_blob);
+            return .{ .err = .{ .code = .internal_error, .message = "claim alloc failed" } };
+        };
+        @memcpy(data[0..records_blob.len], records_blob);
+        self.allocator.free(records_blob);
+        std.mem.writeInt(u64, data[records_blob.len..][0..8], claim_res.next_cursor.timestamp_ms, .little);
+        std.mem.writeInt(u64, data[records_blob.len + 8 ..][0..8], claim_res.next_cursor.sequence, .little);
+
+        return .{ .group_messages = .{ .data = data } };
     }
 
     // ── GROUP TOUCH ─────────────────────────────────────────────────────
@@ -1987,6 +2063,7 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_info)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_pending)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_touch)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_claim)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
     try testing.expectEqual(@as(u16, 17), dispatcher.handler_count);
