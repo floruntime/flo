@@ -465,6 +465,20 @@ pub fn groupPending(
     return groupPendingForConsumer(client, namespace, stream, group, null);
 }
 
+/// Get consumer-group info: [pel_count:u64][member_count:u32][created_at_ns:u64].
+pub fn groupInfo(
+    client: *Client,
+    namespace: []const u8,
+    stream: []const u8,
+    group: []const u8,
+) !Response {
+    // Wire format: [group_len:u16][group]
+    var writer = FixedWireWriter(256).init();
+    try writer.writeLengthPrefixed(u16, group);
+
+    return client.sendRequest(.stream_group_info, namespace, stream, writer.bytes());
+}
+
 /// Get pending messages for a consumer group, optionally filtered to a
 /// single consumer's PEL. `consumer == null` returns the whole group's PEL.
 pub fn groupPendingForConsumer(

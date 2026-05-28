@@ -1294,8 +1294,7 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // groupPending(client, namespace, stream, group) - use pending for info
-    var response = client_mod.stream.groupPending(&client, namespace, stream, group) catch |err| {
+    var response = client_mod.stream.groupInfo(&client, namespace, stream, group) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -1306,11 +1305,23 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
+    // Wire format (serializeGroupInfo):
+    // [pel_count:u64][member_count:u32][created_at_ns:u64]
+    var reader = wire.WireReader.init(response.data);
+    const pel_count = reader.readU64() orelse 0;
+    const member_count = reader.readU32() orelse 0;
+    const created_at_ns = reader.readU64() orelse 0;
+
     if (json_output) {
-        ctx.print("{{\"stream\":\"{s}\",\"group\":\"{s}\",\"pending_count\":{d}}}\n", .{ stream, group, response.data.len });
+        ctx.print(
+            "{{\"stream\":\"{s}\",\"group\":\"{s}\",\"pending\":{d},\"members\":{d},\"created_at_ns\":{d}}}\n",
+            .{ stream, group, pel_count, member_count, created_at_ns },
+        );
     } else {
         ctx.print("Consumer Group: {s}/{s}\n", .{ stream, group });
-        ctx.print("  Pending: {d} bytes\n", .{response.data.len});
+        ctx.print("  Members:    {d}\n", .{member_count});
+        ctx.print("  Pending:    {d} message(s)\n", .{pel_count});
+        ctx.print("  Created at: {d} (ns)\n", .{created_at_ns});
     }
 }
 
