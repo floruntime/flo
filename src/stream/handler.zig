@@ -120,6 +120,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_pending, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_touch, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_claim, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_configure_sweeper, dispatchStream, preRouteByStream);
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -370,6 +371,7 @@ pub const StreamHandler = struct {
             .stream_group_pending => self.handleGroupPending(req),
             .stream_group_touch => self.handleGroupTouch(req),
             .stream_group_claim => self.handleGroupClaim(req),
+            .stream_group_configure_sweeper => self.handleGroupConfigureSweeper(req),
 
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown stream opcode" } },
         };
@@ -736,6 +738,34 @@ pub const StreamHandler = struct {
             };
         };
 
+        // Apply sweeper config from TLV options the CLI/SDK already sends
+        // (previously discarded). In-memory only — see ConsumerGroup config note.
+        applyGroupConfig(self, group_name, req);
+
+        return .ok;
+    }
+
+    // ── GROUP CONFIGURE SWEEPER ─────────────────────────────────────────
+
+    /// Update a group's ack_timeout_ms / max_deliver at runtime (FLO-102).
+    /// Wire value: [group_len:u16][group]; config carried as TLV options
+    /// (ack_timeout_ms = 0x30, max_deliver = 0x31). A missing option leaves
+    /// that field unchanged.
+    fn handleGroupConfigureSweeper(self: *StreamHandler, req: Request) CommandResult {
+        const decoded = decodeGroupName(req.value) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
+        };
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
+
+        const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
+        const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
+
+        self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
+        };
         return .ok;
     }
 
@@ -1779,6 +1809,16 @@ fn decodeGroupConsumer(req: Request) ?GroupConsumerDecode {
     return null;
 }
 
+/// Apply ack_timeout_ms / max_deliver TLV options (if present) to a group's
+/// in-memory sweeper config. Silently ignores a missing group (the caller
+/// just created it) and absent options.
+fn applyGroupConfig(self: *StreamHandler, group_name: []const u8, req: Request) void {
+    const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
+    const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
+    if (ack_timeout == null and max_deliver == null) return;
+    self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch {};
+}
+
 /// Namespace-qualify a group name when decoded from wire format.
 /// Wire-format requests carry the real namespace; fallback (unit test) requests
 /// abuse the namespace field, so we only qualify for wire-format decodes.
@@ -2126,6 +2166,7 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_pending)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_touch)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_claim)] != null);
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_configure_sweeper)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
     try testing.expectEqual(@as(u16, 17), dispatcher.handler_count);
@@ -2504,6 +2545,39 @@ test "stream handler: group claim wire parse + empty response (FLO-102)" {
     var cbuf2: [128]u8 = undefined;
     const missing = handler.handleCommand(makeRequest(.stream_group_claim, "s1", makeClaimValue(&cbuf2, "nope", "worker", 0, StreamID.MIN, 10), ""));
     switch (missing) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stream handler: group configure sweeper (FLO-102)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var gbuf: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", makeGroupValue(&gbuf, "cg1"), ""));
+
+    // Build TLV options: ack_timeout_ms=500, max_deliver=4.
+    var opt_buf: [32]u8 = undefined;
+    var builder = proto.OptionsBuilder.init(&opt_buf);
+    builder.addU32(.ack_timeout_ms, 500) catch unreachable;
+    builder.addU8(.max_deliver, 4) catch unreachable;
+    var cfg_buf: [64]u8 = undefined;
+    const cfg = handler.handleCommand(makeRequest(.stream_group_configure_sweeper, "s1", makeGroupValue(&cfg_buf, "cg1"), builder.getOptions()));
+    switch (cfg) {
+        .ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Configuring a missing group → group_not_found.
+    var miss_buf: [64]u8 = undefined;
+    const miss = handler.handleCommand(makeRequest(.stream_group_configure_sweeper, "s1", makeGroupValue(&miss_buf, "nope"), builder.getOptions()));
+    switch (miss) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
         else => return error.TestUnexpectedResult,
     }
