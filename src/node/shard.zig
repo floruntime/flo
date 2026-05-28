@@ -1235,6 +1235,18 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        // Consumer-group PEL sweeper (FLO-102) — runs every 1 second. Re-nacks
+        // pending entries idle past their group's ack_timeout_ms and drops
+        // poison entries past max_deliver. Local in-memory PEL mutation only
+        // (PEL is not persisted), so no Raft round-trip.
+        self.task_scheduler.register(
+            "stream_group_sweep",
+            1_000, // check every 1 second
+            1_000_000, // 1ms budget per invocation
+            streamGroupSweepTask,
+            @ptrCast(self),
+        ) catch {};
+
         // Persist Raft log entries to .flseg files (async_flush durability).
         if (self.shard_data_dir != null and self.durability == .async_flush) {
             self.task_scheduler.register(
@@ -1311,6 +1323,17 @@ pub const Shard = struct {
         }
 
         return total_trimmed;
+    }
+
+    /// TaskScheduler callback: sweep every consumer group's PEL (FLO-102).
+    /// Re-nacks entries idle past ack_timeout_ms and drops poison entries
+    /// past max_deliver. Returns renacked + dropped for scheduler accounting.
+    fn streamGroupSweepTask(ctx: *anyopaque, _: u64) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        const proj = self.stream_handler.stream;
+        const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
+        const r = proj.sweepAllGroups(now_ms);
+        return @as(u64, r.renacked) + @as(u64, r.dropped);
     }
 
     // ─── Event processing ────────────────────────────────────────────────
