@@ -13,6 +13,8 @@
 // Re-export base types
 pub const Client = @import("base.zig").Client;
 pub const Response = @import("base.zig").Response;
+/// StreamID used across the stream client API (groupAck/groupClaim ids, cursors).
+pub const StreamID = @import("../../stream/stream_id.zig").StreamID;
 
 // Re-export wire utilities from shared protocol module
 pub const wire = @import("../../util/wire.zig");

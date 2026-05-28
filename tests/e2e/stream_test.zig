@@ -9,10 +9,77 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const src = @import("src");
+const StreamID = src.cli_client.StreamID;
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Read the leading record/PEL count (u32 LE) from a group response blob.
+fn recordCount(data: []const u8) u32 {
+    if (data.len < 4) return 0;
+    return std.mem.readInt(u32, data[0..4], .little);
+}
+
+/// Parse StreamIDs out of a group_messages records blob (as returned by
+/// group_read / group_claim). Stops after `count` records, so a trailing
+/// claim cursor is ignored. Returns the number of IDs written to `out`.
+/// Record layout (serializeStreamRecordsWithPayloads):
+/// [count:u32]([seq:u64][ts:i64][tier:u8][partition:u32]
+///   [key_present:u8]([key_len:u32][key])?[payload_len:u32][payload]
+///   [hdr_count:u32]([k_len:u32][k][v_len:u32][v])* )*
+fn parseRecordIds(data: []const u8, out: []StreamID) usize {
+    if (data.len < 4) return 0;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    var pos: usize = 4;
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < count and n < out.len) : (i += 1) {
+        if (pos + 8 + 8 + 1 + 4 + 1 > data.len) break;
+        const seq = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        const ts = std.mem.readInt(i64, data[pos..][0..8], .little);
+        pos += 8;
+        pos += 1; // tier
+        pos += 4; // partition
+        const key_present = data[pos];
+        pos += 1;
+        if (key_present != 0) {
+            if (pos + 4 > data.len) break;
+            const klen = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4 + klen;
+        }
+        if (pos + 4 > data.len) break;
+        const plen = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4 + plen;
+        if (pos + 4 > data.len) break;
+        const hcount = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        var h: u32 = 0;
+        while (h < hcount) : (h += 1) {
+            if (pos + 4 > data.len) break;
+            const kl = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4 + kl;
+            if (pos + 4 > data.len) break;
+            const vl = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4 + vl;
+        }
+        out[n] = .{ .timestamp_ms = @intCast(ts), .sequence = seq };
+        n += 1;
+    }
+    return n;
+}
+
+/// True if a claim response's trailing 16-byte cursor is StreamID.MAX
+/// (PEL fully scanned).
+fn claimCursorIsMax(data: []const u8) bool {
+    if (data.len < 16) return false;
+    const off = data.len - 16;
+    const ts = std.mem.readInt(u64, data[off..][0..8], .little);
+    const seq = std.mem.readInt(u64, data[off + 8 ..][0..8], .little);
+    return ts == std.math.maxInt(u64) and seq == std.math.maxInt(u64);
+}
 
 /// Extract StreamID from command output (format: "Appended at <id>" or just the ID)
 fn extractStreamId(output: []const u8) ?[]const u8 {
@@ -569,6 +636,87 @@ test "e2e/stream: group pending" {
     defer result.deinit();
 
     try testing.expect(result.contains("Pending") or result.contains("pending") or result.succeeded());
+}
+
+test "e2e/stream: group claim redelivers unacked records, ack drains (FLO-102)" {
+    // The headline FLO-102 path over the full wire: deliver → (no ack) →
+    // claim re-returns the same records (crash-recovery redelivery) → ack →
+    // claim returns nothing. This is what GroupRead alone cannot do.
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const NS = "default";
+    const STREAM = "claim-redeliver";
+    const GROUP = "cg";
+    const CONSUMER = "worker-a";
+
+    // Seed 3 records.
+    for (0..3) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "msg-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", STREAM, msg });
+    }
+
+    var conn = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
+    defer conn.deinit();
+    try conn.connect();
+
+    // Deliver 3 to the consumer's PEL, no ack.
+    {
+        var r = try src.cli_client.stream.groupRead(&conn, NS, STREAM, GROUP, CONSUMER, 3, null);
+        defer r.deinit();
+        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
+        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
+    }
+
+    // GroupRead again returns 0 — last_delivered_id has advanced past them.
+    {
+        var r = try src.cli_client.stream.groupRead(&conn, NS, STREAM, GROUP, CONSUMER, 3, null);
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
+    }
+
+    // Claim drains the PEL: same 3 records come back (redelivery), cursor == MAX.
+    var ids: [8]StreamID = undefined;
+    var id_count: usize = 0;
+    {
+        var r = try src.cli_client.stream.groupClaim(&conn, NS, STREAM, GROUP, CONSUMER, 0, StreamID.MIN, 10);
+        defer r.deinit();
+        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
+        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
+        id_count = parseRecordIds(r.data, &ids);
+        try testing.expectEqual(@as(usize, 3), id_count);
+        // Trailing 16-byte cursor == StreamID.MAX (fully scanned).
+        try testing.expect(claimCursorIsMax(r.data));
+    }
+
+    // Pending shows all 3 for this consumer.
+    {
+        var r = try src.cli_client.stream.groupPendingForConsumer(&conn, NS, STREAM, GROUP, CONSUMER);
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
+    }
+
+    // Ack the claimed records.
+    {
+        var r = try src.cli_client.stream.groupAck(&conn, NS, STREAM, GROUP, CONSUMER, ids[0..id_count]);
+        defer r.deinit();
+        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
+    }
+
+    // Now claim returns nothing — PEL is drained.
+    {
+        var r = try src.cli_client.stream.groupClaim(&conn, NS, STREAM, GROUP, CONSUMER, 0, StreamID.MIN, 10);
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
+    }
+
+    // And pending is empty.
+    {
+        var r = try src.cli_client.stream.groupPendingForConsumer(&conn, NS, STREAM, GROUP, CONSUMER);
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
+    }
 }
 
 test "e2e/stream: group nack" {
