@@ -323,12 +323,47 @@ pub const ConsumerGroup = struct {
     }
 
     /// Remove a member from the group. Returns true if removed.
+    ///
+    /// If the member still owns PEL entries, we keep the member record (and its
+    /// owned `id` string) alive and just mark it `.leaving` — PEL entries point
+    /// their `consumer` slice at this owned string (see `internConsumer`), so
+    /// freeing it now would dangle. The record is reclaimed once the last
+    /// pending entry is acked/dropped (via `reapLeftMember`).
     pub fn leave(self: *ConsumerGroup, member_id: []const u8) bool {
+        if (self.members.getPtr(member_id)) |m| {
+            if (m.pending_count > 0) {
+                m.state = .leaving;
+                return true;
+            }
+        }
         if (self.members.fetchRemove(member_id)) |kv| {
             self.allocator.free(@constCast(kv.value.id));
             return true;
         }
         return false;
+    }
+
+    /// Ensure `consumer_id` is a member and return the group-owned copy of its
+    /// id. PEL entries store this owned slice as their `consumer` so it stays
+    /// valid after the request buffer that carried `consumer_id` is freed.
+    /// Best-effort: on OOM falls back to the caller's slice (dangle only under
+    /// allocation failure, which is already fatal elsewhere).
+    fn internConsumer(self: *ConsumerGroup, consumer_id: []const u8) []const u8 {
+        if (self.members.getPtr(consumer_id)) |m| return m.id;
+        _ = self.join(consumer_id, 0) catch return consumer_id;
+        if (self.members.getPtr(consumer_id)) |m| return m.id;
+        return consumer_id;
+    }
+
+    /// Drop a `.leaving` member once it has no pending entries left.
+    fn reapLeftMember(self: *ConsumerGroup, member_id: []const u8) void {
+        if (self.members.getPtr(member_id)) |m| {
+            if (m.state == .leaving and m.pending_count == 0) {
+                if (self.members.fetchRemove(member_id)) |kv| {
+                    self.allocator.free(@constCast(kv.value.id));
+                }
+            }
+        }
     }
 
     pub fn memberCount(self: *const ConsumerGroup) usize {
@@ -341,13 +376,14 @@ pub const ConsumerGroup = struct {
     /// `records` are the StreamRecords being delivered. Returns count added to PEL.
     pub fn deliver(self: *ConsumerGroup, consumer_id: []const u8, records: []const StreamRecord, now_ms: u64) !u32 {
         var added: u32 = 0;
+        const owned_consumer = self.internConsumer(consumer_id);
         for (records) |rec| {
             const key = rec.id.order();
             const gop = try self.pel.getOrPut(self.allocator, key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .{
                     .id = rec.id,
-                    .consumer = consumer_id,
+                    .consumer = owned_consumer,
                     .delivered_at_ms = now_ms,
                     .last_delivery_ms = now_ms,
                     .delivery_count = 1,
@@ -382,6 +418,8 @@ pub const ConsumerGroup = struct {
                 if (self.members.getPtr(kv.value.consumer)) |m| {
                     if (m.pending_count > 0) m.pending_count -= 1;
                 }
+                // Reclaim a member that left while it still had pending entries.
+                self.reapLeftMember(kv.value.consumer);
                 acked += 1;
             }
         }
@@ -414,7 +452,7 @@ pub const ConsumerGroup = struct {
                     if (self.members.getPtr(pe.consumer)) |m| {
                         if (m.pending_count > 0) m.pending_count -= 1;
                     }
-                    pe.consumer = new_consumer;
+                    pe.consumer = self.internConsumer(new_consumer);
                     pe.last_delivery_ms = now_ms;
                     pe.delivery_count += 1;
                     // Increment new consumer count
@@ -474,7 +512,7 @@ pub const ConsumerGroup = struct {
                     if (self.members.getPtr(pe.consumer)) |m| {
                         if (m.pending_count > 0) m.pending_count -= 1;
                     }
-                    pe.consumer = new_consumer;
+                    pe.consumer = self.internConsumer(new_consumer);
                     if (self.members.getPtr(new_consumer)) |m| {
                         m.pending_count += 1;
                     }
@@ -576,6 +614,7 @@ pub const ConsumerGroup = struct {
                 if (self.members.getPtr(kv.value.consumer)) |m| {
                     if (m.pending_count > 0) m.pending_count -= 1;
                 }
+                self.reapLeftMember(kv.value.consumer);
                 res.dropped += 1;
             }
         }
