@@ -685,11 +685,12 @@ pub fn formatTimestamp(timestamp_ms: i64) [32]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
     const day_seconds = epoch_seconds.getDaySeconds();
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
 
     _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(year_day.month),
-        year_day.day,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
         day_seconds.getSecondsIntoMinute(),

@@ -1313,15 +1313,19 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
     const created_at_ns = reader.readU64() orelse 0;
 
     if (json_output) {
+        // JSON keeps the raw epoch-ns for machine consumers.
         ctx.print(
             "{{\"stream\":\"{s}\",\"group\":\"{s}\",\"pending\":{d},\"members\":{d},\"created_at_ns\":{d}}}\n",
             .{ stream, group, pel_count, member_count, created_at_ns },
         );
     } else {
+        // Human view: render created_at as ISO-8601 UTC (helper takes ms).
+        const created_ms: i64 = @intCast(created_at_ns / std.time.ns_per_ms);
+        const ts_buf = output.formatTimestamp(created_ms);
         ctx.print("Consumer Group: {s}/{s}\n", .{ stream, group });
         ctx.print("  Members:    {d}\n", .{member_count});
         ctx.print("  Pending:    {d} message(s)\n", .{pel_count});
-        ctx.print("  Created at: {d} (ns)\n", .{created_at_ns});
+        ctx.print("  Created:    {s}\n", .{ts_buf[0..20]});
     }
 }
 
