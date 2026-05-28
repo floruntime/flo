@@ -1369,11 +1369,13 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.print("Consumer Group: {s}/{s}\n  Pending: {d} message(s)\n\n", .{ stream, group, count });
         if (count > 0) {
-            ctx.print("  {s:<24} {s:<16} {s:<24} {s}\n", .{ "ID", "CONSUMER", "DELIVERED AT", "DELIVERIES" });
-            ctx.print("  {s:<24} {s:<16} {s:<24} {s}\n", .{ "─" ** 24, "─" ** 16, "─" ** 24, "─" ** 10 });
+            ctx.print("  {s:<24} {s:<16} {s}\n", .{ "ID", "CONSUMER", "DELIVERIES" });
+            ctx.print("  {s:<24} {s:<16} {s}\n", .{ "─" ** 24, "─" ** 16, "─" ** 10 });
         }
     }
 
+    // Wire format (serializePendingEntries):
+    // [count:u32]([ts:u64][seq:u64][delivery_count:u32][consumer_len:u16][consumer])*
     var offset: usize = 4;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -1383,25 +1385,20 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
         const seq = std.mem.readInt(u64, data[offset + 8 ..][0..8], .little);
         offset += 16;
 
-        // consumer_len: u32
+        // delivery_count: u32
         if (offset + 4 > data.len) break;
-        const consumer_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+        const delivery_count = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
+
+        // consumer_len: u16
+        if (offset + 2 > data.len) break;
+        const consumer_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+        offset += 2;
 
         // consumer: [consumer_len]u8
         if (offset + consumer_len > data.len) break;
         const consumer = data[offset..][0..consumer_len];
         offset += consumer_len;
-
-        // delivered_at: i64
-        if (offset + 8 > data.len) break;
-        const delivered_at = std.mem.readInt(i64, data[offset..][0..8], .little);
-        offset += 8;
-
-        // delivery_count: u32
-        if (offset + 4 > data.len) break;
-        const delivery_count = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
 
         // Format ID string
         var id_buf: [64]u8 = undefined;
@@ -1409,9 +1406,9 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
 
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":\"{s}\",\"consumer\":\"{s}\",\"delivered_at\":{d},\"delivery_count\":{d}}}", .{ id_str, consumer, delivered_at, delivery_count });
+            ctx.print("{{\"id\":\"{s}\",\"consumer\":\"{s}\",\"delivery_count\":{d}}}", .{ id_str, consumer, delivery_count });
         } else {
-            ctx.print("  {s:<24} {s:<16} {d:<24} {d}\n", .{ id_str, consumer, delivered_at, delivery_count });
+            ctx.print("  {s:<24} {s:<16} {d}\n", .{ id_str, consumer, delivery_count });
         }
     }
 
