@@ -6,10 +6,12 @@
 //!
 //! Routing table:
 //!   kv_put, kv_delete, kv_batch     → KVProjection
-//!   cg_commit, cg_create, cg_delete → KVProjection (consumer group state as KV)
 //!   queue_enqueue, queue_ack, etc.  → QueueProjection
 //!   ts_write, ts_write_batch        → TSProjection
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
+//!   cg_commit, cg_delete            → None (applied to StreamProjection via
+//!                                      the stream handler's replay registry,
+//!                                      not this router — FLO-103)
 //!   raft_config, raft_noop          → None (consensus layer)
 //!   raft_snapshot                    → Snapshot installation
 //!   checkpoint                      → None (processing runtime)
@@ -234,10 +236,17 @@ const RouteTarget = enum(u8) {
 /// Determine which projection an entry type routes to.
 pub fn routeTarget(entry_type: EntryType) RouteTarget {
     return switch (entry_type) {
-        // KV + consumer group state
+        // KV
         .kv_put, .kv_delete, .kv_batch => .kv,
         .kv_incr, .kv_touch => .kv,
-        .cg_commit, .cg_create, .cg_delete => .kv,
+
+        // Consumer-group durability (FLO-103): cg_commit / cg_delete carry
+        // consumer-group state, which lives on the StreamProjection. They are
+        // applied via the stream handler's replay registry (registerReplay),
+        // not the projection router, so route to .none here to avoid also
+        // landing them in the KV keyspace (where they could collide with user
+        // keys). cg_create is unused (groups auto-create on first commit).
+        .cg_commit, .cg_create, .cg_delete => .none,
 
         // Queue
         .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => .queue,
@@ -336,10 +345,10 @@ test "router: routing table correctness" {
     try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_delete));
     try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_batch));
 
-    // Consumer group → KV
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.cg_commit));
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.cg_create));
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.cg_delete));
+    // Consumer group → none (applied via stream handler replay registry, FLO-103)
+    try testing.expectEqual(RouteTarget.none, routeTarget(.cg_commit));
+    try testing.expectEqual(RouteTarget.none, routeTarget(.cg_create));
+    try testing.expectEqual(RouteTarget.none, routeTarget(.cg_delete));
 
     // Queue
     try testing.expectEqual(RouteTarget.queue, routeTarget(.queue_enqueue));
@@ -407,7 +416,10 @@ test "router: ts entry routed to ts projection" {
     try testing.expectEqual(@as(u64, 1), router.stats.ts_entries);
 }
 
-test "router: consumer group entry routed to kv projection" {
+test "router: consumer group entry not routed to a projection (FLO-103)" {
+    // cg_commit / cg_delete carry consumer-group state owned by the
+    // StreamProjection and are applied via the stream handler's replay
+    // registry, so the projection router must NOT route them to KV.
     var kv_proj = TestProjection{};
     var router = ProjectionRouter.init();
     router.registerKV(kv_proj.handle());
@@ -415,9 +427,9 @@ test "router: consumer group entry routed to kv projection" {
     const entry = makeEntry(.cg_commit, 1);
     const result = router.apply(&entry);
 
-    try testing.expectEqual(ApplyResult.applied, result);
-    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count);
-    try testing.expectEqual(@as(u64, 1), router.stats.kv_entries);
+    try testing.expectEqual(ApplyResult.skipped_no_projection, result);
+    try testing.expectEqual(@as(u32, 0), kv_proj.apply_count);
+    try testing.expectEqual(@as(u64, 0), router.stats.kv_entries);
 }
 
 test "router: stream entry has no projection" {
@@ -556,12 +568,14 @@ test "router: mixed entry types across all projections" {
     _ = router.apply(&makeEntry(.kv_put, 1));
     _ = router.apply(&makeEntry(.queue_enqueue, 2));
     _ = router.apply(&makeEntry(.ts_write, 3));
-    _ = router.apply(&makeEntry(.cg_commit, 4)); // → KV
+    _ = router.apply(&makeEntry(.cg_commit, 4)); // → none (stream replay registry, FLO-103)
     _ = router.apply(&makeEntry(.queue_ack, 5));
     _ = router.apply(&makeEntry(.ts_write_batch, 6));
 
-    try testing.expectEqual(@as(u32, 2), kv_proj.apply_count); // kv_put + cg_commit
+    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // kv_put only
     try testing.expectEqual(@as(u32, 2), queue_proj.apply_count); // enqueue + ack
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count); // write + write_batch
-    try testing.expectEqual(@as(u64, 6), router.stats.entries_applied);
+    // cg_commit routes to none (FLO-103), so 5 applied + 1 no-projection.
+    try testing.expectEqual(@as(u64, 5), router.stats.entries_applied);
+    try testing.expectEqual(@as(u64, 1), router.stats.entries_no_projection);
 }

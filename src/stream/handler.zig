@@ -401,16 +401,20 @@ pub const StreamHandler = struct {
 
         const payload_value = if (req.value.len > 0) req.value else "";
 
-        // Persist through Raft, then apply the committed entry (same path as segment replay).
-        const sptr = self.shard_ptr orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "shard not wired" } };
-        };
-        const shard = shardFromPtr(sptr);
-        const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
-        };
-
-        const stream_id = self.applyCommittedStreamEntries(shard, raft_index, partition_index) catch {
+        // Normally the append is persisted through Raft and applied from the
+        // committed log (same path as segment replay), so it replicates and
+        // survives restart. When no shard/consensus layer is wired (single
+        // partition or unit tests), fall back to a local-only apply straight to
+        // the partition + projection — mirrors persistAndApplyTrim's behaviour.
+        const stream_id = if (self.shard_ptr) |sptr| blk: {
+            const shard = shardFromPtr(sptr);
+            const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+            break :blk self.applyCommittedStreamEntries(shard, raft_index, partition_index) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
+            };
+        } else self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
 
@@ -738,9 +742,11 @@ pub const StreamHandler = struct {
             };
         };
 
-        // Apply sweeper config from TLV options the CLI/SDK already sends
-        // (previously discarded). In-memory only — see ConsumerGroup config note.
+        // Apply sweeper config from TLV options the CLI/SDK already sends.
         applyGroupConfig(self, group_name, req);
+
+        // Persist group existence + config so they survive restart (FLO-103).
+        self.persistGroupCommit(group_name, true);
 
         return .ok;
     }
@@ -766,6 +772,10 @@ pub const StreamHandler = struct {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
         };
+
+        // Persist updated config so it survives restart (FLO-103).
+        self.persistGroupCommit(group_name, true);
+
         return .ok;
     }
 
@@ -780,6 +790,8 @@ pub const StreamHandler = struct {
         const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
 
         if (self.stream.deleteGroup(group_name)) {
+            // Persist the removal so it survives restart (FLO-103).
+            self.persistGroupDelete(group_name);
             return .ok;
         } else {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
@@ -1009,6 +1021,10 @@ pub const StreamHandler = struct {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
         };
+
+        // Persist the advanced ack-floor for restart durability, debounced to
+        // floor advances so out-of-order acks don't each force a Raft write (FLO-103).
+        self.persistGroupCommit(group_name, false);
 
         return .ok;
     }
@@ -1674,7 +1690,37 @@ pub const StreamHandler = struct {
         const ual_index = try self.partition.apply(entry);
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.InvalidPayload;
         const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
-        return self.stream.appendToStream(name_hash, ual_index, partition_index);
+        // Anchor the StreamID to the entry's persisted timestamp (not the wall
+        // clock) so replay reproduces the same ID — required for the durable
+        // consumer-group cursor to line up after restart (FLO-103).
+        const ts_ms = entry.header.timestamp_ns / 1_000_000;
+        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms);
+    }
+
+    /// Apply a stream append directly to the local partition + projection,
+    /// bypassing Raft. Used when no shard/consensus layer is wired (single
+    /// partition or unit tests). The UAL index is assigned from the partition's
+    /// committed_index so it stays monotonic and lines up with lookups, exactly
+    /// as the Raft-driven path keeps Raft and UAL indices in lockstep.
+    fn applyLocalStreamAppend(self: *StreamHandler, req: Request, payload_value: []const u8, partition_index: u32) !StreamID {
+        const ns_hash = router.namespaceHash(req.namespace);
+        const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
+        const next_index = self.partition.committed_index + 1;
+
+        var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+        const entry = entry_mod.buildCommandEntry(
+            .stream_append,
+            entry_mod.Flags.NONE,
+            0, // term — unused without consensus
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            req.key,
+            payload_value,
+            &payload_buf,
+        ) orelse return error.PayloadTooLarge;
+
+        return self.applyStreamAppendEntry(&entry, partition_index);
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1685,6 +1731,8 @@ pub const StreamHandler = struct {
     pub fn registerReplay(self: *StreamHandler, registry: *ReplayRegistry) void {
         registry.register(.stream_append, @ptrCast(self), replayEntry);
         registry.register(.stream_trim, @ptrCast(self), replayEntry);
+        registry.register(.cg_commit, @ptrCast(self), replayEntry);
+        registry.register(.cg_delete, @ptrCast(self), replayEntry);
     }
 
     /// Replay a stream entry — rebuild StreamProjection offset tracking
@@ -1701,7 +1749,10 @@ pub const StreamHandler = struct {
         if (etype == .stream_append) {
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
-                _ = self.stream.appendToStream(name_hash, entry.header.index, 0) catch {};
+                // Anchor to the entry timestamp so replay reproduces the same
+                // StreamIDs as the original live apply (FLO-103).
+                const ts_ms = entry.header.timestamp_ns / 1_000_000;
+                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, 0, ts_ms) catch {};
                 self.stream.registerStream(cmd.key) catch {};
             }
         }
@@ -1714,6 +1765,27 @@ pub const StreamHandler = struct {
                     const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
                     _ = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
                 }
+            }
+        }
+
+        // Consumer-group durability (FLO-103): cg_commit carries a group's
+        // ack-floor cursor + sweeper config; cg_delete removes the group. The
+        // CommandPayload key is the namespace-qualified group name. Cursor
+        // advance is monotonic (see StreamProjection.applyCommit), so this is
+        // safe to run on the originating leader as well as on followers/replay.
+        if (etype == .cg_commit) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                if (cmd.key.len > 0) {
+                    if (stream_mod.GroupCommit.decode(cmd.value)) |commit| {
+                        self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch {};
+                    }
+                }
+            }
+        }
+
+        if (etype == .cg_delete) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                if (cmd.key.len > 0) _ = self.stream.deleteGroup(cmd.key);
             }
         }
     }
@@ -1754,6 +1826,43 @@ pub const StreamHandler = struct {
     /// Uses anytype to avoid circular import.
     fn shardFromPtr(ptr: *anyopaque) *Shard {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    /// Persist a consumer group's durable state (ack-floor cursor + sweeper
+    /// config) as a `cg_commit` UAL entry so it survives restart (FLO-103).
+    ///
+    /// `force` = false debounces to floor advances only (the ack hot path):
+    /// acking entries above a still-pending low entry does not move the floor,
+    /// so no Raft write is emitted. `force` = true always emits — used on
+    /// create / configure, where config (not the cursor) is what changed.
+    ///
+    /// Best-effort: a failed persist leaves the in-memory group correct and the
+    /// next commit retries; only durability across restart is at risk.
+    /// No-op when the shard isn't wired (unit tests, pre-Raft paths).
+    fn persistGroupCommit(self: *StreamHandler, group_name: []const u8, force: bool) void {
+        const sptr = self.shard_ptr orelse return;
+        const group = self.stream.getGroup(group_name) orelse return;
+        const floor = group.ackFloor();
+        if (!force and !floor.greaterThan(group.last_committed_floor)) return;
+
+        const commit = stream_mod.GroupCommit{
+            .floor = floor,
+            .ack_timeout_ms = group.ack_timeout_ms,
+            .max_deliver = group.max_deliver,
+        };
+        var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
+        commit.encode(&val);
+
+        // group_name is already namespace-qualified; it travels in the
+        // CommandPayload key, so the namespace arg is unused on replay.
+        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch return;
+        group.last_committed_floor = floor;
+    }
+
+    /// Persist a `cg_delete` so a group removal survives restart (FLO-103).
+    fn persistGroupDelete(self: *StreamHandler, group_name: []const u8) void {
+        const sptr = self.shard_ptr orelse return;
+        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "") catch {};
     }
 };
 

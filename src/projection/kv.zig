@@ -537,7 +537,7 @@ pub const KVProjection = struct {
         const entry_type: EntryType = @enumFromInt(entry.header.entry_type);
 
         switch (entry_type) {
-            .kv_put, .cg_commit, .cg_create => {
+            .kv_put => {
                 const cmd = CommandPayload.deserialize(entry.payload) orelse
                     return error.InvalidPayload;
                 try self.put(
@@ -549,7 +549,7 @@ pub const KVProjection = struct {
                     extractExpiry(entry, &cmd),
                 );
             },
-            .kv_delete, .cg_delete => {
+            .kv_delete => {
                 const cmd = CommandPayload.deserialize(entry.payload) orelse
                     return error.InvalidPayload;
                 try self.delete(
