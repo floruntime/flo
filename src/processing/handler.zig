@@ -373,8 +373,26 @@ pub const ProcessingHandler = struct {
         };
         defer def.deinit(self.allocator);
 
-        // Generate a unique job ID with embedded partition bits
-        const partition_id = shard.router.keyToPartitionNs(def.namespace, def.name);
+        // Generate a unique job ID with embedded partition bits.
+        //
+        // The partition MUST route back to the shard that stores this job's
+        // registry entry — i.e. THIS shard. Submit is routed here by
+        // preRouteByProcessing (empty key → partition 0 → shard 0), so the
+        // entry lives in this shard's `self.jobs`. The job_id's partition bits
+        // are how every ID-routed op (status/stop/cancel/savepoint/restore/
+        // rescale) finds it again: partitionToShard = partition % shard_count.
+        //
+        // Deriving the partition from the job *name* (keyToPartitionNs) was
+        // wrong: it resolves to an arbitrary partition whose shard differs from
+        // the storing shard whenever keyToPartitionNs(ns,name) % shard_count
+        // != shard.id, yielding spurious "Job not found" on any multi-shard
+        // deployment. It only worked by luck when the name happened to hash to
+        // a partition congruent to the storing shard (e.g. 1152 % 3 == 0).
+        //
+        // Embedding shard.id is correct and future-proof: shard.id < shard_count
+        // <= partition_count, and shard.id % shard_count == shard.id, so the ID
+        // always routes back to the shard that created and stores the job.
+        const partition_id: u32 = shard.id;
         var id_buf: [32]u8 = undefined;
         const job_id = shard.run_id_gen.next(.job, partition_id, &id_buf) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "id generation failed");
