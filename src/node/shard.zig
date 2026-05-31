@@ -1138,7 +1138,9 @@ pub const Shard = struct {
         if (@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type)) == .stream_append) {
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                _ = partition.stream.appendToStream(name_hash, ual_index, 0) catch {};
+                // Anchor to the entry timestamp for deterministic replay (FLO-103).
+                const ts_ms = entry.header.timestamp_ns / 1_000_000;
+                _ = partition.stream.appendToStreamAt(name_hash, ual_index, 0, ts_ms) catch {};
                 partition.stream.registerStream(cmd.key) catch {};
             }
         }

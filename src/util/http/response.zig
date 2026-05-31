@@ -127,7 +127,7 @@ pub const HttpResponse = struct {
             .content_type = .json,
             .body = "",
             .body_owned = false,
-            .headers = .{},
+            .headers = .empty,
             .allocator = allocator,
         };
     }
@@ -173,7 +173,9 @@ pub const HttpResponse = struct {
 
     /// Serialize response to bytes for sending
     pub fn serialize(self: *const HttpResponse, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
-        const writer = out.writer(allocator);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
 
         // Status line
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
@@ -208,6 +210,8 @@ pub const HttpResponse = struct {
         if (self.body.len > 0) {
             try writer.writeAll(self.body);
         }
+
+        try out.appendSlice(allocator, aw.written());
     }
 
     /// Convenience: serialize and return owned slice
@@ -237,13 +241,12 @@ pub fn jsonError(allocator: std.mem.Allocator, status: StatusCode, message: []co
     _ = resp.setStatus(status).setContentType(.json);
 
     // Build error JSON - allocate body through response's allocator
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-    try writer.print("{{\"error\":\"{s}\",\"status\":{d}}}", .{ message, @intFromEnum(status) });
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.print("{{\"error\":\"{s}\",\"status\":{d}}}", .{ message, @intFromEnum(status) });
 
     // Dupe the body so response owns the memory
-    const body = try allocator.dupe(u8, buf.items);
+    const body = try allocator.dupe(u8, aw.written());
     _ = resp.setBodyOwned(body);
 
     return resp;

@@ -244,14 +244,24 @@ pub const StreamIdGenerator = struct {
         };
     }
 
-    /// Generate next StreamID
+    /// Generate next StreamID using the current wall clock.
     ///
     /// Guarantees:
     /// - Monotonically increasing (never generates duplicate or lower ID)
     /// - Clock skew safe (if clock goes backward, uses previous timestamp + seq)
+    ///
+    /// NOTE: durable apply paths must use `nextAt` with the originating UAL
+    /// entry's timestamp instead, so replay reproduces identical StreamIDs
+    /// (FLO-103). Reading the wall clock here would renumber records on restart.
     pub fn next(self: *StreamIdGenerator) StreamID {
-        const now_ms = @as(u64, @intCast(@import("stdx").time.milliTimestamp()));
+        return self.nextAt(@as(u64, @intCast(@import("stdx").time.milliTimestamp())));
+    }
 
+    /// Generate the next StreamID anchored to an explicit timestamp (the UAL
+    /// entry's `header.timestamp_ns`, in ms). Deterministic across replay:
+    /// applying the same entries in index order reproduces identical IDs, so a
+    /// persisted consumer-group cursor still lines up after restart (FLO-103).
+    pub fn nextAt(self: *StreamIdGenerator, now_ms: u64) StreamID {
         // Load current state
         const last_ts = self.last_timestamp_ms.load(.acquire);
         const last_seq = self.last_sequence.load(.acquire);
@@ -286,11 +296,18 @@ pub const StreamIdGenerator = struct {
         };
     }
 
-    /// Generate multiple IDs atomically (for batch appends)
-    pub fn nextBatch(self: *StreamIdGenerator, count: usize) !struct { first: StreamID, last: StreamID } {
-        if (count == 0) return error.EmptyBatch;
+    /// First and last ID produced by a batch allocation.
+    pub const Batch = struct { first: StreamID, last: StreamID };
 
-        const now_ms = @as(u64, @intCast(@import("stdx").time.milliTimestamp()));
+    /// Generate multiple IDs atomically (for batch appends)
+    pub fn nextBatch(self: *StreamIdGenerator, count: usize) !Batch {
+        return self.nextBatchAt(@as(u64, @intCast(@import("stdx").time.milliTimestamp())), count);
+    }
+
+    /// Batch variant of `nextAt` — anchors the batch to an explicit timestamp
+    /// for deterministic replay (FLO-103).
+    pub fn nextBatchAt(self: *StreamIdGenerator, now_ms: u64, count: usize) !Batch {
+        if (count == 0) return error.EmptyBatch;
 
         // Load current state
         const last_ts = self.last_timestamp_ms.load(.acquire);
@@ -404,6 +421,33 @@ test "StreamIdGenerator monotonic" {
     // Each ID should be greater than the previous
     try std.testing.expect(id1.lessThan(id2));
     try std.testing.expect(id2.lessThan(id3));
+}
+
+test "StreamIdGenerator nextAt is deterministic across replay (FLO-103)" {
+    // Two generators fed the SAME per-entry timestamps must produce identical
+    // IDs, regardless of wall clock — this is what lets replay reproduce the
+    // original StreamIDs so a persisted consumer-group cursor still lines up.
+    const ts = [_]u64{ 1000, 1000, 1000, 1002, 1002, 1005 };
+
+    var live = StreamIdGenerator.init();
+    var replay = StreamIdGenerator.init();
+
+    for (ts) |t| {
+        const a = live.nextAt(t);
+        const b = replay.nextAt(t);
+        try std.testing.expectEqual(a.timestamp_ms, b.timestamp_ms);
+        try std.testing.expectEqual(a.sequence, b.sequence);
+    }
+
+    // Same-ms entries get incrementing sequences; later ms resets sequence.
+    var g = StreamIdGenerator.init();
+    const a0 = g.nextAt(1000);
+    const a1 = g.nextAt(1000);
+    const a2 = g.nextAt(1002);
+    try std.testing.expectEqual(@as(u64, 0), a0.sequence);
+    try std.testing.expectEqual(@as(u64, 1), a1.sequence);
+    try std.testing.expectEqual(@as(u64, 1002), a2.timestamp_ms);
+    try std.testing.expectEqual(@as(u64, 0), a2.sequence);
 }
 
 test "StreamIdGenerator batch" {

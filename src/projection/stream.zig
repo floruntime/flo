@@ -119,7 +119,13 @@ pub const StreamState = struct {
 
     /// Append a record. Generates a new StreamID and returns it.
     pub fn append(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32) !StreamID {
-        const id = self.id_gen.next();
+        return self.appendAt(allocator, ual_index, partition_index, @as(u64, @intCast(@import("stdx").time.milliTimestamp())));
+    }
+
+    /// Append anchored to an explicit timestamp (the originating UAL entry's
+    /// timestamp, in ms) so replay reproduces identical StreamIDs (FLO-103).
+    pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, ts_ms: u64) !StreamID {
+        const id = self.id_gen.nextAt(ts_ms);
         try self.records.append(allocator, .{
             .id = id,
             .ual_index = ual_index,
@@ -276,6 +282,11 @@ pub const ConsumerGroup = struct {
     pel: std.AutoArrayHashMapUnmanaged(u128, PendingEntry),
     /// Highest StreamID delivered to any consumer in this group.
     last_delivered_id: StreamID,
+    /// Highest ack-floor already persisted via a `cg_commit` UAL entry. Used to
+    /// debounce commits: a `cg_commit` is only emitted when the floor advances
+    /// past this. In-memory only (not serialized / not recovered) — on restart
+    /// it resets to MIN, so the first post-restart ack re-persists the floor.
+    last_committed_floor: StreamID = StreamID.MIN,
     /// Idle time (ms) after which the background sweeper re-nacks a pending
     /// entry (makes it claimable again). 0 = sweeper disabled for this group.
     /// In-memory config — groups are not persisted (auto-created on read), so
@@ -296,6 +307,24 @@ pub const ConsumerGroup = struct {
             .pel = .empty,
             .last_delivered_id = StreamID.MIN,
         };
+    }
+
+    /// The durable recovery cursor for this group: the highest StreamID such
+    /// that every record at or before it is acked. On restart we set
+    /// `last_delivered_id` to this so `groupDeliver` redelivers exactly the
+    /// genuinely-unacked tail (and never-delivered records), and skips acked
+    /// records — at-least-once across restart.
+    ///
+    /// The PEL holds delivered-but-unacked entries in ascending StreamID order
+    /// (delivery is monotonic; `orderedRemove` preserves order), so the lowest
+    /// PEL key is the first unacked record and its predecessor is the floor.
+    /// With an empty PEL everything delivered is acked, so the floor is
+    /// `last_delivered_id`.
+    pub fn ackFloor(self: *const ConsumerGroup) StreamID {
+        if (self.pel.count() == 0) return self.last_delivered_id;
+        const lowest_pending = self.pel.keys()[0];
+        if (lowest_pending == 0) return StreamID.MIN;
+        return StreamID.fromOrder(lowest_pending - 1);
     }
 
     pub fn deinit(self: *ConsumerGroup) void {
@@ -622,6 +651,41 @@ pub const ConsumerGroup = struct {
     }
 };
 
+/// Durable consumer-group state carried by a `cg_commit` UAL entry: the
+/// recovery cursor (ack-floor) plus sweeper config. The group name travels in
+/// the CommandPayload key, so it is not part of this value.
+///
+/// Wire value layout (little-endian): version(1) + floor_ts(8) + floor_seq(8)
+/// + ack_timeout_ms(4) + max_deliver(1) = 22 bytes.
+pub const GroupCommit = struct {
+    pub const WIRE_LEN = 22;
+    const VERSION: u8 = 1;
+
+    floor: StreamID,
+    ack_timeout_ms: u32,
+    max_deliver: u8,
+
+    pub fn encode(self: GroupCommit, buf: *[WIRE_LEN]u8) void {
+        buf[0] = VERSION;
+        std.mem.writeInt(u64, buf[1..9], self.floor.timestamp_ms, .little);
+        std.mem.writeInt(u64, buf[9..17], self.floor.sequence, .little);
+        std.mem.writeInt(u32, buf[17..21], self.ack_timeout_ms, .little);
+        buf[21] = self.max_deliver;
+    }
+
+    pub fn decode(data: []const u8) ?GroupCommit {
+        if (data.len < WIRE_LEN or data[0] != VERSION) return null;
+        return .{
+            .floor = .{
+                .timestamp_ms = std.mem.readInt(u64, data[1..9], .little),
+                .sequence = std.mem.readInt(u64, data[9..17], .little),
+            },
+            .ack_timeout_ms = std.mem.readInt(u32, data[17..21], .little),
+            .max_deliver = data[21],
+        };
+    }
+};
+
 /// Stream metadata — partition count, retention policy, and other per-stream config.
 pub const StreamMetadata = struct {
     partition_count: u32 = 1,
@@ -808,8 +872,15 @@ pub const StreamProjection = struct {
 
     /// Append a record to a named stream. Returns the assigned StreamID.
     pub fn appendToStream(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32) !StreamID {
+        return self.appendToStreamAt(name_hash, ual_index, partition_index, @as(u64, @intCast(@import("stdx").time.milliTimestamp())));
+    }
+
+    /// Append anchored to the originating UAL entry's timestamp (ms) so replay
+    /// reproduces identical StreamIDs — durable apply/replay paths must use this
+    /// instead of `appendToStream`, which reads the wall clock (FLO-103).
+    pub fn appendToStreamAt(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32, ts_ms: u64) !StreamID {
         const ss = try self.getOrCreateStream(name_hash);
-        const id = try ss.append(self.allocator, ual_index, partition_index);
+        const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms);
         self.stats.appended += 1;
         return id;
     }
@@ -954,6 +1025,27 @@ pub const StreamProjection = struct {
         group.configure(ack_timeout_ms, max_deliver);
     }
 
+    /// Apply a durable `cg_commit` (auto-creating the group if needed). Called
+    /// from replay/follower-apply, never on the originating leader (whose live
+    /// in-memory state is already ahead). The cursor advance is **monotonic**:
+    /// we only move `last_delivered_id` forward, so re-applying an older commit
+    /// (or applying on a node that already advanced past it) never regresses
+    /// the group and causes spurious redelivery. Config is last-writer-wins.
+    pub fn applyCommit(self: *StreamProjection, group_name: []const u8, commit: GroupCommit, now_ns: u64) !void {
+        self.createGroup(group_name, now_ns) catch |err| {
+            if (err != error.AlreadyExists) return err;
+        };
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        if (commit.floor.greaterThan(group.last_delivered_id)) {
+            group.last_delivered_id = commit.floor;
+        }
+        if (commit.floor.greaterThan(group.last_committed_floor)) {
+            group.last_committed_floor = commit.floor;
+        }
+        group.ack_timeout_ms = commit.ack_timeout_ms;
+        group.max_deliver = commit.max_deliver;
+    }
+
     /// Run the sweeper pass over every consumer group in this projection.
     /// Returns the aggregate counts. Called from the shard's periodic task.
     pub fn sweepAllGroups(self: *StreamProjection, now_ms: u64) ConsumerGroup.SweepResult {
@@ -1031,7 +1123,8 @@ pub const StreamProjection = struct {
                     std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key)
                 else
                     0;
-                _ = try self.appendToStream(name_hash, ual_entry.header.index, 0);
+                // Anchor to the entry timestamp for deterministic replay (FLO-103).
+                _ = try self.appendToStreamAt(name_hash, ual_entry.header.index, 0, ual_entry.header.timestamp_ns / 1_000_000);
             },
             .stream_trim => {
                 // Trim target encoded as StreamID (timestamp_ms + sequence) in command payload key
@@ -1149,8 +1242,10 @@ pub const StreamProjection = struct {
         var g_it = self.groups.iterator();
         while (g_it.next()) |kv| {
             const group = kv.value_ptr;
-            // name_len(2) + name + pel_count(4) + created_at_ns(8) + member_count(4)
-            total_size += 2 + group.name.len + 4 + 8 + 4;
+            // name_len(2) + name + pel_count(4) + created_at_ns(8)
+            //   + last_delivered_id(16) + ack_timeout_ms(4) + max_deliver(1)
+            //   + member_count(4)
+            total_size += 2 + group.name.len + 4 + 8 + 16 + 4 + 1 + 4;
             var m_it = group.members.iterator();
             while (m_it.next()) |mkv| {
                 // id_len(2) + id + joined_at_ns(8) + state(1)
@@ -1210,6 +1305,19 @@ pub const StreamProjection = struct {
             offset += 4;
             std.mem.writeInt(u64, buf[offset..][0..8], group.created_at_ns, .little);
             offset += 8;
+
+            // Recovery cursor + sweeper config (FLO-103). Persisting the
+            // ack-floor here keeps a future snapshot self-sufficient: entries
+            // at/below the snapshot index are skipped on replay, so the cursor
+            // must live in the snapshot, not only in cg_commit UAL entries.
+            std.mem.writeInt(u64, buf[offset..][0..8], group.last_delivered_id.timestamp_ms, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], group.last_delivered_id.sequence, .little);
+            offset += 8;
+            std.mem.writeInt(u32, buf[offset..][0..4], group.ack_timeout_ms, .little);
+            offset += 4;
+            buf[offset] = group.max_deliver;
+            offset += 1;
 
             // Members
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(group.members.count()), .little);
@@ -1297,7 +1405,9 @@ pub const StreamProjection = struct {
             if (offset + 2 > data.len) return;
             const name_len = std.mem.readInt(u16, data[offset..][0..2], .little);
             offset += 2;
-            if (offset + name_len + 12 > data.len) return;
+            // pel_count(4) + created_at_ns(8) + last_delivered_id(16)
+            //   + ack_timeout_ms(4) + max_deliver(1) = 33 bytes
+            if (offset + name_len + 33 > data.len) return;
             const group_name = data[offset..][0..name_len];
             offset += name_len;
             const _pel_count = std.mem.readInt(u32, data[offset..][0..4], .little);
@@ -1306,7 +1416,21 @@ pub const StreamProjection = struct {
             const created_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
 
+            // Recovery cursor + sweeper config (FLO-103).
+            const last_delivered_ts = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const last_delivered_seq = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const ack_timeout_ms = std.mem.readInt(u32, data[offset..][0..4], .little);
+            offset += 4;
+            const max_deliver = data[offset];
+            offset += 1;
+
             var group = try ConsumerGroup.init(self.allocator, group_name, created_at_ns);
+            group.last_delivered_id = .{ .timestamp_ms = last_delivered_ts, .sequence = last_delivered_seq };
+            group.last_committed_floor = group.last_delivered_id;
+            group.ack_timeout_ms = ack_timeout_ms;
+            group.max_deliver = max_deliver;
 
             // Members
             if (offset + 4 > data.len) {
@@ -1455,6 +1579,13 @@ test "stream: serialize/deserialize round-trip" {
     _ = try s.joinGroup("my-group", "consumer-1", 6000);
     _ = try s.joinGroup("my-group", "consumer-2", 7000);
 
+    // Set a recovery cursor + non-default config to verify they round-trip (FLO-103)
+    {
+        const g = s.getGroup("my-group").?;
+        g.last_delivered_id = .{ .timestamp_ms = 1700, .sequence = 9 };
+        g.configure(45000, 7);
+    }
+
     // Serialize
     const data = try s.serialize(testing.allocator);
     defer testing.allocator.free(data);
@@ -1480,6 +1611,133 @@ test "stream: serialize/deserialize round-trip" {
     // Verify consumer group
     const group = s2.getGroup("my-group").?;
     try testing.expectEqual(@as(usize, 2), group.memberCount());
+
+    // Recovery cursor + config restored (FLO-103)
+    try testing.expectEqual(@as(u64, 1700), group.last_delivered_id.timestamp_ms);
+    try testing.expectEqual(@as(u64, 9), group.last_delivered_id.sequence);
+    try testing.expectEqual(@as(u32, 45000), group.ack_timeout_ms);
+    try testing.expectEqual(@as(u8, 7), group.max_deliver);
+}
+
+test "stream: ackFloor reflects lowest unacked (FLO-103)" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 7;
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+
+    // Append 3 records and deliver them into the PEL.
+    const id1 = try s.appendToStream(hash, 10, 0);
+    const id2 = try s.appendToStream(hash, 11, 0);
+    _ = try s.appendToStream(hash, 12, 0);
+    var buf: [8]StreamRecord = undefined;
+    const n = try s.groupDeliver("g", hash, "c1", 8, 2000, buf[0..]);
+    try testing.expectEqual(@as(usize, 3), n);
+
+    const g = s.getGroup("g").?;
+    // All 3 pending → floor is the predecessor of the lowest pending (id1).
+    try testing.expect(g.ackFloor().lessThan(id1));
+
+    // Ack id1: floor advances to predecessor of id2 (now lowest pending), so
+    // id1 <= floor < id2 — id1 is no longer redelivered, id2 still is.
+    _ = try s.groupAck("g", &[_]StreamID{id1});
+    try testing.expect(!g.ackFloor().lessThan(id1));
+    try testing.expect(g.ackFloor().lessThan(id2));
+
+    // Ack the rest: PEL empty → floor == last_delivered_id (everything acked).
+    _ = try s.groupAck("g", &[_]StreamID{ id2, buf[2].id });
+    try testing.expectEqual(@as(usize, 0), g.pelCount());
+    try testing.expectEqual(g.last_delivered_id.order(), g.ackFloor().order());
+}
+
+test "stream: applyCommit seeds cursor monotonically + restores config (FLO-103)" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    // Fresh group from a replayed commit: cursor advances MIN → floor.
+    const commit = GroupCommit{ .floor = .{ .timestamp_ms = 500, .sequence = 3 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
+    try s.applyCommit("g", commit, 1000);
+    const g = s.getGroup("g").?;
+    try testing.expectEqual(@as(u64, 500), g.last_delivered_id.timestamp_ms);
+    try testing.expectEqual(@as(u32, 12345), g.ack_timeout_ms);
+    try testing.expectEqual(@as(u8, 9), g.max_deliver);
+
+    // A stale (lower) commit must NOT regress the cursor.
+    const stale = GroupCommit{ .floor = .{ .timestamp_ms = 100, .sequence = 0 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
+    try s.applyCommit("g", stale, 1000);
+    try testing.expectEqual(@as(u64, 500), g.last_delivered_id.timestamp_ms);
+
+    // A higher commit advances it.
+    const newer = GroupCommit{ .floor = .{ .timestamp_ms = 900, .sequence = 1 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
+    try s.applyCommit("g", newer, 1000);
+    try testing.expectEqual(@as(u64, 900), g.last_delivered_id.timestamp_ms);
+}
+
+test "stream: restart redelivers only the unacked tail (FLO-103)" {
+    // Simulates the FLO-103 acceptance criterion at the projection layer:
+    // append → deliver → ack some → restart → only the unacked remainder is
+    // redelivered. "Restart" = a fresh projection that replays the same UAL
+    // entries (same name_hash / ual_index / entry-timestamp) so StreamIDs are
+    // reproduced identically, then applies the persisted cg_commit cursor.
+    const hash: u64 = 99;
+    const ts: u64 = 100; // single entry-timestamp ms → ids {100,0..3}
+
+    // ── before restart ──
+    var s1 = StreamProjection.init(testing.allocator);
+    defer s1.deinit();
+    const aid1 = try s1.appendToStreamAt(hash, 10, 0, ts);
+    const aid2 = try s1.appendToStreamAt(hash, 11, 0, ts);
+    const aid3 = try s1.appendToStreamAt(hash, 12, 0, ts);
+    const aid4 = try s1.appendToStreamAt(hash, 13, 0, ts);
+    try s1.createGroup("g", 1);
+    _ = try s1.joinGroup("g", "c1", 1);
+
+    var buf: [8]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 4), try s1.groupDeliver("g", hash, "c1", 8, 1000, buf[0..]));
+    _ = try s1.groupAck("g", &[_]StreamID{ aid1, aid2 }); // ack first two
+
+    const g1 = s1.getGroup("g").?;
+    const commit = GroupCommit{ .floor = g1.ackFloor(), .ack_timeout_ms = g1.ack_timeout_ms, .max_deliver = g1.max_deliver };
+
+    // ── after restart: fresh projection, replay same entries + cursor ──
+    var s2 = StreamProjection.init(testing.allocator);
+    defer s2.deinit();
+    const bid1 = try s2.appendToStreamAt(hash, 10, 0, ts);
+    const bid2 = try s2.appendToStreamAt(hash, 11, 0, ts);
+    const bid3 = try s2.appendToStreamAt(hash, 12, 0, ts);
+    const bid4 = try s2.appendToStreamAt(hash, 13, 0, ts);
+    // Replay reproduced identical StreamIDs.
+    try testing.expectEqual(aid1.order(), bid1.order());
+    try testing.expectEqual(aid2.order(), bid2.order());
+    try testing.expectEqual(aid3.order(), bid3.order());
+    try testing.expectEqual(aid4.order(), bid4.order());
+
+    try s2.applyCommit("g", commit, 1); // recover cursor (auto-creates group)
+    _ = try s2.joinGroup("g", "c1", 1);
+
+    var buf2: [8]StreamRecord = undefined;
+    const n = try s2.groupDeliver("g", hash, "c1", 8, 2000, buf2[0..]);
+    // Only the two genuinely-unacked records come back — not the acked pair.
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(aid3.order(), buf2[0].id.order());
+    try testing.expectEqual(aid4.order(), buf2[1].id.order());
+}
+
+test "stream: GroupCommit encode/decode round-trip (FLO-103)" {
+    const c = GroupCommit{ .floor = .{ .timestamp_ms = 0xDEAD, .sequence = 0xBEEF }, .ack_timeout_ms = 777, .max_deliver = 5 };
+    var buf: [GroupCommit.WIRE_LEN]u8 = undefined;
+    c.encode(&buf);
+    const d = GroupCommit.decode(&buf).?;
+    try testing.expectEqual(c.floor.order(), d.floor.order());
+    try testing.expectEqual(c.ack_timeout_ms, d.ack_timeout_ms);
+    try testing.expectEqual(c.max_deliver, d.max_deliver);
+
+    // Wrong version / short buffer → null.
+    try testing.expectEqual(@as(?GroupCommit, null), GroupCommit.decode(buf[0 .. GroupCommit.WIRE_LEN - 1]));
+    var bad = buf;
+    bad[0] = 0xFF;
+    try testing.expectEqual(@as(?GroupCommit, null), GroupCommit.decode(&bad));
 }
 
 test "stream: serialize empty projection" {
