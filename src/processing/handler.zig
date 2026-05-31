@@ -128,6 +128,13 @@ pub const ProcessingHandler = struct {
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
 
+        // Durable-cursor checkpointing (FLO-104): the last cursor persisted via a
+        // processing_checkpoint UAL entry, plus when. Debounces persistence so a
+        // continuously-fed pipeline doesn't emit a Raft write per poll.
+        persisted_cursor_ts: u64 = 0,
+        persisted_cursor_seq: u64 = 0,
+        last_persist_ms: i64 = 0,
+
         // Operator chain — instantiated from job definition
         operators: []Operator = &.{},
         operator_backings: []native_registry.CreateResult = &.{},
@@ -456,57 +463,9 @@ pub const ProcessingHandler = struct {
         // Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][yaml...]
         self.persistSubmit(shard, req.namespace, owned_id, &record);
 
-        // Build tag registry from all sinks and classify operators
-        // Heap-allocated so classify operators can reference it during creation
-        const tag_registry_ptr = self.allocator.create(definition.TagRegistry) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "tag registry alloc failed");
-            return;
-        };
-        tag_registry_ptr.* = definition.TagRegistry{};
-        var tag_registry = tag_registry_ptr;
-        for (def.sinks.items) |snk| {
-            if (snk.match) |tag_list| {
-                for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
-            }
-        }
-        for (def.operators.items) |op_spec| {
-            if (std.mem.eql(u8, op_spec.type_name, "classify")) {
-                if (op_spec.config) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.startsWith(u8, entry.key, "tag_")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                        // Also register default_tag so it can be resolved
-                        if (std.mem.eql(u8, entry.key, "default_tag")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Resolve required_tags bitmask for each sink
-        for (def.sinks.items) |*snk| {
-            if (snk.match) |tag_list| {
-                snk.required_tags = tag_registry.buildMask(tag_list);
-            }
-        }
-
-        // Create pipeline execution state from parsed definition.
-        // For multi-source jobs, create one pipeline per source (all sinks per pipeline).
-        if (def.sinks.items.len > 0) {
-            for (def.sources.items, 0..) |*src, idx| {
-                if (idx == 0) {
-                    self.createPipeline(owned_id, src, def.sinks.items, &def, tag_registry);
-                } else {
-                    // Multi-source: create additional pipeline with suffixed key
-                    var key_buf: [256]u8 = undefined;
-                    const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ owned_id, idx }) catch continue;
-                    const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
-                    self.createPipeline(ms_owned, src, def.sinks.items, &def, tag_registry);
-                }
-            }
-        }
+        // Build operator pipelines so the job starts consuming. Shared with the
+        // replay path so a RUNNING job resumes after restart (FLO-104).
+        self.startPipelines(owned_id, &def);
 
         // Return the job ID
         shard.sendOkResponse(conn, req.header.request_id, job_id);
@@ -864,6 +823,7 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_cancel, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_savepoint, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_rescale, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
@@ -882,6 +842,7 @@ pub const ProcessingHandler = struct {
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
             .processing_savepoint => self.replaySavepoint(cmd.key, cmd.value),
             .processing_rescale => self.replayRescale(cmd.key, cmd.value),
+            .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => {},
         }
     }
@@ -911,13 +872,12 @@ pub const ProcessingHandler = struct {
 
         const yaml = value[off..];
 
-        // Extract name from YAML by re-parsing
+        // Extract name from YAML by re-parsing. Keep `def` alive so we can also
+        // rebuild the execution pipeline below (FLO-104) — createPipeline
+        // deep-copies what it retains, so freeing `def` at function end is safe.
         var def = parser.parseJobDefinition(self.allocator, yaml) catch return;
-        const name = self.allocator.dupe(u8, def.name) catch {
-            def.deinit(self.allocator);
-            return;
-        };
-        def.deinit(self.allocator);
+        defer def.deinit(self.allocator);
+        const name = self.allocator.dupe(u8, def.name) catch return;
 
         // Use the embedded namespace (authoritative from original submit)
         const namespace = self.allocator.dupe(u8, ns_raw) catch {
@@ -959,6 +919,15 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_yaml);
             return;
         };
+
+        // Rebuild the execution pipeline so a RUNNING job resumes consuming
+        // after restart instead of just reappearing in the registry (FLO-104).
+        // Guard against a double build on idempotent replay. The persisted
+        // source cursor is restored separately by replayCheckpoint, which lands
+        // after this submit entry in log order.
+        if (status == .running and self.pipelines.getPtr(owned_id) == null) {
+            self.startPipelines(owned_id, &def);
+        }
     }
 
     /// Replay a status change (stop/cancel).
@@ -1015,10 +984,81 @@ pub const ProcessingHandler = struct {
         }
     }
 
+    /// Replay a processing_checkpoint entry: restore a pipeline's persisted
+    /// stream source cursor (FLO-104). It lands after the submit entry in log
+    /// order, so replaySubmit has already rebuilt the pipeline; we just advance
+    /// its cursor so it resumes where it left off instead of from MIN.
+    /// Key = pipeline_key; value = [cursor_ts:u64 LE][cursor_seq:u64 LE].
+    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
+        if (value.len < 16) return;
+        const pipe = self.pipelines.getPtr(key) orelse return;
+        pipe.stream_cursor_ts = std.mem.readInt(u64, value[0..8], .little);
+        pipe.stream_cursor_seq = std.mem.readInt(u64, value[8..16], .little);
+        pipe.persisted_cursor_ts = pipe.stream_cursor_ts;
+        pipe.persisted_cursor_seq = pipe.stream_cursor_seq;
+    }
+
     // ── Pipeline Execution ──────────────────────────────────────────────
 
-    /// Create a pipeline execution state from parsed source/sink specifications.
-    /// Instantiates the operator chain from the job definition.
+    /// Build the tag registry + execution pipelines for a parsed job definition
+    /// and register them under `job_id`. Shared by live submit and replay so a
+    /// RUNNING job actually resumes consuming after restart, not just a registry
+    /// entry (FLO-104). Does not take ownership of `def` — createPipeline
+    /// deep-copies everything it retains, so the caller may free `def` after.
+    fn startPipelines(self: *ProcessingHandler, job_id: []const u8, def: *definition.JobDefinition) void {
+        if (def.sinks.items.len == 0) return;
+
+        // Build tag registry from all sinks and classify operators.
+        // Heap-allocated so classify operators can reference it during creation.
+        const tag_registry_ptr = self.allocator.create(definition.TagRegistry) catch {
+            log.err("startPipelines: tag registry alloc failed for job {s}", .{job_id});
+            return;
+        };
+        tag_registry_ptr.* = definition.TagRegistry{};
+        const tag_registry = tag_registry_ptr;
+        for (def.sinks.items) |snk| {
+            if (snk.match) |tag_list| {
+                for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
+            }
+        }
+        for (def.operators.items) |op_spec| {
+            if (std.mem.eql(u8, op_spec.type_name, "classify")) {
+                if (op_spec.config) |entries| {
+                    for (entries) |entry| {
+                        if (std.mem.startsWith(u8, entry.key, "tag_")) {
+                            _ = tag_registry.getOrCreate(entry.value);
+                        }
+                        // Also register default_tag so it can be resolved
+                        if (std.mem.eql(u8, entry.key, "default_tag")) {
+                            _ = tag_registry.getOrCreate(entry.value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve required_tags bitmask for each sink.
+        for (def.sinks.items) |*snk| {
+            if (snk.match) |tag_list| {
+                snk.required_tags = tag_registry.buildMask(tag_list);
+            }
+        }
+
+        // Create pipeline execution state. For multi-source jobs, one pipeline
+        // per source (all sinks per pipeline).
+        for (def.sources.items, 0..) |*src, idx| {
+            if (idx == 0) {
+                self.createPipeline(job_id, src, def.sinks.items, def, tag_registry);
+            } else {
+                // Multi-source: additional pipeline under a suffixed key.
+                var key_buf: [256]u8 = undefined;
+                const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, idx }) catch continue;
+                const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
+                self.createPipeline(ms_owned, src, def.sinks.items, def, tag_registry);
+            }
+        }
+    }
+
     fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *definition.TagRegistry) void {
         // Compute tag hash for TS source filtering (same algorithm as TSHandler)
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
@@ -1200,7 +1240,7 @@ pub const ProcessingHandler = struct {
 
             switch (pipe.source_kind) {
                 .ts => tickTsSource(pipe, shard, job),
-                .stream => self.tickStreamSource(pipe, shard, job),
+                .stream => self.tickStreamSource(pipeline_key, pipe, shard, job),
             }
         }
     }
@@ -1251,7 +1291,7 @@ pub const ProcessingHandler = struct {
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
-    fn tickStreamSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+    fn tickStreamSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         log.info("TICK_ENTRY: src={s} ns={s} cursor_ts={d} cursor_seq={d}", .{ pipe.src_stream, pipe.src_namespace, pipe.stream_cursor_ts, pipe.stream_cursor_seq });
         // Build cursor from last-read StreamID
         const cursor = StreamID{ .timestamp_ms = pipe.stream_cursor_ts, .sequence = pipe.stream_cursor_seq };
@@ -1287,10 +1327,43 @@ pub const ProcessingHandler = struct {
         // Advance cursor to last StreamID read
         pipe.stream_cursor_ts = result.last_id.timestamp_ms;
         pipe.stream_cursor_seq = result.last_id.sequence;
+
+        // Persist the advanced cursor durably (throttled) so the pipeline
+        // resumes from here after restart instead of re-reading from the start
+        // (FLO-104). At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
+        // of progress, which redelivers — it never skips records.
+        maybePersistCheckpoint(pipeline_key, pipe, shard, job.namespace_owned);
     }
 
     /// Apply the operator chain to a single input value.
     /// Returns owned slice of output records (caller must free), or null if no operators.
+    /// Minimum wall-clock gap between durable cursor checkpoints per pipeline.
+    /// Bounds Raft write amplification; a crash loses at most this much progress
+    /// (redelivered on resume — at-least-once, never skipped).
+    const CHECKPOINT_INTERVAL_MS: i64 = 1000;
+
+    /// Persist a pipeline's stream source cursor as a processing_checkpoint UAL
+    /// entry, debounced (FLO-104). Key = pipeline_key (job_id, or job_id\0idx for
+    /// multi-source); value = [cursor_ts:u64 LE][cursor_seq:u64 LE]. On restart,
+    /// replayCheckpoint restores this onto the rebuilt pipeline.
+    fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, namespace: []const u8) void {
+        // Only when the cursor actually advanced past what we last persisted.
+        if (pipe.stream_cursor_ts == pipe.persisted_cursor_ts and
+            pipe.stream_cursor_seq == pipe.persisted_cursor_seq) return;
+
+        const now_ms = @import("stdx").time.milliTimestamp();
+        if (pipe.last_persist_ms != 0 and now_ms - pipe.last_persist_ms < CHECKPOINT_INTERVAL_MS) return;
+
+        var val_buf: [16]u8 = undefined;
+        std.mem.writeInt(u64, val_buf[0..8], pipe.stream_cursor_ts, .little);
+        std.mem.writeInt(u64, val_buf[8..16], pipe.stream_cursor_seq, .little);
+        _ = persistence_mod.persistEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch return;
+
+        pipe.persisted_cursor_ts = pipe.stream_cursor_ts;
+        pipe.persisted_cursor_seq = pipe.stream_cursor_seq;
+        pipe.last_persist_ms = now_ms;
+    }
+
     fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
 
@@ -1480,6 +1553,41 @@ test "ProcessingHandler: init and deinit" {
     const handler = ProcessingHandler.init(std.testing.allocator);
     var h = handler;
     h.deinit();
+}
+
+test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor (FLO-104)" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+
+    // A minimal stream-source pipeline registered under a primary (no '\0') key,
+    // which deinit will not try to free.
+    const src = definition.SourceSpec{
+        .name = "s",
+        .stream = "raw",
+        .namespace = "default",
+        .partition = 0,
+        .batch_size = 0,
+    };
+    try handler.pipelines.put("job-cp", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+
+    var val: [16]u8 = undefined;
+    std.mem.writeInt(u64, val[0..8], 1700, .little);
+    std.mem.writeInt(u64, val[8..16], 5, .little);
+    handler.replayCheckpoint("job-cp", &val);
+
+    const pipe = handler.pipelines.getPtr("job-cp").?;
+    try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 5), pipe.stream_cursor_seq);
+    // persisted_* mirror the restored cursor so the first post-restart tick
+    // doesn't immediately re-persist an unchanged cursor.
+    try std.testing.expectEqual(@as(u64, 1700), pipe.persisted_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 5), pipe.persisted_cursor_seq);
+
+    // Unknown key is a no-op; short value is ignored (no crash, cursor unchanged).
+    handler.replayCheckpoint("missing", &val);
+    handler.replayCheckpoint("job-cp", &[_]u8{0});
+    try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
 }
 
 test "ProcessingHandler: applyOperatorChain with no operators returns null" {
