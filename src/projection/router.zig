@@ -273,7 +273,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
 
         // Processing — restored in replaySegments, no live projection
-        .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale => .none,
+        .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale, .processing_checkpoint => .none,
 
         // Checkpoint — processing runtime
         .checkpoint => .none,

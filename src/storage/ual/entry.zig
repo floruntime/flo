@@ -110,6 +110,7 @@ pub const EntryType = enum(u8) {
     processing_cancel = 0x82,
     processing_savepoint = 0x83,
     processing_rescale = 0x84,
+    processing_checkpoint = 0x85,
 
     // ── Checkpoint ──
     checkpoint = 0xE0,
@@ -125,7 +126,7 @@ pub const EntryType = enum(u8) {
             .workflow_create, .workflow_start, .workflow_complete => true,
             .namespace_create, .namespace_delete, .namespace_config => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
-            .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale => true,
+            .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale, .processing_checkpoint => true,
             .raft_config, .raft_noop, .raft_snapshot, .checkpoint => false,
         };
     }
