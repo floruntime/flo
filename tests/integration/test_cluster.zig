@@ -242,6 +242,7 @@ test "integration: membership tick rebalance trigger" {
 /// Helper to replicate from coordinator leader to alive followers.
 fn coordinatorReplicate(coords: []Coordinator, leader_idx: usize, alive: []const bool) !void {
     var entry_buf: [64]Entry = undefined;
+    var payload_arena: [65536]u8 = undefined;
     const leader = &coords[leader_idx];
 
     for (0..coords.len) |j| {
@@ -266,7 +267,7 @@ fn coordinatorReplicate(coords: []Coordinator, leader_idx: usize, alive: []const
         if (peer.next_index <= last) {
             prev_index = peer.next_index - 1;
             prev_term = if (prev_index == 0) @as(u64, 0) else leader.raft.log.entryTerm(prev_index) orelse 0;
-            const count = leader.raft.log.getRange(peer.next_index, &entry_buf);
+            const count = leader.raft.log.getRange(peer.next_index, &entry_buf, &payload_arena);
             entries = entry_buf[0..count];
         } else {
             // Heartbeat: no new entries, but send leader_commit to advance follower

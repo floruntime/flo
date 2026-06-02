@@ -176,6 +176,11 @@ pub const Shard = struct {
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
 
+    /// Count of persist/flush failures (addEntry or flushSegmentToDisk errors).
+    /// Surfaced instead of being silently swallowed so disk-full / IO faults
+    /// are observable rather than presenting as silent data loss.
+    persist_failures: u64,
+
     /// Storage durability — controls segment flush timing.
     durability: Durability,
 
@@ -494,6 +499,7 @@ pub const Shard = struct {
             .processing_handler = processing_handler,
             .raft_node = raft_node,
             .segment_writer = seg_writer,
+            .persist_failures = 0,
             .durability = durability,
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
@@ -557,7 +563,12 @@ pub const Shard = struct {
     /// Flush segments when `durability == .sync` (after projections are applied).
     pub fn syncFlushIfNeeded(self: *Shard) void {
         if (self.durability == .sync) {
-            self.flushSegmentToDisk() catch {};
+            self.flushSegmentToDisk() catch |err| {
+                // In sync mode a flush failure breaks the durability contract —
+                // surface it loudly instead of acking a write that isn't on disk.
+                self.persist_failures += 1;
+                log.err("shard {d}: sync flush failed: {s} (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+            };
         }
     }
 
@@ -582,7 +593,9 @@ pub const Shard = struct {
         self.connections.deinit(self.allocator);
 
         // Flush pending entries to segment file on shutdown
-        self.flushSegmentToDisk() catch {};
+        self.flushSegmentToDisk() catch |err| {
+            log.err("shard {d}: final flush on shutdown failed: {s} (buffered entries may be lost)", .{ self.id, @errorName(err) });
+        };
 
         // Clean up SegmentWriter
         self.segment_writer.deinit();
@@ -1267,7 +1280,10 @@ pub const Shard = struct {
     /// TaskScheduler callback: flush buffered Raft entries to disk.
     fn segmentFlushTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
-        self.flushSegmentToDisk() catch {};
+        self.flushSegmentToDisk() catch |err| {
+            self.persist_failures += 1;
+            log.err("shard {d}: async segment flush failed: {s} (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+        };
         return 0;
     }
 
@@ -2350,7 +2366,12 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 /// This is the designed hot → warm flush path (UNIFIED_STORAGE_DESIGN §4.3).
 fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    shard.segment_writer.addEntry(entry) catch {};
+    shard.segment_writer.addEntry(entry) catch |err| {
+        // Do not swallow: a failed persist means this committed entry is not
+        // queued for disk and would be lost on restart. Surface it.
+        shard.persist_failures += 1;
+        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s} (persist_failures={d})", .{ shard.id, entry.header.index, @errorName(err), shard.persist_failures });
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

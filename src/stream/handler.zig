@@ -1660,9 +1660,16 @@ pub const StreamHandler = struct {
         return count;
     }
 
-    /// Read a payload from the UAL by entry index (zero-copy).
+    /// Read a payload from the UAL by entry index (zero-copy fast path).
     /// Returns the message value and the tier byte (0=hot, 1=warm).
     /// Falls back to the warm store when the entry has been evicted from the hot ring.
+    ///
+    /// Wrap-safety: the zero-copy `read` below returns null for an entry whose
+    /// payload wraps the hot-ring boundary. That is SAFE here precisely because
+    /// `partition.apply` copies every applied payload into the warm store, so the
+    /// warm fallback serves the wrapped entry as tier=1. This is the canonical
+    /// "null is OK, fall through" use of `read` — do not switch it to readCopy
+    /// (that would force a copy + a response-lived buffer for no correctness gain).
     fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
         // Hot path — entry still in the UAL ring buffer. Strip the partition
         // prefix so callers see the bare batch blob `unpackBatch` expects.

@@ -1058,9 +1058,13 @@ pub const KVHandler = struct {
         // Propose through Raft — in single-node mode this commits immediately
         const propose_result = try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
 
-        // Broadcast to cluster peers via raft network
+        // Broadcast to cluster peers via raft network.
+        // getEntryCopy (not getEntry): the zero-copy read returns null for an
+        // entry whose payload wraps the hot-ring boundary, which would silently
+        // drop it from replication. payload_buf is free to reuse — propose()
+        // already copied it into the ring.
         if (shard.raft_network) |rn| {
-            if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
+            if (shard.raft_node.log.getEntryCopy(propose_result.index, &payload_buf)) |committed_entry| {
                 var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
                 if (committed_entry.serialize(&entry_buf)) |serialized_len| {
                     rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
@@ -1213,8 +1217,11 @@ pub const KVHandler = struct {
         };
 
         // Broadcast to peers (mirrors proposeKVEntryWithValue).
+        // getEntryCopy (not getEntry): the zero-copy read returns null for a
+        // boundary-wrapping payload, which would silently drop it from
+        // replication. payload_buf (heap, len >= written) is free to reuse here.
         if (shard.raft_network) |rn| {
-            if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
+            if (shard.raft_node.log.getEntryCopy(propose_result.index, payload_buf)) |committed_entry| {
                 var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
                 if (committed_entry.serialize(&entry_buf)) |serialized_len| {
                     rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};

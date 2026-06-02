@@ -190,6 +190,13 @@ pub const SegmentWriter = struct {
         defer @import("stdx").fs.closeFile(file);
         try @import("stdx").fs.writeAll(file, sealed);
 
+        // fsync the data before the rename makes it visible. Without this the
+        // bytes may sit in the page cache and be lost on power failure, so
+        // `sync` durability would silently fail to deliver its "fdatasync before
+        // ack" guarantee. Mirrors the snapshot write path (shard.zig). The
+        // rename itself is atomic; directory-entry durability is a follow-up.
+        try @import("stdx").fs.sync(file);
+
         // Rename into place
         @import("stdx").fs.rename(tmp_path, path) catch |err| {
             // If rename fails, try to clean up tmp

@@ -108,9 +108,14 @@ pub fn persistEntry(
         payload_buf[0..payload_len],
     );
 
-    // Broadcast to cluster peers via raft network
+    // Broadcast to cluster peers via raft network.
+    //
+    // Use getEntryCopy, not getEntry: the zero-copy getEntry returns null for an
+    // entry whose payload wraps the hot-ring byte boundary, which would silently
+    // drop the entry from the broadcast and diverge followers. payload_buf is
+    // free to reuse here — propose() already copied it into the ring.
     if (shard.raft_network) |rn| {
-        if (shard.raft_node.log.getEntry(propose_result.index)) |committed_entry| {
+        if (shard.raft_node.log.getEntryCopy(propose_result.index, &payload_buf)) |committed_entry| {
             var entry_buf: [MAX_PERSIST_PAYLOAD + 64]u8 = undefined;
             if (committed_entry.serialize(&entry_buf)) |serialized_len| {
                 rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};

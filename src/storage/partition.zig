@@ -248,8 +248,11 @@ pub const Partition = struct {
     }
 
     /// Check if an entry is still in the hot ring buffer.
+    /// Uses contains() (index-map membership), not read(): read() returns null
+    /// for a boundary-wrapping payload, which would falsely report a live entry
+    /// as evicted.
     pub fn isInHot(self: *const Partition, index: u64) bool {
-        return self.ual.read(index) != null;
+        return self.ual.contains(index);
     }
 
     /// Check if a UAL index is available in cold storage.
@@ -286,8 +289,12 @@ pub const Partition = struct {
     /// Returns the entry with payload pointing into `payload_buf` (or
     /// null if not found anywhere).
     pub fn readTiered(self: *Partition, index: u64, payload_buf: []u8) ?Entry {
-        // 1. Hot ring (zero-copy, cheap)
-        if (self.ual.read(index)) |entry| return entry;
+        // 1. Hot ring. Use readCopy, not the zero-copy read: read() returns null
+        //    for a payload that wraps the ring boundary, which would make a live
+        //    hot entry look "not found" and fall through to warm/cold (or vanish
+        //    if not yet flushed). readCopy reconstructs wrapped payloads and also
+        //    honours this function's contract that the payload lives in payload_buf.
+        if (self.ual.readCopy(index, payload_buf)) |entry| return entry;
 
         // 2. Warm store (payload copy, still local)
         if (self.warm_store.get(index)) |warm_payload| {

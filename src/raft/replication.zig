@@ -75,15 +75,17 @@ pub const ReplicationManager = struct {
 
     /// Build an AppendEntries request for a specific peer.
     ///
-    /// `entry_buf` is caller-provided scratch space for the entry batch.
-    /// The returned `AppendRequest.entries` points into this buffer and is
-    /// valid only as long as `entry_buf` is alive.
+    /// `entry_buf` is caller-provided scratch space for the entry batch and
+    /// `payload_arena` is caller-provided scratch space the entry payloads are
+    /// copied into (wrap-safe). The returned `AppendRequest.entries` points into
+    /// both buffers and is valid only as long as they are alive.
     ///
     /// Returns `null` if there are no new entries to send to this peer.
     pub fn buildAppendRequest(
         self: *ReplicationManager,
         peer_idx: usize,
         entry_buf: []Entry,
+        payload_arena: []u8,
     ) ?AppendRequest {
         if (peer_idx >= self.node.peer_count) return null;
         if (self.node.role != .leader) return null;
@@ -110,7 +112,7 @@ pub const ReplicationManager = struct {
         // Read entries from next_index up to batch limit
         const max_batch: usize = @intCast(self.node.config.max_entries_per_batch);
         const buf_limit = @min(entry_buf.len, max_batch);
-        const count = self.node.log.getRange(peer.next_index, entry_buf[0..buf_limit]);
+        const count = self.node.log.getRange(peer.next_index, entry_buf[0..buf_limit], payload_arena);
 
         if (count == 0) return null;
 
@@ -291,7 +293,8 @@ test "replication: build request for lagging peer" {
 
     // Build request for peer 0
     var buf: [16]Entry = undefined;
-    const req = rm.buildAppendRequest(0, &buf);
+    var arena: [16384]u8 = undefined;
+    const req = rm.buildAppendRequest(0, &buf, &arena);
     try testing.expect(req != null);
 
     const r = req.?;
@@ -332,7 +335,8 @@ test "replication: follower receives replicated entries" {
 
     // Build request for peer 0 (node 2)
     var buf: [16]Entry = undefined;
-    const req = rm.buildAppendRequest(0, &buf).?;
+    var arena: [16384]u8 = undefined;
+    const req = rm.buildAppendRequest(0, &buf, &arena).?;
 
     // Follower processes it
     const resp = try nodes[1].handleAppendEntries(req);
@@ -359,7 +363,8 @@ test "replication: commit advances after majority replication" {
 
     // Replicate to follower 1 (peer index 0, which is node 2)
     var buf1: [16]Entry = undefined;
-    const req1 = rm.buildAppendRequest(0, &buf1).?;
+    var arena: [16384]u8 = undefined;
+    const req1 = rm.buildAppendRequest(0, &buf1, &arena).?;
     const resp1 = try nodes[1].handleAppendEntries(req1);
     try testing.expect(resp1.success);
     rm.handleResponse(resp1);
@@ -387,7 +392,8 @@ test "replication: log mismatch triggers backtrack" {
 
     // Build request — prev_log at index 0, term 0 (should match)
     var buf: [16]Entry = undefined;
-    const req = rm.buildAppendRequest(0, &buf);
+    var arena: [16384]u8 = undefined;
+    const req = rm.buildAppendRequest(0, &buf, &arena);
     try testing.expect(req != null);
 
     // But follower has different entry at index 1, AppendEntries will
@@ -416,11 +422,12 @@ test "replication: pipeline allows multiple in-flight" {
 
     // Should be able to build 3 requests before stalling
     var buf: [16]Entry = undefined;
-    const r1 = rm.buildAppendRequest(0, &buf);
+    var arena: [16384]u8 = undefined;
+    const r1 = rm.buildAppendRequest(0, &buf, &arena);
     try testing.expect(r1 != null);
     try testing.expectEqual(@as(u8, 1), rm.pipeline[0]);
 
-    const r2 = rm.buildAppendRequest(0, &buf);
+    const r2 = rm.buildAppendRequest(0, &buf, &arena);
     // May or may not be null depending on next_index tracking
     // The peer's next_index hasn't been updated (no response yet),
     // so second request reads same entries. Let's just verify pipeline works.
@@ -441,7 +448,8 @@ test "replication: returns null for caught-up peer" {
 
     // No entries proposed — peer is caught up
     var buf: [16]Entry = undefined;
-    const req = rm.buildAppendRequest(0, &buf);
+    var arena: [16384]u8 = undefined;
+    const req = rm.buildAppendRequest(0, &buf, &arena);
     try testing.expect(req == null);
     try testing.expect(!rm.peerNeedsCatchUp(0));
 }
@@ -454,9 +462,10 @@ test "replication: returns null when not leader" {
 
     var rm = ReplicationManager.init(&node);
     var buf: [8]Entry = undefined;
+    var arena: [16384]u8 = undefined;
 
     // Node is a follower — can't replicate
-    try testing.expect(rm.buildAppendRequest(0, &buf) == null);
+    try testing.expect(rm.buildAppendRequest(0, &buf, &arena) == null);
     try testing.expect(rm.buildHeartbeat(0) == null);
 }
 
@@ -472,13 +481,14 @@ test "replication: full 3-node scenario with multiple rounds" {
     _ = try nodes[0].propose(.kv_put, 0, 0, "round1");
 
     var buf: [16]Entry = undefined;
+    var arena: [16384]u8 = undefined;
 
     // Replicate to both followers
-    const req1a = rm.buildAppendRequest(0, &buf).?;
+    const req1a = rm.buildAppendRequest(0, &buf, &arena).?;
     const resp1a = try nodes[1].handleAppendEntries(req1a);
     rm.handleResponse(resp1a);
 
-    const req1b = rm.buildAppendRequest(1, &buf).?;
+    const req1b = rm.buildAppendRequest(1, &buf, &arena).?;
     const resp1b = try nodes[2].handleAppendEntries(req1b);
     rm.handleResponse(resp1b);
 
@@ -490,7 +500,7 @@ test "replication: full 3-node scenario with multiple rounds" {
     _ = try nodes[0].propose(.kv_put, 0, 0, "round2b");
 
     // Replicate to follower 1 only (simulates async)
-    const req2 = rm.buildAppendRequest(0, &buf).?;
+    const req2 = rm.buildAppendRequest(0, &buf, &arena).?;
     const resp2 = try nodes[1].handleAppendEntries(req2);
     rm.handleResponse(resp2);
 
@@ -502,7 +512,7 @@ test "replication: full 3-node scenario with multiple rounds" {
     try testing.expectEqual(@as(u64, 3), nodes[1].log.lastIndex());
 
     // Now replicate to follower 2
-    const req3 = rm.buildAppendRequest(1, &buf).?;
+    const req3 = rm.buildAppendRequest(1, &buf, &arena).?;
     const resp3 = try nodes[2].handleAppendEntries(req3);
     rm.handleResponse(resp3);
 
@@ -526,7 +536,8 @@ test "replication: peers matching at least" {
 
     // Replicate to one follower
     var buf: [16]Entry = undefined;
-    const req = rm.buildAppendRequest(0, &buf).?;
+    var arena: [16384]u8 = undefined;
+    const req = rm.buildAppendRequest(0, &buf, &arena).?;
     const resp = try nodes[1].handleAppendEntries(req);
     rm.handleResponse(resp);
 
@@ -534,7 +545,7 @@ test "replication: peers matching at least" {
     try testing.expectEqual(@as(u8, 1), rm.peersMatchingAtLeast(1));
 
     // Replicate to second follower
-    const req2 = rm.buildAppendRequest(1, &buf).?;
+    const req2 = rm.buildAppendRequest(1, &buf, &arena).?;
     const resp2 = try nodes[2].handleAppendEntries(req2);
     rm.handleResponse(resp2);
 
@@ -556,7 +567,8 @@ test "replication: stats tracking" {
     try testing.expectEqual(@as(u64, 0), rm.heartbeats_sent);
 
     var buf: [16]Entry = undefined;
-    _ = rm.buildAppendRequest(0, &buf);
+    var arena: [16384]u8 = undefined;
+    _ = rm.buildAppendRequest(0, &buf, &arena);
     try testing.expectEqual(@as(u64, 1), rm.batches_sent);
     try testing.expect(rm.entries_replicated > 0);
 
