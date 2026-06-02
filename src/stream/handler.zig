@@ -1680,9 +1680,18 @@ pub const StreamHandler = struct {
         const raft = shard.raft_node;
         var last_id = StreamID.MIN;
 
+        // Copy-read each entry: getEntry()'s zero-copy read returns null for any
+        // entry whose payload wraps the hot-ring byte boundary. Skipping such an
+        // entry here while still advancing last_applied silently drops a
+        // committed record from the stream (data loss) — reproduced by the
+        // tiered-storage warm-spill test with a small hot buffer. getEntryCopy
+        // reconstructs wrapped payloads into payload_buf; partition.apply copies
+        // it out before the next iteration reuses the buffer.
+        var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+
         while (raft.last_applied < through_index) {
             const next_idx = raft.last_applied + 1;
-            if (raft.log.getEntry(next_idx)) |entry| {
+            if (raft.log.getEntryCopy(next_idx, &payload_buf)) |entry| {
                 const etype: EntryType = @enumFromInt(entry.header.entry_type);
                 if (etype == .stream_append) {
                     last_id = try self.applyStreamAppendEntry(&entry);
