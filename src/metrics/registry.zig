@@ -759,6 +759,31 @@ pub const MetricsRegistry = struct {
         return &self.streams.getPtr(key).?.metrics;
     }
 
+    /// Remove a stream's metrics entry (mirror of `registerStream`). No-op if
+    /// the stream was never registered. Frees the owned key, namespace, topic.
+    pub fn unregisterStream(
+        self: *MetricsRegistry,
+        namespace: []const u8,
+        topic: []const u8,
+        partition: u32,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const key = std.fmt.allocPrint(
+            self.allocator,
+            "{s}:{s}:{d}",
+            .{ namespace, topic, partition },
+        ) catch return;
+        defer self.allocator.free(key);
+
+        if (self.streams.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            self.allocator.free(kv.value.namespace);
+            self.allocator.free(kv.value.topic);
+        }
+    }
+
     /// Register a queue and return a pointer to its metrics
     ///
     /// Returns: Pointer to QueueMetrics (owned by registry, valid until deinit)

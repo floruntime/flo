@@ -122,6 +122,7 @@ pub const OpCode = enum(u16) {
     stream_create = 0x13D,
     stream_create_response = 0x13E,
     stream_alter = 0x13F,
+    stream_delete = 0x140,
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──────────────────────────────
     stream_group_create = 0x150,
@@ -327,6 +328,7 @@ pub const OptionTag = enum(u8) {
     retention_count = 0x29, // u64: Retention policy - max event count
     retention_age = 0x2A, // u64: Retention policy - max age in seconds
     retention_bytes = 0x2B, // u64: Retention policy - max bytes
+    force = 0x2C, // void: Force a destructive op (e.g. delete a non-empty stream)
 
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers (overrides default)

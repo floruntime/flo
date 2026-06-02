@@ -491,6 +491,47 @@ test "e2e/stream: trim with --dry-run" {
     try testing.expect(result.contains("DRY") or result.contains("Would") or result.contains("dry") or result.succeeded());
 }
 
+test "e2e/stream: delete removes a stream (FLO-105)" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "del-test", "m1" });
+
+    // Non-empty stream without --force is refused.
+    var r1 = try ctx.cli.run(&.{ "stream", "delete", "del-test" });
+    defer r1.deinit();
+    try testing.expect(!r1.succeeded());
+
+    // --force deletes it.
+    var r2 = try ctx.cli.run(&.{ "stream", "delete", "del-test", "--force" });
+    defer r2.deinit();
+    try testing.expect(r2.succeeded());
+
+    // It no longer appears in the listing.
+    var r3 = try ctx.cli.run(&.{ "stream", "list" });
+    defer r3.deinit();
+    try testing.expect(!r3.contains("del-test"));
+}
+
+test "e2e/stream: delete is idempotent and recreatable (FLO-105)" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Deleting a stream that never existed succeeds (idempotent).
+    var r1 = try ctx.cli.run(&.{ "stream", "delete", "ghost" });
+    defer r1.deinit();
+    try testing.expect(r1.succeeded());
+
+    // After deleting a real stream, the name is free to use again.
+    try ctx.exec(&.{ "stream", "append", "reuse", "a" });
+    try ctx.exec(&.{ "stream", "delete", "reuse", "--force" });
+    try ctx.exec(&.{ "stream", "append", "reuse", "b" });
+
+    var r2 = try ctx.cli.run(&.{ "stream", "list" });
+    defer r2.deinit();
+    try testing.expect(r2.contains("reuse"));
+}
+
 // =============================================================================
 // Consumer Group Operations
 // =============================================================================

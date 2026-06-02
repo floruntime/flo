@@ -255,7 +255,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .ts_write, .ts_write_batch => .ts,
 
         // Stream — no projection (UAL direct reads)
-        .stream_append, .stream_trim => .none,
+        .stream_append, .stream_trim, .stream_delete => .none,
 
         // Raft control — consensus layer
         .raft_config, .raft_noop => .none,

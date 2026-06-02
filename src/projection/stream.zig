@@ -1005,6 +1005,38 @@ pub const StreamProjection = struct {
         return records[idx].id;
     }
 
+    /// Delete a stream entirely: drop its records (by `name_hash`) plus its name
+    /// registry and metadata entries. Mirror of `registerStream` / `trimStream`.
+    /// Consumer groups are namespace-level (they can fan in across streams via
+    /// pattern reads), so they are intentionally left intact (FLO-105 option A).
+    ///
+    /// The name registry is keyed by the namespace-qualified name on the live
+    /// path but by the raw name on the replay path, so both forms are removed.
+    /// Metadata is keyed by the raw name. Returns true if the stream existed.
+    pub fn deleteStream(self: *StreamProjection, name_hash: u64, raw_name: []const u8, qualified_name: []const u8) bool {
+        var existed = false;
+        if (self.streams.fetchRemove(name_hash)) |kv| {
+            var ss = kv.value;
+            ss.deinit(self.allocator);
+            existed = true;
+        }
+        if (self.stream_names.fetchRemove(qualified_name)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            existed = true;
+        }
+        if (!std.mem.eql(u8, raw_name, qualified_name)) {
+            if (self.stream_names.fetchRemove(raw_name)) |kv| {
+                self.allocator.free(@constCast(kv.key));
+                existed = true;
+            }
+        }
+        if (self.stream_metadata.fetchRemove(raw_name)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            existed = true;
+        }
+        return existed;
+    }
+
     /// Deliver records from a named stream to a consumer group.
     /// Reads `count` records after the group's last_delivered_id, adds to PEL.
     /// Returns the StreamRecords delivered (fills buf, returns count).
@@ -1180,6 +1212,15 @@ pub const StreamProjection = struct {
                         const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
                         const name_hash = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
                         _ = self.trimStream(name_hash, .{ .timestamp_ms = ts, .sequence = seq });
+                    }
+                }
+            },
+            .stream_delete => {
+                // key = raw stream name, value = namespace-qualified name (FLO-105).
+                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
+                    if (cmd.key.len > 0) {
+                        const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
+                        _ = self.deleteStream(name_hash, cmd.key, cmd.value);
                     }
                 }
             },
