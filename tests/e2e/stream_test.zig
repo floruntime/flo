@@ -3196,15 +3196,23 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
     defer testing.allocator.free(leader_out);
     const leader_present = countPresent(leader_out);
 
-    // Diagnostic only: follower stream reads currently return a partial set even
-    // with a default (non-wrapping) ring — a SEPARATE pre-existing ~50% gap in
-    // follower-side stream replication/read, unrelated to the wrap boundary (a
-    // wrap drop is 1–2 records, not ~half). Tracked separately; not asserted here
-    // so this wrap regression stays meaningful and green.
+    // A FOLLOWER must serve the same full record set as the leader. The leader
+    // broadcasts every committed entry to peers and the mesh re-broadcasts it for
+    // late joiners, so a follower receives each entry more than once. The follower
+    // ingest path (Shard.applyReplicatedEntry) now (a) skips entries at or below
+    // the already-applied index — matching the ProjectionRouter's idempotency
+    // guard — and (b) rebuilds the stream projection solely through the replay
+    // registry instead of also appending inline. Before the fix each replicated
+    // record was appended up to 4× on a follower (duplicate delivery × duplicate
+    // apply), inflating its record set so a limit-capped read surfaced only the
+    // earliest ~quarter (follower returned 25/50 while the leader returned 50/50).
     const follower_out = try cluster.execCaptureAnyOn(1, &.{ "stream", "read", stream_name, "--limit", "100", "-o", "json" });
     defer testing.allocator.free(follower_out);
-    std.debug.print("\n[wrap-regression] leader present={d}/{d} (must be {d}); follower present={d}/{d} (diagnostic — separate known gap)\n", .{ leader_present, total, total, countPresent(follower_out), total });
+    const follower_present = countPresent(follower_out);
+    std.debug.print("\n[wrap-regression] leader present={d}/{d}; follower present={d}/{d} (both must be {d})\n", .{ leader_present, total, follower_present, total, total });
 
     // The wrap regression: the leader must hold and serve every committed record.
     try testing.expectEqual(total, leader_present);
+    // Replication correctness: the follower must serve every record too.
+    try testing.expectEqual(total, follower_present);
 }

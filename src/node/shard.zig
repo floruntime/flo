@@ -1144,24 +1144,30 @@ pub const Shard = struct {
         const entry = entry_mod.Entry.deserialize(payload) orelse return;
         const partition = self.defaultPartition();
 
-        // Apply to partition (UAL + projection router: KV, Queue, TS)
-        const ual_index = partition.apply(&entry) catch 0;
+        // Idempotency: the leader broadcasts every committed entry to peers, and
+        // the mesh re-broadcasts it for late joiners — so a follower receives each
+        // entry more than once. Skip any entry at or below the index already
+        // applied, matching the ProjectionRouter's own `applied_index` guard.
+        //
+        // Without this, a re-delivered entry was applied again: the stream
+        // projection got a duplicate record (and `replayEntry` below appended yet
+        // another), inflating a follower's record set to a multiple of the real
+        // count. A limit-capped `stream read` then surfaced only the earliest
+        // fraction of records — followers returned ~25/50 while the leader
+        // returned 50/50.
+        if (entry.header.index <= partition.router.applied_index) return;
 
-        // Stream entries need manual offset tracking (router routes to .none)
-        if (@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type)) == .stream_append) {
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                // Recover the user partition from the value prefix so followers
-                // rebuild records on the right partition, not 0.
-                const partition_index = stream_proj_mod.decodeAppendValue(cmd.value).partition_index;
-                // Anchor to the entry timestamp for deterministic replay (FLO-103).
-                const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                _ = partition.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms) catch {};
-                partition.stream.registerStream(cmd.key) catch {};
-            }
-        }
+        // Apply to the partition once: UAL ring + warm store + the router-owned
+        // projections (KV, Queue, TS). This advances `applied_index`, closing the
+        // idempotency window above for any later re-delivery of this entry.
+        _ = partition.apply(&entry) catch return;
 
-        // Dispatch to handler replay (workflow, actions, namespace, etc.)
+        // Rebuild the remaining projections (stream offset tracking, workflow,
+        // actions, namespace, processing, consumer-group cursors) through the
+        // replay registry — the SAME single source of truth `replaySegments` uses
+        // on restart. Stream entries route to `.none` in the router, so this is
+        // where their StreamProjection records are created; doing it inline here
+        // as well would double-append every stream record.
         _ = self.replay_registry.dispatch(&entry);
     }
 
