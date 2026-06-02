@@ -408,10 +408,15 @@ pub const StreamHandler = struct {
         // the partition + projection — mirrors persistAndApplyTrim's behaviour.
         const stream_id = if (self.shard_ptr) |sptr| blk: {
             const shard = shardFromPtr(sptr);
-            const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, payload_value) catch {
+            // Carry the partition in the value prefix so it survives restart (FLO-105).
+            const stored_value = stream_mod.encodeAppendValue(self.allocator, partition_index, payload_value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
+            };
+            defer self.allocator.free(stored_value);
+            const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
             };
-            break :blk self.applyCommittedStreamEntries(shard, raft_index, partition_index) catch {
+            break :blk self.applyCommittedStreamEntries(shard, raft_index) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
             };
         } else self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
@@ -824,10 +829,12 @@ pub const StreamHandler = struct {
             };
         };
 
-        return .{ .group_joined = .{
-            .generation_id = 1, // Placeholder — real gen ID from rebalance
-            .assigned_partitions = &[_]u32{0}, // Single partition for now
-        } };
+        return .{
+            .group_joined = .{
+                .generation_id = 1, // Placeholder — real gen ID from rebalance
+                .assigned_partitions = &[_]u32{0}, // Single partition for now
+            },
+        };
     }
 
     // ── GROUP LEAVE ─────────────────────────────────────────────────────
@@ -1131,7 +1138,7 @@ pub const StreamHandler = struct {
         };
 
         // Serialize PEL entries
-        // Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])* 
+        // Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])*
         const data = serializePendingEntries(self.allocator, pel_buf[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "pending serialization failed" } };
         };
@@ -1510,8 +1517,12 @@ pub const StreamHandler = struct {
 
         const sptr = self.shard_ptr orelse return error.ShardPtrNotSet;
         const shard = shardFromPtr(sptr);
-        const raft_index = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, batch_value);
-        const stream_id = try self.applyCommittedStreamEntries(shard, raft_index, 0);
+        // Pipeline appends are single-partition; carry partition 0 in the value
+        // prefix so the entry decodes consistently on replay.
+        const stored_value = try stream_mod.encodeAppendValue(self.allocator, 0, batch_value);
+        defer self.allocator.free(stored_value);
+        const raft_index = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
+        const stream_id = try self.applyCommittedStreamEntries(shard, raft_index);
 
         // Register the stream name so it appears in `stream list`
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -1623,16 +1634,17 @@ pub const StreamHandler = struct {
     /// Returns the message value and the tier byte (0=hot, 1=warm).
     /// Falls back to the warm store when the entry has been evicted from the hot ring.
     fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
-        // Hot path — entry still in the UAL ring buffer
+        // Hot path — entry still in the UAL ring buffer. Strip the partition
+        // prefix (FLO-105) so callers see the bare batch blob `unpackBatch` expects.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
-                return .{ .payload = cmd.value, .tier = 0 };
+                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 0 };
             }
         }
         // Warm fallback — payload copied to partition warm store on apply()
         if (self.partition.readPayloadWarm(ual_index)) |raw| {
             if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
-                return .{ .payload = cmd.value, .tier = 1 };
+                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 1 };
             }
         }
         return .{ .payload = "", .tier = 0 };
@@ -1664,7 +1676,6 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         shard: *Shard,
         through_index: u64,
-        partition_index: u32,
     ) !StreamID {
         const raft = shard.raft_node;
         var last_id = StreamID.MIN;
@@ -1674,7 +1685,7 @@ pub const StreamHandler = struct {
             if (raft.log.getEntry(next_idx)) |entry| {
                 const etype: EntryType = @enumFromInt(entry.header.entry_type);
                 if (etype == .stream_append) {
-                    last_id = try self.applyStreamAppendEntry(&entry, partition_index);
+                    last_id = try self.applyStreamAppendEntry(&entry);
                 }
                 // .stream_trim: applied in-place by persistAndApplyTrim; skip.
                 // other types: owned by another handler's apply loop; skip.
@@ -1686,10 +1697,14 @@ pub const StreamHandler = struct {
         return last_id;
     }
 
-    fn applyStreamAppendEntry(self: *StreamHandler, entry: *const entry_mod.Entry, partition_index: u32) !StreamID {
+    fn applyStreamAppendEntry(self: *StreamHandler, entry: *const entry_mod.Entry) !StreamID {
         const ual_index = try self.partition.apply(entry);
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.InvalidPayload;
         const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+        // The user partition rides in the value prefix so it survives restart
+        // (FLO-105) — decode it here rather than threading it from the request,
+        // keeping the live and replay paths on one source of truth.
+        const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
         // Anchor the StreamID to the entry's persisted timestamp (not the wall
         // clock) so replay reproduces the same ID — required for the durable
         // consumer-group cursor to line up after restart (FLO-103).
@@ -1707,6 +1722,10 @@ pub const StreamHandler = struct {
         const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
         const next_index = self.partition.committed_index + 1;
 
+        // Carry the partition in the value prefix so it survives restart (FLO-105).
+        const stored_value = try stream_mod.encodeAppendValue(self.allocator, partition_index, payload_value);
+        defer self.allocator.free(stored_value);
+
         var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         const entry = entry_mod.buildCommandEntry(
             .stream_append,
@@ -1716,11 +1735,11 @@ pub const StreamHandler = struct {
             timestamp_ns,
             ns_hash,
             req.key,
-            payload_value,
+            stored_value,
             &payload_buf,
         ) orelse return error.PayloadTooLarge;
 
-        return self.applyStreamAppendEntry(&entry, partition_index);
+        return self.applyStreamAppendEntry(&entry);
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1749,10 +1768,14 @@ pub const StreamHandler = struct {
         if (etype == .stream_append) {
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                // Recover the user partition from the value prefix so it survives
+                // restart — without it every record rebuilds as partition 0 and
+                // partition-filtered reads break (FLO-105).
+                const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply (FLO-103).
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, 0, ts_ms) catch {};
+                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms) catch {};
                 self.stream.registerStream(cmd.key) catch {};
             }
         }
@@ -2251,6 +2274,19 @@ fn makeBatchValueWithHeader(buf: []u8, payload: []const u8, hdr_key: []const u8,
     return buf[0..total];
 }
 
+/// Count records a partition-filtered read returns for `stream` (FLO-105 test).
+fn readPartitionCount(handler: *StreamHandler, stream: []const u8, partition_index: u32) !u32 {
+    var opt_buf: [16]u8 = undefined;
+    var builder = OptionsBuilder.init(&opt_buf);
+    try builder.addU32(.partition, partition_index);
+    const result = handler.handleCommand(makeRequest(.stream_read, stream, "", builder.getOptions()));
+    defer handler.freeResult(result);
+    return switch (result) {
+        .stream_messages => |m| std.mem.readInt(u32, m.data[0..4], .little),
+        else => error.TestUnexpectedResult,
+    };
+}
+
 test "stream handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     StreamHandler.register(&dispatcher);
@@ -2403,6 +2439,51 @@ test "stream handler: read with limit" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "stream handler: partition_index survives restart/replay (FLO-105)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // Append one record to each of three distinct user partitions.
+    const parts = [_]struct { payload: []const u8, partition: u32 }{
+        .{ .payload = "a", .partition = 0 },
+        .{ .payload = "b", .partition = 1 },
+        .{ .payload = "c", .partition = 2 },
+    };
+    for (parts) |p| {
+        var vbuf: [64]u8 = undefined;
+        var obuf: [16]u8 = undefined;
+        var ob = OptionsBuilder.init(&obuf);
+        try ob.addU32(.partition, p.partition);
+        _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbuf, p.payload), ob.getOptions()));
+    }
+
+    // Pre-restart: each partition filter isolates exactly its one record.
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 0));
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
+
+    // Simulate restart: drop the in-memory projection, then rebuild it from the
+    // persisted UAL entries — exactly the segment-replay path used on boot.
+    handler.stream.reset();
+    var idx: u64 = 1;
+    while (idx <= partition.committed_index) : (idx += 1) {
+        if (partition.ual.read(idx)) |entry| {
+            StreamHandler.replayEntry(&handler, &entry);
+        }
+    }
+
+    // After restart, partitions must still be isolated. Before FLO-105 every
+    // record rebuilt as partition 0, so this read 3/0/0 instead of 1/1/1.
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 0));
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
+    try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
 }
 
 test "stream handler: trim" {
