@@ -67,6 +67,7 @@ pub const EntryType = enum(u8) {
     // ── Stream ──
     stream_append = 0x10,
     stream_trim = 0x11,
+    stream_delete = 0x12,
 
     // ── Queue ──
     queue_enqueue = 0x20,
@@ -119,7 +120,7 @@ pub const EntryType = enum(u8) {
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_touch => true,
-            .stream_append, .stream_trim => true,
+            .stream_append, .stream_trim, .stream_delete => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => true,
             .ts_write, .ts_write_batch => true,
             .cg_commit, .cg_create, .cg_delete => true,

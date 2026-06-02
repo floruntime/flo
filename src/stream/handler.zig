@@ -107,6 +107,7 @@ pub const StreamHandler = struct {
         dispatcher.registerWalk(.stream_list, dispatchStream, localScanStreams);
         dispatcher.registerWithRoute(.stream_create, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_alter, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_delete, dispatchStream, preRouteByStream);
 
         // Consumer group operations (0x20–0x2C)
         dispatcher.registerWithRoute(.stream_group_create, dispatchStream, preRouteByStream);
@@ -358,6 +359,7 @@ pub const StreamHandler = struct {
             .stream_list => self.handleList(req),
             .stream_create => self.handleCreate(req),
             .stream_alter => self.handleAlter(req),
+            .stream_delete => self.handleDelete(req),
 
             // Consumer group operations
             .stream_group_create => self.handleGroupCreate(req),
@@ -557,6 +559,34 @@ pub const StreamHandler = struct {
             .deleted_count = deleted,
             .first_seq = first_seq,
         } };
+    }
+
+    // ── DELETE ──────────────────────────────────────────────────────────
+
+    /// Delete a stream entirely (records + metadata + name registry + metrics).
+    /// Consumer groups are namespace-level and intentionally left intact
+    /// (FLO-105 option A). Idempotent: deleting a missing stream returns ok.
+    /// Refuses a non-empty stream unless `force` (option 0x2C) is set.
+    fn handleDelete(self: *StreamHandler, req: Request) CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
+        }
+
+        const ns_hash = router.namespaceHash(req.namespace);
+        const name_hash = router.nameHash(ns_hash, req.key);
+
+        // Safety guard: don't drop a non-empty stream without --force.
+        const force = req.findOption(.force) != null;
+        if (!force and self.stream.streamRecordCount(name_hash) > 0) {
+            return .{ .err = .{ .code = .conflict, .message = "stream is not empty; pass --force to delete" } };
+        }
+
+        self.persistAndApplyDelete(req.namespace, req.key, name_hash);
+
+        // Metrics live on the leader only; followers/replay never touch them.
+        if (self.metrics_registry) |mr| mr.unregisterStream(req.namespace, req.key, 0);
+
+        return .ok;
     }
 
     // ── INFO ────────────────────────────────────────────────────────────
@@ -1759,6 +1789,7 @@ pub const StreamHandler = struct {
     pub fn registerReplay(self: *StreamHandler, registry: *ReplayRegistry) void {
         registry.register(.stream_append, @ptrCast(self), replayEntry);
         registry.register(.stream_trim, @ptrCast(self), replayEntry);
+        registry.register(.stream_delete, @ptrCast(self), replayEntry);
         registry.register(.cg_commit, @ptrCast(self), replayEntry);
         registry.register(.cg_delete, @ptrCast(self), replayEntry);
     }
@@ -1796,6 +1827,18 @@ pub const StreamHandler = struct {
                     const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
                     const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
                     _ = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
+                }
+            }
+        }
+
+        // Stream delete (FLO-105): key = raw stream name, value = qualified name.
+        // Reaches followers via applyReplicatedEntry's registry dispatch and
+        // restart via replaySegments — same path as stream_trim.
+        if (etype == .stream_delete) {
+            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+                if (cmd.key.len > 0) {
+                    const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                    _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
                 }
             }
         }
@@ -1845,6 +1888,25 @@ pub const StreamHandler = struct {
 
         // Apply locally: trim the projection
         return self.stream.trimStream(name_hash, trim_id);
+    }
+
+    /// Encode a stream delete as a `stream_delete` entry and persist through
+    /// Raft, then apply locally — mirror of `persistAndApplyTrim`.
+    /// Format: key = raw stream name, value = namespace-qualified name, so
+    /// followers/replay can clear the name registry without the namespace
+    /// string (they only carry `namespace_hash`).
+    fn persistAndApplyDelete(self: *StreamHandler, namespace: []const u8, raw_name: []const u8, name_hash: u64) void {
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qualified = ns_keys.qualifyKey(&q_buf, namespace, raw_name) catch raw_name;
+
+        // Persist through Raft — replicas/replay apply via replayEntry.
+        if (self.shard_ptr) |sptr| {
+            const shard = shardFromPtr(sptr);
+            _ = persistence_mod.persistEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified) catch {};
+        }
+
+        // Apply locally.
+        _ = self.stream.deleteStream(name_hash, raw_name, qualified);
     }
 
     /// Public interface for background tasks (retention enforcer) to persist trims.
@@ -2323,8 +2385,9 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_configure_sweeper)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
-    // 17 original + stream_group_claim + stream_group_configure_sweeper (FLO-102).
-    try testing.expectEqual(@as(u16, 19), dispatcher.handler_count);
+    // 17 original + stream_group_claim + stream_group_configure_sweeper (FLO-102)
+    // + stream_delete (FLO-105).
+    try testing.expectEqual(@as(u16, 20), dispatcher.handler_count);
 }
 
 test "stream handler: append" {
@@ -2493,6 +2556,67 @@ test "stream handler: partition_index survives restart/replay" {
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 0));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
+}
+
+test "stream handler: delete removes one stream, leaves siblings + --force gating (FLO-105)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var vb1: [64]u8 = undefined;
+    var vb2: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb1, "o1"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "shipments", makeBatchValue(&vb2, "s1"), ""));
+
+    const ns_hash = router.namespaceHash("default");
+    const orders_hash = router.nameHash(ns_hash, "orders");
+    const ship_hash = router.nameHash(ns_hash, "shipments");
+    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+
+    // Non-empty without --force → conflict, stream untouched.
+    const no_force = handler.handleCommand(makeRequest(.stream_delete, "orders", "", ""));
+    try testing.expect(std.meta.activeTag(no_force) == .err);
+    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+
+    // With --force → ok; orders gone, shipments intact.
+    var ob: [8]u8 = undefined;
+    var builder = OptionsBuilder.init(&ob);
+    try builder.addFlag(.force);
+    const forced = handler.handleCommand(makeRequest(.stream_delete, "orders", "", builder.getOptions()));
+    try testing.expect(std.meta.activeTag(forced) == .ok);
+    try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
+    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(ship_hash));
+
+    // Idempotent: deleting the now-missing stream succeeds.
+    const again = handler.handleCommand(makeRequest(.stream_delete, "orders", "", ""));
+    try testing.expect(std.meta.activeTag(again) == .ok);
+}
+
+test "stream handler: stream_delete replay/follower path wipes the stream (FLO-105)" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
+    const ns_hash = router.namespaceHash("default");
+    const orders_hash = router.nameHash(ns_hash, "orders");
+    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+
+    // A replicated/replayed stream_delete entry (key = raw name, value = qualified)
+    // must remove the stream — this is the exact path followers and restart use.
+    var pbuf: [128]u8 = undefined;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
+    StreamHandler.replayEntry(&handler, &del);
+    try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
 
 test "stream handler: trim" {

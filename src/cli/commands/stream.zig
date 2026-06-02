@@ -152,6 +152,19 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
+                .name("delete")
+                .about("Delete a stream and all its data")
+                .aliases(&.{"rm"})
+                .examples(&.{
+                    "flo stream delete events",
+                    "flo stream delete events --force",
+                })
+                .arg("stream", "Stream name")
+                .boolFlag("force", 'f', "Delete even if the stream is not empty")
+                .action(wrapHandler(runDelete)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
                 .name("group")
                 .about("Consumer group operations")
                 .aliases(&.{"cg"})
@@ -701,6 +714,40 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
         ctx.print("{{\"name\":\"{s}\",\"status\":\"altered\"}}\n", .{stream});
     } else {
         ctx.print("Altered stream: {s}\n", .{stream});
+    }
+}
+
+fn runDelete(ctx: *commander.Context) commander.Error!void {
+    const stream = ctx.getPositional("stream").?; // validated by commander
+
+    const force = ctx.getBool("force");
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
+    const json_output = output.getFormat(ctx) == .json;
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| {
+        ctx.printErr("Connection failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+
+    var response = client_mod.stream.delete(&client, namespace, stream, force) catch |err| {
+        ctx.printErr("Request failed: {}\n", .{err});
+        return error.CommandFailed;
+    };
+    defer response.deinit();
+
+    if (response.isError()) {
+        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
+        return error.CommandFailed;
+    }
+
+    if (json_output) {
+        ctx.print("{{\"name\":\"{s}\",\"status\":\"deleted\"}}\n", .{stream});
+    } else {
+        ctx.print("Deleted stream: {s}\n", .{stream});
     }
 }
 

@@ -237,6 +237,23 @@ pub fn trim(
     return client.sendRequestWithOptions(.stream_trim, namespace, stream, "", builder.getOptions());
 }
 
+/// Delete a stream entirely (records + metadata + name registry). Consumer
+/// groups are namespace-level and are left intact. A non-empty stream requires
+/// `force`. Idempotent: deleting a missing stream succeeds.
+pub fn delete(
+    client: *Client,
+    namespace: []const u8,
+    stream: []const u8,
+    force: bool,
+) !Response {
+    var options_buf: [16]u8 = undefined;
+    var builder = proto.OptionsBuilder.init(&options_buf);
+    if (force) {
+        try builder.addFlag(.force);
+    }
+    return client.sendRequestWithOptions(.stream_delete, namespace, stream, "", builder.getOptions());
+}
+
 /// List all streams in a namespace
 pub fn list(
     client: *Client,
