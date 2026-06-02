@@ -176,9 +176,20 @@ pub const UAL = struct {
         return entry.header.index;
     }
 
-    /// Read an entry by UAL index. Returns null if evicted or not found.
-    /// The returned Entry borrows from the ring buffer — valid until
-    /// that region is overwritten.
+    /// Read an entry by UAL index, zero-copy. Returns null in THREE cases that
+    /// callers must not conflate:
+    ///   1. the index was never appended / already evicted, OR
+    ///   2. the entry's magic failed validation, OR
+    ///   3. the entry is live but its payload WRAPS the ring boundary, so it
+    ///      cannot be returned as a single contiguous slice.
+    /// Case 3 is data-present, not data-gone: a caller that treats null as
+    /// "skip / not found" silently drops a live entry. Only use `read` where a
+    /// null is safe to fall through (e.g. a tiered read that then tries warm/cold,
+    /// or an existence probe via `contains`). Any path that must observe every
+    /// entry (apply loops, replication, range scans) MUST use `readCopy` /
+    /// `readRangeCopy`, which reconstruct wrapped payloads.
+    /// The returned Entry borrows from the ring buffer — valid until that region
+    /// is overwritten.
     pub fn read(self: *const UAL, index: u64) ?Entry {
         const pos = self.index_map.get(index) orelse return null;
 
@@ -239,8 +250,36 @@ pub const UAL = struct {
         };
     }
 
-    /// Scan entries in index range [from_index, to_index).
-    /// Returns number of entries found. Caller provides slice of Entry for results.
+    /// Scan entries in index range [from_index, to_index), copying each payload
+    /// into `payload_arena` so wrapped entries are reconstructed (unlike the
+    /// zero-copy `read`, which silently skips boundary-wrapping entries and
+    /// would leave a gap in the returned batch — a replication-divergence hazard).
+    ///
+    /// Payloads are packed sequentially into `payload_arena`; each returned
+    /// Entry.payload points into it. Returns the number of entries written to
+    /// `results`. Scanning stops early if the arena runs out of room, so the
+    /// returned run is always a contiguous, gap-free prefix of the range.
+    pub fn readRangeCopy(self: *const UAL, from_index: u64, to_index: u64, results: []Entry, payload_arena: []u8) usize {
+        var count: usize = 0;
+        var arena_used: usize = 0;
+        var idx = from_index;
+        while (idx < to_index and count < results.len) : (idx += 1) {
+            if (self.readCopy(idx, payload_arena[arena_used..])) |e| {
+                results[count] = e;
+                count += 1;
+                arena_used += e.payload.len;
+            } else {
+                // Stop at the first missing/oversized entry to keep the batch
+                // contiguous — callers (replication) require no index gaps.
+                break;
+            }
+        }
+        return count;
+    }
+
+    /// Zero-copy range scan. DEPRECATED for correctness-sensitive callers: it
+    /// silently omits entries whose payload wraps the ring boundary. Retained
+    /// only for probes that tolerate gaps. Prefer `readRangeCopy`.
     pub fn readRange(self: *const UAL, from_index: u64, to_index: u64, results: []Entry) usize {
         var count: usize = 0;
         var idx = from_index;
@@ -443,6 +482,73 @@ test "UAL: readCopy handles wrap-around" {
     const recovered = ual.readCopy(2, &payload_buf);
     try testing.expect(recovered != null);
     try testing.expectEqualStrings("abcdefghij", recovered.?.payload);
+}
+
+test "UAL: read() returns null on payload wrap but copy reads recover it" {
+    // Regression for the wrap-boundary data-loss bug. Capacity 100, HEADER=40.
+    //   e1: payload 10 -> total 50, written at pos 0..49
+    //   e2: payload 20 -> total 60, evicts e1, written at pos 50 so its header
+    //       occupies 50..89 and its payload 90..109 -> wraps the boundary.
+    var ual = try UAL.init(testing.allocator, 100, 0);
+    defer ual.deinit();
+
+    const e1 = makeEntry(1, "0123456789"); // 10-byte payload, total 50
+    _ = try ual.append(&e1);
+    const e2 = makeEntry(2, "abcdefghijklmnopqrst"); // 20-byte payload, total 60
+    _ = try ual.append(&e2);
+
+    // The entry is live (in the index map)...
+    try testing.expect(ual.contains(2));
+    // ...but the zero-copy read punts on the wrap and returns null.
+    try testing.expectEqual(@as(?Entry, null), ual.read(2));
+
+    // readCopy reconstructs the wrapped payload.
+    var payload_buf: [64]u8 = undefined;
+    const copied = ual.readCopy(2, &payload_buf);
+    try testing.expect(copied != null);
+    try testing.expectEqualStrings("abcdefghijklmnopqrst", copied.?.payload);
+
+    // readRangeCopy must include the wrapped entry (readRange would drop it).
+    var results: [4]Entry = undefined;
+    var arena: [256]u8 = undefined;
+    const n = ual.readRangeCopy(2, 3, &results, &arena);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(u64, 2), results[0].header.index);
+    try testing.expectEqualStrings("abcdefghijklmnopqrst", results[0].payload);
+
+    // Contrast: the wrap-unsafe readRange silently drops it (documents the trap).
+    var bad_results: [4]Entry = undefined;
+    try testing.expectEqual(@as(usize, 0), ual.readRange(2, 3, &bad_results));
+}
+
+test "UAL: readRangeCopy returns a gap-free batch across a wrap" {
+    // A multi-entry range where the middle entry wraps: readRangeCopy must
+    // return all of them packed into the arena with no gap.
+    var ual = try UAL.init(testing.allocator, 200, 0);
+    defer ual.deinit();
+
+    var i: u64 = 1;
+    while (i <= 6) : (i += 1) {
+        // 30-byte payloads (total 70) churn the ring so later entries wrap.
+        const e = makeEntry(i, "abcdefghijklmnopqrstuvwxyz0123");
+        _ = try ual.append(&e);
+    }
+
+    // Only the most recent entries remain live; scan whatever is present and
+    // assert the result is contiguous (indices strictly increasing by 1) and
+    // every payload round-trips — i.e. no wrapped entry was skipped.
+    var results: [8]Entry = undefined;
+    var arena: [1024]u8 = undefined;
+    const n = ual.readRangeCopy(ual.min_live_index, ual.max_index + 1, &results, &arena);
+    try testing.expect(n >= 1);
+    var prev = results[0].header.index;
+    try testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz0123", results[0].payload);
+    var k: usize = 1;
+    while (k < n) : (k += 1) {
+        try testing.expectEqual(prev + 1, results[k].header.index);
+        try testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz0123", results[k].payload);
+        prev = results[k].header.index;
+    }
 }
 
 test "UAL: readRange" {

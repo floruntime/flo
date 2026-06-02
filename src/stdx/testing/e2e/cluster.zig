@@ -92,6 +92,9 @@ pub const ClusterConfig = struct {
     formation_delay_ns: u64 = 6 * std.time.ns_per_s,
     /// Number of shards per node
     shards: u8 = 1,
+    /// Tiered-log config applied to every node (e.g. a small hot_buffer_capacity
+    /// to force hot-ring wrap/spill in replication tests).
+    tiered_log: ServerProcess.TieredLogConfig = .{},
     /// Pre-test cleanup: kill lingering flo processes from crashed tests
     /// Set to false only if you're sure no stale processes exist
     cleanup_stale_processes: bool = true,
@@ -145,6 +148,7 @@ pub const ClusterContext = struct {
         self.servers[0] = try ServerProcess.initWithConfig(allocator, .{
             .durability = config.durability,
             .shards = config.shards,
+            .tiered_log = config.tiered_log,
             .cluster_enabled = true, // Seed node needs Raft listener
         });
         errdefer if (self.servers[0]) |s| s.deinit();
@@ -163,6 +167,7 @@ pub const ClusterContext = struct {
             self.servers[i] = try ServerProcess.initWithConfig(allocator, .{
                 .durability = config.durability,
                 .shards = config.shards,
+                .tiered_log = config.tiered_log,
                 .join_addresses = seed_endpoint,
             });
             errdefer if (self.servers[i]) |s| s.deinit();

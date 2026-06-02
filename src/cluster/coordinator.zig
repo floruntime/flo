@@ -619,9 +619,15 @@ pub const Coordinator = struct {
     /// Returns the number of entries applied.
     pub fn applyCommitted(self: *Coordinator) !u32 {
         var applied: u32 = 0;
+        // getEntryCopy (not getEntry): the zero-copy read returns null for an
+        // entry whose payload wraps the hot-ring byte boundary. Advancing
+        // last_applied past such an entry with `continue` would silently drop a
+        // committed raft_config command from the metadata state machine — the
+        // same wrap-boundary data loss fixed in the stream/kv apply loops.
+        var payload_buf: [@import("../storage/persistence.zig").MAX_PERSIST_PAYLOAD]u8 = undefined;
         while (self.last_applied < self.raft.commit_index) {
             self.last_applied += 1;
-            const entry = self.raft.log.getEntry(self.last_applied) orelse continue;
+            const entry = self.raft.log.getEntryCopy(self.last_applied, &payload_buf) orelse continue;
 
             // Only process raft_config entries (metadata commands)
             if (entry.header.entry_type != @intFromEnum(EntryType.raft_config)) continue;

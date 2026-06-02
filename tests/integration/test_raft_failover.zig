@@ -85,6 +85,7 @@ const TestCluster = struct {
     fn replicate(self: *TestCluster, leader_idx: usize) !u32 {
         var rounds: u32 = 0;
         var entry_buf: [64]Entry = undefined;
+        var payload_arena: [65536]u8 = undefined;
         const leader = &self.nodes[leader_idx];
 
         for (0..CLUSTER_SIZE) |j| {
@@ -106,7 +107,7 @@ const TestCluster = struct {
                 leader.log.entryTerm(prev_index) orelse 0;
 
             // Read entries from next_index
-            const count = leader.log.getRange(peer.next_index, &entry_buf);
+            const count = leader.log.getRange(peer.next_index, &entry_buf, &payload_arena);
             if (count == 0) continue;
 
             const req = AppendRequest{

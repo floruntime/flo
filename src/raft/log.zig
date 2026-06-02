@@ -106,12 +106,15 @@ pub const RaftLog = struct {
     }
 
     /// Read a range of entries starting from `start_index`.
-    /// Returns the number of entries written to `buf`.
-    pub fn getRange(self: *const RaftLog, start_index: u64, buf: []Entry) usize {
+    /// Returns the number of entries written to `buf`. Payloads are copied into
+    /// `payload_arena` (wrap-safe), so the returned entries outlive ring writes
+    /// and no boundary-wrapping entry is silently skipped — a gap in a
+    /// replication batch would diverge followers.
+    pub fn getRange(self: *const RaftLog, start_index: u64, buf: []Entry, payload_arena: []u8) usize {
         if (start_index > self.last_idx) return 0;
-        // UAL.readRange uses exclusive upper bound, so add 1
+        // readRangeCopy uses an exclusive upper bound, so add 1
         const end_exclusive = @min(start_index + buf.len, self.last_idx + 1);
-        return self.ual.readRange(start_index, end_exclusive, buf);
+        return self.ual.readRangeCopy(start_index, end_exclusive, buf, payload_arena);
     }
 
     // ── Truncation ──────────────────────────────────────────────────────
@@ -420,7 +423,8 @@ test "raft log: getRange" {
     }
 
     var buf: [10]Entry = undefined;
-    const count = log.getRange(2, buf[0..3]);
+    var arena: [4096]u8 = undefined;
+    const count = log.getRange(2, buf[0..3], &arena);
     try testing.expect(count >= 2); // at least entries 2 and 3
 }
 
