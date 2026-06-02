@@ -1083,16 +1083,21 @@ pub const KVHandler = struct {
     /// own apply loop. Advancing `last_applied` past them here is intentional.
     fn applyCommittedEntries(shard: *Shard) void {
         const raft = shard.raft_node;
+        // Copy-read each entry: getEntry()'s zero-copy read returns null for an
+        // entry whose payload wraps the hot-ring byte boundary. Advancing
+        // last_applied past such an entry (as the old `else` branch did) silently
+        // drops a committed KV mutation — the same wrap-boundary data loss fixed
+        // in the stream apply loop. getEntryCopy reconstructs wrapped payloads;
+        // kv.applyEntry copies what it stores before the buffer is reused.
+        var payload_buf: [@import("../storage/persistence.zig").MAX_PERSIST_PAYLOAD]u8 = undefined;
         while (raft.last_applied < raft.commit_index) {
             const next_idx = raft.last_applied + 1;
-            // Grab Entry from RaftLog (may have payload on stack — getEntry borrows from UAL ring)
-            if (raft.log.getEntry(next_idx)) |e| {
+            if (raft.log.getEntryCopy(next_idx, &payload_buf)) |e| {
                 shard.defaultPartition().kv.applyEntry(&e) catch {};
-                raft.last_applied = next_idx;
-            } else {
-                // Entry evicted from ring — still advance last_applied to avoid stall
-                raft.last_applied = next_idx;
             }
+            // Advance even when the entry is genuinely gone (evicted past
+            // read_pos) so the loop can't stall.
+            raft.last_applied = next_idx;
         }
         shard.syncFlushIfNeeded();
     }
