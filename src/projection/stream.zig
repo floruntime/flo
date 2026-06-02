@@ -897,7 +897,7 @@ pub const StreamProjection = struct {
         return error.GroupNotFound;
     }
 
-    /// Count of consumer groups.   
+    /// Count of consumer groups.
     pub fn groupCount(self: *const StreamProjection) usize {
         return self.groups.count();
     }
@@ -1166,7 +1166,7 @@ pub const StreamProjection = struct {
                 var partition_index: u32 = 0;
                 if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
                     name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                    // Recover the user partition from the value prefix (FLO-105).
+                    // Recover the user partition from the value prefix.
                     partition_index = decodeAppendValue(cmd.value).partition_index;
                 }
                 // Anchor to the entry timestamp for deterministic replay (FLO-103).

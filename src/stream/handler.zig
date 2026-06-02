@@ -408,7 +408,7 @@ pub const StreamHandler = struct {
         // the partition + projection — mirrors persistAndApplyTrim's behaviour.
         const stream_id = if (self.shard_ptr) |sptr| blk: {
             const shard = shardFromPtr(sptr);
-            // Carry the partition in the value prefix so it survives restart (FLO-105).
+            // Carry the partition in the value prefix so it survives restart.
             const stored_value = stream_mod.encodeAppendValue(self.allocator, partition_index, payload_value) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
             };
@@ -1635,7 +1635,7 @@ pub const StreamHandler = struct {
     /// Falls back to the warm store when the entry has been evicted from the hot ring.
     fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
         // Hot path — entry still in the UAL ring buffer. Strip the partition
-        // prefix (FLO-105) so callers see the bare batch blob `unpackBatch` expects.
+        // prefix so callers see the bare batch blob `unpackBatch` expects.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
                 return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 0 };
@@ -1702,7 +1702,7 @@ pub const StreamHandler = struct {
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.InvalidPayload;
         const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
         // The user partition rides in the value prefix so it survives restart
-        // (FLO-105) — decode it here rather than threading it from the request,
+        // decode it here rather than threading it from the request,
         // keeping the live and replay paths on one source of truth.
         const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
         // Anchor the StreamID to the entry's persisted timestamp (not the wall
@@ -1722,7 +1722,7 @@ pub const StreamHandler = struct {
         const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
         const next_index = self.partition.committed_index + 1;
 
-        // Carry the partition in the value prefix so it survives restart (FLO-105).
+        // Carry the partition in the value prefix so it survives restart.
         const stored_value = try stream_mod.encodeAppendValue(self.allocator, partition_index, payload_value);
         defer self.allocator.free(stored_value);
 
@@ -1770,7 +1770,7 @@ pub const StreamHandler = struct {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
-                // partition-filtered reads break (FLO-105).
+                // partition-filtered reads break.
                 const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply (FLO-103).
@@ -2441,7 +2441,7 @@ test "stream handler: read with limit" {
     }
 }
 
-test "stream handler: partition_index survives restart/replay (FLO-105)" {
+test "stream handler: partition_index survives restart/replay" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
