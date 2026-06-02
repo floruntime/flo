@@ -3216,3 +3216,79 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
     // Replication correctness: the follower must serve every record too.
     try testing.expectEqual(total, follower_present);
 }
+
+test "e2e/cluster: follower serves each stream record exactly once (no replication dup)" {
+    // Dedicated regression for the follower double-apply bug. Shard.applyReplicatedEntry
+    // applied each broadcast stream record twice (inline append + replay dispatch) and
+    // had no idempotency guard, while the mesh re-broadcasts every entry — so a follower
+    // accumulated a MULTIPLE of the real record set. The symptom in a limit-capped read
+    // was 25/50 (duplicates pushed later records past the limit), but the underlying
+    // defect is duplication, so this test reads with a generous limit and asserts the
+    // follower returns EXACTLY `total` records (catches both duplication and loss).
+    //
+    // A default ring is used on purpose: the bug is independent of the hot-ring wrap
+    // boundary (it reproduces with a 64 MB ring), which keeps this regression distinct
+    // from the wrap test above.
+    var cluster = ClusterContext.init(testing.allocator, .{
+        .node_count = 3,
+        .durability = .sync,
+    }) catch |err| {
+        std.debug.print("cluster init failed ({s}); skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer cluster.deinit();
+
+    const stream_name = "dup-repl-test";
+    const total: usize = 30;
+
+    var msg_buf: [48]u8 = undefined;
+    for (0..total) |i| {
+        const msg = try std.fmt.bufPrint(&msg_buf, "dup-msg-{d:0>4}", .{i});
+        try cluster.execOnWithRetry(0, &.{ "stream", "append", stream_name, msg }, 5, 200);
+    }
+
+    // Unique records present (detects loss). Each record's value is distinct.
+    const uniquePresent = struct {
+        fn f(out: []const u8) usize {
+            var present: usize = 0;
+            var nb: [24]u8 = undefined;
+            for (0..total) |i| {
+                const needle = std.fmt.bufPrint(&nb, "dup-msg-{d:0>4}", .{i}) catch unreachable;
+                if (std.mem.indexOf(u8, out, needle) != null) present += 1;
+            }
+            return present;
+        }
+    }.f;
+    // Total record objects returned (detects duplication). Each JSON record carries
+    // exactly one `"tier":` field, so counting it counts records regardless of value.
+    const jsonRecordCount = struct {
+        fn f(out: []const u8) usize {
+            return std.mem.count(u8, out, "\"tier\":");
+        }
+    }.f;
+
+    // Read with a generous limit so duplicates are NOT truncated away — the whole
+    // point is to observe the inflated record count if the bug regresses.
+    const follower_out = try cluster.pollUntilContains(
+        1,
+        &.{ "stream", "read", stream_name, "--limit", "500", "-o", "json" },
+        "dup-msg-0029",
+        30,
+        300,
+    );
+    defer testing.allocator.free(follower_out);
+
+    const follower_unique = uniquePresent(follower_out);
+    const follower_records = jsonRecordCount(follower_out);
+    std.debug.print("\n[dup-repl] follower records={d}, unique={d} (both must be {d})\n", .{ follower_records, follower_unique, total });
+
+    // No loss: every distinct record present.
+    try testing.expectEqual(total, follower_unique);
+    // No duplication: exactly `total` records, not a multiple of it.
+    try testing.expectEqual(total, follower_records);
+
+    // Leader sanity — same exactly-once guarantee.
+    const leader_out = try cluster.execCaptureAnyOn(0, &.{ "stream", "read", stream_name, "--limit", "500", "-o", "json" });
+    defer testing.allocator.free(leader_out);
+    try testing.expectEqual(total, jsonRecordCount(leader_out));
+}
