@@ -85,6 +85,49 @@ pub const StreamRecord = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Stream-append value codec
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fixed `partition_index` prefix (LE u32) carried at the front of every
+/// `stream_append` entry value, ahead of the user payload (the batch blob).
+///
+/// The partition is resolved at append time from request options
+/// (`.partition` / `.partition_key`) and is not otherwise recoverable, so it
+/// must ride inside the durable entry to survive restart/replay. Without it,
+/// replay rebuilds every record as partition 0 and partition-filtered reads
+/// break after a restart (FLO-105). Encode at every persist site; decode at
+/// read/replay via `decodeAppendValue`.
+pub const APPEND_PARTITION_PREFIX: usize = 4;
+
+/// Decoded view of a stored stream-append value.
+pub const AppendValue = struct {
+    partition_index: u32,
+    /// Inner payload (the batch blob), with the partition prefix stripped.
+    payload: []const u8,
+};
+
+/// Prepend `partition_index` to `payload`, producing the value persisted in a
+/// `stream_append` UAL entry. Caller owns the returned buffer.
+pub fn encodeAppendValue(allocator: Allocator, partition_index: u32, payload: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, APPEND_PARTITION_PREFIX + payload.len);
+    std.mem.writeInt(u32, buf[0..4], partition_index, .little);
+    if (payload.len > 0) @memcpy(buf[APPEND_PARTITION_PREFIX..], payload);
+    return buf;
+}
+
+/// Split a stored stream-append value into its partition index and inner
+/// payload. An empty append carries exactly the 4-byte prefix; a value shorter
+/// than the prefix (malformed/pre-FLO-105) decodes as partition 0 with the
+/// bytes passed through unchanged.
+pub fn decodeAppendValue(value: []const u8) AppendValue {
+    if (value.len < APPEND_PARTITION_PREFIX) return .{ .partition_index = 0, .payload = value };
+    return .{
+        .partition_index = std.mem.readInt(u32, value[0..4], .little),
+        .payload = value[APPEND_PARTITION_PREFIX..],
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Per-Stream State
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -854,7 +897,7 @@ pub const StreamProjection = struct {
         return error.GroupNotFound;
     }
 
-    /// Count of consumer groups.   
+    /// Count of consumer groups.
     pub fn groupCount(self: *const StreamProjection) usize {
         return self.groups.count();
     }
@@ -1119,12 +1162,15 @@ pub const StreamProjection = struct {
 
         switch (entry_type) {
             .stream_append => {
-                const name_hash = if (CommandPayload.deserialize(ual_entry.payload)) |cmd|
-                    std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key)
-                else
-                    0;
+                var name_hash: u64 = 0;
+                var partition_index: u32 = 0;
+                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
+                    name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
+                    // Recover the user partition from the value prefix.
+                    partition_index = decodeAppendValue(cmd.value).partition_index;
+                }
                 // Anchor to the entry timestamp for deterministic replay (FLO-103).
-                _ = try self.appendToStreamAt(name_hash, ual_entry.header.index, 0, ual_entry.header.timestamp_ns / 1_000_000);
+                _ = try self.appendToStreamAt(name_hash, ual_entry.header.index, partition_index, ual_entry.header.timestamp_ns / 1_000_000);
             },
             .stream_trim => {
                 // Trim target encoded as StreamID (timestamp_ms + sequence) in command payload key
