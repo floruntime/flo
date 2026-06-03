@@ -107,6 +107,37 @@ pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const 
     return buf[0..total];
 }
 
+/// Qualify a consumer-group name so it is scoped to a single stream:
+/// `qualifyKey(ns, stream) ++ "\x00" ++ group`.
+///
+///   default ns:     `"<stream>\x00<group>"`
+///   non-default ns: `"<ns>\x00<stream>\x00<group>"`
+///
+/// This is what keys a consumer group in the projection and in the durable
+/// cg_commit/cg_delete entries, so folding the stream in here makes cursors and
+/// PEL strictly per-(stream, group) — a group never spans streams. The prefix a
+/// stream's groups share is exactly `qualifyKey(ns, stream) ++ "\x00"`, which
+/// `deleteStream` uses to cascade-remove a deleted stream's groups.
+pub fn qualifyGroupKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, stream: []const u8, group: []const u8) error{KeyTooLarge}![]const u8 {
+    const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
+    const ns_prefix_len: usize = if (has_ns) ns.len + 1 else 0;
+    const total = ns_prefix_len + stream.len + 1 + group.len;
+    if (total > MAX_QUALIFIED_KEY) return error.KeyTooLarge;
+    var off: usize = 0;
+    if (has_ns) {
+        @memcpy(buf[0..ns.len], ns);
+        buf[ns.len] = NAMESPACE_SEPARATOR;
+        off = ns.len + 1;
+    }
+    @memcpy(buf[off..][0..stream.len], stream);
+    off += stream.len;
+    buf[off] = NAMESPACE_SEPARATOR;
+    off += 1;
+    @memcpy(buf[off..][0..group.len], group);
+    off += group.len;
+    return buf[0..off];
+}
+
 /// Strip namespace prefix from a qualified key for display to the user.
 ///
 /// Given a stored key like `"myapp\x00mykey"` and namespace `"myapp"`, returns

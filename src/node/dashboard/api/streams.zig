@@ -291,12 +291,16 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     try obj.stringField("group", group_name);
     try obj.stringField("namespace", "default");
 
-    // Find group across shard projections
+    // Find group across shard projections. Groups are keyed per-(stream, group)
+    // as `qualifyGroupKey(ns, stream, group)`; the dashboard scopes to the
+    // default namespace.
+    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
     var found = false;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_name)) |group| {
+            if (sp.getGroup(group_key)) |group| {
                 found = true;
                 try obj.intField("generation", 0);
                 try obj.intField("partition_count", 1);
@@ -349,7 +353,6 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
 /// GET /streams/:name/groups/:group/members - Consumer group members (flat array)
 pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    _ = stream_name;
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -358,10 +361,12 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
+    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_name)) |group| {
+            if (sp.getGroup(group_key)) |group| {
                 var mit = group.members.iterator();
                 while (mit.next()) |me| {
                     try arr.next();
@@ -384,7 +389,6 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
 /// GET /streams/:name/groups/:group/pending - Pending messages
 pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    _ = stream_name;
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -397,11 +401,13 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     var pending_arr = try obj.arrayField("pending");
     try pending_arr.begin();
 
+    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
     var pel_count: usize = 0;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_name)) |group| {
+            if (sp.getGroup(group_key)) |group| {
                 pel_count = group.pelCount();
                 const cap: usize = @min(pel_count, 1000);
                 const buf = allocator.alloc(PendingEntry, cap) catch null;

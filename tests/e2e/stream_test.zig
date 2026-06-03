@@ -2759,131 +2759,78 @@ test "e2e/stream: headers survive consumer group read" {
 }
 
 // =============================================================================
-// Pattern-Based Group Read (Wildcard Subscription)
+// Per-Stream Consumer Groups (FLO-105)
+//
+// Consumer groups are strictly per-(stream, group): one group belongs to one
+// stream, with its own cursor and PEL. Cross-stream fan-in (`events.*`) is gone.
 // =============================================================================
 
-test "e2e/stream: pattern group read matches multiple streams" {
+test "e2e/stream: wildcard group read is rejected" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Create multiple streams under a common prefix
-    try ctx.exec(&.{ "stream", "append", "events.login", "user-alice-logged-in" });
-    try ctx.exec(&.{ "stream", "append", "events.logout", "user-bob-logged-out" });
-    try ctx.exec(&.{ "stream", "append", "events.signup", "user-carol-signed-up" });
+    try ctx.exec(&.{ "stream", "append", "events.login", "user-alice" });
 
-    // Pattern read: events.* should match all three
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "events.*", "--group", "pattern-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
+    // A wildcard key must error, not fan out across streams.
+    var result = try ctx.cli.run(&.{ "stream", "group", "read", "events.*", "--group", "g", "--consumer", "w1", "--limit", "10" });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
-    // Should see data from multiple streams
-    try testing.expect(result.contains("alice") or result.contains("bob") or result.contains("carol"));
+    try testing.expect(!result.succeeded());
+    try testing.expect(result.contains("wildcard") or result.contains("single stream") or result.stderr.len > 0);
 }
 
-test "e2e/stream: pattern group read includes stream name in response" {
+test "e2e/stream: same group name on two streams has independent cursors" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "stream", "append", "orders.created", "order-100" });
-    try ctx.exec(&.{ "stream", "append", "orders.fulfilled", "order-200" });
+    try ctx.exec(&.{ "stream", "append", "orders", "order-1" });
+    try ctx.exec(&.{ "stream", "append", "events", "event-1" });
 
-    // Pattern read with JSON — should include "stream" field per record
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "orders.*", "--group", "order-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
-    defer result.deinit();
+    // Group `g` on `orders` sees only orders' record.
+    var r_orders = try ctx.cli.run(&.{ "stream", "group", "read", "orders", "--group", "g", "--consumer", "w1", "--limit", "10" });
+    defer r_orders.deinit();
+    try testing.expect(r_orders.contains("order-1"));
+    try testing.expect(!r_orders.contains("event-1"));
 
-    try stdx.testing.assertSucceeded(result);
-    // JSON response should include stream identity
-    try testing.expect(result.contains("\"stream\""));
-    try testing.expect(result.contains("orders.created") or result.contains("orders.fulfilled"));
+    // Group `g` on `events` still sees its own record — the cursor is NOT shared,
+    // so reading `orders` above did not advance past `events`' record. (Under the
+    // old namespace-level group this read could return nothing — the bug.)
+    var r_events = try ctx.cli.run(&.{ "stream", "group", "read", "events", "--group", "g", "--consumer", "w1", "--limit", "10" });
+    defer r_events.deinit();
+    try testing.expect(r_events.contains("event-1"));
+    try testing.expect(!r_events.contains("order-1"));
+
+    // Re-reading `orders` returns nothing new — its own cursor advanced
+    // independently of the `events` cursor.
+    var r_orders2 = try ctx.cli.run(&.{ "stream", "group", "read", "orders", "--group", "g", "--consumer", "w1", "--limit", "10" });
+    defer r_orders2.deinit();
+    try testing.expect(!r_orders2.contains("order-1"));
 }
 
-test "e2e/stream: pattern group read text output shows stream name" {
+test "e2e/stream: deleting a stream removes its consumer groups" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "stream", "append", "logs.app", "server-started" });
-    try ctx.exec(&.{ "stream", "append", "logs.audit", "user-login" });
+    try ctx.exec(&.{ "stream", "append", "s-del", "a" });
+    try ctx.exec(&.{ "stream", "append", "s-keep", "b" });
 
-    // Text output: <id> [<stream>]: <payload>
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "logs.*", "--group", "log-grp", "--consumer", "w1", "--limit", "10" });
-    defer result.deinit();
+    // Same group name on two distinct streams = two independent groups.
+    try ctx.exec(&.{ "stream", "group", "create", "s-del", "--group", "g" });
+    try ctx.exec(&.{ "stream", "group", "create", "s-keep", "--group", "g" });
 
-    try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("logs.app") or result.contains("logs.audit"));
+    // Deleting `s-del` cascade-removes its group `g`...
+    try ctx.exec(&.{ "stream", "delete", "s-del", "--force" });
+
+    var info_del = try ctx.cli.run(&.{ "stream", "group", "info", "s-del", "--group", "g" });
+    defer info_del.deinit();
+    try testing.expect(!info_del.succeeded() or info_del.contains("not found"));
+
+    // ...while the same-named group on `s-keep` survives.
+    var info_keep = try ctx.cli.run(&.{ "stream", "group", "info", "s-keep", "--group", "g" });
+    defer info_keep.deinit();
+    try testing.expect(info_keep.succeeded() or info_keep.contains("g"));
 }
 
-test "e2e/stream: pattern group read does not match non-matching streams" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "metrics.cpu", "cpu-data" });
-    try ctx.exec(&.{ "stream", "append", "metrics.mem", "mem-data" });
-    try ctx.exec(&.{ "stream", "append", "logs.error", "error-data" });
-
-    // Pattern: metrics.* should NOT include logs.error
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "metrics.*", "--group", "metrics-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-    try testing.expect(!result.contains("error-data"));
-}
-
-test "e2e/stream: pattern group read with no matching streams returns empty" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "unrelated-stream", "data" });
-
-    // Pattern that matches nothing
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "nonexistent.*", "--group", "empty-grp", "--consumer", "w1", "--limit", "10" });
-    defer result.deinit();
-
-    // Should succeed with empty result
-    try testing.expect(result.contains("no messages") or result.contains("[]") or result.succeeded());
-}
-
-test "e2e/stream: pattern group read tracks offset per matched stream" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Append to two streams
-    try ctx.exec(&.{ "stream", "append", "tasks.email", "email-1" });
-    try ctx.exec(&.{ "stream", "append", "tasks.sms", "sms-1" });
-
-    // First read consumes all existing messages
-    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
-    defer read1.deinit();
-    try testing.expect(read1.contains("email-1") or read1.contains("sms-1"));
-
-    // Second read without new appends should return empty (offsets advanced)
-    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
-    defer read2.deinit();
-    try testing.expect(read2.contains("no messages") or read2.contains("[]") or read2.stdout.len == 0 or read2.succeeded());
-
-    // Append new message to one stream
-    try ctx.exec(&.{ "stream", "append", "tasks.email", "email-2" });
-
-    // Third read should get only the new message
-    var read3 = try ctx.cli.run(&.{ "stream", "group", "read", "tasks.*", "--group", "offset-grp", "--consumer", "w1", "--limit", "10" });
-    defer read3.deinit();
-    try testing.expect(read3.contains("email-2"));
-}
-
-test "e2e/stream: pattern group read with headers" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "alerts.critical", "disk-full", "--header", "severity=critical,host=web-01" });
-    try ctx.exec(&.{ "stream", "append", "alerts.warning", "high-cpu", "--header", "severity=warning,host=web-02" });
-
-    // Pattern read should return both records with their headers
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "alerts.*", "--group", "alert-grp", "--consumer", "w1", "--limit", "10", "-o", "json" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("severity"));
-    try testing.expect(result.contains("host"));
-}
 
 // =============================================================================
 // Stream Retention & Alter
