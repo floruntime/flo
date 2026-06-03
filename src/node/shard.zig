@@ -308,6 +308,14 @@ pub const Shard = struct {
         errdefer allocator.destroy(namespace_handler);
         namespace_handler.* = NamespaceHandler.init(allocator);
 
+        // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
+        // namespace handler. Done HERE — before replaySegments runs below — so that
+        // queues re-registered during replay resolve their real namespace instead of
+        // falling back to "default". (namespace_create entries replay before the
+        // queue_enqueue entries that reference them, so the registry is populated in time.)
+        queue_handler.queue.ns_resolver = resolveQueueNamespace;
+        queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
+
         // Create Actions handler
         const actions_handler = try allocator.create(ActionsHandler);
         errdefer allocator.destroy(actions_handler);
@@ -535,6 +543,15 @@ pub const Shard = struct {
     /// Should only be called on Shard 0.
     pub fn setCoordinator(self: *Shard, coord: *Coordinator) void {
         self.coordinator = coord;
+    }
+
+    /// Namespace resolver wired into the queue projection: hash → name via the
+    /// shard's namespace registry. `ctx` is the (stable, heap-allocated)
+    /// `*NamespaceHandler`, so this is safe to call during replay — before the
+    /// shard's back-pointers are wired.
+    fn resolveQueueNamespace(ctx: *anyopaque, ns_hash: u32) ?[]const u8 {
+        const nh: *NamespaceHandler = @ptrCast(@alignCast(ctx));
+        return nh.nameForHash(ns_hash);
     }
 
     /// Wire shard back-pointers into handlers that need Raft access.

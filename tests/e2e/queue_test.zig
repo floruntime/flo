@@ -472,6 +472,44 @@ test "e2e/queue: messages persist across restart (sync durability)" {
     );
 }
 
+test "e2e/queue: queue keeps its namespace label across restart" {
+    // Regression: queue_enqueue entries carry only the namespace hash, so on
+    // replay the apply path used to re-register every queue under "default".
+    // A queue created in a named namespace must still be listed under that
+    // namespace after a restart.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "queue_ns_rt" });
+    try ctx.exec(&.{ "queue", "enqueue", "ns-queue", "hello", "-n", "queue_ns_rt" });
+
+    // Before restart: listed under its namespace, not under default.
+    var before = try ctx.cli.run(&.{ "queue", "list", "-n", "queue_ns_rt" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    try stdx.testing.assertContains(before, "ns-queue");
+
+    try ctx.restartServer();
+
+    // After restart: still under its namespace.
+    var after = try ctx.cli.run(&.{ "queue", "list", "-n", "queue_ns_rt" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    try stdx.testing.assertContains(after, "ns-queue");
+
+    // And it must NOT have leaked into the default namespace.
+    var default_list = try ctx.cli.run(&.{ "queue", "list" });
+    defer default_list.deinit();
+    try testing.expect(!default_list.stdoutContains("ns-queue"));
+
+    // The message itself survives too (sanity).
+    var msg = try ctx.cli.run(&.{ "queue", "dequeue", "ns-queue", "-n", "queue_ns_rt" });
+    defer msg.deinit();
+    try stdx.testing.assertContains(msg, "hello");
+}
+
 // =============================================================================
 // Unit Tests for Helper Functions
 // =============================================================================
