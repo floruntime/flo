@@ -327,7 +327,11 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     }
 
     if (result.asRawData()) |data| {
-        ctx.print("Started workflow run: {s}\n", .{data});
+        switch (output.getFormat(ctx)) {
+            .json => ctx.print("{{\"run_id\":\"{s}\"}}\n", .{data}),
+            .raw => ctx.print("{s}\n", .{data}),
+            .table => ctx.print("Started workflow run: {s}\n", .{data}),
+        }
     } else {
         ctx.print("Workflow started\n", .{});
     }
@@ -508,7 +512,7 @@ fn printWorkflowRunStatus(ctx: *commander.Context, run_id: []const u8, data: []c
     }
 
     ctx.print("Run:      {s}\n", .{run_id});
-    ctx.print("Workflow: {s} (v{s})\n", .{ workflow, version });
+    ctx.print("Workflow: {s} ({s})\n", .{ workflow, version });
     ctx.print("Status:   {s}\n", .{status_str});
     ctx.print("Step:     {s}\n", .{current_step});
     ctx.print("Input:    {s}\n", .{input});

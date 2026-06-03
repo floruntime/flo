@@ -1060,9 +1060,32 @@ pub const Shard = struct {
             .shutdown => self.running = false,
             .raft_message => self.applyReplicatedEntry(msg),
             .action_invoke => self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self)),
+            .stream_event => self.workflow_handler.triggers_dirty = true,
             .deferred_response => self.deliverInboundResponse(msg),
             .forward_request => self.runForwardedRequest(msg),
             else => {},
+        }
+    }
+
+    /// Push-wake stream triggers after a stream append. The trigger for a stream
+    /// lives on the workflow-definition's shard, which is usually NOT the shard
+    /// that owns the stream's data — so we mark the local handler dirty (covers
+    /// the co-located case) and broadcast a `stream_event` to all peers, whose
+    /// next tick force-polls their triggers. No-op when no trigger exists on the
+    /// node, so streams that nobody watches incur zero cross-shard chatter.
+    pub fn notifyStreamTriggers(self: *Shard) void {
+        if (!WorkflowHandler.anyStreamTriggers()) return;
+
+        self.workflow_handler.triggers_dirty = true;
+
+        if (self.peer_inboxes) |inboxes| {
+            for (inboxes, 0..) |inbox, i| {
+                if (i == self.id) continue;
+                _ = inbox.send(.{
+                    .tag = .stream_event,
+                    .src_shard = @intCast(self.id),
+                });
+            }
         }
     }
 
