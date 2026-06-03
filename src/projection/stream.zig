@@ -1006,9 +1006,16 @@ pub const StreamProjection = struct {
     }
 
     /// Delete a stream entirely: drop its records (by `name_hash`) plus its name
-    /// registry and metadata entries. Mirror of `registerStream` / `trimStream`.
-    /// Consumer groups are namespace-level (they can fan in across streams via
-    /// pattern reads), so they are intentionally left intact (FLO-105 option A).
+    /// registry and metadata entries, and cascade-delete its consumer groups.
+    /// Mirror of `registerStream` / `trimStream`.
+    ///
+    /// Consumer groups are per-(stream, group): their key is
+    /// `qualifyKey(ns, stream) ++ "\x00" ++ group` (see `ns_keys.qualifyGroupKey`),
+    /// so every group whose key has `qualified_name ++ "\x00"` as a prefix belongs
+    /// to this stream and is removed with it. Because `deleteStream` runs on all
+    /// four rebuild paths (leader live, follower replication, restart replay,
+    /// projection apply), this cleanup is durable and replicated without a
+    /// separate cg_delete entry.
     ///
     /// The name registry is keyed by the namespace-qualified name on the live
     /// path but by the raw name on the replay path, so both forms are removed.
@@ -1033,6 +1040,32 @@ pub const StreamProjection = struct {
         if (self.stream_metadata.fetchRemove(raw_name)) |kv| {
             self.allocator.free(@constCast(kv.key));
             existed = true;
+        }
+
+        // Cascade-delete this stream's consumer groups. Scan-and-remove one at a
+        // time: removing while iterating would invalidate the iterator, and group
+        // counts per stream are small, so the rescan cost is negligible on this
+        // rare path. Each matching key's backing memory is owned by its group and
+        // freed by `group.deinit()`, so it must not be touched after removal.
+        while (true) {
+            var match: ?[]const u8 = null;
+            var it = self.groups.keyIterator();
+            while (it.next()) |k| {
+                const gk = k.*;
+                if (gk.len > qualified_name.len and
+                    gk[qualified_name.len] == 0 and
+                    std.mem.startsWith(u8, gk, qualified_name))
+                {
+                    match = gk;
+                    break;
+                }
+            }
+            const gk = match orelse break;
+            if (self.groups.fetchRemove(gk)) |kv| {
+                var group = kv.value;
+                group.deinit();
+                self.stats.groups_deleted += 1;
+            }
         }
         return existed;
     }

@@ -318,18 +318,18 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Register waiter — woken by dispatchAppend or expired by timeout
-            const is_pattern = req.key.len > 0 and req.key[req.key.len - 1] == '*';
+            // Register waiter — woken by dispatchAppend or expired by timeout.
+            // (A wildcard key is already rejected by handleCommand above, so the
+            // key here is always a single concrete stream.)
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .fd = conn.fd,
                 .owner_shard = conn.owner_shard,
                 .conn_id = conn.id,
                 .request_id = req.header.request_id,
-                .key = if (is_pattern) req.key[0 .. req.key.len - 1] else req.key,
+                .key = req.key,
                 .min_version = shard.defaultPartition().ual.max_index,
                 .timeout_ms = bms,
-                .pattern = is_pattern,
             });
             if (!registered) {
                 // Pool full — send an empty result now rather than deferring a
@@ -768,7 +768,7 @@ pub const StreamHandler = struct {
 
         // Namespace-qualify for isolation (wire format only)
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, wire_format);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, wire_format);
 
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -799,7 +799,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
 
         const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
         const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
@@ -824,7 +824,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
 
         if (self.stream.deleteGroup(group_name)) {
             // Persist the removal so it survives restart (FLO-103).
@@ -843,7 +843,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -877,7 +877,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         _ = self.stream.leaveGroup(group_name, member_id) catch |err| {
@@ -892,9 +892,11 @@ pub const StreamHandler = struct {
     // ── GROUP READ ──────────────────────────────────────────────────────
 
     fn handleGroupRead(self: *StreamHandler, req: Request) CommandResult {
-        // Pattern group read: key ends with `*` (e.g. `events.*` or `*`)
+        // Consumer groups are per-stream: a wildcard/fan-in key is rejected.
+        // Use one stream (e.g. an `all-events` stream + a JSON type discriminator
+        // and processing-based routing) instead of `events.*`.
         if (req.key.len > 0 and req.key[req.key.len - 1] == '*') {
-            return self.handlePatternGroupRead(req);
+            return .{ .err = .{ .code = .invalid_request, .message = "wildcard group reads are no longer supported; target a single stream" } };
         }
 
         // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
@@ -902,7 +904,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         // Auto-create group and join consumer if not exists
@@ -937,89 +939,6 @@ pub const StreamHandler = struct {
         return .{ .group_messages = .{ .data = data } };
     }
 
-    /// Pattern group read — reads from all streams matching a prefix pattern.
-    ///
-    /// The key `events.*` matches all streams starting with `events.`.
-    /// A bare `*` matches all streams in the namespace.
-    /// Records from each matching stream carry the stream name as key identity.
-    fn handlePatternGroupRead(self: *StreamHandler, req: Request) CommandResult {
-        const pair = decodeGroupConsumer(req) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, pair.group, pair.wire);
-        const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
-
-        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-        const now_ns = now_ms * 1_000_000;
-        self.stream.createGroup(group_name, now_ns) catch |err| {
-            if (err != error.AlreadyExists) {
-                return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
-            }
-        };
-        _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
-
-        const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
-        const capped = @min(limit, MAX_READ_BATCH);
-
-        // Strip trailing `*` to get the bare prefix (e.g. `events.*` → `events.`, `*` → ``)
-        const bare_prefix = req.key[0 .. req.key.len - 1];
-
-        // Build namespace-qualified prefix for filtering stream_names
-        var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_prefix = ns_keys.namespacePrefix(&ns_buf, req.namespace);
-
-        // Scan all stream names from this shard's projection
-        var name_buf: [1024][]const u8 = undefined;
-        const raw_count = self.stream.scanStreamNames(&name_buf);
-
-        const ns_hash = router.namespaceHash(req.namespace);
-
-        // Collect records from all matching streams
-        var all_buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        // Track which stream each batch of records came from (for serialization)
-        var stream_names_out: [MAX_READ_BATCH][]const u8 = undefined;
-        var total: usize = 0;
-
-        for (name_buf[0..raw_count]) |qualified_name| {
-            if (total >= capped) break;
-
-            // Filter by namespace
-            const display_name = blk: {
-                if (ns_prefix.len == 0) {
-                    // Default namespace — only bare names (no NUL separator)
-                    if (std.mem.indexOfScalar(u8, qualified_name, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
-                    break :blk qualified_name;
-                } else {
-                    if (!std.mem.startsWith(u8, qualified_name, ns_prefix)) continue;
-                    break :blk qualified_name[ns_prefix.len..];
-                }
-            };
-
-            // Filter by pattern prefix
-            if (bare_prefix.len > 0 and !std.mem.startsWith(u8, display_name, bare_prefix)) continue;
-
-            // Compute name_hash for this stream
-            const name_hash = router.nameHash(ns_hash, display_name);
-
-            const remaining = capped - total;
-            const count = self.stream.groupDeliver(group_name, name_hash, consumer_id, remaining, now_ms, all_buf[total .. total + remaining]) catch continue;
-
-            // Tag each record with the stream name for serialization
-            for (total..total + count) |i| {
-                stream_names_out[i] = display_name;
-            }
-            total += count;
-        }
-
-        // Serialize combined results with per-record stream names
-        const data = self.serializePatternGroupRecords(all_buf[0..total], stream_names_out[0..total]) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "pattern group read serialization failed" } };
-        };
-
-        return .{ .group_messages = .{ .data = data } };
-    }
-
     // ── GROUP ACK ───────────────────────────────────────────────────────
 
     fn handleGroupAck(self: *StreamHandler, req: Request) CommandResult {
@@ -1031,7 +950,7 @@ pub const StreamHandler = struct {
         _ = reader.readLengthPrefixed(u16); // consumer
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
 
         // Read StreamID array
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1079,7 +998,7 @@ pub const StreamHandler = struct {
         _ = reader.readLengthPrefixed(u16); // consumer
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
 
         // Read StreamIDs to NACK
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1123,7 +1042,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
 
         const group = self.stream.getGroup(group_name) orelse {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
@@ -1150,7 +1069,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
 
         // Optional consumer filter (only valid for wire-format requests).
         var consumer_filter: ?[]const u8 = null;
@@ -1214,7 +1133,7 @@ pub const StreamHandler = struct {
         const count: u32 = reader.readU32() orelse DEFAULT_READ_BATCH;
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
         const consumer_id = if (consumer_raw.len > 0) consumer_raw else "default";
 
         const start_id = StreamID{ .timestamp_ms = start_ts, .sequence = start_seq };
@@ -1262,7 +1181,7 @@ pub const StreamHandler = struct {
         };
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
         _ = reader.readLengthPrefixed(u16); // consumer
 
         // Read StreamIDs to touch
@@ -1437,90 +1356,6 @@ pub const StreamHandler = struct {
             }
 
             // headers
-            std.mem.writeInt(u32, buf[pos..][0..4], e.header_count, .little);
-            pos += 4;
-            if (e.header_count > 0) {
-                pos = writeResponseHeaders(e.headers_raw, e.header_count, buf, pos);
-            }
-        }
-
-        return buf;
-    }
-
-    /// Serialize pattern group read results where each record has its own stream name.
-    /// Same wire format as serializeStreamRecordsWithPayloads but with per-record keys.
-    fn serializePatternGroupRecords(self: *StreamHandler, records: []const StreamRecord, stream_names_in: []const []const u8) ![]u8 {
-        // Expand batch payloads into individual records
-        var expanded: [MAX_READ_BATCH]ResolvedRecord = undefined;
-        const expanded_count = self.expandRecords(records, &expanded);
-
-        // Build per-record stream name mapping (expand names alongside records)
-        var exp_names: [MAX_READ_BATCH][]const u8 = undefined;
-        {
-            var idx: usize = 0;
-            var exp_idx: usize = 0;
-            for (records, 0..) |_, ri| {
-                if (ri >= stream_names_in.len) break;
-                const name = stream_names_in[ri];
-                const result_payload = blk: {
-                    const result = self.getPayloadAndTier(records[ri].ual_index);
-                    var batch_buf: [100]UnpackedRecord = undefined;
-                    const n = unpackBatch(result.payload, &batch_buf);
-                    break :blk if (n > 0) n else 1;
-                };
-                var j: usize = 0;
-                while (j < result_payload and exp_idx < expanded_count) : ({
-                    j += 1;
-                    exp_idx += 1;
-                }) {
-                    exp_names[exp_idx] = name;
-                }
-                idx += 1;
-            }
-        }
-
-        // Compute total buffer size
-        var total: usize = 4;
-        for (expanded[0..expanded_count], 0..) |e, i| {
-            const name = exp_names[i];
-            const key_size: usize = 1 + 4 + name.len;
-            const hdr_size = responseHeaderSize(e.header_count, e.headers_raw.len);
-            total += 8 + 8 + 1 + 4 + key_size + 4 + e.payload.len + 4 + hdr_size;
-        }
-
-        const buf = try self.allocator.alloc(u8, total);
-        errdefer self.allocator.free(buf);
-
-        var pos: usize = 0;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(expanded_count), .little);
-        pos += 4;
-
-        for (expanded[0..expanded_count], 0..) |e, i| {
-            const name = exp_names[i];
-
-            std.mem.writeInt(u64, buf[pos..][0..8], e.sequence, .little);
-            pos += 8;
-            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(e.timestamp_ms)), .little);
-            pos += 8;
-            buf[pos] = e.tier;
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], e.partition_index, .little);
-            pos += 4;
-
-            buf[pos] = 1;
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(name.len), .little);
-            pos += 4;
-            @memcpy(buf[pos .. pos + name.len], name);
-            pos += name.len;
-
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.payload.len), .little);
-            pos += 4;
-            if (e.payload.len > 0) {
-                @memcpy(buf[pos .. pos + e.payload.len], e.payload);
-                pos += e.payload.len;
-            }
-
             std.mem.writeInt(u32, buf[pos..][0..4], e.header_count, .little);
             pos += 4;
             if (e.header_count > 0) {
@@ -2031,14 +1866,16 @@ fn applyGroupConfig(self: *StreamHandler, group_name: []const u8, req: Request) 
     self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch {};
 }
 
-/// Namespace-qualify a group name when decoded from wire format.
-/// Wire-format requests carry the real namespace; fallback (unit test) requests
-/// abuse the namespace field, so we only qualify for wire-format decodes.
-fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, raw_name: []const u8, is_wire: bool) []const u8 {
-    if (is_wire) {
-        return ns_keys.qualifyKey(buf, namespace, raw_name) catch raw_name;
-    }
-    return raw_name;
+/// Resolve a wire group name to its durable, per-(stream, group) key:
+/// `qualifyKey(ns, stream) ++ "\x00" ++ group`. A consumer group is scoped to a
+/// single stream, so the cursor/PEL never span streams.
+///
+/// Wire-format requests carry the real namespace; fallback (unit-test) requests
+/// abuse the namespace field, so for those we qualify under the default
+/// namespace (stream-only) — `stream` (req.key) is always meaningful.
+fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, raw_name: []const u8, is_wire: bool) []const u8 {
+    const ns = if (is_wire) namespace else "default";
+    return ns_keys.qualifyGroupKey(buf, ns, stream, raw_name) catch raw_name;
 }
 
 /// Serialize a list of names in the standard walk wire format.
