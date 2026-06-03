@@ -351,6 +351,12 @@ const Converter = struct {
             return;
         }
 
+        // YAML flow mapping: { key: value, ... } → JSON object
+        if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+            try self.writeFlowMapping(trimmed);
+            return;
+        }
+
         // Strip inline comments from unquoted values (YAML spec: " #" starts a comment)
         const clean = stripInlineComment(trimmed);
 
@@ -403,6 +409,71 @@ const Converter = struct {
         }
 
         self.output.append(self.allocator, ']') catch return ConvertError.OutOfMemory;
+    }
+
+    /// Convert a YAML flow mapping `{ key: value, ... }` to a JSON object.
+    /// Values are recursively converted, so nested flow maps/sequences and scalars
+    /// all work (e.g. `{ name: events }`, `{ a: { b: c }, d: [1, 2] }`).
+    fn writeFlowMapping(self: *Converter, value: []const u8) ConvertError!void {
+        const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
+        self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
+
+        var first = true;
+        var rest: []const u8 = inner;
+        while (rest.len > 0) {
+            const seg_end = findTopLevel(rest, ',') orelse rest.len;
+            const pair = mem.trim(u8, rest[0..seg_end], " \t");
+            rest = if (seg_end < rest.len) rest[seg_end + 1 ..] else "";
+            if (pair.len == 0) continue;
+
+            if (!first) self.output.append(self.allocator, ',') catch return ConvertError.OutOfMemory;
+            first = false;
+
+            if (findTopLevel(pair, ':')) |colon| {
+                const key = mem.trim(u8, pair[0..colon], " \t");
+                const val = mem.trim(u8, pair[colon + 1 ..], " \t");
+                try self.writeMapKey(key);
+                self.output.append(self.allocator, ':') catch return ConvertError.OutOfMemory;
+                try self.writeValue(val);
+            } else {
+                // Bare key with no value → null
+                try self.writeMapKey(pair);
+                self.output.appendSlice(self.allocator, ":null") catch return ConvertError.OutOfMemory;
+            }
+        }
+
+        self.output.append(self.allocator, '}') catch return ConvertError.OutOfMemory;
+    }
+
+    /// Find the first occurrence of `target` at brace/bracket depth 0, skipping
+    /// quoted spans. Returns null if not found at the top level.
+    fn findTopLevel(s: []const u8, target: u8) ?usize {
+        var depth: i32 = 0;
+        var in_quote: u8 = 0;
+        for (s, 0..) |c, i| {
+            if (in_quote != 0) {
+                if (c == in_quote) in_quote = 0;
+                continue;
+            }
+            switch (c) {
+                '"', '\'' => in_quote = c,
+                '{', '[' => depth += 1,
+                '}', ']' => depth -= 1,
+                else => if (c == target and depth == 0) return i,
+            }
+        }
+        return null;
+    }
+
+    /// Write a flow-mapping key as a JSON string, stripping surrounding quotes.
+    fn writeMapKey(self: *Converter, key: []const u8) ConvertError!void {
+        const k = if (key.len >= 2 and
+            ((key[0] == '"' and key[key.len - 1] == '"') or
+                (key[0] == '\'' and key[key.len - 1] == '\'')))
+            key[1 .. key.len - 1]
+        else
+            key;
+        try self.writeString(k);
     }
 
     /// Strip inline YAML comments: " # ..." (space-hash) outside quoted strings.
@@ -662,4 +733,31 @@ test "yaml_to_json: inline comments stripped from values" {
     try std.testing.expect(mem.indexOf(u8, json, "\"count\":42") != null);
     // Quoted value should preserve the # character
     try std.testing.expect(mem.indexOf(u8, json, "\"quoted\":\"has # inside\"") != null);
+}
+
+test "yaml_to_json: flow mapping inline object" {
+    const yaml =
+        \\kind: Processing
+        \\sources:
+        \\  - stream: { name: events }
+        \\sinks:
+        \\  - stream: { name: events-copy }
+        \\
+    ;
+    const json = try convert(std.testing.allocator, yaml);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(mem.indexOf(u8, json, "\"stream\":{\"name\":\"events\"}") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"stream\":{\"name\":\"events-copy\"}") != null);
+}
+
+test "yaml_to_json: flow mapping with multiple keys and nesting" {
+    const yaml =
+        \\a: { x: 1, y: two, z: { deep: true } }
+        \\
+    ;
+    const json = try convert(std.testing.allocator, yaml);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(mem.indexOf(u8, json, "\"x\":1") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"y\":\"two\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"z\":{\"deep\":true}") != null);
 }

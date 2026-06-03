@@ -244,15 +244,15 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 
     // --- sources (required array) ---
     if (getArray(root, "sources")) |arr| {
-        for (arr) |item| {
-            try parseOneSource(allocator, item, batch_size, effective_namespace, &sources);
+        for (arr, 0..) |item, idx| {
+            try parseOneSource(allocator, item, idx, batch_size, effective_namespace, &sources);
         }
     }
 
     // --- sinks (required array) ---
     if (getArray(root, "sinks")) |arr| {
-        for (arr) |item| {
-            try parseOneSink(allocator, item, effective_namespace, &sinks);
+        for (arr, 0..) |item, idx| {
+            try parseOneSink(allocator, item, idx, effective_namespace, &sinks);
         }
     }
 
@@ -451,10 +451,14 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 ///       field: usage_idle
 ///       poll_interval_ms: 500
 ///   ```
-fn parseOneSource(allocator: Allocator, item: JsonValue, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
+fn parseOneSource(allocator: Allocator, item: JsonValue, index: usize, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
     if (item != .object) return;
 
-    const base_name = getString(item, "name") orelse "default-source";
+    // Default the source name to a per-index unique value so multiple unnamed
+    // sources (e.g. the doc's flow-style `- stream: { name: … }`) don't collide.
+    var name_buf: [32]u8 = undefined;
+    const base_name = getString(item, "name") orelse
+        (std.fmt.bufPrint(&name_buf, "default-source-{d}", .{index}) catch "default-source");
 
     // Detect TS source
     if (getObject(item, "ts")) |ts_obj| {
@@ -583,9 +587,15 @@ fn appendStreamSource(
         if (v > 0) bs = @intCast(@as(i64, v));
     }
 
+    // Poll interval (default 1000ms) — how often the pipeline reads from the source.
+    var poll_ms: u32 = 1000;
+    if (getInt(stream_obj, "poll_interval_ms")) |v| {
+        if (v > 0) poll_ms = @intCast(@as(i64, v));
+    }
+
     // `partitions:` as string → range/list/all expansion
     if (getString(stream_obj, "partitions")) |partitions_str| {
-        try expandPartitions(allocator, source_name, stream_name, ns_raw, bs, partitions_str, sources);
+        try expandPartitions(allocator, source_name, stream_name, ns_raw, bs, poll_ms, partitions_str, sources);
         return;
     }
 
@@ -607,6 +617,7 @@ fn appendStreamSource(
         .namespace = ns_dup,
         .partition = partition,
         .batch_size = bs,
+        .ts_poll_interval_ms = poll_ms,
     }) catch return error.OutOfMemory;
 }
 
@@ -622,6 +633,7 @@ fn expandPartitions(
     stream_name: []const u8,
     ns_raw: []const u8,
     bs: u32,
+    poll_ms: u32,
     partitions_str: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
@@ -641,6 +653,7 @@ fn expandPartitions(
             .namespace = ns_d,
             .partition = PARTITION_ALL,
             .batch_size = bs,
+            .ts_poll_interval_ms = poll_ms,
         }) catch return error.OutOfMemory;
         return;
     }
@@ -655,7 +668,7 @@ fn expandPartitions(
 
         var p = start;
         while (p <= end) : (p += 1) {
-            try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, sources);
+            try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, poll_ms, sources);
         }
         return;
     }
@@ -667,7 +680,7 @@ fn expandPartitions(
         const trimmed = std.mem.trim(u8, seg, " ");
         if (trimmed.len == 0) continue;
         const p = std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidPartitions;
-        try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, sources);
+        try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, poll_ms, sources);
         count += 1;
     }
     if (count == 0) return error.InvalidPartitions;
@@ -681,6 +694,7 @@ fn appendExpandedSource(
     ns_raw: []const u8,
     partition: u32,
     bs: u32,
+    poll_ms: u32,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
     // Generate name: "base_name-p3"
@@ -696,6 +710,7 @@ fn appendExpandedSource(
         .namespace = ns_d,
         .partition = partition,
         .batch_size = bs,
+        .ts_poll_interval_ms = poll_ms,
     }) catch return error.OutOfMemory;
 }
 
@@ -708,10 +723,15 @@ fn appendExpandedSource(
 ///   - `stream:` object present → SinkKind.stream
 ///
 /// Optional `match:` array maps this sink to tagged records only (AND match).
-fn parseOneSink(allocator: Allocator, item: JsonValue, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
+fn parseOneSink(allocator: Allocator, item: JsonValue, index: usize, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
     if (item != .object) return;
 
-    const sink_name = getString(item, "name") orelse "default-sink";
+    // Default the sink name to a per-index unique value so multiple unnamed sinks
+    // (e.g. the doc's flow-style `- stream: { name: … }`) don't trip the
+    // duplicate-name validation check.
+    var name_buf: [32]u8 = undefined;
+    const sink_name = getString(item, "name") orelse
+        (std.fmt.bufPrint(&name_buf, "default-sink-{d}", .{index}) catch "default-sink");
 
     // Parse match list — either a YAML array of strings, or a single string (sugar)
     const sink_match: ?[]const []const u8 = blk: {
