@@ -43,6 +43,8 @@ const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const stream_handler_mod = @import("../stream/handler.zig");
 const kv_handler_mod = @import("../kv/handler.zig");
+const ts_handler_mod = @import("../ts/handler.zig");
+const queue_handler_mod = @import("../queue/handler.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -91,8 +93,14 @@ pub const ProcessingHandler = struct {
     peer_partition_count: u32 = 0,
 
     /// Cross-shard KV handlers — one per shard, wired by Runtime.
-    /// Enables KV lookup operators to find keys on any shard.
+    /// Enables KV lookup operators and KV sinks to reach keys on any shard.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
+
+    /// Cross-shard TS / queue handlers — one per shard, wired by Runtime.
+    /// Enables TS and queue sinks to write to the shard that owns the target
+    /// measurement / queue (matching how `ts read` / `queue dequeue` route).
+    peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
+    peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
     const MAX_JOBS: usize = 100_000;
 
@@ -245,6 +253,16 @@ pub const ProcessingHandler = struct {
         self.peer_kv_handlers = handlers;
     }
 
+    /// Wire cross-shard TS handler references (for TS sinks).
+    pub fn setPeerTsHandlers(self: *ProcessingHandler, handlers: []const *ts_handler_mod.TSHandler) void {
+        self.peer_ts_handlers = handlers;
+    }
+
+    /// Wire cross-shard queue handler references (for queue sinks).
+    pub fn setPeerQueueHandlers(self: *ProcessingHandler, handlers: []const *queue_handler_mod.QueueHandler) void {
+        self.peer_queue_handlers = handlers;
+    }
+
     /// Resolve the correct StreamHandler for a given stream name + namespace.
     /// Uses hashKeyWithNamespace (namespace + key) to match the Dispatcher's
     /// stream_append routing — the Dispatcher uses preRouteByStream which
@@ -253,10 +271,40 @@ pub const ProcessingHandler = struct {
     fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, namespace: []const u8) *stream_handler_mod.StreamHandler {
         const peers = self.peer_stream_handlers orelse return local;
         if (peers.len <= 1) return local;
-        const hash = router.hashKeyWithNamespace(namespace, stream_name);
+        return peers[self.peerShardId(namespace, stream_name)];
+    }
+
+    /// Shard that owns `key` in `namespace`, using the same composite hash the
+    /// dispatchers use to route stream/kv/queue/ts commands. Sinks resolve through
+    /// this so a write lands on the shard a subsequent read will query.
+    fn peerShardId(self: *const ProcessingHandler, namespace: []const u8, key: []const u8) u16 {
+        const hash = router.hashKeyWithNamespace(namespace, key);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
-        const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
-        return peers[shard_id];
+        return @intCast(partition_id % self.peer_shard_count);
+    }
+
+    /// Resolve the KV handler that owns `key` in `namespace` (for KV sinks).
+    fn resolveKvHandler(self: *ProcessingHandler, local: *kv_handler_mod.KVHandler, namespace: []const u8, key: []const u8) *kv_handler_mod.KVHandler {
+        const peers = self.peer_kv_handlers orelse return local;
+        if (peers.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return local;
+        const shard_id = self.peerShardId(namespace, key);
+        return if (shard_id < peers.len) peers[shard_id] else local;
+    }
+
+    /// Resolve the TS handler that owns `measurement` in `namespace` (for TS sinks).
+    fn resolveTsHandler(self: *ProcessingHandler, local: *ts_handler_mod.TSHandler, namespace: []const u8, measurement: []const u8) *ts_handler_mod.TSHandler {
+        const peers = self.peer_ts_handlers orelse return local;
+        if (peers.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return local;
+        const shard_id = self.peerShardId(namespace, measurement);
+        return if (shard_id < peers.len) peers[shard_id] else local;
+    }
+
+    /// Resolve the queue handler that owns `queue_name` in `namespace` (for queue sinks).
+    fn resolveQueueHandler(self: *ProcessingHandler, local: *queue_handler_mod.QueueHandler, namespace: []const u8, queue_name: []const u8) *queue_handler_mod.QueueHandler {
+        const peers = self.peer_queue_handlers orelse return local;
+        if (peers.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return local;
+        const shard_id = self.peerShardId(namespace, queue_name);
+        return if (shard_id < peers.len) peers[shard_id] else local;
     }
 
     fn freeJobRecord(self: *ProcessingHandler, job: *JobRecord) void {
@@ -1257,14 +1305,14 @@ pub const ProcessingHandler = struct {
             pipe.last_poll_ms = now_ms;
 
             switch (pipe.source_kind) {
-                .ts => tickTsSource(pipe, shard, job),
+                .ts => self.tickTsSource(pipe, shard, job),
                 .stream => self.tickStreamSource(pipeline_key, pipe, shard, job),
             }
         }
     }
 
     /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
-    fn tickTsSource(pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+    fn tickTsSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         var point_buf: [256]StoredPoint = undefined;
         const result = shard.ts_handler.ts.queryRange(
             pipe.src_measurement,
@@ -1292,11 +1340,11 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer shard.allocator.free(records);
                 for (records) |rec| {
-                    writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash, rec.tags);
+                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash, rec.tags);
                 }
             } else {
                 // No operators or chain failed — direct passthrough
-                writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash, 0);
+                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash, 0);
             }
 
             // Advance cursor past this point
@@ -1441,16 +1489,18 @@ pub const ProcessingHandler = struct {
     /// Write a processed record to all matching sinks (TS source variant).
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
-    fn writeSinkRecord(pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64, record_tags: u32) void {
+    fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64, record_tags: u32) void {
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
             switch (snk.kind) {
                 .stream => {
-                    _ = shard.stream_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                    const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
+                    _ = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
                 },
                 .ts => {
-                    const ual_idx = shard.ts_handler.nextUalIndex();
-                    shard.ts_handler.ts.insert(
+                    const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
+                    const ual_idx = ts_h.nextUalIndex();
+                    ts_h.ts.insert(
                         snk.measurement,
                         snk.value_field,
                         field_value,
@@ -1459,8 +1509,8 @@ pub const ProcessingHandler = struct {
                         tag_hash,
                     ) catch continue;
                 },
-                .kv => writeKvSink(snk, shard, "", payload),
-                .queue => writeQueueSink(snk, shard, payload),
+                .kv => self.writeKvSink(snk, shard, "", payload),
+                .queue => self.writeQueueSink(snk, shard, payload),
             }
         }
     }
@@ -1476,9 +1526,9 @@ pub const ProcessingHandler = struct {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
                     _ = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
                 },
-                .ts => writeTsSinkFromJson(snk, shard, payload),
-                .kv => writeKvSink(snk, shard, record_key, payload),
-                .queue => writeQueueSink(snk, shard, payload),
+                .ts => self.writeTsSinkFromJson(snk, shard, payload),
+                .kv => self.writeKvSink(snk, shard, record_key, payload),
+                .queue => self.writeQueueSink(snk, shard, payload),
             }
         }
     }
@@ -1486,7 +1536,9 @@ pub const ProcessingHandler = struct {
     /// TS sink (JSON source variant): honors the `fields:` map (one point per
     /// `field_name ← json_key` pair) and the `tags:` map (real tag hash). Falls back
     /// to the `value_field` shorthand (single "value" field) when no fields map is set.
-    fn writeTsSinkFromJson(snk: SinkConfig, shard: *Shard, payload: []const u8) void {
+    /// Routes to the shard that owns the measurement so `ts read` finds the points.
+    fn writeTsSinkFromJson(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
+        const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@import("stdx").time.milliTimestamp())) * 1_000_000);
         const tag_hash_val = computeTsSinkTagHash(snk.ts_tag_keys, payload);
 
@@ -1495,8 +1547,8 @@ pub const ProcessingHandler = struct {
             while (it.next()) |pair| {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse continue;
-                const ual_idx = shard.ts_handler.nextUalIndex();
-                shard.ts_handler.ts.insert(snk.measurement, pair.key, value, now_ns, ual_idx, tag_hash_val) catch continue;
+                const ual_idx = ts_h.nextUalIndex();
+                ts_h.ts.insert(snk.measurement, pair.key, value, now_ns, ual_idx, tag_hash_val) catch continue;
             }
             return;
         }
@@ -1504,13 +1556,13 @@ pub const ProcessingHandler = struct {
         // value_field shorthand — extract the named JSON field and store it as "value".
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return);
-        const ual_idx = shard.ts_handler.nextUalIndex();
-        shard.ts_handler.ts.insert(snk.measurement, "value", value, now_ns, ual_idx, tag_hash_val) catch {};
+        const ual_idx = ts_h.nextUalIndex();
+        ts_h.ts.insert(snk.measurement, "value", value, now_ns, ual_idx, tag_hash_val) catch {};
     }
 
-    /// KV sink: write the record under `key_prefix + separator + record_key`.
-    /// Note: like the TS sink, this applies to the local shard's KV projection.
-    fn writeKvSink(snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
+    /// KV sink: write the record under `key_prefix + separator + record_key`,
+    /// routed to the shard that owns that key so a later `kv get` finds it.
+    fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [1024]u8 = undefined;
         const full_key = if (snk.kv_key_prefix.len > 0)
             (std.fmt.bufPrint(&key_buf, "{s}{s}{s}", .{ snk.kv_key_prefix, snk.kv_separator, record_key }) catch return)
@@ -1530,13 +1582,15 @@ pub const ProcessingHandler = struct {
             .value = payload,
             .options = opt_buf[0..ob.offset],
         };
-        const result = shard.kv_handler.handleCommand(req);
-        shard.kv_handler.freeResult(result);
+        const kv = self.resolveKvHandler(shard.kv_handler, snk.namespace, full_key);
+        const result = kv.handleCommand(req);
+        kv.freeResult(result);
     }
 
     /// Queue sink: enqueue the record payload into the configured queue (durable,
-    /// via the queue handler's Raft-backed enqueue path).
-    fn writeQueueSink(snk: SinkConfig, shard: *Shard, payload: []const u8) void {
+    /// via the queue handler's Raft-backed enqueue path), routed to the shard that
+    /// owns the queue so a later `queue dequeue` finds it.
+    fn writeQueueSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
         var opt_buf: [64]u8 = undefined;
         var ob = proto.OptionsBuilder.init(&opt_buf);
         if (snk.queue_priority > 0) ob.addU8(.priority, snk.queue_priority) catch {};
@@ -1549,8 +1603,9 @@ pub const ProcessingHandler = struct {
             .value = payload,
             .options = opt_buf[0..ob.offset],
         };
-        const result = shard.queue_handler.handleCommand(req);
-        shard.queue_handler.freeResult(result);
+        const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
+        const result = q.handleCommand(req);
+        q.freeResult(result);
     }
 
     /// Build a minimal in-process request header carrying just the opcode.

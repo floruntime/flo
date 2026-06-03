@@ -3006,3 +3006,57 @@ test "e2e/processing: doc flow-style YAML parses" {
     try testing.expect(!result.stdoutContains("missing stream name"));
     try stdx.testing.assertContains(result, "PASSED"); // flow-style example parses.
 }
+
+// =============================================================================
+// Cross-shard sink routing (#11)
+// =============================================================================
+
+// On a multi-shard node, a KV sink must write to the shard that OWNS the key
+// (the same shard a later `kv get` routes to), not the shard running the
+// pipeline. The 8 distinct keyby keys below hash across all 4 shards, so most
+// are written cross-shard — pre-fix those were unreadable; now all resolve.
+test "e2e/processing: kv sink routes to the owning shard (multi-shard)" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "xshard" });
+
+    const ids = [_][]const u8{ "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7" };
+    inline for (ids) |id| {
+        try ctx.exec(&.{ "stream", "append", "xshard-src", "{\"id\":\"" ++ id ++ "\",\"v\":\"val-" ++ id ++ "\"}", "-n", "xshard" });
+    }
+
+    const job_def =
+        \\kind: Processing
+        \\name: xshard-kv
+        \\namespace: xshard
+        \\sources.[0].stream.name: xshard-src
+        \\operators.[0].type: keyby
+        \\operators.[0].name: by-id
+        \\operators.[0].key_expression: $.id
+        \\sinks.[0].kv.namespace: xshard
+        \\sinks.[0].kv.key_prefix: u
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-xshard-kv.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "xshard" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Every record's KV key must be readable, including keys whose hash shard
+    // differs from the shard running the pipeline.
+    inline for (ids) |id| {
+        const found = try kvGetBlocking(ctx, "u:" ++ id, "xshard", "val-" ++ id, 8000);
+        if (!found) {
+            std.debug.print("\n[FAILED] cross-shard KV sink key 'u:{s}' not found\n", .{id});
+            ctx.dumpServerLogs();
+            return error.KvKeyMissing;
+        }
+    }
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "xshard" });
+}
