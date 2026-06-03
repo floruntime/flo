@@ -128,6 +128,9 @@ pub const WorkflowHandler = struct {
         version_owned: []const u8,
         yaml_owned: []const u8,
         created_at_ms: i64,
+        /// Cached idempotency mode (parsed once at create time) so the start
+        /// path can enforce `required` without re-parsing the YAML.
+        idempotency: definition.IdempotencyMode = .none,
     };
 
     pub const RunRecord = struct {
@@ -167,6 +170,19 @@ pub const WorkflowHandler = struct {
 
         /// Shard ID where the pending action run was created (for cross-shard lookup).
         pending_action_shard_id: ?u16 = null,
+
+        /// Child workflow run ID when parked waiting for a `@workflow/<name>` step.
+        pending_child_run_id_owned: ?[]const u8 = null,
+
+        /// Shard ID where the pending child workflow run lives (cross-shard lookup).
+        pending_child_shard_id: ?u16 = null,
+
+        /// Number of poll attempts taken for the current step (a `poll:` step that
+        /// keeps returning `pending`). Reset on step transition.
+        poll_attempt: u32 = 0,
+
+        /// Absolute time the next poll re-invocation is due (ms; 0 = not polling).
+        poll_next_at_ms: i64 = 0,
 
         /// Retry attempt counter for the current step (reset on step transition).
         retry_count: u32 = 0,
@@ -302,6 +318,7 @@ pub const WorkflowHandler = struct {
         if (run.current_step_name_owned) |s| self.allocator.free(s);
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
+        if (run.pending_child_run_id_owned) |a| self.allocator.free(a);
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         if (run.wait_timeout_target_owned) |t| self.allocator.free(t);
         if (run.output_owned) |o| self.allocator.free(o);
@@ -522,6 +539,7 @@ pub const WorkflowHandler = struct {
             .version_owned = owned_version,
             .yaml_owned = owned_yaml,
             .created_at_ms = now_ms,
+            .idempotency = def.idempotency,
         }) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_name);
@@ -650,6 +668,16 @@ pub const WorkflowHandler = struct {
             // Remaining bytes are input
             if (offset < value.len) {
                 input = value[offset..];
+            }
+        }
+
+        // Enforce idempotency mode: `required` rejects starts with no key.
+        if (idempotency_key == null) {
+            if (self.definitions.get(def_ns_key)) |def_rec| {
+                if (def_rec.idempotency == .required) {
+                    shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "idempotency key is required for this workflow");
+                    return;
+                }
             }
         }
 
@@ -1499,7 +1527,15 @@ pub const WorkflowHandler = struct {
                     if (resolved_input) |ri| self.allocator.free(ri);
 
                     // null outcome means run is parked (async action)
-                    const outcome = outcome_or_park orelse return;
+                    const raw_outcome = outcome_or_park orelse return;
+
+                    // Polling: a `pending` outcome on a `poll:` step parks for a
+                    // backoff re-invocation instead of transitioning. On exhaustion
+                    // the effective outcome becomes `timeout`.
+                    const outcome = switch (self.applyPollPolicy(run, run_step, raw_outcome, step_label, now_ms)) {
+                        .parked => return,
+                        .proceed => |o| o,
+                    };
 
                     // Check retry on failure
                     if (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
@@ -1516,8 +1552,10 @@ pub const WorkflowHandler = struct {
 
                     self.addHistoryEvent(run, "step_completed", step_label, now_ms);
 
-                    // Reset retry counter on step transition
+                    // Reset retry + poll counters on step transition
                     run.retry_count = 0;
+                    run.poll_attempt = 0;
+                    run.poll_next_at_ms = 0;
 
                     // Follow transition
                     const transition = run_step.resolveTransition(outcome) orelse {
@@ -1606,10 +1644,188 @@ pub const WorkflowHandler = struct {
         } else if (run_step.isPlan()) {
             return self.executePlan(shard, run, def, run_step.targetName(), step_input, step_label, namespace, now_ms);
         } else if (run_step.isChildWorkflow()) {
-            // Child workflow invocation — not yet wired.
-            return definition.StepOutcome.execution_failure;
+            return self.executeChildWorkflow(shard, run, run_step, step_input, step_label, namespace, now_ms);
         }
         return definition.StepOutcome.execution_failure;
+    }
+
+    /// Invoke a child workflow (`run: "@workflow/<name>[:version]"`).
+    /// Creates a child run on the shard that owns the child workflow, parks the
+    /// parent, and returns null. The parent resumes via checkPendingActions when
+    /// the child reaches a terminal state (completed → success, otherwise failure).
+    fn executeChildWorkflow(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        run: *RunRecord,
+        run_step: definition.RunStep,
+        step_input: []const u8,
+        step_label: []const u8,
+        namespace: []const u8,
+        now_ms: i64,
+    ) ?[]const u8 {
+        // Strip the optional ":version" suffix — definitions are keyed by name.
+        const raw = run_step.targetName();
+        const child_name = if (std.mem.indexOfScalar(u8, raw, ':')) |i| raw[0..i] else raw;
+
+        // Reconstruct the parent's run key up-front: spawnRun below may insert a
+        // new entry into self.runs (same map when the child is local), which can
+        // resize and invalidate the `run` pointer. We re-fetch after spawning.
+        const parent_ns_key = self.makeNsKey(namespace, run.run_id_owned) orelse
+            return definition.StepOutcome.execution_failure;
+        defer self.allocator.free(parent_ns_key);
+
+        const child_ns_key = self.makeNsKey(namespace, child_name) orelse
+            return definition.StepOutcome.execution_failure;
+        defer self.allocator.free(child_ns_key);
+
+        // Resolve the shard/handler that owns the child workflow.
+        const target_shard_id = self.resolveWorkflowShardId(shard, namespace, child_name);
+        const is_local = (target_shard_id == shard.id);
+        const target_shard: *Shard = if (is_local) shard else blk: {
+            const peers = shard.peer_shards orelse break :blk shard;
+            break :blk peers[target_shard_id];
+        };
+        const target_handler: *WorkflowHandler = if (is_local) self else target_shard.workflow_handler;
+
+        // Cross-shard: serialize access to the target handler's run map.
+        if (!is_local) target_handler.mu.lock();
+        defer if (!is_local) target_handler.mu.unlock();
+
+        if (!target_handler.definitions.contains(child_ns_key)) {
+            self.addHistoryEvent(run, "child_not_found", child_name, now_ms);
+            return definition.StepOutcome.target_not_found;
+        }
+
+        const child_rid = target_handler.spawnRun(target_shard, namespace, child_name, step_input, "child_started", now_ms) orelse
+            return definition.StepOutcome.execution_failure;
+
+        // Re-fetch the (possibly relocated) parent record and park it.
+        const parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
+        self.parkForChild(parent, child_rid, step_label, child_name, target_shard_id, now_ms);
+        return null; // parked
+    }
+
+    /// Compute the shard ID that owns the given workflow (definition + runs).
+    fn resolveWorkflowShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, workflow_name: []const u8) u16 {
+        _ = self;
+        const hash = router.hashKeyWithNamespace(namespace, workflow_name);
+        const target = shard.router.route(hash);
+        return switch (target) {
+            .local => shard.id,
+            .shard => |t| t.shard_id,
+            .remote => shard.id,
+        };
+    }
+
+    /// Create and start a workflow run programmatically. Used for child-workflow
+    /// invocation. Must be called with this handler's `mu` held. Returns the new
+    /// run's ID (a slice owned by the stored record) or null on failure.
+    fn spawnRun(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        namespace: []const u8,
+        wf_name: []const u8,
+        input: []const u8,
+        evt_type: []const u8,
+        now_ms: i64,
+    ) ?[]const u8 {
+        var run_id_buf: [32]u8 = undefined;
+        const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return null;
+
+        const run_ns_key = self.makeNsKey(namespace, run_id_str) orelse return null;
+        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
+            self.allocator.free(run_ns_key);
+            return null;
+        };
+        const owned_wf_name = self.allocator.dupe(u8, wf_name) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            return null;
+        };
+        const owned_version = self.allocator.dupe(u8, "latest") catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            return null;
+        };
+        const owned_input = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(run_ns_key);
+            self.allocator.free(owned_run_id);
+            self.allocator.free(owned_wf_name);
+            self.allocator.free(owned_version);
+            return null;
+        };
+
+        var run = RunRecord{
+            .run_id_owned = owned_run_id,
+            .workflow_name_owned = owned_wf_name,
+            .workflow_version_owned = owned_version,
+            .status = .running,
+            .input_owned = owned_input,
+            .created_at_ms = now_ms,
+            .started_at_ms = now_ms,
+            .completed_at_ms = null,
+            .idempotency_key_owned = null,
+            .signals = .empty,
+            .history = .empty,
+        };
+
+        const ev_type = self.allocator.dupe(u8, evt_type) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return null;
+        };
+        const ev_detail = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(ev_type);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return null;
+        };
+        run.history.append(self.allocator, .{
+            .event_type_owned = ev_type,
+            .detail_owned = ev_detail,
+            .timestamp_ms = now_ms,
+        }) catch {
+            self.allocator.free(ev_type);
+            self.allocator.free(ev_detail);
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return null;
+        };
+
+        self.runs.put(run_ns_key, run) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(run_ns_key);
+            return null;
+        };
+
+        self.persistStart(shard, namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
+        self.advanceWorkflow(shard, run_ns_key, namespace);
+
+        // Return the stored run_id (advanceWorkflow does not insert into self.runs,
+        // so the entry is stable here).
+        const stored = self.runs.getPtr(run_ns_key) orelse return null;
+        return stored.run_id_owned;
+    }
+
+    /// Park a workflow run waiting for a child workflow to reach a terminal state.
+    fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, target_shard_id: u16, now_ms: i64) void {
+        run.status = .waiting;
+
+        if (run.pending_child_run_id_owned) |old| self.allocator.free(old);
+        run.pending_child_run_id_owned = self.allocator.dupe(u8, child_run_id) catch null;
+
+        if (run.pending_step_name_owned) |old| self.allocator.free(old);
+        run.pending_step_name_owned = self.allocator.dupe(u8, step_label) catch null;
+
+        run.pending_child_shard_id = target_shard_id;
+
+        const sig_type = std.fmt.allocPrint(self.allocator, "_child_done:{s}", .{child_run_id}) catch null;
+        if (run.wait_signal_type_owned) |old| self.allocator.free(old);
+        run.wait_signal_type_owned = sig_type;
+
+        self.addHistoryEvent(run, "awaiting_child", child_name, now_ms);
     }
 
     /// Execute a plan step: iterate executors with selection strategy awareness.
@@ -1864,6 +2080,26 @@ pub const WorkflowHandler = struct {
         }
     }
 
+    /// Resolve the StreamHandler that owns `stream_name` in `namespace`, using
+    /// the same composite hash the dispatcher uses to route stream_append. The
+    /// stream's data lives on that shard, so stream triggers must read from it
+    /// rather than the local shard (which is merely wherever the triggering
+    /// workflow definition happened to be created). Falls back to local.
+    fn resolveStreamHandler(shard: *Shard, namespace: []const u8, stream_name: []const u8) @TypeOf(shard.stream_handler) {
+        const hash = router.hashKeyWithNamespace(namespace, stream_name);
+        const target = shard.router.route(hash);
+        switch (target) {
+            .local => return shard.stream_handler,
+            .shard => |t| {
+                if (shard.peer_shards) |peers| {
+                    return peers[t.shard_id].stream_handler;
+                }
+                return shard.stream_handler;
+            },
+            .remote => return shard.stream_handler,
+        }
+    }
+
     /// Compute the shard ID that owns the given action.
     fn resolveActionShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) u16 {
         _ = self;
@@ -1916,6 +2152,42 @@ pub const WorkflowHandler = struct {
         self.addHistoryEvent(run, "awaiting_action", action_name, now_ms);
     }
 
+    /// Decision returned by applyPollPolicy for a step outcome.
+    const PollDecision = union(enum) {
+        /// A poll was armed; the run is parked. Caller should return immediately.
+        parked,
+        /// Caller should follow the transition for this (effective) outcome.
+        proceed: []const u8,
+    };
+
+    /// Apply `poll:` semantics to a step outcome. When an action returns the
+    /// `pending` business outcome and the step has a `poll:` block, the run is
+    /// parked for a backoff delay and re-invoked later (up to `maxAttempts`).
+    /// On exhaustion the effective outcome becomes `timeout` so the caller follows
+    /// the documented `timeout:` transition. Non-pending outcomes pass through.
+    fn applyPollPolicy(self: *WorkflowHandler, run: *RunRecord, run_step: definition.RunStep, outcome: []const u8, step_label: []const u8, now_ms: i64) PollDecision {
+        if (!std.mem.eql(u8, outcome, definition.StepOutcome.pending)) return .{ .proceed = outcome };
+        const poll_cfg = run_step.poll orelse return .{ .proceed = outcome };
+
+        if (run.poll_attempt < poll_cfg.max_attempts) {
+            const delay: i64 = if (run.poll_attempt == 0)
+                poll_cfg.initial_delay_ms
+            else
+                @intCast(poll_cfg.calculateDelay(run.poll_attempt - 1));
+            run.poll_attempt += 1;
+            run.poll_next_at_ms = now_ms + delay;
+            run.status = .waiting;
+            self.addHistoryEvent(run, "poll_scheduled", step_label, now_ms);
+            return .parked;
+        }
+
+        // Max attempts exceeded — fall through to the `timeout` transition.
+        run.poll_attempt = 0;
+        run.poll_next_at_ms = 0;
+        self.addHistoryEvent(run, "poll_exhausted", step_label, now_ms);
+        return .{ .proceed = definition.StepOutcome.timeout };
+    }
+
     /// Check all waiting runs for completed async actions and timed-out signals.
     /// Called periodically by the shard's task scheduler.
     pub fn checkPendingActions(self: *WorkflowHandler, shard: *Shard) void {
@@ -1927,13 +2199,26 @@ pub const WorkflowHandler = struct {
         // Collect keys of runs that need resuming (can't modify map while iterating)
         var resume_keys: [64][]const u8 = undefined;
         var timeout_keys: [64][]const u8 = undefined;
+        var child_keys: [64][]const u8 = undefined;
+        var poll_keys: [64][]const u8 = undefined;
         var resume_count: usize = 0;
         var timeout_count: usize = 0;
+        var child_count: usize = 0;
+        var poll_count: usize = 0;
 
         var it = self.runs.iterator();
         while (it.next()) |entry| {
             const run = entry.value_ptr;
             if (run.status != .waiting) continue;
+
+            // Check due poll timers (a `poll:` step awaiting backoff re-invocation)
+            if (run.poll_next_at_ms > 0 and now_ms >= run.poll_next_at_ms) {
+                if (poll_count < poll_keys.len) {
+                    poll_keys[poll_count] = entry.key_ptr.*;
+                    poll_count += 1;
+                }
+                continue; // a polling run has no pending action/child/signal to check
+            }
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
@@ -1943,6 +2228,16 @@ pub const WorkflowHandler = struct {
                             resume_keys[resume_count] = entry.key_ptr.*;
                             resume_count += 1;
                         }
+                    }
+                }
+            }
+
+            // Check child workflow completion
+            if (run.pending_child_run_id_owned) |child_rid| {
+                if (self.childRunTerminal(shard, entry.key_ptr.*, child_rid, run.pending_child_shard_id)) {
+                    if (child_count < child_keys.len) {
+                        child_keys[child_count] = entry.key_ptr.*;
+                        child_count += 1;
                     }
                 }
             }
@@ -1964,9 +2259,143 @@ pub const WorkflowHandler = struct {
             self.resumeFromAction(shard, ns_key, now_ms);
         }
 
+        // Resume child-workflow-completed runs
+        for (child_keys[0..child_count]) |ns_key| {
+            self.resumeFromChild(shard, ns_key, now_ms);
+        }
+
+        // Fire due poll timers — re-invoke the current step's action.
+        for (poll_keys[0..poll_count]) |ns_key| {
+            if (self.runs.getPtr(ns_key)) |r| {
+                r.poll_next_at_ms = 0;
+                r.status = .running;
+                if (r.wait_signal_type_owned) |s| self.allocator.free(s);
+                r.wait_signal_type_owned = null;
+            }
+            const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
+            self.advanceWorkflow(shard, ns_key, ns_key[0..ns_end]);
+        }
+
         // Handle signal timeouts
         for (timeout_keys[0..timeout_count]) |ns_key| {
             self.handleWaitTimeout(shard, ns_key, now_ms);
+        }
+    }
+
+    /// Whether the child run referenced by a parent is in a terminal state.
+    /// `parent_ns_key` is "namespace:parent_run_id"; the child shares the namespace.
+    fn childRunTerminal(self: *WorkflowHandler, shard: *Shard, parent_ns_key: []const u8, child_run_id: []const u8, child_shard_id: ?u16) bool {
+        const ns_end = std.mem.indexOfScalar(u8, parent_ns_key, ':') orelse return false;
+        const namespace = parent_ns_key[0..ns_end];
+        const child_ns_key = self.makeNsKey(namespace, child_run_id) orelse return false;
+        defer self.allocator.free(child_ns_key);
+
+        const tid = child_shard_id orelse shard.id;
+        if (tid == shard.id) {
+            const child = self.runs.getPtr(child_ns_key) orelse return false;
+            return child.status.isTerminal();
+        }
+        const peers = shard.peer_shards orelse return false;
+        if (tid >= peers.len) return false;
+        const handler = peers[tid].workflow_handler;
+        handler.mu.lock();
+        defer handler.mu.unlock();
+        const child = handler.runs.getPtr(child_ns_key) orelse return false;
+        return child.status.isTerminal();
+    }
+
+    /// Resume a parent workflow run after its child workflow reached a terminal
+    /// state. Child `completed` → parent step `success`; any other terminal → `failure`.
+    fn resumeFromChild(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, now_ms: i64) void {
+        const run = self.runs.getPtr(run_ns_key) orelse return;
+        const child_rid = run.pending_child_run_id_owned orelse return;
+        const step_label = run.pending_step_name_owned orelse "unknown";
+
+        const ns_end = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
+        const namespace = run_ns_key[0..ns_end];
+
+        const child_ns_key = self.makeNsKey(namespace, child_rid) orelse return;
+        defer self.allocator.free(child_ns_key);
+
+        // Read the child's terminal status + a private copy of its output.
+        const tid = run.pending_child_shard_id orelse shard.id;
+        var child_status: RunStatus = undefined;
+        var child_output: ?[]u8 = null;
+        if (tid == shard.id) {
+            const child = self.runs.getPtr(child_ns_key) orelse return;
+            if (!child.status.isTerminal()) return;
+            child_status = child.status;
+            if (child.output_owned) |o| child_output = self.allocator.dupe(u8, o) catch null;
+        } else {
+            const peers = shard.peer_shards orelse return;
+            if (tid >= peers.len) return;
+            const handler = peers[tid].workflow_handler;
+            handler.mu.lock();
+            if (handler.runs.getPtr(child_ns_key)) |child| {
+                if (!child.status.isTerminal()) {
+                    handler.mu.unlock();
+                    return;
+                }
+                child_status = child.status;
+                if (child.output_owned) |o| child_output = self.allocator.dupe(u8, o) catch null;
+            } else {
+                handler.mu.unlock();
+                return;
+            }
+            handler.mu.unlock();
+        }
+        defer if (child_output) |o| self.allocator.free(o);
+
+        const outcome: []const u8 = if (child_status == .completed)
+            definition.StepOutcome.success
+        else
+            definition.StepOutcome.failure;
+
+        if (run.step_outputs) |*so| {
+            so.put(self.allocator, step_label, child_output orelse "{}", outcome) catch {};
+        }
+
+        run.status = .running;
+        self.addHistoryEvent(run, "child_completed", outcome, now_ms);
+        self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+
+        // Clear pending child state.
+        if (run.pending_child_run_id_owned) |a| self.allocator.free(a);
+        run.pending_child_run_id_owned = null;
+        if (run.pending_step_name_owned) |s| self.allocator.free(s);
+        run.pending_step_name_owned = null;
+        run.pending_child_shard_id = null;
+        if (run.wait_signal_type_owned) |s| self.allocator.free(s);
+        run.wait_signal_type_owned = null;
+
+        // Follow the transition for the parent's current step.
+        const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+        defer self.allocator.free(def_ns_key);
+        const def_record = self.definitions.get(def_ns_key) orelse return;
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+        defer def.deinit(self.allocator);
+
+        const step: definition.Step = if (run.current_step_name_owned) |sn|
+            def.getStep(sn) orelse return
+        else
+            def.start;
+
+        switch (step) {
+            .run => |run_step| {
+                const transition = run_step.resolveTransition(outcome) orelse {
+                    self.completeRun(shard, run_ns_key, run, .failed, "no transition for outcome", now_ms);
+                    return;
+                };
+                if (resolveTerminalStatus(transition.target, def.terminals)) |status| {
+                    self.completeRun(shard, run_ns_key, run, status, transition.target, now_ms);
+                    return;
+                }
+                self.setCurrentStep(run, transition.target);
+                const key_copy = self.allocator.dupe(u8, run_ns_key) catch return;
+                defer self.allocator.free(key_copy);
+                self.advanceWorkflow(shard, key_copy, namespace);
+            },
+            else => {},
         }
     }
 
@@ -2030,6 +2459,14 @@ pub const WorkflowHandler = struct {
 
         switch (step) {
             .run => |run_step| {
+                // Polling: a `pending` async outcome on a `poll:` step re-arms a
+                // backoff poll instead of transitioning. On exhaustion → `timeout`.
+                const poll_label = run.current_step_name_owned orelse "start";
+                const eff_outcome = switch (self.applyPollPolicy(run, run_step, outcome, poll_label, now_ms)) {
+                    .parked => return,
+                    .proceed => |o| o,
+                };
+
                 // Record health for health-weighted plan executors (on async completion)
                 if (run_step.isPlan()) {
                     if (def.getPlan(run_step.targetName())) |plan| {
@@ -2107,7 +2544,7 @@ pub const WorkflowHandler = struct {
                     }
                 }
 
-                const transition = run_step.resolveTransition(outcome) orelse {
+                const transition = run_step.resolveTransition(eff_outcome) orelse {
                     self.completeRun(shard, run_ns_key, run, .failed, "no transition for outcome", now_ms);
                     return;
                 };
@@ -2365,6 +2802,9 @@ pub const WorkflowHandler = struct {
         run.plan_executor_idx = 0;
         run.plan_executor_natural_idx = 0;
         run.plan_executor_retry_count = 0;
+        // Reset poll state — a new step starts its own poll budget
+        run.poll_attempt = 0;
+        run.poll_next_at_ms = 0;
     }
 
     // ── Stream Trigger Polling ─────────────────────────────────────────
@@ -2649,14 +3089,17 @@ pub const WorkflowHandler = struct {
             // Read from the source stream
             const batch_limit: usize = @intCast(trigger.batch_size);
             const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
-            const result = shard.stream_handler.readPayloadsForStream(
+            // Read from the shard that owns the stream's data, not the local
+            // shard (which is just where this workflow definition was created).
+            const stream_handler = resolveStreamHandler(shard, trigger.stream_namespace_owned, trigger.stream_name_owned);
+            const result = stream_handler.readPayloadsForStream(
                 trigger.stream_name_owned,
                 trigger.stream_namespace_owned,
                 cursor,
                 @max(batch_limit, 1) * 10, // read ahead for batching
             );
             if (result.payloads.len == 0) continue;
-            defer shard.stream_handler.allocator.free(result.payloads);
+            defer stream_handler.allocator.free(result.payloads);
 
             // Start one run per event (or per batch if batch_size > 1)
             if (trigger.batch_size <= 1) {
@@ -3163,6 +3606,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(ns_key);
             return;
         };
+        const idempotency = def.idempotency;
         def.deinit(self.allocator);
 
         const owned_name = self.allocator.dupe(u8, raw_name) catch {
@@ -3182,6 +3626,7 @@ pub const WorkflowHandler = struct {
             .version_owned = version,
             .yaml_owned = owned_yaml,
             .created_at_ms = 0,
+            .idempotency = idempotency,
         }) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_name);
@@ -3529,6 +3974,15 @@ const test_input_mapping_json =
 const test_retry_workflow_json =
     \\{"kind":"Workflow","name":"retry-wf","version":"1.0.0",
     \\"start":{"run":"@actions/flaky","retry":{"maxAttempts":3},"transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+;
+
+// Poll workflow: action returns `pending`; the engine should re-arm a backoff
+// poll (delays 0 for test speed) and follow `timeout` after maxAttempts=2.
+const test_poll_workflow_json =
+    \\{"kind":"Workflow","name":"poll-wf","version":"1.0.0",
+    \\"start":{"run":"@actions/poller",
+    \\"poll":{"maxAttempts":2,"initialDelayMs":0,"baseDelayMs":0,"maxDelayMs":0,"backoff":"constant"},
+    \\"transitions":{"success":"flo.Completed","failure":"flo.Failed","timeout":"flo.TimedOut"}}}
 ;
 
 /// Register a test action for workflow step executor tests.
@@ -3989,6 +4443,64 @@ test "step executor: retry on failure" {
         }
     }
     try testing.expect(retry_count >= 2); // at least 2 retries before final failure
+}
+
+// An action that returns the `pending` business outcome on a `poll:` step must
+// re-arm a backoff poll (not fail with "no transition"), and after maxAttempts
+// is exceeded must follow the `timeout` transition. Driven at the handler layer
+// because the worker CLI cannot emit a `pending` outcome.
+test "step executor: poll re-arms on pending and times out after maxAttempts" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "poller");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:poll-wf", "poll-wf", test_poll_workflow_json);
+    createTestRun(&handler, "default:run-poll", "run-poll", "poll-wf");
+
+    // Initial: poller invoked, parks for async completion.
+    handler.advanceWorkflow(&shard, "default:run-poll", "default");
+
+    // First `pending` must ARM a poll (not fail): status waiting, attempt incremented.
+    {
+        const run = handler.runs.getPtr("default:run-poll").?;
+        try testing.expect(run.pending_action_run_id_owned != null);
+        completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "pending");
+    }
+    handler.checkPendingActions(&shard);
+    {
+        const run = handler.runs.getPtr("default:run-poll").?;
+        try testing.expect(!run.status.isTerminal()); // pre-fix bug: would be .failed
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        try testing.expectEqual(@as(u32, 1), run.poll_attempt);
+    }
+
+    // Drive remaining poll cycles: each tick either fires the due poll timer
+    // (re-invoking the action) or processes the re-invoked action's `pending`
+    // completion (re-arming). maxAttempts=2 → exhausted → `timeout` → flo.TimedOut.
+    var i: u32 = 0;
+    while (i < 12) : (i += 1) {
+        const run = handler.runs.getPtr("default:run-poll").?;
+        if (run.status.isTerminal()) break;
+        if (run.pending_action_run_id_owned) |rid| {
+            completeTestActionWith(&actions, rid, "pending");
+        }
+        handler.checkPendingActions(&shard);
+    }
+
+    const run = handler.runs.get("default:run-poll").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, run.status);
+
+    var polls: u32 = 0;
+    for (run.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "poll_scheduled")) polls += 1;
+    }
+    try testing.expect(polls >= 1);
 }
 
 test "step executor: checkPendingActions handles completed async action" {

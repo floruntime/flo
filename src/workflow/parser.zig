@@ -649,6 +649,28 @@ fn parseTrigger(allocator: Allocator, root: JsonValue) ParseError!?StreamTrigger
     return trig;
 }
 
+/// Parse a backoff strategy string. Accepts both the canonical spellings
+/// ("constant", "linear", "exponential", "exponential_jitter") and the
+/// duration-suffixed forms used elsewhere ("exp-jitter-200ms", "constant-500ms").
+/// The jitter variants are matched before the bare "exp" prefix so the
+/// documented "exponential_jitter" does not silently degrade to "exponential".
+fn parseBackoffStr(backoff_str: []const u8) BackoffType {
+    if (mem.startsWith(u8, backoff_str, "exp-jitter") or
+        mem.startsWith(u8, backoff_str, "exponential_jitter") or
+        mem.startsWith(u8, backoff_str, "exponential-jitter"))
+    {
+        return .exponential_jitter;
+    } else if (mem.startsWith(u8, backoff_str, "exp")) {
+        return .exponential;
+    } else if (mem.startsWith(u8, backoff_str, "linear")) {
+        return .linear;
+    } else if (mem.startsWith(u8, backoff_str, "constant")) {
+        return .constant;
+    } else {
+        return BackoffType.fromString(backoff_str) orelse .exponential;
+    }
+}
+
 fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
     if (obj != .object) return ParseError.InvalidFieldType;
 
@@ -657,21 +679,7 @@ fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
     const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| @intCast(d) else 30000;
     const within_ms: ?u64 = if (getInt(obj, "withinMs") orelse getInt(obj, "within_ms")) |w| @intCast(w) else null;
 
-    const backoff: BackoffType = blk: {
-        const backoff_str = getString(obj, "backoff") orelse "exponential";
-        // Parse backoff string like "exp-jitter-200ms" or "constant-500ms"
-        if (mem.startsWith(u8, backoff_str, "exp-jitter")) {
-            break :blk .exponential_jitter;
-        } else if (mem.startsWith(u8, backoff_str, "exp")) {
-            break :blk .exponential;
-        } else if (mem.startsWith(u8, backoff_str, "linear")) {
-            break :blk .linear;
-        } else if (mem.startsWith(u8, backoff_str, "constant")) {
-            break :blk .constant;
-        } else {
-            break :blk BackoffType.fromString(backoff_str) orelse .exponential;
-        }
-    };
+    const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
 
     return .{
         .max_attempts = max_attempts,
@@ -690,20 +698,7 @@ fn parsePollConfig(obj: JsonValue) ParseError!definition.PollConfig {
     const base_delay_ms: u32 = if (getInt(obj, "baseDelayMs") orelse getInt(obj, "base_delay_ms")) |d| @intCast(d) else 1000;
     const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| @intCast(d) else 60000;
 
-    const backoff: BackoffType = blk: {
-        const backoff_str = getString(obj, "backoff") orelse "exponential";
-        if (mem.startsWith(u8, backoff_str, "exp-jitter")) {
-            break :blk .exponential_jitter;
-        } else if (mem.startsWith(u8, backoff_str, "exp")) {
-            break :blk .exponential;
-        } else if (mem.startsWith(u8, backoff_str, "linear")) {
-            break :blk .linear;
-        } else if (mem.startsWith(u8, backoff_str, "constant")) {
-            break :blk .constant;
-        } else {
-            break :blk BackoffType.fromString(backoff_str) orelse .exponential;
-        }
-    };
+    const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
 
     return .{
         .initial_delay_ms = initial_delay_ms,
@@ -973,6 +968,35 @@ test "parseWorkflow: basic workflow" {
     try testing.expectEqualStrings("@actions/validate-order", def.start.run.target);
     try testing.expectEqual(@as(usize, 2), def.start.run.transitions.len);
     try testing.expectEqual(@as(usize, 1), def.steps.len);
+}
+
+// The docs (and BackoffType.fromString) spell the jittered strategy
+// "exponential_jitter". parseBackoffStr must honor that spelling in both retry
+// and poll configs rather than letting the bare "exp" prefix degrade it to
+// plain .exponential.
+test "parseWorkflow: exponential_jitter backoff parses to jitter" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const json =
+        \\{
+        \\  "kind": "Workflow",
+        \\  "name": "backoff-test",
+        \\  "version": "1.0.0",
+        \\  "start": {
+        \\    "run": "@actions/x",
+        \\    "retry": { "max_attempts": 3, "backoff": "exponential_jitter", "initial_delay_ms": 10 },
+        \\    "poll":  { "maxAttempts": 3, "backoff": "exponential_jitter", "baseDelayMs": 10 },
+        \\    "transitions": { "success": "flo.Completed", "failure": "flo.Failed" }
+        \\  }
+        \\}
+    ;
+
+    var def = try parseWorkflow(allocator, json);
+    defer def.deinit(allocator);
+
+    try testing.expectEqual(BackoffType.exponential_jitter, def.start.run.retry.?.backoff);
+    try testing.expectEqual(BackoffType.exponential_jitter, def.start.run.poll.?.backoff);
 }
 
 test "parseWorkflow: with search attributes" {

@@ -117,9 +117,15 @@ pub const PathResolver = struct {
             return try self.allocator.dupe(u8, step.output);
         }
 
-        // $.steps.{name}.outcome - return outcome string
+        // $.steps.{name}.outcome - return outcome as a JSON string (quoted),
+        // so the mapper's JSON re-parse accepts it. A bare word like `success`
+        // is not valid JSON and would otherwise fall back to the literal path.
         if (mem.eql(u8, rest, "outcome")) {
-            return try self.allocator.dupe(u8, step.outcome);
+            const result = try self.allocator.alloc(u8, step.outcome.len + 2);
+            result[0] = '"';
+            @memcpy(result[1 .. result.len - 1], step.outcome);
+            result[result.len - 1] = '"';
+            return result;
         }
 
         // $.steps.{name}.output.field - extract nested field

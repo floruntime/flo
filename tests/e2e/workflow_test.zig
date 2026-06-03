@@ -2773,3 +2773,181 @@ test "e2e/workflow: multi-shard namespace isolation across shards" {
     try ctx.exec(&.{ "workflow", "definition", "ms-ns-test", "-n", "alpha" });
     try ctx.exec(&.{ "workflow", "definition", "ms-ns-test", "-n", "beta" });
 }
+
+// =============================================================================
+// Workflow doc-contract regression tests
+//
+// These assert the DOCUMENTED behavior from
+// https://docs.floruntime.io/orchestration/workflows/ for features that were
+// previously missing or broken: child workflows, multi-shard stream triggers,
+// `idempotency: required` enforcement, and `$.steps.{name}.outcome` resolution.
+// (Backoff `exponential_jitter` parsing and polling-on-`pending` are covered by
+// unit tests in src/workflow/parser.zig and src/workflow/handler.zig.)
+// =============================================================================
+
+// Child workflows: a `start.run: @workflow/<child>` step must create a child run
+// (it must not return execution_failure / leave no child run behind).
+test "e2e/workflow: child workflow step creates a child run" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "audit-child-act" });
+
+    const child_def =
+        \\kind: Workflow
+        \\name: audit-child-1
+        \\version: 1.0.0
+        \\start.run: @actions/audit-child-act
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "audit-child-1.yaml");
+    defer cleanupTempFile(testing.allocator, child_path);
+    try ctx.exec(&.{ "workflow", "create", "-f", child_path });
+
+    const parent_def =
+        \\kind: Workflow
+        \\name: audit-parent-1
+        \\version: 1.0.0
+        \\start.run: @workflow/audit-child-1
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "audit-parent-1.yaml");
+    defer cleanupTempFile(testing.allocator, parent_path);
+    try ctx.exec(&.{ "workflow", "create", "-f", parent_path });
+
+    try ctx.exec(&.{ "workflow", "start", "audit-parent-1", "{}", "--run-id", "audit-parent-run-1" });
+
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
+
+    // A child run must now exist under the child workflow's name.
+    var runs = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "audit-child-1" });
+    defer runs.deinit();
+    try stdx.testing.assertSucceeded(runs);
+    try stdx.testing.assertContains(runs, "wfr-"); // pre-fix: "(no runs)"
+}
+
+// Stream triggers must fire under the default multi-shard topology — the trigger
+// is registered on one shard but the stream data lives on another, so it must
+// read the stream-owning shard. Uses three independent (workflow, stream) pairs
+// so the assertion does not depend on a lucky trigger-shard == stream-shard hash
+// collision.
+test "e2e/workflow: stream trigger fires runs under multi-shard topology" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "audit-trig-act" });
+
+    const Pair = struct { wf: []const u8, stream: []const u8, file: []const u8 };
+    const pairs = [_]Pair{
+        .{ .wf = "audit-trig-1", .stream = "audit-stream-1", .file = "audit-trig-1.yaml" },
+        .{ .wf = "audit-trig-2", .stream = "audit-stream-2", .file = "audit-trig-2.yaml" },
+        .{ .wf = "audit-trig-3", .stream = "audit-stream-3", .file = "audit-trig-3.yaml" },
+    };
+
+    inline for (pairs) |p| {
+        const def = "kind: Workflow\n" ++
+            "name: " ++ p.wf ++ "\n" ++
+            "version: 1.0.0\n" ++
+            "trigger.stream: " ++ p.stream ++ "\n" ++
+            "trigger.batchTimeoutMs: 500\n" ++
+            "trigger.batchSize: 1\n" ++
+            "start.run: @actions/audit-trig-act\n" ++
+            "start.transition.success: flo.Completed\n" ++
+            "start.transition.failure: flo.Failed";
+        const path = try writeDottedToTempYaml(testing.allocator, def, p.file);
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+        try ctx.exec(&.{ "stream", "append", p.stream, "{\"e\":1}", "{\"e\":2}" });
+    }
+
+    // Poll interval is batchTimeoutMs (500ms); wait several cycles.
+    @import("stdx").time.sleep(2500 * std.time.ns_per_ms);
+
+    inline for (pairs) |p| {
+        var runs = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", p.wf });
+        defer runs.deinit();
+        try stdx.testing.assertSucceeded(runs);
+        try stdx.testing.assertContains(runs, "wfr-"); // pre-fix: "(no runs)"
+    }
+}
+
+// `idempotency: required` must be enforced — docs: "required: every start must
+// include a key", so a start with no key must be rejected.
+test "e2e/workflow: idempotency required rejects start without key" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "audit-idem-act" });
+
+    const def =
+        \\kind: Workflow
+        \\name: audit-idem
+        \\version: 1.0.0
+        \\idempotency: required
+        \\start.run: @actions/audit-idem-act
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, def, "audit-idem.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // No --idempotency-key supplied.
+    var res = try ctx.cli.run(&.{ "workflow", "start", "audit-idem", "{}" });
+    defer res.deinit();
+    try stdx.testing.assertFailed(res); // pre-fix: start succeeds
+}
+
+// `$.steps.{name}.outcome` must resolve to the step's outcome value (not the
+// literal path string). We drive step 1 to success and inspect the input the
+// engine hands to step 2.
+test "e2e/workflow: steps.outcome resolves in input mapping" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "audit-s1" });
+    try ctx.exec(&.{ "action", "register", "audit-s2" });
+
+    const yaml =
+        \\kind: Workflow
+        \\name: audit-outcome
+        \\version: "1.0.0"
+        \\start:
+        \\  run: "@actions/audit-s1"
+        \\  transitions:
+        \\    success: process
+        \\    failure: flo.Failed
+        \\steps:
+        \\  process:
+        \\    run: "@actions/audit-s2"
+        \\    inputMapping: '{"prev_outcome": "$.steps.start.outcome"}'
+        \\    transitions:
+        \\      success: flo.Completed
+        \\      failure: flo.Failed
+    ;
+    const path = try writeTempYaml(testing.allocator, yaml, "audit-outcome.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    try ctx.exec(&.{ "workflow", "start", "audit-outcome", "{}", "--run-id", "audit-outcome-run-1" });
+
+    // Drive step 1 (audit-s1) to success.
+    var a1 = try ctx.cli.run(&.{ "worker", "await", "audit-s1", "--worker-id", "aw", "--block", "5000" });
+    defer a1.deinit();
+    try stdx.testing.assertSucceeded(a1);
+    const t1 = extractTaskId(a1.stdoutTrimmed()) orelse return error.AssertionFailed;
+    try ctx.exec(&.{ "worker", "complete", t1, "--worker-id", "aw", "--action", "audit-s1", "--result", "{}" });
+
+    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
+
+    // Step 2's input must carry the RESOLVED outcome ("success"), not the path.
+    var a2 = try ctx.cli.run(&.{ "worker", "await", "audit-s2", "--worker-id", "aw", "--block", "5000" });
+    defer a2.deinit();
+    try stdx.testing.assertSucceeded(a2);
+    try stdx.testing.assertNotContains(a2, "$.steps.start.outcome"); // pre-fix: literal path present
+    try stdx.testing.assertContains(a2, "success"); // resolved outcome value
+}
