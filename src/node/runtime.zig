@@ -32,6 +32,8 @@ const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const generateNodeId = @import("../raft/network.zig").generateNodeId;
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
+const TSHandler = @import("../ts/handler.zig").TSHandler;
+const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
@@ -191,6 +193,10 @@ pub const Runtime = struct {
     /// Cross-shard KV handler array — allocated during wirePeerKvHandlers, freed on deinit.
     peer_kv_handlers_slice: ?[]const *KVHandler,
 
+    /// Cross-shard TS / queue handler arrays — allocated during wirePeer*, freed on deinit.
+    peer_ts_handlers_slice: ?[]const *TSHandler,
+    peer_queue_handlers_slice: ?[]const *QueueHandler,
+
     /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
     peer_shards_slice: ?[]*Shard,
 
@@ -215,6 +221,8 @@ pub const Runtime = struct {
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .peer_stream_handlers_slice = null,
             .peer_kv_handlers_slice = null,
+            .peer_ts_handlers_slice = null,
+            .peer_queue_handlers_slice = null,
             .peer_inboxes_slice = null,
             .peer_shards_slice = null,
         };
@@ -278,6 +286,16 @@ pub const Runtime = struct {
         if (self.peer_kv_handlers_slice) |s| {
             self.allocator.free(s);
             self.peer_kv_handlers_slice = null;
+        }
+
+        // Clean up peer TS / queue handler arrays
+        if (self.peer_ts_handlers_slice) |s| {
+            self.allocator.free(s);
+            self.peer_ts_handlers_slice = null;
+        }
+        if (self.peer_queue_handlers_slice) |s| {
+            self.allocator.free(s);
+            self.peer_queue_handlers_slice = null;
         }
 
         // Clean up peer inbox array
@@ -400,8 +418,12 @@ pub const Runtime = struct {
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
         try self.wirePeerStreamHandlers(shards);
 
-        // 2.555 Wire cross-shard KV handler references for processing KV lookups.
+        // 2.555 Wire cross-shard KV handler references for processing KV lookups + sinks.
         try self.wirePeerKvHandlers(shards);
+
+        // 2.556 Wire cross-shard TS / queue handler references for processing sinks.
+        try self.wirePeerTsHandlers(shards);
+        try self.wirePeerQueueHandlers(shards);
 
         // 2.56 Wire cross-shard inbox references for inbox messaging.
         try self.wirePeerInboxes(shards);
@@ -544,7 +566,7 @@ pub const Runtime = struct {
     }
 
     /// Wire cross-shard KV handler references so processing pipelines'
-    /// KV lookup operators can find keys on any shard.
+    /// KV lookup operators and KV sinks can reach keys on any shard.
     fn wirePeerKvHandlers(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
         const handlers = try self.allocator.alloc(*KVHandler, n);
@@ -555,6 +577,36 @@ pub const Runtime = struct {
 
         for (0..n) |i| {
             shards[i].processing_handler.setPeerKvHandlers(handlers);
+        }
+    }
+
+    /// Wire cross-shard TS handler references so TS sinks write to the shard
+    /// that owns the target measurement.
+    fn wirePeerTsHandlers(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const handlers = try self.allocator.alloc(*TSHandler, n);
+        for (0..n) |i| {
+            handlers[i] = shards[i].ts_handler;
+        }
+        self.peer_ts_handlers_slice = handlers;
+
+        for (0..n) |i| {
+            shards[i].processing_handler.setPeerTsHandlers(handlers);
+        }
+    }
+
+    /// Wire cross-shard queue handler references so queue sinks enqueue to the
+    /// shard that owns the target queue.
+    fn wirePeerQueueHandlers(self: *Runtime, shards: []Shard) !void {
+        const n = self.shard_count;
+        const handlers = try self.allocator.alloc(*QueueHandler, n);
+        for (0..n) |i| {
+            handlers[i] = shards[i].queue_handler;
+        }
+        self.peer_queue_handlers_slice = handlers;
+
+        for (0..n) |i| {
+            shards[i].processing_handler.setPeerQueueHandlers(handlers);
         }
     }
 
