@@ -249,6 +249,15 @@ pub const QueueHandler = struct {
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
 
+        // Register the queue with its REAL namespace before applying the entry.
+        // The apply path (queue.applyEntry) re-registers using only the namespace
+        // hash and falls back to the literal "default" string for the namespace;
+        // registering the correct namespace first makes that fallback a no-op
+        // (registerQueue keeps the first writer), so `queue list -n <ns>` works for
+        // non-default namespaces instead of mislabeling every queue as "default".
+        const q_name_hash = router.nameHash(ns_hash, req.key);
+        self.queue.registerQueue(q_name_hash, req.key, req.namespace) catch {};
+
         // Build value: [priority:u32][payload]
         const value_len = 4 + req.value.len;
         var value_buf: [4 + 4096]u8 = undefined;
@@ -307,10 +316,6 @@ pub const QueueHandler = struct {
         _ = self.partition.apply(&entry) catch {
             return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
-
-        // Register the queue name so it appears in queue list
-        const q_name_hash = router.nameHash(ns_hash, req.key);
-        self.queue.registerQueue(q_name_hash, req.key, req.namespace) catch {};
 
         // Register in global metrics registry for dashboard/Prometheus
         if (self.metrics_registry) |mr| {

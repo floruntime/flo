@@ -360,6 +360,7 @@ test "e2e/processing: processing response opcodes are defined" {
 // =============================================================================
 
 const writeDottedToTempYaml = stdx.testing.writeDottedToTempYaml;
+const writeTempYaml = stdx.testing.writeTempYaml;
 const cleanupTempFile = stdx.testing.cleanupTempFile;
 
 /// Extract job ID from "Job submitted: <job_id>" output
@@ -940,16 +941,15 @@ test "e2e/processing: checkpoint persists to internal KV namespace" {
 
 /// Poll `flo ts read` until data appears or timeout.
 /// Returns true if the measurement returned data within the timeout.
-fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: []const u8, timeout_ms: u64) !bool {
+fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: []const u8, field: []const u8, timeout_ms: u64) !bool {
     const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
     const max_attempts = @max(timeout_ms / 100, 1);
 
     for (0..max_attempts) |_| {
         var result = try ctx.cli.run(&.{
-            "ts",       "read",    measurement,
-            "-n",       ns,        "--from",
-            "0",        "--limit", "100",
-            "--output", "json",
+            "ts",     "read",    measurement, "-n",     ns,    "--from",
+            "0",      "--field", field,       "--limit", "100", "--output",
+            "json",
         });
         defer result.deinit();
 
@@ -962,10 +962,9 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
 
     // One final attempt
     var result = try ctx.cli.run(&.{
-        "ts",       "read",    measurement,
-        "-n",       ns,        "--from",
-        "0",        "--limit", "100",
-        "--output", "json",
+        "ts",     "read",    measurement, "-n",     ns,    "--from",
+        "0",      "--field", field,       "--limit", "100", "--output",
+        "json",
     });
     defer result.deinit();
 
@@ -1008,8 +1007,8 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
         return error.NoJobId;
     };
 
-    // Step 3: Wait for the TS sink to write data
-    const found = try readTsBlocking(ctx, "proc_cpu_metrics", "proc_tssink", 5000);
+    // Step 3: Wait for the TS sink to write data (field `cpu` ← cpu_percent)
+    const found = try readTsBlocking(ctx, "proc_cpu_metrics", "proc_tssink", "cpu", 5000);
 
     if (!found) {
         std.debug.print("\n[TIMEOUT] TS sink data did not appear within 5s\n", .{});
@@ -1020,17 +1019,18 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
         return error.PipelineTimeout;
     }
 
-    // Step 4: Verify data via `flo ts read` with tag filter
+    // Step 4: Verify data via `flo ts read` — field `cpu`, tag host=web-01, value 72.5
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_cpu_metrics", "-n",  "proc_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--limit",          "100", "--output",    "json",
+        "ts",     "read", "proc_cpu_metrics", "-n",     "proc_tssink", "--tags", "host=web-01",
+        "--from", "0",    "--field",          "cpu",    "--limit",     "100",    "--output", "json",
     });
     defer read_result.deinit();
 
     try stdx.testing.assertSucceeded(read_result);
-    // JSON output should contain data points (not "(no data)")
+    // JSON output should contain data points (not "(no data)") with the mapped value.
     try testing.expect(!read_result.stdoutContains("(no data)"));
     try testing.expect(read_result.stdoutContains("["));
+    try testing.expect(read_result.stdoutContains("72.5"));
 
     // Step 5: Verify measurement appears in `flo ts list`
     var list_result = try ctx.cli.run(&.{ "ts", "list", "-n", "proc_tssink" });
@@ -1072,8 +1072,8 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
     const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_tsscal" });
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
-    // Wait for data to appear
-    const found = try readTsBlocking(ctx, "proc_temp", "proc_tsscal", 5000);
+    // Wait for data to appear (value_field shorthand stores under the "value" field)
+    const found = try readTsBlocking(ctx, "proc_temp", "proc_tsscal", "value", 5000);
 
     if (!found) {
         std.debug.print("\n[TIMEOUT] TS scalar sink data did not appear within 5s\n", .{});
@@ -1131,8 +1131,8 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
     try ctx.exec(&.{ "stream", "append", "ts-late-input", "{\"host\":\"db-01\",\"load_avg\":3.14}", "-n", "proc_tslate" });
     try ctx.exec(&.{ "stream", "append", "ts-late-input", "{\"host\":\"db-01\",\"load_avg\":2.71}", "-n", "proc_tslate" });
 
-    // Step 3: Wait for TS data to appear
-    const found = try readTsBlocking(ctx, "proc_late_metric", "proc_tslate", 5000);
+    // Step 3: Wait for TS data to appear (field `load` ← load_avg)
+    const found = try readTsBlocking(ctx, "proc_late_metric", "proc_tslate", "load", 5000);
 
     if (!found) {
         std.debug.print("\n[TIMEOUT] Late TS sink data did not appear within 5s\n", .{});
@@ -1142,8 +1142,8 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
 
     // Verify via read
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_late_metric", "-n",  "proc_tslate", "--tags", "host=db-01",
-        "--from", "0",    "--limit",          "100", "--output",    "json",
+        "ts",     "read", "proc_late_metric", "-n",     "proc_tslate", "--tags", "host=db-01",
+        "--from", "0",    "--field",          "load",   "--limit",     "100",    "--output", "json",
     });
     defer read_result.deinit();
 
@@ -1182,8 +1182,8 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
     const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_tsagg" });
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
-    // Wait for data to flow through
-    const found = try readTsBlocking(ctx, "proc_requests", "proc_tsagg", 5000);
+    // Wait for data to flow through (field `rps` ← rps)
+    const found = try readTsBlocking(ctx, "proc_requests", "proc_tsagg", "rps", 5000);
 
     if (!found) {
         std.debug.print("\n[TIMEOUT] TS agg sink data did not appear within 5s\n", .{});
@@ -1191,11 +1191,11 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
         return error.PipelineTimeout;
     }
 
-    // Verify via `flo ts query` with aggregation
+    // Verify via `flo ts query` with aggregation on the `rps` field
     var query_result = try ctx.cli.run(&.{
-        "ts",     "query", "proc_requests", "-n", "proc_tsagg", "--tags", "region=us",
-        "--from", "0",     "--window",      "1h", "--agg",      "sum",    "--output",
-        "json",
+        "ts",     "query", "proc_requests", "-n",  "proc_tsagg", "--tags", "region=us",
+        "--from", "0",     "--field",       "rps", "--window",   "1h",     "--agg", "sum",
+        "--output", "json",
     });
     defer query_result.deinit();
 
@@ -1411,8 +1411,8 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         return error.NoJobId;
     };
 
-    // Step 3: Wait for derived measurement to appear
-    const found = try readTsBlocking(ctx, "derived_temp", "proc_ts2ts", 8000);
+    // Step 3: Wait for derived measurement to appear (value_field → "value")
+    const found = try readTsBlocking(ctx, "derived_temp", "proc_ts2ts", "value", 8000);
 
     if (!found) {
         std.debug.print("\n[TIMEOUT] TS-to-TS pipeline data did not appear within 8s\n", .{});
@@ -2719,4 +2719,290 @@ test "e2e/processing: filter with AND condition — keeps records matching all b
     try testing.expect(!read_result.stdoutContains("refund"));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_and" });
+}
+
+// =============================================================================
+// Doc-contract regression tests
+//
+// Each test below asserts the behavior the docs advertise
+// (https://docs.floruntime.io/orchestration/processing/). They were written from a
+// live audit of the running engine that surfaced a batch of doc-vs-reality bugs
+// (KV/queue sink no-ops, `json:$.` conditions, TS field/tag mapping, flow-style YAML);
+// the bugs are fixed and these lock the behavior in. Do not weaken the assertions.
+// =============================================================================
+
+/// Poll `kv get <key>` until the value is present (not "(nil)") and contains `expected`.
+fn kvGetBlocking(ctx: *stdx.testing.TestContext, key: []const u8, ns: []const u8, expected: []const u8, timeout_ms: u64) !bool {
+    const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
+    const max_attempts = @max(timeout_ms / 100, 1);
+    for (0..max_attempts) |_| {
+        var result = try ctx.cli.run(&.{ "kv", "get", key, "-n", ns });
+        defer result.deinit();
+        if (result.succeeded() and !result.stdoutContains("(nil)") and result.stdoutContains(expected)) return true;
+        @import("stdx").time.sleep(poll_interval_ns);
+    }
+    var result = try ctx.cli.run(&.{ "kv", "get", key, "-n", ns });
+    defer result.deinit();
+    return result.succeeded() and !result.stdoutContains("(nil)") and result.stdoutContains(expected);
+}
+
+/// Poll `queue list` until the named queue appears (queues are auto-created on first enqueue,
+/// so the queue's existence is proof the sink enqueued at least one record).
+fn queueAppearsBlocking(ctx: *stdx.testing.TestContext, queue_name: []const u8, ns: []const u8, timeout_ms: u64) !bool {
+    const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
+    const max_attempts = @max(timeout_ms / 100, 1);
+    for (0..max_attempts) |_| {
+        var result = try ctx.cli.run(&.{ "queue", "list", "-n", ns });
+        defer result.deinit();
+        if (result.succeeded() and result.stdoutContains(queue_name)) return true;
+        @import("stdx").time.sleep(poll_interval_ns);
+    }
+    var result = try ctx.cli.run(&.{ "queue", "list", "-n", ns });
+    defer result.deinit();
+    return result.succeeded() and result.stdoutContains(queue_name);
+}
+
+// Regression: the KV sink used to be a silent no-op.
+// `writeSinkRecordFromStream` (handler.zig) switches only on .stream/.ts; .kv falls
+// into `else => {}`. records_processed increments but nothing is ever written to KV.
+// Docs advertise the KV sink with a full example.
+test "e2e/processing: kv sink writes records to KV" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_bug_kvsink" });
+
+    // keyby sets the record key to the user_id; the KV sink uses key_prefix + ":" + key.
+    try ctx.exec(&.{ "stream", "append", "kvsink-input", "{\"user_id\":\"u1\",\"name\":\"alice\"}", "-n", "proc_bug_kvsink" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-bug-kvsink
+        \\namespace: proc_bug_kvsink
+        \\sources.[0].stream.name: kvsink-input
+        \\operators.[0].type: keyby
+        \\operators.[0].name: by-user
+        \\operators.[0].key_expression: $.user_id
+        \\sinks.[0].kv.namespace: proc_bug_kvsink
+        \\sinks.[0].kv.key_prefix: user
+        \\sinks.[0].kv.write_mode: upsert
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-kvsink.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_bug_kvsink" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Documented behavior: the record is written under key `user:u1`.
+    const found = try kvGetBlocking(ctx, "user:u1", "proc_bug_kvsink", "alice", 6000);
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_kvsink" });
+    try testing.expect(found); // KV sink must persist the record.
+}
+
+// Regression: the queue sink used to be a silent no-op.
+// Docs advertise the Queue sink with a full example.
+test "e2e/processing: queue sink enqueues records" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_bug_qsink" });
+
+    try ctx.exec(&.{ "stream", "append", "qsink-input", "{\"task\":\"do-thing\"}", "-n", "proc_bug_qsink" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-bug-qsink
+        \\namespace: proc_bug_qsink
+        \\sources.[0].stream.name: qsink-input
+        \\sinks.[0].queue.name: bug-task-queue
+        \\sinks.[0].queue.priority: 5
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-qsink.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_bug_qsink" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Documented behavior: the record is enqueued into `bug-task-queue`.
+    const appeared = try queueAppearsBlocking(ctx, "bug-task-queue", "proc_bug_qsink", 6000);
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_qsink" });
+    try testing.expect(appeared); // queue sink must enqueue the record.
+}
+
+// Regression: `json:$.<path>` conditions in `filter` used to match nothing.
+// The doc uses `$.`-prefixed JSONPaths in conditions (e.g. `json:$.latency_ms>5000`),
+// but the condition parser only matches plain paths (`json:amount>100`). With `$.`
+// the filter drops every record.
+test "e2e/processing: filter json:$. condition keeps matching records" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_bug_filt" });
+
+    try ctx.exec(&.{ "stream", "append", "filt-input", "{\"amount\":250}", "-n", "proc_bug_filt" });
+    try ctx.exec(&.{ "stream", "append", "filt-input", "{\"amount\":5}", "-n", "proc_bug_filt" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-bug-filter-dollar
+        \\namespace: proc_bug_filt
+        \\sources.[0].stream.name: filt-input
+        \\operators.[0].type: filter
+        \\operators.[0].name: big-amounts
+        \\operators.[0].condition: json:$.amount>100
+        \\sinks.[0].stream.name: filt-output
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-filter-dollar.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_bug_filt" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Best-effort wait for the matching record to flow through.
+    _ = try readStreamBlocking(ctx, "filt-output", "proc_bug_filt", "\"amount\":250", "6000");
+
+    var read_result = try ctx.cli.run(&.{ "stream", "read", "filt-output", "-n", "proc_bug_filt", "--start", "0-0", "--limit", "20" });
+    defer read_result.deinit();
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_filt" });
+
+    try stdx.testing.assertSucceeded(read_result);
+    // Documented: amount 250 passes the `$.amount>100` filter…
+    try stdx.testing.assertContains(read_result, "\"amount\":250"); // `$.amount>100` keeps the matching record.
+    // …and amount 5 is filtered out.
+    try testing.expect(!read_result.stdoutContains("\"amount\":5"));
+}
+
+// Regression: `json:$.<path>` conditions in `classify` rules used to never set the tag,
+// so tag-routed sinks (`match:`) receive nothing. The doc's routing example uses
+// `json:$.latency_ms>5000`. (Plain-path classify routing works — see the passing
+// non-bug classify tests — so this isolates the `$.` prefix as the cause.)
+test "e2e/processing: classify json:$. routing delivers to matched sink" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_bug_cls" });
+
+    try ctx.exec(&.{ "stream", "append", "cls-input", "{\"level\":\"error\",\"service\":\"api\"}", "-n", "proc_bug_cls" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-bug-classify-dollar
+        \\namespace: proc_bug_cls
+        \\sources.[0].stream.name: cls-input
+        \\operators.[0].type: classify
+        \\operators.[0].name: route
+        \\operators.[0].rules.[0].condition: json:$.level=error
+        \\operators.[0].rules.[0].tag: errors
+        \\sinks.[0].stream.name: cls-main
+        \\sinks.[1].stream.name: cls-errors
+        \\sinks.[1].match.[0]: errors
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-classify-dollar.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_bug_cls" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Sanity: classify never drops, so the unfiltered main sink must always receive the record.
+    const main_found = try readStreamBlocking(ctx, "cls-main", "proc_bug_cls", "error", "6000");
+    // Best-effort wait for the tagged record to reach the errors sink.
+    _ = try readStreamBlocking(ctx, "cls-errors", "proc_bug_cls", "error", "6000");
+
+    var errors_read = try ctx.cli.run(&.{ "stream", "read", "cls-errors", "-n", "proc_bug_cls", "--start", "0-0", "--limit", "20" });
+    defer errors_read.deinit();
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_cls" });
+
+    try testing.expect(main_found); // control: main sink always gets it
+    try stdx.testing.assertSucceeded(errors_read);
+    // Documented: the `$.level=error` rule tags the record `errors`, routing it to the errors sink.
+    try stdx.testing.assertContains(errors_read, "error"); // `$.level=error` tags the record so it reaches the errors sink.
+}
+
+// Regression: the TS sink used to ignore the configured `fields:` map (and tag mapping), writing
+// field literally as "value" with 0.0 when the value can't be extracted. The doc says
+// `fields: { cpu: cpu_percent }` over `{"cpu_percent":72.5}` writes field cpu = 72.5.
+// (The existing "ts sink - JSON records flow" test only checks that *some* data exists;
+// this one asserts the actual mapped value, which is the documented contract.)
+test "e2e/processing: ts sink maps configured field value" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_bug_tssink" });
+
+    try ctx.exec(&.{ "stream", "append", "tssink-input", "{\"hostname\":\"web-01\",\"cpu_percent\":72.5}", "-n", "proc_bug_tssink" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-bug-tssink
+        \\namespace: proc_bug_tssink
+        \\sources.[0].stream.name: tssink-input
+        \\sinks.[0].ts.measurement: bug_cpu
+        \\sinks.[0].ts.tags.host: hostname
+        \\sinks.[0].ts.fields.cpu: cpu_percent
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-tssink.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_bug_tssink" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Wait for the sink to write the `cpu` field point.
+    _ = try readTsBlocking(ctx, "bug_cpu", "proc_bug_tssink", "cpu", 6000);
+
+    var read_result = try ctx.cli.run(&.{
+        "ts",     "read", "bug_cpu", "-n",     "proc_bug_tssink", "--tags", "host=web-01",
+        "--from", "0",    "--field", "cpu",    "--limit",         "100",    "--output", "json",
+    });
+    defer read_result.deinit();
+
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_tssink" });
+
+    try stdx.testing.assertSucceeded(read_result);
+    // Documented: `fields: { cpu: cpu_percent }` writes field `cpu` = 72.5 with tag host=web-01,
+    // not a hardcoded "value"=0.0. Reading field `cpu` with the tag filter must return 72.5.
+    try stdx.testing.assertContains(read_result, "72.5"); // configured field mapping writes the real value.
+}
+
+// Regression: the docs' own minimal examples use YAML flow-style inline maps
+// (`sources: - stream: { name: events }`), but the processing parser only accepts
+// block-style nested mappings — flow style fails with "source is missing stream name".
+// This is the verbatim "Stream to Stream (Passthrough)" example from the docs.
+test "e2e/processing: doc flow-style YAML parses" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Verbatim from https://docs.floruntime.io/orchestration/processing/ ("Pipeline Patterns").
+    const flow_yaml =
+        \\kind: Processing
+        \\name: mirror
+        \\sources:
+        \\  - stream: { name: events }
+        \\sinks:
+        \\  - stream: { name: events-copy }
+        \\
+    ;
+    const path = try writeTempYaml(testing.allocator, flow_yaml, "e2e-bug-flowstyle.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    // `validate processing` runs the same parser the server uses, offline.
+    var result = try ctx.cli.run(&.{ "validate", "processing", "--file", path });
+    defer result.deinit();
+
+    // Documented behavior: this example is valid and should parse.
+    try testing.expect(!result.stdoutContains("missing stream name"));
+    try stdx.testing.assertContains(result, "PASSED"); // flow-style example parses.
 }

@@ -346,16 +346,36 @@ pub const ExprFilterOperator = struct {
         defer parsed.deinit();
 
         const root = parsed.value;
-        if (root != .object) return false;
-
-        const field = root.object.get(expr.path) orelse return false;
+        const field = resolveJsonField(root, expr.path) orelse return false;
 
         return switch (field) {
             .string => |s| evalStringOp(s, expr.op, expr.value),
-            .integer => |n| evalNumericOp(n, expr.op, expr.value),
+            .integer => |n| evalNumericOp(@floatFromInt(n), expr.op, expr.value),
+            .float => |f| evalNumericOp(f, expr.op, expr.value),
             .bool => |b| evalBoolOp(b, expr.op, expr.value),
             else => false,
         };
+    }
+
+    /// Resolve a (possibly dotted, possibly `$.`-prefixed) JSONPath against a parsed value.
+    /// Accepts `$.a.b`, `$a`, and plain `a.b` — mirroring the keyby/map convention so the
+    /// `json:$.field…` syntax used throughout the docs works in filter/classify conditions.
+    fn resolveJsonField(root: std.json.Value, raw_path: []const u8) ?std.json.Value {
+        var path = raw_path;
+        if (std.mem.startsWith(u8, path, "$.")) {
+            path = path[2..];
+        } else if (std.mem.startsWith(u8, path, "$")) {
+            path = path[1..];
+        }
+
+        var current = root;
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |seg| {
+            if (seg.len == 0) continue;
+            if (current != .object) return null;
+            current = current.object.get(seg) orelse return null;
+        }
+        return current;
     }
 
     fn evalStringOp(s: []const u8, op: JsonOp, value: []const u8) bool {
@@ -370,8 +390,8 @@ pub const ExprFilterOperator = struct {
         };
     }
 
-    fn evalNumericOp(n: i64, op: JsonOp, value: []const u8) bool {
-        const expected = std.fmt.parseInt(i64, value, 10) catch return false;
+    fn evalNumericOp(n: f64, op: JsonOp, value: []const u8) bool {
+        const expected = std.fmt.parseFloat(f64, value) catch return false;
         return switch (op) {
             .eq => n == expected,
             .neq => n != expected,
@@ -641,4 +661,29 @@ test "ExprFilterOperator — single condition with OR in value is not compound" 
     var op = ExprFilterOperator.init("not-compound", "value_contains:OR-gate");
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "OR-gate open", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "AND-gate open", 0)));
+}
+
+test "ExprFilterOperator — json:$. JSONPath-prefixed paths resolve (doc syntax)" {
+    // The docs use `$.`-prefixed paths in conditions; they must behave like plain paths.
+    var eq = ExprFilterOperator.init("dollar-eq", "json:$.level=error");
+    try std.testing.expect(eq.evaluate(ProcessingRecord.init("k", "{\"level\":\"error\"}", 0)));
+    try std.testing.expect(!eq.evaluate(ProcessingRecord.init("k", "{\"level\":\"info\"}", 0)));
+
+    // Numeric comparison with `$.` prefix, including float values.
+    var gt = ExprFilterOperator.init("dollar-gt", "json:$.amount>100");
+    try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":250}", 0)));
+    try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":72.5e1}", 0))); // 725.0 float
+    try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":5}", 0)));
+
+    // Nested dotted path under `$.`.
+    var nested = ExprFilterOperator.init("dollar-nested", "json:$.meta.region=us-east");
+    try std.testing.expect(nested.evaluate(ProcessingRecord.init("k", "{\"meta\":{\"region\":\"us-east\"}}", 0)));
+    try std.testing.expect(!nested.evaluate(ProcessingRecord.init("k", "{\"meta\":{\"region\":\"eu-west\"}}", 0)));
+}
+
+test "ExprFilterOperator — plain float numeric comparison" {
+    // Floats must compare numerically (previously `.float` fell through to false).
+    var op = ExprFilterOperator.init("float-gt", "json:latency_ms>5000");
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":6000.5}", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":10.0}", 0)));
 }
