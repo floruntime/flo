@@ -947,8 +947,8 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
 
     for (0..max_attempts) |_| {
         var result = try ctx.cli.run(&.{
-            "ts",     "read",    measurement, "-n",     ns,    "--from",
-            "0",      "--field", field,       "--limit", "100", "--output",
+            "ts",   "read",    measurement, "-n",      ns,    "--from",
+            "0",    "--field", field,       "--limit", "100", "--output",
             "json",
         });
         defer result.deinit();
@@ -962,8 +962,8 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
 
     // One final attempt
     var result = try ctx.cli.run(&.{
-        "ts",     "read",    measurement, "-n",     ns,    "--from",
-        "0",      "--field", field,       "--limit", "100", "--output",
+        "ts",   "read",    measurement, "-n",      ns,    "--from",
+        "0",    "--field", field,       "--limit", "100", "--output",
         "json",
     });
     defer result.deinit();
@@ -1021,8 +1021,9 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
 
     // Step 4: Verify data via `flo ts read` — field `cpu`, tag host=web-01, value 72.5
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_cpu_metrics", "-n",     "proc_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--field",          "cpu",    "--limit",     "100",    "--output", "json",
+        "ts",     "read", "proc_cpu_metrics", "-n",  "proc_tssink", "--tags", "host=web-01",
+        "--from", "0",    "--field",          "cpu", "--limit",     "100",    "--output",
+        "json",
     });
     defer read_result.deinit();
 
@@ -1142,8 +1143,9 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
 
     // Verify via read
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "proc_late_metric", "-n",     "proc_tslate", "--tags", "host=db-01",
-        "--from", "0",    "--field",          "load",   "--limit",     "100",    "--output", "json",
+        "ts",     "read", "proc_late_metric", "-n",   "proc_tslate", "--tags", "host=db-01",
+        "--from", "0",    "--field",          "load", "--limit",     "100",    "--output",
+        "json",
     });
     defer read_result.deinit();
 
@@ -1193,9 +1195,9 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
 
     // Verify via `flo ts query` with aggregation on the `rps` field
     var query_result = try ctx.cli.run(&.{
-        "ts",     "query", "proc_requests", "-n",  "proc_tsagg", "--tags", "region=us",
-        "--from", "0",     "--field",       "rps", "--window",   "1h",     "--agg", "sum",
-        "--output", "json",
+        "ts",     "query",    "proc_requests", "-n",  "proc_tsagg", "--tags", "region=us",
+        "--from", "0",        "--field",       "rps", "--window",   "1h",     "--agg",
+        "sum",    "--output", "json",
     });
     defer query_result.deinit();
 
@@ -2964,8 +2966,9 @@ test "e2e/processing: ts sink maps configured field value" {
     _ = try readTsBlocking(ctx, "bug_cpu", "proc_bug_tssink", "cpu", 6000);
 
     var read_result = try ctx.cli.run(&.{
-        "ts",     "read", "bug_cpu", "-n",     "proc_bug_tssink", "--tags", "host=web-01",
-        "--from", "0",    "--field", "cpu",    "--limit",         "100",    "--output", "json",
+        "ts",     "read", "bug_cpu", "-n",  "proc_bug_tssink", "--tags", "host=web-01",
+        "--from", "0",    "--field", "cpu", "--limit",         "100",    "--output",
+        "json",
     });
     defer read_result.deinit();
 
