@@ -210,6 +210,8 @@ pub const StreamHandler = struct {
                 if (req.key.len > 0) {
                     shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
                     shard.waiter_pool.notify(.stream_group_read, req.key, @import("../node/shard.zig").resolveGroupReadWaiter, @ptrCast(shard));
+                    // Push-wake any workflow stream triggers watching this stream.
+                    shard.notifyStreamTriggers();
                 }
             },
             else => {},

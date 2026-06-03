@@ -56,6 +56,12 @@ const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
 
+/// Cluster-local count of registered stream triggers across all shards on this
+/// node. Lets the (cross-shard) stream-append path skip the trigger push-wake
+/// broadcast entirely when no workflow watches any stream — zero overhead for
+/// deployments that don't use stream triggers.
+var global_stream_trigger_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // WorkflowHandler
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -80,6 +86,13 @@ pub const WorkflowHandler = struct {
     /// Active stream triggers: "namespace:workflow_name" → StreamTriggerState.
     /// Registered when a workflow with a `trigger:` block is created.
     stream_triggers: std.StringHashMap(StreamTriggerState),
+
+    /// Set when a stream this shard watches was just appended to (via a
+    /// `stream_event` inbox notification or a local append). The next
+    /// `tickStreamTriggers` force-polls all triggers, bypassing their poll
+    /// timer — turning a polled (≤ batch_timeout_ms) latency into ~one tick.
+    /// Single-threaded per shard (set/read only on the shard's reactor thread).
+    triggers_dirty: bool = false,
 
     /// Active interval/cron schedules: "namespace:workflow_name" → ScheduleState.
     /// Registered when a workflow with a `schedule:` block is created.
@@ -289,6 +302,7 @@ pub const WorkflowHandler = struct {
         while (tit.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.freeTriggerState(entry.value_ptr);
+            _ = global_stream_trigger_count.fetchSub(1, .monotonic);
         }
         self.stream_triggers.deinit();
 
@@ -2809,6 +2823,13 @@ pub const WorkflowHandler = struct {
 
     // ── Stream Trigger Polling ─────────────────────────────────────────
 
+    /// True if any stream trigger is registered on this node (across all shards).
+    /// Read by the stream-append path to decide whether to push-wake pollers, so
+    /// streams that nobody watches incur zero cross-shard notification overhead.
+    pub fn anyStreamTriggers() bool {
+        return global_stream_trigger_count.load(.monotonic) > 0;
+    }
+
     /// Register a stream trigger for a workflow definition.
     /// Called from handleCreate when the parsed definition has a `trigger:` block.
     fn registerStreamTrigger(
@@ -2819,11 +2840,13 @@ pub const WorkflowHandler = struct {
     ) void {
         const trigger_key = self.makeNsKey(namespace, workflow_name) orelse return;
 
-        // Remove old trigger if re-creating workflow
+        // Remove old trigger if re-creating workflow (count stays balanced —
+        // we decrement here and increment again after the put below).
         if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
             self.freeTriggerState(&state);
+            _ = global_stream_trigger_count.fetchSub(1, .monotonic);
         }
 
         const owned_wf = self.allocator.dupe(u8, workflow_name) catch {
@@ -2866,7 +2889,9 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_stream);
             self.allocator.free(owned_stream_ns);
+            return;
         };
+        _ = global_stream_trigger_count.fetchAdd(1, .monotonic);
     }
 
     /// Remove the stream trigger for a workflow definition.
@@ -2878,6 +2903,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(old.key);
             var state = old.value;
             self.freeTriggerState(&state);
+            _ = global_stream_trigger_count.fetchSub(1, .monotonic);
         }
     }
 
@@ -3074,13 +3100,22 @@ pub const WorkflowHandler = struct {
     pub fn tickStreamTriggers(self: *WorkflowHandler, shard: *Shard) void {
         const now_ms = @import("stdx").time.milliTimestamp();
 
+        // A `stream_event` notification (push-wake) forces an immediate poll of
+        // every trigger this tick, bypassing each trigger's poll-interval timer.
+        // The timer remains as a fallback for events that arrive without a
+        // notification (e.g. appended before the trigger registered).
+        const forced = self.triggers_dirty;
+        self.triggers_dirty = false;
+
         var it = self.stream_triggers.iterator();
         while (it.next()) |entry| {
             const trigger = entry.value_ptr;
 
-            // Enforce poll interval
-            const poll_ms: i64 = @intCast(trigger.poll_interval_ms);
-            if (now_ms - trigger.last_poll_ms < poll_ms) continue;
+            // Enforce poll interval unless a push-wake forced this poll.
+            if (!forced) {
+                const poll_ms: i64 = @intCast(trigger.poll_interval_ms);
+                if (now_ms - trigger.last_poll_ms < poll_ms) continue;
+            }
             trigger.last_poll_ms = now_ms;
 
             // Skip disabled workflows

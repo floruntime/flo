@@ -2951,3 +2951,58 @@ test "e2e/workflow: steps.outcome resolves in input mapping" {
     try stdx.testing.assertNotContains(a2, "$.steps.start.outcome"); // pre-fix: literal path present
     try stdx.testing.assertContains(a2, "success"); // resolved outcome value
 }
+
+// Push-wake: an appended event must start a trigger run well before the periodic
+// poll timer would. batch_timeout_ms is set to 60s and we let each trigger's
+// initial (last_poll_ms=0) poll elapse BEFORE appending — so the only thing that
+// can fire a run within the assert window is the stream-append notification path.
+// Multi-shard so the trigger and the stream's data are (usually) on different
+// shards, exercising the cross-shard `stream_event` broadcast.
+test "e2e/workflow: stream trigger fires promptly via push-wake" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4 },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "push-act" });
+
+    const Pair = struct { wf: []const u8, stream: []const u8, file: []const u8 };
+    const pairs = [_]Pair{
+        .{ .wf = "push-1", .stream = "push-stream-1", .file = "push-1.yaml" },
+        .{ .wf = "push-2", .stream = "push-stream-2", .file = "push-2.yaml" },
+        .{ .wf = "push-3", .stream = "push-stream-3", .file = "push-3.yaml" },
+    };
+
+    inline for (pairs) |p| {
+        const def = "kind: Workflow\n" ++
+            "name: " ++ p.wf ++ "\n" ++
+            "version: 1.0.0\n" ++
+            "trigger.stream: " ++ p.stream ++ "\n" ++
+            "trigger.batchTimeoutMs: 60000\n" ++ // 60s timer — must NOT be what fires the run
+            "trigger.batchSize: 1\n" ++
+            "start.run: @actions/push-act\n" ++
+            "start.transition.success: flo.Completed\n" ++
+            "start.transition.failure: flo.Failed";
+        const path = try writeDottedToTempYaml(testing.allocator, def, p.file);
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+    }
+
+    // Let each trigger's initial (last_poll_ms=0) poll elapse on an empty stream,
+    // so the next timer poll is 60s out. Only push-wake can beat that.
+    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
+
+    inline for (pairs) |p| {
+        try ctx.exec(&.{ "stream", "append", p.stream, "{\"e\":1}" });
+    }
+
+    // Well under the 60s poll timer.
+    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
+
+    inline for (pairs) |p| {
+        var runs = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", p.wf });
+        defer runs.deinit();
+        try stdx.testing.assertSucceeded(runs);
+        try stdx.testing.assertContains(runs, "wfr-"); // fired via push-wake, not the 60s timer
+    }
+}

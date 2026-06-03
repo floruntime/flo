@@ -54,6 +54,9 @@ pub const Tag = enum(u8) {
 
     // ── Actions ──
     action_invoke, // Cross-shard action invocation from workflow handler
+
+    // ── Workflows ──
+    stream_event, // A stream was appended to — wake stream-trigger polling
 };
 
 /// 32-byte compact envelope — payload is slab-allocated separately.
