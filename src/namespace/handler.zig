@@ -49,6 +49,7 @@ const NamespaceConfig = coordinator_mod.NamespaceConfig;
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const router = @import("../node/router.zig");
 
 const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -239,6 +240,19 @@ pub const NamespaceHandler = struct {
     // Updates the local in-memory registry to match the committed state.
 
     /// Apply a Raft-committed namespace creation to the local registry.
+    /// Resolve a namespace name from its `router.namespaceHash`. Linear scan over
+    /// the in-memory registry — fine given the small namespace count, and only used
+    /// on the cold replay path (e.g. re-labeling queues whose entry carries the
+    /// namespace hash but not the string). Returns null if no known namespace matches
+    /// (e.g. the implicit "default" namespace, which is never registered).
+    pub fn nameForHash(self: *const NamespaceHandler, hash: u32) ?[]const u8 {
+        var it = self.namespaces.keyIterator();
+        while (it.next()) |key_ptr| {
+            if (router.namespaceHash(key_ptr.*) == hash) return key_ptr.*;
+        }
+        return null;
+    }
+
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) void {
         if (self.namespaces.contains(name)) return; // idempotent
         const owned = self.allocator.dupe(u8, name) catch return;

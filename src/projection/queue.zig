@@ -159,6 +159,13 @@ pub const QueueProjection = struct {
     /// Stats.
     stats: Stats,
 
+    /// Optional namespace resolver (hash → name), wired at shard init. A
+    /// queue_enqueue entry carries only the namespace hash, so on replay the
+    /// apply path can't recover the namespace string on its own; this lets it
+    /// register the queue under its real namespace instead of "default".
+    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) ?[]const u8 = null,
+    ns_resolver_ctx: ?*anyopaque = null,
+
     pub const QueueMeta = struct {
         name: []const u8,
         namespace: []const u8,
@@ -284,6 +291,15 @@ pub const QueueProjection = struct {
     }
 
     /// Register a queue name so it appears in `list` and stats are tracked per-queue.
+    /// Resolve a namespace hash to its name via the wired resolver, falling back
+    /// to "default" (the implicit namespace, which is never registered).
+    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) []const u8 {
+        if (self.ns_resolver) |resolver| {
+            if (resolver(self.ns_resolver_ctx.?, ns_hash)) |name| return name;
+        }
+        return "default";
+    }
+
     pub fn registerQueue(self: *QueueProjection, queue_name_hash: u64, name: []const u8, namespace: []const u8) !void {
         const gop = try self.known_queues.getOrPut(queue_name_hash);
         if (!gop.found_existing) {
@@ -479,6 +495,7 @@ pub const QueueProjection = struct {
                 var payload: []const u8 = &[_]u8{};
                 var q_name_hash: u64 = 0;
                 var q_name: []const u8 = "";
+                var q_ns_hash: u32 = 0;
                 if (CommandPayload.deserialize(entry.payload)) |cmd| {
                     if (cmd.value.len >= 4) {
                         priority = std.mem.readInt(u32, cmd.value[0..4], .little);
@@ -491,11 +508,15 @@ pub const QueueProjection = struct {
                     }
                     q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
                     q_name = cmd.key;
+                    q_ns_hash = cmd.namespace_hash;
                 }
                 _ = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
-                // Register queue during recovery so list works after restart
+                // Register queue during recovery so list works after restart. The entry
+                // only has the namespace hash; resolve the real namespace string when a
+                // resolver is wired (live enqueues already register the correct namespace
+                // before apply, so this primarily fixes restart/replay labeling).
                 if (q_name.len > 0) {
-                    self.registerQueue(q_name_hash, q_name, "default") catch {};
+                    self.registerQueue(q_name_hash, q_name, self.resolveNamespace(q_ns_hash)) catch {};
                 }
             },
             .queue_ack => {
