@@ -1,0 +1,30 @@
+/* -----------------------------------------------------------------------------
+   Console stylesheet aggregator.
+   Every component/screen keeps its CSS co-located in its own folder for easy
+   tweaking; this file imports them all in cascade order (tokens → atoms →
+   layout → screens). Imported once from main.tsx.
+   --------------------------------------------------------------------------- */
+@import "./tokens.css";
+
+/* component atoms */
+@import "../components/buttons/Button.css";
+@import "../components/inputs/inputs.css";
+@import "../components/feedback/feedback.css";
+@import "../components/layout/layout.css";
+@import "../components/overlay/Modal.css";
+@import "../components/data/data.css";
+
+/* app shell */
+@import "../layout/Shell.css";
+
+/* screens */
+@import "../screens/Overview.css";
+@import "../screens/streams/streams.css";
+@import "../screens/kv/kv.css";
+@import "../screens/workflows/workflows.css";
+@import "../screens/processing/processing.css";
+@import "../screens/compute/compute.css";
+@import "../screens/timeseries/timeseries.css";
+
+/* playground */
+@import "../playground/playground.css";

@@ -135,13 +135,21 @@ pub const WriteBuffer = struct {
 // Series Key — measurement + field name
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Series keys are namespace-scoped: a fixed 4-byte little-endian
+/// `namespace_hash` prefix, then `measurement\x00field_name`. The prefix may
+/// contain 0x00 bytes, so measurement/field parsing always starts at offset
+/// NS_PREFIX (never `indexOfScalar` from offset 0).
+const NS_PREFIX = 4;
+
 const SeriesKey = struct {
+    namespace_hash: u32,
     measurement: []const u8,
     field_name: []const u8,
 };
 
 fn seriesKeyHash(key: SeriesKey) u64 {
     var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&key.namespace_hash));
     hasher.update(key.measurement);
     hasher.update("\x00");
     hasher.update(key.field_name);
@@ -151,10 +159,27 @@ fn seriesKeyHash(key: SeriesKey) u64 {
 fn seriesKeyToString(allocator: Allocator, key: SeriesKey) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
+    var ns_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ns_bytes, key.namespace_hash, .little);
+    try buf.appendSlice(allocator, &ns_bytes);
     try buf.appendSlice(allocator, key.measurement);
     try buf.append(allocator, 0);
     try buf.appendSlice(allocator, key.field_name);
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Namespace hash from a series key's 4-byte prefix.
+fn keyNsHash(key: []const u8) u32 {
+    if (key.len < NS_PREFIX) return 0;
+    return std.mem.readInt(u32, key[0..NS_PREFIX], .little);
+}
+
+/// Measurement name from a series key (the bytes after the prefix, up to \x00).
+fn keyMeasurement(key: []const u8) []const u8 {
+    if (key.len < NS_PREFIX) return key;
+    const rest = key[NS_PREFIX..];
+    const sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    return rest[0..sep];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -223,6 +248,7 @@ pub const TSProjection = struct {
     /// Insert a single data point.
     pub fn insert(
         self: *TSProjection,
+        namespace_hash: u32,
         measurement: []const u8,
         field_name: []const u8,
         value: f64,
@@ -231,6 +257,7 @@ pub const TSProjection = struct {
         tag_hash: u64,
     ) !void {
         const series_str = try seriesKeyToString(self.allocator, .{
+            .namespace_hash = namespace_hash,
             .measurement = measurement,
             .field_name = field_name,
         });
@@ -303,6 +330,7 @@ pub const TSProjection = struct {
     /// Returns points from both the write buffer and flushed blocks.
     pub fn queryRange(
         self: *TSProjection,
+        namespace_hash: u32,
         measurement: []const u8,
         field_name: []const u8,
         min_ts: u64,
@@ -310,6 +338,7 @@ pub const TSProjection = struct {
         point_buf: []StoredPoint,
     ) !QueryResult {
         const series_str = try seriesKeyToString(self.allocator, .{
+            .namespace_hash = namespace_hash,
             .measurement = measurement,
             .field_name = field_name,
         });
@@ -346,9 +375,9 @@ pub const TSProjection = struct {
     // ─── Aggregations ──────────────────────────────────────────────────────
 
     /// Compute the average of points in a range from the write buffer.
-    pub fn avg(self: *TSProjection, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn avg(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(measurement, field_name, min_ts, max_ts, &buf);
+        const result = try self.queryRange(namespace_hash, measurement, field_name, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var acc: f64 = 0;
@@ -359,9 +388,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the min of points in a range from the write buffer.
-    pub fn min(self: *TSProjection, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn min(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(measurement, field_name, min_ts, max_ts, &buf);
+        const result = try self.queryRange(namespace_hash, measurement, field_name, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var min_val: f64 = std.math.floatMax(f64);
@@ -372,9 +401,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the max of points in a range from the write buffer.
-    pub fn max(self: *TSProjection, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn max(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(measurement, field_name, min_ts, max_ts, &buf);
+        const result = try self.queryRange(namespace_hash, measurement, field_name, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var max_val: f64 = -std.math.floatMax(f64);
@@ -385,9 +414,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the sum of points in a range from the write buffer.
-    pub fn sum(self: *TSProjection, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn sum(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !?f64 {
         var point_buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(measurement, field_name, min_ts, max_ts, &point_buf);
+        const result = try self.queryRange(namespace_hash, measurement, field_name, min_ts, max_ts, &point_buf);
         if (result.points_in_buffer == 0) return null;
 
         var total: f64 = 0;
@@ -398,9 +427,9 @@ pub const TSProjection = struct {
     }
 
     /// Count points in a range from the write buffer.
-    pub fn count(self: *TSProjection, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !usize {
+    pub fn count(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, min_ts: u64, max_ts: u64) !usize {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(measurement, field_name, min_ts, max_ts, &buf);
+        const result = try self.queryRange(namespace_hash, measurement, field_name, min_ts, max_ts, &buf);
         return result.points_in_buffer;
     }
 
@@ -416,14 +445,14 @@ pub const TSProjection = struct {
     /// Returns the count of unique names written. Names are borrowed
     /// references into the internal HashMap key storage — valid only
     /// while the projection is not mutated.
-    pub fn scanMeasurementNames(self: *const TSProjection, buf: [][]const u8) usize {
+    pub fn scanMeasurementNames(self: *const TSProjection, namespace_hash: u32, buf: [][]const u8) usize {
         var result_count: usize = 0;
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             if (result_count >= buf.len) break;
             const key = kv.key_ptr.*;
-            const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
-            const meas = key[0..sep];
+            if (keyNsHash(key) != namespace_hash) continue;
+            const meas = keyMeasurement(key);
             // Dedup via linear scan (measurement count is typically small)
             var dup = false;
             for (buf[0..result_count]) |existing| {
@@ -442,18 +471,16 @@ pub const TSProjection = struct {
 
     /// Return unique measurement names from the write buffers.
     /// Caller owns the returned slices and must free them.
-    pub fn listMeasurements(self: *const TSProjection, allocator: Allocator) ![][]const u8 {
-        // Collect unique measurement names from buffer keys ("measurement\x00field")
+    pub fn listMeasurements(self: *const TSProjection, namespace_hash: u32, allocator: Allocator) ![][]const u8 {
+        // Collect unique measurement names from this namespace's buffer keys.
         var seen = std.StringHashMap(void).init(allocator);
         defer seen.deinit();
 
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            // Find the \x00 separator
-            const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
-            const meas = key[0..sep];
-            _ = try seen.getOrPut(meas);
+            if (keyNsHash(key) != namespace_hash) continue;
+            _ = try seen.getOrPut(keyMeasurement(key));
         }
 
         const names = try allocator.alloc([]const u8, seen.count());
@@ -480,21 +507,18 @@ pub const TSProjection = struct {
 
     /// Delete all data for a measurement (all fields).
     /// Returns the number of series removed.
-    pub fn deleteMeasurement(self: *TSProjection, measurement: []const u8) usize {
+    pub fn deleteMeasurement(self: *TSProjection, namespace_hash: u32, measurement: []const u8) usize {
         var removed: usize = 0;
 
-        // Delete matching write buffers
+        // Delete matching write buffers (this namespace + measurement only)
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
-            // Series key format: "measurement\x00field_name"
-            if (std.mem.indexOfScalar(u8, key, 0)) |sep| {
-                if (std.mem.eql(u8, key[0..sep], measurement)) {
-                    kv.value_ptr.deinit();
-                    self.allocator.free(@constCast(key));
-                    self.buffers.removeByPtr(kv.key_ptr);
-                    removed += 1;
-                }
+            if (keyNsHash(key) == namespace_hash and std.mem.eql(u8, keyMeasurement(key), measurement)) {
+                kv.value_ptr.deinit();
+                self.allocator.free(@constCast(key));
+                self.buffers.removeByPtr(kv.key_ptr);
+                removed += 1;
             }
         }
 
@@ -502,12 +526,10 @@ pub const TSProjection = struct {
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (std.mem.indexOfScalar(u8, key, 0)) |sep| {
-                if (std.mem.eql(u8, key[0..sep], measurement)) {
-                    kv.value_ptr.deinit(self.allocator);
-                    self.allocator.free(@constCast(key));
-                    self.blocks.removeByPtr(kv.key_ptr);
-                }
+            if (keyNsHash(key) == namespace_hash and std.mem.eql(u8, keyMeasurement(key), measurement)) {
+                kv.value_ptr.deinit(self.allocator);
+                self.allocator.free(@constCast(key));
+                self.blocks.removeByPtr(kv.key_ptr);
             }
         }
 
@@ -570,6 +592,7 @@ pub const TSProjection = struct {
                     }
                     // Use measurement as both measurement and field for simplified path
                     try self.insert(
+                        cmd.namespace_hash,
                         cmd.key,
                         "value",
                         value,
@@ -845,15 +868,15 @@ test "ts: basic insert and query" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("cpu", "usage", 82.5, 1000, 1, 0);
-    try ts.insert("cpu", "usage", 75.0, 2000, 2, 0);
-    try ts.insert("cpu", "usage", 90.1, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, 0);
+    try ts.insert(0, "cpu", "usage", 90.1, 3000, 3, 0);
 
     try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange("cpu", "usage", 1000, 3000, &buf);
+    const result = try ts.queryRange(0, "cpu", "usage", 1000, 3000, &buf);
     try testing.expectEqual(@as(usize, 3), result.points_in_buffer);
     try testing.expectEqual(@as(f64, 82.5), buf[0].field_value);
 }
@@ -862,13 +885,13 @@ test "ts: range query filters by timestamp" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("mem", "used", 100.0, 1000, 1, 0);
-    try ts.insert("mem", "used", 200.0, 2000, 2, 0);
-    try ts.insert("mem", "used", 300.0, 3000, 3, 0);
-    try ts.insert("mem", "used", 400.0, 4000, 4, 0);
+    try ts.insert(0, "mem", "used", 100.0, 1000, 1, 0);
+    try ts.insert(0, "mem", "used", 200.0, 2000, 2, 0);
+    try ts.insert(0, "mem", "used", 300.0, 3000, 3, 0);
+    try ts.insert(0, "mem", "used", 400.0, 4000, 4, 0);
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange("mem", "used", 2000, 3000, &buf);
+    const result = try ts.queryRange(0, "mem", "used", 2000, 3000, &buf);
     try testing.expectEqual(@as(usize, 2), result.points_in_buffer);
     try testing.expectEqual(@as(f64, 200.0), buf[0].field_value);
     try testing.expectEqual(@as(f64, 300.0), buf[1].field_value);
@@ -878,11 +901,11 @@ test "ts: aggregation — avg" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("cpu", "usage", 80.0, 1000, 1, 0);
-    try ts.insert("cpu", "usage", 90.0, 2000, 2, 0);
-    try ts.insert("cpu", "usage", 100.0, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 90.0, 2000, 2, 0);
+    try ts.insert(0, "cpu", "usage", 100.0, 3000, 3, 0);
 
-    const average = (try ts.avg("cpu", "usage", 1000, 3000)).?;
+    const average = (try ts.avg(0, "cpu", "usage", 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), average, 0.001);
 }
 
@@ -890,17 +913,17 @@ test "ts: aggregation — min/max/sum" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("disk", "iops", 10.0, 1000, 1, 0);
-    try ts.insert("disk", "iops", 50.0, 2000, 2, 0);
-    try ts.insert("disk", "iops", 30.0, 3000, 3, 0);
+    try ts.insert(0, "disk", "iops", 10.0, 1000, 1, 0);
+    try ts.insert(0, "disk", "iops", 50.0, 2000, 2, 0);
+    try ts.insert(0, "disk", "iops", 30.0, 3000, 3, 0);
 
-    const min_val = (try ts.min("disk", "iops", 1000, 3000)).?;
+    const min_val = (try ts.min(0, "disk", "iops", 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 10.0), min_val, 0.001);
 
-    const max_val = (try ts.max("disk", "iops", 1000, 3000)).?;
+    const max_val = (try ts.max(0, "disk", "iops", 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 50.0), max_val, 0.001);
 
-    const sum_val = (try ts.sum("disk", "iops", 1000, 3000)).?;
+    const sum_val = (try ts.sum(0, "disk", "iops", 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), sum_val, 0.001);
 }
 
@@ -908,11 +931,11 @@ test "ts: aggregation — count" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("net", "rx", 1.0, 1000, 1, 0);
-    try ts.insert("net", "rx", 2.0, 2000, 2, 0);
-    try ts.insert("net", "rx", 3.0, 3000, 3, 0);
+    try ts.insert(0, "net", "rx", 1.0, 1000, 1, 0);
+    try ts.insert(0, "net", "rx", 2.0, 2000, 2, 0);
+    try ts.insert(0, "net", "rx", 3.0, 3000, 3, 0);
 
-    const c = try ts.count("net", "rx", 1500, 2500);
+    const c = try ts.count(0, "net", "rx", 1500, 2500);
     try testing.expectEqual(@as(usize, 1), c); // only ts=2000 in range
 }
 
@@ -920,18 +943,18 @@ test "ts: buffer flush creates block" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 3 });
     defer ts.deinit();
 
-    try ts.insert("cpu", "usage", 1.0, 1000, 1, 0);
-    try ts.insert("cpu", "usage", 2.0, 2000, 2, 0);
+    try ts.insert(0, "cpu", "usage", 1.0, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 2.0, 2000, 2, 0);
     try testing.expectEqual(@as(u64, 0), ts.stats.blocks_flushed);
 
     // Third insert triggers flush
-    try ts.insert("cpu", "usage", 3.0, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 3.0, 3000, 3, 0);
     try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
     try testing.expectEqual(@as(usize, 1), ts.totalBlocks());
 
     // Buffer should be cleared after flush
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange("cpu", "usage", 1000, 3000, &buf);
+    const result = try ts.queryRange(0, "cpu", "usage", 1000, 3000, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
     try testing.expectEqual(@as(usize, 1), result.blocks_matched);
 }
@@ -940,9 +963,9 @@ test "ts: multiple series" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("cpu", "usage", 80.0, 1000, 1, 0);
-    try ts.insert("cpu", "idle", 20.0, 1000, 2, 0);
-    try ts.insert("mem", "used", 4096.0, 1000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
+    try ts.insert(0, "cpu", "idle", 20.0, 1000, 2, 0);
+    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, 0);
 
     try testing.expectEqual(@as(usize, 3), ts.seriesCount());
 }
@@ -952,7 +975,7 @@ test "ts: query nonexistent series" {
     defer ts.deinit();
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange("nonexistent", "field", 0, 9999, &buf);
+    const result = try ts.queryRange(0, "nonexistent", "field", 0, 9999, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
     try testing.expectEqual(@as(usize, 0), result.blocks_matched);
 }
@@ -961,7 +984,7 @@ test "ts: memory usage estimate" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert("cpu", "usage", 80.0, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
     try testing.expect(ts.memoryUsage() > 0);
 }
 
@@ -992,12 +1015,12 @@ test "ts: serialize/deserialize round-trip" {
     defer ts.deinit();
 
     // Insert points into different series
-    try ts.insert("cpu", "usage", 82.5, 1000, 1, 0);
-    try ts.insert("cpu", "usage", 75.0, 2000, 2, 0);
-    try ts.insert("mem", "used", 4096.0, 1000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, 0);
+    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, 0);
 
     // Force a flush by filling the buffer (capacity=3)
-    try ts.insert("cpu", "usage", 90.0, 3000, 4, 0);
+    try ts.insert(0, "cpu", "usage", 90.0, 3000, 4, 0);
     try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
 
     // Serialize
@@ -1018,7 +1041,7 @@ test "ts: serialize/deserialize round-trip" {
 
     // Verify mem\0used buffer has 1 point
     var buf: [10]StoredPoint = undefined;
-    const mem_result = try ts2.queryRange("mem", "used", 0, 9999, &buf);
+    const mem_result = try ts2.queryRange(0, "mem", "used", 0, 9999, &buf);
     try testing.expectEqual(@as(usize, 1), mem_result.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 4096.0), buf[0].field_value, 0.001);
 

@@ -13,8 +13,46 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
-const StreamProjection = @import("../../../projection/stream.zig").StreamProjection;
+const stream_mod = @import("../../../projection/stream.zig");
+const StreamProjection = stream_mod.StreamProjection;
 const ns_keys = @import("../../../namespace/handler.zig");
+const router = @import("../../router.zig");
+
+/// Unpack a stream-append batch blob into its individual record payloads, writing
+/// payload slices (into `value`) to `out`. Batch wire format:
+///   `[record_count:u32]( [payload_len:u32][payload][header_count:u16]([klen:u16][k][vlen:u16][v])* )*`
+/// One append may carry N records; the dashboard must surface all of them (a
+/// batch isn't a single record). Returns the number of payloads written.
+fn unpackBatchPayloads(value: []const u8, out: [][]const u8) usize {
+    if (value.len < 4) return 0;
+    const rcount = std.mem.readInt(u32, value[0..4], .little);
+    var pos: usize = 4;
+    var n: usize = 0;
+    var j: u32 = 0;
+    while (j < rcount and n < out.len) : (j += 1) {
+        if (pos + 4 > value.len) break;
+        const plen = std.mem.readInt(u32, value[pos..][0..4], .little);
+        pos += 4;
+        if (pos + plen > value.len) break;
+        out[n] = value[pos .. pos + plen];
+        n += 1;
+        pos += plen;
+        // skip headers
+        if (pos + 2 > value.len) break;
+        const hcount = std.mem.readInt(u16, value[pos..][0..2], .little);
+        pos += 2;
+        var hh: u16 = 0;
+        while (hh < hcount) : (hh += 1) {
+            if (pos + 2 > value.len) return n;
+            const klen = std.mem.readInt(u16, value[pos..][0..2], .little);
+            pos += 2 + klen;
+            if (pos + 2 > value.len) return n;
+            const vlen = std.mem.readInt(u16, value[pos..][0..2], .little);
+            pos += 2 + vlen;
+        }
+    }
+    return n;
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -31,6 +69,39 @@ fn getStreamProjection(ctx: *DashboardContext, idx: usize) ?*StreamProjection {
 
 fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
+}
+
+/// Logical record count for a stream = sum of each append batch's record count
+/// (a batch may carry N records). `sp.streamRecordCount` only counts append
+/// entries, so it under-reports for batched producers. Reads each batch's count
+/// header via the zero-copy UAL read (cheap, no payload copy). Bounded by
+/// `MAX_BATCHES`; beyond that, extrapolates from the sampled prefix.
+fn streamLogicalCount(allocator: Allocator, partition: anytype, sp: *StreamProjection, name_hash: u64) u64 {
+    const batches = sp.streamRecordCount(name_hash);
+    if (batches == 0) return 0;
+    const MAX_BATCHES: usize = 16384;
+    const to_read = @min(batches, MAX_BATCHES);
+    const buf = allocator.alloc(stream_mod.StreamRecord, to_read) catch return batches;
+    defer allocator.free(buf);
+    const n = sp.readStreamAfter(name_hash, stream_mod.StreamID.MIN, null, buf);
+    if (n == 0) return batches;
+    var sum: u64 = 0;
+    for (buf[0..n]) |rec| {
+        var c: u64 = 1;
+        if (partition.ual.read(rec.ual_index)) |entry| {
+            if (entry.commandPayload()) |cmd| {
+                const batch = stream_mod.decodeAppendValue(cmd.value).payload;
+                if (batch.len >= 4) {
+                    const rc = std.mem.readInt(u32, batch[0..4], .little);
+                    if (rc > 0) c = rc;
+                }
+            }
+        }
+        sum += c;
+    }
+    // Extrapolate if the stream has more batches than we sampled.
+    if (batches > n) return sum * batches / n;
+    return sum;
 }
 
 /// GET /streams - List all streams
@@ -124,7 +195,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
 /// GET /streams/:name - Stream detail with partitions and consumer groups
 pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -155,13 +226,15 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     try obj.intField("total_count", total_appends);
     try obj.intField("total_bytes", total_bytes);
 
-    // Partitions — read record count from shard 0's stream projection
+    // Partitions — logical record count (sum of batch sizes) from shard 0.
     {
         var parts_arr = try obj.arrayField("partitions");
         try parts_arr.begin();
-        if (getStreamProjection(ctx, 0)) |sp| {
-            const name_hash = std.hash.Wyhash.hash(0, stream_name);
-            const record_count = sp.streamRecordCount(name_hash);
+        if (getShard(ctx, 0)) |shard| {
+            const partition = shard.defaultPartition();
+            const sp = &partition.stream;
+            const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
+            const record_count = streamLogicalCount(allocator, partition, sp, name_hash);
             if (record_count > 0 or sp.streamCount() > 0) {
                 try parts_arr.next();
                 var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -175,21 +248,31 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
         try parts_arr.end();
     }
 
-    // Consumer groups — aggregated from all shard projections
+    // Consumer groups — only those belonging to THIS stream+namespace. Group keys
+    // are `[ns\0]stream\0group`; filter by the stream's qualified prefix and emit
+    // the bare group name plus its last-delivered position (for the activity bar).
     {
         var groups_arr = try obj.arrayField("consumer_groups");
         try groups_arr.begin();
+        var sp_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch stream_name;
         const n = shardCount(ctx);
         for (0..n) |i| {
             if (getStreamProjection(ctx, i)) |sp| {
                 var git = sp.groups.iterator();
                 while (git.next()) |ge| {
+                    const gkey = ge.key_ptr.*;
+                    if (!std.mem.startsWith(u8, gkey, stream_prefix)) continue;
+                    if (gkey.len <= stream_prefix.len or gkey[stream_prefix.len] != ns_keys.NAMESPACE_SEPARATOR) continue;
+                    const bare_group = gkey[stream_prefix.len + 1 ..];
+                    const grp = ge.value_ptr;
                     try groups_arr.next();
                     var gobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try gobj.begin();
-                    try gobj.stringField("name", ge.key_ptr.*);
-                    try gobj.intField("members", ge.value_ptr.members.count());
-                    try gobj.intField("pending_count", ge.value_ptr.pelCount());
+                    try gobj.stringField("name", bare_group);
+                    try gobj.intField("members", grp.members.count());
+                    try gobj.intField("pending_count", grp.pelCount());
+                    try gobj.intField("last_delivered_ms", @as(i64, @intCast(grp.last_delivered_id.timestamp_ms)));
                     try gobj.end();
                 }
             }
@@ -206,6 +289,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
 /// cursor format: "<timestamp_ms>-<sequence>" — omit for start of stream
 pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = h.parseQueryParam(u32, query_string, "limit") orelse 2000;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     // Parse cursor "ts-seq" into StreamID
     const StreamID = @import("../../../projection/stream.zig").StreamID;
@@ -233,28 +317,66 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
         var msgs_arr = try obj.arrayField("messages");
         try msgs_arr.begin();
 
-        // Read from shard 0's stream projection using StreamRecord
-        if (getStreamProjection(ctx, 0)) |sp| {
-            const name_hash = std.hash.Wyhash.hash(0, stream_name);
-            total_count = sp.streamRecordCount(name_hash);
+        // Read from shard 0's stream projection using StreamRecord, then resolve
+        // each record's payload from the partition's UAL via the wrap-safe
+        // readCopy (the zero-copy read silently skips ring-boundary-wrapping
+        // entries — a data-loss hazard, see getEntry-wrap-unsafe).
+        if (getShard(ctx, 0)) |shard| {
+            const partition = shard.defaultPartition();
+            const sp = &partition.stream;
+            const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
+            total_count = streamLogicalCount(allocator, partition, sp, name_hash);
             const cap: usize = @min(@as(usize, @intCast(limit)), 1000);
 
-            const StreamRecord = @import("../../../projection/stream.zig").StreamRecord;
+            const StreamRecord = stream_mod.StreamRecord;
             const buf = allocator.alloc(StreamRecord, cap) catch null;
             defer if (buf) |b| allocator.free(b);
             if (buf) |b| {
                 const read_count = sp.readStreamAfter(name_hash, start_id, null, b);
-                for (b[0..read_count]) |rec| {
-                    try msgs_arr.next();
-                    var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try mobj.begin();
-                    try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
-                    try mobj.intField("id_seq", @as(i64, @intCast(rec.id.sequence)));
-                    try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
-                    try mobj.intField("size", 0);
-                    try mobj.end();
-                    last_id = rec.id;
-                    msg_count += 1;
+                const cap_u: u64 = @intCast(cap);
+                var payload_buf: [65536]u8 = undefined;
+                var payloads: [256][]const u8 = undefined;
+                outer: for (b[0..read_count]) |rec| {
+                    if (msg_count >= cap_u) break;
+                    // entry → CommandPayload.value → strip partition prefix → batch blob → N record payloads
+                    var pn: usize = 0;
+                    if (partition.ual.readCopy(rec.ual_index, &payload_buf)) |entry| {
+                        if (entry.commandPayload()) |cmd| {
+                            const batch = stream_mod.decodeAppendValue(cmd.value).payload;
+                            pn = unpackBatchPayloads(batch, &payloads);
+                        }
+                    }
+                    if (pn == 0) {
+                        // Couldn't read/parse — still surface the record (id only).
+                        try msgs_arr.next();
+                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                        try mobj.begin();
+                        try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
+                        try mobj.intField("id_seq", @as(i64, @intCast(rec.id.sequence)));
+                        try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
+                        try mobj.intField("size", 0);
+                        try mobj.stringField("payload", "");
+                        try mobj.end();
+                        last_id = rec.id;
+                        msg_count += 1;
+                        continue;
+                    }
+                    for (payloads[0..pn], 0..) |raw, j| {
+                        if (msg_count >= cap_u) break :outer;
+                        const payload = if (std.unicode.utf8ValidateSlice(raw)) raw else "<binary>";
+                        const seq = rec.id.sequence + j;
+                        try msgs_arr.next();
+                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                        try mobj.begin();
+                        try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
+                        try mobj.intField("id_seq", @as(i64, @intCast(seq)));
+                        try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
+                        try mobj.intField("size", @as(i64, @intCast(payload.len)));
+                        try mobj.stringField("payload", payload);
+                        try mobj.end();
+                        last_id = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = seq };
+                        msg_count += 1;
+                    }
                 }
             }
         }

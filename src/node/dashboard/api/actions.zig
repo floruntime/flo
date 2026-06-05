@@ -14,6 +14,7 @@ const Shard = @import("../../shard.zig").Shard;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../../../worker/handler.zig").WorkerHandler;
 const workers = @import("worker.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
 
@@ -21,6 +22,17 @@ fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
     const ptrs = ctx.shard_ptrs orelse return null;
     if (idx >= ptrs.len) return null;
     return @ptrCast(@alignCast(ptrs[idx]));
+}
+
+/// Short-lived loopback client to the node's own protocol port — mutations can't
+/// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
 }
 
 fn shardCount(ctx: *DashboardContext) usize {
@@ -95,8 +107,8 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.stringField("description", "");
                     try obj.intField("version", @as(i64, @intCast(rec.version)));
                     try obj.boolField("enabled", rec.enabled);
-                    try obj.intField("timeout_ms", 30000);
-                    try obj.intField("max_retries", 3);
+                    try obj.intField("timeout_ms", 30000); // not persisted on ActionRecord — see gap log
+                    try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
@@ -155,9 +167,9 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         try obj.stringField("description", "");
         try obj.intField("version", @as(i64, @intCast(rec.version)));
         try obj.boolField("enabled", rec.enabled);
-        try obj.intField("timeout_ms", 30000);
-        try obj.intField("max_retries", 3);
-        try obj.intField("retry_delay_ms", 1000);
+        try obj.intField("timeout_ms", 30000); // not persisted on ActionRecord — see gap log
+        try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
+        try obj.intField("retry_delay_ms", 1000); // not persisted — see gap log
         try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
         try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
 
@@ -436,21 +448,40 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /actions/:name/invoke — Invoke action
+/// POST /actions/:name/invoke?namespace= — Invoke action (loopback write)
+/// Mutations can't be proposed from the dashboard thread, so we issue the real
+/// `action_invoke` over a short-lived loopback client to the node's own protocol
+/// port (same path as the CLI). The async invoke returns a run_id immediately.
 pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
-    _ = ctx;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const input = if (body.len > 0) body else "{}";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.action.invoke(&client, ns_q, name, input, null, null, null) catch
+        return try h.jsonError(allocator, "Action invoke failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    // Response wire format: [run_id_len:u16][run_id][has_output:u8]...
+    var run_id: []const u8 = "";
+    if (resp.asRawData()) |data| {
+        if (data.len >= 2) {
+            const run_id_len = std.mem.readInt(u16, data[0..2], .little);
+            const run_id_end = @as(usize, 2) + run_id_len;
+            if (data.len >= run_id_end and run_id_len > 0) run_id = data[2..run_id_end];
+        }
+    }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("action", name);
-    try obj.stringField("status", "not_wired");
-    try obj.intField("input_size", @as(i64, @intCast(body.len)));
+    try obj.stringField("namespace", ns_q);
+    try obj.stringField("status", "invoked");
+    try obj.stringField("run_id", run_id);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

@@ -1,0 +1,11 @@
+/* calm modal */
+.cm-scrim{position:fixed;inset:0;z-index:200;background:rgba(8,8,7,0.62);backdrop-filter:blur(3px);
+  display:flex;align-items:center;justify-content:center;padding:24px;}
+.cm{max-height:86vh;background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);
+  overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,0.55);}
+.cm-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:17px 20px;border-bottom:1px solid var(--line-soft);}
+.cm-body{padding:18px 20px;overflow-y:auto;background:var(--bg);}
+.cm-foot{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--line-soft);}
+.cm-x{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--r-sm);
+  border:none;background:transparent;color:var(--tx-3);cursor:pointer;flex:none;transition:.14s var(--ease);}
+.cm-x:hover{background:var(--hover);color:var(--tx);}

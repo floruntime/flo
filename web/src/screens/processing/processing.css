@@ -1,0 +1,28 @@
+/* ===== Processing ===== */
+.kvrow2{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--tx-2);}
+.kvrow2:last-child{border-bottom:none;}
+.pop-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;}
+@media(max-width:760px){.pop-grid{grid-template-columns:repeat(2,1fr);}}
+.pop-l{font-size:11.5px;color:var(--tx-3);}
+.ptmpl{width:100%;text-align:left;padding:11px 12px;border-radius:var(--r-sm);border:1px solid transparent;background:transparent;cursor:pointer;transition:.14s var(--ease);}
+.ptmpl:hover{background:var(--hover);}
+.ptmpl.on{border-color:var(--accent-line);background:color-mix(in srgb,var(--accent) 7%,transparent);}
+
+/* topology */
+.ptopo-scroll{overflow-x:auto;padding:6px 2px 4px;}
+.ptopo{display:flex;align-items:center;gap:0;min-width:max-content;}
+.ptopo-col{display:flex;flex-direction:column;gap:10px;}
+.ptopo-node{border:1px solid var(--line);border-radius:var(--r-sm);background:var(--card-2);padding:9px 12px;width:150px;flex:none;}
+.ptopo-node.err{border-color:color-mix(in srgb,var(--crit) 45%,transparent);}
+.ptopo-top{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.ptopo-flag{color:var(--warn);font-size:10px;}
+.ptopo-name{font-size:12.5px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ptopo-sub{font-size:10.5px;color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
+.ptopo-wire{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;width:62px;flex:none;}
+.ptopo-count{font-size:10.5px;color:var(--tx-2);margin-bottom:5px;}
+.ptopo-line{width:100%;height:1.5px;background:var(--line-strong,var(--line));border-radius:2px;}
+.ptopo-line.flow{background:color-mix(in srgb,var(--accent) 35%,var(--line));}
+.ptopo-line.short{width:34px;}
+.ptopo-fan{display:flex;flex-direction:column;gap:8px;}
+.ptopo-fanrow{display:flex;align-items:center;gap:8px;}
+.ptopo-match{font-size:10px;color:var(--tx-faint);white-space:nowrap;min-width:96px;text-align:right;}

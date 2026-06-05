@@ -1,0 +1,14 @@
+/* ===== Time Series ===== */
+.ts-chip{font-family:var(--mono);font-size:12px;padding:5px 11px;border-radius:var(--r-sm);background:var(--card-2);
+  color:var(--tx-3);border:1px solid var(--line);cursor:pointer;transition:.14s var(--ease);white-space:nowrap;}
+.ts-chip:hover{color:var(--tx-2);border-color:var(--line);background:var(--hover);}
+.ts-chip.on{color:var(--tx);border-color:var(--accent-line);background:var(--accent-soft);}
+.ts-query{display:flex;align-items:center;gap:12px;background:var(--card-2);border:1px solid var(--line);
+  border-radius:var(--r);padding:9px 10px 9px 14px;}
+.ts-query code{font-size:13px;line-height:1.5;overflow-x:auto;white-space:nowrap;color:var(--tx-2);}
+.ts-spin{width:13px;height:13px;border-radius:50%;border:2px solid color-mix(in srgb,currentColor 30%,transparent);
+  border-top-color:currentColor;display:inline-block;animation:tsspin .7s linear infinite;}
+@keyframes tsspin{to{transform:rotate(360deg);}}
+.ts-frow{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px;}
+.ts-buf{display:inline-block;width:54px;height:6px;border-radius:3px;background:var(--card-2);border:1px solid var(--line-soft);overflow:hidden;}
+.ts-buf span{display:block;height:100%;background:color-mix(in srgb,var(--accent) 55%,var(--line));}

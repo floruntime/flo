@@ -97,7 +97,7 @@ pub const TSHandler = struct {
     /// (guaranteed — single-threaded shard).
     pub fn localScanMeasurements(
         ctx: *anyopaque,
-        _: []const u8,
+        namespace: []const u8,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
@@ -106,7 +106,7 @@ pub const TSHandler = struct {
         const S = struct {
             threadlocal var name_buf: [1024][]const u8 = undefined;
         };
-        const count = ts.scanMeasurementNames(&S.name_buf);
+        const count = ts.scanMeasurementNames(router.namespaceHash(namespace), &S.name_buf);
         return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 
@@ -190,7 +190,7 @@ pub const TSHandler = struct {
         }
 
         // Insert into local TS projection (full fidelity: field_name + tag_hash)
-        self.ts.insert(measurement, field_name, value, timestamp_ns, ual_index, tag_hash) catch {
+        self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tag_hash) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
         };
 
@@ -229,7 +229,7 @@ pub const TSHandler = struct {
 
         // Query raw points
         var point_buf: [4096]StoredPoint = undefined;
-        const result = self.ts.queryRange(measurement, field_name, from_ns, to_ns, &point_buf) catch {
+        const result = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
 
@@ -271,16 +271,17 @@ pub const TSHandler = struct {
             "avg";
 
         // Dispatch to the appropriate aggregation function
+        const ns_hash = router.namespaceHash(req.namespace);
         const agg_value: ?f64 = if (std.mem.eql(u8, agg_name, "avg"))
-            self.ts.avg(measurement, field_name, from_ns, to_ns) catch null
+            self.ts.avg(ns_hash, measurement, field_name, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "sum"))
-            self.ts.sum(measurement, field_name, from_ns, to_ns) catch null
+            self.ts.sum(ns_hash, measurement, field_name, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "min"))
-            self.ts.min(measurement, field_name, from_ns, to_ns) catch null
+            self.ts.min(ns_hash, measurement, field_name, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "max"))
-            self.ts.max(measurement, field_name, from_ns, to_ns) catch null
+            self.ts.max(ns_hash, measurement, field_name, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "count")) blk: {
-            const c = self.ts.count(measurement, field_name, from_ns, to_ns) catch 0;
+            const c = self.ts.count(ns_hash, measurement, field_name, from_ns, to_ns) catch 0;
             break :blk @as(f64, @floatFromInt(c));
         } else null;
 
@@ -340,7 +341,7 @@ pub const TSHandler = struct {
 
         // 3. Query the TSProjection for raw points
         var point_buf: [4096]StoredPoint = undefined;
-        const qr = self.ts.queryRange(measurement, field_name, from_ns, to_ns, &point_buf) catch {
+        const qr = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
         };
 
@@ -393,9 +394,7 @@ pub const TSHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *TSHandler, req: Request) CommandResult {
-        _ = req;
-
-        const names = self.ts.listMeasurements(self.allocator) catch {
+        const names = self.ts.listMeasurements(router.namespaceHash(req.namespace), self.allocator) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts list failed" } };
         };
         defer {
@@ -417,7 +416,7 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
         }
 
-        const removed = self.ts.deleteMeasurement(req.key);
+        const removed = self.ts.deleteMeasurement(router.namespaceHash(req.namespace), req.key);
         _ = removed;
         return .ok;
     }
@@ -491,6 +490,7 @@ pub const TSHandler = struct {
                 value = @bitCast(std.mem.readInt(u64, cmd.value[0..8], .little));
             }
             self.ts.insert(
+                cmd.namespace_hash,
                 cmd.key,
                 "value",
                 value,

@@ -34,6 +34,10 @@ pub const DashboardContext = struct {
     /// Opaque pointers to Shard structs (set by runtime after shard creation).
     /// Handlers cast via `getShard()` to access projections read-only.
     shard_ptrs: ?[]*anyopaque,
+    /// The node's own protocol listen port. Mutations from the dashboard thread
+    /// are issued as a loopback client request to `127.0.0.1:listen_port`, reusing
+    /// the thread-safe protocol path (the dashboard thread cannot propose directly).
+    listen_port: u16 = 9000,
 
     pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
         return .{
@@ -48,8 +52,11 @@ pub const DashboardContext = struct {
     /// Get uptime in seconds
     pub fn uptimeSeconds(self: *const DashboardContext) u64 {
         const now = @import("stdx").time.milliTimestamp();
-        const diff = now - self.start_time;
-        return if (diff > 0) @intCast(diff) else 0;
+        // start_time is a ms timestamp — convert the diff to seconds (this was
+        // returning milliseconds-as-seconds, making uptime 1000× too large and
+        // rps = commands_total/uptime collapse to 0).
+        const diff_ms = now - self.start_time;
+        return if (diff_ms > 0) @intCast(@divFloor(diff_ms, 1000)) else 0;
     }
 };
 

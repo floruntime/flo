@@ -1,0 +1,26 @@
+/* dot */
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
+
+/* soft pill / tag (no color unless needed) */
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;border-radius:999px;
+  background:var(--card-2);color:var(--tx-2);border:1px solid var(--line);white-space:nowrap;}
+.pill .d{width:5px;height:5px;border-radius:50%;background:var(--tx-3);}
+.pill.ok{color:var(--tx-2);} .pill.ok .d{background:var(--accent);}
+.pill.lag{color:var(--warn);} .pill.lag .d{background:var(--warn);}
+.tag{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:var(--r-sm);background:var(--card-2);color:var(--tx-2);border:1px solid var(--line);}
+
+/* status pill with colored dot (workflows / processing / compute) */
+.wpill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:500;white-space:nowrap;}
+.wpill .wd{width:6px;height:6px;border-radius:50%;flex:none;}
+
+/* operator / kind tag */
+.op-pill{font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:2px 7px;border-radius:5px;white-space:nowrap;}
+
+/* trigger label */
+.wtrig{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--tx-2);text-transform:capitalize;}
+.wtrig svg{color:var(--tx-3);}
+
+/* progress bar */
+.bar{flex:1;height:3px;border-radius:2px;background:var(--line);overflow:hidden;max-width:200px;}
+.bar>span{display:block;height:100%;background:var(--accent);border-radius:2px;}
+.bar.warn>span{background:var(--warn);}

@@ -13,6 +13,7 @@ const DashboardContext = h.DashboardContext;
 const Method = @import("../../../util/http/mod.zig").Method;
 const Shard = @import("../../shard.zig").Shard;
 const TSProjection = @import("../../../projection/ts.zig").TSProjection;
+const router = @import("../../router.zig");
 
 // ── Helpers ──
 
@@ -23,13 +24,28 @@ fn getTSProjection(ctx: *DashboardContext, idx: usize) ?*TSProjection {
     return &shard.defaultPartition().ts;
 }
 
+// TS series keys are `[namespace_hash:4 LE][measurement]\x00[field]` (see
+// projection/ts.zig). The 4-byte prefix may contain 0x00, so always parse the
+// measurement from offset 4.
+fn keyNsHash(key: []const u8) u32 {
+    if (key.len < 4) return 0;
+    return std.mem.readInt(u32, key[0..4], .little);
+}
+fn keyMeasurement(key: []const u8) []const u8 {
+    if (key.len < 4) return key;
+    const rest = key[4..];
+    const sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    return rest[0..sep];
+}
+
 fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
 }
 
 /// GET /timeseries — List all measurements with field counts and stats
 pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns_hash = router.namespaceHash(ns);
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -38,7 +54,7 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // Collect unique measurement names from all shard TS projections
+    // Collect unique measurement names from all shard TS projections (this namespace)
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
@@ -46,18 +62,37 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
     for (0..n) |i| {
         if (getTSProjection(ctx, i)) |ts| {
             var buf: [256][]const u8 = undefined;
-            const count = ts.scanMeasurementNames(&buf);
+            const count = ts.scanMeasurementNames(ns_hash, &buf);
             for (buf[0..count]) |meas_name| {
                 const gop = try seen.getOrPut(meas_name);
-                if (!gop.found_existing) {
-                    try arr.next();
-                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try obj.begin();
-                    try obj.stringField("name", meas_name);
-                    try obj.intField("series_count", ts.seriesCount());
-                    try obj.intField("points", ts.stats.points_inserted);
-                    try obj.end();
+                if (gop.found_existing) continue;
+
+                // Tally per-measurement series (= write buffers, one per
+                // measurement+field) and points across all shards, scoped to
+                // this namespace (key = [ns_hash:4][measurement]\x00[field]).
+                var series_count: usize = 0;
+                var points: u64 = 0;
+                for (0..n) |j| {
+                    if (getTSProjection(ctx, j)) |tsj| {
+                        var it = tsj.buffers.iterator();
+                        while (it.next()) |kv| {
+                            const key = kv.key_ptr.*;
+                            if (keyNsHash(key) == ns_hash and std.mem.eql(u8, keyMeasurement(key), meas_name)) {
+                                series_count += 1;
+                                points += kv.value_ptr.len();
+                            }
+                        }
+                    }
                 }
+
+                try arr.next();
+                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try obj.begin();
+                try obj.stringField("name", meas_name);
+                try obj.intField("series_count", series_count);
+                try obj.intField("field_count", series_count);
+                try obj.intField("points", points);
+                try obj.end();
             }
         }
     }
@@ -68,7 +103,8 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
 
 /// GET /timeseries/:measurement — Measurement detail
 pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns = h.parseQueryParam([]const u8, query_string, "namespace");
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns_hash = router.namespaceHash(ns);
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -77,9 +113,9 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", measurement);
-    try obj.stringField("namespace", ns orelse "default");
+    try obj.stringField("namespace", ns);
 
-    // Collect field names and series count from shard projections
+    // Collect field names and series count for this namespace+measurement.
     var field_set = std.StringHashMap(void).init(allocator);
     defer field_set.deinit();
     var total_series: usize = 0;
@@ -91,14 +127,15 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
             var it = ts.buffers.iterator();
             while (it.next()) |kv| {
                 const key = kv.key_ptr.*;
-                const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
-                const meas = key[0..sep];
+                if (keyNsHash(key) != ns_hash) continue;
+                const meas = keyMeasurement(key);
                 if (std.mem.eql(u8, meas, measurement)) {
                     total_series += 1;
                     total_points += kv.value_ptr.len();
-                    if (sep < key.len) {
-                        const field = key[sep + 1 ..];
-                        try field_set.put(field, {});
+                    // field = bytes after `[ns:4][measurement]\x00`
+                    const field_off = 4 + meas.len + 1;
+                    if (field_off <= key.len) {
+                        try field_set.put(key[field_off..], {});
                     }
                 }
             }
@@ -135,6 +172,7 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
 /// GET /timeseries/:measurement/data — Query data points
 pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const field = h.parseQueryParam([]const u8, query_string, "field") orelse "value";
+    const ns_hash = router.namespaceHash(h.parseQueryParam([]const u8, query_string, "namespace") orelse "default");
     const from_str = h.parseQueryParam([]const u8, query_string, "from");
     const to_str = h.parseQueryParam([]const u8, query_string, "to");
     const window = h.parseQueryParam(u64, query_string, "window") orelse 0;
@@ -170,7 +208,7 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         for (0..n) |i| {
             if (getTSProjection(ctx, i)) |ts| {
                 var point_buf: [1024]StoredPoint = undefined;
-                const result = ts.queryRange(measurement, field, from_ns, to_ns, &point_buf) catch continue;
+                const result = ts.queryRange(ns_hash, measurement, field, from_ns, to_ns, &point_buf) catch continue;
                 if (result.points_in_buffer > 0) {
                     for (point_buf[0..result.points_in_buffer]) |pt| {
                         try series_arr.next();

@@ -1,0 +1,33 @@
+/* field — text input with focus ring */
+.field{display:flex;align-items:center;gap:9px;background:var(--card-2);border:1px solid var(--line);
+  border-radius:var(--r-sm);padding:7px 11px;}
+.field:focus-within{border-color:var(--accent-line);}
+.field input{border:none;outline:none;background:transparent;font:inherit;font-size:13px;color:var(--tx);width:100%;}
+.field input::placeholder{color:var(--tx-faint);}
+
+/* segmented control */
+.seg-group{display:inline-flex;gap:4px;background:var(--card-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:3px;}
+.seg-btn{padding:6px 12px;border-radius:5px;border:none;background:transparent;color:var(--tx-2);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;transition:.14s var(--ease);white-space:nowrap;}
+.seg-btn:hover{color:var(--tx);}
+.seg-btn.on{background:var(--card);color:var(--tx);}
+
+/* checkbox row */
+.kv-check{display:flex;align-items:flex-start;gap:9px;font-size:12.5px;color:var(--tx-2);cursor:pointer;line-height:1.5;}
+.kv-check input{margin-top:2px;accent-color:var(--accent);}
+
+/* textarea (code editor) */
+.kv-editor{width:100%;min-height:140px;resize:vertical;font-family:var(--mono);font-size:12.5px;line-height:1.6;
+  padding:12px 14px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--card-2);color:var(--tx);outline:none;}
+.kv-editor:focus{border-color:var(--accent-line);}
+.kv-editor.err{border-color:color-mix(in srgb,var(--crit) 50%,transparent);}
+.kv-editor::placeholder{color:var(--tx-faint);}
+
+/* native select wrapper */
+.kv-nssel{display:flex;align-items:center;gap:7px;background:var(--card-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:0 10px;height:34px;}
+.kv-nssel select{background:transparent;border:none;outline:none;color:var(--tx);font:inherit;font-size:13px;font-family:var(--mono);cursor:pointer;}
+
+/* toggle switch */
+.wtoggle{display:inline-block;width:28px;height:16px;border-radius:9px;background:var(--line);position:relative;vertical-align:middle;cursor:pointer;}
+.wtoggle.on{background:color-mix(in srgb,var(--accent) 55%,transparent);}
+.wtoggle::after{content:"";position:absolute;top:2px;width:12px;height:12px;border-radius:50%;background:var(--tx);transition:.14s var(--ease);left:2px;}
+.wtoggle.on::after{left:14px;background:var(--accent);}

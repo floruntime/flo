@@ -22,6 +22,7 @@ const Shard = @import("../../shard.zig").Shard;
 const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler;
 const wf_parser = @import("../../../workflow/parser.zig");
 const wf_definition = @import("../../../workflow/definition.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
 
@@ -29,6 +30,17 @@ fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
     const ptrs = ctx.shard_ptrs orelse return null;
     if (idx >= ptrs.len) return null;
     return @ptrCast(@alignCast(ptrs[idx]));
+}
+
+/// Short-lived loopback client to the node's own protocol port — mutations can't
+/// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
 }
 
 fn shardCount(ctx: *DashboardContext) usize {
@@ -50,7 +62,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
     if (std.mem.eql(u8, path, "/runs")) {
         return switch (method) {
             .GET => listRuns(allocator, query_string, ctx),
-            .POST => startRun(allocator, body, ctx),
+            .POST => startRun(allocator, query_string, body, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
     }
@@ -60,11 +72,11 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         const rest = path["/definitions/".len..];
         if (std.mem.endsWith(u8, rest, "/enable")) {
             const name = rest[0 .. rest.len - "/enable".len];
-            return enableWorkflow(allocator, name, ctx);
+            return enableWorkflow(allocator, name, query_string, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/disable")) {
             const name = rest[0 .. rest.len - "/disable".len];
-            return disableWorkflow(allocator, name, ctx);
+            return disableWorkflow(allocator, name, query_string, ctx);
         }
         // /workflow/definitions/:name
         return getDefinition(allocator, rest, ctx);
@@ -83,7 +95,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         }
         // DELETE /workflow/runs/:id or GET /workflow/runs/:id
         return switch (method) {
-            .DELETE => cancelRun(allocator, rest, ctx),
+            .DELETE => cancelRun(allocator, rest, query_string, ctx),
             .GET => getRunStatus(allocator, rest, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
@@ -239,34 +251,50 @@ fn getDefinition(allocator: Allocator, name: []const u8, ctx: *DashboardContext)
     return try json_aw.toOwnedSlice();
 }
 
-fn enableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// PUT /workflow/definitions/:name/enable?namespace=&version= (loopback write)
+fn enableWorkflow(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const version = h.parseQueryParam([]const u8, query_string, "version");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.enable(&client, ns_q, name, version) catch
+        return try h.jsonError(allocator, "Enable failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("name", name);
     try obj.boolField("enabled", true);
-    try obj.stringField("status", "not_wired");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-fn disableWorkflow(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// PUT /workflow/definitions/:name/disable?namespace=&version= (loopback write)
+fn disableWorkflow(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const version = h.parseQueryParam([]const u8, query_string, "version");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.disable(&client, ns_q, name, version) catch
+        return try h.jsonError(allocator, "Disable failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("name", name);
     try obj.boolField("enabled", false);
-    try obj.stringField("status", "not_wired");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -442,19 +470,34 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     return try json_aw.toOwnedSlice();
 }
 
-fn startRun(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// POST /workflow/runs?namespace=&workflow=&version= (loopback write). The request
+/// body is the input JSON; workflow name + version come from the query string (so
+/// the dashboard thread doesn't have to parse JSON). Response carries the run_id.
+fn startRun(allocator: Allocator, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const workflow = h.parseQueryParam([]const u8, query_string, "workflow") orelse
+        return try h.jsonError(allocator, "Missing ?workflow=");
+    const version = h.parseQueryParam([]const u8, query_string, "version") orelse "latest";
+    const input = if (body.len > 0) body else "{}";
 
-    if (body.len == 0) return try h.jsonError(allocator, "Empty run request body");
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.start(&client, ns_q, workflow, version, input, null, null) catch
+        return try h.jsonError(allocator, "Workflow start failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    const run_id = resp.asRawData() orelse "";
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
-    try obj.stringField("status", "not_wired");
-    try obj.intField("body_size", @as(i64, @intCast(body.len)));
+    try obj.boolField("ok", true);
+    try obj.stringField("run_id", run_id);
+    try obj.stringField("workflow", workflow);
+    try obj.stringField("status", "started");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -633,17 +676,26 @@ fn getRunHistory(allocator: Allocator, run_id: []const u8, ctx: *DashboardContex
     return try json_aw.toOwnedSlice();
 }
 
-fn cancelRun(allocator: Allocator, run_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// DELETE /workflow/runs/:id?namespace=&reason= (loopback write)
+fn cancelRun(allocator: Allocator, run_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const reason = h.parseQueryParam([]const u8, query_string, "reason");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.cancel(&client, ns_q, run_id, reason) catch
+        return try h.jsonError(allocator, "Cancel failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("run_id", run_id);
-    try obj.stringField("status", "not_wired");
+    try obj.stringField("status", "cancelled");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -930,13 +982,15 @@ test "handleWorkflowRequest get definition detail" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"my-workflow\"") != null);
 }
 
-test "handleWorkflowRequest cancel run" {
+test "handleWorkflowRequest cancel run surfaces loopback failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
+    // cancel is now a real loopback write; with no node listening it must fail
+    // gracefully with an error envelope rather than the old stub success.
     const result = try handleWorkflowRequest(allocator, .DELETE, "/runs/run-123", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"run_id\":\"run-123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }

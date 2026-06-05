@@ -18,6 +18,7 @@ const KVProjection = @import("../../../projection/kv.zig").KVProjection;
 const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler;
 const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
+const ns_keys = @import("../../../namespace/handler.zig");
 
 // ── Helpers ──
 
@@ -464,16 +465,29 @@ fn countQueuesInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
 }
 
 fn countKVInNamespace(ctx: *DashboardContext, namespace: []const u8) u64 {
-    ctx.metrics.mutex.lock();
-    defer ctx.metrics.mutex.unlock();
+    // Scan the KV projection per namespace (the metrics key_count counter is not
+    // updated on write, so it under-reports). Mirrors api/kv.zig getKVKeys filtering.
+    var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
 
-    var it = ctx.metrics.kv_namespaces.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.namespace, namespace)) {
-            return entry.value_ptr.metrics.key_count.load(.monotonic);
+    var count: u64 = 0;
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getKVProjection(ctx, i)) |kv| {
+            var it = kv.map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.tombstone) continue;
+                const key = entry.key_ptr.*;
+                if (ns_prefix.len == 0) {
+                    if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
+                } else {
+                    if (!std.mem.startsWith(u8, key, ns_prefix)) continue;
+                }
+                count += 1;
+            }
         }
     }
-    return 0;
+    return count;
 }
 
 fn countWorkflowsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {

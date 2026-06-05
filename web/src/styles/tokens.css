@@ -1,0 +1,54 @@
+/* =============================================================================
+   Flo Console — design tokens + base
+   "calm" theme · near-monochrome warm-dark · one restrained sage accent ·
+   minimal icons · flat borderless surfaces · soft type. Steel/Claude-app lineage.
+   ============================================================================= */
+@font-face { font-family:"Collier"; src:url("/fonts/Collier-Light.otf") format("opentype"); font-weight:300; font-display:swap; }
+@font-face { font-family:"Collier"; src:url("/fonts/Collier-Regular.otf") format("opentype"); font-weight:400; font-display:swap; }
+@font-face { font-family:"Collier"; src:url("/fonts/Collier-Book.otf") format("opentype"); font-weight:450; font-display:swap; }
+@font-face { font-family:"Collier"; src:url("/fonts/Collier-Semibold.otf") format("opentype"); font-weight:600; font-display:swap; }
+
+:root{
+  --bg:#121210;
+  --panel:#171715;
+  --card:#1a1a18;
+  --card-2:#1f1f1c;
+  --hover:#222220;
+  --line:#262521;
+  --line-soft:#1e1d1a;
+  --tx:#ECE9E3;
+  --tx-2:#A3A097;
+  --tx-3:#6F6D65;
+  --tx-faint:#4C4A44;
+  --accent:#7FAA8A;          /* muted sage — primary accent */
+  --accent-soft:rgba(127,170,138,0.13);
+  --accent-line:rgba(127,170,138,0.34);
+  --warn:#C9A26B;            /* desaturated amber */
+  --crit:#C98787;            /* desaturated rose */
+  --info:#6F9BD1;            /* soft blue */
+  /* curated category palette — Steel-style: tasteful muted accents on small marks only */
+  --cat-1:#7FAA8A;  --cat-2:#6F9BD1;  --cat-3:#B58BC9;
+  --cat-4:#C9A26B;  --cat-5:#C98787;  --cat-6:#5FB0A6;
+  --font:"Inter",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,monospace;
+  --serif:"Collier",Georgia,serif;
+  --r:8px; --r-sm:5px; --r-lg:12px;
+  --ease:cubic-bezier(0.32,0.72,0,1);
+}
+
+*{box-sizing:border-box;}
+html,body,#root{height:100%;}
+body{margin:0;font-family:var(--font);background:var(--bg);color:var(--tx);
+  -webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5;}
+a{color:inherit;}
+.mono{font-family:var(--mono);font-feature-settings:"tnum" 1;letter-spacing:-0.01em;}
+.tnum{font-feature-settings:"tnum" 1;}
+::selection{background:var(--accent-soft);}
+*::-webkit-scrollbar{width:9px;height:9px;}
+*::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px;border:2px solid transparent;background-clip:content-box;}
+*::-webkit-scrollbar-track{background:transparent;}
+
+.fade{animation:fade .4s var(--ease) both;}
+@keyframes fade{from{transform:translateY(6px);}to{transform:none;}}
+
+@media(prefers-reduced-motion:reduce){.fade{animation:none;}.ts-spin{animation:none;}}

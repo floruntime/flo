@@ -157,7 +157,7 @@ fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_stri
         const dlq_rest = sub["dlq/".len..];
         if (std.mem.endsWith(u8, dlq_rest, "/requeue")) {
             const seq_str = dlq_rest[0 .. dlq_rest.len - "/requeue".len];
-            return queues.requeueDLQEntry(allocator, name, seq_str, ctx);
+            return queues.requeueDLQEntry(allocator, name, seq_str, query_string, ctx);
         }
         // DELETE /dlq/:seq
         if (method == .DELETE) return queues.deleteDLQEntry(allocator, name, dlq_rest, ctx);

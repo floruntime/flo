@@ -17,6 +17,7 @@ const DashboardContext = h.DashboardContext;
 const Method = @import("../../../util/http/mod.zig").Method;
 const Shard = @import("../../shard.zig").Shard;
 const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
+const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
 
@@ -24,6 +25,17 @@ fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
     const ptrs = ctx.shard_ptrs orelse return null;
     if (idx >= ptrs.len) return null;
     return @ptrCast(@alignCast(ptrs[idx]));
+}
+
+/// Short-lived loopback client to the node's own protocol port — mutations can't
+/// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
 }
 
 fn shardCount(ctx: *DashboardContext) usize {
@@ -36,7 +48,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
     if (std.mem.eql(u8, path, "/jobs")) {
         return switch (method) {
             .GET => listJobs(allocator, query_string, ctx),
-            .POST => submitJob(allocator, body, ctx),
+            .POST => submitJob(allocator, body, query_string, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
     }
@@ -46,7 +58,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         const rest = path["/jobs/".len..];
         if (std.mem.endsWith(u8, rest, "/stop")) {
             const job_id = rest[0 .. rest.len - "/stop".len];
-            return stopJob(allocator, job_id, ctx);
+            return stopJob(allocator, job_id, query_string, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/savepoint")) {
             const job_id = rest[0 .. rest.len - "/savepoint".len];
@@ -62,7 +74,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         }
         // DELETE /processing/jobs/:id or GET /processing/jobs/:id
         return switch (method) {
-            .DELETE => cancelJob(allocator, rest, ctx),
+            .DELETE => cancelJob(allocator, rest, query_string, ctx),
             .GET => getJobDetail(allocator, rest, query_string, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
@@ -118,12 +130,56 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
 
 fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = query_string;
-    _ = ctx;
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
 
+    // Find the real job across shards (mirror listJobs). Each job hashes to one
+    // shard, but scan all to be safe.
+    const n = shardCount(ctx);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const shard = getShard(ctx, i) orelse continue;
+        const job = shard.processing_handler.jobs.getPtr(job_id) orelse continue;
+
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("job_id", job.job_id_owned);
+        try obj.stringField("name", job.name_owned);
+        try obj.stringField("namespace", job.namespace_owned);
+        try obj.stringField("status", job.status.toString());
+        try obj.intField("parallelism", @as(i64, @intCast(job.parallelism)));
+        try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
+        try obj.intField("created_at", job.created_at_ms);
+        try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
+        // Full pipeline definition — the frontend parses this for the source/
+        // operator/sink DAG.
+        try obj.stringField("yaml", job.yaml_owned);
+
+        // Savepoints for this job (from the same shard's savepoint store).
+        {
+            var sp_arr = try obj.arrayField("savepoints");
+            try sp_arr.begin();
+            var sit = shard.processing_handler.savepoints.iterator();
+            while (sit.next()) |se| {
+                const sp = se.value_ptr;
+                if (!std.mem.eql(u8, sp.job_id_owned, job_id)) continue;
+                try sp_arr.next();
+                var sobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try sobj.begin();
+                try sobj.stringField("savepoint_id", sp.savepoint_id_owned);
+                try sobj.intField("created_at", sp.created_at_ms);
+                try sobj.intField("records_at_savepoint", @as(i64, @intCast(sp.records_at_savepoint)));
+                try sobj.end();
+            }
+            try sp_arr.end();
+        }
+        try obj.end();
+        return try json_aw.toOwnedSlice();
+    }
+
+    // Not found — keep a minimal stub (job_id echoed) so callers can detect it.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("job_id", job_id);
@@ -133,30 +189,47 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
     return try json_aw.toOwnedSlice();
 }
 
-fn submitJob(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-
+/// POST /processing/jobs?namespace= — submit a job (loopback write). Body is the
+/// pipeline YAML; the response's raw data is the new job_id.
+fn submitJob(allocator: Allocator, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     if (body.len == 0) return try h.jsonError(allocator, "Empty job definition");
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.processing.submit(&client, ns_q, body) catch
+        return try h.jsonError(allocator, "Job submit failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    const job_id = resp.asRawData() orelse "";
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
-    try obj.stringField("status", "not_wired");
-    try obj.intField("body_size", @as(i64, @intCast(body.len)));
+    try obj.boolField("ok", true);
+    try obj.stringField("job_id", job_id);
+    try obj.stringField("status", "RUNNING");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-fn stopJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// PUT /processing/jobs/:id/stop?namespace= — graceful stop (loopback write).
+fn stopJob(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.processing.stop(&client, ns_q, job_id) catch
+        return try h.jsonError(allocator, "Job stop failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
@@ -166,13 +239,20 @@ fn stopJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]
     return try json_aw.toOwnedSlice();
 }
 
-fn cancelJob(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// DELETE /processing/jobs/:id?namespace= — force cancel (loopback write).
+fn cancelJob(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.processing.cancel(&client, ns_q, job_id) catch
+        return try h.jsonError(allocator, "Job cancel failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
@@ -261,19 +341,20 @@ test "handleProcessingRequest job detail" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"job_id\":\"job-456\"") != null);
 }
 
-test "handleProcessingRequest cancel job" {
+test "handleProcessingRequest cancel job surfaces loopback failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
+    // cancel is now a real loopback write; with no node listening it must fail
+    // gracefully with an error envelope rather than the old stub success.
     const result = try handleProcessingRequest(allocator, .DELETE, "/jobs/job-789", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"state\":\"CANCELLED\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }
 
-test "handleProcessingRequest stop job" {
+test "handleProcessingRequest stop job surfaces loopback failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
@@ -281,6 +362,5 @@ test "handleProcessingRequest stop job" {
 
     const result = try handleProcessingRequest(allocator, .PUT, "/jobs/job-789/stop", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"state\":\"STOPPED\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }
