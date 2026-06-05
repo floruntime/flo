@@ -15,12 +15,14 @@ build:
 build.release:
     script:
         echo "Building zflo (release)..."
+        bash scripts/build-dashboard.sh
         zig build -Drelease=true
 
 ## Build for production deployment
 build.prod:
     arg: <target> [string?] "Target (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos)"
     script:
+        bash scripts/build-dashboard.sh
         let build_target = {{target}}
         @if [ -z "{{build_target}}" ]; then
             echo "Building for production (native)..."
@@ -31,15 +33,10 @@ build.prod:
         fi
 
 
+## Build the web dashboard and embed it into the binary's dashboard assets
 build.dashboard:
     script:
-        echo "Building web dashboard..."
-        cd web && npm install && npm run build
-        echo "Copying dashboard assets to src/node/dashboard/dist/..."
-        rm -rf src/node/dashboard/dist
-        mkdir -p src/node/dashboard/dist
-        cp -r web/dist/* src/node/dashboard/dist/
-        echo "✓ Dashboard build complete"
+        bash scripts/build-dashboard.sh
 
 ## Clean build artifacts
 clean:
@@ -341,10 +338,13 @@ release:
         echo "Step 1: Cleaning..."
         rm -rf zig-out zig-cache .zig-cache
         echo ""
-        echo "Step 2: Running tests..."
+        echo "Step 2: Building dashboard (embeds Console v2)..."
+        bash scripts/build-dashboard.sh
+        echo ""
+        echo "Step 3: Running tests..."
         zig build test --summary all
         echo ""
-        echo "Step 3: Building release..."
+        echo "Step 4: Building release..."
         let build_target = {{target}}
         @if [ -z "{{build_target}}" ]; then
             zig build --release=fast
@@ -363,7 +363,10 @@ ci:
         echo "Step 1: Testing..."
         zig build test --summary all
         echo ""
-        echo "Step 2: Building release..."
+        echo "Step 2: Building dashboard (embeds Console v2)..."
+        bash scripts/build-dashboard.sh
+        echo ""
+        echo "Step 3: Building release..."
         zig build -Drelease
         echo ""
         echo "Step 3: Quick benchmarks..."
