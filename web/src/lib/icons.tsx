@@ -57,6 +57,19 @@ export const PHI: Record<string, string> = {
   drives: 'M3.5 6.5h17v4h-17z|M3.5 13.5h17v4h-17z|M7 8.5h.01|M7 15.5h.01',
 }
 
+/* ---- Header / command-palette glyph paths (reusable `d` strings) ---- */
+export const SEARCH_PATH = 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z|M20.5 20.5L16.6 16.6'
+export const BOOK_PATH = 'M12 6.6C10.4 5.5 7.8 5 4 5v13c3.8 0 6.4.5 8 1.5 1.6-1 4.2-1.5 8-1.5V5c-3.8 0-6.4.5-8 1.6z|M12 6.6V20'
+export const TERMINAL_PATH = 'M5 7l4 4-4 4|M12 16h7'
+export const CUBE_PATH = 'M12 2.5l8 4.5v9l-8 4.5-8-4.5v-9z|M12 12l8-4.5M12 12v9.5M12 12L4 7.5'
+
+export const SearchIcon = ({ size = 15 }: { size?: number }) => (
+  <Icon paths={SEARCH_PATH} size={size} strokeWidth={1.6} />
+)
+export const BookIcon = ({ size = 18 }: { size?: number }) => (
+  <Icon paths={BOOK_PATH} size={size} strokeWidth={1.6} />
+)
+
 /* ---- Common small icons ---- */
 export const TrashIcon = ({ size = 15 }: { size?: number }) => (
   <Icon paths="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" size={size} strokeWidth={1.6} />

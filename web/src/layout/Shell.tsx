@@ -1,38 +1,16 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { NavLink } from 'react-router-dom'
 import { NAMESPACES, useNamespace } from '@/lib/namespace'
 import { useNamespaces, useClusterStats } from '@/lib/api/hooks'
-import { Icon, NAV_ICONS, CheckIcon, ChevronVIcon, CubeIcon, PlusIcon } from '@/lib/icons'
+import { Icon, NAV_ICONS, CheckIcon, ChevronVIcon, CubeIcon, PlusIcon, SearchIcon, BookIcon } from '@/lib/icons'
 import { Dot } from '@/components/feedback'
 import { Logo } from '@/components/brand/Logo'
+import { CommandPalette, DOCS_URL } from './CommandPalette'
+import { NAV } from './nav'
+import type { NavRow } from './nav'
 import { cx } from '@/lib/cx'
 import './Shell.css'
-
-type NavRow = { label: string; to?: string; tail?: string; id: string }
-type NavGroup = { grp: string; rows: NavRow[] }
-
-const NAV: NavGroup[] = [
-  { grp: 'Observe', rows: [{ label: 'Overview', to: '/', id: 'overview' }] },
-  {
-    grp: 'Data layer',
-    rows: [
-      { label: 'Streams', to: '/streams', id: 'streams' },
-      { label: 'KV Store', to: '/kv', tail: '4', id: 'kv' },
-      { label: 'Queues', to: '/queues', tail: '8', id: 'queues' },
-      { label: 'Time Series', to: '/timeseries', id: 'ts' },
-    ],
-  },
-  {
-    grp: 'Compute',
-    rows: [
-      { label: 'Actions', to: '/actions', id: 'actions' },
-      { label: 'Workers', to: '/workers', id: 'workers' },
-      { label: 'Processing', to: '/processing', id: 'processing' },
-      { label: 'Workflows', to: '/workflows', id: 'workflows' },
-    ],
-  },
-]
 
 function NamespaceSwitcher() {
   const { ns, setNs } = useNamespace()
@@ -103,6 +81,20 @@ export function Shell({ children }: { children: ReactNode }) {
   const nodes = stats?.nodes ?? []
   const healthy = nodes.filter((n) => n.status === 'healthy').length
   const allOk = nodes.length > 0 && healthy === nodes.length
+  const [cmdkOpen, setCmdkOpen] = useState(false)
+
+  // ⌘K / Ctrl-K toggles the command palette anywhere in the console.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        setCmdkOpen((o) => !o)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   return (
     <div className="app">
       <header className="hdr">
@@ -112,14 +104,21 @@ export function Shell({ children }: { children: ReactNode }) {
           <NamespaceSwitcher />
         </div>
         <div className="hdr-r">
-          <span className="lnk">Search</span>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, color: 'var(--tx-2)' }}>
+          <button className="cmdk-trigger" onClick={() => setCmdkOpen(true)}>
+            <SearchIcon />
+            <span>Search or jump to…</span>
+            <span className="kbd">⌘K</span>
+          </button>
+          <span className="health-pill">
             <Dot color={allOk ? 'var(--accent)' : 'var(--warn)'} />
             {nodes.length ? `${healthy} / ${nodes.length} node${nodes.length > 1 ? 's' : ''} healthy` : 'connecting…'}
           </span>
-          <span className="lnk">Docs</span>
+          <a className="icon-btn" href={DOCS_URL} target="_blank" rel="noopener noreferrer" title="Docs" aria-label="Docs">
+            <BookIcon />
+          </a>
         </div>
       </header>
+      <CommandPalette open={cmdkOpen} onClose={() => setCmdkOpen(false)} />
       <div className="body">
         <nav className="side">
           {NAV.map((s) => (

@@ -41,22 +41,26 @@ pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     try obj.intField("bytes_sent", server_metrics.bytes_sent);
     try obj.intField("subscriptions", server_metrics.subscriptions);
 
+    // A node's dashboard only observes itself (no cluster-membership view here),
+    // so we report one node: this live process, with real host telemetry. The
+    // shard count is surfaced separately via `num_shards`.
+    const usage = ctx.host.sample();
+
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host_name = std.posix.gethostname(&host_buf) catch "node-0";
+
     var nodes_arr = try obj.arrayField("nodes");
     try nodes_arr.begin();
-
-    for (0..num_shards) |i| {
-        try nodes_arr.next();
-        var node_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-        try node_obj.begin();
-
-        var id_buf: [32]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "shard-{d}", .{i}) catch "shard-?";
-        try node_obj.stringField("id", id_str);
-        try node_obj.stringField("status", "healthy");
-        try node_obj.stringField("role", "active");
-        try node_obj.end();
-    }
-
+    try nodes_arr.next();
+    var node_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try node_obj.begin();
+    try node_obj.stringField("id", host_name);
+    try node_obj.stringField("status", "healthy");
+    try node_obj.stringField("role", "active");
+    try node_obj.intField("cpu", usage.cpu);
+    try node_obj.intField("mem", usage.mem);
+    try node_obj.intField("io", usage.io);
+    try node_obj.end();
     try nodes_arr.end();
     try obj.end();
 
@@ -125,8 +129,10 @@ test "getClusterStats returns valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"version\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"num_shards\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"nodes\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "shard-0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "shard-1") != null);
+    // One node (this process) with live host telemetry.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"cpu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"mem\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"io\"") != null);
 }
 
 test "getMetricsJson returns valid JSON" {

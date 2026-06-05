@@ -9,3 +9,8 @@
 .ov-node{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft);}
 .ov-node:last-child{border-bottom:none;}
 .ov-meters{display:flex;gap:18px;flex:1;max-width:420px;margin-left:auto;}
+.ov-meter{flex:1;min-width:0;}
+.ov-meter .bar{max-width:none;}
+.ov-meter-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;}
+.ov-meter-l{font-size:11px;font-weight:600;letter-spacing:0.05em;color:var(--tx-3);}
+.ov-meter-v{font-size:11px;color:var(--tx-2);}

@@ -1,15 +1,29 @@
 /* Flo Console v2 — Overview (live).
    Cluster health + real workload/traffic + workflow activity, from `cluster/stats`
    and `/metrics`. The event-flow strip is a client-derived command-rate series
-   (sampled from `commands_total` deltas across polls). Real per-node CPU/MEM/IO and
-   per-namespace storage aren't instrumented server-side, so the node list shows the
-   honest shard registry (id/status/role) rather than fabricated meters. */
+   (sampled from `commands_total` deltas across polls). The node list shows this
+   node's live host telemetry (real CPU/MEM/IO from `cluster/stats`); a node's
+   dashboard only observes itself, so peers aren't listed here. */
 import { useEffect, useRef, useState } from 'react'
 import { cfmt } from '@/lib/format'
 import { useClusterStats, useMetrics } from '@/lib/api/hooks'
 import { Card, PhSec } from '@/components/layout'
-import { Pill, Dot } from '@/components/feedback'
+import { Pill, Dot, Bar } from '@/components/feedback'
 import './Overview.css'
+
+/** A labelled CPU/MEM/IO bar — sage under 60%, amber 60–80%, rose above. */
+function Meter({ label, pct }: { label: string; pct: number }) {
+  const color = pct > 80 ? 'var(--crit)' : pct > 60 ? 'var(--warn)' : 'var(--accent)'
+  return (
+    <div className="ov-meter">
+      <div className="ov-meter-h">
+        <span className="ov-meter-l">{label}</span>
+        <span className="mono ov-meter-v">{pct}%</span>
+      </div>
+      <Bar value={pct / 100} color={color} />
+    </div>
+  )
+}
 
 const ICON = {
   gauge: 'M3.5 18a8.5 8.5 0 0 1 17 0|M12 18l4.5-6',
@@ -146,27 +160,43 @@ export function Overview() {
         </Card>
       </div>
 
-      {/* nodes (shards) — honest registry, no fabricated meters */}
+      {/* nodes — this node's live host telemetry (CPU/MEM/IO) */}
       <Card className="sec">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <PhSec icon={ICON.nodes} title="Shards" />
+          <PhSec icon={ICON.nodes} title="Nodes" />
           <Pill tone={healthy === nodes.length ? 'ok' : 'lag'} style={{ padding: '2px 9px' }}>
             {healthy} / {nodes.length || '—'} healthy
           </Pill>
         </div>
-        {nodes.length === 0 && <div style={{ padding: '20px 0', color: 'var(--tx-3)', fontSize: 13 }}>No shards reporting.</div>}
-        {nodes.map((n) => (
-          <div key={n.id} className="ov-node">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 160 }}>
-              <Dot color={n.status === 'healthy' ? 'var(--accent)' : 'var(--crit)'} />
-              <span className="mono" style={{ fontSize: 13, color: 'var(--tx)' }}>{n.id}</span>
-              <span className="gmode">{n.role}</span>
+        {nodes.length === 0 && <div style={{ padding: '20px 0', color: 'var(--tx-3)', fontSize: 13 }}>No nodes reporting.</div>}
+        {nodes.map((n) => {
+          const hasMeters = n.cpu != null && n.mem != null && n.io != null
+          return (
+            <div key={n.id} className="ov-node">
+              <div style={{ minWidth: 168 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Dot color={n.status === 'healthy' ? 'var(--accent)' : 'var(--crit)'} />
+                  <span className="mono" style={{ fontSize: 13, color: 'var(--tx)' }}>{n.id}</span>
+                  <span className="gmode">{n.role}</span>
+                </div>
+                {n.region && (
+                  <div className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)', paddingLeft: 18, marginTop: 4 }}>{n.region}</div>
+                )}
+              </div>
+              {hasMeters ? (
+                <div className="ov-meters">
+                  <Meter label="CPU" pct={n.cpu!} />
+                  <Meter label="MEM" pct={n.mem!} />
+                  <Meter label="IO" pct={n.io!} />
+                </div>
+              ) : (
+                <span className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)', flex: 1, textAlign: 'right' }}>
+                  {n.status}
+                </span>
+              )}
             </div>
-            <span className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)', flex: 1, textAlign: 'right' }}>
-              {n.status}
-            </span>
-          </div>
-        ))}
+          )
+        })}
       </Card>
     </div>
   )
