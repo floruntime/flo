@@ -22,9 +22,10 @@
 .ns-item.on{color:var(--tx);}
 .ns-div{height:1px;background:var(--line-soft);margin:5px 4px;}
 .ns-new{color:var(--tx-3);}
-.hdr-r{display:flex;align-items:center;gap:18px;}
-.hdr-r .lnk{color:var(--tx-3);font-size:13px;cursor:pointer;}
-.hdr-r .lnk:hover{color:var(--tx);}
+.hdr-r{display:flex;align-items:center;gap:10px;}
+.health-pill{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:999px;
+  background:var(--accent-soft);border:1px solid var(--accent-line);
+  font-size:12px;font-weight:500;color:var(--tx-2);white-space:nowrap;}
 
 .body{flex:1;display:flex;min-height:0;}
 .side{width:208px;flex:none;padding:18px 12px;border-right:1px solid var(--line-soft);overflow-y:auto;}

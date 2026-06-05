@@ -12,6 +12,7 @@ const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 pub const json = @import("../../../util/json.zig");
 pub const MetricsRegistry = @import("../../../metrics/registry.zig").MetricsRegistry;
+pub const HostStats = @import("../host_stats.zig");
 
 // =============================================================================
 // Dashboard Context — Central context for all dashboard API handlers
@@ -38,6 +39,8 @@ pub const DashboardContext = struct {
     /// are issued as a loopback client request to `127.0.0.1:listen_port`, reusing
     /// the thread-safe protocol path (the dashboard thread cannot propose directly).
     listen_port: u16 = 9000,
+    /// Live host telemetry for this node (CPU/MEM/IO), sampled by /cluster/stats.
+    host: HostStats.Sampler = .{},
 
     pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
         return .{
