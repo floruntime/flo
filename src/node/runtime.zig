@@ -522,6 +522,8 @@ pub const Runtime = struct {
 
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
+            // Loopback target for dashboard-issued mutations (see DashboardContext.listen_port).
+            ctx.listen_port = self.config.listen_port;
 
             // Wire shard references for read-only projection access
             if (self.shards) |s| {

@@ -1,77 +1,45 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { AppLayout } from "./layouts/AppLayout";
-import { NamespaceProvider } from "./lib/NamespaceContext";
-import { AuthProvider, useAuth } from "./lib/AuthContext";
-import { LoginPage } from "./pages/LoginPage";
-import { ClusterOverview } from "./pages/ClusterOverview";
-import { StreamsList } from "./pages/StreamsList";
-import { ActionsList } from "./pages/ActionsList";
-import { ActionDetailPage } from "./pages/ActionDetail";
-import { WorkersListPage } from "./pages/WorkersList";
-import { WorkerDetailPage } from "./pages/WorkerDetail";
-import { StreamDetail } from "./pages/StreamDetail.tsx";
-import { KeyDetail } from "./pages/KeyDetail";
-import { QueuesList } from "./pages/QueuesList";
-import { QueueDetail } from "./pages/QueueDetail";
-import { ProcessingList } from "./pages/ProcessingList";
-import { ProcessingDetail } from "./pages/ProcessingDetail";
-import { WorkflowsListPage } from "./pages/WorkflowsListPage";
-import { WorkflowDetailPage } from "./pages/WorkflowDetailPage";
-import { WorkflowDefinitionsPage } from "./pages/WorkflowDefinitionsPage";
-import { WorkflowLayout } from "./layouts/WorkflowLayout";
-import { TimeSeriesList } from "./pages/TimeSeriesList";
-import { TimeSeriesDetail } from "./pages/TimeSeriesDetail";
-import type { ReactNode } from "react";
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { NamespaceProvider } from '@/lib/namespace'
+import { Shell } from '@/layout/Shell'
+import { Overview } from '@/screens/Overview'
+import { Streams } from '@/screens/streams/Streams'
+import { KV } from '@/screens/kv/KV'
+import { Queues } from '@/screens/queues/Queues'
+import { TimeSeries } from '@/screens/timeseries/TimeSeries'
+import { Actions } from '@/screens/compute/Actions'
+import { Workers } from '@/screens/compute/Workers'
+import { Processing } from '@/screens/processing/Processing'
+import { Workflows } from '@/screens/workflows/Workflows'
+import { Playground } from '@/playground/Playground'
 
-function RequireAuth({ children }: { children: ReactNode }) {
-  const { isAuthenticated, authRequired, authChecked } = useAuth();
-  if (!authChecked) return null; // Wait for auth status check
-  if (!authRequired) return <>{children}</>; // Server has no auth configured
-  if (!isAuthenticated) return <Navigate to="/login" replace />;
-  return <>{children}</>;
+function Console() {
+  return (
+    <NamespaceProvider>
+      <Shell>
+        <Routes>
+          <Route index element={<Overview />} />
+          <Route path="streams" element={<Streams />} />
+          <Route path="kv" element={<KV />} />
+          <Route path="queues" element={<Queues />} />
+          <Route path="timeseries" element={<TimeSeries />} />
+          <Route path="actions" element={<Actions />} />
+          <Route path="workers" element={<Workers />} />
+          <Route path="processing" element={<Processing />} />
+          <Route path="workflows" element={<Workflows />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Shell>
+    </NamespaceProvider>
+  )
 }
 
-function App() {
+export function App() {
   return (
     <BrowserRouter>
-      <AuthProvider>
       <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route element={<RequireAuth><NamespaceProvider><AppLayout /></NamespaceProvider></RequireAuth>}>
-          <Route path="/" element={<ClusterOverview />} />
-          <Route path="/streams" element={<StreamsList />} />
-          <Route path="/streams/:streamId" element={<StreamDetail />} />
-
-          {/* KV Routes — namespace controlled by header selector */}
-          <Route path="/kv" element={<KeyDetail />} />
-          <Route path="/kv/:namespace" element={<KeyDetail />} />
-          <Route path="/kv/:namespace/:key" element={<KeyDetail />} />
-
-          <Route path="/queues" element={<QueuesList />} />
-          <Route path="/queues/:queueName" element={<QueueDetail />} />
-          <Route path="/timeseries" element={<TimeSeriesList />} />
-          <Route path="/timeseries/:measurement" element={<TimeSeriesDetail />} />
-          <Route path="/actions" element={<ActionsList />} />
-          <Route path="/actions/:actionName" element={<ActionDetailPage />} />
-          <Route path="/workers" element={<WorkersListPage />} />
-          <Route path="/workers/:workerId" element={<WorkerDetailPage />} />
-          <Route path="/processing" element={<ProcessingList />} />
-          <Route path="/processing/:jobId" element={<ProcessingDetail />} />
-
-          {/* Workflow Routes – WorkflowLayout keeps the sidebar mounted across pages */}
-          <Route element={<WorkflowLayout />}>
-            <Route path="/workflows" element={<WorkflowsListPage />} />
-            <Route path="/workflows/runs/:runId" element={<WorkflowDetailPage />} />
-            <Route path="/workflows/definitions" element={<WorkflowDefinitionsPage />} />
-          </Route>
-
-          <Route path="/settings" element={<div className="p-4">Settings Page (Coming Soon)</div>} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
+        <Route path="/playground/*" element={<Playground />} />
+        <Route path="/*" element={<Console />} />
       </Routes>
-      </AuthProvider>
     </BrowserRouter>
-  );
+  )
 }
-
-export default App;

@@ -736,6 +736,7 @@ pub const Shard = struct {
         self.next_conn_id += 1;
 
         try self.connections.put(self.allocator, fd, conn);
+        if (self.metrics_registry) |m| m.server.connectionOpened();
         return conn;
     }
 
@@ -746,6 +747,7 @@ pub const Shard = struct {
             _ = self.kv_handler.txn_table.dropByConnection(kv.value.id);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
+            if (self.metrics_registry) |m| m.server.connectionClosed();
         }
     }
 
@@ -772,6 +774,10 @@ pub const Shard = struct {
     pub fn dispatchRequest(self: *Shard, conn: *Connection, req: proto.Request) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
+        // Count every dispatched request for the cluster command counter (drives
+        // Overview's commands_total + rps). Other server counters (connections,
+        // bytes) are not yet wired — see the metrics gap log.
+        if (self.metrics_registry) |m| m.server.recordCommand();
 
         const op = req.header.op_code;
 
@@ -1480,6 +1486,8 @@ pub const Shard = struct {
             return;
         }
 
+        if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+
         // Accumulate data in the read buffer
         _ = conn.read_buf.write(tmp_buf[0..n]);
 
@@ -1732,6 +1740,7 @@ pub const Shard = struct {
                 self.closeConnection(fd);
                 return;
             }
+            if (self.metrics_registry) |m| m.server.recordBytesSent(@intCast(written));
             conn.consumeWritten(written);
         }
 

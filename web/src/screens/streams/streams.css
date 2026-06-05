@@ -1,0 +1,43 @@
+/* calm activity tape — soft echo of the log tape: thin group cursors + playhead + seeker */
+.strip{position:relative;height:96px;border-radius:var(--r);background:var(--card-2);
+  border:1px solid var(--line-soft);overflow:hidden;display:flex;align-items:flex-end;gap:2px;padding:14px;}
+.strip i{flex:1;border-radius:1px;background:var(--tx-faint);opacity:0.5;transition:background .14s;}
+.strip i.a{background:var(--accent);opacity:0.85;}
+
+.tape2{position:relative;border-radius:var(--r);background:var(--card-2);border:1px solid var(--line-soft);overflow:hidden;}
+.tape2-bars{display:flex;align-items:flex-end;gap:2px;padding:20px 0 16px;height:128px;}
+.tape2-bars i{flex:1;border-radius:1px;background:var(--tx-faint);opacity:0.42;cursor:pointer;transition:opacity .12s;}
+.tape2-bars i:hover{opacity:0.7;}
+.tape2-bars i.a{background:var(--accent);opacity:0.9;}
+.tape2-ov{position:absolute;left:0;right:0;top:0;bottom:0;pointer-events:none;}
+.gc{position:absolute;top:12px;bottom:14px;width:1px;background:color-mix(in srgb,var(--gc) 50%,transparent);}
+.gc::before{content:"";position:absolute;top:-3px;left:50%;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:var(--gc);}
+.gc-l{display:none;}
+.ph2{position:absolute;top:8px;bottom:14px;width:1.5px;background:var(--accent);}
+.ph2::before{content:"";position:absolute;top:-1px;left:-3px;border-left:3.5px solid transparent;border-right:3.5px solid transparent;border-top:5px solid var(--accent);}
+
+.tape-dim{position:absolute;top:0;bottom:0;background:rgba(10,10,9,0.4);}
+
+.seeker{position:relative;height:6px;border-radius:3px;background:var(--line);cursor:pointer;margin-top:12px;}
+.seeker-dim{position:absolute;top:0;bottom:0;background:rgba(8,8,7,0.55);border-radius:3px;}
+.seeker-win{position:absolute;top:0;bottom:0;background:var(--accent-soft);border-radius:2px;}
+.seeker-tick{position:absolute;top:-2px;bottom:-2px;width:1.5px;border-radius:1px;}
+.seeker-cur{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--accent);border-radius:2px;}
+.seeker-h{position:absolute;top:-4px;bottom:-4px;width:6px;transform:translateX(-50%);background:var(--accent);
+  border-radius:3px;cursor:ew-resize;opacity:0.85;}
+.seeker-h:hover{opacity:1;}
+
+/* consumer group rows */
+.grow{display:grid;grid-template-columns:minmax(150px,1.5fr) 76px 68px 54px minmax(130px,1.3fr) 56px 28px;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--line-soft);}
+.grow:last-child{border-bottom:none;}
+.grow.head{padding:11px 0 9px;border-bottom:1px solid var(--line);}
+.grow.head>div{font-size:11px;color:var(--tx-faint);font-weight:500;letter-spacing:0.02em;}
+.grow.head>div.r{text-align:right;}
+.grow .r{text-align:right;}
+.gtrash{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--r-sm);
+  border:1px solid transparent;background:transparent;color:var(--tx-faint);cursor:pointer;transition:.14s var(--ease);}
+.gtrash:hover{color:var(--crit);background:color-mix(in srgb,var(--crit) 12%,transparent);border-color:color-mix(in srgb,var(--crit) 32%,transparent);}
+.grp{display:flex;align-items:center;gap:14px;padding:13px 0;border-bottom:1px solid var(--line-soft);}
+.grp:last-child{border-bottom:none;}
+.gn{font-family:var(--mono);font-size:13.5px;color:var(--tx);letter-spacing:-0.01em;}
+.gmode{font-size:13px;color:var(--tx-3);white-space:nowrap;}

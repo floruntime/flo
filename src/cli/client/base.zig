@@ -312,19 +312,19 @@ pub fn resolveEndpointAddress(host: []const u8, port: u16) !@import("stdx").net.
 test "resolveEndpointAddress accepts localhost and numeric addresses" {
     // ensure our helper treats localhost as an acceptable address
     _ = resolveEndpointAddress("localhost", 9000) catch {
-        std.testing.expect(false);
+        try std.testing.expect(false);
         return;
     };
 
     // ensure numeric address still works (IPv4)
     _ = resolveEndpointAddress("127.0.0.1", 9000) catch {
-        std.testing.expect(false);
+        try std.testing.expect(false);
         return;
     };
 
     // ensure IPv6 literal parses
     _ = resolveEndpointAddress("::1", 9000) catch {
-        std.testing.expect(false);
+        try std.testing.expect(false);
         return;
     };
 }

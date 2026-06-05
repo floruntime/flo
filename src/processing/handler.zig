@@ -1315,6 +1315,7 @@ pub const ProcessingHandler = struct {
     fn tickTsSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         var point_buf: [256]StoredPoint = undefined;
         const result = shard.ts_handler.ts.queryRange(
+            router.namespaceHash(pipe.src_namespace),
             pipe.src_measurement,
             pipe.src_field,
             pipe.ts_cursor_ns,
@@ -1501,6 +1502,7 @@ pub const ProcessingHandler = struct {
                     const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
                     const ual_idx = ts_h.nextUalIndex();
                     ts_h.ts.insert(
+                        router.namespaceHash(snk.namespace),
                         snk.measurement,
                         snk.value_field,
                         field_value,
@@ -1548,7 +1550,7 @@ pub const ProcessingHandler = struct {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse continue;
                 const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(snk.measurement, pair.key, value, now_ns, ual_idx, tag_hash_val) catch continue;
+                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, tag_hash_val) catch continue;
             }
             return;
         }
@@ -1557,7 +1559,7 @@ pub const ProcessingHandler = struct {
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return);
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(snk.measurement, "value", value, now_ns, ual_idx, tag_hash_val) catch {};
+        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, tag_hash_val) catch {};
     }
 
     /// KV sink: write the record under `key_prefix + separator + record_key`,

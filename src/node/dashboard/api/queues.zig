@@ -15,6 +15,42 @@ const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const QueueProjection = @import("../../../projection/queue.zig").QueueProjection;
+const router = @import("../../router.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
+
+/// Short-lived loopback client to the node's own protocol port — mutations can't
+/// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
+}
+
+fn queueHash(namespace: []const u8, name: []const u8) u64 {
+    return router.nameHash(router.namespaceHash(namespace), name);
+}
+
+/// Per-queue message tally by state (computed from the projection — the metrics
+/// counters under-report). `pending = ready + leased`.
+const QueueTally = struct { ready: u64 = 0, leased: u64 = 0, dlq: u64 = 0 };
+
+fn tallyQueue(qp: *QueueProjection, qhash: u64) QueueTally {
+    var t = QueueTally{};
+    var it = qp.messages.iterator();
+    while (it.next()) |kv| {
+        const msg = kv.value_ptr.*;
+        if (msg.queue_name_hash != qhash) continue;
+        switch (msg.state) {
+            .ready => t.ready += 1,
+            .leased => t.leased += 1,
+            .dlq => t.dlq += 1,
+        }
+    }
+    return t;
+}
 
 // ── Helpers ──
 
@@ -38,32 +74,38 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    ctx.metrics.mutex.lock();
-    defer ctx.metrics.mutex.unlock();
+    // List from the projection's registered queues (the metrics counters
+    // under-report); counts per queue are tallied from the message map.
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
 
-    var it = ctx.metrics.queues.iterator();
-    while (it.next()) |entry| {
-        const queue_entry = entry.value_ptr.*;
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getQueueProjection(ctx, i)) |qp| {
+            var it = qp.known_queues.iterator();
+            while (it.next()) |kv| {
+                const qhash = kv.key_ptr.*;
+                const meta = kv.value_ptr.*;
+                if (meta.name.len > 0 and meta.name[0] == '_') continue; // system queue
+                const gop = try seen.getOrPut(qhash);
+                if (gop.found_existing) continue;
 
-        // Skip internal/system queues (prefixed with '_')
-        if (queue_entry.queue.len > 0 and queue_entry.queue[0] == '_') continue;
-
-        try arr.next();
-        const snap = queue_entry.metrics.snapshot();
-
-        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-        try obj.begin();
-        try obj.stringField("name", queue_entry.queue);
-        try obj.stringField("namespace", queue_entry.namespace);
-        try obj.intField("pending", snap.queue_available_current + snap.leases_active_current);
-        try obj.intField("available", snap.queue_available_current);
-        try obj.intField("enqueued", snap.enqueue_ops_total);
-        try obj.intField("dequeued", snap.dequeue_ops_total);
-        try obj.intField("acked", snap.leases_completed_total);
-        try obj.intField("nacked", snap.leases_failed_total);
-        try obj.intField("dlq_count", snap.dlq_messages_total);
-        try obj.intField("bytes_total", snap.enqueue_bytes_total);
-        try obj.end();
+                const t = tallyQueue(qp, qhash);
+                try arr.next();
+                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try obj.begin();
+                try obj.stringField("name", meta.name);
+                try obj.stringField("namespace", meta.namespace);
+                try obj.intField("ready", t.ready);
+                try obj.intField("inflight", t.leased);
+                try obj.intField("pending", t.ready + t.leased);
+                try obj.intField("available", t.ready);
+                try obj.intField("enqueued", meta.enqueued);
+                try obj.intField("dequeued", meta.dequeued);
+                try obj.intField("dlq_count", t.dlq);
+                try obj.end();
+            }
+        }
     }
 
     try arr.end();
@@ -72,7 +114,9 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
 
 /// GET /queues/:name - Queue detail
 pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const qhash = queueHash(ns_q, queue_name);
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -80,43 +124,30 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", queue_name);
+    try obj.stringField("namespace", ns_q);
 
-    ctx.metrics.mutex.lock();
-    defer ctx.metrics.mutex.unlock();
-
-    var found = false;
-    var it = ctx.metrics.queues.iterator();
-    while (it.next()) |entry| {
-        const queue_entry = entry.value_ptr.*;
-        if (std.mem.eql(u8, queue_entry.queue, queue_name)) {
-            const snap = queue_entry.metrics.snapshot();
-
-            try obj.stringField("namespace", queue_entry.namespace);
-            try obj.intField("pending", snap.queue_available_current + snap.leases_active_current);
-            try obj.intField("available", snap.queue_available_current);
-            try obj.intField("enqueued", snap.enqueue_ops_total);
-            try obj.intField("dequeued", snap.dequeue_ops_total);
-            try obj.intField("acked", snap.leases_completed_total);
-            try obj.intField("nacked", snap.leases_failed_total);
-            try obj.intField("dlq_count", snap.dlq_messages_total);
-            try obj.intField("bytes_total", snap.enqueue_bytes_total);
-            found = true;
-            break;
+    var enqueued: u64 = 0;
+    var dequeued: u64 = 0;
+    var t = QueueTally{};
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getQueueProjection(ctx, i)) |qp| {
+            if (qp.known_queues.get(qhash)) |meta| {
+                enqueued = meta.enqueued;
+                dequeued = meta.dequeued;
+                t = tallyQueue(qp, qhash);
+                break;
+            }
         }
     }
 
-    if (!found) {
-        try obj.stringField("namespace", "default");
-        try obj.intField("pending", 0);
-        try obj.intField("available", 0);
-        try obj.intField("enqueued", 0);
-        try obj.intField("dequeued", 0);
-        try obj.intField("acked", 0);
-        try obj.intField("nacked", 0);
-        try obj.intField("dlq_count", 0);
-        try obj.intField("bytes_total", 0);
-    }
-
+    try obj.intField("ready", t.ready);
+    try obj.intField("inflight", t.leased);
+    try obj.intField("pending", t.ready + t.leased);
+    try obj.intField("available", t.ready);
+    try obj.intField("enqueued", enqueued);
+    try obj.intField("dequeued", dequeued);
+    try obj.intField("dlq_count", t.dlq);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -125,8 +156,11 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
 /// Query params: ?status=&limit=
 pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     _ = h.parseQueryParam([]const u8, query_string, "status");
-    const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
-    const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 1000;
+    const limit: usize = @min(@as(usize, @intCast(limit_param)), 2000);
+    const qhash = queueHash(ns_q, queue_name);
+    const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -144,11 +178,18 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
         const n = shardCount(ctx);
         for (0..n) |i| {
             if (getQueueProjection(ctx, i)) |qp| {
-                total += qp.messages.count();
                 var it = qp.messages.iterator();
                 while (it.next()) |entry| {
-                    if (msg_count >= limit) break;
                     const msg = entry.value_ptr.*;
+                    if (msg.queue_name_hash != qhash) continue; // only THIS queue
+                    total += 1;
+                    if (msg_count >= limit) continue;
+                    const payload = if (std.unicode.utf8ValidateSlice(msg.payload)) msg.payload else "<binary>";
+                    const lease_ms: i64 = blk: {
+                        if (msg.state != .leased) break :blk 0;
+                        const exp_ms: i64 = @intCast(msg.lease_expiry_ns / std.time.ns_per_ms);
+                        break :blk if (exp_ms > now_ms) exp_ms - now_ms else 0;
+                    };
                     try msgs_arr.next();
                     var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try mobj.begin();
@@ -161,6 +202,9 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
                     });
                     try mobj.intField("attempts", msg.attempts);
                     try mobj.intField("enqueued_at", @as(i64, @intCast(msg.enqueued_at_ns / std.time.ns_per_ms)));
+                    try mobj.intField("lease_remaining_ms", lease_ms);
+                    try mobj.intField("size", @as(i64, @intCast(msg.payload.len)));
+                    try mobj.stringField("payload", payload);
                     try mobj.end();
                     msg_count += 1;
                 }
@@ -221,17 +265,21 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /queues/:name/dlq/:seq/requeue - Requeue a DLQ entry
-pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    _ = queue_name;
-    _ = seq_str;
+/// POST /queues/:name/dlq/:seq/requeue?namespace= - Requeue a DLQ entry (loopback write)
+pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const seq = std.fmt.parseInt(u64, seq_str, 10) catch return try h.jsonError(allocator, "Invalid seq");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.queue.dlqRequeue(&client, ns_q, queue_name, &[_]u64{seq}) catch
+        return try h.jsonError(allocator, "DLQ requeue failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
@@ -338,13 +386,14 @@ test "purgeQueue returns ok" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"purged\":0") != null);
 }
 
-test "requeueDLQEntry returns ok" {
+test "requeueDLQEntry surfaces loopback connect failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here → connect refused
 
-    const result = try requeueDLQEntry(allocator, "test-q", "42", &ctx);
+    const result = try requeueDLQEntry(allocator, "test-q", "42", null, &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }

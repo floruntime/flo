@@ -16,6 +16,7 @@ const Shard = @import("../../shard.zig").Shard;
 const kv_mod = @import("../../../projection/kv.zig");
 const KVProjection = kv_mod.KVProjection;
 const ns_keys = @import("../../../namespace/handler.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -254,37 +255,80 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     return try json_aw.toOwnedSlice();
 }
 
+/// Connect a short-lived loopback client to the node's own protocol port.
+/// Mutations can't be proposed from the dashboard thread, so we issue them over
+/// the wire to ourselves — the same thread-safe path the CLI uses.
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
+}
+
 /// PUT /kv/namespaces/:ns/keys/:key - Set a key's value
+/// Body: { "value": "<bytes>", "ttl_seconds": <int|null>, "nx": <bool> }
 pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
     if (body.len == 0) return try h.jsonError(allocator, "Empty request body");
 
-    // Write operations require Raft proposal — not safe from dashboard thread.
-    // Return stub acknowledgement for now.
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return try h.jsonError(allocator, "Invalid JSON body");
+    defer parsed.deinit();
+    if (parsed.value != .object) return try h.jsonError(allocator, "Body must be a JSON object");
+    const obj_in = parsed.value.object;
+
+    var value: []const u8 = "";
+    if (obj_in.get("value")) |v| switch (v) {
+        .string => |s| value = s,
+        else => {},
+    };
+    var opts = client_mod.kv.SetOptions{};
+    if (obj_in.get("ttl_seconds")) |t| switch (t) {
+        .integer => |i| {
+            if (i > 0) opts.ttl_seconds = @intCast(i);
+        },
+        else => {},
+    };
+    if (obj_in.get("nx")) |n| switch (n) {
+        .bool => |b| opts.if_not_exists = b,
+        else => {},
+    };
+
+    var client = loopbackConnect(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.kv.set(&client, namespace, key, value, opts) catch
+        return try h.jsonError(allocator, "KV set failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
     try obj.boolField("ok", true);
-    try obj.intField("version", 1);
+    try obj.intField("version", @as(i64, @intCast(resp.getVersion() orelse 0)));
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
 /// DELETE /kv/namespaces/:ns/keys/:key - Delete a key
 pub fn deleteKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+    var client = loopbackConnect(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.kv.delete(&client, namespace, key, null, null, null) catch
+        return try h.jsonError(allocator, "KV delete failed");
+    defer resp.deinit();
+    if (resp.isError() and !resp.isNotFound()) return try h.jsonError(allocator, resp.errorMessage());
 
-    // Write operations require Raft proposal — not safe from dashboard thread.
-    // Return stub acknowledgement for now.
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("key", key);
@@ -335,24 +379,36 @@ test "getKVKeyValue returns not found" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"key\":\"mykey\"") != null);
 }
 
-test "putKVKey returns ok" {
+test "putKVKey rejects empty body" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try putKVKey(allocator, "default", "k", "v", &ctx);
+    const result = try putKVKey(allocator, "default", "k", "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }
 
-test "deleteKVKey returns ok" {
+test "putKVKey rejects invalid JSON body" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+
+    const result = try putKVKey(allocator, "default", "k", "not json", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+}
+
+test "deleteKVKey surfaces loopback connect failure (no node in unit test)" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here → connect refused
 
     const result = try deleteKVKey(allocator, "default", "k", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }

@@ -1,0 +1,8 @@
+/* compute (Actions + Workers) — add screen-specific CSS here if needed */
+
+/* no-wrap + ellipsis helper for mono identifiers in list rows (from the design's `.nw`) */
+.nw {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

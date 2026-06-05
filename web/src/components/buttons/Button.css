@@ -1,0 +1,14 @@
+/* buttons — Steel-style presence */
+.btn{display:inline-flex;align-items:center;gap:7px;font:inherit;font-size:13px;font-weight:500;white-space:nowrap;
+  padding:8px 15px;border-radius:6px;border:1px solid #34332d;background:var(--hover);
+  color:var(--tx);cursor:pointer;transition:.14s var(--ease);}
+.btn:hover{background:#2a2925;border-color:#403e37;}
+.btn:active{transform:translateY(0.5px);}
+.btn.q{background:transparent;border-color:transparent;color:var(--tx-3);font-weight:500;}
+.btn.q:hover{color:var(--tx);background:var(--hover);}
+.btn.acc{background:var(--accent);border-color:var(--accent);color:#0d1410;font-weight:600;}
+.btn.acc:hover{filter:brightness(1.06);background:var(--accent);}
+.btn.danger{background:transparent;border-color:color-mix(in srgb,var(--crit) 34%,transparent);color:var(--crit);}
+.btn.danger:hover{background:color-mix(in srgb,var(--crit) 14%,transparent);border-color:color-mix(in srgb,var(--crit) 50%,transparent);}
+.btn:disabled{opacity:0.4;cursor:default;}
+.btn:disabled:hover{background:var(--hover);border-color:#34332d;}

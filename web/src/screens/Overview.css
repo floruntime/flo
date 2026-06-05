@@ -1,0 +1,11 @@
+/* overview */
+.ov-summary{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr;gap:1px;background:var(--line-soft);border:1px solid var(--line-soft);border-radius:var(--r);overflow:hidden;}
+.ov-summary>div{background:var(--card);padding:14px 16px;}
+.ov-hero{display:flex;flex-direction:column;justify-content:center;}
+.ov-lbl{font-size:12px;color:var(--tx-3);}
+.ov-big{font-size:34px;font-weight:600;letter-spacing:-0.01em;font-feature-settings:"tnum" 1;}
+.ov-num{font-size:22px;font-weight:600;color:var(--tx);font-feature-settings:"tnum" 1;margin-top:8px;}
+.ov-u{font-size:13px;font-weight:400;color:var(--tx-3);margin-left:5px;}
+.ov-node{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--line-soft);}
+.ov-node:last-child{border-bottom:none;}
+.ov-meters{display:flex;gap:18px;flex:1;max-width:420px;margin-left:auto;}
