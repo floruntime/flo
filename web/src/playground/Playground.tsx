@@ -23,6 +23,7 @@ import {
   PhSec,
   Crumb,
   Modal,
+  Logo,
 } from '@/components'
 import { TrashIcon, PlusIcon } from '@/lib/icons'
 import './playground.css'
@@ -77,7 +78,7 @@ function TokensSection() {
           ))}
         </div>
       </Block>
-      <Block title="Type" desc="Inter · JetBrains Mono · Collier (serif wordmark).">
+      <Block title="Type" desc="Inter · JetBrains Mono · Collier (serif display).">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <span style={{ fontFamily: 'var(--serif)', fontStyle: 'italic', fontSize: 28 }}>flo</span>
           <span style={{ fontSize: 26, fontWeight: 600, letterSpacing: '-0.02em' }}>Inter Semibold 26 / page title</span>
@@ -280,7 +281,7 @@ export function Playground() {
     <div className="pg">
       <nav className="pg-side">
         <div className="pg-brand">
-          <span className="wm">flo</span>
+          <Logo className="wm" />
           <span className="sl">/</span>
           <span className="lbl">playground</span>
         </div>

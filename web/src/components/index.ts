@@ -11,3 +11,5 @@ export * from './data'
 
 export { Modal } from './overlay/Modal'
 export type { ModalProps } from './overlay/Modal'
+
+export { Logo, LogoMark } from './brand/Logo'

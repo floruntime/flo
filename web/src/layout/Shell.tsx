@@ -5,6 +5,7 @@ import { NAMESPACES, useNamespace } from '@/lib/namespace'
 import { useNamespaces, useClusterStats } from '@/lib/api/hooks'
 import { Icon, NAV_ICONS, CheckIcon, ChevronVIcon, CubeIcon, PlusIcon } from '@/lib/icons'
 import { Dot } from '@/components/feedback'
+import { Logo } from '@/components/brand/Logo'
 import { cx } from '@/lib/cx'
 import './Shell.css'
 
@@ -106,7 +107,7 @@ export function Shell({ children }: { children: ReactNode }) {
     <div className="app">
       <header className="hdr">
         <div className="brand">
-          <span className="wm">flo</span>
+          <Logo className="wm" />
           <span className="sl">/</span>
           <NamespaceSwitcher />
         </div>
