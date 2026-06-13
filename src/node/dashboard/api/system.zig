@@ -107,6 +107,18 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     try wf_obj.intField("active_schedules", wf.active_schedules);
     try wf_obj.end();
 
+    // Replication divergence counters (issue #16). Non-zero values mean a
+    // follower has missed committed entries or the leader dropped a broadcast.
+    const repl = ctx.metrics.replication.snapshot();
+    var repl_obj = try obj.objectField("replication");
+    try repl_obj.begin();
+    try repl_obj.intField("follower_gaps_total", repl.follower_gaps_total);
+    try repl_obj.intField("follower_entries_missing_total", repl.follower_entries_missing_total);
+    try repl_obj.intField("broadcast_oversize_skipped_total", repl.broadcast_oversize_skipped_total);
+    try repl_obj.intField("broadcast_send_failures_total", repl.broadcast_send_failures_total);
+    try repl_obj.intField("last_gap_received_index", repl.last_gap_received_index);
+    try repl_obj.end();
+
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -149,4 +161,6 @@ test "getMetricsJson returns valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"streams\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"queues\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"kv_namespaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"replication\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"follower_gaps_total\"") != null);
 }
