@@ -5,7 +5,7 @@ import { NAMESPACES, useNamespace } from '@/lib/namespace'
 import { useNamespaces, useClusterStats } from '@/lib/api/hooks'
 import { Icon, NAV_ICONS, CheckIcon, ChevronVIcon, CubeIcon, PlusIcon, SearchIcon, BookIcon } from '@/lib/icons'
 import { Dot } from '@/components/feedback'
-import { Logo } from '@/components/brand/Logo'
+import { LogoMark } from '@/components/brand/Logo'
 import { CommandPalette, DOCS_URL } from './CommandPalette'
 import { NAV } from './nav'
 import type { NavRow } from './nav'
@@ -99,15 +99,17 @@ export function Shell({ children }: { children: ReactNode }) {
     <div className="app">
       <header className="hdr">
         <div className="brand">
-          <Logo className="wm" />
+          <span className="flo-mark" aria-label="Flo">
+            <LogoMark />
+          </span>
           <span className="sl">/</span>
           <NamespaceSwitcher />
         </div>
         <div className="hdr-r">
-          <button className="cmdk-trigger" onClick={() => setCmdkOpen(true)}>
-            <SearchIcon />
-            <span>Search or jump to…</span>
-            <span className="kbd">⌘K</span>
+          <button className="hdr-search" onClick={() => setCmdkOpen(true)}>
+            <SearchIcon size={14} />
+            <span>Search</span>
+            <span className="hdr-kbd">⌘K</span>
           </button>
           <span className="health-pill">
             <Dot color={allOk ? 'var(--accent)' : 'var(--warn)'} />

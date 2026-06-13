@@ -3,7 +3,9 @@
 .hdr{height:56px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 22px;
   border-bottom:1px solid var(--line-soft);}
 .brand{display:flex;align-items:center;gap:11px;font-size:14px;}
-.brand .wm{display:block;height:18px;width:auto;color:var(--tx);}
+.brand .flo-mark{display:flex;align-items:center;justify-content:center;height:32px;width:32px;
+  border-radius:var(--r-sm);background:var(--accent-soft);color:var(--accent);}
+.brand .flo-mark svg{height:19px;width:auto;display:block;}
 .brand .sl{color:var(--tx-faint);font-weight:300;}
 .brand .ns{color:var(--tx-2);font-weight:500;}
 .ns-btn{display:flex;align-items:center;gap:8px;background:transparent;border:1px solid transparent;border-radius:var(--r-sm);
@@ -23,6 +25,14 @@
 .ns-div{height:1px;background:var(--line-soft);margin:5px 4px;}
 .ns-new{color:var(--tx-3);}
 .hdr-r{display:flex;align-items:center;gap:10px;}
+.hdr-search{display:flex;align-items:center;gap:8px;background:var(--card-2);border:1px solid var(--line);
+  border-radius:var(--r-sm);padding:5px 9px 5px 10px;color:var(--tx-3);font:inherit;font-size:13px;cursor:pointer;
+  transition:.14s var(--ease);}
+.hdr-search:hover{border-color:var(--line);background:var(--hover);color:var(--tx-2);}
+.hdr-search svg{color:var(--tx-faint);}
+.hdr-search:hover svg{color:var(--tx-3);}
+.hdr-kbd{font-family:var(--mono);font-size:11px;color:var(--tx-faint);border:1px solid var(--line);
+  border-radius:4px;padding:1px 5px;line-height:1.4;margin-left:2px;}
 .health-pill{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:999px;
   background:var(--accent-soft);border:1px solid var(--accent-line);
   font-size:12px;font-weight:500;color:var(--tx-2);white-space:nowrap;}

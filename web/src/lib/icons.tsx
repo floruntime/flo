@@ -62,6 +62,7 @@ export const SEARCH_PATH = 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z|M20.5 20.5L16.6
 export const BOOK_PATH = 'M12 6.6C10.4 5.5 7.8 5 4 5v13c3.8 0 6.4.5 8 1.5 1.6-1 4.2-1.5 8-1.5V5c-3.8 0-6.4.5-8 1.6z|M12 6.6V20'
 export const TERMINAL_PATH = 'M5 7l4 4-4 4|M12 16h7'
 export const CUBE_PATH = 'M12 2.5l8 4.5v9l-8 4.5-8-4.5v-9z|M12 12l8-4.5M12 12v9.5M12 12L4 7.5'
+export const ARROW_PATH = 'M5 12h13|M13 6l6 6-6 6'
 
 export const SearchIcon = ({ size = 15 }: { size?: number }) => (
   <Icon paths={SEARCH_PATH} size={size} strokeWidth={1.6} />
