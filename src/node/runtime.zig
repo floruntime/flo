@@ -520,6 +520,10 @@ pub const Runtime = struct {
                 }
             }
 
+            // Wire replication metrics into the raft network (issue #16) so the
+            // leader-side oversize-skip / send-failure counters are recorded.
+            if (self.raft_network) |rn| rn.setReplicationMetrics(&metrics.replication);
+
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
             // Loopback target for dashboard-issued mutations (see DashboardContext.listen_port).

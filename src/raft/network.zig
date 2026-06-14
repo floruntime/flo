@@ -15,9 +15,11 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const log = @import("stdx").log;
 const transport = @import("transport.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const inbox_mod = @import("../node/inbox.zig");
+const ReplicationMetrics = @import("../metrics/registry.zig").ReplicationMetrics;
 
 const Entry = entry_mod.Entry;
 const RaftHeader = transport.RaftHeader;
@@ -147,6 +149,9 @@ pub const RaftNetwork = struct {
     /// Raft ports of peers we should connect to (from peer exchange).
     pending_peer_ports: [MAX_PEERS]u16,
     pending_peer_count: u8,
+    /// Optional replication metrics (issue #16). Set by the runtime when the
+    /// dashboard/metrics registry is enabled; null otherwise (logging still fires).
+    repl_metrics: ?*ReplicationMetrics = null,
 
     pub fn init(allocator: Allocator, node_id: u32, listen_port: u16, main_port: u16) !RaftNetwork {
         const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
@@ -174,7 +179,14 @@ pub const RaftNetwork = struct {
             .shard_inbox = null,
             .pending_peer_ports = [_]u16{0} ** MAX_PEERS,
             .pending_peer_count = 0,
+            .repl_metrics = null,
         };
+    }
+
+    /// Wire replication metrics (issue #16). Optional — when unset, the loud
+    /// log lines still fire; only the counters are skipped.
+    pub fn setReplicationMetrics(self: *RaftNetwork, m: *ReplicationMetrics) void {
+        self.repl_metrics = m;
     }
 
     pub fn deinit(self: *RaftNetwork) void {
@@ -404,13 +416,21 @@ pub const RaftNetwork = struct {
         // (e.g., nodes that joined after the source). Skip the sender and the
         // original source node to avoid duplicates.
         var msg_buf: [MAX_MSG_BUF]u8 = undefined;
-        if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) return;
+        if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) {
+            log.warn("raft: entry too large to re-broadcast ({d} bytes > {d} max) — not forwarded; late-joining peers will diverge", .{ entry_data.len + HEADER_SIZE, MAX_MSG_BUF });
+            if (self.repl_metrics) |m| m.recordOversizeSkipped();
+            return;
+        }
         const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, source_node, entry_data, &msg_buf);
         for (&self.peers) |*p| {
             if (!p.active) continue;
             if (p.fd == sender_fd) continue;
             if (p.node_id == source_node) continue;
-            _ = sysWrite(p.fd, msg_buf[0..total]) catch {};
+            _ = sysWrite(p.fd, msg_buf[0..total]) catch |err| blk: {
+                log.warn("raft: failed to re-broadcast entry to peer node {d}: {s} — not delivered, no retry", .{ p.node_id, @errorName(err) });
+                if (self.repl_metrics) |m| m.recordSendFailure();
+                break :blk 0;
+            };
         }
     }
 
@@ -430,11 +450,19 @@ pub const RaftNetwork = struct {
 
         for (to_send.items) |entry_data| {
             var msg_buf: [MAX_MSG_BUF]u8 = undefined;
-            if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) continue;
+            if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) {
+                log.warn("raft: committed entry too large to replicate ({d} bytes > {d} max) — NOT broadcast to any peer; all followers will diverge on this entry", .{ entry_data.len + HEADER_SIZE, MAX_MSG_BUF });
+                if (self.repl_metrics) |m| m.recordOversizeSkipped();
+                continue;
+            }
             const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, self.node_id, entry_data, &msg_buf);
             for (&self.peers) |*p| {
                 if (!p.active) continue;
-                _ = sysWrite(p.fd, msg_buf[0..total]) catch {};
+                _ = sysWrite(p.fd, msg_buf[0..total]) catch |err| blk: {
+                    log.warn("raft: failed to broadcast entry to peer node {d}: {s} — not delivered, no retry (follower may diverge)", .{ p.node_id, @errorName(err) });
+                    if (self.repl_metrics) |m| m.recordSendFailure();
+                    break :blk 0;
+                };
             }
         }
     }

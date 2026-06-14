@@ -1203,6 +1203,21 @@ pub const Shard = struct {
         // returned 50/50.
         if (entry.header.index <= partition.router.applied_index) return;
 
+        // Gap detection (issue #16): cross-node replication is best-effort,
+        // fire-and-forget broadcast with no ack, retransmit, or repair path. If
+        // a committed entry is lost in flight, the next one applies here and the
+        // missing index is otherwise skipped *silently* — leaving this follower
+        // permanently diverged with no signal. We can't repair it yet, but we
+        // refuse to hide it: a jump past the next expected index is logged
+        // loudly and counted. (Guarded on applied_index > 0 so a fresh follower
+        // joining mid-stream doesn't false-positive on its first entry.)
+        const expected_index = partition.router.applied_index + 1;
+        if (partition.router.applied_index > 0 and entry.header.index > expected_index) {
+            const missing = entry.header.index - expected_index;
+            log.warn("shard {d}: REPLICATION GAP — expected entry index {d}, received {d} ({d} entry(ies) lost in flight; this follower has permanently diverged)", .{ self.id, expected_index, entry.header.index, missing });
+            if (self.metrics_registry) |m| m.replication.recordFollowerGap(missing, entry.header.index);
+        }
+
         // Apply to the partition once: UAL ring + warm store + the router-owned
         // projections (KV, Queue, TS). This advances `applied_index`, closing the
         // idempotency window above for any later re-delivery of this entry.
@@ -2650,6 +2665,84 @@ test "Shard: inbox shutdown message" {
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
     try std.testing.expect(!shard.running);
+}
+
+/// Deliver a single replicated UAL entry to the shard the way the raft network
+/// thread does: serialize it, hand the bytes to the shard inbox as a
+/// `.raft_message` (ownership transfers — `applyReplicatedEntry` frees it), then
+/// drain. Used by the gap-detection test below.
+fn deliverReplicatedEntry(shard: *Shard, index: u64) !void {
+    const entry = entry_mod.buildEntry(.kv_put, 0, 1, index, 0, "v");
+    var buf: [256]u8 = undefined;
+    const n = entry.serialize(&buf) orelse return error.SerializeFailed;
+    const dup = try std.testing.allocator.dupe(u8, buf[0..n]);
+    const sent = shard.inbox.send(.{
+        .tag = .raft_message,
+        .src_shard = 0xFF,
+        .partition_id = 0,
+        .payload_len = @intCast(dup.len),
+        .sequence = 0,
+        .payload_ptr = dup.ptr,
+        ._padding = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    });
+    try std.testing.expect(sent);
+    _ = shard.drainInbox();
+}
+
+// Regression test for issue #16 (best-effort broadcast replication silently
+// drops entries). Drives the real follower apply path — inbox → drainInbox →
+// applyReplicatedEntry → router — and asserts a lost entry is detected and
+// counted rather than vanishing. Deterministic: the "loss" is modeled by simply
+// not delivering an index, so there is no socket/timing flakiness.
+test "Shard: replication gap detection surfaces silent follower divergence" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    defer shard.deinit();
+    shard.setMetricsRegistry(&registry);
+
+    const partition = shard.defaultPartition();
+
+    // Cold start: the first replicated entry must NOT be flagged as a gap (a
+    // fresh follower has applied_index == 0 and legitimately starts anywhere).
+    try deliverReplicatedEntry(&shard, 1);
+    try std.testing.expectEqual(@as(u64, 1), partition.router.applied_index);
+    try std.testing.expectEqual(@as(u64, 0), registry.replication.snapshot().follower_gaps_total);
+
+    // Contiguous delivery: no gap.
+    try deliverReplicatedEntry(&shard, 2);
+    try std.testing.expectEqual(@as(u64, 2), partition.router.applied_index);
+    try std.testing.expectEqual(@as(u64, 0), registry.replication.snapshot().follower_gaps_total);
+
+    // Entry 3 is lost in flight; 4 arrives → one gap of width 1.
+    try deliverReplicatedEntry(&shard, 4);
+    {
+        const snap = registry.replication.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), snap.follower_gaps_total);
+        try std.testing.expectEqual(@as(u64, 1), snap.follower_entries_missing_total);
+        try std.testing.expectEqual(@as(u64, 4), snap.last_gap_received_index);
+    }
+    try std.testing.expectEqual(@as(u64, 4), partition.router.applied_index);
+
+    // Entries 5 and 6 are lost; 7 arrives → second gap, width 2.
+    try deliverReplicatedEntry(&shard, 7);
+    {
+        const snap = registry.replication.snapshot();
+        try std.testing.expectEqual(@as(u64, 2), snap.follower_gaps_total);
+        try std.testing.expectEqual(@as(u64, 3), snap.follower_entries_missing_total);
+        try std.testing.expectEqual(@as(u64, 7), snap.last_gap_received_index);
+    }
+
+    // A re-delivered (already-applied) entry is dropped by the idempotency guard
+    // and must NOT be mistaken for a gap.
+    try deliverReplicatedEntry(&shard, 4);
+    try std.testing.expectEqual(@as(u64, 2), registry.replication.snapshot().follower_gaps_total);
+    try std.testing.expectEqual(@as(u64, 7), partition.router.applied_index);
 }
 
 test "replay: segment filenames sort by first_index" {

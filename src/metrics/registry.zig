@@ -366,6 +366,66 @@ pub const ProcessingMetrics = struct {
     }
 };
 
+// =============================================================================
+// Replication Metrics
+// =============================================================================
+
+/// Replication metrics (singleton — one per node).
+///
+/// Surfaces the otherwise-silent failure modes of best-effort broadcast
+/// replication (issue #16): a follower that misses a committed entry, an
+/// over-size entry that is never broadcast, and a per-peer send that fails.
+/// These are detection-only — they make divergence *observable*; they do not
+/// repair it. The matching loud log lines live at the call sites.
+pub const ReplicationMetrics = struct {
+    /// Distinct gap events observed on a follower (received index > expected).
+    follower_gaps_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Total entries inferred missing across all gaps (sum of gap widths).
+    follower_entries_missing_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Over-size committed entries never broadcast to any peer (leader side).
+    broadcast_oversize_skipped_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Per-peer broadcast sends that failed and were not retried (leader side).
+    broadcast_send_failures_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Follower index at which a gap was last observed (gauge, debugging aid).
+    last_gap_received_index: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn init() ReplicationMetrics {
+        return .{};
+    }
+
+    pub fn recordFollowerGap(self: *ReplicationMetrics, missing: u64, received_index: u64) void {
+        _ = self.follower_gaps_total.fetchAdd(1, .monotonic);
+        _ = self.follower_entries_missing_total.fetchAdd(missing, .monotonic);
+        self.last_gap_received_index.store(received_index, .monotonic);
+    }
+
+    pub fn recordOversizeSkipped(self: *ReplicationMetrics) void {
+        _ = self.broadcast_oversize_skipped_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordSendFailure(self: *ReplicationMetrics) void {
+        _ = self.broadcast_send_failures_total.fetchAdd(1, .monotonic);
+    }
+
+    pub const Snapshot = struct {
+        follower_gaps_total: u64,
+        follower_entries_missing_total: u64,
+        broadcast_oversize_skipped_total: u64,
+        broadcast_send_failures_total: u64,
+        last_gap_received_index: u64,
+    };
+
+    pub fn snapshot(self: *const ReplicationMetrics) Snapshot {
+        return .{
+            .follower_gaps_total = self.follower_gaps_total.load(.monotonic),
+            .follower_entries_missing_total = self.follower_entries_missing_total.load(.monotonic),
+            .broadcast_oversize_skipped_total = self.broadcast_oversize_skipped_total.load(.monotonic),
+            .broadcast_send_failures_total = self.broadcast_send_failures_total.load(.monotonic),
+            .last_gap_received_index = self.last_gap_received_index.load(.monotonic),
+        };
+    }
+};
+
 /// Server-level metrics (connections, subscriptions, commands, etc.)
 pub const ServerMetrics = struct {
     /// Current active connections
@@ -619,6 +679,9 @@ pub const MetricsRegistry = struct {
     /// Processing engine metrics (singleton - one per node)
     processing: ProcessingMetrics,
 
+    /// Replication metrics (singleton - one per node)
+    replication: ReplicationMetrics,
+
     /// Per-shard metrics for the thread-per-shard architecture.
     /// Indexed by shard_id. Null until initShards() is called.
     shard_counters: ?[]ShardMetrics,
@@ -661,6 +724,7 @@ pub const MetricsRegistry = struct {
             .tiered_logs = std.AutoHashMap(u32, TieredLogEntry).init(allocator),
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
+            .replication = ReplicationMetrics.init(),
             .shard_counters = null,
             .num_shards = 0,
             .mutex = @import("stdx").Mutex{},
@@ -981,6 +1045,9 @@ pub const MetricsRegistry = struct {
         // Export processing metrics
         try writeProcessingMetrics(writer, self.processing.snapshot());
 
+        // Export replication metrics
+        try writeReplicationMetrics(writer, self.replication.snapshot());
+
         return aw.toOwnedSlice();
     }
 
@@ -1245,6 +1312,29 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
 }
 
+/// Write replication metrics in Prometheus format
+fn writeReplicationMetrics(writer: anytype, snapshot: ReplicationMetrics.Snapshot) !void {
+    try writer.print("\n# HELP flo_replication_follower_gaps_total Replication gaps detected on a follower (received index > expected)\n", .{});
+    try writer.print("# TYPE flo_replication_follower_gaps_total counter\n", .{});
+    try writer.print("flo_replication_follower_gaps_total {d}\n", .{snapshot.follower_gaps_total});
+
+    try writer.print("# HELP flo_replication_follower_entries_missing_total Entries inferred missing across all follower gaps\n", .{});
+    try writer.print("# TYPE flo_replication_follower_entries_missing_total counter\n", .{});
+    try writer.print("flo_replication_follower_entries_missing_total {d}\n", .{snapshot.follower_entries_missing_total});
+
+    try writer.print("# HELP flo_replication_broadcast_oversize_skipped_total Over-size entries never broadcast to any peer\n", .{});
+    try writer.print("# TYPE flo_replication_broadcast_oversize_skipped_total counter\n", .{});
+    try writer.print("flo_replication_broadcast_oversize_skipped_total {d}\n", .{snapshot.broadcast_oversize_skipped_total});
+
+    try writer.print("# HELP flo_replication_broadcast_send_failures_total Per-peer broadcast sends that failed and were not retried\n", .{});
+    try writer.print("# TYPE flo_replication_broadcast_send_failures_total counter\n", .{});
+    try writer.print("flo_replication_broadcast_send_failures_total {d}\n", .{snapshot.broadcast_send_failures_total});
+
+    try writer.print("# HELP flo_replication_last_gap_received_index Follower index at which a gap was last observed\n", .{});
+    try writer.print("# TYPE flo_replication_last_gap_received_index gauge\n", .{});
+    try writer.print("flo_replication_last_gap_received_index {d}\n", .{snapshot.last_gap_received_index});
+}
+
 /// Write per-shard metrics in Prometheus format
 fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_connections{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.connections });
@@ -1429,6 +1519,34 @@ test "registry: shard metrics connection open/close" {
 
     shard.connectionClosed();
     try testing.expectEqual(@as(u64, 2), shard.snapshot().connections);
+}
+
+test "registry: replication metrics gap + broadcast counters" {
+    const allocator = testing.allocator;
+
+    var registry = MetricsRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Two gap events: 3 entries missing (indices 5..7) then 1 (index 9).
+    registry.replication.recordFollowerGap(3, 8);
+    registry.replication.recordFollowerGap(1, 10);
+    registry.replication.recordOversizeSkipped();
+    registry.replication.recordSendFailure();
+    registry.replication.recordSendFailure();
+
+    const snap = registry.replication.snapshot();
+    try testing.expectEqual(@as(u64, 2), snap.follower_gaps_total);
+    try testing.expectEqual(@as(u64, 4), snap.follower_entries_missing_total);
+    try testing.expectEqual(@as(u64, 1), snap.broadcast_oversize_skipped_total);
+    try testing.expectEqual(@as(u64, 2), snap.broadcast_send_failures_total);
+    try testing.expectEqual(@as(u64, 10), snap.last_gap_received_index);
+
+    const text = try registry.exportPrometheus(allocator);
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_replication_follower_gaps_total 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_replication_follower_entries_missing_total 4") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_replication_broadcast_oversize_skipped_total 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "flo_replication_broadcast_send_failures_total 2") != null);
 }
 
 test "registry: shard metrics reactor and inbox" {
