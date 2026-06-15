@@ -20,24 +20,19 @@ const FixedWireWriter = wire.FixedWireWriter;
 // Action Operations
 // =============================================================================
 
-/// Register an action
+/// Register an action.
 /// Wire format in value:
-///   [action_type:u8][timeout_ms:u32][max_retries:u32]
-///   [has_desc:u8]
-///   [has_wasm_module:u8][has_wasm_entrypoint:u8][has_wasm_memory_limit:u8]
-///   [has_trigger_stream:u8][has_trigger_group:u8]
-///
-/// key = owner (used as req.key)
-/// name passed first in value for actual action name
+///   [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
+/// key = action_name.
 pub fn register(
     client: *Client,
     namespace: []const u8,
     action_name: []const u8,
     action_type: u8,
-    _: []const u8, // owner - not used in current wire format
+    owner: []const u8,
     timeout_ms: ?u32,
     max_retries: ?u8,
-    _: ?u32, // retry_delay_ms - not in wire format
+    _: ?u32, // retry_delay_ms - not persisted yet
     _: ?[]const u8, // wasm_module_bytes - removed
 ) !Response {
     var value_buf: [1024]u8 = undefined;
@@ -47,12 +42,9 @@ pub fn register(
     try writer.writeByte(action_type);
     try writer.writeInt(u32, timeout_ms orelse 30_000, .little);
     try writer.writeInt(u32, @as(u32, max_retries orelse 3), .little);
-    try writer.writeByte(0); // no description
-    try writer.writeByte(0); // no wasm_module
-    try writer.writeByte(0); // no wasm_entrypoint
-    try writer.writeByte(0); // no wasm_memory_limit
-    try writer.writeByte(0); // no trigger_stream
-    try writer.writeByte(0); // no trigger_group
+    const owner_len: u16 = @intCast(@min(owner.len, std.math.maxInt(u16)));
+    try writer.writeInt(u16, owner_len, .little);
+    try writer.writeAll(owner[0..owner_len]);
 
     return client.sendRequest(.action_register, namespace, action_name, fbs.buffered());
 }
