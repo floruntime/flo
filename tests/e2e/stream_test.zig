@@ -471,10 +471,15 @@ test "e2e/stream: trim with --maxlen" {
         try ctx.exec(&.{ "stream", "append", "trim-test", msg });
     }
 
-    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-test", "--maxlen", "5" });
+    // JSON output so success is unambiguous: an isError() prints to stderr and
+    // the CLI still exits 0, so asserting on stdout content (not exit code) is
+    // what actually proves the trim worked. (Regression guard for the handler
+    // option-mismatch bug where every trim returned "trim offset is required".)
+    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-test", "--maxlen", "5", "--output", "json" });
     defer result.deinit();
 
-    try testing.expect(result.contains("Trimmed") or result.contains("trim") or result.succeeded());
+    try testing.expect(result.contains("\"status\":\"ok\""));
+    try testing.expect(!result.contains("required"));
 }
 
 test "e2e/stream: trim with --dry-run" {
@@ -485,10 +490,11 @@ test "e2e/stream: trim with --dry-run" {
         try ctx.exec(&.{ "stream", "append", "dryrun-test", "message" });
     }
 
-    var result = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--maxlen", "2", "--dry-run" });
+    var result = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--maxlen", "2", "--dry-run", "--output", "json" });
     defer result.deinit();
 
-    try testing.expect(result.contains("DRY") or result.contains("Would") or result.contains("dry") or result.succeeded());
+    try testing.expect(result.contains("dry_run"));
+    try testing.expect(!result.contains("required"));
 }
 
 test "e2e/stream: delete removes a stream (FLO-105)" {
@@ -2527,18 +2533,20 @@ test "e2e/stream: trim with --before StreamID" {
 
     const id3 = extractStreamId(out3) orelse return error.NoStreamId;
 
-    // Trim everything before id3
-    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-before-test", "--before", id3 });
+    // Trim up to id3 (inclusive boundary).
+    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-before-test", "--before", id3, "--output", "json" });
     defer result.deinit();
 
-    try testing.expect(result.contains("Trimmed") or result.contains("trim") or result.succeeded());
+    try testing.expect(result.contains("\"status\":\"ok\""));
+    try testing.expect(!result.contains("required"));
 
-    // Read remaining — should not contain msg-1 or msg-2
+    // Read remaining — the earlier records are actually gone, later ones remain.
     var read_result = try ctx.cli.run(&.{ "stream", "read", "trim-before-test", "--start", "0-0", "--limit", "10" });
     defer read_result.deinit();
 
-    // msg-3, msg-4, msg-5 should remain; msg-1, msg-2 should be gone
-    try testing.expect(read_result.contains("trim-msg-4") or read_result.contains("trim-msg-5") or read_result.succeeded());
+    try testing.expect(!read_result.contains("trim-msg-1"));
+    try testing.expect(!read_result.contains("trim-msg-2"));
+    try testing.expect(read_result.contains("trim-msg-5"));
 }
 
 test "e2e/stream: group read output contains StreamID format" {
