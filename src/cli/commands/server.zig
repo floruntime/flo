@@ -205,18 +205,10 @@ fn setupSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.HUP, &crash_act, null);
 }
 
-/// Expand ~ to home directory in path
+/// Expand ~ to home directory in path. Delegates to the shared `stdx.fs`
+/// helper so CLI and runtime share one tilde-expansion implementation.
 fn expandTilde(allocator: Allocator, path: []const u8) ![]const u8 {
-    if (path.len > 0 and path[0] == '~') {
-        const home = @import("stdx").io.getenv("HOME") orelse return error.NoHomeDirectory;
-        if (path.len == 1) {
-            return try allocator.dupe(u8, home);
-        }
-        if (path[1] == '/') {
-            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
-        }
-    }
-    return try allocator.dupe(u8, path);
+    return @import("stdx").fs.expandTilde(allocator, path);
 }
 
 // PID file management
