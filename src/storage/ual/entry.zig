@@ -74,6 +74,7 @@ pub const EntryType = enum(u8) {
     queue_ack = 0x21,
     queue_nack = 0x22,
     queue_lease = 0x23,
+    queue_purge = 0x24,
 
     // ── TimeSeries ──
     ts_write = 0x30,
@@ -121,7 +122,7 @@ pub const EntryType = enum(u8) {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_touch => true,
             .stream_append, .stream_trim, .stream_delete => true,
-            .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => true,
+            .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
             .ts_write, .ts_write_batch => true,
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start, .workflow_complete => true,
