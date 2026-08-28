@@ -547,10 +547,55 @@ pub const QueueHandler = struct {
     // ── PURGE ───────────────────────────────────────────────────────────
 
     fn handlePurge(self: *QueueHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // Purge not yet implemented — requires clearing all messages
-        return .{ .err = .{ .code = .invalid_request, .message = "purge not yet implemented" } };
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
+        }
+
+        const ns_hash = router.namespaceHash(req.namespace);
+        const q_name_hash = router.nameHash(ns_hash, req.key);
+
+        // Count what we're about to remove for the response (single-threaded shard).
+        const count: u32 = @intCast(@min(self.queue.countQueue(q_name_hash), std.math.maxInt(u32)));
+
+        // Persist through Raft for durability and replication.
+        if (self.shard_ptr) |sptr| {
+            const shard: *Shard = @ptrCast(@alignCast(sptr));
+            _ = persistence_mod.persistEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            };
+        }
+
+        // Apply locally via a command entry → router → queue.applyEntry(.queue_purge).
+        const next_index = self.partition.ual.max_index + 1;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len;
+        var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256]u8 = undefined;
+        const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
+            break :blk self.allocator.alloc(u8, payload_size) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+            };
+        };
+        defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
+
+        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        const entry = entry_mod.buildCommandEntry(
+            .queue_purge,
+            entry_mod.Flags.NONE,
+            self.partition.current_term,
+            next_index,
+            timestamp_ns,
+            ns_hash,
+            req.key,
+            &[_]u8{},
+            payload_buf,
+        ) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+        };
+
+        _ = self.partition.apply(&entry) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
+        };
+
+        return .{ .queue_purged = .{ .count = count } };
     }
 
     // ── LIST ────────────────────────────────────────────────────────────
@@ -741,6 +786,11 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
         },
         .queue_dlq_messages => |m| {
             shard.sendOkResponse(conn, request_id, m.data);
+        },
+        .queue_purged => |p| {
+            var cnt_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &cnt_buf, p.count, .little);
+            shard.sendOkResponse(conn, request_id, &cnt_buf);
         },
         .kv_not_found => {
             shard.sendErrorResponse(conn, request_id, .not_found, "queue not found");

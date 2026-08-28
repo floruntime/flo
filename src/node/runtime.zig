@@ -329,16 +329,24 @@ pub const Runtime = struct {
 
     /// Start the runtime: create shards, spawn threads, start acceptor.
     pub fn start(self: *Runtime) !void {
+        // Expand a leading `~` to $HOME at the single point where the configured
+        // data dir first becomes real directories. Without this, a default or
+        // CLI-bypassing `~/.flo/data` would have `makePath` create a literal `~`
+        // directory under the current working directory (both here via
+        // ensureTopology and below via each Shard.init).
+        const data_dir = try @import("stdx").fs.expandTilde(self.allocator, self.config.data_dir);
+        defer self.allocator.free(data_dir);
+
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
             self.shard_count,
             self.config.listen_port,
-            self.config.data_dir,
+            data_dir,
         });
 
         // 0. Topology safety — validate shard/partition count against SYSTEM manifest
         try manifest.ensureTopology(
             self.allocator,
-            self.config.data_dir,
+            data_dir,
             self.shard_count,
             self.config.partition_count,
         );
@@ -401,7 +409,7 @@ pub const Runtime = struct {
                 self.shard_count,
                 self.config.partition_count,
                 pipes[i][0],
-                self.config.data_dir,
+                data_dir,
                 self.config.tiered_log.hot_buffer_capacity,
                 self.config.tiered_log.max_hot_entries,
                 self.config.tiered_log.hot_flush_seconds,
@@ -861,9 +869,17 @@ test "Runtime: init and deinit" {
 }
 
 test "Runtime: boot 2 shards and shutdown" {
+    // Use an isolated temp data dir — never the default `~/.flo/data`, which
+    // would otherwise persist into the developer's real home directory.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(data_dir);
+
     var runtime = try Runtime.init(std.testing.allocator, .{
         .num_shards = 2,
         .listen_port = 0, // ephemeral port
+        .data_dir = data_dir,
     });
     defer runtime.deinit();
 

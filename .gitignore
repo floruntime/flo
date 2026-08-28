@@ -17,6 +17,11 @@ test_check
 *.sst
 *.tmp
 
+# Backstop: a literal `~` dir means some path used an unexpanded `~/.flo/data`
+# instead of $HOME. The data dir is expanded at the runtime boundary now, but
+# keep this so a stray one never gets committed. See stdx.fs.expandTilde.
+/~/
+
 # OS
 .DS_Store
 Thumbs.db
