@@ -31,10 +31,12 @@ export function useSeriesData(ns: string, name: string | null, field: string) {
   })
 }
 
-/** Run a FloQL query. The server currently echoes the query with an empty
-    result set — the parser/executor is not wired to the dashboard yet. */
-export function useFloql() {
+/** Run a FloQL query. The server parses it, resolves the source across shards
+    and executes the pipeline, returning the computed series. Namespace-scoped
+    server-side via `?namespace=`. */
+export function useFloql(ns: string) {
   return useMutation({
-    mutationFn: (q: string) => api.get<TsFloqlResponse>(`timeseries/floql?q=${enc(q)}`),
+    mutationFn: (q: string) =>
+      api.get<TsFloqlResponse>(`timeseries/floql?q=${enc(q)}&namespace=${enc(ns)}`),
   })
 }
