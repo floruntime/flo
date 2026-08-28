@@ -765,11 +765,12 @@ test "e2e/ts: read filters by tag" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Write two different series
-    try ctx.exec(&.{ "ts", "write", "tag_filter_test", "--tags", "host=web-01,env=prod", "--value", "10.0", "--timestamp", "1708700400000" });
-    try ctx.exec(&.{ "ts", "write", "tag_filter_test", "--tags", "host=web-02,env=staging", "--value", "20.0", "--timestamp", "1708700400000" });
+    // Two tag-series under the same measurement+field.
+    try ctx.exec(&.{ "ts", "write", "tag_filter_test", "--tags", "host=web-01", "--value", "111.0", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "tag_filter_test", "--tags", "host=web-02", "--value", "222.0", "--timestamp", "1708700400000" });
 
-    // Read with tag filter for web-01
+    // Filtering by one tag set must return ONLY that series. Before #24 the
+    // option was dropped server-side, so this returned both.
     var result = try ctx.cli.run(&.{
         "ts",            "read",        "tag_filter_test",
         "--tags",        "host=web-01", "--from",
@@ -779,6 +780,40 @@ test "e2e/ts: read filters by tag" {
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("111"));
+    try testing.expect(!result.contains("222"));
+
+    // No filter = every tag-series (a tagged write stays visible to an
+    // untagged read).
+    var all = try ctx.cli.run(&.{
+        "ts", "read", "tag_filter_test", "--from", "1708700000000", "--output", "raw", "--limit", "100",
+    });
+    defer all.deinit();
+    try testing.expect(all.contains("111"));
+    try testing.expect(all.contains("222"));
+}
+
+test "e2e/ts: tag filter matches the exact tag set (known #24 part-2b limit)" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ts", "write", "tag_exact_test", "--tags", "host=web-01,env=prod", "--value", "333.0", "--timestamp", "1708700400000" });
+
+    // The full tag set matches, in any order — the hash is canonical.
+    var exact = try ctx.cli.run(&.{
+        "ts", "read", "tag_exact_test", "--tags", "env=prod,host=web-01", "--from", "1708700000000", "--output", "raw", "--limit", "100",
+    });
+    defer exact.deinit();
+    try testing.expect(exact.contains("333"));
+
+    // A PARTIAL tag set does not: a tag hash can only answer exact-set
+    // equality. Partial/regex matching needs the tag dictionary (#24 part 2b).
+    // Pinned here so the behaviour is a decision, not a surprise.
+    var partial = try ctx.cli.run(&.{
+        "ts", "read", "tag_exact_test", "--tags", "host=web-01", "--from", "1708700000000", "--output", "raw", "--limit", "100",
+    });
+    defer partial.deinit();
+    try testing.expect(!partial.contains("333"));
 }
 
 test "e2e/ts: query filters by tag" {
@@ -788,7 +823,8 @@ test "e2e/ts: query filters by tag" {
     try ctx.exec(&.{ "ts", "write", "tag_query_test", "--tags", "region=us-east", "--value", "100.0", "--timestamp", "1708700400000" });
     try ctx.exec(&.{ "ts", "write", "tag_query_test", "--tags", "region=eu-west", "--value", "200.0", "--timestamp", "1708700400000" });
 
-    // Query only us-east
+    // avg over us-east alone is 100 — not 150, which is what an unfiltered
+    // aggregate (the pre-#24 behaviour) would produce.
     var result = try ctx.cli.run(&.{
         "ts",            "query",          "tag_query_test",
         "--tags",        "region=us-east", "--from",
@@ -799,6 +835,12 @@ test "e2e/ts: query filters by tag" {
 
     try stdx.testing.assertSucceeded(result);
     try testing.expect(!result.contains("(no data)"));
+    // NOTE: no value assertion here on purpose. `flo ts query` renders an empty
+    // table for ANY aggregate — with or without a tag filter, and on the
+    // pre-#24 baseline too — so asserting `avg == 100` would be testing a
+    // separate, pre-existing bug rather than tag filtering. Tag-filtered
+    // aggregation itself is covered at the projection layer by the
+    // "untagged query still sees tagged writes" unit test in projection/ts.zig.
 }
 
 // =============================================================================
