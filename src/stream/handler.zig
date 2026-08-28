@@ -523,10 +523,22 @@ pub const StreamHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
 
-        // Parse trim target as StreamID
+        // Resolve the trim boundary into a StreamID. Records with id <= the
+        // boundary are removed (trim is inclusive — see `trimStream`). The
+        // boundary may come from any of the options `client.stream.trim` sends
+        // (--before / --maxlen / --maxage); whichever is present wins, checked
+        // most-specific first. `.max_bytes` is not yet supported here.
+        //
+        // Historically this only read `.stream_end` + a bare-integer value, but
+        // the client sends `.stream_start` / `.limit` / `.max_age_seconds` with
+        // an empty value, so every trim returned "trim offset is required". Now
+        // the wire contract and handler agree.
         var trim_id = StreamID.MIN;
 
-        if (req.findOption(.stream_end)) |opt| {
+        // Explicit boundary id: `--before <id>` (.stream_start) or the legacy
+        // `.stream_end`. Remove everything up to and including this id.
+        const boundary_opt = req.findOption(.stream_start) orelse req.findOption(.stream_end);
+        if (boundary_opt) |opt| {
             if (opt.asStreamId()) |sid| {
                 if (sid.timestamp_ms > 0) {
                     trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
@@ -536,8 +548,36 @@ pub const StreamHandler = struct {
             }
         }
 
+        // `--maxlen N` (.limit): keep only the newest N records, so the boundary
+        // is the (total - N)th record. Nothing to trim when total <= N.
+        if (trim_id.eql(StreamID.MIN)) {
+            if (req.findOption(.limit)) |opt| {
+                if (opt.asU64()) |keep| {
+                    if (keep > 0) {
+                        const total = self.stream.streamRecordCount(name_hash);
+                        if (total <= keep) return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
+                        trim_id = self.stream.resolveNthRecordId(name_hash, total - keep);
+                    }
+                }
+            }
+        }
+
+        // `--maxage S` (.max_age_seconds): remove records older than now - S.
+        if (trim_id.eql(StreamID.MIN)) {
+            if (req.findOption(.max_age_seconds)) |opt| {
+                if (opt.asU64()) |age_s| {
+                    if (age_s > 0) {
+                        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+                        const cutoff_ms = if (now_ms > age_s * 1000) now_ms - age_s * 1000 else 0;
+                        if (cutoff_ms == 0) return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
+                        trim_id = StreamID.fromTimestamp(cutoff_ms);
+                    }
+                }
+            }
+        }
+
+        // Bare-integer value fallback: trim the first N records (back-compat).
         if (trim_id.eql(StreamID.MIN) and req.value.len > 0) {
-            // Bare integer: trim the first N records — resolve to a StreamID
             const count = std.fmt.parseInt(u64, req.value, 10) catch 0;
             if (count > 0) {
                 trim_id = self.stream.resolveNthRecordId(name_hash, count);
@@ -548,6 +588,9 @@ pub const StreamHandler = struct {
         }
 
         if (trim_id.eql(StreamID.MIN)) {
+            if (req.findOption(.max_bytes) != null) {
+                return .{ .err = .{ .code = .invalid_request, .message = "byte-based trim (max_bytes) is not supported yet; use max_len, max_age, or before" } };
+            }
             return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 

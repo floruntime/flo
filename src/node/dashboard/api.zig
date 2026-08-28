@@ -47,7 +47,7 @@ pub fn handleRequest(
         return streams.getStreams(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "streams/")) {
-        return routeStream(allocator, path["streams/".len..], query_string, ctx);
+        return routeStream(allocator, method, path["streams/".len..], query_string, ctx);
     }
 
     // ── queues ──────────────────────────────────────────────
@@ -187,15 +187,28 @@ fn routeNamespace(allocator: Allocator, rest: []const u8, _: ?[]const u8, ctx: *
     return helpers.jsonError(allocator, "Not found");
 }
 
-/// Route /streams/:name[/messages|/groups/:group[/pending|/members]]
-fn routeStream(allocator: Allocator, rest: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+/// Route /streams/:name[/messages|/trim|/groups/:group[/pending|/members]]
+///   GET    /streams/:name                  — detail
+///   DELETE /streams/:name                  — delete stream (?force=true)
+///   POST   /streams/:name/trim             — trim (?max_len|max_age_s|max_bytes|dry_run)
+///   GET    /streams/:name/messages         — messages
+///   GET    /streams/:name/groups/:group    — group detail
+///   DELETE /streams/:name/groups/:group    — delete consumer group
+fn routeStream(allocator: Allocator, method: Method, rest: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     // Split ":name" from optional sub-resource
     const slash_idx = std.mem.indexOfScalar(u8, rest, '/');
     const name = if (slash_idx) |idx| rest[0..idx] else rest;
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
-    if (sub.len == 0) return streams.getStreamDetail(allocator, name, query_string, ctx);
+    if (sub.len == 0) {
+        if (method == .DELETE) return streams.deleteStream(allocator, name, query_string, ctx);
+        return streams.getStreamDetail(allocator, name, query_string, ctx);
+    }
     if (std.mem.eql(u8, sub, "messages")) return streams.getStreamMessages(allocator, name, query_string, ctx);
+    if (std.mem.eql(u8, sub, "trim")) {
+        if (method == .POST) return streams.trimStream(allocator, name, query_string, ctx);
+        return helpers.jsonError(allocator, "Method not allowed");
+    }
 
     // groups/:group[/pending|/members]
     if (std.mem.startsWith(u8, sub, "groups/")) {
@@ -204,7 +217,10 @@ fn routeStream(allocator: Allocator, rest: []const u8, query_string: ?[]const u8
         const group_name = if (group_slash) |idx| group_rest[0..idx] else group_rest;
         const group_sub = if (group_slash) |idx| group_rest[idx + 1 ..] else "";
 
-        if (group_sub.len == 0) return streams.getGroupDetail(allocator, name, group_name, query_string, ctx);
+        if (group_sub.len == 0) {
+            if (method == .DELETE) return streams.deleteGroup(allocator, name, group_name, query_string, ctx);
+            return streams.getGroupDetail(allocator, name, group_name, query_string, ctx);
+        }
         if (std.mem.eql(u8, group_sub, "pending")) return streams.getGroupPending(allocator, name, group_name, query_string, ctx);
         if (std.mem.eql(u8, group_sub, "members")) return streams.getGroupMembers(allocator, name, group_name, query_string, ctx);
     }
