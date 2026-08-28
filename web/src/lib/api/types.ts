@@ -224,10 +224,17 @@ export interface TsDataResponse {
   to_ms: number
   series: TsPoint[]
 }
+export interface TsFloqlSeries {
+  key: string
+  field: string
+  point_count: number
+  tags: { key: string; value: string }[]
+  points: TsPoint[]
+}
 export interface TsFloqlResponse {
   query: string
-  /** Empty — the FloQL parser/executor is not wired to the dashboard yet. */
-  series: unknown[]
+  /** Computed by the FloQL engine — one entry per resulting series. */
+  series: TsFloqlSeries[]
   error?: string
 }
 

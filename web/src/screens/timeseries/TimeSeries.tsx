@@ -2,11 +2,13 @@
    Columnar engine · line-protocol ingest · FloQL pipelines.
 
    Wired to the dashboard API. The TS projection keys write buffers by
-   `measurement\0field` only — there is no tag-series or namespace dimension in
-   storage — so this screen renders what is truly backed: measurements, their
-   fields, per-field point counts, and raw point charts from /data. FloQL is a
-   server echo (executor not wired); ingest is command-only (no write endpoint);
-   measurements are namespace-scoped server-side (`?namespace=`). See API_INTEGRATION.md. */
+   `measurement\0field` only — there is no tag-series dimension in storage — so
+   this screen renders what is truly backed: measurements, their fields,
+   per-field point counts, and raw point charts from /data. FloQL now executes
+   server-side (parser + pipeline executor), but source-level tag filters
+   (`{host=web-01}`) are still no-ops until tags become a series dimension.
+   Ingest is command-only (no write endpoint); measurements are namespace-scoped
+   server-side (`?namespace=`). See API_INTEGRATION.md. */
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { Modal } from '@/components/overlay/Modal'
 import { Crumb, Stats, Stat } from '@/components/layout'
@@ -22,14 +24,6 @@ const vfmt = (v: number): string =>
   v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v >= 100 ? String(Math.round(v)) : v >= 10 ? v.toFixed(0) : v.toFixed(1)
 const hhmm = (ms: number): string =>
   new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-const safeDecode = (s: string): string => {
-  try {
-    return decodeURIComponent(s)
-  } catch {
-    return s
-  }
-}
-
 const CATS = ['var(--cat-1)', 'var(--cat-2)', 'var(--cat-3)', 'var(--cat-4)', 'var(--cat-5)', 'var(--cat-6)']
 
 type ChartDataset = { label: string; color: string; values: number[]; dots?: boolean }
@@ -191,7 +185,7 @@ function TSChart({ datasets, times, unit, height = 236 }: TSChartProps) {
   )
 }
 
-/* ======================= FloQL console (echo) ======================= */
+/* ======================= FloQL console ======================= */
 function floHL(q: string): string {
   let s = q.replace(/&/g, '&amp;').replace(/</g, '&lt;')
   s = s.replace(/^(\w+)/, '<span style="color:var(--tx);font-weight:600">$1</span>')
@@ -212,7 +206,7 @@ function FloQLConsole({ ns, measurements }: { ns: string; measurements: TsMeasur
     [m0],
   )
   const [q, setQ] = useState(samples[0])
-  const floql = useFloql()
+  const floql = useFloql(ns)
   useEffect(() => setQ(samples[0]), [samples])
 
   const run = (text?: string) => {
@@ -222,9 +216,9 @@ function FloQLConsole({ ns, measurements }: { ns: string; measurements: TsMeasur
   }
 
   const res = floql.data
-  // The server echoes the raw `?q=` param without URL-decoding it, so recover
-  // the original text for display.
-  const echoed = res ? safeDecode(res.query) : ''
+  // The server percent-decodes `?q=` before parsing and echoes the decoded
+  // text, so this is already the original query.
+  const echoed = res?.query ?? ''
   return (
     <div className="card" style={{ overflow: 'hidden', marginBottom: 20 }}>
       <div className="card-p" style={{ paddingBottom: 14, borderBottom: '1px solid var(--line-soft)' }}>
@@ -270,35 +264,63 @@ function FloQLConsole({ ns, measurements }: { ns: string; measurements: TsMeasur
           <div className="mono" style={{ fontSize: 12.5, color: 'var(--crit)' }}>
             {String((floql.error as Error)?.message ?? 'Query failed')}
           </div>
+        ) : res?.error ? (
+          <div className="mono" style={{ fontSize: 12.5, color: 'var(--crit)' }}>
+            {res.error}
+          </div>
         ) : res ? (
           <div>
-            <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-2)', marginBottom: 8 }}>
-              accepted · <span style={{ color: 'var(--tx)' }}>{echoed}</span>
+            <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-2)', marginBottom: 10 }}>
+              {res.series.length} series ·{' '}
+              {res.series.reduce((a, s) => a + s.point_count, 0)} points ·{' '}
+              <span style={{ color: 'var(--tx)' }}>{echoed}</span>
             </div>
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'flex-start',
-                gap: 10,
-                fontSize: 12.5,
-                color: 'var(--tx-3)',
-                background: 'var(--card-2)',
-                border: '1px solid var(--line-soft)',
-                borderRadius: 'var(--r-sm)',
-                padding: '11px 13px',
-              }}
-            >
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="var(--warn)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flex: 'none', marginTop: 1 }}>
-                <circle cx="12" cy="12" r="9" />
-                <path d="M12 8v5M12 16h.01" />
-              </svg>
-              <span>
-                The server parsed and echoed the query but returned{' '}
-                <span className="mono">{res.series.length}</span> series — the FloQL parser/executor is not yet
-                wired to the dashboard, so pipeline results aren’t computed here. Use the per-measurement charts
-                below for live data.
-              </span>
-            </div>
+            {res.series.length === 0 ? (
+              <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-faint)' }}>
+                No series matched.
+              </div>
+            ) : (
+              res.series.map((s, i) => (
+                <div key={`${s.key}-${s.field}-${i}`} style={{ marginBottom: 12 }}>
+                  <div className="mono" style={{ fontSize: 12, color: 'var(--tx)', marginBottom: 5 }}>
+                    {s.key}
+                    <span style={{ color: 'var(--tx-faint)' }}>·{s.field}</span>
+                    {s.tags.map((t) => (
+                      <span key={t.key} style={{ color: 'var(--info)' }}>
+                        {' '}
+                        {t.key}={t.value}
+                      </span>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      maxHeight: 190,
+                      overflowY: 'auto',
+                      background: 'var(--card-2)',
+                      border: '1px solid var(--line-soft)',
+                      borderRadius: 'var(--r-sm)',
+                      padding: '8px 11px',
+                    }}
+                  >
+                    {s.points.slice(0, 200).map((p, j) => (
+                      <div
+                        key={j}
+                        className="mono"
+                        style={{ display: 'flex', justifyContent: 'space-between', gap: 16, fontSize: 12, color: 'var(--tx-3)' }}
+                      >
+                        <span>{new Date(p.timestamp).toISOString()}</span>
+                        <span style={{ color: 'var(--tx)' }}>{p.value}</span>
+                      </div>
+                    ))}
+                    {s.points.length > 200 ? (
+                      <div className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)', marginTop: 5 }}>
+                        … {s.points.length - 200} more
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         ) : (
           <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-faint)' }}>
