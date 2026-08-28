@@ -305,20 +305,62 @@ pub fn deleteDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []c
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /queues/:name/purge - Purge all messages from queue
-pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    _ = queue_name;
+/// POST /queues/:name/purge - Purge all live (ready+leased) messages (loopback write).
+pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.queue.purge(&client, ns_q, queue_name) catch
+        return try h.jsonError(allocator, "Purge failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    // Response raw data is a u32 LE count of removed messages.
+    var purged: u32 = 0;
+    if (resp.asRawData()) |data| {
+        if (data.len >= 4) purged = std.mem.readInt(u32, data[0..4], .little);
+    }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread.
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.boolField("ok", true);
-    try obj.intField("purged", 0);
+    try obj.intField("purged", @as(i64, @intCast(purged)));
+    try obj.end();
+    return try json_aw.toOwnedSlice();
+}
+
+/// POST /queues/:name — enqueue a message (loopback write). Body is the payload;
+/// `?priority=` & `?delay_ms=` optional.
+pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const priority: u8 = @intCast(@min(h.parseQueryParam(u64, query_string, "priority") orelse 0, 255));
+    const delay_ms = h.parseQueryParam(u64, query_string, "delay_ms");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority, delay_ms, null) catch
+        return try h.jsonError(allocator, "Enqueue failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    // Response raw data is the assigned sequence number (u64 LE).
+    var seq: u64 = 0;
+    if (resp.asRawData()) |data| {
+        if (data.len >= 8) seq = std.mem.readInt(u64, data[0..8], .little);
+    }
+
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.boolField("ok", true);
+    try obj.stringField("queue", queue_name);
+    try obj.intField("seq", @as(i64, @intCast(seq)));
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -374,16 +416,16 @@ test "getQueueDLQ returns empty list" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"count\":0") != null);
 }
 
-test "purgeQueue returns ok" {
+test "purgeQueue surfaces loopback connect failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here → connect refused
 
-    const result = try purgeQueue(allocator, "test-q", &ctx);
+    const result = try purgeQueue(allocator, "test-q", null, &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"purged\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }
 
 test "requeueDLQEntry surfaces loopback connect failure (no node in unit test)" {

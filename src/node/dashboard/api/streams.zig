@@ -17,6 +17,7 @@ const stream_mod = @import("../../../projection/stream.zig");
 const StreamProjection = stream_mod.StreamProjection;
 const ns_keys = @import("../../../namespace/handler.zig");
 const router = @import("../../router.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
 
 /// Unpack a stream-append batch blob into its individual record payloads, writing
 /// payload slices (into `value`) to `out`. Batch wire format:
@@ -71,6 +72,25 @@ fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
 }
 
+/// Short-lived loopback client to the node's own protocol port — stream
+/// mutations (trim/delete) can't be proposed from the dashboard thread, so they
+/// re-enter through the thread-safe protocol path (see api/workflows.zig).
+fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var ep_buf: [32]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    var client = client_mod.Client.init(allocator, endpoint);
+    errdefer client.deinit();
+    try client.connect();
+    return client;
+}
+
+/// Parse a boolean query param ("true"/"1" → true). `parseQueryParam` only
+/// handles strings and integers, so booleans are decoded here.
+fn boolParam(query_string: ?[]const u8, key: []const u8) bool {
+    const v = h.parseQueryParam([]const u8, query_string, key) orelse return false;
+    return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+}
+
 /// Logical record count for a stream = sum of each append batch's record count
 /// (a batch may carry N records). `sp.streamRecordCount` only counts append
 /// entries, so it under-reports for batched producers. Reads each batch's count
@@ -102,6 +122,42 @@ fn streamLogicalCount(allocator: Allocator, partition: anytype, sp: *StreamProje
     // Extrapolate if the stream has more batches than we sampled.
     if (batches > n) return sum * batches / n;
     return sum;
+}
+
+/// Cumulative append/read record counts for a (namespace, topic), summed across
+/// all partition entries in the metrics registry. Returns zeros if the stream
+/// has no registered metrics yet. Locks the registry once per call.
+const StreamCounts = struct { ingest: u64 = 0, reads: u64 = 0 };
+fn streamCounts(ctx: *DashboardContext, namespace: []const u8, topic: []const u8) StreamCounts {
+    var c = StreamCounts{};
+    ctx.metrics.mutex.lock();
+    defer ctx.metrics.mutex.unlock();
+    var it = ctx.metrics.streams.iterator();
+    while (it.next()) |entry| {
+        const e = entry.value_ptr.*;
+        if (!std.mem.eql(u8, e.topic, topic)) continue;
+        if (!std.mem.eql(u8, e.namespace, namespace)) continue;
+        const snap = e.metrics.snapshot();
+        c.ingest += snap.append_records_total;
+        c.reads += snap.read_records_total;
+    }
+    return c;
+}
+
+/// Render a stream's persisted retention policy into the human string the
+/// console shows. Count/age/bytes are independent caps (first non-zero wins for
+/// display); "∞" means no policy is set.
+fn formatRetention(buf: []u8, meta: stream_mod.StreamMetadata) []const u8 {
+    if (meta.retention_count > 0) return std.fmt.bufPrint(buf, "{d} records", .{meta.retention_count}) catch "∞";
+    if (meta.retention_age_s > 0) {
+        const s = meta.retention_age_s;
+        if (s % 86400 == 0) return std.fmt.bufPrint(buf, "{d}d", .{s / 86400}) catch "∞";
+        if (s % 3600 == 0) return std.fmt.bufPrint(buf, "{d}h", .{s / 3600}) catch "∞";
+        if (s % 60 == 0) return std.fmt.bufPrint(buf, "{d}m", .{s / 60}) catch "∞";
+        return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "∞";
+    }
+    if (meta.retention_bytes > 0) return std.fmt.bufPrint(buf, "{d} bytes", .{meta.retention_bytes}) catch "∞";
+    return "∞";
 }
 
 /// GET /streams - List all streams
@@ -146,16 +202,21 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
                 const gop = try seen.getOrPut(display_name);
                 if (!gop.found_existing) {
-                    const partitions = sp.getPartitionCount(display_name);
+                    const partitions = sp.getPartitionCount(name);
+                    const counts = streamCounts(ctx, effective_ns, display_name);
+                    var ret_buf: [64]u8 = undefined;
+                    const retention = if (sp.stream_metadata.get(name)) |meta| formatRetention(&ret_buf, meta) else "∞";
                     try arr.next();
                     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try obj.begin();
                     try obj.stringField("name", display_name);
                     try obj.stringField("namespace", effective_ns);
                     try obj.intField("partitions", partitions);
-                    try obj.intField("ingest_rate", 0);
-                    try obj.intField("reads", 0);
-                    try obj.stringField("retention", "7d");
+                    // Cumulative record counts (true per-second rate needs client-side
+                    // windowing across polls). Real retention from persisted metadata.
+                    try obj.intField("ingest_rate", counts.ingest);
+                    try obj.intField("reads", counts.reads);
+                    try obj.stringField("retention", retention);
                     try obj.end();
                 }
             }
@@ -175,21 +236,106 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
             }
             const gop = try seen.getOrPut(stream_entry.topic);
             if (!gop.found_existing) {
+                // Metrics-only stream (not registered in any projection) — no
+                // persisted retention metadata is available here. Counts come
+                // straight from this entry's snapshot (we already hold the lock).
+                const snap = stream_entry.metrics.snapshot();
                 try arr.next();
                 var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                 try obj.begin();
                 try obj.stringField("name", stream_entry.topic);
                 try obj.stringField("namespace", stream_entry.namespace);
                 try obj.intField("partitions", 1);
-                try obj.intField("ingest_rate", 0);
-                try obj.intField("reads", 0);
-                try obj.stringField("retention", "7d");
+                try obj.intField("ingest_rate", snap.append_records_total);
+                try obj.intField("reads", snap.read_records_total);
+                try obj.stringField("retention", "∞");
                 try obj.end();
             }
         }
     }
 
     try arr.end();
+    return try json_aw.toOwnedSlice();
+}
+
+/// POST /streams/:name/trim - trim a stream by count/age/bytes (loopback write).
+/// Query: ?namespace= &max_len= &max_age_s= &max_bytes= &dry_run=
+pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const max_len = h.parseQueryParam(u64, query_string, "max_len");
+    const max_age_s = h.parseQueryParam(u64, query_string, "max_age_s");
+    const max_bytes = h.parseQueryParam(u64, query_string, "max_bytes");
+    const dry_run = boolParam(query_string, "dry_run");
+
+    if (max_len == null and max_age_s == null and max_bytes == null) {
+        return try h.jsonError(allocator, "trim requires one of max_len, max_age_s, or max_bytes");
+    }
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.stream.trim(&client, ns_q, stream_name, max_len, null, max_age_s, max_bytes, dry_run) catch
+        return try h.jsonError(allocator, "Trim failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.boolField("ok", true);
+    try obj.stringField("stream", stream_name);
+    try obj.boolField("dry_run", dry_run);
+    try obj.end();
+    return try json_aw.toOwnedSlice();
+}
+
+/// DELETE /streams/:name - delete a stream entirely (loopback write).
+/// Query: ?namespace= &force=  (force required for non-empty streams)
+pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const force = boolParam(query_string, "force");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.stream.delete(&client, ns_q, stream_name, force) catch
+        return try h.jsonError(allocator, "Delete failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.boolField("ok", true);
+    try obj.stringField("stream", stream_name);
+    try obj.boolField("deleted", true);
+    try obj.end();
+    return try json_aw.toOwnedSlice();
+}
+
+/// DELETE /streams/:name/groups/:group - delete a consumer group (loopback write).
+pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.stream.groupDelete(&client, ns_q, stream_name, group_name) catch
+        return try h.jsonError(allocator, "Group delete failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.boolField("ok", true);
+    try obj.stringField("stream", stream_name);
+    try obj.stringField("group", group_name);
+    try obj.boolField("deleted", true);
+    try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
@@ -402,7 +548,7 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
 
 /// GET /streams/:name/groups/:group - Consumer group detail
 pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -411,13 +557,13 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     try obj.begin();
     try obj.stringField("stream", stream_name);
     try obj.stringField("group", group_name);
-    try obj.stringField("namespace", "default");
+    try obj.stringField("namespace", ns_q);
 
     // Find group across shard projections. Groups are keyed per-(stream, group)
-    // as `qualifyGroupKey(ns, stream, group)`; the dashboard scopes to the
-    // default namespace.
+    // as `qualifyGroupKey(ns, stream, group)`; honor the `?namespace=` param so
+    // non-default-namespace streams resolve (matches getStreamDetail).
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
     var found = false;
     const n = shardCount(ctx);
     for (0..n) |i| {
@@ -474,7 +620,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
 
 /// GET /streams/:name/groups/:group/members - Consumer group members (flat array)
 pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -484,7 +630,7 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     try arr.begin();
 
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
@@ -510,7 +656,7 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
 
 /// GET /streams/:name/groups/:group/pending - Pending messages
 pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -524,7 +670,7 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     try pending_arr.begin();
 
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, "default", stream_name, group_name) catch group_name;
+    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
     var pel_count: usize = 0;
     const n = shardCount(ctx);
     for (0..n) |i| {
