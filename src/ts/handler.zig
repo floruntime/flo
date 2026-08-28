@@ -301,23 +301,53 @@ pub const TSHandler = struct {
         else
             "avg";
 
-        // Dispatch to the appropriate aggregation function
+        // `--window` was accepted on the wire and then ignored: every query
+        // collapsed to a single aggregate and reported window_start_ms = 0.
+        // Buckets are aligned to the epoch (ts / window * window) so a bucket's
+        // identity does not depend on the query's `from`.
+        const window_ms: i64 = if (req.findOption(.ts_window_ms)) |opt| blk: {
+            const w = opt.asI64() orelse 0;
+            break :blk if (w > 0) w else DEFAULT_WINDOW_MS;
+        } else DEFAULT_WINDOW_MS;
+
         const ns_hash = router.namespaceHash(req.namespace);
         const tag_filter = requestTagFilter(req);
-        const agg_value: ?f64 = if (std.mem.eql(u8, agg_name, "avg"))
-            self.ts.avg(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
-        else if (std.mem.eql(u8, agg_name, "sum"))
-            self.ts.sum(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
-        else if (std.mem.eql(u8, agg_name, "min"))
-            self.ts.min(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
-        else if (std.mem.eql(u8, agg_name, "max"))
-            self.ts.max(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
-        else if (std.mem.eql(u8, agg_name, "count")) blk: {
-            const c = self.ts.count(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch 0;
-            break :blk @as(f64, @floatFromInt(c));
-        } else null;
 
-        const data = serializeAggResult(self.allocator, measurement, agg_value) catch {
+        var point_buf: [4096]StoredPoint = undefined;
+        const qr = self.ts.queryRange(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns, &point_buf) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "ts query failed" } };
+        };
+        const pts = point_buf[0..qr.points_in_buffer];
+
+        // Points arrive time-ordered, so buckets are produced in order and a
+        // point can only ever extend the most recent bucket.
+        var starts: [MAX_QUERY_BUCKETS]i64 = undefined;
+        var accs: [MAX_QUERY_BUCKETS]BucketAcc = undefined;
+        var nb: usize = 0;
+        for (pts) |pt| {
+            const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
+            const start = @divFloor(ts_ms, window_ms) * window_ms;
+            if (nb > 0 and starts[nb - 1] == start) {
+                accs[nb - 1].add(pt.field_value);
+            } else {
+                if (nb >= MAX_QUERY_BUCKETS) break;
+                starts[nb] = start;
+                accs[nb] = .{};
+                accs[nb].add(pt.field_value);
+                nb += 1;
+            }
+        }
+
+        var buckets: [MAX_QUERY_BUCKETS]QueryBucket = undefined;
+        var out_n: usize = 0;
+        for (starts[0..nb], accs[0..nb]) |start, acc| {
+            if (acc.value(agg_name)) |v| {
+                buckets[out_n] = .{ .start_ms = start, .value = v };
+                out_n += 1;
+            }
+        }
+
+        const data = serializeQueryResult(self.allocator, measurement, buckets[0..out_n]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts query serialization failed" } };
         };
 
@@ -630,37 +660,77 @@ fn serializeDataPoints(allocator: Allocator, points: []const StoredPoint) ![]u8 
     return buf;
 }
 
-/// Serialize aggregation result.
-/// Wire format: [series_count:u32][key_len:u32][key][bucket_count:u32][window_start_ms:i64][value:f64]
-fn serializeAggResult(allocator: Allocator, measurement: []const u8, value: ?f64) ![]u8 {
-    if (value) |v| {
-        // 1 series, 1 bucket
-        const total = 4 + 4 + measurement.len + 4 + 8 + 8;
-        const buf = try allocator.alloc(u8, total);
-        errdefer allocator.free(buf);
-        var offset: usize = 0;
+/// Default aggregation window when the request does not specify one.
+const DEFAULT_WINDOW_MS: i64 = 60_000;
 
-        std.mem.writeInt(u32, buf[offset..][0..4], 1, .little); // series_count
-        offset += 4;
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(measurement.len), .little); // key_len
-        offset += 4;
-        @memcpy(buf[offset .. offset + measurement.len], measurement);
-        offset += measurement.len;
-        std.mem.writeInt(u32, buf[offset..][0..4], 1, .little); // bucket_count
-        offset += 4;
-        std.mem.writeInt(i64, buf[offset..][0..8], 0, .little); // window_start_ms
-        offset += 8;
-        const val_bits: u64 = @bitCast(v);
-        std.mem.writeInt(u64, buf[offset..][0..8], val_bits, .little);
+/// Upper bound on buckets returned by one `ts query`.
+const MAX_QUERY_BUCKETS: usize = 1024;
 
-        return buf;
-    } else {
-        // 0 series
+const QueryBucket = struct {
+    start_ms: i64,
+    value: f64,
+};
+
+/// Running aggregate for one window.
+const BucketAcc = struct {
+    sum: f64 = 0,
+    min_v: f64 = std.math.floatMax(f64),
+    max_v: f64 = -std.math.floatMax(f64),
+    n: usize = 0,
+
+    fn add(self: *BucketAcc, v: f64) void {
+        self.sum += v;
+        self.n += 1;
+        if (v < self.min_v) self.min_v = v;
+        if (v > self.max_v) self.max_v = v;
+    }
+
+    /// Null for an empty bucket or an unrecognised aggregation name.
+    fn value(self: BucketAcc, agg: []const u8) ?f64 {
+        if (self.n == 0) return null;
+        if (std.mem.eql(u8, agg, "avg")) return self.sum / @as(f64, @floatFromInt(self.n));
+        if (std.mem.eql(u8, agg, "sum")) return self.sum;
+        if (std.mem.eql(u8, agg, "min")) return self.min_v;
+        if (std.mem.eql(u8, agg, "max")) return self.max_v;
+        if (std.mem.eql(u8, agg, "count")) return @floatFromInt(self.n);
+        return null;
+    }
+};
+
+/// Serialize an aggregate query result.
+///
+/// Wire format (the CLI parser in cli/commands/ts.zig must match byte for byte —
+/// it previously read a `[hash:u64]` here that no encoder ever wrote, which
+/// misaligned the whole stream and rendered an empty table):
+///   [series_count:u32][key_len:u32][key][bucket_count:u32]([start_ms:i64][value:f64])*
+fn serializeQueryResult(allocator: Allocator, measurement: []const u8, buckets: []const QueryBucket) ![]u8 {
+    if (buckets.len == 0) {
         const buf = try allocator.alloc(u8, 4);
-        errdefer allocator.free(buf);
-        std.mem.writeInt(u32, buf[0..4], 0, .little);
+        std.mem.writeInt(u32, buf[0..4], 0, .little); // series_count = 0
         return buf;
     }
+
+    const total = 4 + 4 + measurement.len + 4 + buckets.len * 16;
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+    var offset: usize = 0;
+
+    std.mem.writeInt(u32, buf[offset..][0..4], 1, .little); // series_count
+    offset += 4;
+    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(measurement.len), .little);
+    offset += 4;
+    @memcpy(buf[offset .. offset + measurement.len], measurement);
+    offset += measurement.len;
+    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(buckets.len), .little);
+    offset += 4;
+    for (buckets) |b| {
+        std.mem.writeInt(i64, buf[offset..][0..8], b.start_ms, .little);
+        offset += 8;
+        std.mem.writeInt(u64, buf[offset..][0..8], @bitCast(b.value), .little);
+        offset += 8;
+    }
+
+    return buf;
 }
 
 /// Serialize list result.
