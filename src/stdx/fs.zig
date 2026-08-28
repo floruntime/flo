@@ -77,6 +77,29 @@ pub fn realpathAlloc(allocator: std.mem.Allocator, pathname: []const u8) ![]u8 {
     return allocator.dupe(u8, buf[0..len]);
 }
 
+/// Expand a leading `~` to `$HOME` so paths are never created literally.
+///
+/// `~` alone → `$HOME`; `~/x` → `$HOME/x`. Any other form (including a `~`
+/// that isn't the first byte) is returned unchanged. The result is always a
+/// freshly allocated copy the caller owns and must free.
+///
+/// This is the single choke point for tilde handling — every code path that
+/// turns a configured data dir into real directories (`makePath`) must route
+/// through here, otherwise an unexpanded `~/.flo/data` silently creates a
+/// literal `~` directory under the current working directory.
+pub fn expandTilde(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
+    if (sub_path.len > 0 and sub_path[0] == '~') {
+        const home = io_mod.getenv("HOME") orelse return error.NoHomeDirectory;
+        if (sub_path.len == 1) {
+            return allocator.dupe(u8, home);
+        }
+        if (sub_path[1] == '/') {
+            return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, sub_path[1..] });
+        }
+    }
+    return allocator.dupe(u8, sub_path);
+}
+
 /// Get the canonical absolute path for `pathname` resolved against `dir`.
 pub fn dirRealpathAlloc(dir: Dir, allocator: std.mem.Allocator, pathname: []const u8) ![]u8 {
     var buf: [max_path_bytes]u8 = undefined;

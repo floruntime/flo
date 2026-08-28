@@ -19,6 +19,7 @@ pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");
 pub const metrics_test = @import("metrics_test.zig");
 pub const dashboard_streams_test = @import("dashboard_streams_test.zig");
+pub const dashboard_queues_test = @import("dashboard_queues_test.zig");
 
 // Future test modules:
 // pub const cluster_test = @import("cluster_test.zig");
