@@ -234,6 +234,11 @@ pub const CommandResult = union(enum) {
         count: u32,
     },
 
+    /// Queue purge response — number of messages removed.
+    queue_purged: struct {
+        count: u32,
+    },
+
     /// Queue list response (pre-serialized)
     /// Wire format: [count:u32] ([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*
     queues_listed: struct {
@@ -884,6 +889,7 @@ pub const CommandResult = union(enum) {
             .queue_peek_messages => .queue_peek_response,
             .queue_dlq_messages => .queue_dlq_list_response,
             .queue_touched => .queue_touch_response,
+            .queue_purged => .queue_purge_response,
             .queues_listed => .queue_list_response,
 
             .action_registered => .action_register_response,
@@ -978,6 +984,7 @@ pub const CommandResult = union(enum) {
             .queue_peek_messages => |m| 1 + 4 + m.data.len, // tag + len + data
             .queue_dlq_messages => |m| 1 + 4 + m.data.len, // tag + len + data (total_count is embedded)
             .queue_touched => 1 + 4, // tag + count
+            .queue_purged => 1 + 4, // tag + count
             .queues_listed => |s| 1 + 4 + s.data.len, // tag + len + data
 
             .action_registered => |a| 1 + 4 + a.name.len + 4 + a.version.len,
@@ -1198,6 +1205,9 @@ pub const CommandResult = union(enum) {
             },
             .queue_touched => |t| {
                 try writer.writeInt(u32, t.count, .little);
+            },
+            .queue_purged => |p| {
+                try writer.writeInt(u32, p.count, .little);
             },
             .queues_listed => |s| {
                 try writeSlice(writer, s.data);
@@ -1536,6 +1546,9 @@ pub const CommandResult = union(enum) {
                 .data = try readSlice(reader, allocator),
             } },
             .queue_touched => .{ .queue_touched = .{
+                .count = try reader.takeInt(u32, .little),
+            } },
+            .queue_purged => .{ .queue_purged = .{
                 .count = try reader.takeInt(u32, .little),
             } },
             .queues_listed => .{ .queues_listed = .{

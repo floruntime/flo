@@ -4028,9 +4028,15 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         return;
     };
+    const owned_owner = alloc.dupe(u8, "") catch {
+        alloc.free(owned_name);
+        alloc.free(owned_ns);
+        return;
+    };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
+        .owner_owned = owned_owner,
         .action_type = .user,
         .version = 1,
         .enabled = true,
@@ -4038,6 +4044,7 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
     }) catch {
         alloc.free(owned_name);
         alloc.free(owned_ns);
+        alloc.free(owned_owner);
     };
 }
 
@@ -4049,9 +4056,15 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_name);
         return;
     };
+    const owned_owner = alloc.dupe(u8, "") catch {
+        alloc.free(owned_name);
+        alloc.free(owned_ns);
+        return;
+    };
     actions.actions.put(owned_name, .{
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
+        .owner_owned = owned_owner,
         .action_type = .user,
         .version = 1,
         .enabled = true,
@@ -4059,6 +4072,7 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
     }) catch {
         alloc.free(owned_name);
         alloc.free(owned_ns);
+        alloc.free(owned_owner);
     };
 }
 

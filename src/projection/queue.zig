@@ -252,6 +252,39 @@ pub const QueueProjection = struct {
         self.stats = .{};
     }
 
+    /// Count the live (ready + leased) messages belonging to one queue.
+    pub fn countQueue(self: *QueueProjection, queue_name_hash: u64) u64 {
+        var n: u64 = 0;
+        var it = self.messages.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.queue_name_hash == queue_name_hash) n += 1;
+        }
+        return n;
+    }
+
+    /// Purge all live (ready + leased) messages for one queue, returning the
+    /// count removed. The ready/lease heaps are left untouched — they self-clean
+    /// lazily on pop (a popped seq missing from `messages` is skipped), so only
+    /// the message store needs mutating. DLQ entries are not per-queue
+    /// addressable (no queue hash on DLQEntry) and are left intact.
+    pub fn purgeQueue(self: *QueueProjection, queue_name_hash: u64) u64 {
+        // Collect matching seqs first; removing during iteration is unsafe.
+        var seqs: std.ArrayList(u64) = .empty;
+        defer seqs.deinit(self.allocator);
+        var it = self.messages.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.queue_name_hash == queue_name_hash) {
+                seqs.append(self.allocator, kv.key_ptr.*) catch return 0;
+            }
+        }
+        for (seqs.items) |seq| {
+            if (self.messages.fetchRemove(seq)) |removed| {
+                if (removed.value.payload.len > 0) self.allocator.free(removed.value.payload);
+            }
+        }
+        return @intCast(seqs.items.len);
+    }
+
     // ─── Core operations ───────────────────────────────────────────────────
 
     /// Enqueue a message with the given priority, UAL index, queue identity, and payload.
@@ -538,6 +571,13 @@ pub const QueueProjection = struct {
             },
             .queue_lease => {
                 // Lease extension — not yet implemented, treat as no-op
+            },
+            .queue_purge => {
+                // Drop all ready+leased messages for one queue. Key = queue name.
+                if (CommandPayload.deserialize(entry.payload)) |cmd| {
+                    const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
+                    _ = self.purgeQueue(q_name_hash);
+                }
             },
             else => {},
         }
