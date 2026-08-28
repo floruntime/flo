@@ -552,8 +552,11 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    // Query response is opaque bytes from query.encodeQueryResult()
-    // Format: [series_count:u32] for each series: [hash:u64][bucket_count:u32] [bucket_start_ms:i64][value:f64]...
+    // Query response bytes, produced by serializeQueryResult() in ts/handler.zig.
+    // Format: [series_count:u32] per series: [key_len:u32][key][bucket_count:u32]
+    //         then per bucket: [start_ms:i64][value:f64]
+    // NB: this used to read a [hash:u64] here that no encoder ever wrote, which
+    // misaligned the stream so every aggregate rendered as an empty table.
     const data = result.asRawData() orelse {
         ctx.print("(no data)\n", .{});
         return;
@@ -584,7 +587,8 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
 
             var s: u32 = 0;
             while (s < series_count) : (s += 1) {
-                _ = reader.readU64() orelse break; // series hash
+                const key_len = reader.readU32() orelse break;
+                _ = reader.readSlice(key_len) orelse break; // series key
                 const bucket_count = reader.readU32() orelse break;
                 var b: u32 = 0;
                 while (b < bucket_count) : (b += 1) {
@@ -606,11 +610,12 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
             ctx.print("{{\n  \"series\": [\n", .{});
             var s: u32 = 0;
             while (s < series_count) : (s += 1) {
-                const hash = reader.readU64() orelse break;
+                const key_len = reader.readU32() orelse break;
+                const key = reader.readSlice(key_len) orelse break;
                 const bucket_count = reader.readU32() orelse break;
 
                 if (s > 0) ctx.print(",\n", .{});
-                ctx.print("    {{\"series_hash\": {d}, \"buckets\": [\n", .{hash});
+                ctx.print("    {{\"series\": \"{s}\", \"buckets\": [\n", .{key});
 
                 var b: u32 = 0;
                 while (b < bucket_count) : (b += 1) {

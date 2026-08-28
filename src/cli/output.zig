@@ -97,6 +97,7 @@ pub const Table = struct {
 
     pub fn deinit(self: *Table) void {
         for (self.rows.items) |row| {
+            for (row) |cell| self.allocator.free(cell);
             self.allocator.free(row);
         }
         self.rows.deinit(self.allocator);
@@ -125,8 +126,19 @@ pub const Table = struct {
             }
         }
 
-        // Store row (make a copy of the slice)
-        const row_copy = try self.allocator.dupe([]const u8, values);
+        // Copy the cell CONTENTS, not just the slice array. Callers routinely
+        // format cells into a stack buffer that is reused on the next loop
+        // iteration, so storing borrowed slices made every row render with the
+        // last row's text (this is what made multi-bucket `ts query` output
+        // print the same bucket N times).
+        const row_copy = try self.allocator.alloc([]const u8, values.len);
+        errdefer self.allocator.free(row_copy);
+        var filled: usize = 0;
+        errdefer for (row_copy[0..filled]) |cell| self.allocator.free(cell);
+        for (values, 0..) |val, i| {
+            row_copy[i] = try self.allocator.dupe(u8, val);
+            filled = i + 1;
+        }
         try self.rows.append(self.allocator, row_copy);
     }
 

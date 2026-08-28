@@ -833,14 +833,19 @@ test "e2e/ts: query filters by tag" {
     });
     defer result.deinit();
 
+    // avg over us-east alone is 100 — not 150, which is what an unfiltered
+    // aggregate would produce.
     try stdx.testing.assertSucceeded(result);
     try testing.expect(!result.contains("(no data)"));
-    // NOTE: no value assertion here on purpose. `flo ts query` renders an empty
-    // table for ANY aggregate — with or without a tag filter, and on the
-    // pre-#24 baseline too — so asserting `avg == 100` would be testing a
-    // separate, pre-existing bug rather than tag filtering. Tag-filtered
-    // aggregation itself is covered at the projection layer by the
-    // "untagged query still sees tagged writes" unit test in projection/ts.zig.
+    try testing.expect(result.contains("100"));
+    try testing.expect(!result.contains("150"));
+
+    // Unfiltered spans both tag-series: (100+200)/2 = 150.
+    var all = try ctx.cli.run(&.{
+        "ts", "query", "tag_query_test", "--from", "1708700000000", "--window", "1m", "--agg", "avg",
+    });
+    defer all.deinit();
+    try testing.expect(all.contains("150"));
 }
 
 // =============================================================================
@@ -1376,4 +1381,63 @@ test "e2e/ts: list returns all measurements across shards" {
     for (measurements) |m| {
         try stdx.testing.assertContains(result, m);
     }
+}
+
+test "e2e/ts: query renders real aggregate values" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // `ts query` used to render an empty table for every aggregate: the CLI
+    // parsed a [hash:u64] the server never wrote, misaligning the stream.
+    try ctx.exec(&.{ "ts", "write", "agg_vals", "--value", "100.0", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "agg_vals", "--value", "200.0", "--timestamp", "1708700400000" });
+
+    const cases = [_][2][]const u8{
+        .{ "avg", "150" },
+        .{ "sum", "300" },
+        .{ "min", "100" },
+        .{ "max", "200" },
+        .{ "count", "2" },
+    };
+    inline for (cases) |c| {
+        var r = try ctx.cli.run(&.{
+            "ts", "query", "agg_vals", "--from", "1708700000000", "--window", "1m", "--agg", c[0],
+        });
+        defer r.deinit();
+        try stdx.testing.assertSucceeded(r);
+        try testing.expect(r.contains(c[1]));
+        // A real epoch-aligned bucket start, not the hardcoded 0 it used to emit.
+        try testing.expect(r.contains("1708700400000"));
+    }
+}
+
+test "e2e/ts: query buckets by window" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Two points in one minute, a third in a later minute.
+    try ctx.exec(&.{ "ts", "write", "agg_win", "--value", "10.0", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "agg_win", "--value", "20.0", "--timestamp", "1708700430000" });
+    try ctx.exec(&.{ "ts", "write", "agg_win", "--value", "90.0", "--timestamp", "1708700520000" });
+
+    // 1m → two buckets: avg 15 then avg 90. `--window` was previously ignored
+    // (one bucket for the whole range), and every row rendered the LAST row's
+    // text because the table borrowed the caller's reused format buffer.
+    var one_min = try ctx.cli.run(&.{
+        "ts", "query", "agg_win", "--from", "1708700000000", "--window", "1m", "--agg", "avg",
+    });
+    defer one_min.deinit();
+    try stdx.testing.assertSucceeded(one_min);
+    try testing.expect(one_min.contains("15"));
+    try testing.expect(one_min.contains("90"));
+    try testing.expect(one_min.contains("1708700400000"));
+    try testing.expect(one_min.contains("1708700520000"));
+
+    // 5m → a single bucket covering all three: (10+20+90)/3 = 40.
+    var five_min = try ctx.cli.run(&.{
+        "ts", "query", "agg_win", "--from", "1708700000000", "--window", "5m", "--agg", "avg",
+    });
+    defer five_min.deinit();
+    try testing.expect(five_min.contains("40"));
+    try testing.expect(!five_min.contains("1708700520000"));
 }
