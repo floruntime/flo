@@ -160,6 +160,21 @@ pub const ProcessingHandler = struct {
 
         // Tag registry — heap-allocated, used by classify operators for tag resolution
         tag_registry: ?*definition.TagRegistry = null,
+
+        // ── Live runtime metrics (ephemeral; reset on submit/restart) ──
+        // Surfaced per-job on the dashboard Metrics tab (issue #27). All cheap
+        // counters updated on the hot tick path; no persistence.
+        /// Records emitted from the operator chain into the sink stage.
+        records_out: u64 = 0,
+        /// Records read on the last productive tick (vs batch_size → saturation).
+        last_read_count: u32 = 0,
+        /// Highest event-time watermark observed (0 = none / processing-time source).
+        watermark_ms: i64 = 0,
+        /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
+        tick_ns_last: u64 = 0,
+        tick_ns_max: u64 = 0,
+        tick_ns_sum: u64 = 0,
+        tick_count: u64 = 0,
     };
 
     pub const JobStatus = enum(u8) {
@@ -1304,9 +1319,23 @@ pub const ProcessingHandler = struct {
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
             pipe.last_poll_ms = now_ms;
 
+            // Time the tick, but only record latency/throughput for *productive*
+            // ticks (those that actually read records) so idle polls don't skew
+            // the averages toward zero. `records_processed` counts source reads.
+            const before = job.records_processed;
+            const t0 = @import("stdx").time.nanoTimestamp();
             switch (pipe.source_kind) {
                 .ts => self.tickTsSource(pipe, shard, job),
                 .stream => self.tickStreamSource(pipeline_key, pipe, shard, job),
+            }
+            const processed = job.records_processed - before;
+            if (processed > 0) {
+                const dur: u64 = @intCast(@max(@as(i128, 0), @import("stdx").time.nanoTimestamp() - t0));
+                pipe.last_read_count = @intCast(@min(processed, std.math.maxInt(u32)));
+                pipe.tick_ns_last = dur;
+                pipe.tick_ns_max = @max(pipe.tick_ns_max, dur);
+                pipe.tick_ns_sum += dur;
+                pipe.tick_count += 1;
             }
         }
     }
@@ -1352,6 +1381,9 @@ pub const ProcessingHandler = struct {
             if (pt.timestamp_ns >= pipe.ts_cursor_ns) {
                 pipe.ts_cursor_ns = pt.timestamp_ns + 1;
             }
+
+            // Event-time watermark = highest source point timestamp seen.
+            if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
 
             job.records_processed += 1;
         }
@@ -1491,6 +1523,7 @@ pub const ProcessingHandler = struct {
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
     fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64, record_tags: u32) void {
+        pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
             switch (snk.kind) {
@@ -1521,6 +1554,7 @@ pub const ProcessingHandler = struct {
     /// `record_key` is the record's partitioning key (set by `keyby`, empty otherwise);
     /// it is used to construct the KV sink key.
     fn writeSinkRecordFromStream(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, record_key: []const u8, payload: []const u8, record_tags: u32) void {
+        pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
             switch (snk.kind) {

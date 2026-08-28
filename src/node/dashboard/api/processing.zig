@@ -42,6 +42,88 @@ fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
 }
 
+/// Live per-job runtime metrics for the dashboard Metrics tab (issue #27).
+/// Counters come from the job's pipeline state(s); rates are derived against the
+/// job's elapsed lifetime. `running` is false when no pipeline exists (stopped
+/// jobs), in which case the live gauges are zero but cumulative counts persist.
+const JobMetrics = struct {
+    records_in: u64,
+    records_out: u64 = 0,
+    throughput_per_sec: f64 = 0,
+    output_per_sec: f64 = 0,
+    last_read_count: u32 = 0,
+    batch_size: u32,
+    idle_ms: i64 = 0,
+    watermark_ms: i64 = 0,
+    watermark_lag_ms: i64 = 0,
+    latency_last_ms: f64 = 0,
+    latency_avg_ms: f64 = 0,
+    latency_max_ms: f64 = 0,
+    running: bool = false,
+};
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn jobMetrics(shard: *Shard, job: *const ProcessingHandler.JobRecord, now_ms: i64) JobMetrics {
+    var m = JobMetrics{ .records_in = job.records_processed, .batch_size = job.batch_size };
+    const elapsed_s: f64 = @as(f64, @floatFromInt(@max(@as(i64, 1), now_ms - job.created_at_ms))) / 1000.0;
+    m.throughput_per_sec = @as(f64, @floatFromInt(m.records_in)) / elapsed_s;
+
+    // A job maps to one pipeline, or several `job_id\0idx` entries for a
+    // multi-source job; aggregate across all that belong to this job. Pipelines
+    // live on the same shard as the job, so scanning this shard suffices.
+    var tick_sum: u64 = 0;
+    var tick_count: u64 = 0;
+    var tick_max: u64 = 0;
+    var last_ns: u64 = 0;
+    var last_poll: i64 = 0;
+    var it = shard.processing_handler.pipelines.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        const base = if (std.mem.indexOfScalar(u8, key, 0)) |p| key[0..p] else key;
+        if (!std.mem.eql(u8, base, job.job_id_owned)) continue;
+        const pipe = e.value_ptr;
+        m.running = true;
+        m.records_out += pipe.records_out;
+        if (pipe.last_read_count > m.last_read_count) m.last_read_count = pipe.last_read_count;
+        if (pipe.watermark_ms > m.watermark_ms) m.watermark_ms = pipe.watermark_ms;
+        if (pipe.last_poll_ms > last_poll) last_poll = pipe.last_poll_ms;
+        tick_sum += pipe.tick_ns_sum;
+        tick_count += pipe.tick_count;
+        if (pipe.tick_ns_max > tick_max) tick_max = pipe.tick_ns_max;
+        if (pipe.tick_ns_last > last_ns) last_ns = pipe.tick_ns_last;
+    }
+
+    m.output_per_sec = @as(f64, @floatFromInt(m.records_out)) / elapsed_s;
+    m.idle_ms = if (last_poll > 0) now_ms - last_poll else 0;
+    m.latency_last_ms = nsToMs(last_ns);
+    m.latency_max_ms = nsToMs(tick_max);
+    m.latency_avg_ms = if (tick_count > 0) nsToMs(tick_sum / tick_count) else 0;
+    m.watermark_lag_ms = if (m.watermark_ms > 0) now_ms - m.watermark_ms else 0;
+    return m;
+}
+
+fn writeJobMetrics(obj: anytype, m: JobMetrics) !void {
+    var mo = try obj.objectField("metrics");
+    try mo.begin();
+    try mo.intField("records_in", @as(i64, @intCast(m.records_in)));
+    try mo.intField("records_out", @as(i64, @intCast(m.records_out)));
+    try mo.floatField("throughput_per_sec", m.throughput_per_sec);
+    try mo.floatField("output_per_sec", m.output_per_sec);
+    try mo.intField("last_read_count", @as(i64, @intCast(m.last_read_count)));
+    try mo.intField("batch_size", @as(i64, @intCast(m.batch_size)));
+    try mo.intField("idle_ms", m.idle_ms);
+    try mo.intField("watermark_ms", m.watermark_ms);
+    try mo.intField("watermark_lag_ms", m.watermark_lag_ms);
+    try mo.floatField("latency_last_ms", m.latency_last_ms);
+    try mo.floatField("latency_avg_ms", m.latency_avg_ms);
+    try mo.floatField("latency_max_ms", m.latency_max_ms);
+    try mo.boolField("running", m.running);
+    try mo.end();
+}
+
 /// Router for /processing/* requests
 pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     // /processing/jobs (exact)
@@ -96,6 +178,7 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
+    const now_ms = @import("stdx").time.milliTimestamp();
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
@@ -118,6 +201,7 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
                     try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
                     try obj.intField("created_at", job.created_at_ms);
                     try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
+                    try writeJobMetrics(&obj, jobMetrics(shard, job, now_ms));
                     try obj.end();
                 }
             }
@@ -153,6 +237,7 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
         try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
         try obj.intField("created_at", job.created_at_ms);
         try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
+        try writeJobMetrics(&obj, jobMetrics(shard, job, @import("stdx").time.milliTimestamp()));
         // Full pipeline definition — the frontend parses this for the source/
         // operator/sink DAG.
         try obj.stringField("yaml", job.yaml_owned);
