@@ -2,11 +2,12 @@
    Columnar engine · line-protocol ingest · FloQL pipelines.
 
    Wired to the dashboard API. The TS projection keys write buffers by
-   `measurement\0field` only — there is no tag-series dimension in storage — so
-   this screen renders what is truly backed: measurements, their fields,
-   per-field point counts, and raw point charts from /data. FloQL now executes
-   server-side (parser + pipeline executor), but source-level tag filters
-   (`{host=web-01}`) are still no-ops until tags become a series dimension.
+   `measurement\0field\0tag_hash`, so tags are a real series dimension: this
+   screen renders measurements, their fields, per-field point counts, and raw
+   point charts from /data (add `?tags=k=v` to scope to one tag-series). FloQL
+   executes server-side (parser + pipeline executor) and its source tag filters
+   are applied when they name a complete tag set with `=`; partial sets and
+   `!=`/`=~`/`!~` still fall back to unfiltered until the tag dictionary lands.
    Ingest is command-only (no write endpoint); measurements are namespace-scoped
    server-side (`?namespace=`). See API_INTEGRATION.md. */
 import { useState, useEffect, useMemo, useRef } from 'react'

@@ -17,6 +17,8 @@ const router = @import("../../router.zig");
 const floql_parser = @import("../../../ts/floql/parser.zig");
 const floql_executor = @import("../../../ts/floql/executor.zig");
 const ss_mod = @import("../../../ts/floql/series_set.zig");
+const floql_ast = @import("../../../ts/floql/ast.zig");
+const ts_projection = @import("../../../projection/ts.zig");
 
 // ── Helpers ──
 
@@ -43,6 +45,22 @@ fn keyMeasurement(key: []const u8) []const u8 {
 
 fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
+}
+
+/// Turn FloQL source tag filters into an exact tag-set hash. A hash can only
+/// answer exact-set equality, so this applies only when every filter is `=`;
+/// `!=`, `=~`, `!~` and partial tag sets return null (unfiltered) rather than
+/// silently matching nothing. Mirrors `TSHandler.floqlTagFilter` — real
+/// partial/regex tag matching needs the tag dictionary (#24 part 2b).
+fn floqlTagFilter(filters: []const floql_ast.TagFilter, scratch: []u8) ?u64 {
+    if (filters.len == 0) return null;
+    var pairs_buf: [32]ts_projection.TagPair = undefined;
+    if (filters.len > pairs_buf.len) return null;
+    for (filters, 0..) |f, i| {
+        if (f.op != .eq) return null;
+        pairs_buf[i] = .{ .key = f.key, .value = f.value };
+    }
+    return ts_projection.canonicalTagHashPairs(pairs_buf[0..filters.len], scratch);
 }
 
 /// GET /timeseries — List all measurements with field counts and stats
@@ -176,6 +194,11 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
 pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const field = h.parseQueryParam([]const u8, query_string, "field") orelse "value";
     const ns_hash = router.namespaceHash(h.parseQueryParam([]const u8, query_string, "namespace") orelse "default");
+    // `?tags=host=web-01,env=prod` selects one tag-series; absent = every tag-series.
+    const tag_filter: ?u64 = if (h.parseQueryParam([]const u8, query_string, "tags")) |t|
+        (if (t.len > 0) ts_projection.canonicalTagHash(t) else null)
+    else
+        null;
     const from_str = h.parseQueryParam([]const u8, query_string, "from");
     const to_str = h.parseQueryParam([]const u8, query_string, "to");
     const window = h.parseQueryParam(u64, query_string, "window") orelse 0;
@@ -211,7 +234,7 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         for (0..n) |i| {
             if (getTSProjection(ctx, i)) |ts| {
                 var point_buf: [1024]StoredPoint = undefined;
-                const result = ts.queryRange(ns_hash, measurement, field, from_ns, to_ns, &point_buf) catch continue;
+                const result = ts.queryRange(ns_hash, measurement, field, tag_filter, from_ns, to_ns, &point_buf) catch continue;
                 if (result.points_in_buffer > 0) {
                     for (point_buf[0..result.points_in_buffer]) |pt| {
                         try series_arr.next();
@@ -293,6 +316,12 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     }
 
     // 4. Resolve the source across every shard.
+    //
+    // Source tag filters are applied here when they are expressible as an exact
+    // tag-set hash (all `=`); `!=`/regex/partial sets stay unfiltered — see
+    // floqlTagFilter.
+    var tag_scratch: [1024]u8 = undefined;
+    const src_tag_filter = floqlTagFilter(query.source.filters, &tag_scratch);
     const StoredPoint = @import("../../../projection/ts.zig").StoredPoint;
     var points: std.ArrayList(ss_mod.DataPoint) = .empty;
     defer points.deinit(allocator);
@@ -301,7 +330,7 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
         for (0..n) |i| {
             if (getTSProjection(ctx, i)) |ts| {
                 var point_buf: [4096]StoredPoint = undefined;
-                const qr = ts.queryRange(ns_hash, measurement, field_name, from_ns, to_ns, &point_buf) catch continue;
+                const qr = ts.queryRange(ns_hash, measurement, field_name, src_tag_filter, from_ns, to_ns, &point_buf) catch continue;
                 for (point_buf[0..qr.points_in_buffer]) |sp| {
                     points.append(allocator, .{
                         .timestamp_ms = @intCast(sp.timestamp_ns / std.time.ns_per_ms),

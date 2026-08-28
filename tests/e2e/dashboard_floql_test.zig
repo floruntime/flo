@@ -90,3 +90,30 @@ test "e2e/dashboard: floql reports a parse error" {
     defer resp.deinit();
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
 }
+
+test "e2e/dashboard: floql source tag filters actually filter (#24 part 2a)" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // Two tag-series under one measurement+field.
+    try ctx.exec(&.{ "ts", "write", "dash_tags", "--tags", "host=web-01", "--value", "10.0" });
+    try ctx.exec(&.{ "ts", "write", "dash_tags", "--tags", "host=web-02", "--value", "20.0" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    // `{host=web-01}` selects one series → avg is 10, not 15. Before #24 part 2a
+    // the filter was parsed and then ignored, so this returned 15.
+    var one = try http.post("/api/v1/timeseries/floql", "dash_tags{host=web-01} [1h] | avg()");
+    defer one.deinit();
+    try testing.expectEqual(@as(u16, 200), one.status);
+    try testing.expect(std.mem.indexOf(u8, one.body, "\"value\":10") != null);
+    try testing.expect(std.mem.indexOf(u8, one.body, "\"value\":15") == null);
+
+    // No filter still spans every tag-series → avg is 15.
+    var all = try http.post("/api/v1/timeseries/floql", "dash_tags[1h] | avg()");
+    defer all.deinit();
+    try testing.expect(std.mem.indexOf(u8, all.body, "\"value\":15") != null);
+}

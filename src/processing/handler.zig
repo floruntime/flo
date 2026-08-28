@@ -1134,20 +1134,18 @@ pub const ProcessingHandler = struct {
     }
 
     fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *definition.TagRegistry) void {
-        // Compute tag hash for TS source filtering (same algorithm as TSHandler)
+        // Canonical tag hash for TS source selection — must match the write
+        // path exactly (ts_mod.canonicalTagHash), or the series won't be found.
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
-            var tag_buf: [1024]u8 = undefined;
-            var pos: usize = 0;
+            var pairs_buf: [32]ts_mod.TagPair = undefined;
+            var n: usize = 0;
             var i: usize = 0;
-            while (i + 1 < src.ts_tags.len) : (i += 2) {
-                if (pos > 0 and pos < tag_buf.len) {
-                    tag_buf[pos] = ',';
-                    pos += 1;
-                }
-                const kv = std.fmt.bufPrint(tag_buf[pos..], "{s}={s}", .{ src.ts_tags[i], src.ts_tags[i + 1] }) catch break;
-                pos += kv.len;
+            while (i + 1 < src.ts_tags.len and n < pairs_buf.len) : (i += 2) {
+                pairs_buf[n] = .{ .key = src.ts_tags[i], .value = src.ts_tags[i + 1] };
+                n += 1;
             }
-            break :blk if (pos > 0) std.hash.Wyhash.hash(0, tag_buf[0..pos]) else 0;
+            var tag_buf: [1024]u8 = undefined;
+            break :blk if (n > 0) ts_mod.canonicalTagHashPairs(pairs_buf[0..n], &tag_buf) else 0;
         } else 0;
 
         // Instantiate operator chain from definition
@@ -1343,10 +1341,14 @@ pub const ProcessingHandler = struct {
     /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
     fn tickTsSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         var point_buf: [256]StoredPoint = undefined;
+        // Tags are part of the series key now, so a configured tag set selects
+        // the series directly instead of being scanned for after the fact (which
+        // also wasted the point budget on non-matching points).
         const result = shard.ts_handler.ts.queryRange(
             router.namespaceHash(pipe.src_namespace),
             pipe.src_measurement,
             pipe.src_field,
+            if (pipe.src_tag_hash != 0) pipe.src_tag_hash else null,
             pipe.ts_cursor_ns,
             std.math.maxInt(u64),
             &point_buf,
@@ -1356,9 +1358,6 @@ pub const ProcessingHandler = struct {
         if (points.len == 0) return;
 
         for (points) |pt| {
-            // Filter by tag hash if specified
-            if (pipe.src_tag_hash != 0 and pt.tag_hash != pipe.src_tag_hash) continue;
-
             // Format TS point as JSON record
             var json_buf: [512]u8 = undefined;
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);

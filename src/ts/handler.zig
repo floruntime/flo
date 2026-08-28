@@ -169,11 +169,12 @@ pub const TSHandler = struct {
             break :blk if (ts_ms > 0) @intCast(@as(u64, @bitCast(ts_ms)) * 1_000_000) else serverTimestampNs();
         } else serverTimestampNs();
 
-        // Tag hash (simplified): hash the comma-separated tag string if present
-        const tag_hash: u64 = if (req.findOption(.ts_tags)) |opt| blk: {
-            const tags_str = opt.asString();
-            break :blk if (tags_str.len > 0) std.hash.Wyhash.hash(0, tags_str) else 0;
-        } else 0;
+        // Canonical tag hash — sorted pairs, so tag ordering is not part of
+        // the series identity (see ts_mod.canonicalTagHash).
+        const tag_hash: u64 = if (req.findOption(.ts_tags)) |opt|
+            ts_mod.canonicalTagHash(opt.asString())
+        else
+            0;
 
         // Persist through Raft for durability and replication
         var ual_index: u64 = 0;
@@ -205,6 +206,36 @@ pub const TSHandler = struct {
 
     // ── READ ────────────────────────────────────────────────────────────
 
+    /// Turn FloQL source tag filters into an exact tag-set hash.
+    ///
+    /// A tag *hash* can only answer exact-set equality, so this applies only
+    /// when every filter is `=` AND the filters name the point's complete tag
+    /// set. `!=`, `=~`, `!~` — and partial tag sets — are unanswerable from a
+    /// hash, so we return null (unfiltered, i.e. today's behaviour) rather than
+    /// silently returning nothing. Real partial/regex tag matching needs the
+    /// tag dictionary (issue #24 part 2b).
+    fn floqlTagFilter(filters: []const floql_ast.TagFilter, scratch: []u8) ?u64 {
+        if (filters.len == 0) return null;
+        var pairs_buf: [32]ts_mod.TagPair = undefined;
+        if (filters.len > pairs_buf.len) return null;
+        for (filters, 0..) |f, i| {
+            if (f.op != .eq) return null; // not expressible as a set hash
+            pairs_buf[i] = .{ .key = f.key, .value = f.value };
+        }
+        return ts_mod.canonicalTagHashPairs(pairs_buf[0..filters.len], scratch);
+    }
+
+    /// Optional tag-set filter for a read: `null` when the request names no
+    /// tags, which means "any tags" and fans out across every tag-series.
+    /// Previously `.ts_tags` was accepted on the wire and silently dropped, so
+    /// every tag filter was a no-op.
+    fn requestTagFilter(req: Request) ?u64 {
+        const opt = req.findOption(.ts_tags) orelse return null;
+        const tags_str = opt.asString();
+        if (tags_str.len == 0) return null;
+        return ts_mod.canonicalTagHash(tags_str);
+    }
+
     fn handleRead(self: *TSHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
@@ -229,7 +260,7 @@ pub const TSHandler = struct {
 
         // Query raw points
         var point_buf: [4096]StoredPoint = undefined;
-        const result = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, from_ns, to_ns, &point_buf) catch {
+        const result = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, requestTagFilter(req), from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
 
@@ -272,16 +303,17 @@ pub const TSHandler = struct {
 
         // Dispatch to the appropriate aggregation function
         const ns_hash = router.namespaceHash(req.namespace);
+        const tag_filter = requestTagFilter(req);
         const agg_value: ?f64 = if (std.mem.eql(u8, agg_name, "avg"))
-            self.ts.avg(ns_hash, measurement, field_name, from_ns, to_ns) catch null
+            self.ts.avg(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "sum"))
-            self.ts.sum(ns_hash, measurement, field_name, from_ns, to_ns) catch null
+            self.ts.sum(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "min"))
-            self.ts.min(ns_hash, measurement, field_name, from_ns, to_ns) catch null
+            self.ts.min(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "max"))
-            self.ts.max(ns_hash, measurement, field_name, from_ns, to_ns) catch null
+            self.ts.max(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch null
         else if (std.mem.eql(u8, agg_name, "count")) blk: {
-            const c = self.ts.count(ns_hash, measurement, field_name, from_ns, to_ns) catch 0;
+            const c = self.ts.count(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns) catch 0;
             break :blk @as(f64, @floatFromInt(c));
         } else null;
 
@@ -341,7 +373,9 @@ pub const TSHandler = struct {
 
         // 3. Query the TSProjection for raw points
         var point_buf: [4096]StoredPoint = undefined;
-        const qr = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, from_ns, to_ns, &point_buf) catch {
+        var tag_scratch: [1024]u8 = undefined;
+        const src_tag_filter = floqlTagFilter(query.source.filters, &tag_scratch);
+        const qr = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, src_tag_filter, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
         };
 
