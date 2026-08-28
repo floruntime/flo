@@ -83,10 +83,14 @@ pub const ActionsHandler = struct {
     pub const ActionRecord = struct {
         name_owned: []const u8,
         namespace_owned: []const u8,
+        /// Owner/team string from `--owner` (always an owned slice, possibly empty).
+        owner_owned: []const u8,
         action_type: ActionType,
         version: u32,
         enabled: bool,
         created_at_ns: u64,
+        /// Execution timeout in ms from `--timeout` (persisted; default 30s).
+        timeout_ms: u32 = 30_000,
         max_retries: u32 = 3,
     };
 
@@ -124,6 +128,7 @@ pub const ActionsHandler = struct {
         while (ait.next()) |entry| {
             self.allocator.free(entry.value_ptr.namespace_owned);
             self.allocator.free(entry.value_ptr.name_owned);
+            self.allocator.free(entry.value_ptr.owner_owned);
         }
         self.actions.deinit();
 
@@ -464,6 +469,29 @@ pub const ActionsHandler = struct {
 
     // ── REGISTER ────────────────────────────────────────────────────────
 
+    const RegisterMeta = struct {
+        action_type: ActionType,
+        timeout_ms: u32,
+        max_retries: u32,
+        owner: []const u8,
+    };
+
+    /// Parse the action-register wire value:
+    ///   `[action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]`
+    /// Every field is defaulted so short/legacy values still parse. `owner` is a
+    /// borrowed slice into `value`; the caller dupes it if it needs ownership.
+    fn parseRegisterValue(value: []const u8) RegisterMeta {
+        var m = RegisterMeta{ .action_type = .user, .timeout_ms = 30_000, .max_retries = 3, .owner = "" };
+        if (value.len > 0) m.action_type = ActionType.fromU8(value[0]);
+        if (value.len >= 5) m.timeout_ms = std.mem.readInt(u32, value[1..5], .little);
+        if (value.len >= 9) m.max_retries = std.mem.readInt(u32, value[5..9], .little);
+        if (value.len >= 11) {
+            const owner_len = std.mem.readInt(u16, value[9..11], .little);
+            if (value.len >= 11 + @as(usize, owner_len)) m.owner = value[11 .. 11 + owner_len];
+        }
+        return m;
+    }
+
     fn handleRegister(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
@@ -487,7 +515,11 @@ pub const ActionsHandler = struct {
             version = old.value.version + 1;
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
+            self.allocator.free(old.value.owner_owned);
         }
+
+        // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
+        const meta = parseRegisterValue(req.value);
 
         const owned_name = self.allocator.dupe(u8, name) catch {
             return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
@@ -496,33 +528,33 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_name);
             return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
         };
+        const owned_owner = self.allocator.dupe(u8, meta.owner) catch {
+            self.allocator.free(owned_ns);
+            self.allocator.free(owned_name);
+            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
+        };
 
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-
-        // Parse action_type from first byte of value (client wire format)
-        // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32]
-        const action_type = if (req.value.len > 0) ActionType.fromU8(req.value[0]) else .user;
-        const max_retries: u32 = if (req.value.len >= 9)
-            std.mem.readInt(u32, req.value[5..9], .little)
-        else
-            3; // default
 
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
-            .action_type = action_type,
+            .owner_owned = owned_owner,
+            .action_type = meta.action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = now_ns,
-            .max_retries = max_retries,
+            .timeout_ms = meta.timeout_ms,
+            .max_retries = meta.max_retries,
         }) catch {
+            self.allocator.free(owned_owner);
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
         };
 
         // Persist through Raft: value = [version:u32][created_at_ns:u64][action_type:u8][original_value...]
-        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, action_type, req.value);
+        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, meta.action_type, req.value);
 
         // Version string
         var ver_buf: [12]u8 = undefined;
@@ -816,6 +848,7 @@ pub const ActionsHandler = struct {
         if (self.actions.fetchRemove(name)) |kv| {
             self.allocator.free(kv.value.namespace_owned);
             self.allocator.free(kv.value.name_owned);
+            self.allocator.free(kv.value.owner_owned);
 
             // Persist deletion through Raft
             if (shard) |s| self.persistDelete(s, req.namespace, name);
@@ -1382,12 +1415,16 @@ pub const ActionsHandler = struct {
 
         const version = std.mem.readInt(u32, value[0..4], .little);
         const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
-        const action_type = ActionType.fromU8(value[12]);
+        // The original register wire value was appended after the 13-byte
+        // header (see persistRegister), so owner/timeout_ms/max_retries replay
+        // from there — previously they were dropped (record reset to defaults).
+        const meta = parseRegisterValue(value[13..]);
 
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(name)) |old| {
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
+            self.allocator.free(old.value.owner_owned);
         }
 
         const owned_name = self.allocator.dupe(u8, name) catch return;
@@ -1395,14 +1432,23 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_name);
             return;
         };
+        const owned_owner = self.allocator.dupe(u8, meta.owner) catch {
+            self.allocator.free(owned_ns);
+            self.allocator.free(owned_name);
+            return;
+        };
         self.actions.put(owned_name, .{
             .name_owned = owned_name,
             .namespace_owned = owned_ns,
-            .action_type = action_type,
+            .owner_owned = owned_owner,
+            .action_type = meta.action_type,
             .version = version,
             .enabled = true,
             .created_at_ns = created_at_ns,
+            .timeout_ms = meta.timeout_ms,
+            .max_retries = meta.max_retries,
         }) catch {
+            self.allocator.free(owned_owner);
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
         };
@@ -1419,6 +1465,7 @@ pub const ActionsHandler = struct {
         if (self.actions.fetchRemove(name)) |old| {
             self.allocator.free(old.value.namespace_owned);
             self.allocator.free(old.value.name_owned);
+            self.allocator.free(old.value.owner_owned);
         }
     }
 

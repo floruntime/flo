@@ -39,6 +39,60 @@ fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
 }
 
+const LatencyStats = struct { count: u64 = 0, avg_ms: i64 = 0, p99_ms: i64 = 0 };
+
+/// Real invocation latency for an action, derived from completed run records
+/// (`completed_at_ms - started_at_ms`). avg is over all completed runs; p99 is
+/// over a bounded sample (the first `LAT_CAP` completed runs found).
+fn computeLatency(allocator: Allocator, ctx: *DashboardContext, name: []const u8) LatencyStats {
+    const LAT_CAP: usize = 4096;
+    const buf = allocator.alloc(i64, LAT_CAP) catch return .{};
+    defer allocator.free(buf);
+
+    var n_samples: usize = 0;
+    var sum: i64 = 0;
+    var total: u64 = 0;
+    const n = shardCount(ctx);
+    for (0..n) |i| {
+        if (getShard(ctx, i)) |shard| {
+            var rit = shard.actions_handler.runs.iterator();
+            while (rit.next()) |re| {
+                const run = re.value_ptr;
+                if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                const started = run.started_at_ms orelse continue;
+                const completed = run.completed_at_ms orelse continue;
+                if (completed < started) continue;
+                const lat = completed - started;
+                total += 1;
+                sum += lat;
+                if (n_samples < LAT_CAP) {
+                    buf[n_samples] = lat;
+                    n_samples += 1;
+                }
+            }
+        }
+    }
+
+    if (total == 0) return .{};
+    var stats = LatencyStats{ .count = total, .avg_ms = @divTrunc(sum, @as(i64, @intCast(total))) };
+    if (n_samples > 0) {
+        std.mem.sort(i64, buf[0..n_samples], {}, std.sort.asc(i64));
+        const idx = @min((n_samples * 99) / 100, n_samples - 1);
+        stats.p99_ms = buf[idx];
+    }
+    return stats;
+}
+
+/// Emit a `latency` JSON object (avg/p99 in ms + sample count).
+fn writeLatency(obj: anytype, stats: LatencyStats) !void {
+    var lat_obj = try obj.objectField("latency");
+    try lat_obj.begin();
+    try lat_obj.intField("count", @as(i64, @intCast(stats.count)));
+    try lat_obj.intField("avg_ms", stats.avg_ms);
+    try lat_obj.intField("p99_ms", stats.p99_ms);
+    try lat_obj.end();
+}
+
 /// GET /actions — List all registered actions with run counts
 pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
@@ -103,15 +157,16 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.stringField("name", rec.name_owned);
                     try obj.stringField("namespace", rec.namespace_owned);
                     try obj.stringField("type", rec.action_type.toString());
-                    try obj.stringField("owner", "");
+                    try obj.stringField("owner", rec.owner_owned);
                     try obj.stringField("description", "");
                     try obj.intField("version", @as(i64, @intCast(rec.version)));
                     try obj.boolField("enabled", rec.enabled);
-                    try obj.intField("timeout_ms", 30000); // not persisted on ActionRecord — see gap log
+                    try obj.intField("timeout_ms", @as(i64, @intCast(rec.timeout_ms)));
                     try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
+                    try writeLatency(&obj, computeLatency(allocator, ctx, rec.name_owned));
                     {
                         var runs_obj = try obj.objectField("runs");
                         try runs_obj.begin();
@@ -163,15 +218,16 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     if (found_rec) |rec| {
         try obj.stringField("namespace", rec.namespace_owned);
         try obj.stringField("type", rec.action_type.toString());
-        try obj.stringField("owner", "");
+        try obj.stringField("owner", rec.owner_owned);
         try obj.stringField("description", "");
         try obj.intField("version", @as(i64, @intCast(rec.version)));
         try obj.boolField("enabled", rec.enabled);
-        try obj.intField("timeout_ms", 30000); // not persisted on ActionRecord — see gap log
+        try obj.intField("timeout_ms", @as(i64, @intCast(rec.timeout_ms)));
         try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
         try obj.intField("retry_delay_ms", 1000); // not persisted — see gap log
         try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
         try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
+        try writeLatency(&obj, computeLatency(allocator, ctx, name));
 
         // Count runs for this action across all shards
         var counts = h.RunCounts{};
@@ -324,6 +380,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         try obj.intField("retry_delay_ms", 1000);
         try obj.intField("created_at", 0);
         try obj.intField("updated_at", 0);
+        try writeLatency(&obj, .{});
         {
             var runs_obj = try obj.objectField("runs");
             try runs_obj.begin();
