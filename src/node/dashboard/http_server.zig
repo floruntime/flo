@@ -154,11 +154,23 @@ pub const DashboardServer = struct {
             _ = std.c.close(client);
         }
 
+        // Read until the full request has arrived. A single read can return just
+        // the headers (the client may send the body in a later TCP segment), so
+        // loop until we have headers + the full Content-Length body. Without this
+        // every POST/PUT with a body intermittently saw an empty body.
         var buf: [8192]u8 = undefined;
-        const n = @import("stdx").net.sysRead(client, &buf) catch return;
-        if (n == 0) return;
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = @import("stdx").net.sysRead(client, buf[total..]) catch break;
+            if (n == 0) break; // peer closed
+            total += n;
+            if (http.getExpectedSize(buf[0..total])) |expected| {
+                if (total >= expected) break; // complete request received
+            }
+        }
+        if (total == 0) return;
 
-        const request = buf[0..n];
+        const request = buf[0..total];
 
         // Parse HTTP request using shared primitives
         const parsed = http.parseRequest(request) orelse {

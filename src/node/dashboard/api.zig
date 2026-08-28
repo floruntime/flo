@@ -55,7 +55,7 @@ pub fn handleRequest(
         return queues.getQueues(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "queues/")) {
-        return routeQueue(allocator, method, path["queues/".len..], query_string, ctx);
+        return routeQueue(allocator, method, path["queues/".len..], query_string, body, ctx);
     }
 
     // ── kv ──────────────────────────────────────────────────
@@ -142,15 +142,21 @@ pub fn handleRequest(
 // ─── Sub-routers ─────────────────────────────────────────────────────────────
 
 /// Route /queues/:name[/messages|/dlq[/:seq[/requeue]]|/purge]
-fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+///   GET  /queues/:name          — detail
+///   POST /queues/:name          — enqueue a message (body = payload)
+///   POST /queues/:name/purge    — purge live messages
+fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     const slash_idx = std.mem.indexOfScalar(u8, rest, '/');
     const name = if (slash_idx) |idx| rest[0..idx] else rest;
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
-    if (sub.len == 0) return queues.getQueueDetail(allocator, name, query_string, ctx);
+    if (sub.len == 0) {
+        if (method == .POST) return queues.enqueueMessage(allocator, name, body, query_string, ctx);
+        return queues.getQueueDetail(allocator, name, query_string, ctx);
+    }
     if (std.mem.eql(u8, sub, "messages")) return queues.getQueueMessages(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "dlq")) return queues.getQueueDLQ(allocator, name, query_string, ctx);
-    if (std.mem.eql(u8, sub, "purge")) return queues.purgeQueue(allocator, name, ctx);
+    if (std.mem.eql(u8, sub, "purge")) return queues.purgeQueue(allocator, name, query_string, ctx);
 
     // dlq/:seq or dlq/:seq/requeue
     if (std.mem.startsWith(u8, sub, "dlq/")) {
@@ -464,8 +470,10 @@ test "route queue purge" {
     var metrics = helpers.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // purge loops back to the protocol port; none here
 
+    // Routes to purgeQueue, which attempts a loopback write → connect refused.
     const result = try handleRequest(allocator, .POST, "queues/myq/purge", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }

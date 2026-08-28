@@ -249,7 +249,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .cg_commit, .cg_create, .cg_delete => .none,
 
         // Queue
-        .queue_enqueue, .queue_ack, .queue_nack, .queue_lease => .queue,
+        .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => .queue,
 
         // TimeSeries
         .ts_write, .ts_write_batch => .ts,
