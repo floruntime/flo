@@ -22,6 +22,7 @@ pub const dashboard_streams_test = @import("dashboard_streams_test.zig");
 pub const dashboard_queues_test = @import("dashboard_queues_test.zig");
 pub const dashboard_actions_test = @import("dashboard_actions_test.zig");
 pub const dashboard_processing_test = @import("dashboard_processing_test.zig");
+pub const dashboard_workflows_test = @import("dashboard_workflows_test.zig");
 
 // Future test modules:
 // pub const cluster_test = @import("cluster_test.zig");

@@ -53,7 +53,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
     if (std.mem.eql(u8, path, "/definitions")) {
         return switch (method) {
             .GET => listDefinitions(allocator, query_string, ctx),
-            .POST => createDefinition(allocator, body, ctx),
+            .POST => createDefinition(allocator, query_string, body, ctx),
             else => h.jsonError(allocator, "Method not allowed"),
         };
     }
@@ -91,7 +91,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         }
         if (std.mem.endsWith(u8, rest, "/signal")) {
             const run_id = rest[0 .. rest.len - "/signal".len];
-            return signalRun(allocator, run_id, body, ctx);
+            return signalRun(allocator, run_id, query_string, body, ctx);
         }
         // DELETE /workflow/runs/:id or GET /workflow/runs/:id
         return switch (method) {
@@ -164,20 +164,48 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
     return try json_aw.toOwnedSlice();
 }
 
-fn createDefinition(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// Extract a top-level `name:` value from a YAML/JSON workflow definition, used
+/// only for hash-routing the create to the owning shard (the server re-parses
+/// and validates the full definition). Returns "" if not found.
+fn extractWorkflowName(content: []const u8) []const u8 {
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const key = if (std.mem.startsWith(u8, trimmed, "name:"))
+            trimmed["name:".len..]
+        else if (std.mem.startsWith(u8, trimmed, "\"name\":"))
+            trimmed["\"name\":".len..]
+        else
+            continue;
+        return std.mem.trim(u8, key, " \t\r\"',");
+    }
+    return "";
+}
 
+/// POST /workflow/definitions?namespace= — create/define a workflow (loopback
+/// write). Body is the YAML/JSON definition.
+fn createDefinition(allocator: Allocator, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     if (body.len == 0) return try h.jsonError(allocator, "Empty definition body");
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    const wf_name = extractWorkflowName(body);
+    if (wf_name.len == 0) return try h.jsonError(allocator, "definition is missing a top-level name");
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.create(&client, ns_q, wf_name, body) catch
+        return try h.jsonError(allocator, "Workflow create failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
-    try obj.stringField("status", "not_wired");
-    try obj.intField("body_size", @as(i64, @intCast(body.len)));
+    try obj.boolField("ok", true);
+    try obj.stringField("name", wf_name);
+    try obj.stringField("status", "created");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -700,18 +728,31 @@ fn cancelRun(allocator: Allocator, run_id: []const u8, query_string: ?[]const u8
     return try json_aw.toOwnedSlice();
 }
 
-fn signalRun(allocator: Allocator, run_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
+/// POST /workflow/runs/:id/signal?namespace=&signal=<type> — deliver a signal
+/// to a running workflow (loopback write). Body is the signal payload.
+fn signalRun(allocator: Allocator, run_id: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const signal_type = h.parseQueryParam([]const u8, query_string, "signal") orelse
+        h.parseQueryParam([]const u8, query_string, "type") orelse
+        return try h.jsonError(allocator, "Missing ?signal=<type>");
+    const payload: ?[]const u8 = if (body.len > 0) body else null;
+
+    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.workflow.signal(&client, ns_q, run_id, signal_type, payload) catch
+        return try h.jsonError(allocator, "Signal failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
+    try obj.boolField("ok", true);
     try obj.stringField("run_id", run_id);
-    try obj.stringField("status", "not_wired");
-    try obj.intField("signal_size", @as(i64, @intCast(body.len)));
+    try obj.stringField("signal", signal_type);
+    try obj.stringField("status", "signaled");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
