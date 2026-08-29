@@ -2,10 +2,6 @@ name: CI
 
 on:
   pull_request:
-    # 'feat/*' covers series integration branches (feat/flo-107-vopr and
-    # successors) — PRs into them need the same gate as dev's, or a series
-    # lands unproven. Push stays dev/main: a push to a PR head branch
-    # already gets a pull_request run, and feat/* here would double-run it.
     branches: [dev, main, 'feat/*']
   push:
     branches: [dev, main]
