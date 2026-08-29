@@ -58,8 +58,8 @@ const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
-const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
-const ns_keys = @import("../namespace/handler.zig");
+const handler_mod = @import("../namespace/handler.zig");
+const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
@@ -2280,8 +2280,8 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         @memcpy(buf[pos..][0..n.len], n);
         pos += n.len;
         // partition_count from stream metadata, keyed by the qualified name
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const pc = stream.getPartitionCount(ns_keys.qualifyKey(&qbuf, ns, n) catch n);
+        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+        const pc = stream.getPartitionCount(handler_mod.qualifyKey(&qbuf, ns, n) catch n);
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
