@@ -90,7 +90,7 @@ pub const RuntimeConfig = struct {
     /// Bind address for the metrics server. Was parsed from `[metrics] bind`
     /// and then dropped on the floor — the exporter always listened on
     /// 0.0.0.0 regardless of what the operator configured.
-    metrics_bind: []const u8 = "0.0.0.0",
+    metrics_bind: []const u8 = "127.0.0.1",
 
     dashboard_enabled: bool = true,
     /// Port for dashboard HTTP server (0 = derive from listen_port + 2)
