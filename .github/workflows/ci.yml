@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run obsolete. Never cancel on
+# dev/main — those runs are the record of what the branch actually did.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # The console is compiled into the Zig binary, so a TypeScript error here
+  # breaks the release build — `npm run build` runs `tsc -b` first.
+  web:
+    name: Web console
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build console
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # Handed to the Zig jobs so they embed the real console rather than
+      # rebuilding it three times.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: web/dist
+          retention-days: 1
+
+  build:
+    name: Build
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: src/node/dashboard/dist
+
+      # No `zig fmt --check` gate yet: 12 files on dev are already unformatted,
+      # so it would fail every PR on day one. Reformatting them is a separate
+      # cleanup, best landed when no PRs are in flight — two of those files are
+      # touched by open PRs right now.
+      - name: Build
+        run: zig build
+
+  test:
+    name: ${{ matrix.step }}
+    needs: web
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every suite's result — one failure should not hide the others.
+      fail-fast: false
+      matrix:
+        step: [test-unit, test-integration, test-e2e]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The e2e suite drives a real server, which embeds the console.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: src/node/dashboard/dist
+
+      - name: zig build ${{ matrix.step }}
+        run: zig build ${{ matrix.step }}
+        timeout-minutes: 30
