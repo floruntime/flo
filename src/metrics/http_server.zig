@@ -13,6 +13,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const MetricsRegistry = @import("registry.zig").MetricsRegistry;
 const http = @import("../util/http/mod.zig");
@@ -45,8 +46,7 @@ pub const HttpMetricsServer = struct {
 
     pub fn start(self: *Self) !void {
         // Create listening socket.
-        const net = @import("stdx").net;
-        const sock = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        const sock = try stdx.net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer _ = std.c.close(sock);
 
         // Allow address reuse
@@ -54,9 +54,9 @@ pub const HttpMetricsServer = struct {
         try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
 
         // Bind to port
-        const addr = net.SocketAddrV4.initIp4(.{ 0, 0, 0, 0 }, self.port);
-        try net.sysBind(sock, addr.anyPtr(), addr.anyLen());
-        try net.sysListen(sock, 16);
+        const addr = stdx.net.SocketAddrV4.initIp4(.{ 0, 0, 0, 0 }, self.port);
+        try stdx.net.sysBind(sock, addr.anyPtr(), addr.anyLen());
+        try stdx.net.sysListen(sock, 16);
 
         self.listener = sock;
         self.running.store(true, .release);
@@ -96,7 +96,7 @@ pub const HttpMetricsServer = struct {
             var client_addr: std.posix.sockaddr = undefined;
             var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
 
-            const client = @import("stdx").net.sysAccept(listener, &client_addr, &addr_len, 0) catch |err| {
+            const client = stdx.net.sysAccept(listener, &client_addr, &addr_len, 0) catch |err| {
                 if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                     // Server shutting down
                     break;
@@ -152,8 +152,8 @@ pub const HttpMetricsServer = struct {
         const header = http.formatResponseHeaders(&header_buf, .ok, .prometheus, body.len) orelse
             return error.BufferTooSmall;
 
-        _ = try @import("stdx").net.sysWrite(client, header);
-        _ = try @import("stdx").net.sysWrite(client, body);
+        _ = try stdx.net.sysWrite(client, header);
+        _ = try stdx.net.sysWrite(client, body);
     }
 
     /// Send JSON health response with shard and uptime info
@@ -170,8 +170,8 @@ pub const HttpMetricsServer = struct {
         const header = http.formatResponseHeaders(&header_buf, .ok, .json, body.len) orelse
             return error.BufferTooSmall;
 
-        _ = try @import("stdx").net.sysWrite(client, header);
-        _ = try @import("stdx").net.sysWrite(client, body);
+        _ = try stdx.net.sysWrite(client, header);
+        _ = try stdx.net.sysWrite(client, body);
     }
 
     /// Get the actual bound port (useful when port was 0)
@@ -201,7 +201,7 @@ test "HttpMetricsServer basic functionality" {
     const port = try server.getBoundPort();
 
     // Make HTTP request.
-    const net = @import("stdx").net;
+    const net = stdx.net;
     const stream = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
     defer stream.close();
 

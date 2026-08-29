@@ -19,6 +19,7 @@
 //! 4. Clean up pipes and resources
 
 const std = @import("std");
+const stdx = @import("stdx");
 const log = @import("stdx").log;
 const Shard = @import("shard.zig").Shard;
 const Acceptor = @import("acceptor.zig").Acceptor;
@@ -345,7 +346,7 @@ pub const Runtime = struct {
         // CLI-bypassing `~/.flo/data` would have `makePath` create a literal `~`
         // directory under the current working directory (both here via
         // ensureTopology and below via each Shard.init).
-        const data_dir = try @import("stdx").fs.expandTilde(self.allocator, self.config.data_dir);
+        const data_dir = try stdx.fs.expandTilde(self.allocator, self.config.data_dir);
         defer self.allocator.free(data_dir);
 
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
@@ -508,7 +509,7 @@ pub const Runtime = struct {
                 var attempt: usize = 0;
                 while (attempt < 30) : (attempt += 1) {
                     rn.connectToPeer("127.0.0.1", seed_port) catch {
-                        @import("stdx").time.sleep(200 * std.time.ns_per_ms);
+                        stdx.time.sleep(200 * std.time.ns_per_ms);
                         continue;
                     };
                     break;
@@ -856,7 +857,7 @@ fn acceptorThread(acc: *Acceptor) void {
     while (acc.running.load(.acquire)) {
         _ = acc.acceptOne() catch {};
         // Small yield to avoid busy-spin when no connections pending
-        @import("stdx").time.sleep(100_000); // 100μs
+        stdx.time.sleep(100_000); // 100μs
     }
 }
 
@@ -914,7 +915,7 @@ test "Runtime: boot 2 shards and shutdown" {
     // would otherwise persist into the developer's real home directory.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const data_dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
     defer std.testing.allocator.free(data_dir);
 
     var runtime = try Runtime.init(std.testing.allocator, .{
@@ -930,7 +931,7 @@ test "Runtime: boot 2 shards and shutdown" {
     try std.testing.expectEqual(@as(usize, 2), runtime.shards.?.len);
 
     // Let it run briefly
-    @import("stdx").time.sleep(10_000_000); // 10ms
+    stdx.time.sleep(10_000_000); // 10ms
 
     runtime.stop();
     try std.testing.expect(!runtime.started);
