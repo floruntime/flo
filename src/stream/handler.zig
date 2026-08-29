@@ -398,7 +398,8 @@ pub const StreamHandler = struct {
             // Hash the partition key and map to a partition index
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                const pc = self.stream.getPartitionCount(req.key);
+                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const pc = self.stream.getPartitionCount(metaKey(&qbuf, req));
                 partition_index = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -489,7 +490,8 @@ pub const StreamHandler = struct {
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                const pc = self.stream.getPartitionCount(req.key);
+                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const pc = self.stream.getPartitionCount(metaKey(&qbuf, req));
                 partition_filter = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -639,7 +641,9 @@ pub const StreamHandler = struct {
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
-        const pc = self.stream.getPartitionCount(req.key);
+        var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const meta_key = metaKey(&meta_buf, req);
+        const pc = self.stream.getPartitionCount(meta_key);
 
         const first_id = self.stream.streamFirstId(name_hash);
         const last_id = self.stream.streamLastId(name_hash);
@@ -647,7 +651,7 @@ pub const StreamHandler = struct {
         const count = self.stream.streamLogicalCount(name_hash);
         const bytes = self.stream.streamByteSize(name_hash);
 
-        const meta = self.stream.stream_metadata.get(req.key);
+        const meta = self.stream.stream_metadata.get(meta_key);
 
         return .{ .stream_info = .{
             .first_timestamp_ms = if (count > 0) first_id.timestamp_ms else 0,
@@ -690,7 +694,7 @@ pub const StreamHandler = struct {
             }
         }
 
-        const data = serializeNameList(self.allocator, filtered[0..filtered_count], self.stream) catch {
+        const data = serializeNameList(self.allocator, filtered[0..filtered_count], self.stream, req.namespace) catch {
             return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
         };
 
@@ -698,6 +702,17 @@ pub const StreamHandler = struct {
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
+
+    /// Namespace-qualified stream name for metadata lookups.
+    ///
+    /// `stream_metadata` (partition count + retention) used to be keyed by the
+    /// bare name, so a same-named stream in a second namespace silently
+    /// overwrote the first one's configuration — including its partition
+    /// count, which drives routing (issue #46). Qualify at every read and
+    /// write, exactly as `stream_names` already does.
+    fn metaKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, req: Request) []const u8 {
+        return ns_keys.qualifyKey(buf, req.namespace, req.key) catch req.key;
+    }
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
         // Register the stream name for listing (namespace-qualified)
@@ -722,7 +737,7 @@ pub const StreamHandler = struct {
             const ns_hash = router.namespaceHash(req.namespace);
             const name_hash = router.nameHash(ns_hash, req.key);
 
-            self.stream.registerStreamMetadata(req.key, .{
+            self.stream.registerStreamMetadata(ns_stream_name, .{
                 .partition_count = partition_count,
                 .name_hash = name_hash,
                 .retention_age_s = retention.age_s,
@@ -746,7 +761,9 @@ pub const StreamHandler = struct {
         }
 
         // Check stream exists
-        const existing = self.stream.stream_metadata.get(req.key) orelse {
+        var alter_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const alter_key = metaKey(&alter_buf, req);
+        const existing = self.stream.stream_metadata.get(alter_key) orelse {
             return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         };
 
@@ -754,7 +771,7 @@ pub const StreamHandler = struct {
         const retention = parseRetentionOptions(req);
 
         // Merge: keep existing partition_count and name_hash, update retention
-        self.stream.registerStreamMetadata(req.key, .{
+        self.stream.registerStreamMetadata(alter_key, .{
             .partition_count = existing.partition_count,
             .name_hash = existing.name_hash,
             .retention_age_s = if (retention.age_s > 0) retention.age_s else existing.retention_age_s,
@@ -1942,7 +1959,9 @@ fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, 
 
 /// Serialize a list of names in the standard walk wire format.
 /// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
-fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection) ![]u8 {
+/// `names` are namespace-STRIPPED for the wire, but metadata is keyed by the
+/// qualified name, so `ns` is needed to look each one back up (#46).
+fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     // Stream list wire format (matches CLI expectations):
     // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16]
     var total: usize = 4; // count
@@ -1963,8 +1982,9 @@ fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *c
         pos += 4;
         @memcpy(buf[pos..][0..name.len], name);
         pos += name.len;
-        // partition_count from stream metadata
-        const pc = stream.getPartitionCount(name);
+        // partition_count from stream metadata, keyed by the qualified name
+        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const pc = stream.getPartitionCount(ns_keys.qualifyKey(&qbuf, ns, name) catch name);
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
