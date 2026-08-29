@@ -274,9 +274,6 @@ pub const Reactor = struct {
             };
             _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
         } else if (comptime is_linux) {
-            // std.posix.timerfd_create/settime were removed in Zig 0.16; call the
-            // raw linux syscalls and map errno the way stdx.net does. This branch
-            // is Linux-only, so macOS builds never analysed it (issue #50).
             const tfd_rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
             if (posix.errno(@as(isize, @bitCast(tfd_rc))) != .SUCCESS) return error.TimerCreateFailed;
             const tfd: i32 = @intCast(tfd_rc);

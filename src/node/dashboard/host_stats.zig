@@ -19,7 +19,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const stdx = @import("stdx");
-const time = stdx.time;
 
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = switch (builtin.os.tag) {
@@ -46,7 +45,7 @@ pub const Sampler = struct {
     /// Take a reading and return 0..100 meters. The first call seeds the baseline
     /// and returns zero for the rate-based meters (no delta yet).
     pub fn sample(self: *Sampler) Usage {
-        const now_ms = time.milliTimestamp();
+        const now_ms = stdx.time.milliTimestamp();
         const cpu_us = processCpuMicros();
         const io_bytes = processIoBytes();
         const mem_pct = memPercent();
@@ -178,10 +177,6 @@ fn processIoBytes() u64 {
 /// null on any error or if the key/number isn't in the first 4 KiB.
 fn readProcField(path: []const u8, key: []const u8) ?u64 {
     var buf: [4096]u8 = undefined;
-    // Via the stdx.fs wrappers, which track the std.fs API this codebase
-    // targets. The direct std.fs.openFileAbsolute + File.readAll pair used
-    // here no longer exists in Zig 0.16, and this file is Linux-only, so no
-    // macOS build ever analysed it (issue #50).
     const content = stdx.fs.readFile(path, &buf) catch return null;
     const at = std.mem.indexOf(u8, content, key) orelse return null;
     var i = at + key.len;
