@@ -209,6 +209,7 @@ pub const RaftNetwork = struct {
     }
 
     pub fn connectToPeer(self: *RaftNetwork, host: []const u8, port: u16) !void {
+        log.debug("raft: connecting to seed {s}:{d}", .{ host, port });
         const addr = try parseAddress(host, port);
         const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer sysClose(fd);
@@ -227,7 +228,10 @@ pub const RaftNetwork = struct {
 
         // Read join response
         var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
-        const n = try readExact(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE]);
+        const n = readExact(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE]) catch |err| {
+            log.debug("raft: join response read from {s}:{d} failed: {s}", .{ host, port, @errorName(err) });
+            return err;
+        };
         if (n < HEADER_SIZE) return error.ShortRead;
 
         const resp_hdr = RaftHeader.fromBytes(resp_buf[0..HEADER_SIZE]);
@@ -277,10 +281,12 @@ pub const RaftNetwork = struct {
             var client_addr: posix.sockaddr = undefined;
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
             const client_fd = sysAccept(self.listener_fd, &client_addr, &addr_len, 0) catch return;
+            log.debug("raft: accepted peer connection fd={d}", .{client_fd});
 
             // Read join request with timeout
             var req_buf: [HEADER_SIZE + JOIN_REQ_SIZE + 16]u8 = undefined;
-            const n = readWithTimeout(client_fd, &req_buf, 2000) catch {
+            const n = readWithTimeout(client_fd, &req_buf, 2000) catch |err| {
+                log.debug("raft: join request read failed fd={d}: {s}", .{ client_fd, @errorName(err) });
                 sysClose(client_fd);
                 continue;
             };
@@ -304,10 +310,12 @@ pub const RaftNetwork = struct {
 
             var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
             _ = frameCustomMessage(MSG_JOIN_RESPONSE, 0, self.node_id, &resp_payload, &resp_buf);
-            _ = sysWrite(client_fd, &resp_buf) catch {
+            _ = sysWrite(client_fd, &resp_buf) catch |err| {
+                log.debug("raft: join response write failed fd={d}: {s}", .{ client_fd, @errorName(err) });
                 sysClose(client_fd);
                 continue;
             };
+            log.debug("raft: join response sent to node {d} fd={d}", .{ peer_node_id, client_fd });
 
             // Reject duplicate connections — keep existing connection
             if (self.hasPeer(peer_node_id)) {
@@ -637,14 +645,12 @@ fn frameCustomMessage(msg_type: u8, group_id: u32, source_node: u32, payload: []
     return total;
 }
 
+/// Delegates to the stdx helper rather than repeating the fcntl dance. The
+/// duplicate here hardcoded macOS's O_NONBLOCK (0x0004) and so was a no-op on
+/// Linux, leaving every peer socket blocking — see the note on
+/// `stdx.net.sysFcntlSetNonblocking` (issue #54).
 fn setNonBlocking(fd: posix.socket_t) !void {
-    // F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x0004 on macOS
-    const F_GETFL: i32 = 3;
-    const F_SETFL: i32 = 4;
-    const O_NONBLOCK: c_int = 0x0004;
-    const current = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
-    if (current < 0) return error.FcntlFailed;
-    if (std.c.fcntl(fd, F_SETFL, current | O_NONBLOCK) < 0) return error.FcntlFailed;
+    return @import("stdx").net.sysFcntlSetNonblocking(fd);
 }
 
 fn readWithTimeout(fd: posix.socket_t, buf: []u8, timeout_ms: i32) !usize {
