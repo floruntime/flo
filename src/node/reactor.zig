@@ -18,6 +18,8 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const linux = if (is_linux) std.os.linux else void;
 
+const log = std.log.scoped(.reactor);
+
 const is_linux = builtin.os.tag == .linux;
 const is_bsd = builtin.os.tag == .macos or builtin.os.tag == .freebsd or
     builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
@@ -152,7 +154,24 @@ pub const Reactor = struct {
                 .cqe_buf = {},
             };
         } else if (comptime is_linux) {
-            const ring = try linux.IoUring.init(256, 0);
+            // A bare `error.PermissionDenied` here is nearly undiagnosable: it
+            // names neither io_uring nor seccomp, and the usual cause is a
+            // container runtime's default seccomp profile blocking the
+            // io_uring syscalls (#42 item 7).
+            const ring = linux.IoUring.init(256, 0) catch |err| {
+                switch (err) {
+                    error.PermissionDenied, error.SystemOutdated => log.err(
+                        "io_uring is unavailable ({s}). Flo's event loop requires io_uring on Linux.\n" ++
+                            "  * Under a container runtime's default seccomp profile the io_uring syscalls are blocked.\n" ++
+                            "    Run with `--security-opt seccomp=unconfined`, or use a profile that allows\n" ++
+                            "    io_uring_setup, io_uring_enter and io_uring_register.\n" ++
+                            "  * On kernels older than 5.1, io_uring does not exist and Flo cannot start.",
+                        .{@errorName(err)},
+                    ),
+                    else => log.err("io_uring initialisation failed: {s}", .{@errorName(err)}),
+                }
+                return err;
+            };
             return .{
                 .poll_fd = {},
                 .allocator = allocator,

@@ -193,6 +193,10 @@ pub const Shard = struct {
     /// Raft network reference (set by runtime for shard 0, null otherwise).
     raft_network: ?*RaftNetwork,
 
+    /// This node's cluster-wide node ID, set by the runtime at start. Distinct
+    /// from `raft_node.id`, which identifies the per-shard Raft group.
+    cluster_node_id: u32,
+
     /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
     /// Writes go through propose() → commit → apply to projections.
     raft_node: *RaftNode,
@@ -468,6 +472,7 @@ pub const Shard = struct {
         WorkerHandler.register(&dispatcher);
         WorkflowHandler.register(&dispatcher);
         ProcessingHandler.register(&dispatcher);
+        dispatcher.register(.cluster_status, dispatchClusterStatus);
 
         // Register ping handler
         dispatcher.register(.ping, handlePing);
@@ -512,6 +517,7 @@ pub const Shard = struct {
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
+            .cluster_node_id = 0,
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
@@ -1766,6 +1772,44 @@ pub const Shard = struct {
     // ─── Response helpers ────────────────────────────────────────────────
 
     /// Send an error response on a connection.
+    /// `cluster_status` — report this node's Raft identity and role.
+    ///
+    /// Previously unregistered, so it fell through to the dispatcher's generic
+    /// "not implemented" reply even though `flo --help` advertises the command
+    /// (#42 item 6). A single-node server answers with itself as leader of a
+    /// one-member cluster, which is the truthful answer rather than an error.
+    fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        const raft = shard.raft_node;
+        const state: u8 = switch (raft.role) {
+            .follower => 0,
+            .candidate => 1,
+            .leader => 2,
+        };
+
+        // With no peer listener there is exactly one member and this node is
+        // trivially its leader; the per-shard Raft group already bootstraps to
+        // leader, so `raft.role` reports that without special-casing.
+        // The Controller coordinator (Shard 0) is the membership authority; a
+        // node without one is a cluster of itself.
+        const member_count: u32 = if (shard.coordinator) |c| @max(1, c.nodeCount()) else 1;
+        const leader_id: u32 = if (raft.leader_id != 0 and shard.raft_network != null)
+            raft.leader_id
+        else
+            shard.cluster_node_id;
+
+        var buf: [21]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], shard.cluster_node_id, .little);
+        std.mem.writeInt(u32, buf[4..8], leader_id, .little);
+        std.mem.writeInt(u64, buf[8..16], raft.current_term, .little);
+        buf[16] = state;
+        std.mem.writeInt(u32, buf[17..21], member_count, .little);
+
+        shard.sendOkResponse(conn, req.header.request_id, &buf);
+    }
+
     pub fn sendErrorResponse(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, msg: []const u8) void {
         _ = self;
         var buf: [512]u8 = undefined;
