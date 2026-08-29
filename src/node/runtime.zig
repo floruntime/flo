@@ -87,6 +87,10 @@ pub const RuntimeConfig = struct {
     metrics_enabled: bool = true,
     /// Port for HTTP metrics server (0 = derive from listen_port + 1)
     metrics_port: u16 = 0,
+    /// Bind address for the metrics server. Was parsed from `[metrics] bind`
+    /// and then dropped on the floor — the exporter always listened on
+    /// 0.0.0.0 regardless of what the operator configured.
+    metrics_bind: []const u8 = "0.0.0.0",
 
     dashboard_enabled: bool = true,
     /// Port for dashboard HTTP server (0 = derive from listen_port + 2)
@@ -557,7 +561,7 @@ pub const Runtime = struct {
         if (self.config.metrics_enabled) {
             if (self.metrics_registry) |metrics| {
                 const ms = try self.allocator.create(HttpMetricsServer);
-                ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), metrics);
+                ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), self.config.metrics_bind, metrics);
                 self.metrics_server = ms;
                 ms.start() catch |err| {
                     log.err("metrics exporter failed to start on port {d}: {s}", .{ self.config.effectiveMetricsPort(), @errorName(err) });
@@ -789,9 +793,16 @@ pub const Runtime = struct {
         if (!self.started) return;
         log.debug("Runtime.stop: initiating graceful shutdown", .{});
 
-        // 0. Stop dashboard HTTP server first
+        // 0. Stop the HTTP servers first. The exporter must go down with the
+        //    dashboard: otherwise it keeps answering /health with
+        //    {"status":"ok"} and serving /metrics for a node that has stopped,
+        //    for the whole window between stop() and deinit() — which includes
+        //    every shard's final flush.
         if (self.dashboard_server) |server| {
             server.stop();
+        }
+        if (self.metrics_server) |ms| {
+            ms.stop();
         }
 
         // 0.5 Stop raft network

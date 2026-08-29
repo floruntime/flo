@@ -173,6 +173,7 @@ pub const ServerConfig = struct {
             .ws_pong_timeout_ms = self.websocket.pong_timeout_ms,
             .metrics_enabled = self.metrics.enabled,
             .metrics_port = self.metrics.port,
+            .metrics_bind = self.metrics.bind,
             .dashboard_enabled = self.dashboard.enabled,
             .dashboard_port = self.dashboard.port,
             .dashboard_bind = self.dashboard.bind,

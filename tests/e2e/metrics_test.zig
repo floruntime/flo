@@ -46,7 +46,10 @@ test "e2e/metrics: prometheus exporter serves the registry" {
     defer resp.deinit();
 
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "text/plain") != null or resp.body.len > 0);
+    // (An earlier version asserted `contains("text/plain") or body.len > 0`,
+    // which any 200 satisfies — a tautology. Assert the real content type.)
+    try testing.expect(resp.getHeader("content-type") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.getHeader("content-type").?, "text/plain") != null);
 
     // Prometheus exposition format, with the families that are actually recorded.
     try testing.expect(std.mem.indexOf(u8, resp.body, "# TYPE flo_commands_total counter") != null);
