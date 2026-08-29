@@ -527,9 +527,7 @@ pub const Runtime = struct {
         log.debug("Runtime.start: acceptor thread spawned", .{});
 
         // 6. Metrics registry — shared by the Prometheus exporter and the
-        //    dashboard. Created when either consumer is enabled; it used to be
-        //    created inside the dashboard block, so `metrics.enabled = true`
-        //    with the dashboard off produced no registry and no exporter.
+        //    dashboard. Created when either consumer is enabled.
         if (self.config.metrics_enabled or self.config.dashboard_enabled) {
             const metrics = try self.allocator.create(MetricsRegistry);
             metrics.* = MetricsRegistry.init(self.allocator);
@@ -554,9 +552,7 @@ pub const Runtime = struct {
             if (self.raft_network) |rn| rn.setReplicationMetrics(&metrics.replication);
         }
 
-        // 6a. Prometheus exporter. The server existed but nothing ever
-        //     constructed it, so `exportPrometheus` had no live caller and there
-        //     was no scrape target on the metrics port.
+        // 6a. Prometheus exporter if metrics is enabled
         if (self.config.metrics_enabled) {
             if (self.metrics_registry) |metrics| {
                 const ms = try self.allocator.create(HttpMetricsServer);

@@ -44,10 +44,7 @@ pub const HttpMetricsServer = struct {
     }
 
     pub fn start(self: *Self) !void {
-        // Create listening socket. Uses the stdx.net syscall wrappers rather
-        // than std.posix.socket/bind/listen/accept, which do not exist in this
-        // Zig version — that is why this server never compiled and so was never
-        // wired into the runtime.
+        // Create listening socket.
         const net = @import("stdx").net;
         const sock = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer _ = std.c.close(sock);
@@ -182,8 +179,6 @@ pub const HttpMetricsServer = struct {
         const sock = self.listener orelse return error.NotListening;
         var addr: std.posix.sockaddr.in = undefined;
         var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        // std.c rather than std.posix.getsockname, which this Zig version
-        // does not expose (see the socket calls in `start`).
         if (std.c.getsockname(sock, @ptrCast(&addr), &len) != 0) return error.GetSockNameFailed;
         return std.mem.bigToNative(u16, addr.port);
     }
@@ -205,8 +200,7 @@ test "HttpMetricsServer basic functionality" {
     try server.start();
     const port = try server.getBoundPort();
 
-    // Make HTTP request. stdx.net rather than std.net.tcpConnectToHost, which
-    // this Zig version does not provide.
+    // Make HTTP request.
     const net = @import("stdx").net;
     const stream = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
     defer stream.close();

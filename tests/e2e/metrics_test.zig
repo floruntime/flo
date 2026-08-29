@@ -45,9 +45,6 @@ test "e2e/metrics: prometheus exporter serves the registry" {
     var resp = try http.get("/metrics");
     defer resp.deinit();
 
-    // The exporter never compiled (std.posix.socket/write don't exist in this
-    // Zig version) and was never constructed, so there was no scrape target at
-    // all — this request used to be refused outright.
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "text/plain") != null or resp.body.len > 0);
 
