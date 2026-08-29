@@ -88,6 +88,12 @@ pub const MAX_NODES = 5;
 pub const ClusterConfig = struct {
     /// Number of nodes (2-5)
     node_count: u8 = 3,
+    /// Cluster nodes log at debug by default. Startup between "topology
+    /// verified" and the acceptor going live emits only debug lines, so at
+    /// info a node that hangs in there leaves no trace of how far it got —
+    /// which is exactly the state issue #54 is stuck in. The log is only ever
+    /// printed as a bounded tail on failure, so this costs nothing on success.
+    log_level: []const u8 = "debug",
     /// Durability mode for all nodes
     durability: ServerProcess.Durability = .sync,
     /// Time to wait for cluster formation (nanoseconds)
@@ -152,6 +158,7 @@ pub const ClusterContext = struct {
             .durability = config.durability,
             .shards = config.shards,
             .tiered_log = config.tiered_log,
+            .log_level = config.log_level,
             .cluster_enabled = true, // Seed node needs Raft listener
         });
         // Covers every node created so far. A per-iteration `errdefer` inside
@@ -175,6 +182,7 @@ pub const ClusterContext = struct {
                 .durability = config.durability,
                 .shards = config.shards,
                 .tiered_log = config.tiered_log,
+                .log_level = config.log_level,
                 .join_addresses = seed_endpoint,
             });
             startServerWithRetry(self.servers[i].?) catch |err| {

@@ -120,6 +120,10 @@ pub const ServerProcess = struct {
         metrics_enabled: bool = false,
         /// Number of shards (1 = faster startup)
         shards: u8 = 1,
+        /// Server log level written into flo.toml. The harness only ever sees
+        /// this through the captured log, so raising it is the way to find out
+        /// where a server got to when it never became ready (#54).
+        log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
         durability: Durability = .async_flush,
         /// Cold storage configuration (for tiered storage tests)
@@ -287,6 +291,8 @@ pub const ServerProcess = struct {
                 try config_writer.print("file_base_path = \"{s}/archive\"\n", .{self.data_dir});
             }
         }
+
+        try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});
 
         const config_file = try self.tmp_dir.dir.createFile(stdx.io.instance(), "flo.toml", .{});
         defer stdx.fs.closeFile(config_file);
