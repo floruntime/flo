@@ -1369,11 +1369,11 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer shard.allocator.free(records);
                 for (records) |rec| {
-                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, pt.tag_hash, rec.tags);
+                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), rec.tags);
                 }
             } else {
                 // No operators or chain failed — direct passthrough
-                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, pt.tag_hash, 0);
+                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), 0);
             }
 
             // Advance cursor past this point
@@ -1521,7 +1521,7 @@ pub const ProcessingHandler = struct {
     /// Write a processed record to all matching sinks (TS source variant).
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
-    fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, tag_hash: u64, record_tags: u32) void {
+    fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
@@ -1540,7 +1540,7 @@ pub const ProcessingHandler = struct {
                         field_value,
                         timestamp_ns,
                         ual_idx,
-                        tag_hash,
+                        src_tags,
                     ) catch continue;
                 },
                 .kv => self.writeKvSink(snk, shard, "", payload),
@@ -1575,7 +1575,8 @@ pub const ProcessingHandler = struct {
     fn writeTsSinkFromJson(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, payload: []const u8) void {
         const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@import("stdx").time.milliTimestamp())) * 1_000_000);
-        const tag_hash_val = computeTsSinkTagHash(snk.ts_tag_keys, payload);
+        var sink_tag_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+        const sink_tags = computeTsSinkTags(snk.ts_tag_keys, payload, &sink_tag_buf);
 
         if (snk.ts_field_keys.len > 0) {
             var it = FlatPairIterator.init(snk.ts_field_keys);
@@ -1583,7 +1584,7 @@ pub const ProcessingHandler = struct {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse continue;
                 const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, tag_hash_val) catch continue;
+                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch continue;
             }
             return;
         }
@@ -1592,7 +1593,7 @@ pub const ProcessingHandler = struct {
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return);
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, tag_hash_val) catch {};
+        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch {};
     }
 
     /// KV sink: write the record under `key_prefix + separator + record_key`,
@@ -1681,22 +1682,29 @@ pub const ProcessingHandler = struct {
     /// Compute the TS tag hash for a sink write from its `tags:` map and the record
     /// payload. Builds `tagname=value,…` (config order) and Wyhashes it — the SAME
     /// algorithm the TS source filter and `ts read --tags` use, so writes are queryable.
-    fn computeTsSinkTagHash(tag_keys: []const u8, payload: []const u8) u64 {
-        if (tag_keys.len == 0) return 0;
-        var tag_buf: [1024]u8 = undefined;
+    /// Build the sink's tag set as a `k=v,k=v` string from the configured tag
+    /// keys and the record payload.
+    ///
+    /// This used to return a raw `Wyhash` of the string — NOT the canonical
+    /// hash the write and read paths use — so every point a TS sink wrote
+    /// landed in a series that no query could ever address. Returning the
+    /// string and letting the projection canonicalize is what keeps the one
+    /// hashing rule in one place.
+    fn computeTsSinkTags(tag_keys: []const u8, payload: []const u8, buf: []u8) []const u8 {
+        if (tag_keys.len == 0) return "";
         var pos: usize = 0;
         var it = FlatPairIterator.init(tag_keys);
         while (it.next()) |pair| {
             // pair.key = TS tag name, pair.value = JSON field to read the tag value from.
             const tag_val = extractJsonString(payload, pair.value) orelse continue;
-            if (pos > 0 and pos < tag_buf.len) {
-                tag_buf[pos] = ',';
+            if (pos > 0 and pos < buf.len) {
+                buf[pos] = ',';
                 pos += 1;
             }
-            const kv = std.fmt.bufPrint(tag_buf[pos..], "{s}={s}", .{ pair.key, tag_val }) catch break;
+            const kv = std.fmt.bufPrint(buf[pos..], "{s}={s}", .{ pair.key, tag_val }) catch break;
             pos += kv.len;
         }
-        return if (pos > 0) std.hash.Wyhash.hash(0, tag_buf[0..pos]) else 0;
+        return buf[0..pos];
     }
 
     /// Extract a string field value from a JSON payload (unescaped, first match).

@@ -793,27 +793,37 @@ test "e2e/ts: read filters by tag" {
     try testing.expect(all.contains("222"));
 }
 
-test "e2e/ts: tag filter matches the exact tag set (known #24 part-2b limit)" {
+test "e2e/ts: partial tag filter matches a superset tag set" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "ts", "write", "tag_exact_test", "--tags", "host=web-01,env=prod", "--value", "333.0", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "tag_exact_test", "--tags", "host=web-02,env=prod", "--value", "444.0", "--timestamp", "1708700400000" });
 
-    // The full tag set matches, in any order — the hash is canonical.
+    // The full tag set matches in any order — the hash is canonical.
     var exact = try ctx.cli.run(&.{
         "ts", "read", "tag_exact_test", "--tags", "env=prod,host=web-01", "--from", "1708700000000", "--output", "raw", "--limit", "100",
     });
     defer exact.deinit();
     try testing.expect(exact.contains("333"));
+    try testing.expect(!exact.contains("444"));
 
-    // A PARTIAL tag set does not: a tag hash can only answer exact-set
-    // equality. Partial/regex matching needs the tag dictionary (#24 part 2b).
-    // Pinned here so the behaviour is a decision, not a surprise.
+    // A PARTIAL tag set now matches too: predicates constrain only the tags
+    // they name. Under the 2a tag-hash lookup this returned nothing.
     var partial = try ctx.cli.run(&.{
         "ts", "read", "tag_exact_test", "--tags", "host=web-01", "--from", "1708700000000", "--output", "raw", "--limit", "100",
     });
     defer partial.deinit();
-    try testing.expect(!partial.contains("333"));
+    try testing.expect(partial.contains("333"));
+    try testing.expect(!partial.contains("444"));
+
+    // A tag shared by both selects both.
+    var shared = try ctx.cli.run(&.{
+        "ts", "read", "tag_exact_test", "--tags", "env=prod", "--from", "1708700000000", "--output", "raw", "--limit", "100",
+    });
+    defer shared.deinit();
+    try testing.expect(shared.contains("333"));
+    try testing.expect(shared.contains("444"));
 }
 
 test "e2e/ts: query filters by tag" {
@@ -1250,13 +1260,16 @@ test "e2e/ts: floql glob tag filter =~" {
     try ctx.exec(&.{ "ts", "write", "glob_test", "--tags", "host=web-02", "--value", "20.0" });
     try ctx.exec(&.{ "ts", "write", "glob_test", "--tags", "host=api-01", "--value", "30.0" });
 
-    // Query only web-* hosts using =~
+    // Only web-* hosts: avg(10,20) = 15, not 20 (which would include api-01).
+    // The filter was inert before the tag dictionary landed.
     var result = try ctx.cli.run(&.{
-        "ts", "floql", "glob_test{host=~web-*}[1h] | window(5m) | avg()",
+        "ts", "floql", "glob_test{host=~web-*}[1h] | avg()",
     });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("15"));
+    try testing.expect(!result.contains("20.0000"));
 }
 
 test "e2e/ts: floql negate glob tag filter !~" {
@@ -1268,13 +1281,15 @@ test "e2e/ts: floql negate glob tag filter !~" {
     try ctx.exec(&.{ "ts", "write", "nglob_test", "--tags", "host=web-02,region=us-west", "--value", "20.0" });
     try ctx.exec(&.{ "ts", "write", "nglob_test", "--tags", "host=api-01,region=eu-west", "--value", "30.0" });
 
-    // Exclude *-west regions using !~
+    // Excluding *-west leaves only us-east → avg is exactly 10.
     var result = try ctx.cli.run(&.{
-        "ts", "floql", "nglob_test{region!~*-west}[1h] | window(5m) | avg()",
+        "ts", "floql", "nglob_test{region!~*-west}[1h] | avg()",
     });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
+    try testing.expect(result.contains("10"));
+    try testing.expect(!result.contains("30"));
 }
 
 test "e2e/ts: floql neq tag filter with !=" {

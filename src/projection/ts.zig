@@ -138,51 +138,59 @@ pub const WriteBuffer = struct {
 /// UAL payload layout for a `ts_write` command value (the measurement travels
 /// in the command key):
 ///
-///   [value: f64 LE 8][tag_hash: u64 LE 8][timestamp_ns: u64 LE 8][field_len: u16 LE 2][field]
+///   [value: f64 LE 8][timestamp_ns: u64 LE 8][field_len: u16 LE 2][tags_len: u16 LE 2][field][tags]
 ///
 /// Before #24 the value was just the 8 value bytes, so the field name, the
 /// client-supplied timestamp AND the tags were all dropped on replay: a point
 /// written as `cpu --field user --tags host=a` came back after a restart as
 /// `cpu/value` with no tags. With tags now part of the series key, persisting
 /// them is what keeps a replayed series identical to the one that was written.
+/// The tag SET is stored, not its hash: the hash is derivable, but the tag
+/// dictionary needs the spelling to survive a restart.
 pub const TsWriteValue = struct {
     value: f64,
-    tag_hash: u64,
     timestamp_ns: u64,
     field_name: []const u8,
+    tags: []const u8,
 
-    pub const MIN_SIZE = 8 + 8 + 8 + 2;
+    pub const MIN_SIZE = 8 + 8 + 2 + 2;
 
     pub fn encode(buf: []u8, v: TsWriteValue) ?[]const u8 {
-        if (v.field_name.len > std.math.maxInt(u16)) return null;
-        const total = MIN_SIZE + v.field_name.len;
+        if (v.field_name.len > std.math.maxInt(u16) or v.tags.len > std.math.maxInt(u16)) return null;
+        const total = MIN_SIZE + v.field_name.len + v.tags.len;
         if (buf.len < total) return null;
         std.mem.writeInt(u64, buf[0..8], @bitCast(v.value), .little);
-        std.mem.writeInt(u64, buf[8..16], v.tag_hash, .little);
-        std.mem.writeInt(u64, buf[16..24], v.timestamp_ns, .little);
-        std.mem.writeInt(u16, buf[24..26], @intCast(v.field_name.len), .little);
-        @memcpy(buf[26..][0..v.field_name.len], v.field_name);
+        std.mem.writeInt(u64, buf[8..16], v.timestamp_ns, .little);
+        std.mem.writeInt(u16, buf[16..18], @intCast(v.field_name.len), .little);
+        std.mem.writeInt(u16, buf[18..20], @intCast(v.tags.len), .little);
+        var off: usize = 20;
+        @memcpy(buf[off..][0..v.field_name.len], v.field_name);
+        off += v.field_name.len;
+        @memcpy(buf[off..][0..v.tags.len], v.tags);
         return buf[0..total];
     }
 
-    /// Decode a persisted value. A payload too short to carry the full record is
-    /// read as a bare f64 (defensive, not a migration path — it also covers a
-    /// truncated tail) and falls back to the entry header's timestamp.
+    /// Decode a persisted value. A payload too short to carry the full record
+    /// is read as a bare f64 (defensive against truncation) and falls back to
+    /// the entry header's timestamp.
     pub fn decode(data: []const u8, fallback_ts_ns: u64) ?TsWriteValue {
         if (data.len < 8) return null;
         const value: f64 = @bitCast(std.mem.readInt(u64, data[0..8], .little));
         if (data.len < MIN_SIZE) {
-            return .{ .value = value, .tag_hash = 0, .timestamp_ns = fallback_ts_ns, .field_name = "value" };
+            return .{ .value = value, .timestamp_ns = fallback_ts_ns, .field_name = "value", .tags = "" };
         }
-        const tag_hash = std.mem.readInt(u64, data[8..16], .little);
-        const ts_ns = std.mem.readInt(u64, data[16..24], .little);
-        const flen: usize = std.mem.readInt(u16, data[24..26], .little);
-        const field = if (MIN_SIZE + flen <= data.len and flen > 0) data[MIN_SIZE..][0..flen] else "value";
+        const ts_ns = std.mem.readInt(u64, data[8..16], .little);
+        const flen: usize = std.mem.readInt(u16, data[16..18], .little);
+        const tlen: usize = std.mem.readInt(u16, data[18..20], .little);
+        var off: usize = 20;
+        const field = if (off + flen <= data.len and flen > 0) data[off..][0..flen] else "value";
+        off += flen;
+        const tags = if (off + tlen <= data.len and tlen > 0) data[off..][0..tlen] else "";
         return .{
             .value = value,
-            .tag_hash = tag_hash,
             .timestamp_ns = if (ts_ns > 0) ts_ns else fallback_ts_ns,
             .field_name = field,
+            .tags = tags,
         };
     }
 };
@@ -191,32 +199,30 @@ pub const TsWriteValue = struct {
 ///
 ///   [namespace_hash: u32 LE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
 ///
-/// `tag_hash` is a real series *dimension* (issue #24): points sharing a
+/// `tag_hash` is a real series dimension (issue #24): points sharing a
 /// measurement+field but carrying different tags live in different series
-/// instead of collapsing into one write buffer. A query that does not name a
-/// tag set must therefore fan out across every tag-series for that
-/// measurement+field — see `queryRange`.
+/// instead of collapsing into one write buffer. The hash resolves back to its
+/// canonical tag string through the projection's tag dictionary, which is what
+/// makes partial/glob tag matching and `group_by(tag)` possible.
 ///
 /// Both the 4-byte prefix and the trailing 8-byte hash may contain 0x00, so
 /// measurement/field parsing always starts at offset NS_PREFIX and is bounded
-/// by the \x00 separators (never `indexOfScalar` from offset 0, never to the
-/// end of the key).
+/// by the \x00 separators.
 const NS_PREFIX = 4;
 const TAG_SUFFIX = 8;
 
 /// Maximum `key=value` pairs considered when canonicalizing a tag set.
 const MAX_TAGS = 32;
 
-/// Hash a tag set canonically: the comma-separated `key=value` pairs are sorted
-/// before hashing, so `host=a,env=b` and `env=b,host=a` denote the SAME series.
-/// Returns 0 for an empty tag set — the untagged series.
-///
-/// Every producer of a tag hash must route through here (the write path, the
-/// read/query/FloQL paths, and the processing pipeline). Hashing the raw user
-/// string instead — as the write path used to — makes tag ordering part of the
-/// series identity and silently fragments a series in two.
-pub fn canonicalTagHash(tags: []const u8) u64 {
-    if (tags.len == 0) return 0;
+/// Upper bound on a canonical tag string.
+pub const MAX_TAG_STRING = 1024;
+
+/// Normalize a tag set into its canonical form: pairs trimmed, empty pairs
+/// dropped, and **sorted**, joined with `,`. This is the string stored in the
+/// tag dictionary and the exact bytes `canonicalTagHash` hashes, so a tag set
+/// has one identity no matter what order the writer supplied it in.
+pub fn canonicalTagString(tags: []const u8, buf: []u8) []const u8 {
+    if (tags.len == 0) return "";
     var parts: [MAX_TAGS][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, tags, ',');
@@ -227,18 +233,100 @@ pub fn canonicalTagHash(tags: []const u8) u64 {
         parts[n] = part;
         n += 1;
     }
-    if (n == 0) return 0;
+    if (n == 0) return "";
     std.mem.sort([]const u8, parts[0..n], {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
     }.lt);
-    var hasher = std.hash.Wyhash.init(0);
+
+    var pos: usize = 0;
     for (parts[0..n], 0..) |part, i| {
-        if (i > 0) hasher.update(",");
-        hasher.update(part);
+        if (i > 0) {
+            if (pos + 1 > buf.len) break;
+            buf[pos] = ',';
+            pos += 1;
+        }
+        if (pos + part.len > buf.len) break;
+        @memcpy(buf[pos..][0..part.len], part);
+        pos += part.len;
     }
-    return hasher.final();
+    return buf[0..pos];
+}
+
+/// Canonical tag-set hash — `canonicalTagString` then Wyhash. Returns 0 for an
+/// empty tag set (the untagged series).
+pub fn canonicalTagHash(tags: []const u8) u64 {
+    if (tags.len == 0) return 0;
+    var buf: [MAX_TAG_STRING]u8 = undefined;
+    const canon = canonicalTagString(tags, &buf);
+    if (canon.len == 0) return 0;
+    return std.hash.Wyhash.hash(0, canon);
+}
+
+/// Glob matcher supporting `*` (any run) and `?` (any single byte). FloQL's
+/// `=~` / `!~` are glob, not regex — see the `{host=~web-*}` / `{region!~*-west}`
+/// e2e cases.
+pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var star_t: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == text[t])) {
+            p += 1;
+            t += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            star_t = t;
+            p += 1;
+        } else if (star) |sp| {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+pub const TagOp = enum { eq, neq, glob, nglob };
+
+/// One tag predicate, e.g. `host=web-01` or `region!~*-west`.
+pub const TagPredicate = struct {
+    key: []const u8,
+    op: TagOp,
+    value: []const u8,
+};
+
+/// Value of one tag within a canonical tag string, or null if absent.
+pub fn tagValue(canonical_tags: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, canonical_tags, ',');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Do a series' tags satisfy every predicate?
+///
+/// Predicates constrain only the tags they name, so `{host=web-01}` matches a
+/// point tagged `host=web-01,env=prod` — the partial matching a bare tag hash
+/// could never express. A negated predicate is satisfied by an absent tag,
+/// matching the usual time-series convention.
+pub fn tagsMatch(canonical_tags: []const u8, preds: []const TagPredicate) bool {
+    for (preds) |pred| {
+        const actual = tagValue(canonical_tags, pred.key);
+        const ok = switch (pred.op) {
+            .eq => actual != null and std.mem.eql(u8, actual.?, pred.value),
+            .neq => actual == null or !std.mem.eql(u8, actual.?, pred.value),
+            .glob => actual != null and globMatch(pred.value, actual.?),
+            .nglob => actual == null or !globMatch(pred.value, actual.?),
+        };
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// A single tag as key/value, for callers that hold structured tags rather than
@@ -342,6 +430,14 @@ pub const TSProjection = struct {
     /// Flushed blocks (per series key).
     blocks: std.StringHashMap(std.ArrayList(Block)),
 
+    /// Tag dictionary: `tag_hash` → its canonical tag string (owned).
+    ///
+    /// The series key stores only a hash, which can answer exact-set equality
+    /// and nothing else. Keeping the string alongside it is what makes partial
+    /// matching (`{host=web-01}` against `host=web-01,env=prod`), `!=`, glob
+    /// filters, listing a series' tags and `group_by(tag)` possible.
+    tag_dict: std.AutoHashMap(u64, []const u8),
+
     /// Buffer capacity (points in write buffer before flush).
     buffer_capacity: usize,
 
@@ -366,6 +462,7 @@ pub const TSProjection = struct {
             .allocator = allocator,
             .buffers = std.StringHashMap(WriteBuffer).init(allocator),
             .blocks = std.StringHashMap(std.ArrayList(Block)).init(allocator),
+            .tag_dict = std.AutoHashMap(u64, []const u8).init(allocator),
             .buffer_capacity = config.buffer_capacity,
             .applied_index = 0,
             .stats = .{},
@@ -388,11 +485,22 @@ pub const TSProjection = struct {
             self.allocator.free(@constCast(kv.key_ptr.*));
         }
         self.blocks.deinit();
+
+        // Free the tag dictionary
+        var tit = self.tag_dict.iterator();
+        while (tit.next()) |kv| self.allocator.free(@constCast(kv.value_ptr.*));
+        self.tag_dict.deinit();
     }
 
     // ─── Core operations ───────────────────────────────────────────────────
 
     /// Insert a single data point.
+    /// Insert a point. `tags` is the raw `k=v,k=v` tag set (empty for untagged);
+    /// the projection canonicalizes it, derives the series' tag hash and records
+    /// the spelling in the tag dictionary. Taking the string rather than a
+    /// pre-computed hash keeps hashing in ONE place — callers previously each
+    /// rolled their own, and one of them (the processing TS sink) hashed
+    /// non-canonically, producing series no query could ever find.
     pub fn insert(
         self: *TSProjection,
         namespace_hash: u32,
@@ -401,8 +509,13 @@ pub const TSProjection = struct {
         value: f64,
         timestamp_ns: u64,
         ual_index: u64,
-        tag_hash: u64,
+        tags: []const u8,
     ) !void {
+        var canon_buf: [MAX_TAG_STRING]u8 = undefined;
+        const canonical = canonicalTagString(tags, &canon_buf);
+        const tag_hash: u64 = if (canonical.len == 0) 0 else std.hash.Wyhash.hash(0, canonical);
+        try self.registerTagSet(tag_hash, canonical);
+
         const series_str = try seriesKeyToString(self.allocator, .{
             .namespace_hash = namespace_hash,
             .measurement = measurement,
@@ -552,6 +665,82 @@ pub const TSProjection = struct {
         return result;
     }
 
+    /// Query every tag-series whose tags satisfy `preds`, merged and
+    /// time-ordered.
+    ///
+    /// This is the general form: predicates constrain only the tags they name,
+    /// so a partial filter matches a superset tag set — which an exact tag-hash
+    /// lookup (`queryRange`) fundamentally cannot do. An empty predicate list
+    /// means "every tag-series".
+    pub fn queryRangeFiltered(
+        self: *TSProjection,
+        namespace_hash: u32,
+        measurement: []const u8,
+        field_name: []const u8,
+        preds: []const TagPredicate,
+        min_ts: u64,
+        max_ts: u64,
+        point_buf: []StoredPoint,
+    ) !QueryResult {
+        var result = QueryResult{ .points_in_buffer = 0, .blocks_matched = 0 };
+
+        const prefix = try seriesKeyPrefix(self.allocator, namespace_hash, measurement, field_name);
+        defer self.allocator.free(prefix);
+
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            if (!tagsMatch(self.tagsForHash(keyTagHash(key)), preds)) continue;
+            if (result.points_in_buffer >= point_buf.len) break;
+            result.points_in_buffer += kv.value_ptr.queryRange(min_ts, max_ts, point_buf[result.points_in_buffer..]);
+        }
+
+        var bit = self.blocks.iterator();
+        while (bit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            if (!tagsMatch(self.tagsForHash(keyTagHash(key)), preds)) continue;
+            for (kv.value_ptr.items) |block| {
+                if (block.max_timestamp_ns >= min_ts and block.min_timestamp_ns <= max_ts) {
+                    result.blocks_matched += 1;
+                }
+            }
+        }
+
+        std.mem.sort(StoredPoint, point_buf[0..result.points_in_buffer], {}, struct {
+            fn lt(_: void, a: StoredPoint, b: StoredPoint) bool {
+                return a.timestamp_ns < b.timestamp_ns;
+            }
+        }.lt);
+
+        self.stats.queries += 1;
+        return result;
+    }
+
+    /// Distinct tag-series under one measurement+field, as canonical tag
+    /// strings. Backs per-series rollups and `group_by`.
+    pub fn seriesTagsFor(
+        self: *TSProjection,
+        namespace_hash: u32,
+        measurement: []const u8,
+        field_name: []const u8,
+        out: [][]const u8,
+    ) !usize {
+        const prefix = try seriesKeyPrefix(self.allocator, namespace_hash, measurement, field_name);
+        defer self.allocator.free(prefix);
+        var n: usize = 0;
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            if (n >= out.len) break;
+            const key = kv.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            out[n] = self.tagsForHash(keyTagHash(key));
+            n += 1;
+        }
+        return n;
+    }
+
     pub const QueryResult = struct {
         points_in_buffer: usize,
         blocks_matched: usize,
@@ -560,9 +749,9 @@ pub const TSProjection = struct {
     // ─── Aggregations ──────────────────────────────────────────────────────
 
     /// Compute the average of points in a range from the write buffer.
-    pub fn avg(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn avg(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(namespace_hash, measurement, field_name, tag_hash, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var acc: f64 = 0;
@@ -573,9 +762,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the min of points in a range from the write buffer.
-    pub fn min(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn min(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(namespace_hash, measurement, field_name, tag_hash, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var min_val: f64 = std.math.floatMax(f64);
@@ -586,9 +775,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the max of points in a range from the write buffer.
-    pub fn max(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn max(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(namespace_hash, measurement, field_name, tag_hash, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var max_val: f64 = -std.math.floatMax(f64);
@@ -599,9 +788,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the sum of points in a range from the write buffer.
-    pub fn sum(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn sum(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var point_buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(namespace_hash, measurement, field_name, tag_hash, min_ts, max_ts, &point_buf);
+        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &point_buf);
         if (result.points_in_buffer == 0) return null;
 
         var total: f64 = 0;
@@ -612,9 +801,9 @@ pub const TSProjection = struct {
     }
 
     /// Count points in a range from the write buffer.
-    pub fn count(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, tag_hash: ?u64, min_ts: u64, max_ts: u64) !usize {
+    pub fn count(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !usize {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRange(namespace_hash, measurement, field_name, tag_hash, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
         return result.points_in_buffer;
     }
 
@@ -781,7 +970,7 @@ pub const TSProjection = struct {
                             rec.value,
                             rec.timestamp_ns,
                             ual_entry.header.index,
-                            rec.tag_hash,
+                            rec.tags,
                         );
                     }
                 }
@@ -847,8 +1036,32 @@ pub const TSProjection = struct {
         }
         self.blocks.clearAndFree();
 
+        var tit = self.tag_dict.iterator();
+        while (tit.next()) |kv| self.allocator.free(@constCast(kv.value_ptr.*));
+        self.tag_dict.clearAndFree();
+
         self.applied_index = 0;
         self.stats = .{};
+    }
+
+    /// Record a tag set in the dictionary. Idempotent — the first canonical
+    /// string wins, so a hash always resolves to one spelling.
+    pub fn registerTagSet(self: *TSProjection, tag_hash: u64, canonical: []const u8) !void {
+        if (tag_hash == 0 or canonical.len == 0) return;
+        const gop = try self.tag_dict.getOrPut(tag_hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = self.allocator.dupe(u8, canonical) catch |e| {
+                _ = self.tag_dict.remove(tag_hash);
+                return e;
+            };
+        }
+    }
+
+    /// Canonical tag string for a hash. The untagged series (hash 0) resolves
+    /// to "" so predicate matching treats it as "no tags present".
+    pub fn tagsForHash(self: *const TSProjection, tag_hash: u64) []const u8 {
+        if (tag_hash == 0) return "";
+        return self.tag_dict.get(tag_hash) orelse "";
     }
 
     // ─── Snapshot Serialization ────────────────────────────────────────────
@@ -862,12 +1075,15 @@ pub const TSProjection = struct {
     ///     [key_len: u16][key bytes][block_count: u32]
     ///     per block: [min_ts: u64][max_ts: u64][point_count: u32][ual_start: u64][ual_end: u64]
     /// Caller owns returned slice.
-    /// On-disk snapshot version for the TS section. Bumped to 1 by #24, when
-    /// tags became part of the series key: a v0 snapshot's keys lack the
-    /// trailing tag hash, so restoring one into this layout would silently
-    /// mis-parse every field name. `deserialize` refuses anything it does not
-    /// recognise rather than loading garbage.
-    pub const SNAPSHOT_VERSION: u8 = 1;
+    /// On-disk snapshot version for the TS section.
+    ///   v1 — tags became part of the series key (a v0 snapshot's keys lack the
+    ///        trailing hash, so restoring one would mis-parse every field name)
+    ///   v2 — adds the tag dictionary section; without it a restored projection
+    ///        knows a series' tag HASH but not its tags, so every predicate
+    ///        filter would silently match nothing after a restart.
+    /// `deserialize` refuses anything it does not recognise rather than loading
+    /// a projection that looks fine and answers wrongly.
+    pub const SNAPSHOT_VERSION: u8 = 2;
 
     pub fn serialize(self: *TSProjection, allocator: Allocator) ![]u8 {
         // Calculate total size
@@ -886,6 +1102,13 @@ pub const TSProjection = struct {
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
             total_size += 2 + kv.key_ptr.len + 4 + kv.value_ptr.items.len * 36;
+        }
+
+        // Tag dictionary: count(4) + per entry(hash(8) + tags_len(2) + tags)
+        total_size += 4;
+        var tdit = self.tag_dict.iterator();
+        while (tdit.next()) |kv| {
+            total_size += 8 + 2 + kv.value_ptr.len;
         }
 
         const buf = try allocator.alloc(u8, total_size);
@@ -950,6 +1173,19 @@ pub const TSProjection = struct {
                 std.mem.writeInt(u64, buf[offset..][0..8], block.ual_index_end, .little);
                 offset += 8;
             }
+        }
+
+        // Tag dictionary
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.tag_dict.count()), .little);
+        offset += 4;
+        var tdw = self.tag_dict.iterator();
+        while (tdw.next()) |kv| {
+            std.mem.writeInt(u64, buf[offset..][0..8], kv.key_ptr.*, .little);
+            offset += 8;
+            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(kv.value_ptr.len), .little);
+            offset += 2;
+            @memcpy(buf[offset .. offset + kv.value_ptr.len], kv.value_ptr.*);
+            offset += kv.value_ptr.len;
         }
 
         return buf;
@@ -1058,6 +1294,24 @@ pub const TSProjection = struct {
 
             try self.blocks.put(key, block_list);
         }
+
+        // Tag dictionary — without it a restored projection knows each series'
+        // tag hash but not its tags, so every predicate filter would match
+        // nothing after a restart.
+        if (offset + 4 > data.len) return;
+        const dict_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+        offset += 4;
+        var dct: u32 = 0;
+        while (dct < dict_count) : (dct += 1) {
+            if (offset + 10 > data.len) return;
+            const hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+            offset += 8;
+            const tlen = std.mem.readInt(u16, data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + tlen > data.len) return;
+            try self.registerTagSet(hash, data[offset..][0..tlen]);
+            offset += tlen;
+        }
     }
 };
 
@@ -1071,9 +1325,9 @@ test "ts: basic insert and query" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, 0);
-    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, 0);
-    try ts.insert(0, "cpu", "usage", 90.1, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, "");
+    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, "");
+    try ts.insert(0, "cpu", "usage", 90.1, 3000, 3, "");
 
     try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
@@ -1088,10 +1342,10 @@ test "ts: range query filters by timestamp" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "mem", "used", 100.0, 1000, 1, 0);
-    try ts.insert(0, "mem", "used", 200.0, 2000, 2, 0);
-    try ts.insert(0, "mem", "used", 300.0, 3000, 3, 0);
-    try ts.insert(0, "mem", "used", 400.0, 4000, 4, 0);
+    try ts.insert(0, "mem", "used", 100.0, 1000, 1, "");
+    try ts.insert(0, "mem", "used", 200.0, 2000, 2, "");
+    try ts.insert(0, "mem", "used", 300.0, 3000, 3, "");
+    try ts.insert(0, "mem", "used", 400.0, 4000, 4, "");
 
     var buf: [10]StoredPoint = undefined;
     const result = try ts.queryRange(0, "mem", "used", null, 2000, 3000, &buf);
@@ -1104,11 +1358,11 @@ test "ts: aggregation — avg" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
-    try ts.insert(0, "cpu", "usage", 90.0, 2000, 2, 0);
-    try ts.insert(0, "cpu", "usage", 100.0, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
+    try ts.insert(0, "cpu", "usage", 90.0, 2000, 2, "");
+    try ts.insert(0, "cpu", "usage", 100.0, 3000, 3, "");
 
-    const average = (try ts.avg(0, "cpu", "usage", null, 1000, 3000)).?;
+    const average = (try ts.avg(0, "cpu", "usage", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), average, 0.001);
 }
 
@@ -1116,17 +1370,17 @@ test "ts: aggregation — min/max/sum" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "disk", "iops", 10.0, 1000, 1, 0);
-    try ts.insert(0, "disk", "iops", 50.0, 2000, 2, 0);
-    try ts.insert(0, "disk", "iops", 30.0, 3000, 3, 0);
+    try ts.insert(0, "disk", "iops", 10.0, 1000, 1, "");
+    try ts.insert(0, "disk", "iops", 50.0, 2000, 2, "");
+    try ts.insert(0, "disk", "iops", 30.0, 3000, 3, "");
 
-    const min_val = (try ts.min(0, "disk", "iops", null, 1000, 3000)).?;
+    const min_val = (try ts.min(0, "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 10.0), min_val, 0.001);
 
-    const max_val = (try ts.max(0, "disk", "iops", null, 1000, 3000)).?;
+    const max_val = (try ts.max(0, "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 50.0), max_val, 0.001);
 
-    const sum_val = (try ts.sum(0, "disk", "iops", null, 1000, 3000)).?;
+    const sum_val = (try ts.sum(0, "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), sum_val, 0.001);
 }
 
@@ -1134,11 +1388,11 @@ test "ts: aggregation — count" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "net", "rx", 1.0, 1000, 1, 0);
-    try ts.insert(0, "net", "rx", 2.0, 2000, 2, 0);
-    try ts.insert(0, "net", "rx", 3.0, 3000, 3, 0);
+    try ts.insert(0, "net", "rx", 1.0, 1000, 1, "");
+    try ts.insert(0, "net", "rx", 2.0, 2000, 2, "");
+    try ts.insert(0, "net", "rx", 3.0, 3000, 3, "");
 
-    const c = try ts.count(0, "net", "rx", null, 1500, 2500);
+    const c = try ts.count(0, "net", "rx", &.{}, 1500, 2500);
     try testing.expectEqual(@as(usize, 1), c); // only ts=2000 in range
 }
 
@@ -1146,12 +1400,12 @@ test "ts: buffer flush creates block" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 3 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 1.0, 1000, 1, 0);
-    try ts.insert(0, "cpu", "usage", 2.0, 2000, 2, 0);
+    try ts.insert(0, "cpu", "usage", 1.0, 1000, 1, "");
+    try ts.insert(0, "cpu", "usage", 2.0, 2000, 2, "");
     try testing.expectEqual(@as(u64, 0), ts.stats.blocks_flushed);
 
     // Third insert triggers flush
-    try ts.insert(0, "cpu", "usage", 3.0, 3000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 3.0, 3000, 3, "");
     try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
     try testing.expectEqual(@as(usize, 1), ts.totalBlocks());
 
@@ -1166,9 +1420,9 @@ test "ts: multiple series" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
-    try ts.insert(0, "cpu", "idle", 20.0, 1000, 2, 0);
-    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
+    try ts.insert(0, "cpu", "idle", 20.0, 1000, 2, "");
+    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, "");
 
     try testing.expectEqual(@as(usize, 3), ts.seriesCount());
 }
@@ -1187,7 +1441,7 @@ test "ts: memory usage estimate" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, 0);
+    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
     try testing.expect(ts.memoryUsage() > 0);
 }
 
@@ -1218,12 +1472,12 @@ test "ts: serialize/deserialize round-trip" {
     defer ts.deinit();
 
     // Insert points into different series
-    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, 0);
-    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, 0);
-    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, 0);
+    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, "");
+    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, "");
+    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, "");
 
     // Force a flush by filling the buffer (capacity=3)
-    try ts.insert(0, "cpu", "usage", 90.0, 3000, 4, 0);
+    try ts.insert(0, "cpu", "usage", 90.0, 3000, 4, "");
     try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
 
     // Serialize
@@ -1277,9 +1531,9 @@ test "ts: tags are a series dimension, not collapsed into one buffer" {
     const web2 = canonicalTagHash("host=web-02");
     try testing.expect(web1 != web2);
 
-    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, web1);
-    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, web2);
-    try ts.insert(1, "cpu", "value", 30.0, 3000, 3, web1);
+    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01");
+    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, "host=web-02");
+    try ts.insert(1, "cpu", "value", 30.0, 3000, 3, "host=web-01");
 
     // Same measurement+field, two tag sets → two distinct series.
     try testing.expectEqual(@as(usize, 2), ts.seriesCount());
@@ -1304,9 +1558,9 @@ test "ts: untagged query still sees tagged writes (no silent regression)" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
 
-    try ts.insert(1, "cpu", "value", 10.0, 3000, 1, canonicalTagHash("host=a"));
-    try ts.insert(1, "cpu", "value", 20.0, 1000, 2, canonicalTagHash("host=b"));
-    try ts.insert(1, "cpu", "value", 30.0, 2000, 3, 0);
+    try ts.insert(1, "cpu", "value", 10.0, 3000, 1, "host=a");
+    try ts.insert(1, "cpu", "value", 20.0, 1000, 2, "host=b");
+    try ts.insert(1, "cpu", "value", 30.0, 2000, 3, "");
 
     // `null` = any tags: every tag-series is merged...
     var buf: [16]StoredPoint = undefined;
@@ -1319,9 +1573,9 @@ test "ts: untagged query still sees tagged writes (no silent regression)" {
     try testing.expectEqual(@as(u64, 3000), buf[2].timestamp_ns);
 
     // Aggregations follow the same rule: (10+20+30)/3 across all tag-series.
-    const a = try ts.avg(1, "cpu", "value", null, 0, std.math.maxInt(u64));
+    const a = try ts.avg(1, "cpu", "value", &.{}, 0, std.math.maxInt(u64));
     try testing.expectApproxEqAbs(@as(f64, 20.0), a.?, 0.001);
-    const a_b = try ts.avg(1, "cpu", "value", canonicalTagHash("host=b"), 0, std.math.maxInt(u64));
+    const a_b = try ts.avg(1, "cpu", "value", &[_]TagPredicate{.{ .key = "host", .op = .eq, .value = "b" }}, 0, std.math.maxInt(u64));
     try testing.expectApproxEqAbs(@as(f64, 20.0), a_b.?, 0.001);
 }
 
@@ -1340,8 +1594,8 @@ test "ts: tag hash is canonical — order does not fragment a series" {
 
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
-    try ts.insert(1, "cpu", "value", 1.0, 1000, 1, canonicalTagHash("host=a,env=b"));
-    try ts.insert(1, "cpu", "value", 2.0, 2000, 2, canonicalTagHash("env=b,host=a"));
+    try ts.insert(1, "cpu", "value", 1.0, 1000, 1, "host=a,env=b");
+    try ts.insert(1, "cpu", "value", 2.0, 2000, 2, "env=b,host=a");
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
 }
 
@@ -1374,20 +1628,20 @@ test "ts: series key parsing isolates field from the trailing tag hash" {
 }
 
 test "ts: TsWriteValue round-trips field, timestamp and tags" {
-    // These three were silently dropped on replay before #24.
-    var buf: [128]u8 = undefined;
+    // All three were silently dropped on replay before #24.
+    var buf: [256]u8 = undefined;
     const encoded = TsWriteValue.encode(&buf, .{
         .value = 42.5,
-        .tag_hash = 0xDEADBEEF,
         .timestamp_ns = 123_456_789,
         .field_name = "user",
+        .tags = "host=web-01,env=prod",
     }).?;
 
     const decoded = TsWriteValue.decode(encoded, 999).?;
     try testing.expectApproxEqAbs(@as(f64, 42.5), decoded.value, 0.001);
-    try testing.expectEqual(@as(u64, 0xDEADBEEF), decoded.tag_hash);
     try testing.expectEqual(@as(u64, 123_456_789), decoded.timestamp_ns);
     try testing.expectEqualStrings("user", decoded.field_name);
+    try testing.expectEqualStrings("host=web-01,env=prod", decoded.tags);
 
     // A bare 8-byte value decodes defensively against the header timestamp.
     var short: [8]u8 = undefined;
@@ -1396,14 +1650,14 @@ test "ts: TsWriteValue round-trips field, timestamp and tags" {
     try testing.expectApproxEqAbs(@as(f64, 7.0), legacy.value, 0.001);
     try testing.expectEqual(@as(u64, 555), legacy.timestamp_ns);
     try testing.expectEqualStrings("value", legacy.field_name);
-    try testing.expectEqual(@as(u64, 0), legacy.tag_hash);
+    try testing.expectEqualStrings("", legacy.tags);
 }
 
 test "ts: snapshot round-trips tagged series and rejects an old version" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
-    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, canonicalTagHash("host=a"));
-    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, canonicalTagHash("host=b"));
+    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=a");
+    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, "host=b");
 
     const data = try ts.serialize(testing.allocator);
     defer testing.allocator.free(data);
@@ -1425,4 +1679,137 @@ test "ts: snapshot round-trips tagged series and rejects an old version" {
     var ts3 = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts3.deinit();
     try testing.expectError(error.UnsupportedSnapshotVersion, ts3.deserialize(old_snapshot));
+}
+
+// ─── Tag dictionary: partial / negated / glob matching (issue #24 part 2b) ──
+
+test "ts: partial tag filter matches a superset tag set" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    defer ts.deinit();
+
+    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
+    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, "host=web-02,env=prod");
+    try ts.insert(1, "cpu", "value", 30.0, 3000, 3, "host=web-01,env=staging");
+
+    var buf: [16]StoredPoint = undefined;
+
+    // The whole point of 2b: a filter naming ONE tag selects every series whose
+    // tag set contains it. Under the 2a tag-hash lookup this matched nothing.
+    const host1 = [_]TagPredicate{.{ .key = "host", .op = .eq, .value = "web-01" }};
+    const r1 = try ts.queryRangeFiltered(1, "cpu", "value", &host1, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 2), r1.points_in_buffer);
+    try testing.expectApproxEqAbs(@as(f64, 10.0), buf[0].field_value, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 30.0), buf[1].field_value, 0.001);
+
+    // Two predicates AND together.
+    const both = [_]TagPredicate{
+        .{ .key = "host", .op = .eq, .value = "web-01" },
+        .{ .key = "env", .op = .eq, .value = "prod" },
+    };
+    const r2 = try ts.queryRangeFiltered(1, "cpu", "value", &both, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 1), r2.points_in_buffer);
+    try testing.expectApproxEqAbs(@as(f64, 10.0), buf[0].field_value, 0.001);
+
+    // No predicates = every tag-series.
+    const r3 = try ts.queryRangeFiltered(1, "cpu", "value", &.{}, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 3), r3.points_in_buffer);
+}
+
+test "ts: negated and glob tag predicates" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    defer ts.deinit();
+
+    try ts.insert(1, "m", "value", 1.0, 1000, 1, "region=us-east");
+    try ts.insert(1, "m", "value", 2.0, 2000, 2, "region=us-west");
+    try ts.insert(1, "m", "value", 3.0, 3000, 3, "region=eu-west");
+    try ts.insert(1, "m", "value", 4.0, 4000, 4, "");
+
+    var buf: [16]StoredPoint = undefined;
+
+    // `!=` — and an absent tag satisfies a negation, so the untagged point matches.
+    const neq = [_]TagPredicate{.{ .key = "region", .op = .neq, .value = "us-east" }};
+    const r1 = try ts.queryRangeFiltered(1, "m", "value", &neq, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 3), r1.points_in_buffer);
+
+    // Glob `us-*`.
+    const glob = [_]TagPredicate{.{ .key = "region", .op = .glob, .value = "us-*" }};
+    const r2 = try ts.queryRangeFiltered(1, "m", "value", &glob, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 2), r2.points_in_buffer);
+
+    // Negated glob `*-west` excludes us-west and eu-west, keeps us-east + untagged.
+    const nglob = [_]TagPredicate{.{ .key = "region", .op = .nglob, .value = "*-west" }};
+    const r3 = try ts.queryRangeFiltered(1, "m", "value", &nglob, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 2), r3.points_in_buffer);
+}
+
+test "ts: glob matcher" {
+    try testing.expect(globMatch("web-*", "web-01"));
+    try testing.expect(globMatch("*-west", "us-west"));
+    try testing.expect(globMatch("web-0?", "web-01"));
+    try testing.expect(globMatch("*", "anything"));
+    try testing.expect(globMatch("exact", "exact"));
+    try testing.expect(!globMatch("web-*", "db-01"));
+    try testing.expect(!globMatch("web-0?", "web-012"));
+    try testing.expect(!globMatch("exact", "exac"));
+    // A `*` may match nothing at all.
+    try testing.expect(globMatch("a*b", "ab"));
+}
+
+test "ts: tag dictionary resolves a series' tags and survives a snapshot" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    defer ts.deinit();
+
+    // Written unsorted — the dictionary stores the canonical (sorted) spelling.
+    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
+    const h = canonicalTagHash("env=prod,host=web-01");
+    try testing.expectEqualStrings("env=prod,host=web-01", ts.tagsForHash(h));
+    try testing.expectEqualStrings("", ts.tagsForHash(0));
+
+    var names: [8][]const u8 = undefined;
+    const n = try ts.seriesTagsFor(1, "cpu", "value", &names);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("env=prod,host=web-01", names[0]);
+
+    // A restored projection must still resolve tags, or every predicate filter
+    // would silently match nothing after a restart.
+    const data = try ts.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+    var ts2 = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer ts2.deinit();
+    try ts2.deserialize(data);
+
+    try testing.expectEqualStrings("env=prod,host=web-01", ts2.tagsForHash(h));
+    var buf: [8]StoredPoint = undefined;
+    const preds = [_]TagPredicate{.{ .key = "host", .op = .eq, .value = "web-01" }};
+    const r = try ts2.queryRangeFiltered(1, "cpu", "value", &preds, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
+}
+
+test "ts: replay reconstructs the tagged series exactly" {
+    // The write path persists TsWriteValue; applyEntry must rebuild the same
+    // series, tags included. 2a added the codec but never wired the encode
+    // side, so replay still lost field/timestamp/tags.
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
+    defer ts.deinit();
+
+    var val_buf: [256]u8 = undefined;
+    const encoded = TsWriteValue.encode(&val_buf, .{
+        .value = 55.0,
+        .timestamp_ns = 7_000_000_000,
+        .field_name = "user",
+        .tags = "host=web-01,env=prod",
+    }).?;
+
+    var payload_buf: [512]u8 = undefined;
+    const entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 123, 1, "cpu", encoded, &payload_buf).?;
+    try ts.applyEntry(&entry);
+
+    // Field, timestamp and tags all survive — and the point is addressable by a
+    // partial tag filter, which requires the dictionary to be repopulated.
+    var buf: [8]StoredPoint = undefined;
+    const preds = [_]TagPredicate{.{ .key = "env", .op = .eq, .value = "prod" }};
+    const r = try ts.queryRangeFiltered(1, "cpu", "user", &preds, 0, std.math.maxInt(u64), &buf);
+    try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
+    try testing.expectApproxEqAbs(@as(f64, 55.0), buf[0].field_value, 0.001);
+    try testing.expectEqual(@as(u64, 7_000_000_000), buf[0].timestamp_ns);
 }

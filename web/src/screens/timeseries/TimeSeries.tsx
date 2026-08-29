@@ -6,8 +6,8 @@
    screen renders measurements, their fields, per-field point counts, and raw
    point charts from /data (add `?tags=k=v` to scope to one tag-series). FloQL
    executes server-side (parser + pipeline executor) and its source tag filters
-   are applied when they name a complete tag set with `=`; partial sets and
-   `!=`/`=~`/`!~` still fall back to unfiltered until the tag dictionary lands.
+   are fully applied — partial sets, `!=`, and `=~`/`!~` globs all select series
+   via the projection's tag dictionary.
    Ingest is command-only (no write endpoint); measurements are namespace-scoped
    server-side (`?namespace=`). See API_INTEGRATION.md. */
 import { useState, useEffect, useMemo, useRef } from 'react'

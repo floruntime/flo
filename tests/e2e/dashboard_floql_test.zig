@@ -117,3 +117,39 @@ test "e2e/dashboard: floql source tag filters actually filter (#24 part 2a)" {
     defer all.deinit();
     try testing.expect(std.mem.indexOf(u8, all.body, "\"value\":15") != null);
 }
+
+test "e2e/dashboard: floql partial and glob tag filters (#24 part 2b)" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ts", "write", "dash_2b", "--tags", "host=web-01,env=prod", "--value", "10.0" });
+    try ctx.exec(&.{ "ts", "write", "dash_2b", "--tags", "host=web-02,env=prod", "--value", "20.0" });
+    try ctx.exec(&.{ "ts", "write", "dash_2b", "--tags", "host=api-01,env=prod", "--value", "60.0" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    // PARTIAL filter — names one tag of a two-tag set. Returned nothing under
+    // the 2a tag-hash lookup; now selects that one series.
+    var partial = try http.post("/api/v1/timeseries/floql", "dash_2b{host=web-01} [1h] | avg()");
+    defer partial.deinit();
+    try testing.expectEqual(@as(u16, 200), partial.status);
+    try testing.expect(std.mem.indexOf(u8, partial.body, "\"value\":10") != null);
+
+    // GLOB — web-* selects two series: avg(10,20) = 15.
+    var glob = try http.post("/api/v1/timeseries/floql", "dash_2b{host=~web-*} [1h] | avg()");
+    defer glob.deinit();
+    try testing.expect(std.mem.indexOf(u8, glob.body, "\"value\":15") != null);
+
+    // NEGATED — everything but api-01 is the same two series.
+    var neg = try http.post("/api/v1/timeseries/floql", "dash_2b{host!=api-01} [1h] | avg()");
+    defer neg.deinit();
+    try testing.expect(std.mem.indexOf(u8, neg.body, "\"value\":15") != null);
+
+    // A shared tag selects all three: avg(10,20,60) = 30.
+    var all = try http.post("/api/v1/timeseries/floql", "dash_2b{env=prod} [1h] | avg()");
+    defer all.deinit();
+    try testing.expect(std.mem.indexOf(u8, all.body, "\"value\":30") != null);
+}
