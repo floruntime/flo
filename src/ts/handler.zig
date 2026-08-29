@@ -171,27 +171,37 @@ pub const TSHandler = struct {
 
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
-        const tag_hash: u64 = if (req.findOption(.ts_tags)) |opt|
-            ts_mod.canonicalTagHash(opt.asString())
-        else
-            0;
+        const tags_str: []const u8 = if (req.findOption(.ts_tags)) |opt| opt.asString() else "";
 
-        // Persist through Raft for durability and replication
+        // Persist through Raft for durability and replication.
+        //
+        // The value carries the reading AND the field name, client timestamp and
+        // tag set (ts_mod.TsWriteValue). Persisting only the 8 value bytes — as
+        // this did — meant replay reconstructed every point as `<measurement>/
+        // value` at the entry's own timestamp with no tags, silently losing
+        // three of the four dimensions on restart.
         var ual_index: u64 = 0;
         if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
-            // Encode value as f64 LE bytes for persistence
-            var val_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &val_buf, @as(u64, @bitCast(value)), .little);
-            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, &val_buf) catch {
+            var val_buf: [ts_mod.MAX_TAG_STRING + 512]u8 = undefined;
+            const encoded = ts_mod.TsWriteValue.encode(&val_buf, .{
+                .value = value,
+                .timestamp_ns = timestamp_ns,
+                .field_name = field_name,
+                .tags = tags_str,
+            }) orelse {
+                return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
+            };
+            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "ts write persistence failed" } };
             };
         } else {
             ual_index = self.nextUalIndex();
         }
 
-        // Insert into local TS projection (full fidelity: field_name + tag_hash)
-        self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tag_hash) catch {
+        // Insert into the local projection (the projection canonicalizes the
+        // tag set and owns hashing + dictionary registration).
+        self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
         };
 
@@ -206,34 +216,54 @@ pub const TSHandler = struct {
 
     // ── READ ────────────────────────────────────────────────────────────
 
-    /// Turn FloQL source tag filters into an exact tag-set hash.
+    /// Parse a `k=v,k=v` filter string into equality predicates.
     ///
-    /// A tag *hash* can only answer exact-set equality, so this applies only
-    /// when every filter is `=` AND the filters name the point's complete tag
-    /// set. `!=`, `=~`, `!~` — and partial tag sets — are unanswerable from a
-    /// hash, so we return null (unfiltered, i.e. today's behaviour) rather than
-    /// silently returning nothing. Real partial/regex tag matching needs the
-    /// tag dictionary (issue #24 part 2b).
-    fn floqlTagFilter(filters: []const floql_ast.TagFilter, scratch: []u8) ?u64 {
-        if (filters.len == 0) return null;
-        var pairs_buf: [32]ts_mod.TagPair = undefined;
-        if (filters.len > pairs_buf.len) return null;
-        for (filters, 0..) |f, i| {
-            if (f.op != .eq) return null; // not expressible as a set hash
-            pairs_buf[i] = .{ .key = f.key, .value = f.value };
+    /// Predicates constrain only the tags they name, so `--tags host=web-01`
+    /// now matches a point tagged `host=web-01,env=prod`. Under the previous
+    /// exact tag-hash lookup a partial filter matched nothing at all.
+    fn parseTagPredicates(tags: []const u8, out: []ts_mod.TagPredicate) []const ts_mod.TagPredicate {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, tags, ',');
+        while (it.next()) |raw| {
+            if (n >= out.len) break;
+            const part = std.mem.trim(u8, raw, " \t");
+            if (part.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+            out[n] = .{ .key = part[0..eq], .op = .eq, .value = part[eq + 1 ..] };
+            n += 1;
         }
-        return ts_mod.canonicalTagHashPairs(pairs_buf[0..filters.len], scratch);
+        return out[0..n];
     }
 
-    /// Optional tag-set filter for a read: `null` when the request names no
-    /// tags, which means "any tags" and fans out across every tag-series.
-    /// Previously `.ts_tags` was accepted on the wire and silently dropped, so
-    /// every tag filter was a no-op.
-    fn requestTagFilter(req: Request) ?u64 {
-        const opt = req.findOption(.ts_tags) orelse return null;
+    /// Tag predicates for a read request (empty = every tag-series).
+    fn requestTagPredicates(req: Request, out: []ts_mod.TagPredicate) []const ts_mod.TagPredicate {
+        const opt = req.findOption(.ts_tags) orelse return &.{};
         const tags_str = opt.asString();
-        if (tags_str.len == 0) return null;
-        return ts_mod.canonicalTagHash(tags_str);
+        if (tags_str.len == 0) return &.{};
+        return parseTagPredicates(tags_str, out);
+    }
+
+    /// Translate FloQL source tag filters into predicates. Every operator maps
+    /// directly now — `=~`/`!~` are glob, matching the `{host=~web-*}` form the
+    /// e2e suite uses — so filters are no longer silently dropped for anything
+    /// other than a complete `=` set.
+    fn floqlTagPredicates(filters: []const floql_ast.TagFilter, out: []ts_mod.TagPredicate) []const ts_mod.TagPredicate {
+        var n: usize = 0;
+        for (filters) |f| {
+            if (n >= out.len) break;
+            out[n] = .{
+                .key = f.key,
+                .op = switch (f.op) {
+                    .eq => .eq,
+                    .neq => .neq,
+                    .regex => .glob,
+                    .nregex => .nglob,
+                },
+                .value = f.value,
+            };
+            n += 1;
+        }
+        return out[0..n];
     }
 
     fn handleRead(self: *TSHandler, req: Request) CommandResult {
@@ -260,7 +290,9 @@ pub const TSHandler = struct {
 
         // Query raw points
         var point_buf: [4096]StoredPoint = undefined;
-        const result = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, requestTagFilter(req), from_ns, to_ns, &point_buf) catch {
+        var pred_buf: [32]ts_mod.TagPredicate = undefined;
+        const preds = requestTagPredicates(req, &pred_buf);
+        const result = self.ts.queryRangeFiltered(router.namespaceHash(req.namespace), measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
 
@@ -311,10 +343,11 @@ pub const TSHandler = struct {
         } else DEFAULT_WINDOW_MS;
 
         const ns_hash = router.namespaceHash(req.namespace);
-        const tag_filter = requestTagFilter(req);
+        var pred_buf: [32]ts_mod.TagPredicate = undefined;
+        const preds = requestTagPredicates(req, &pred_buf);
 
         var point_buf: [4096]StoredPoint = undefined;
-        const qr = self.ts.queryRange(ns_hash, measurement, field_name, tag_filter, from_ns, to_ns, &point_buf) catch {
+        const qr = self.ts.queryRangeFiltered(ns_hash, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts query failed" } };
         };
         const pts = point_buf[0..qr.points_in_buffer];
@@ -403,9 +436,9 @@ pub const TSHandler = struct {
 
         // 3. Query the TSProjection for raw points
         var point_buf: [4096]StoredPoint = undefined;
-        var tag_scratch: [1024]u8 = undefined;
-        const src_tag_filter = floqlTagFilter(query.source.filters, &tag_scratch);
-        const qr = self.ts.queryRange(router.namespaceHash(req.namespace), measurement, field_name, src_tag_filter, from_ns, to_ns, &point_buf) catch {
+        var pred_buf: [32]ts_mod.TagPredicate = undefined;
+        const src_preds = floqlTagPredicates(query.source.filters, &pred_buf);
+        const qr = self.ts.queryRangeFiltered(router.namespaceHash(req.namespace), measurement, field_name, src_preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
         };
 
@@ -549,19 +582,17 @@ pub const TSHandler = struct {
     fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
         const self: *TSHandler = @ptrCast(@alignCast(ctx));
         if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-            var value: f64 = 0.0;
-            if (cmd.value.len >= 8) {
-                value = @bitCast(std.mem.readInt(u64, cmd.value[0..8], .little));
+            if (ts_mod.TsWriteValue.decode(cmd.value, entry.header.timestamp_ns)) |rec| {
+                self.ts.insert(
+                    cmd.namespace_hash,
+                    cmd.key,
+                    rec.field_name,
+                    rec.value,
+                    rec.timestamp_ns,
+                    entry.header.index,
+                    rec.tags,
+                ) catch {};
             }
-            self.ts.insert(
-                cmd.namespace_hash,
-                cmd.key,
-                "value",
-                value,
-                entry.header.timestamp_ns,
-                entry.header.index,
-                0,
-            ) catch {};
         }
     }
 
