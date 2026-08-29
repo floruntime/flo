@@ -487,6 +487,7 @@ pub const Runtime = struct {
         // 2.57 Wire cross-shard shard pointers for pre-route forwarding.
         log.debug("Runtime.start: wiring peer shards", .{});
         try self.wirePeerShards(shards);
+        log.debug("Runtime.start: peer shards wired", .{});
 
         // 2.6 Register cooperative background tasks (hot_flush, etc.).
         // Must happen after shards are at final heap addresses.
@@ -736,7 +737,13 @@ pub const Runtime = struct {
     /// pre-routed requests to the correct shard's handlers.
     fn wirePeerShards(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
+        // This function is two single-iteration loops around an 8-byte
+        // allocation, yet it is where a joining node's output stops on Linux
+        // (#54). Logged step by step to establish whether it actually blocks
+        // here or whether the previous line was simply the last one flushed.
+        log.debug("wirePeerShards: allocating {d} ptrs", .{n});
         const ptrs = try self.allocator.alloc(*Shard, n);
+        log.debug("wirePeerShards: allocated", .{});
         for (0..n) |i| {
             ptrs[i] = &shards[i];
         }
@@ -744,6 +751,7 @@ pub const Runtime = struct {
         for (0..n) |i| {
             shards[i].peer_shards = ptrs;
         }
+        log.debug("wirePeerShards: done", .{});
     }
 
     /// Wire cross-shard walk contexts for all walk-registered opcodes.
