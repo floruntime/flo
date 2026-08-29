@@ -40,6 +40,7 @@ const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
+const HttpMetricsServer = @import("../metrics/http_server.zig").HttpMetricsServer;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
 ///
@@ -179,6 +180,9 @@ pub const Runtime = struct {
     /// Metrics registry for dashboard and Prometheus endpoint.
     metrics_registry: ?*MetricsRegistry,
 
+    /// Prometheus exporter (serves GET /metrics on the metrics port).
+    metrics_server: ?*HttpMetricsServer,
+
     /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
     /// Each entry is a per-shard array of projection pointers for one walk opcode.
     /// Slots: [0] = ts_list. More slots added as modules gain list support.
@@ -218,6 +222,7 @@ pub const Runtime = struct {
             .dashboard_server = null,
             .dashboard_ctx = null,
             .metrics_registry = null,
+            .metrics_server = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .peer_stream_handlers_slice = null,
             .peer_kv_handlers_slice = null,
@@ -245,6 +250,12 @@ pub const Runtime = struct {
             }
             self.allocator.destroy(ctx);
             self.dashboard_ctx = null;
+        }
+        // Stop the exporter before freeing the registry it reads from.
+        if (self.metrics_server) |ms| {
+            ms.deinit();
+            self.allocator.destroy(ms);
+            self.metrics_server = null;
         }
         if (self.metrics_registry) |metrics| {
             metrics.deinit();
@@ -515,13 +526,23 @@ pub const Runtime = struct {
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
         log.debug("Runtime.start: acceptor thread spawned", .{});
 
-        // 6. Start dashboard HTTP server if enabled
-        if (self.config.dashboard_enabled) {
+        // 6. Metrics registry — shared by the Prometheus exporter and the
+        //    dashboard. Created when either consumer is enabled; it used to be
+        //    created inside the dashboard block, so `metrics.enabled = true`
+        //    with the dashboard off produced no registry and no exporter.
+        if (self.config.metrics_enabled or self.config.dashboard_enabled) {
             const metrics = try self.allocator.create(MetricsRegistry);
             metrics.* = MetricsRegistry.init(self.allocator);
             self.metrics_registry = metrics;
 
-            // Wire metrics registry into each shard's stream handler
+            // Size the per-shard counter table. Without this `shardCount()`
+            // stays 0, so /health reported "shards":0 on a multi-shard node and
+            // the shard metric family was omitted entirely.
+            metrics.initShards(self.shard_count) catch |err| {
+                log.warn("metrics: initShards({d}) failed: {s}", .{ self.shard_count, @errorName(err) });
+            };
+
+            // Wire metrics registry into each shard's handlers
             if (self.shards) |s| {
                 for (s) |*shard| {
                     shard.setMetricsRegistry(metrics);
@@ -531,6 +552,30 @@ pub const Runtime = struct {
             // Wire replication metrics into the raft network (issue #16) so the
             // leader-side oversize-skip / send-failure counters are recorded.
             if (self.raft_network) |rn| rn.setReplicationMetrics(&metrics.replication);
+        }
+
+        // 6a. Prometheus exporter. The server existed but nothing ever
+        //     constructed it, so `exportPrometheus` had no live caller and there
+        //     was no scrape target on the metrics port.
+        if (self.config.metrics_enabled) {
+            if (self.metrics_registry) |metrics| {
+                const ms = try self.allocator.create(HttpMetricsServer);
+                ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), metrics);
+                self.metrics_server = ms;
+                ms.start() catch |err| {
+                    log.err("metrics exporter failed to start on port {d}: {s}", .{ self.config.effectiveMetricsPort(), @errorName(err) });
+                    self.allocator.destroy(ms);
+                    self.metrics_server = null;
+                };
+                if (self.metrics_server != null) {
+                    log.debug("Runtime.start: metrics exporter on port {d}", .{self.config.effectiveMetricsPort()});
+                }
+            }
+        }
+
+        // 6b. Start dashboard HTTP server if enabled
+        if (self.config.dashboard_enabled) {
+            const metrics = self.metrics_registry.?;
 
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);

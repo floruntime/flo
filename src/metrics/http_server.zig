@@ -44,8 +44,12 @@ pub const HttpMetricsServer = struct {
     }
 
     pub fn start(self: *Self) !void {
-        // Create listening socket
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        // Create listening socket. Uses the stdx.net syscall wrappers rather
+        // than std.posix.socket/bind/listen/accept, which do not exist in this
+        // Zig version — that is why this server never compiled and so was never
+        // wired into the runtime.
+        const net = @import("stdx").net;
+        const sock = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer _ = std.c.close(sock);
 
         // Allow address reuse
@@ -53,9 +57,9 @@ pub const HttpMetricsServer = struct {
         try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
 
         // Bind to port
-        const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port);
-        try std.posix.bind(sock, &addr.any, addr.getOsSockLen());
-        try std.posix.listen(sock, 16);
+        const addr = net.SocketAddrV4.initIp4(.{ 0, 0, 0, 0 }, self.port);
+        try net.sysBind(sock, addr.anyPtr(), addr.anyLen());
+        try net.sysListen(sock, 16);
 
         self.listener = sock;
         self.running.store(true, .release);
@@ -74,7 +78,7 @@ pub const HttpMetricsServer = struct {
         // Close listener to unblock accept
         if (self.listener) |sock| {
             // Shutdown first to interrupt any blocked accept()
-            std.posix.shutdown(sock, .both) catch {};
+            _ = std.c.shutdown(sock, 2); // SHUT_RDWR
             _ = std.c.close(sock);
             self.listener = null;
         }
@@ -95,7 +99,7 @@ pub const HttpMetricsServer = struct {
             var client_addr: std.posix.sockaddr = undefined;
             var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
 
-            const client = std.posix.accept(listener, &client_addr, &addr_len, 0) catch |err| {
+            const client = @import("stdx").net.sysAccept(listener, &client_addr, &addr_len, 0) catch |err| {
                 if (err == error.ConnectionAborted or err == error.SocketNotListening) {
                     // Server shutting down
                     break;
@@ -151,8 +155,8 @@ pub const HttpMetricsServer = struct {
         const header = http.formatResponseHeaders(&header_buf, .ok, .prometheus, body.len) orelse
             return error.BufferTooSmall;
 
-        _ = try std.posix.write(client, header);
-        _ = try std.posix.write(client, body);
+        _ = try @import("stdx").net.sysWrite(client, header);
+        _ = try @import("stdx").net.sysWrite(client, body);
     }
 
     /// Send JSON health response with shard and uptime info
@@ -169,8 +173,8 @@ pub const HttpMetricsServer = struct {
         const header = http.formatResponseHeaders(&header_buf, .ok, .json, body.len) orelse
             return error.BufferTooSmall;
 
-        _ = try std.posix.write(client, header);
-        _ = try std.posix.write(client, body);
+        _ = try @import("stdx").net.sysWrite(client, header);
+        _ = try @import("stdx").net.sysWrite(client, body);
     }
 
     /// Get the actual bound port (useful when port was 0)
@@ -178,7 +182,9 @@ pub const HttpMetricsServer = struct {
         const sock = self.listener orelse return error.NotListening;
         var addr: std.posix.sockaddr.in = undefined;
         var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        try std.posix.getsockname(sock, @ptrCast(&addr), &len);
+        // std.c rather than std.posix.getsockname, which this Zig version
+        // does not expose (see the socket calls in `start`).
+        if (std.c.getsockname(sock, @ptrCast(&addr), &len) != 0) return error.GetSockNameFailed;
         return std.mem.bigToNative(u16, addr.port);
     }
 };
@@ -199,14 +205,24 @@ test "HttpMetricsServer basic functionality" {
     try server.start();
     const port = try server.getBoundPort();
 
-    // Make HTTP request
-    const stream = try std.net.tcpConnectToHost(allocator, "127.0.0.1", port);
+    // Make HTTP request. stdx.net rather than std.net.tcpConnectToHost, which
+    // this Zig version does not provide.
+    const net = @import("stdx").net;
+    const stream = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
     defer stream.close();
 
     _ = try stream.write("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
-    var response_buf: [4096]u8 = undefined;
-    const response_len = try stream.read(&response_buf);
+    // Read until the peer closes. A single read() races the server: the
+    // response can arrive split across segments, which made this test fail
+    // roughly two runs in three under the full suite.
+    var response_buf: [8192]u8 = undefined;
+    var response_len: usize = 0;
+    while (response_len < response_buf.len) {
+        const n = stream.read(response_buf[response_len..]) catch break;
+        if (n == 0) break;
+        response_len += n;
+    }
     const response = response_buf[0..response_len];
 
     // Verify response

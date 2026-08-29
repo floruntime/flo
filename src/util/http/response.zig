@@ -340,8 +340,11 @@ pub fn writeResponse(client: std.posix.socket_t, status: StatusCode, content_typ
     var header_buf: [512]u8 = undefined;
     const header = formatResponseHeaders(&header_buf, status, content_type, body.len) orelse
         return error.BufferTooSmall;
-    _ = try std.posix.write(client, header);
-    _ = try std.posix.write(client, body);
+    // stdx.net.sysWrite rather than std.posix.write, which does not exist in
+    // this Zig version. Only the metrics exporter calls this, and that server
+    // never compiled, so the breakage was invisible until it was wired up.
+    _ = try @import("stdx").net.sysWrite(client, header);
+    _ = try @import("stdx").net.sysWrite(client, body);
 }
 
 test "build JSON response" {
