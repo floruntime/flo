@@ -18,7 +18,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const time = @import("stdx").time;
+const stdx = @import("stdx");
+const time = stdx.time;
 
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = switch (builtin.os.tag) {
@@ -177,10 +178,11 @@ fn processIoBytes() u64 {
 /// null on any error or if the key/number isn't in the first 4 KiB.
 fn readProcField(path: []const u8, key: []const u8) ?u64 {
     var buf: [4096]u8 = undefined;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const n = file.readAll(&buf) catch return null;
-    const content = buf[0..n];
+    // Via the stdx.fs wrappers, which track the std.fs API this codebase
+    // targets. The direct std.fs.openFileAbsolute + File.readAll pair used
+    // here no longer exists in Zig 0.16, and this file is Linux-only, so no
+    // macOS build ever analysed it (issue #50).
+    const content = stdx.fs.readFile(path, &buf) catch return null;
     const at = std.mem.indexOf(u8, content, key) orelse return null;
     var i = at + key.len;
     while (i < content.len and (content[i] < '0' or content[i] > '9')) : (i += 1) {}

@@ -274,7 +274,12 @@ pub const Reactor = struct {
             };
             _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
         } else if (comptime is_linux) {
-            const tfd = try posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+            // std.posix.timerfd_create/settime were removed in Zig 0.16; call the
+            // raw linux syscalls and map errno the way stdx.net does. This branch
+            // is Linux-only, so macOS builds never analysed it (issue #50).
+            const tfd_rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+            if (posix.errno(@as(isize, @bitCast(tfd_rc))) != .SUCCESS) return error.TimerCreateFailed;
+            const tfd: i32 = @intCast(tfd_rc);
             errdefer _ = std.c.close(tfd);
 
             // Convert interval_ms to itimerspec (repeating timer)
@@ -284,7 +289,8 @@ pub const Reactor = struct {
                 .it_interval = .{ .sec = secs, .nsec = nsecs },
                 .it_value = .{ .sec = secs, .nsec = nsecs },
             };
-            try posix.timerfd_settime(tfd, .{}, &spec, null);
+            const settime_rc = linux.timerfd_settime(tfd, .{}, &spec, null);
+            if (posix.errno(@as(isize, @bitCast(settime_rc))) != .SUCCESS) return error.TimerSetFailed;
 
             // Register timerfd as a source with .timer tag so poll identifies it
             try self.sources.put(tfd, .{
