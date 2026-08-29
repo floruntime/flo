@@ -67,6 +67,9 @@ fn startServerWithRetry(server: *ServerProcess) !void {
     const max_retries: u8 = 3;
     var attempt: u8 = 0;
     while (true) {
+        // Only the last attempt prints the server's log tail; the earlier ones
+        // are usually the same failure and would triple the output (#54).
+        server.dump_log_on_failure = (attempt + 1 >= max_retries);
         server.start() catch |err| {
             attempt += 1;
             if (attempt >= max_retries) return err;
@@ -151,7 +154,11 @@ pub const ClusterContext = struct {
             .tiered_log = config.tiered_log,
             .cluster_enabled = true, // Seed node needs Raft listener
         });
-        errdefer if (self.servers[0]) |s| s.deinit();
+        // Covers every node created so far. A per-iteration `errdefer` inside
+        // the join loop below only fires for its own iteration, so when the
+        // third node failed the first two leaked — 75 allocations across the
+        // suite, all traced to initWithConfig (issue #54).
+        errdefer self.deinitServers();
         startServerWithRetry(self.servers[0].?) catch |err| {
             std.debug.print("[cluster] Seed node failed to start: {}\n", .{err});
             return err;
@@ -170,9 +177,8 @@ pub const ClusterContext = struct {
                 .tiered_log = config.tiered_log,
                 .join_addresses = seed_endpoint,
             });
-            errdefer if (self.servers[i]) |s| s.deinit();
             startServerWithRetry(self.servers[i].?) catch |err| {
-                std.debug.print("[cluster] Node {d} failed to start: {}\n", .{ i, err });
+                std.debug.print("[cluster] Node {d} of {d} failed to start: {}\n", .{ i, config.node_count, err });
                 return err;
             };
         }
@@ -194,6 +200,18 @@ pub const ClusterContext = struct {
     /// Initialize with default 3-node configuration
     pub fn initDefault(allocator: Allocator) !Self {
         return init(allocator, .{});
+    }
+
+    /// Tear down any servers created so far. Safe to call with unset slots,
+    /// so it doubles as the error-path cleanup for a partially built cluster.
+    fn deinitServers(self: *Self) void {
+        for (0..self.node_count) |i| {
+            if (self.servers[i]) |server| {
+                server.stop();
+                server.deinit();
+                self.servers[i] = null;
+            }
+        }
     }
 
     /// Clean up all resources
