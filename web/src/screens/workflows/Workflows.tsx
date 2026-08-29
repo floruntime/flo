@@ -6,7 +6,9 @@
    results and the event timeline come straight from the engine. Start / cancel /
    enable / disable are real loopback writes. The list `steps[]` is often empty
    (the start step isn't a named step) so the Definition tab shows the raw YAML
-   rather than a synthesized DAG. create + signal have no dashboard endpoint yet.
+   rather than a synthesized DAG. create + signal have dashboard endpoints
+   (POST /workflow/definitions, POST /workflow/runs/:id/signal?signal=<type>)
+   but are not surfaced as controls in this screen yet.
    See API_INTEGRATION.md. */
 import { useMemo, useState } from 'react'
 import { Button } from '@/components/buttons/Button'
