@@ -340,8 +340,18 @@ pub fn writeResponse(client: std.posix.socket_t, status: StatusCode, content_typ
     var header_buf: [512]u8 = undefined;
     const header = formatResponseHeaders(&header_buf, status, content_type, body.len) orelse
         return error.BufferTooSmall;
-    _ = try std.posix.write(client, header);
-    _ = try std.posix.write(client, body);
+    try writeAllTo(client, header);
+    try writeAllTo(client, body);
+}
+
+/// Write the whole buffer — `sysWrite` retries neither a short write nor EINTR.
+fn writeAllTo(client: std.posix.socket_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try @import("stdx").net.sysWrite(client, bytes[off..]);
+        if (n == 0) return error.WriteFailed;
+        off += n;
+    }
 }
 
 test "build JSON response" {

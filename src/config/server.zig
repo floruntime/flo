@@ -173,6 +173,7 @@ pub const ServerConfig = struct {
             .ws_pong_timeout_ms = self.websocket.pong_timeout_ms,
             .metrics_enabled = self.metrics.enabled,
             .metrics_port = self.metrics.port,
+            .metrics_bind = self.metrics.bind,
             .dashboard_enabled = self.dashboard.enabled,
             .dashboard_port = self.dashboard.port,
             .dashboard_bind = self.dashboard.bind,
@@ -622,8 +623,9 @@ pub fn generateDefaultConfig() []const u8 {
     \\enabled = true
     \\# Port for metrics HTTP server (0 = auto: listen_port + 1)
     \\# port = 9001
-    \\# Bind address for metrics server
-    \\# bind = "0.0.0.0"
+    \\# Bind address for metrics server. Loopback by default — /metrics and
+    \\# /health are unauthenticated. Set "0.0.0.0" to allow remote scraping.
+    \\# bind = "127.0.0.1"
     \\
     \\[dashboard]
     \\# Enable the web dashboard for monitoring and management
