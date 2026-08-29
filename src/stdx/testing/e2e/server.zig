@@ -472,6 +472,19 @@ pub const ServerProcess = struct {
     /// than no diagnostic. Bounded so a chatty server cannot bury the failure.
     pub fn dumpLogTail(self: *Self) void {
         const TAIL_BYTES: usize = 4096;
+
+        // Distinguish a crash from a hang before anything else: a process that
+        // already exited stopped for a different reason than one still spinning,
+        // and the log tail alone cannot tell them apart (#54).
+        if (self.process) |*proc| {
+            var status: c_int = 0;
+            const rc = std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
+            if (rc == proc.id) {
+                std.debug.print("[server] port {d}: process already exited (raw status {d})\n", .{ self.port, status });
+            } else if (rc == 0) {
+                std.debug.print("[server] port {d}: process still running — hung, not crashed\n", .{self.port});
+            }
+        }
         const logs = self.readLogs() catch |err| {
             std.debug.print("[server] could not read {s}: {s}\n", .{ self.log_file_path, @errorName(err) });
             return;
