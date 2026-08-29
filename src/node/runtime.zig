@@ -121,22 +121,31 @@ pub const RuntimeConfig = struct {
     // Port Derivation Methods
     // =========================================================================
     // Use these instead of accessing port fields directly.
+    //
+    // `listen_port = 0` means "bind an ephemeral port", so it is not a base you
+    // can add an offset to: listen_port + 1 is port 1, + 2 is port 2, + 500 is
+    // port 500 — all privileged, and all refused on Linux without
+    // CAP_NET_BIND_SERVICE. An unresolved base therefore derives an unresolved
+    // (ephemeral) port rather than a low one (issue #52).
 
     /// Get effective metrics port (derives from listen_port + 1 if set to 0)
     pub fn effectiveMetricsPort(self: RuntimeConfig) u16 {
         if (self.metrics_port > 0) return self.metrics_port;
+        if (self.listen_port == 0) return 0;
         return self.listen_port +| PORT_OFFSET_METRICS;
     }
 
     /// Get effective dashboard port (derives from listen_port + 2 if set to 0)
     pub fn effectiveDashboardPort(self: RuntimeConfig) u16 {
         if (self.dashboard_port > 0) return self.dashboard_port;
+        if (self.listen_port == 0) return 0;
         return self.listen_port +| PORT_OFFSET_DASHBOARD;
     }
 
     /// Get effective Raft RPC port (derives from listen_port + 500 if set to 0)
     pub fn effectiveRaftPort(self: RuntimeConfig) u16 {
         if (self.cluster_raft_port > 0) return self.cluster_raft_port;
+        if (self.listen_port == 0) return 0;
         return self.listen_port +| PORT_OFFSET_RAFT;
     }
 
@@ -156,6 +165,7 @@ pub const RuntimeConfig = struct {
     /// Get effective gossip port (derives from listen_port + 600 if set to 0)
     pub fn effectiveGossipPort(self: RuntimeConfig) u16 {
         if (self.cluster_gossip_port > 0) return self.cluster_gossip_port;
+        if (self.listen_port == 0) return 0;
         return self.listen_port +| PORT_OFFSET_GOSSIP;
     }
 };
@@ -1004,14 +1014,36 @@ test "RuntimeConfig: the listener comes up when peers are possible (#42 item 5)"
 }
 
 test "RuntimeConfig: an ephemeral listen_port must not derive a privileged Raft port (#42 item 5)" {
-    // `listen_port = 0` means "pick an ephemeral port", but effectiveRaftPort()
-    // adds 500 unconditionally and yields 500 — a privileged port. Combined with
-    // the old always-true gate, a plain two-shard test runtime tried to bind it:
-    // macOS happens to permit bind(0.0.0.0:500), Linux returns EACCES, so this
-    // failed only in CI.
+    // `listen_port = 0` means "pick an ephemeral port". effectiveRaftPort() used
+    // to add 500 unconditionally and yield port 500 — privileged — and the old
+    // always-true gate then tried to bind it from a plain two-shard test
+    // runtime. macOS permits bind(0.0.0.0:500), Linux returns EACCES, so this
+    // failed only in CI. Both halves are now closed: the port derives ephemeral
+    // (#52), and nothing about this config implies peers, so no listener starts.
     const ephemeral = RuntimeConfig{ .listen_port = 0 };
-    try std.testing.expectEqual(@as(u16, 500), ephemeral.effectiveRaftPort());
-    // Nothing about that config implies peers, so the listener never starts and
-    // the privileged port is never bound.
+    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveRaftPort());
     try std.testing.expect(!ephemeral.clusterListenerWanted());
+}
+
+test "RuntimeConfig: an ephemeral listen_port derives ephemeral ports, not privileged ones (#52)" {
+    // listen_port = 0 asks the OS for any port, so there is no base to offset
+    // from. Deriving anyway produced ports 1, 2 and 500 — all privileged, all
+    // refused on Linux. macOS happens to permit bind(0.0.0.0:<low>), so this
+    // only ever failed in CI.
+    const ephemeral = RuntimeConfig{ .listen_port = 0 };
+    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveMetricsPort());
+    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveDashboardPort());
+    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveRaftPort());
+    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveGossipPort());
+
+    // A real base still derives as documented.
+    const real = RuntimeConfig{ .listen_port = 9000 };
+    try std.testing.expectEqual(@as(u16, 9001), real.effectiveMetricsPort());
+    try std.testing.expectEqual(@as(u16, 9002), real.effectiveDashboardPort());
+    try std.testing.expectEqual(@as(u16, 9500), real.effectiveRaftPort());
+    try std.testing.expectEqual(@as(u16, 9600), real.effectiveGossipPort());
+
+    // An explicit port always wins, even off an ephemeral base.
+    const explicit = RuntimeConfig{ .listen_port = 0, .dashboard_port = 8080 };
+    try std.testing.expectEqual(@as(u16, 8080), explicit.effectiveDashboardPort());
 }
