@@ -524,6 +524,10 @@ pub const Runtime = struct {
             const node_id = cluster_node_id;
 
             const rn = try self.allocator.create(RaftNetwork);
+            // RaftNetwork.init binds a socket and can fail; without this the
+            // allocation leaks on that path. Surfaced by CI on Linux, where the
+            // bind really does fail for a `listen_port = 0` config.
+            errdefer self.allocator.destroy(rn);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
             rn.setShardInbox(&shards[0].inbox);
             shards[0].raft_network = rn;
@@ -997,4 +1001,17 @@ test "RuntimeConfig: the listener comes up when peers are possible (#42 item 5)"
     // `[cluster] enabled = true` used to be parsed and discarded entirely.
     const enabled = RuntimeConfig{ .listen_port = 9000, .cluster_enabled = true };
     try std.testing.expect(enabled.clusterListenerWanted());
+}
+
+test "RuntimeConfig: an ephemeral listen_port must not derive a privileged Raft port (#42 item 5)" {
+    // `listen_port = 0` means "pick an ephemeral port", but effectiveRaftPort()
+    // adds 500 unconditionally and yields 500 — a privileged port. Combined with
+    // the old always-true gate, a plain two-shard test runtime tried to bind it:
+    // macOS happens to permit bind(0.0.0.0:500), Linux returns EACCES, so this
+    // failed only in CI.
+    const ephemeral = RuntimeConfig{ .listen_port = 0 };
+    try std.testing.expectEqual(@as(u16, 500), ephemeral.effectiveRaftPort());
+    // Nothing about that config implies peers, so the listener never starts and
+    // the privileged port is never bound.
+    try std.testing.expect(!ephemeral.clusterListenerWanted());
 }
