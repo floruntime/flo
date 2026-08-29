@@ -98,6 +98,9 @@ pub const RuntimeConfig = struct {
     dashboard_bind: []const u8 = "0.0.0.0",
     dashboard_cors_origins: ?[]const u8 = null,
 
+/// Start the peer-facing Raft listener even without seeds. See
+    /// `ClusterConfig.enabled`.
+    cluster_enabled: bool = false,
     cluster_node_id: u32 = 0,
     /// Port for Raft RPC communication (0 = derive from listen_port + 500)
     cluster_raft_port: u16 = 0,
@@ -135,6 +138,19 @@ pub const RuntimeConfig = struct {
     pub fn effectiveRaftPort(self: RuntimeConfig) u16 {
         if (self.cluster_raft_port > 0) return self.cluster_raft_port;
         return self.listen_port +| PORT_OFFSET_RAFT;
+    }
+
+    /// Whether this node should bring up the peer-facing Raft listener.
+    ///
+    /// True when peers are actually possible: seeds are configured, a Raft port
+    /// was named explicitly, replication is on, or the operator asked for it
+    /// with `[cluster] enabled = true`. A plain single-node server matches none
+    /// of these and leaves the port unbound.
+    pub fn clusterListenerWanted(self: RuntimeConfig) bool {
+        return self.cluster_enabled or
+            self.cluster_seeds.len > 0 or
+            self.cluster_raft_port > 0 or
+            self.cluster_replication_factor > 1;
     }
 
     /// Get effective gossip port (derives from listen_port + 600 if set to 0)
@@ -490,13 +506,22 @@ pub const Runtime = struct {
             log.debug("Runtime.start: spawned shard thread {d}", .{i});
         }
 
-        // 3.5 Create raft network if cluster is enabled
-        if (self.config.effectiveRaftPort() != self.config.listen_port or self.config.cluster_seeds.len > 0) {
+        // This node's cluster identity exists whether or not the Raft listener
+        // runs — `flo cluster status` reports it single-node too (#42 item 6).
+        const cluster_node_id = if (self.config.cluster_node_id > 0)
+            self.config.cluster_node_id
+        else
+            generateNodeId(self.config.listen_port);
+        for (0..self.shard_count) |i| shards[i].cluster_node_id = cluster_node_id;
+
+        // 3.5 Start the peer-facing Raft listener only when this node can
+        // actually have peers. The old condition compared effectiveRaftPort()
+        // against listen_port, but that helper *derives* listen_port + 500 when
+        // no port is configured — so it was true for every single-node server,
+        // which bound 9500 while the banner reported "Raft port: 0" (#42 item 5).
+        if (self.config.clusterListenerWanted()) {
             const raft_port = self.config.effectiveRaftPort();
-            const node_id = if (self.config.cluster_node_id > 0)
-                self.config.cluster_node_id
-            else
-                generateNodeId(self.config.listen_port);
+            const node_id = cluster_node_id;
 
             const rn = try self.allocator.create(RaftNetwork);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
@@ -946,4 +971,30 @@ test "Runtime: boot 2 shards and shutdown" {
 
     runtime.stop();
     try std.testing.expect(!runtime.started);
+}
+
+test "RuntimeConfig: single-node does not want a Raft listener (#42 item 5)" {
+    // The old gate was `effectiveRaftPort() != listen_port`, but that helper
+    // *derives* listen_port + 500 when no port is configured — so it was true
+    // for every plain single-node server and Raft always bound its port.
+    const plain = RuntimeConfig{ .listen_port = 9000 };
+    try std.testing.expect(!plain.clusterListenerWanted());
+    try std.testing.expectEqual(@as(u16, 9500), plain.effectiveRaftPort());
+    // The old condition, for the record:
+    try std.testing.expect(plain.effectiveRaftPort() != plain.listen_port);
+}
+
+test "RuntimeConfig: the listener comes up when peers are possible (#42 item 5)" {
+    const seeded = RuntimeConfig{ .listen_port = 9000, .cluster_seeds = &.{"10.0.0.1:9500"} };
+    try std.testing.expect(seeded.clusterListenerWanted());
+
+    const explicit_port = RuntimeConfig{ .listen_port = 9000, .cluster_raft_port = 9500 };
+    try std.testing.expect(explicit_port.clusterListenerWanted());
+
+    const replicated = RuntimeConfig{ .listen_port = 9000, .cluster_replication_factor = 3 };
+    try std.testing.expect(replicated.clusterListenerWanted());
+
+    // `[cluster] enabled = true` used to be parsed and discarded entirely.
+    const enabled = RuntimeConfig{ .listen_port = 9000, .cluster_enabled = true };
+    try std.testing.expect(enabled.clusterListenerWanted());
 }

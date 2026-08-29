@@ -413,12 +413,20 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // Print cluster info
     ctx.print("\n", .{});
     ctx.print("  Cluster:\n", .{});
+    const rc_preview = config.toRuntimeConfig();
     if (config.cluster.node_id == 0) {
         ctx.print("    Node ID:    auto (will generate on start)\n", .{});
     } else {
         ctx.print("    Node ID:    {d}\n", .{config.cluster.node_id});
     }
-    ctx.print("    Raft port:  {d}\n", .{config.cluster.raft_port});
+    // Report the port Raft will actually bind, not the unset config value —
+    // the banner used to print "Raft port: 0" while the listener was up on
+    // listen_port + 500 (#42 item 5).
+    if (rc_preview.clusterListenerWanted()) {
+        ctx.print("    Raft port:  {d}\n", .{rc_preview.effectiveRaftPort()});
+    } else {
+        ctx.print("    Raft port:  not listening (single-node)\n", .{});
+    }
     if (config.cluster.gossip_port > 0) {
         ctx.print("    Gossip:     {d}\n", .{config.cluster.gossip_port});
     }

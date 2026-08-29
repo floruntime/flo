@@ -179,6 +179,7 @@ pub const ServerConfig = struct {
             .dashboard_bind = self.dashboard.bind,
             .dashboard_cors_origins = self.dashboard.cors_origins,
             // Cluster configuration (always enabled, no explicit flag)
+            .cluster_enabled = self.cluster.enabled,
             .cluster_node_id = self.cluster.node_id,
             .cluster_raft_port = self.cluster.raft_port,
             .cluster_gossip_port = self.cluster.gossip_port,

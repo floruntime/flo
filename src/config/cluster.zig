@@ -14,6 +14,18 @@ const builtin = @import("builtin");
 
 /// Cluster configuration loaded from [cluster] section in flo.toml
 pub const ClusterConfig = struct {
+    /// Start the peer-facing Raft listener even with no seeds configured.
+    ///
+    /// The listener exists to accept connections from other nodes, so a node
+    /// with no seeds and no replication has nothing to accept and does not
+    /// bind it. Set this to bring the listener up anyway — e.g. a seed node
+    /// that peers will join before it knows about them.
+    ///
+    /// This was previously parsed and discarded ("cluster always runs"), so
+    /// `enabled = false` was accepted in silence while Raft bound its port
+    /// regardless (issue #42 item 5).
+    enabled: bool = false,
+
     /// This node's unique ID within the cluster
     /// If 0, auto-generated from hostname hash + port
     node_id: u32 = 0,
@@ -133,9 +145,9 @@ pub fn parseClusterConfig(
 ) !ClusterConfig {
     var config = ClusterConfig{};
 
-    // Note: "enabled" field is deprecated - cluster always runs
-    // Parse it for backwards compatibility but ignore
-    _ = table.getBool("enabled");
+    if (table.getBool("enabled")) |e| {
+        config.enabled = e;
+    }
 
     if (table.getInt("node_id")) |n| {
         config.node_id = @intCast(n);
