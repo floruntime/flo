@@ -10,6 +10,7 @@ pub const kv_test = @import("kv_test.zig");
 pub const http_test = @import("http_test.zig");
 pub const cluster_test = @import("cluster_test.zig");
 pub const stream_test = @import("stream_test.zig");
+pub const stream_recovery_test = @import("stream_recovery_test.zig");
 pub const queue_test = @import("queue_test.zig");
 pub const namespace_test = @import("namespace_test.zig");
 pub const action_test = @import("action_test.zig");

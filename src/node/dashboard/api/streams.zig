@@ -92,36 +92,13 @@ fn boolParam(query_string: ?[]const u8, key: []const u8) bool {
 }
 
 /// Logical record count for a stream = sum of each append batch's record count
-/// (a batch may carry N records). `sp.streamRecordCount` only counts append
-/// entries, so it under-reports for batched producers. Reads each batch's count
-/// header via the zero-copy UAL read (cheap, no payload copy). Bounded by
-/// `MAX_BATCHES`; beyond that, extrapolates from the sampled prefix.
-fn streamLogicalCount(allocator: Allocator, partition: anytype, sp: *StreamProjection, name_hash: u64) u64 {
-    const batches = sp.streamRecordCount(name_hash);
-    if (batches == 0) return 0;
-    const MAX_BATCHES: usize = 16384;
-    const to_read = @min(batches, MAX_BATCHES);
-    const buf = allocator.alloc(stream_mod.StreamRecord, to_read) catch return batches;
-    defer allocator.free(buf);
-    const n = sp.readStreamAfter(name_hash, stream_mod.StreamID.MIN, null, buf);
-    if (n == 0) return batches;
-    var sum: u64 = 0;
-    for (buf[0..n]) |rec| {
-        var c: u64 = 1;
-        if (partition.ual.read(rec.ual_index)) |entry| {
-            if (entry.commandPayload()) |cmd| {
-                const batch = stream_mod.decodeAppendValue(cmd.value).payload;
-                if (batch.len >= 4) {
-                    const rc = std.mem.readInt(u32, batch[0..4], .little);
-                    if (rc > 0) c = rc;
-                }
-            }
-        }
-        sum += c;
-    }
-    // Extrapolate if the stream has more batches than we sampled.
-    if (batches > n) return sum * batches / n;
-    return sum;
+/// (a batch may carry N records). The projection now maintains this
+/// incrementally, so this is an O(1) read. It previously re-read every UAL
+/// entry to sum batch headers, sampling the first 16k and extrapolating beyond
+/// that — and used the zero-copy `ual.read`, which returns null for any entry
+/// whose payload wraps the hot-ring boundary, silently counting those as 1.
+fn streamLogicalCount(sp: *StreamProjection, name_hash: u64) u64 {
+    return sp.streamLogicalCount(name_hash);
 }
 
 /// Cumulative append/read record counts for a (namespace, topic), summed across
@@ -380,7 +357,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
             const partition = shard.defaultPartition();
             const sp = &partition.stream;
             const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
-            const record_count = streamLogicalCount(allocator, partition, sp, name_hash);
+            const record_count = streamLogicalCount(sp, name_hash);
             if (record_count > 0 or sp.streamCount() > 0) {
                 try parts_arr.next();
                 var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -471,7 +448,7 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
             const partition = shard.defaultPartition();
             const sp = &partition.stream;
             const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
-            total_count = streamLogicalCount(allocator, partition, sp, name_hash);
+            total_count = streamLogicalCount(sp, name_hash);
             const cap: usize = @min(@as(usize, @intCast(limit)), 1000);
 
             const StreamRecord = stream_mod.StreamRecord;
