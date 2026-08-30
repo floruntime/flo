@@ -643,7 +643,9 @@ pub const StreamHandler = struct {
 
         const first_id = self.stream.streamFirstId(name_hash);
         const last_id = self.stream.streamLastId(name_hash);
-        const count = self.stream.streamRecordCount(name_hash);
+        // Logical records (batch contents), not append entries.
+        const count = self.stream.streamLogicalCount(name_hash);
+        const bytes = self.stream.streamByteSize(name_hash);
 
         const meta = self.stream.stream_metadata.get(req.key);
 
@@ -653,7 +655,7 @@ pub const StreamHandler = struct {
             .last_timestamp_ms = if (count > 0) last_id.timestamp_ms else 0,
             .last_seq = if (count > 0) last_id.sequence else 0,
             .count = count,
-            .bytes = 0,
+            .bytes = bytes,
             .partition_count = pc,
             .retention_age_s = if (meta) |m| m.retention_age_s else 0,
             .retention_count = if (meta) |m| m.retention_count else 0,
@@ -1630,12 +1632,17 @@ pub const StreamHandler = struct {
         // The user partition rides in the value prefix so it survives restart
         // decode it here rather than threading it from the request,
         // keeping the live and replay paths on one source of truth.
-        const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
+        const av = stream_mod.decodeAppendValue(cmd.value);
+        const partition_index = av.partition_index;
+        // A batch carries N logical records; both are read from the durable
+        // value so live apply and replay agree on counts and ID ranges.
+        const record_count = stream_mod.batchRecordCount(av.payload);
+        const byte_len: u32 = @intCast(av.payload.len);
         // Anchor the StreamID to the entry's persisted timestamp (not the wall
         // clock) so replay reproduces the same ID — required for the durable
         // consumer-group cursor to line up after restart (FLO-103).
         const ts_ms = entry.header.timestamp_ns / 1_000_000;
-        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms);
+        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms, record_count, byte_len);
     }
 
     /// Apply a stream append directly to the local partition + projection,
@@ -1698,12 +1705,24 @@ pub const StreamHandler = struct {
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
-                const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
+                const av = stream_mod.decodeAppendValue(cmd.value);
+                const partition_index = av.partition_index;
+                const record_count = stream_mod.batchRecordCount(av.payload);
+                const byte_len: u32 = @intCast(av.payload.len);
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply (FLO-103).
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms) catch {};
-                self.stream.registerStream(cmd.key) catch {};
+                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch {};
+                // Register the NAMESPACE-QUALIFIED name, exactly as the live
+                // append path does. A bare key is invisible to `stream list`,
+                // which filters on the namespace prefix, while `stream info`
+                // still resolves it by hash — so the two disagree. Only the
+                // default namespace, whose qualified form is the bare name,
+                // is unaffected.
+                var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const ns = self.stream.resolveNamespace(cmd.namespace_hash);
+                const ns_name = ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key) catch cmd.key;
+                self.stream.registerStream(ns_name) catch {};
             }
         }
 

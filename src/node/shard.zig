@@ -319,6 +319,8 @@ pub const Shard = struct {
         // queue_enqueue entries that reference them, so the registry is populated in time.)
         queue_handler.queue.ns_resolver = resolveQueueNamespace;
         queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
+        stream_handler.stream.ns_resolver = resolveQueueNamespace;
+        stream_handler.stream.ns_resolver_ctx = @ptrCast(namespace_handler);
 
         // Create Actions handler
         const actions_handler = try allocator.create(ActionsHandler);
@@ -551,8 +553,8 @@ pub const Shard = struct {
         self.coordinator = coord;
     }
 
-    /// Namespace resolver wired into the queue projection: hash → name via the
-    /// shard's namespace registry. `ctx` is the (stable, heap-allocated)
+    /// Namespace resolver wired into the queue and stream projections: hash →
+    /// name via the shard's namespace registry. `ctx` is the (stable, heap-allocated)
     /// `*NamespaceHandler`, so this is safe to call during replay — before the
     /// shard's back-pointers are wired.
     fn resolveQueueNamespace(ctx: *anyopaque, ns_hash: u32) ?[]const u8 {
@@ -1405,7 +1407,8 @@ pub const Shard = struct {
 
             // Count-based retention: resolve Nth record ID, persist trim through Raft
             if (meta.retention_count > 0) {
-                const count = proj.streamRecordCount(name_hash);
+                // Retention is expressed in records, not append entries.
+                const count = proj.streamLogicalCount(name_hash);
                 if (count > meta.retention_count) {
                     const excess = count - meta.retention_count;
                     const trim_id = proj.resolveNthRecordId(name_hash, excess);
