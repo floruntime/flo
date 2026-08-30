@@ -8,9 +8,10 @@
 //!                                   under test cannot be interrupted from
 //!                                   within, so the parent kills on timeout)
 //!        [--seed-timeout=SECS]      per-seed watchdog budget (default 300)
-//!        [--mode=volatile]          model production's unpersisted hard state
+//!        [--mode=volatile|persisted] hard-state model (persisted is the default)
 //!        [--no-timer-reset]         drop harness timer re-arming (livelock demo)
-//!        [--small-ring]             the deliberately-tiny-ring slice
+//!        [--small-ring]             shrink the ring so eviction outruns
+//!                                   replication (fails by design)
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -283,6 +284,14 @@ pub fn main(init: std.process.Init) !void {
         usage();
         std.process.exit(2);
     };
+
+    // Swarm children each derive their own scenario from their seed; a
+    // pinned scenario or an output path cannot apply to all of them, and
+    // silently ignoring the flag is this codebase's signature bug shape.
+    if (args.iterations != null and (args.scenario_in != null or args.scenario_out != null)) {
+        std.debug.print("--iterations cannot combine with --scenario-in/--scenario-out\n", .{});
+        std.process.exit(2);
+    }
 
     const ok = if (args.iterations != null)
         try runSwarm(init.gpa, args)

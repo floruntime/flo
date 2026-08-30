@@ -2,17 +2,17 @@
 //! fault injection and invariant checking
 //!
 //! The unit under test is the production `RaftNode`, driven through its
-//! public API plus the two `pub` seams a wired runtime must own anyway:
-//! per-peer replication state (`peers[]`) and the election deadline. The
-//! harness supplies what the runtime doesn't have yet — a replication
-//! pump, timer arming, stable storage — as reference implementations.
+//! public API plus the seams a wired runtime must own anyway: per-peer
+//! replication state (`peers[]`), the election deadline, hard-state
+//! restore on restart, and `last_applied`. The harness supplies what the
+//! runtime doesn't have yet — a replication pump, timer arming, stable
+//! storage — as reference implementations.
 //!
 //! One run is two-phase: a safety phase under full fault injection, then
 //! a liveness phase where a random quorum-sized "core" is healed, its
 //! faults frozen, and every non-core node permanently isolated — bugs
 //! that random healing would mask must now surface as convergence
-//! failures. Violation output leads with the seed; the seed is the whole
-//! repro.
+//! failures. The seed is the whole repro.
 
 const std = @import("std");
 const PRNG = @import("stdx").PRNG;
@@ -42,13 +42,13 @@ const HASH_SEED: u64 = 0x5EED;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const Invariant = enum {
-    election_safety, // I1
-    state_machine_safety, // I2
-    leader_completeness, // I3
-    durability, // I4
-    term_monotonicity, // I5
-    applied_integrity, // I6
-    convergence, // I7
+    election_safety,
+    state_machine_safety,
+    leader_completeness,
+    durability,
+    term_monotonicity,
+    applied_integrity,
+    convergence,
     api_error, // error return from a public API on protocol-legal input
 };
 
@@ -158,8 +158,8 @@ const Checker = struct {
     allocator: Allocator,
     /// Leader completeness assumes committed entries survive on a quorum.
     /// Under async_flush a crashed quorum legally loses its unflushed
-    /// suffix (the mode's documented contract, same grace I4 gets), so
-    /// the invariant is only assertable under sync durability.
+    /// suffix (the mode's documented contract, the same grace the final
+    /// durability check gets), so it is only assertable under sync.
     check_completeness: bool = true,
     /// Under async_flush a cluster-wide crash inside the flush window can
     /// legally erase applied history, and a newer term rewrites those
@@ -341,7 +341,6 @@ pub const Simulator = struct {
     /// Tracked incrementally; recomputing it from all ops every tick is
     /// O(ops x ticks) and dominates the whole run.
     max_acked_index: u64,
-    last_crash_at: u64,
     // Scratch, allocated once.
     range_entries: []entry_mod.Entry,
     range_arena: []u8,
@@ -377,7 +376,6 @@ pub const Simulator = struct {
             .acked_at = .empty,
             .crash_ticks = .empty,
             .max_acked_index = 0,
-            .last_crash_at = 0,
             .range_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH),
             .range_arena = try allocator.alloc(u8, @as(usize, scenario.payload_max) * MAX_BATCH + 64),
             .apply_buf = try allocator.alloc(u8, @as(usize, scenario.payload_max) + 64),
@@ -472,7 +470,6 @@ pub const Simulator = struct {
         node.up = false;
         node.disk.crash();
         self.crashes += 1;
-        self.last_crash_at = self.now;
         self.crash_ticks.append(self.allocator, self.now) catch @panic("sim OOM");
     }
 
@@ -657,9 +654,11 @@ pub const Simulator = struct {
         const last = node.raft.log.lastIndex();
         for (0..node.raft.peer_count) |i| {
             const peer_id = node.raft.peer_ids[i];
-            // A follower's success response reports its whole log as
-            // match_index, which can exceed the leader's — clamp, or
-            // prev_log below is unbuildable.
+            // A stale success ack can outlive its leadership stint:
+            // handleAppendResponse takes any success response at face
+            // value, so an ack delayed across this leader's
+            // crash-restart (which shrank its log) can push next_index
+            // past the tip — clamp, or prev_log below is unbuildable.
             if (node.raft.peers[i].next_index > last + 1) {
                 node.raft.peers[i].next_index = last + 1;
             }
@@ -674,8 +673,8 @@ pub const Simulator = struct {
             const prev_term = node.raft.log.entryTerm(prev_index) orelse blk: {
                 if (prev_index == 0) break :blk @as(u64, 0);
                 // The entry a repair needs is gone from the ring and there
-                // is no snapshot/catch-up path — the stall the small-ring
-                // slice exists to expose. Surfaces as convergence failure.
+                // is no snapshot/catch-up path — the stall the --small-ring
+                // scenario exists to expose. Surfaces as convergence failure.
                 self.apply_stalls += 1;
                 continue;
             };
@@ -881,10 +880,10 @@ pub const Simulator = struct {
         return true;
     }
 
-    /// I4, checked at the end: every acked op is in canonical history at
-    /// its acked (term, index). Mode-aware — under async_flush, losing
-    /// ops acked inside the flush window of the last crash is the mode's
-    /// documented contract, not a finding.
+    /// Durability, checked at the end: every acked op is in canonical
+    /// history at its acked (term, index). Mode-aware — under
+    /// async_flush, losing ops acked inside the flush window of a crash
+    /// is the mode's documented contract, not a finding.
     fn finalDurabilityCheck(self: *Simulator) void {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
@@ -919,9 +918,10 @@ pub const Simulator = struct {
     // ── Main loop ──────────────────────────────────────────────────────
 
     /// Within-tick order is pinned (it defines ack-vs-crash semantics):
-    /// deliver → ticks + pump → apply → ack sweep → stable-storage sync →
-    /// faults. An op acked in the tick its acker crashes was acked before
-    /// the crash — the client has the response; the guarantee stands.
+    /// deliver → ticks + pump → submit → apply → ack sweep →
+    /// stable-storage sync → faults. An op acked in the tick its acker
+    /// crashes was acked before the crash — the client has the response;
+    /// the guarantee stands.
     fn tick(self: *Simulator) !void {
         self.now += 1;
         try self.deliverAll();
@@ -941,8 +941,8 @@ pub const Simulator = struct {
         if (self.checker.violations.items.len == 0) {
             try self.transitionToConvergence();
             // Budget scales with repair cost: next_index backs off one
-            // step per round trip, so a from-zero follower needs O(log)
-            // round trips at message latency.
+            // step per round trip, so a from-zero follower needs round
+            // trips linear in the log length, at message latency.
             var max_log: u64 = 0;
             for (self.nodes) |*node| max_log = @max(max_log, node.raft.log.lastIndex());
             const budget = @max(
