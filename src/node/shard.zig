@@ -1778,10 +1778,9 @@ pub const Shard = struct {
     /// Send an error response on a connection.
     /// `cluster_status` — report this node's Raft identity and role.
     ///
-    /// Previously unregistered, so it fell through to the dispatcher's generic
-    /// "not implemented" reply even though `flo --help` advertises the command
-    /// (#42 item 6). A single-node server answers with itself as leader of a
-    /// one-member cluster, which is the truthful answer rather than an error.
+    /// A single-node server answers with itself as leader of a one-member
+    /// cluster; that is the truthful answer, and the command is advertised in
+    /// `flo --help` regardless of whether a cluster is configured.
     fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));

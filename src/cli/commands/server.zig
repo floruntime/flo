@@ -419,9 +419,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.print("    Node ID:    {d}\n", .{config.cluster.node_id});
     }
-    // Report the port Raft will actually bind, not the unset config value —
-    // the banner used to print "Raft port: 0" while the listener was up on
-    // listen_port + 500 (#42 item 5).
+    // Report the port Raft will actually bind, not the unset config value,
+    // which reads as 0 while the listener is up on listen_port + 500.
     if (rc_preview.clusterListenerWanted()) {
         ctx.print("    Raft port:  {d}\n", .{rc_preview.effectiveRaftPort()});
     } else {
