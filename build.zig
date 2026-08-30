@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/stdx/mod.zig"),
         .target = target,
         .optimize = optimize,
+        // stdx wraps libc directly (std.c sockets, fcntl, file IO), so it needs
+        // the link wherever it is rooted. Consumers set this on their own root
+        // module, which covers stdx as a dependency but not the test artifact
+        // rooted at stdx itself — that one fails to compile without it on
+        // targets where libc is not linked implicitly.
+        .link_libc = true,
     });
 
     // ── Version (git describe) ──
