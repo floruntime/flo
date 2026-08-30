@@ -156,6 +156,17 @@ const Canon = struct { term: u64, hash: u64, op_id: ?u64 };
 
 const Checker = struct {
     allocator: Allocator,
+    /// Leader completeness assumes committed entries survive on a quorum.
+    /// Under async_flush a crashed quorum legally loses its unflushed
+    /// suffix (the mode's documented contract, same grace I4 gets), so
+    /// the invariant is only assertable under sync durability.
+    check_completeness: bool = true,
+    /// Under async_flush a cluster-wide crash inside the flush window can
+    /// legally erase applied history, and a newer term rewrites those
+    /// indices — cross-term canonical immutability doesn't hold. What
+    /// always holds is same-term immutability: one leader wrote that
+    /// index exactly once. Sync mode asserts full immutability.
+    allow_cross_term_rewrite: bool = false,
     /// canonical[i] is the first-applied (term, payload-hash) at index i+1.
     /// First applier sets it; every later applier must match. A mismatch
     /// is a violation whichever side is "right" — two nodes applied
@@ -193,6 +204,7 @@ const Checker = struct {
         }
         // Leader completeness: the new leader's log must contain every
         // canonically committed entry, at the committed term.
+        if (!self.check_completeness) return;
         for (self.canonical.items, 1..) |maybe, idx| {
             const canon = maybe orelse continue;
             const t = node.raft.log.entryTerm(idx) orelse {
@@ -230,13 +242,30 @@ const Checker = struct {
             self.canonical.append(self.allocator, null) catch @panic("checker OOM");
         }
         if (self.canonical.items[idx - 1]) |canon| {
-            if (canon.term != term or canon.hash != hash) self.fail(.{
-                .invariant = .state_machine_safety,
-                .node = node,
-                .index = idx,
-                .tick = tick,
-                .detail = "applied entry differs from the canonical entry at this index",
-            });
+            if (canon.term == term and canon.hash != hash) {
+                self.fail(.{
+                    .invariant = .state_machine_safety,
+                    .node = node,
+                    .index = idx,
+                    .tick = tick,
+                    .detail = "two different entries applied at one index in the same term",
+                });
+            } else if (canon.term != term) {
+                if (self.allow_cross_term_rewrite) {
+                    // Keep the newest-term version as canonical.
+                    if (term > canon.term) {
+                        self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id };
+                    }
+                } else {
+                    self.fail(.{
+                        .invariant = .state_machine_safety,
+                        .node = node,
+                        .index = idx,
+                        .tick = tick,
+                        .detail = "applied entry differs from the canonical entry at this index",
+                    });
+                }
+            }
         } else {
             self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id };
         }
@@ -304,6 +333,10 @@ pub const Simulator = struct {
     core: [MAX_NODES]bool,
     pending_ops: std.ArrayListUnmanaged(u64),
     acked_at: std.AutoHashMapUnmanaged(u64, u64),
+    /// Every crash tick, in order — the async_flush durability grace must
+    /// ask "did any crash land inside this op's flush window", not
+    /// "did the last crash".
+    crash_ticks: std.ArrayListUnmanaged(u64),
     /// Highest log index of any acked op — the convergence target.
     /// Tracked incrementally; recomputing it from all ops every tick is
     /// O(ops x ticks) and dominates the whole run.
@@ -332,12 +365,17 @@ pub const Simulator = struct {
             .nodes = try allocator.alloc(SimNode, scenario.node_count),
             .net = SimNetwork.init(allocator),
             .workload = try Workload.init(allocator, &scenario),
-            .checker = .{ .allocator = allocator },
+            .checker = .{
+                .allocator = allocator,
+                .check_completeness = scenario.durability == .sync,
+                .allow_cross_term_rewrite = scenario.durability == .async_flush,
+            },
             .now = 0,
             .phase = .safety,
             .core = @splat(false),
             .pending_ops = .empty,
             .acked_at = .empty,
+            .crash_ticks = .empty,
             .max_acked_index = 0,
             .last_crash_at = 0,
             .range_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH),
@@ -377,6 +415,7 @@ pub const Simulator = struct {
         self.checker.deinit();
         self.pending_ops.deinit(self.allocator);
         self.acked_at.deinit(self.allocator);
+        self.crash_ticks.deinit(self.allocator);
         self.allocator.free(self.range_entries);
         self.allocator.free(self.range_arena);
         self.allocator.free(self.apply_buf);
@@ -434,6 +473,7 @@ pub const Simulator = struct {
         node.disk.crash();
         self.crashes += 1;
         self.last_crash_at = self.now;
+        self.crash_ticks.append(self.allocator, self.now) catch @panic("sim OOM");
     }
 
     fn restartNode(self: *Simulator, node: *SimNode) !void {
@@ -849,8 +889,17 @@ pub const Simulator = struct {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
             if (self.scenario.durability == .async_flush) {
+                // Excuse the op if any crash landed inside its flush
+                // window — that loss is the mode's documented contract.
                 const at = self.acked_at.get(op.id) orelse 0;
-                if (at + self.scenario.flush_interval_ms > self.last_crash_at and self.last_crash_at > 0) continue;
+                var excused = false;
+                for (self.crash_ticks.items) |ct| {
+                    if (ct >= at and ct <= at + self.scenario.flush_interval_ms) {
+                        excused = true;
+                        break;
+                    }
+                }
+                if (excused) continue;
             }
             const bad = blk: {
                 if (op.index == 0 or op.index > self.checker.canonical.items.len) break :blk true;
