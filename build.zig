@@ -154,6 +154,28 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    // ── VOPR simulator ──
+
+    const vopr_exe = b.addExecutable(.{
+        .name = "vopr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vopr/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    vopr_exe.root_module.addImport("src", src_module);
+    vopr_exe.root_module.addImport("stdx", stdx_module);
+    b.installArtifact(vopr_exe);
+
+    const run_vopr = b.addRunArtifact(vopr_exe);
+    run_vopr.step.dependOn(b.getInstallStep());
+    if (b.args) |vopr_args| run_vopr.addArgs(vopr_args);
+
+    const vopr_step = b.step("vopr", "Run the deterministic cluster simulator (-- --seed=N | --iterations=K)");
+    vopr_step.dependOn(&run_vopr.step);
+
     // ── Benchmarks ──
 
     const bench_step = b.step("bench", "Build all benchmarks");
