@@ -795,6 +795,8 @@ pub const WorkflowHandler = struct {
             .history = .empty,
         };
 
+        if (shard.metrics_registry) |m| m.workflow.recordStarted();
+
         // Add initial history event
         const evt_type = self.allocator.dupe(u8, "workflow_started") catch {
             self.freeRunRecord(&run);
@@ -907,6 +909,7 @@ pub const WorkflowHandler = struct {
 
         // Add history event
         self.addHistoryEvent(run, "signal_received", signal_type, now_ms);
+        if (shard.metrics_registry) |m| m.workflow.recordSignalDelivered();
 
         // If the run is waiting for this signal type, resume execution
         if (run.status == .waiting) {
@@ -1565,6 +1568,7 @@ pub const WorkflowHandler = struct {
                     }
 
                     self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
                     // Reset retry + poll counters on step transition
                     run.retry_count = 0;
@@ -1604,6 +1608,7 @@ pub const WorkflowHandler = struct {
                     if (signal_found) {
                         // Signal already received — follow "success" transition
                         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
                         const transition = wait_step.getTransition(definition.StepOutcome.success) orelse {
                             self.completeRun(shard, run_ns_key, run, .failed, "no success transition for wait step", now_ms);
                             return;
@@ -2372,6 +2377,7 @@ pub const WorkflowHandler = struct {
         run.status = .running;
         self.addHistoryEvent(run, "child_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
         // Clear pending child state.
         if (run.pending_child_run_id_owned) |a| self.allocator.free(a);
@@ -2444,6 +2450,7 @@ pub const WorkflowHandler = struct {
         run.status = .running;
         self.addHistoryEvent(run, "action_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
+                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
         // Clear pending action state
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
@@ -2662,6 +2669,16 @@ pub const WorkflowHandler = struct {
     fn completeRun(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
         run.status = status;
         run.completed_at_ms = now_ms;
+
+        // Every terminal transition passes through here, so this is the one
+        // place the outcome counters need to be recorded.
+        if (shard.metrics_registry) |m| switch (status) {
+            .completed => m.workflow.recordCompleted(),
+            .failed => m.workflow.recordFailed(),
+            .cancelled => m.workflow.recordCancelled(),
+            .timed_out => m.workflow.recordTimedOut(),
+            else => {},
+        };
 
         // Resolve explicit output mapping from definition (if declared)
         if (status == .completed) {
@@ -4086,6 +4103,10 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.actions_handler = actions;
     shard.peer_shards = null;
     shard.peer_inboxes = null;
+    // `Shard = undefined` means field defaults do not apply — anything the code
+    // under test reads must be assigned here or it holds garbage.
+    shard.metrics_registry = null;
+    shard.shard_metrics = null;
     const raft_node = try std.testing.allocator.create(RaftNode);
     raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
     try raft_node.bootstrap();
