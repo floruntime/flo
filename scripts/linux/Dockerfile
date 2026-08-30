@@ -1,8 +1,7 @@
 # Linux build/test environment for flo, matching the Zig version in CI.
 #
 # Exists because macOS never compiles flo's Linux-only code paths (io_uring
-# reactor, /proc host stats), so a whole class of breakage is invisible
-# locally — see issues #50, #52, #54.
+# reactor, /proc host stats), so that breakage is invisible on a Mac.
 FROM debian:bookworm-slim
 
 ARG ZIG_VERSION=0.16.0

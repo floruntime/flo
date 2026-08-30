@@ -2,10 +2,9 @@
 # Build and test flo on Linux from a macOS host.
 #
 # Zig analyses lazily, so a macOS build never compiles flo's Linux-only code —
-# the io_uring reactor and the /proc host stats. That has hidden real breakage
-# more than once (issues #50, #52) and the cluster e2e failures in #54 do not
-# reproduce on macOS at all. This gives a local Linux environment so those are
-# debuggable without a 15-minute CI round trip.
+# the io_uring reactor, the /proc host stats. Whole classes of breakage are
+# therefore invisible on a Mac, and some failures reproduce only on Linux.
+# This gives a local Linux environment instead of a CI round trip.
 #
 #   scripts/linux/run.sh build
 #   scripts/linux/run.sh test-e2e -Dtest-filter="e2e/kv/cluster"

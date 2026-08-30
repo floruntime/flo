@@ -67,8 +67,8 @@ fn startServerWithRetry(server: *ServerProcess) !void {
     const max_retries: u8 = 3;
     var attempt: u8 = 0;
     while (true) {
-        // Only the last attempt prints the server's log tail; the earlier ones
-        // are usually the same failure and would triple the output (#54).
+        // Only the last attempt prints the server's log tail; earlier ones are
+        // usually the same failure and would triple the output.
         server.dump_log_on_failure = (attempt + 1 >= max_retries);
         server.start() catch |err| {
             attempt += 1;
@@ -88,11 +88,11 @@ pub const MAX_NODES = 5;
 pub const ClusterConfig = struct {
     /// Number of nodes (2-5)
     node_count: u8 = 3,
-    /// Cluster nodes log at debug by default. Startup between "topology
-    /// verified" and the acceptor going live emits only debug lines, so at
-    /// info a node that hangs in there leaves no trace of how far it got —
-    /// which is exactly the state issue #54 is stuck in. The log is only ever
-    /// printed as a bounded tail on failure, so this costs nothing on success.
+    /// Cluster nodes log at debug by default. Most of startup — everything
+    /// between topology verification and the acceptor going live — logs only
+    /// at debug, so at info a node that stalls in there leaves no trace of how
+    /// far it got. The log is only printed as a bounded tail on failure, so
+    /// this costs nothing when tests pass.
     log_level: []const u8 = "debug",
     /// Durability mode for all nodes
     durability: ServerProcess.Durability = .sync,
@@ -161,10 +161,9 @@ pub const ClusterContext = struct {
             .log_level = config.log_level,
             .cluster_enabled = true, // Seed node needs Raft listener
         });
-        // Covers every node created so far. A per-iteration `errdefer` inside
-        // the join loop below only fires for its own iteration, so when the
-        // third node failed the first two leaked — 75 allocations across the
-        // suite, all traced to initWithConfig (issue #54).
+        // Covers every node created so far. A per-iteration `errdefer` in the
+        // join loop below would only fire for its own iteration, leaking the
+        // nodes already started when a later one fails.
         errdefer self.deinitServers();
         startServerWithRetry(self.servers[0].?) catch |err| {
             std.debug.print("[cluster] Seed node failed to start: {}\n", .{err});

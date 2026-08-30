@@ -38,8 +38,8 @@ pub const ServerProcess = struct {
     config_file: []const u8,
     log_file_path: []const u8,
     /// Print the captured server log if startup fails. Callers that retry set
-    /// this false for all but the final attempt, so a transient first failure
-    /// does not print the same tail three times.
+    /// this false for all but the final attempt, so one failure is not
+    /// reported three times.
     dump_log_on_failure: bool = true,
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
@@ -120,9 +120,9 @@ pub const ServerProcess = struct {
         metrics_enabled: bool = false,
         /// Number of shards (1 = faster startup)
         shards: u8 = 1,
-        /// Server log level written into flo.toml. The harness only ever sees
-        /// this through the captured log, so raising it is the way to find out
-        /// where a server got to when it never became ready (#54).
+        /// Server log level written into flo.toml. Raise it to see how far a
+        /// server got when it never became ready — the captured log is the
+        /// only view the harness has into a server's startup.
         log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
         durability: Durability = .async_flush,
@@ -195,9 +195,9 @@ pub const ServerProcess = struct {
         self.started = false;
         self.api_key = null;
         // `allocator.create` leaves the struct uninitialised, so the field
-        // defaults declared above never apply — every field must be assigned
-        // here. `log_thread` is otherwise only set inside `start()`, so a
-        // server that is created and torn down without starting would join a
+        // defaults declared above do NOT apply — every field must be assigned
+        // here. `log_thread` in particular is otherwise only set inside
+        // `start()`, and a server torn down without starting would then join a
         // garbage thread handle.
         self.log_thread = null;
         self.dump_log_on_failure = true;
@@ -384,10 +384,9 @@ pub const ServerProcess = struct {
 
         // Wait for server to be ready
         self.waitForReady(timeout_ms) catch |err| {
-            // The server's own output is captured to a log file, so a startup
-            // failure otherwise surfaces only as this harness's timeout — the
-            // real bind error or panic never reaches the test output. Print the
-            // tail before killing it (issue #54).
+            // The server's own output goes to a log file, so without this a
+            // startup failure surfaces only as this harness's timeout and the
+            // real bind error or panic never reaches the test output.
             if (self.dump_log_on_failure) self.dumpLogTail();
             self.forceKill();
             return err;
@@ -473,9 +472,8 @@ pub const ServerProcess = struct {
     pub fn dumpLogTail(self: *Self) void {
         const TAIL_BYTES: usize = 4096;
 
-        // Distinguish a crash from a hang before anything else: a process that
-        // already exited stopped for a different reason than one still spinning,
-        // and the log tail alone cannot tell them apart (#54).
+        // A crash and a hang look identical in the log — output simply stops —
+        // and they have different causes, so report which one this is.
         if (self.process) |*proc| {
             var status: c_int = 0;
             const rc = std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
@@ -653,9 +651,9 @@ pub const ServerProcess = struct {
                 true;
 
             // Readiness is deliberately just the client and dashboard ports.
-            // The metrics exporter is wired into the runtime (#43) but binds
-            // only when enabled, and the Raft listener only when the node can
-            // have peers (#47), so neither is a reliable readiness signal.
+            // The metrics exporter binds only when enabled, and the Raft
+            // listener only when the node can have peers, so neither is a
+            // reliable readiness signal.
 
             if (main_ready and dashboard_ready) {
                 return;

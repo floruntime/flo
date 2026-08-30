@@ -209,7 +209,6 @@ pub const RaftNetwork = struct {
     }
 
     pub fn connectToPeer(self: *RaftNetwork, host: []const u8, port: u16) !void {
-        log.debug("raft: connecting to seed {s}:{d}", .{ host, port });
         const addr = try parseAddress(host, port);
         const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer sysClose(fd);
@@ -281,7 +280,6 @@ pub const RaftNetwork = struct {
             var client_addr: posix.sockaddr = undefined;
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
             const client_fd = sysAccept(self.listener_fd, &client_addr, &addr_len, 0) catch return;
-            log.debug("raft: accepted peer connection fd={d}", .{client_fd});
 
             // Read join request with timeout
             var req_buf: [HEADER_SIZE + JOIN_REQ_SIZE + 16]u8 = undefined;
@@ -315,7 +313,6 @@ pub const RaftNetwork = struct {
                 sysClose(client_fd);
                 continue;
             };
-            log.debug("raft: join response sent to node {d} fd={d}", .{ peer_node_id, client_fd });
 
             // Reject duplicate connections — keep existing connection
             if (self.hasPeer(peer_node_id)) {
@@ -645,10 +642,6 @@ fn frameCustomMessage(msg_type: u8, group_id: u32, source_node: u32, payload: []
     return total;
 }
 
-/// Delegates to the stdx helper rather than repeating the fcntl dance. The
-/// duplicate here hardcoded macOS's O_NONBLOCK (0x0004) and so was a no-op on
-/// Linux, leaving every peer socket blocking — see the note on
-/// `stdx.net.sysFcntlSetNonblocking` (issue #54).
 fn setNonBlocking(fd: posix.socket_t) !void {
     return @import("stdx").net.sysFcntlSetNonblocking(fd);
 }

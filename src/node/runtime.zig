@@ -461,41 +461,29 @@ pub const Runtime = struct {
         }
         self.shards = shards;
 
-        // Each of these steps is logged: a node that stops between "Shard 0
-        // initializing" and "shards initialized" gave no clue which one it was
-        // stuck in (issue #54).
-        log.debug("Runtime.start: wiring walk contexts", .{});
         try self.wireWalkContexts(shards);
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
-        log.debug("Runtime.start: wiring peer stream handlers", .{});
         try self.wirePeerStreamHandlers(shards);
 
         // 2.555 Wire cross-shard KV handler references for processing KV lookups + sinks.
-        log.debug("Runtime.start: wiring peer kv handlers", .{});
         try self.wirePeerKvHandlers(shards);
 
         // 2.556 Wire cross-shard TS / queue handler references for processing sinks.
-        log.debug("Runtime.start: wiring peer ts/queue handlers", .{});
         try self.wirePeerTsHandlers(shards);
         try self.wirePeerQueueHandlers(shards);
 
         // 2.56 Wire cross-shard inbox references for inbox messaging.
-        log.debug("Runtime.start: wiring peer inboxes", .{});
         try self.wirePeerInboxes(shards);
 
         // 2.57 Wire cross-shard shard pointers for pre-route forwarding.
-        log.debug("Runtime.start: wiring peer shards", .{});
         try self.wirePeerShards(shards);
-        log.debug("Runtime.start: peer shards wired", .{});
 
         // 2.6 Register cooperative background tasks (hot_flush, etc.).
         // Must happen after shards are at final heap addresses.
         // Also wire shard back-pointers for handlers that need Raft access.
         for (0..self.shard_count) |i| {
-            log.debug("Runtime.start: registering background tasks for shard {d}", .{i});
             shards[i].registerBackgroundTasks();
-            log.debug("Runtime.start: wiring handler shard ptrs for shard {d}", .{i});
             shards[i].wireHandlerShardPtrs();
         }
 
@@ -544,9 +532,7 @@ pub const Runtime = struct {
             const node_id = cluster_node_id;
 
             const rn = try self.allocator.create(RaftNetwork);
-            // RaftNetwork.init binds a socket and can fail; without this the
-            // allocation leaks on that path. Surfaced by CI on Linux, where the
-            // bind really does fail for a `listen_port = 0` config.
+            // RaftNetwork.init binds a socket and can fail.
             errdefer self.allocator.destroy(rn);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
             rn.setShardInbox(&shards[0].inbox);
@@ -737,13 +723,7 @@ pub const Runtime = struct {
     /// pre-routed requests to the correct shard's handlers.
     fn wirePeerShards(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
-        // This function is two single-iteration loops around an 8-byte
-        // allocation, yet it is where a joining node's output stops on Linux
-        // (#54). Logged step by step to establish whether it actually blocks
-        // here or whether the previous line was simply the last one flushed.
-        log.debug("wirePeerShards: allocating {d} ptrs", .{n});
         const ptrs = try self.allocator.alloc(*Shard, n);
-        log.debug("wirePeerShards: allocated", .{});
         for (0..n) |i| {
             ptrs[i] = &shards[i];
         }
@@ -751,7 +731,6 @@ pub const Runtime = struct {
         for (0..n) |i| {
             shards[i].peer_shards = ptrs;
         }
-        log.debug("wirePeerShards: done", .{});
     }
 
     /// Wire cross-shard walk contexts for all walk-registered opcodes.
