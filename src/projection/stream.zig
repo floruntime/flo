@@ -1109,10 +1109,10 @@ pub const StreamProjection = struct {
     /// projection apply), this cleanup is durable and replicated without a
     /// separate cg_delete entry.
     ///
-    /// The name registry is keyed by the namespace-qualified name on both the
-    /// live and replay paths; the raw form is swept too, so registry entries
-    /// written under a bare name are not left behind.
-    /// Metadata is keyed by the raw name. Returns true if the stream existed.
+    /// The name registry and the metadata map are both keyed by the
+    /// namespace-qualified name, on the live and replay paths alike; the raw
+    /// form is swept too, so an entry written under a bare name is not left
+    /// behind. Returns true if the stream existed.
     pub fn deleteStream(self: *StreamProjection, name_hash: u64, raw_name: []const u8, qualified_name: []const u8) bool {
         var existed = false;
         if (self.streams.fetchRemove(name_hash)) |kv| {
@@ -1129,6 +1129,12 @@ pub const StreamProjection = struct {
                 self.allocator.free(@constCast(kv.key));
                 existed = true;
             }
+        }
+        // Metadata is keyed by the qualified name; the raw form is swept too,
+        // so an entry written under a bare name is not left behind.
+        if (self.stream_metadata.fetchRemove(qualified_name)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            existed = true;
         }
         if (self.stream_metadata.fetchRemove(raw_name)) |kv| {
             self.allocator.free(@constCast(kv.key));

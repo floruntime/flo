@@ -58,7 +58,8 @@ const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
-const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
+const handler_mod = @import("../namespace/handler.zig");
+const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
@@ -1030,7 +1031,7 @@ pub const Shard = struct {
             // kv_scan uses scan wire format: [count:u32]([key_len:u16][key][value_len:u32(=0)])*[has_more:u8][cursor_len:u16][cursor]
             .kv_scan => serializeWalkKeysAsScan(self.allocator, deduped[0..dedup_count], result.next_cursor),
             // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
-            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream),
+            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream, req.namespace),
             // queue_list uses rich binary format with per-queue stats
             .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // processing_list and workflow_list_definitions use binary wire format with rich fields
@@ -2255,7 +2256,9 @@ fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, n
 ///
 /// The stream CLI expects u32 name lengths and a u32 partition_count per entry
 /// (distinct from the generic name-list format used by ts_list).
-fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection) ![]u8 {
+/// `names` reach here namespace-STRIPPED, but stream metadata is keyed by the
+/// qualified name, so `ns` is needed to look each one back up.
+fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     const cursor_bytes = next_cursor orelse &[_]u8{};
     const has_more: u8 = if (next_cursor != null) 1 else 0;
 
@@ -2276,8 +2279,9 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         pos += 4;
         @memcpy(buf[pos..][0..n.len], n);
         pos += n.len;
-        // partition_count from stream metadata
-        const pc = stream.getPartitionCount(n);
+        // partition_count from stream metadata, keyed by the qualified name
+        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+        const pc = stream.getPartitionCount(handler_mod.qualifyKey(&qbuf, ns, n) catch n);
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
