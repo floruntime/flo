@@ -2257,7 +2257,7 @@ fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, n
 /// The stream CLI expects u32 name lengths and a u32 partition_count per entry
 /// (distinct from the generic name-list format used by ts_list).
 /// `names` reach here namespace-STRIPPED, but stream metadata is keyed by the
-/// qualified name, so `ns` is needed to look each one back up (#46).
+/// qualified name, so `ns` is needed to look each one back up.
 fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     const cursor_bytes = next_cursor orelse &[_]u8{};
     const has_more: u8 = if (next_cursor != null) 1 else 0;

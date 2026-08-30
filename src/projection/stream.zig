@@ -1130,8 +1130,8 @@ pub const StreamProjection = struct {
                 existed = true;
             }
         }
-        // Metadata is keyed by the qualified name (#46); the raw form is still
-        // swept so entries written by builds before that change do not leak.
+        // Metadata is keyed by the qualified name; the raw form is swept too,
+        // so an entry written under a bare name is not left behind.
         if (self.stream_metadata.fetchRemove(qualified_name)) |kv| {
             self.allocator.free(@constCast(kv.key));
             existed = true;

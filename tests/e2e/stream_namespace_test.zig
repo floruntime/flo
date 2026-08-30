@@ -1,9 +1,8 @@
-//! Stream Namespace Isolation E2E Tests (issue #46)
+//! Stream Namespace Isolation E2E Tests
 //!
-//! Stream metadata (partition count + retention) was keyed by the bare stream
-//! name, so a same-named stream in a second namespace silently overwrote the
-//! first one's configuration. Partition count drives routing, so one tenant
-//! could re-route another tenant's stream just by picking the same name.
+//! Stream metadata — partition count and retention — must be per-namespace.
+//! Sharing it across namespaces lets one tenant re-route or expire another
+//! tenant's same-named stream, since partition count drives routing.
 //!
 //! Asserts on real output rather than exit status — the CLI exits 0 even on
 //! protocol errors.
@@ -12,7 +11,7 @@ const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 
-test "e2e/stream/ns: partition count is per-namespace (#46)" {
+test "e2e/stream/ns: partition count is per-namespace" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -33,7 +32,7 @@ test "e2e/stream/ns: partition count is per-namespace (#46)" {
     try testing.expect(std.mem.indexOf(u8, b.stdout, "Partitions: 1") != null);
 }
 
-test "e2e/stream/ns: list reports each namespace's own partition count (#46)" {
+test "e2e/stream/ns: list reports each namespace's own partition count" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -55,7 +54,7 @@ test "e2e/stream/ns: list reports each namespace's own partition count (#46)" {
     try testing.expect(std.mem.indexOf(u8, b.stdout, "4") == null);
 }
 
-test "e2e/stream/ns: retention is per-namespace (#46)" {
+test "e2e/stream/ns: retention is per-namespace" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -64,8 +63,8 @@ test "e2e/stream/ns: retention is per-namespace (#46)" {
     try ctx.exec(&.{ "stream", "create", "shared", "-n", "tenant-a" });
     try ctx.exec(&.{ "stream", "create", "shared", "-n", "tenant-b" });
 
-    // Shared metadata meant one namespace could shorten another's retention,
-    // which silently deletes the other tenant's data.
+    // Shared metadata would let one namespace shorten another's retention,
+    // silently deleting the other tenant's data.
     try ctx.exec(&.{ "stream", "alter", "shared", "--retention", "24", "-n", "tenant-a" });
 
     var a = try ctx.cli.run(&.{ "stream", "info", "shared", "-n", "tenant-a" });

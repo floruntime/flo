@@ -705,11 +705,11 @@ pub const StreamHandler = struct {
 
     /// Namespace-qualified stream name for metadata lookups.
     ///
-    /// `stream_metadata` (partition count + retention) used to be keyed by the
-    /// bare name, so a same-named stream in a second namespace silently
-    /// overwrote the first one's configuration — including its partition
-    /// count, which drives routing (issue #46). Qualify at every read and
-    /// write, exactly as `stream_names` already does.
+    /// `stream_metadata` (partition count + retention) must be keyed the same
+    /// way `stream_names` is. Keyed by the bare name, a same-named stream in
+    /// another namespace shares the entry and silently overwrites the first
+    /// one's configuration — including its partition count, which drives
+    /// routing. Qualify at every read and write.
     fn metaKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, req: Request) []const u8 {
         return ns_keys.qualifyKey(buf, req.namespace, req.key) catch req.key;
     }
@@ -1960,7 +1960,7 @@ fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, 
 /// Serialize a list of names in the standard walk wire format.
 /// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
 /// `names` are namespace-STRIPPED for the wire, but metadata is keyed by the
-/// qualified name, so `ns` is needed to look each one back up (#46).
+/// qualified name, so `ns` is needed to look each one back up.
 fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     // Stream list wire format (matches CLI expectations):
     // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16]
