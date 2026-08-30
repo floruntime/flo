@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const time = @import("time.zig");
 
 // Re-exports
 pub const Field = @import("log/field.zig").Field;
@@ -411,7 +412,7 @@ fn writeFmtEntry(
     var fbs: std.Io.Writer = .fixed(&buf);
     const writer = &fbs;
 
-    const timestamp = @import("time.zig").nanoTimestamp();
+    const timestamp = time.nanoTimestamp();
 
     const caller: ?format.Caller = if (global.show_caller)
         .{ .file = src.file, .line = src.line, .fn_name = src.fn_name }
@@ -446,7 +447,7 @@ fn writeEntry(
     var fbs: std.Io.Writer = .fixed(&buf);
     const writer = &fbs;
 
-    const timestamp = @import("time.zig").nanoTimestamp();
+    const timestamp = time.nanoTimestamp();
 
     // Build caller info if enabled
     const caller: ?format.Caller = if (global.show_caller)
@@ -759,7 +760,7 @@ pub fn stdLogFn(
     var fbs: std.Io.Writer = .fixed(&buf);
     const writer = &fbs;
 
-    const timestamp = @import("time.zig").nanoTimestamp();
+    const timestamp = time.nanoTimestamp();
     const colors = global.use_colors;
 
     // Simple text format for std.log bridge
@@ -824,7 +825,7 @@ pub const TestLogger = struct {
     pub fn logTo(self: *TestLogger, level: Level, comptime msg: []const u8, fields: anytype) void {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        formatTextEntry(&aw.writer, level, msg, @import("time.zig").nanoTimestamp(), null, fields);
+        formatTextEntry(&aw.writer, level, msg, time.nanoTimestamp(), null, fields);
         self.buffer.appendSlice(self.allocator, aw.written()) catch {};
     }
 };
