@@ -152,20 +152,24 @@ const SimNode = struct {
 // Checker
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const Canon = struct { term: u64, hash: u64, op_id: ?u64 };
+const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
 
 const Checker = struct {
     allocator: Allocator,
     /// Leader completeness assumes committed entries survive on a quorum.
     /// Under async_flush a crashed quorum legally loses its unflushed
     /// suffix (the mode's documented contract, the same grace the final
-    /// durability check gets), so it is only assertable under sync.
+    /// durability check gets). Asserted until the first async-mode crash
+    /// makes erasure possible; sync mode asserts it throughout.
     check_completeness: bool = true,
     /// Under async_flush a cluster-wide crash inside the flush window can
     /// legally erase applied history, and a newer term rewrites those
     /// indices — cross-term canonical immutability doesn't hold. What
     /// always holds is same-term immutability: one leader wrote that
-    /// index exactly once. Sync mode asserts full immutability.
+    /// index exactly once. Sync mode asserts full immutability, and even
+    /// async mode only permits a rewrite when a crash actually happened
+    /// after the canonical entry was recorded — without one, nothing
+    /// could have legally erased it.
     allow_cross_term_rewrite: bool = false,
     /// canonical[i] is the first-applied (term, payload-hash) at index i+1.
     /// First applier sets it; every later applier must match. A mismatch
@@ -235,6 +239,7 @@ const Checker = struct {
         term: u64,
         payload: []const u8,
         tick: u64,
+        latest_crash: u64,
     ) void {
         const hash = std.hash.Wyhash.hash(HASH_SEED, payload);
         const op_id = Workload.opIdFromPayload(payload);
@@ -251,10 +256,11 @@ const Checker = struct {
                     .detail = "two different entries applied at one index in the same term",
                 });
             } else if (canon.term != term) {
-                if (self.allow_cross_term_rewrite) {
+                const erasable = self.allow_cross_term_rewrite and latest_crash >= canon.recorded_at;
+                if (erasable) {
                     // Keep the newest-term version as canonical.
                     if (term > canon.term) {
-                        self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id };
+                        self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
                     }
                 } else {
                     self.fail(.{
@@ -267,7 +273,7 @@ const Checker = struct {
                 }
             }
         } else {
-            self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id };
+            self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
         }
         // Applied-entry integrity: a workload payload must hash to what
         // the oracle recorded when it was synthesized.
@@ -314,6 +320,7 @@ pub const Summary = struct {
     messages_delivered: u64,
     messages_dropped: u64,
     apply_stalls: u64,
+    eviction_stalls: u64,
     /// Wyhash over the canonical history — two runs of one seed must agree.
     canonical_hash: u64,
     violation_count: usize,
@@ -337,6 +344,9 @@ pub const Simulator = struct {
     /// ask "did any crash land inside this op's flush window", not
     /// "did the last crash".
     crash_ticks: std.ArrayListUnmanaged(u64),
+    /// The erasability gate for cross-term canonical rewrites: a rewrite
+    /// is legal only if some crash happened after the entry was recorded.
+    latest_crash_at: u64,
     /// Highest log index of any acked op — the convergence target.
     /// Tracked incrementally; recomputing it from all ops every tick is
     /// O(ops x ticks) and dominates the whole run.
@@ -351,6 +361,7 @@ pub const Simulator = struct {
     restarts: u64 = 0,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
+    eviction_stalls: u64 = 0,
 
     const RAFT_GROUP: u32 = 1;
 
@@ -366,7 +377,6 @@ pub const Simulator = struct {
             .workload = try Workload.init(allocator, &scenario),
             .checker = .{
                 .allocator = allocator,
-                .check_completeness = scenario.durability == .sync,
                 .allow_cross_term_rewrite = scenario.durability == .async_flush,
             },
             .now = 0,
@@ -375,6 +385,7 @@ pub const Simulator = struct {
             .pending_ops = .empty,
             .acked_at = .empty,
             .crash_ticks = .empty,
+            .latest_crash_at = 0,
             .max_acked_index = 0,
             .range_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH),
             .range_arena = try allocator.alloc(u8, @as(usize, scenario.payload_max) * MAX_BATCH + 64),
@@ -470,7 +481,11 @@ pub const Simulator = struct {
         node.up = false;
         node.disk.crash();
         self.crashes += 1;
+        self.latest_crash_at = self.now;
         self.crash_ticks.append(self.allocator, self.now) catch @panic("sim OOM");
+        // From here on an async-mode quorum can legally lose committed
+        // entries, so leader completeness stops being assertable.
+        if (self.scenario.durability == .async_flush) self.checker.check_completeness = false;
     }
 
     fn restartNode(self: *Simulator, node: *SimNode) !void {
@@ -556,13 +571,16 @@ pub const Simulator = struct {
     fn deliverAll(self: *Simulator) !void {
         self.delivery.clearRetainingCapacity();
         try self.net.deliverDue(self.now, &self.delivery);
-        for (self.delivery.items) |*msg| {
-            defer self.net.release(msg);
+        // Drain from the front so a message is out of the list before it
+        // can error — anything still listed on an error path is released
+        // exactly once, by deinit.
+        while (self.delivery.items.len > 0) {
+            var msg = self.delivery.orderedRemove(0);
+            defer self.net.release(&msg);
             const node = self.node_(msg.to);
             if (!node.up) continue;
-            try self.handleMessage(node, msg);
+            try self.handleMessage(node, &msg);
         }
-        self.delivery.clearRetainingCapacity();
     }
 
     fn handleMessage(self: *Simulator, node: *SimNode, msg: *const Message) !void {
@@ -657,7 +675,8 @@ pub const Simulator = struct {
             // A stale success ack can outlive its leadership stint:
             // handleAppendResponse takes any success response at face
             // value, so an ack delayed across this leader's
-            // crash-restart (which shrank its log) can push next_index
+            // crash-restart or conflict truncation (which shrank its
+            // log) can push next_index
             // past the tip — clamp, or prev_log below is unbuildable.
             if (node.raft.peers[i].next_index > last + 1) {
                 node.raft.peers[i].next_index = last + 1;
@@ -681,7 +700,40 @@ pub const Simulator = struct {
 
             var entries: []OwnedEntry = &.{};
             if (want_data) {
-                const count = node.raft.log.getRange(next, self.range_entries, self.range_arena);
+                var count = node.raft.log.getRange(next, self.range_entries, self.range_arena);
+                if (count == 0) {
+                    // The range a repair needs is evicted from the ring —
+                    // without a catch-up path the peer wedges silently
+                    // (term lookups still succeed via the term cache, so
+                    // the prev_term stall above never fires). Count it,
+                    // and outside the --small-ring scenario fall back to
+                    // the harness's stable storage — the same
+                    // reference-implementation role as the pump itself,
+                    // standing in for the snapshot/catch-up path the
+                    // runtime doesn't have. --small-ring keeps the wedge
+                    // observable as the acceptance test for that work.
+                    self.eviction_stalls += 1;
+                    if (!self.scenario.small_ring) {
+                        const disk = node.disk.entries.items;
+                        var k: usize = 0;
+                        var arena_used: usize = 0;
+                        while (k < MAX_BATCH and next - 1 + k < disk.len) : (k += 1) {
+                            const de = disk[next - 1 + k];
+                            if (arena_used + de.payload.len > self.range_arena.len) break;
+                            @memcpy(self.range_arena[arena_used..][0..de.payload.len], de.payload);
+                            self.range_entries[k] = entry_mod.buildEntry(
+                                @enumFromInt(de.entry_type),
+                                de.flags,
+                                de.term,
+                                next + k,
+                                de.timestamp_ns,
+                                self.range_arena[arena_used..][0..de.payload.len],
+                            );
+                            arena_used += de.payload.len;
+                        }
+                        count = k;
+                    }
+                }
                 if (count > 0) {
                     const owned = try self.allocator.alloc(OwnedEntry, count);
                     var built: usize = 0;
@@ -804,7 +856,7 @@ pub const Simulator = struct {
                     self.apply_stalls += 1;
                     break;
                 }
-                self.checker.onApply(&self.workload, node.id, idx, term, payload, self.now);
+                self.checker.onApply(&self.workload, node.id, idx, term, payload, self.now, self.latest_crash_at);
                 node.raft.last_applied = idx;
             }
         }
@@ -1004,6 +1056,7 @@ pub const Simulator = struct {
             .messages_delivered = self.net.delivered,
             .messages_dropped = self.net.dropped,
             .apply_stalls = self.apply_stalls,
+            .eviction_stalls = self.eviction_stalls,
             .canonical_hash = h.final(),
             .violation_count = self.checker.violations.items.len,
         };
@@ -1069,6 +1122,15 @@ test "vopr sim: same seed twice produces identical summaries" {
     const sa = try a.run();
     const sb = try b.run();
     try testing.expectEqual(sa, sb);
+    // Equal counters can hide divergent checker content — compare the
+    // violation lists element-wise too.
+    try testing.expectEqual(a.checker.violations.items.len, b.checker.violations.items.len);
+    for (a.checker.violations.items, b.checker.violations.items) |va, vb| {
+        try testing.expectEqual(va.invariant, vb.invariant);
+        try testing.expectEqual(va.node, vb.node);
+        try testing.expectEqual(va.index, vb.index);
+        try testing.expectEqual(va.tick, vb.tick);
+    }
 }
 
 test "vopr sim: volatile hard state trips term monotonicity on restart" {

@@ -79,49 +79,12 @@ fn parseArgs(argv: []const []const u8) !Args {
     return args;
 }
 
-// ── Scenario JSON loading (the pin format written by writeJson) ────────
-
-fn jsonU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
-    const v = obj.get(key) orelse return error.MissingField;
-    return @intCast(v.integer);
-}
+// ── Scenario file IO (parsing lives with Scenario itself) ─────────────
 
 fn loadScenario(allocator: std.mem.Allocator, path: []const u8) !Scenario {
     const bytes = try stdx.fs.readFileAlloc(allocator, path, 64 * 1024);
     defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-
-    const hard = (obj.get("hard_state") orelse return error.MissingField).string;
-    const dura = (obj.get("durability") orelse return error.MissingField).string;
-    return .{
-        .seed = try jsonU64(obj, "seed"),
-        .node_count = @intCast(try jsonU64(obj, "node_count")),
-        .log_capacity = @intCast(try jsonU64(obj, "log_capacity")),
-        .small_ring = (obj.get("small_ring") orelse return error.MissingField).bool,
-        .ticks_safety = try jsonU64(obj, "ticks_safety"),
-        .ticks_convergence = try jsonU64(obj, "ticks_convergence"),
-        .hard_state = if (std.mem.eql(u8, hard, "volatile")) .volatile_state else .persisted,
-        .durability = if (std.mem.eql(u8, dura, "async_flush")) .async_flush else .sync,
-        .flush_interval_ms = try jsonU64(obj, "flush_interval_ms"),
-        .msg_delay_min_ms = try jsonU64(obj, "msg_delay_min_ms"),
-        .msg_delay_max_ms = try jsonU64(obj, "msg_delay_max_ms"),
-        .drop_percent = @intCast(try jsonU64(obj, "drop_percent")),
-        .duplicate_percent = @intCast(try jsonU64(obj, "duplicate_percent")),
-        .partition_permille = @intCast(try jsonU64(obj, "partition_permille")),
-        .partition_min_ms = try jsonU64(obj, "partition_min_ms"),
-        .partition_max_ms = try jsonU64(obj, "partition_max_ms"),
-        .crash_permille = @intCast(try jsonU64(obj, "crash_permille")),
-        .restart_permille = @intCast(try jsonU64(obj, "restart_permille")),
-        .request_percent = @intCast(try jsonU64(obj, "request_percent")),
-        .payload_min = @intCast(try jsonU64(obj, "payload_min")),
-        .payload_max = @intCast(try jsonU64(obj, "payload_max")),
-        .election_timeout_min_ms = try jsonU64(obj, "election_timeout_min_ms"),
-        .election_timeout_max_ms = try jsonU64(obj, "election_timeout_max_ms"),
-        .heartbeat_interval_ms = try jsonU64(obj, "heartbeat_interval_ms"),
-        .rpc_timeout_ms = try jsonU64(obj, "rpc_timeout_ms"),
-    };
+    return Scenario.fromJsonSlice(allocator, bytes);
 }
 
 fn writeScenario(scenario: *const Scenario, path: []const u8) !void {
