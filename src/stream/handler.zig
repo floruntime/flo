@@ -433,9 +433,14 @@ pub const StreamHandler = struct {
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
         self.stream.registerStream(ns_stream_name) catch {};
 
-        // Register in global metrics registry for dashboard/Prometheus
+        // Register in global metrics registry for dashboard/Prometheus, and
+        // record the append against it. `registerStream` returns the per-stream
+        // metrics, so the counters cost one call next to the registration they
+        // already do.
         if (self.metrics_registry) |mr| {
-            _ = mr.registerStream(req.namespace, req.key, 0) catch {};
+            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
+                sm.recordAppend(stream_mod.batchRecordCount(payload_value), payload_value.len);
+            } else |_| {}
         }
 
         return .{ .stream_append_ok = .{
@@ -506,6 +511,16 @@ pub const StreamHandler = struct {
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
+
+        if (self.metrics_registry) |mr| {
+            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
+                // `count` is append entries; sum their batch contents so the
+                // counter matches what the caller actually receives.
+                var records: u64 = 0;
+                for (buf[0..count]) |rec| records += rec.record_count;
+                if (records == 0) sm.recordEmptyRead() else sm.recordRead(records, data.len);
+            } else |_| {}
+        }
 
         const last_id = if (count > 0) buf[count - 1].id else StreamID.MIN;
         return .{ .stream_messages = .{

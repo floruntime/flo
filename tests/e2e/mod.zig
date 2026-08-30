@@ -21,6 +21,7 @@ pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");
 pub const metrics_test = @import("metrics_test.zig");
+pub const metrics_values_test = @import("metrics_values_test.zig");
 pub const dashboard_streams_test = @import("dashboard_streams_test.zig");
 pub const dashboard_queues_test = @import("dashboard_queues_test.zig");
 pub const dashboard_actions_test = @import("dashboard_actions_test.zig");
