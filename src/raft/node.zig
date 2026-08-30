@@ -140,6 +140,9 @@ pub const RaftNode = struct {
     peer_count: u8,
     votes_received: u8,
     votes_needed: u8,
+    /// Which peers (indexed like peer_ids) granted a vote in the current
+    /// election. Re-delivered VoteResponses must not double-count toward quorum.
+    vote_granted_by: [MAX_PEERS]bool,
 
     // ── Log ────────────────────────────────────────────────────────────
     log: RaftLog,
@@ -181,6 +184,7 @@ pub const RaftNode = struct {
             .peer_count = 0,
             .votes_received = 0,
             .votes_needed = 0,
+            .vote_granted_by = std.mem.zeroes([MAX_PEERS]bool),
             .log = raft_log_inst,
             .config = config,
             .allocator = allocator,
@@ -289,6 +293,7 @@ pub const RaftNode = struct {
         self.leader_id = NO_VOTE;
         self.votes_received = 1; // vote for self
         self.votes_needed = self.quorum();
+        self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
         self.elections_started += 1;
         self.terms_seen += 1;
 
@@ -341,6 +346,11 @@ pub const RaftNode = struct {
         if (resp.term != self.current_term) return false;
 
         if (resp.vote_granted) {
+            // Count each peer at most once; grants from unknown nodes (or a
+            // duplicated response for self) never count toward quorum.
+            const idx = self.peerIndex(resp.from) orelse return false;
+            if (self.vote_granted_by[idx]) return false;
+            self.vote_granted_by[idx] = true;
             self.votes_received += 1;
             if (self.votes_received >= self.votes_needed) {
                 self.becomeLeader();
@@ -501,6 +511,13 @@ pub const RaftNode = struct {
             self.peers[i].match_index = 0;
             self.peers[i].inflight = false;
         }
+    }
+
+    fn peerIndex(self: *const RaftNode, peer_id: NodeId) ?usize {
+        for (0..self.peer_count) |i| {
+            if (self.peer_ids[i] == peer_id) return i;
+        }
+        return null;
     }
 
     fn isLogUpToDate(self: *const RaftNode, last_index: u64, last_term: u64) bool {
@@ -1015,6 +1032,75 @@ test "raft node: conflict truncation reports match through appended batch" {
     try testing.expectEqual(@as(u64, 4), resp.match_index);
     try testing.expectEqual(@as(u64, 4), node.log.lastIndex());
     try testing.expectEqual(@as(u64, 3), node.log.entryTerm(4).?);
+}
+
+test "raft node: duplicate vote from same peer counts once" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+    try testing.expectEqual(@as(u8, 3), node.quorum());
+
+    _ = node.startElection();
+
+    // Peer 2 grants twice (network duplication) — must not reach quorum
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    const won_dup = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expect(!won_dup);
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+
+    // A second distinct peer completes the quorum
+    const won = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 3 });
+    try testing.expect(won);
+    try testing.expectEqual(Role.leader, node.role);
+}
+
+test "raft node: vote from unknown node does not count" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+
+    _ = node.startElection();
+
+    const won = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 99 });
+    try testing.expect(!won);
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(u8, 1), node.votes_received); // self only
+}
+
+test "raft node: startElection resets vote tracking" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+
+    // New election: nothing carries over, and peer 2 may grant again
+    _ = node.startElection();
+    try testing.expectEqual(@as(u8, 1), node.votes_received);
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+    try testing.expectEqual(Role.candidate, node.role);
 }
 
 test "raft node: cluster size and quorum" {
