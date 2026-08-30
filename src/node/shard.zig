@@ -93,6 +93,7 @@ const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const NodeId = @import("../raft/node.zig").NodeId;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
+const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -193,6 +194,9 @@ pub const Shard = struct {
 
     /// Raft network reference (set by runtime for shard 0, null otherwise).
     raft_network: ?*RaftNetwork,
+
+    /// Per-shard counters, mirroring the global server ones for attribution.
+    shard_metrics: ?*ShardMetrics,
 
     /// This node's cluster-wide node ID, set by the runtime at start. Distinct
     /// from `raft_node.id`, which identifies the per-shard Raft group.
@@ -520,6 +524,7 @@ pub const Shard = struct {
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
+            .shard_metrics = null,
             .cluster_node_id = 0,
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
@@ -602,6 +607,11 @@ pub const Shard = struct {
     /// Called by runtime after the registry is created.
     pub fn setMetricsRegistry(self: *Shard, registry: *MetricsRegistry) void {
         self.metrics_registry = registry;
+        // Resolved once: the shard table is sized by `initShards` before this
+        // runs, and the pointer is stable for the registry's lifetime. Without
+        // it every `flo_shard_*` series exports 0 while the global `flo_*`
+        // equivalents move, which reads as "this shard is idle".
+        self.shard_metrics = registry.shardMetrics(self.id);
         self.stream_handler.metrics_registry = registry;
         self.queue_handler.metrics_registry = registry;
         self.kv_handler.metrics_registry = registry;
@@ -746,6 +756,7 @@ pub const Shard = struct {
 
         try self.connections.put(self.allocator, fd, conn);
         if (self.metrics_registry) |m| m.server.connectionOpened();
+        if (self.shard_metrics) |sm| sm.connectionOpened();
         return conn;
     }
 
@@ -757,6 +768,7 @@ pub const Shard = struct {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             if (self.metrics_registry) |m| m.server.connectionClosed();
+            if (self.shard_metrics) |sm| sm.connectionClosed();
         }
     }
 
@@ -787,6 +799,7 @@ pub const Shard = struct {
         // Overview's commands_total + rps). Other server counters (connections,
         // bytes) are not yet wired — see the metrics gap log.
         if (self.metrics_registry) |m| m.server.recordCommand();
+        if (self.shard_metrics) |sm| sm.recordCommand();
 
         const op = req.header.op_code;
 
@@ -1512,6 +1525,7 @@ pub const Shard = struct {
         }
 
         if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+        if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
 
         // Accumulate data in the read buffer
         _ = conn.read_buf.write(tmp_buf[0..n]);
@@ -1766,6 +1780,7 @@ pub const Shard = struct {
                 return;
             }
             if (self.metrics_registry) |m| m.server.recordBytesSent(@intCast(written));
+            if (self.shard_metrics) |sm| sm.recordBytesSent(@intCast(written));
             conn.consumeWritten(written);
         }
 

@@ -317,9 +317,13 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
         };
 
-        // Register in global metrics registry for dashboard/Prometheus
+        // Register in global metrics registry for dashboard/Prometheus, and
+        // record the enqueue against the per-queue metrics `registerQueue`
+        // returns.
         if (self.metrics_registry) |mr| {
-            _ = mr.registerQueue(req.namespace, req.key) catch {};
+            if (mr.registerQueue(req.namespace, req.key)) |qm| {
+                qm.recordEnqueue(1, req.value.len, false);
+            } else |_| {}
         }
 
         // Seq was assigned by the projection during apply
@@ -369,8 +373,16 @@ pub const QueueHandler = struct {
 
         // Persist auto-ack entries so dequeued messages don't reappear after restart.
         // In this simplified model, dequeue = consume (not a lease-based model).
+        var dequeued_bytes: usize = 0;
         for (results[0..actual]) |r| {
+            dequeued_bytes += r.payload.len;
             self.persistAck(ns_hash, r.seq);
+        }
+
+        if (self.metrics_registry) |mr| {
+            if (mr.registerQueue(req.namespace, req.key)) |qm| {
+                if (actual == 0) qm.recordEmptyDequeue() else qm.recordDequeue(actual, dequeued_bytes);
+            } else |_| {}
         }
 
         return .{ .queue_messages = .{ .data = data } };
