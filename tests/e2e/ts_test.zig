@@ -1125,7 +1125,7 @@ test "e2e/ts: floql math subtract" {
 
     try stdx.testing.assertSucceeded(result);
     // 50-10=40
-    try testing.expect(result.contains("40"));
+    try testing.expect(result.contains("40.0000"));
 }
 
 test "e2e/ts: floql math modulo" {
@@ -1141,7 +1141,7 @@ test "e2e/ts: floql math modulo" {
 
     try stdx.testing.assertSucceeded(result);
     // 17 % 5 = 2
-    try testing.expect(result.contains("2"));
+    try testing.expect(result.contains("2.0000"));
 }
 
 test "e2e/ts: floql math chained with aggregation" {
@@ -1175,7 +1175,7 @@ test "e2e/ts: floql math shorthand (no 'value' keyword)" {
 
     try stdx.testing.assertSucceeded(result);
     // 10*2=20
-    try testing.expect(result.contains("20"));
+    try testing.expect(result.contains("20.0000"));
 }
 
 // =============================================================================
@@ -1195,7 +1195,7 @@ test "e2e/ts: floql round to integer" {
 
     try stdx.testing.assertSucceeded(result);
     // 72.567 rounded to 0 decimals → 73
-    try testing.expect(result.contains("73"));
+    try testing.expect(result.contains("73.0000"));
 }
 
 test "e2e/ts: floql round to 2 decimals" {
@@ -1211,7 +1211,7 @@ test "e2e/ts: floql round to 2 decimals" {
 
     try stdx.testing.assertSucceeded(result);
     // 72.5678 rounded to 2 decimals → 72.57
-    try testing.expect(result.contains("72.57"));
+    try testing.expect(result.contains("72.5700"));
 }
 
 test "e2e/ts: floql round default (no args)" {
@@ -1227,7 +1227,7 @@ test "e2e/ts: floql round default (no args)" {
 
     try stdx.testing.assertSucceeded(result);
     // Default round → nearest integer → 43
-    try testing.expect(result.contains("43"));
+    try testing.expect(result.contains("43.0000"));
 }
 
 test "e2e/ts: floql math then round" {
@@ -1244,7 +1244,7 @@ test "e2e/ts: floql math then round" {
 
     try stdx.testing.assertSucceeded(result);
     // Should contain 33.3
-    try testing.expect(result.contains("33.3"));
+    try testing.expect(result.contains("33.3000"));
 }
 
 // =============================================================================
@@ -1268,7 +1268,7 @@ test "e2e/ts: floql glob tag filter =~" {
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("15"));
+    try testing.expect(result.contains("15.0000"));
     try testing.expect(!result.contains("20.0000"));
 }
 
@@ -1287,9 +1287,14 @@ test "e2e/ts: floql negate glob tag filter !~" {
     });
     defer result.deinit();
 
+    // Match the rendered value, not a bare number: output lines are
+    // `<epoch_ms>: <value>` and these points carry wall-clock timestamps, so a
+    // bare "30" matches a digit pair inside the timestamp and fails a passing
+    // run. Values always render with four decimals and timestamps never contain
+    // a '.', so the decimal form cannot collide.
     try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("10"));
-    try testing.expect(!result.contains("30"));
+    try testing.expect(result.contains("10.0000"));
+    try testing.expect(!result.contains("30.0000"));
 }
 
 test "e2e/ts: floql neq tag filter with !=" {
