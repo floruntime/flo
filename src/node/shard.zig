@@ -613,6 +613,10 @@ pub const Shard = struct {
         // equivalents move, which reads as "this shard is idle".
         self.shard_metrics = registry.shardMetrics(self.id);
         self.stream_handler.metrics_registry = registry;
+        // Tier-hit counters are per log; resolve once so the read path avoids a
+        // registry lookup per record. Also the only caller of registerTieredLog,
+        // without which the flo_tiered_log_* family never appears at all.
+        self.stream_handler.tiered_metrics = registry.registerTieredLog(self.id) catch null;
         self.queue_handler.metrics_registry = registry;
         self.kv_handler.metrics_registry = registry;
     }

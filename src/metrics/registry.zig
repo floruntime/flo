@@ -47,7 +47,15 @@ pub const KVMetrics = struct {
     }
 
     pub fn decrementKeyCount(self: *KVMetrics) void {
-        _ = self.key_count.fetchSub(1, .monotonic);
+        // Saturate at zero. Recovery rebuilds keys without going through
+        // recordSet, so key_count can be 0 while keys exist on disk — an
+        // unguarded fetchSub would wrap to u64 max and export a nonsense gauge.
+        var cur = self.key_count.load(.monotonic);
+        while (cur > 0) {
+            if (self.key_count.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
+                cur = actual;
+            } else return;
+        }
     }
 
     pub const Snapshot = struct {
@@ -1017,6 +1025,19 @@ pub const MetricsRegistry = struct {
             try writeStreamMetrics(writer, snapshot, labels);
         }
 
+        // Export KV metrics, one series set per namespace.
+        var kv_iter = self.kv_namespaces.valueIterator();
+        while (kv_iter.next()) |entry| {
+            const kv_snapshot = entry.metrics.snapshot();
+            const kv_labels = try std.fmt.allocPrint(
+                allocator,
+                "namespace=\"{s}\"",
+                .{entry.namespace},
+            );
+            defer allocator.free(kv_labels);
+            try writeKVMetrics(writer, kv_snapshot, kv_labels);
+        }
+
         // Export tiered log metrics
         var tiered_iter = self.tiered_logs.valueIterator();
         while (tiered_iter.next()) |entry| {
@@ -1198,6 +1219,32 @@ fn writeQueueMetrics(
 }
 
 /// Write tiered log metrics in Prometheus format
+fn writeKVMetrics(
+    writer: anytype,
+    snapshot: KVMetrics.Snapshot,
+    labels: []const u8,
+) !void {
+    try writer.print("# HELP flo_kv_keys Current keys stored in this namespace\n", .{});
+    try writer.print("# TYPE flo_kv_keys gauge\n", .{});
+    try writer.print("flo_kv_keys{{{s}}} {d}\n", .{ labels, snapshot.key_count });
+
+    try writer.print("# HELP flo_kv_get_ops_total Total KV get operations\n", .{});
+    try writer.print("# TYPE flo_kv_get_ops_total counter\n", .{});
+    try writer.print("flo_kv_get_ops_total{{{s}}} {d}\n", .{ labels, snapshot.get_ops_total });
+
+    try writer.print("# HELP flo_kv_set_ops_total Total KV set operations\n", .{});
+    try writer.print("# TYPE flo_kv_set_ops_total counter\n", .{});
+    try writer.print("flo_kv_set_ops_total{{{s}}} {d}\n", .{ labels, snapshot.set_ops_total });
+
+    try writer.print("# HELP flo_kv_delete_ops_total Total KV delete operations\n", .{});
+    try writer.print("# TYPE flo_kv_delete_ops_total counter\n", .{});
+    try writer.print("flo_kv_delete_ops_total{{{s}}} {d}\n", .{ labels, snapshot.delete_ops_total });
+
+    try writer.print("# HELP flo_kv_bytes_stored Approximate bytes stored in this namespace\n", .{});
+    try writer.print("# TYPE flo_kv_bytes_stored gauge\n", .{});
+    try writer.print("flo_kv_bytes_stored{{{s}}} {d}\n", .{ labels, snapshot.bytes_stored });
+}
+
 fn writeTieredLogMetrics(
     writer: anytype,
     snapshot: TieredLogMetrics.Snapshot,

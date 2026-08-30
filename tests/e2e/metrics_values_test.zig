@@ -176,3 +176,70 @@ test "e2e/metrics: processing submitted counter carries a real value" {
 
     try testing.expectEqual(@as(?u64, 1), scalarValue(resp.body, "flo_processing_jobs_submitted_total"));
 }
+
+test "e2e/metrics: kv counters carry real values" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "a", "1" });
+    try ctx.exec(&.{ "kv", "set", "b", "2" });
+    try ctx.exec(&.{ "kv", "get", "a" });
+    try ctx.exec(&.{ "kv", "delete", "b" });
+
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+
+    // The family was not emitted by exportPrometheus at all before, so these
+    // series did not exist rather than reading zero.
+    try testing.expectEqual(@as(?u64, 2), seriesValue(resp.body, "flo_kv_set_ops_total", "default"));
+    try testing.expectEqual(@as(?u64, 1), seriesValue(resp.body, "flo_kv_get_ops_total", "default"));
+    try testing.expectEqual(@as(?u64, 1), seriesValue(resp.body, "flo_kv_delete_ops_total", "default"));
+}
+
+test "e2e/metrics: tiered log hit counters carry real values" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "tiered", "a", "b", "c" });
+    try ctx.exec(&.{ "stream", "read", "tiered" });
+
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+
+    // registerTieredLog had no callers, so the whole family was absent.
+    // A fresh append is served from the hot ring.
+    const hot = seriesValue(resp.body, "flo_tiered_log_hot_hits_total", "group_id") orelse 0;
+    try testing.expect(hot > 0);
+    try testing.expect(seriesValue(resp.body, "flo_tiered_log_reads_total", "group_id") != null);
+}
+
+test "e2e/metrics: kv key count does not wrap when deleting a recovered key" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true, .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "survivor", "v" });
+
+    // Recovery rebuilds keys without going through recordSet, so key_count is
+    // back to 0 here while the key exists. Deleting it used to wrap the gauge
+    // to u64 max.
+    try ctx.restartServer();
+    try ctx.exec(&.{ "kv", "delete", "survivor" });
+
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+
+    const keys = seriesValue(resp.body, "flo_kv_keys", "default") orelse 0;
+    try testing.expect(keys < 1_000_000);
+}
