@@ -26,6 +26,10 @@ pub const process = @import("process.zig");
 pub const Mutex = sync.Mutex;
 
 pub const testing = @import("testing/e2e/mod.zig");
+
+/// Deterministic seedable PRNG for VOPR-style simulation testing.
+pub const prng = @import("testing/prng.zig");
+pub const PRNG = prng.PRNG;
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.
 pub fn copy_disjoint(

@@ -73,6 +73,11 @@ test {
     _ = @import("raft/snapshot.zig");
 }
 
+// VOPR simulation testing
+test {
+    _ = @import("vopr/mod.zig");
+}
+
 // Projections
 test {
     _ = @import("projection/router.zig");

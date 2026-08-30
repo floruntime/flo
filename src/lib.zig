@@ -32,6 +32,11 @@ pub const storage = @import("storage/mod.zig");
 pub const raft = @import("raft/mod.zig");
 
 // =============================================================================
+// VOPR: deterministic simulation & scenario testing
+// =============================================================================
+pub const vopr = @import("vopr/mod.zig");
+
+// =============================================================================
 // Projection Engines: KV, Queue, Stream, TimeSeries (NEW)
 // =============================================================================
 pub const projection = @import("projection/mod.zig");
