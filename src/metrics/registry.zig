@@ -47,7 +47,15 @@ pub const KVMetrics = struct {
     }
 
     pub fn decrementKeyCount(self: *KVMetrics) void {
-        _ = self.key_count.fetchSub(1, .monotonic);
+        // Saturate at zero. Recovery rebuilds keys without going through
+        // recordSet, so key_count can be 0 while keys exist on disk — an
+        // unguarded fetchSub would wrap to u64 max and export a nonsense gauge.
+        var cur = self.key_count.load(.monotonic);
+        while (cur > 0) {
+            if (self.key_count.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
+                cur = actual;
+            } else return;
+        }
     }
 
     pub const Snapshot = struct {

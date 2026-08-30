@@ -220,3 +220,26 @@ test "e2e/metrics: tiered log hit counters carry real values" {
     try testing.expect(hot > 0);
     try testing.expect(seriesValue(resp.body, "flo_tiered_log_reads_total", "group_id") != null);
 }
+
+test "e2e/metrics: kv key count does not wrap when deleting a recovered key" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true, .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "survivor", "v" });
+
+    // Recovery rebuilds keys without going through recordSet, so key_count is
+    // back to 0 here while the key exists. Deleting it used to wrap the gauge
+    // to u64 max.
+    try ctx.restartServer();
+    try ctx.exec(&.{ "kv", "delete", "survivor" });
+
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+
+    const keys = seriesValue(resp.body, "flo_kv_keys", "default") orelse 0;
+    try testing.expect(keys < 1_000_000);
+}
