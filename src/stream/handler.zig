@@ -398,7 +398,8 @@ pub const StreamHandler = struct {
             // Hash the partition key and map to a partition index
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                const pc = self.stream.getPartitionCount(req.key);
+                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const pc = self.stream.getPartitionCount(metaKey(&qbuf, req));
                 partition_index = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -432,9 +433,14 @@ pub const StreamHandler = struct {
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
         self.stream.registerStream(ns_stream_name) catch {};
 
-        // Register in global metrics registry for dashboard/Prometheus
+        // Register in global metrics registry for dashboard/Prometheus, and
+        // record the append against it. `registerStream` returns the per-stream
+        // metrics, so the counters cost one call next to the registration they
+        // already do.
         if (self.metrics_registry) |mr| {
-            _ = mr.registerStream(req.namespace, req.key, 0) catch {};
+            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
+                sm.recordAppend(stream_mod.batchRecordCount(payload_value), payload_value.len);
+            } else |_| {}
         }
 
         return .{ .stream_append_ok = .{
@@ -489,7 +495,8 @@ pub const StreamHandler = struct {
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                const pc = self.stream.getPartitionCount(req.key);
+                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const pc = self.stream.getPartitionCount(metaKey(&qbuf, req));
                 partition_filter = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -504,6 +511,16 @@ pub const StreamHandler = struct {
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
+
+        if (self.metrics_registry) |mr| {
+            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
+                // `count` is append entries; sum their batch contents so the
+                // counter matches what the caller actually receives.
+                var records: u64 = 0;
+                for (buf[0..count]) |rec| records += rec.record_count;
+                if (records == 0) sm.recordEmptyRead() else sm.recordRead(records, data.len);
+            } else |_| {}
+        }
 
         const last_id = if (count > 0) buf[count - 1].id else StreamID.MIN;
         return .{ .stream_messages = .{
@@ -639,13 +656,17 @@ pub const StreamHandler = struct {
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
-        const pc = self.stream.getPartitionCount(req.key);
+        var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const meta_key = metaKey(&meta_buf, req);
+        const pc = self.stream.getPartitionCount(meta_key);
 
         const first_id = self.stream.streamFirstId(name_hash);
         const last_id = self.stream.streamLastId(name_hash);
-        const count = self.stream.streamRecordCount(name_hash);
+        // Logical records (batch contents), not append entries.
+        const count = self.stream.streamLogicalCount(name_hash);
+        const bytes = self.stream.streamByteSize(name_hash);
 
-        const meta = self.stream.stream_metadata.get(req.key);
+        const meta = self.stream.stream_metadata.get(meta_key);
 
         return .{ .stream_info = .{
             .first_timestamp_ms = if (count > 0) first_id.timestamp_ms else 0,
@@ -653,7 +674,7 @@ pub const StreamHandler = struct {
             .last_timestamp_ms = if (count > 0) last_id.timestamp_ms else 0,
             .last_seq = if (count > 0) last_id.sequence else 0,
             .count = count,
-            .bytes = 0,
+            .bytes = bytes,
             .partition_count = pc,
             .retention_age_s = if (meta) |m| m.retention_age_s else 0,
             .retention_count = if (meta) |m| m.retention_count else 0,
@@ -688,7 +709,7 @@ pub const StreamHandler = struct {
             }
         }
 
-        const data = serializeNameList(self.allocator, filtered[0..filtered_count], self.stream) catch {
+        const data = serializeNameList(self.allocator, filtered[0..filtered_count], self.stream, req.namespace) catch {
             return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
         };
 
@@ -696,6 +717,17 @@ pub const StreamHandler = struct {
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
+
+    /// Namespace-qualified stream name for metadata lookups.
+    ///
+    /// `stream_metadata` (partition count + retention) must be keyed the same
+    /// way `stream_names` is. Keyed by the bare name, a same-named stream in
+    /// another namespace shares the entry and silently overwrites the first
+    /// one's configuration — including its partition count, which drives
+    /// routing. Qualify at every read and write.
+    fn metaKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, req: Request) []const u8 {
+        return ns_keys.qualifyKey(buf, req.namespace, req.key) catch req.key;
+    }
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
         // Register the stream name for listing (namespace-qualified)
@@ -720,7 +752,7 @@ pub const StreamHandler = struct {
             const ns_hash = router.namespaceHash(req.namespace);
             const name_hash = router.nameHash(ns_hash, req.key);
 
-            self.stream.registerStreamMetadata(req.key, .{
+            self.stream.registerStreamMetadata(ns_stream_name, .{
                 .partition_count = partition_count,
                 .name_hash = name_hash,
                 .retention_age_s = retention.age_s,
@@ -744,7 +776,9 @@ pub const StreamHandler = struct {
         }
 
         // Check stream exists
-        const existing = self.stream.stream_metadata.get(req.key) orelse {
+        var alter_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const alter_key = metaKey(&alter_buf, req);
+        const existing = self.stream.stream_metadata.get(alter_key) orelse {
             return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         };
 
@@ -752,7 +786,7 @@ pub const StreamHandler = struct {
         const retention = parseRetentionOptions(req);
 
         // Merge: keep existing partition_count and name_hash, update retention
-        self.stream.registerStreamMetadata(req.key, .{
+        self.stream.registerStreamMetadata(alter_key, .{
             .partition_count = existing.partition_count,
             .name_hash = existing.name_hash,
             .retention_age_s = if (retention.age_s > 0) retention.age_s else existing.retention_age_s,
@@ -1630,12 +1664,17 @@ pub const StreamHandler = struct {
         // The user partition rides in the value prefix so it survives restart
         // decode it here rather than threading it from the request,
         // keeping the live and replay paths on one source of truth.
-        const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
+        const av = stream_mod.decodeAppendValue(cmd.value);
+        const partition_index = av.partition_index;
+        // A batch carries N logical records; both are read from the durable
+        // value so live apply and replay agree on counts and ID ranges.
+        const record_count = stream_mod.batchRecordCount(av.payload);
+        const byte_len: u32 = @intCast(av.payload.len);
         // Anchor the StreamID to the entry's persisted timestamp (not the wall
         // clock) so replay reproduces the same ID — required for the durable
         // consumer-group cursor to line up after restart (FLO-103).
         const ts_ms = entry.header.timestamp_ns / 1_000_000;
-        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms);
+        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms, record_count, byte_len);
     }
 
     /// Apply a stream append directly to the local partition + projection,
@@ -1698,12 +1737,24 @@ pub const StreamHandler = struct {
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
-                const partition_index = stream_mod.decodeAppendValue(cmd.value).partition_index;
+                const av = stream_mod.decodeAppendValue(cmd.value);
+                const partition_index = av.partition_index;
+                const record_count = stream_mod.batchRecordCount(av.payload);
+                const byte_len: u32 = @intCast(av.payload.len);
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply (FLO-103).
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms) catch {};
-                self.stream.registerStream(cmd.key) catch {};
+                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch {};
+                // Register the NAMESPACE-QUALIFIED name, exactly as the live
+                // append path does. A bare key is invisible to `stream list`,
+                // which filters on the namespace prefix, while `stream info`
+                // still resolves it by hash — so the two disagree. Only the
+                // default namespace, whose qualified form is the bare name,
+                // is unaffected.
+                var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const ns = self.stream.resolveNamespace(cmd.namespace_hash);
+                const ns_name = ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key) catch cmd.key;
+                self.stream.registerStream(ns_name) catch {};
             }
         }
 
@@ -1923,7 +1974,9 @@ fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, 
 
 /// Serialize a list of names in the standard walk wire format.
 /// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
-fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection) ![]u8 {
+/// `names` are namespace-STRIPPED for the wire, but metadata is keyed by the
+/// qualified name, so `ns` is needed to look each one back up.
+fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     // Stream list wire format (matches CLI expectations):
     // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16]
     var total: usize = 4; // count
@@ -1944,8 +1997,9 @@ fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *c
         pos += 4;
         @memcpy(buf[pos..][0..name.len], name);
         pos += name.len;
-        // partition_count from stream metadata
-        const pc = stream.getPartitionCount(name);
+        // partition_count from stream metadata, keyed by the qualified name
+        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const pc = stream.getPartitionCount(ns_keys.qualifyKey(&qbuf, ns, name) catch name);
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }

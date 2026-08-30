@@ -227,7 +227,10 @@ pub const RaftNetwork = struct {
 
         // Read join response
         var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
-        const n = try readExact(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE]);
+        const n = readExact(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE]) catch |err| {
+            log.debug("raft: join response read from {s}:{d} failed: {s}", .{ host, port, @errorName(err) });
+            return err;
+        };
         if (n < HEADER_SIZE) return error.ShortRead;
 
         const resp_hdr = RaftHeader.fromBytes(resp_buf[0..HEADER_SIZE]);
@@ -280,7 +283,8 @@ pub const RaftNetwork = struct {
 
             // Read join request with timeout
             var req_buf: [HEADER_SIZE + JOIN_REQ_SIZE + 16]u8 = undefined;
-            const n = readWithTimeout(client_fd, &req_buf, 2000) catch {
+            const n = readWithTimeout(client_fd, &req_buf, 2000) catch |err| {
+                log.debug("raft: join request read failed fd={d}: {s}", .{ client_fd, @errorName(err) });
                 sysClose(client_fd);
                 continue;
             };
@@ -304,7 +308,8 @@ pub const RaftNetwork = struct {
 
             var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
             _ = frameCustomMessage(MSG_JOIN_RESPONSE, 0, self.node_id, &resp_payload, &resp_buf);
-            _ = sysWrite(client_fd, &resp_buf) catch {
+            _ = sysWrite(client_fd, &resp_buf) catch |err| {
+                log.debug("raft: join response write failed fd={d}: {s}", .{ client_fd, @errorName(err) });
                 sysClose(client_fd);
                 continue;
             };
@@ -638,13 +643,7 @@ fn frameCustomMessage(msg_type: u8, group_id: u32, source_node: u32, payload: []
 }
 
 fn setNonBlocking(fd: posix.socket_t) !void {
-    // F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x0004 on macOS
-    const F_GETFL: i32 = 3;
-    const F_SETFL: i32 = 4;
-    const O_NONBLOCK: c_int = 0x0004;
-    const current = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
-    if (current < 0) return error.FcntlFailed;
-    if (std.c.fcntl(fd, F_SETFL, current | O_NONBLOCK) < 0) return error.FcntlFailed;
+    return @import("stdx").net.sysFcntlSetNonblocking(fd);
 }
 
 fn readWithTimeout(fd: posix.socket_t, buf: []u8, timeout_ms: i32) !usize {

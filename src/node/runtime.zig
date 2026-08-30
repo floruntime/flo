@@ -122,11 +122,11 @@ pub const RuntimeConfig = struct {
     // =========================================================================
     // Use these instead of accessing port fields directly.
     //
-    // `listen_port = 0` means "bind an ephemeral port", so it is not a base you
-    // can add an offset to: listen_port + 1 is port 1, + 2 is port 2, + 500 is
+    // `listen_port = 0` means "bind an ephemeral port", so it is not a base an
+    // offset can be added to: listen_port + 1 is port 1, + 2 is port 2, + 500 is
     // port 500 — all privileged, and all refused on Linux without
     // CAP_NET_BIND_SERVICE. An unresolved base therefore derives an unresolved
-    // (ephemeral) port rather than a low one (issue #52).
+    // (ephemeral) port rather than a low one.
 
     /// Get effective metrics port (derives from listen_port + 1 if set to 0)
     pub fn effectiveMetricsPort(self: RuntimeConfig) u16 {
@@ -461,8 +461,6 @@ pub const Runtime = struct {
         }
         self.shards = shards;
 
-        // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
-        // Each walk opcode gets a slice of per-shard projection pointers.
         try self.wireWalkContexts(shards);
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
@@ -517,7 +515,7 @@ pub const Runtime = struct {
         }
 
         // This node's cluster identity exists whether or not the Raft listener
-        // runs — `flo cluster status` reports it single-node too (#42 item 6).
+        // runs — `flo cluster status` reports it single-node too.
         const cluster_node_id = if (self.config.cluster_node_id > 0)
             self.config.cluster_node_id
         else
@@ -525,18 +523,15 @@ pub const Runtime = struct {
         for (0..self.shard_count) |i| shards[i].cluster_node_id = cluster_node_id;
 
         // 3.5 Start the peer-facing Raft listener only when this node can
-        // actually have peers. The old condition compared effectiveRaftPort()
-        // against listen_port, but that helper *derives* listen_port + 500 when
-        // no port is configured — so it was true for every single-node server,
-        // which bound 9500 while the banner reported "Raft port: 0" (#42 item 5).
+        // actually have peers. Note this cannot be decided by comparing
+        // effectiveRaftPort() against listen_port: that helper *derives*
+        // listen_port + 500, so such a check is true even for a lone node.
         if (self.config.clusterListenerWanted()) {
             const raft_port = self.config.effectiveRaftPort();
             const node_id = cluster_node_id;
 
             const rn = try self.allocator.create(RaftNetwork);
-            // RaftNetwork.init binds a socket and can fail; without this the
-            // allocation leaks on that path. Surfaced by CI on Linux, where the
-            // bind really does fail for a `listen_port = 0` config.
+            // RaftNetwork.init binds a socket and can fail.
             errdefer self.allocator.destroy(rn);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
             rn.setShardInbox(&shards[0].inbox);
@@ -987,18 +982,17 @@ test "Runtime: boot 2 shards and shutdown" {
     try std.testing.expect(!runtime.started);
 }
 
-test "RuntimeConfig: single-node does not want a Raft listener (#42 item 5)" {
-    // The old gate was `effectiveRaftPort() != listen_port`, but that helper
-    // *derives* listen_port + 500 when no port is configured — so it was true
-    // for every plain single-node server and Raft always bound its port.
+test "RuntimeConfig: single-node does not want a Raft listener" {
     const plain = RuntimeConfig{ .listen_port = 9000 };
     try std.testing.expect(!plain.clusterListenerWanted());
+
+    // A derived Raft port always differs from listen_port, so it must not be
+    // used to infer whether this node is clustered.
     try std.testing.expectEqual(@as(u16, 9500), plain.effectiveRaftPort());
-    // The old condition, for the record:
     try std.testing.expect(plain.effectiveRaftPort() != plain.listen_port);
 }
 
-test "RuntimeConfig: the listener comes up when peers are possible (#42 item 5)" {
+test "RuntimeConfig: the listener comes up when peers are possible" {
     const seeded = RuntimeConfig{ .listen_port = 9000, .cluster_seeds = &.{"10.0.0.1:9500"} };
     try std.testing.expect(seeded.clusterListenerWanted());
 
@@ -1008,28 +1002,24 @@ test "RuntimeConfig: the listener comes up when peers are possible (#42 item 5)"
     const replicated = RuntimeConfig{ .listen_port = 9000, .cluster_replication_factor = 3 };
     try std.testing.expect(replicated.clusterListenerWanted());
 
-    // `[cluster] enabled = true` used to be parsed and discarded entirely.
     const enabled = RuntimeConfig{ .listen_port = 9000, .cluster_enabled = true };
     try std.testing.expect(enabled.clusterListenerWanted());
 }
 
-test "RuntimeConfig: an ephemeral listen_port must not derive a privileged Raft port (#42 item 5)" {
-    // `listen_port = 0` means "pick an ephemeral port". effectiveRaftPort() used
-    // to add 500 unconditionally and yield port 500 — privileged — and the old
-    // always-true gate then tried to bind it from a plain two-shard test
-    // runtime. macOS permits bind(0.0.0.0:500), Linux returns EACCES, so this
-    // failed only in CI. Both halves are now closed: the port derives ephemeral
-    // (#52), and nothing about this config implies peers, so no listener starts.
+test "RuntimeConfig: an ephemeral listen_port must not derive a privileged Raft port" {
+    // `listen_port = 0` means "pick an ephemeral port", so offsetting it would
+    // yield privileged ports — 500 here, which Linux refuses. It must derive
+    // ephemeral instead, and nothing about this config implies peers anyway.
     const ephemeral = RuntimeConfig{ .listen_port = 0 };
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveRaftPort());
     try std.testing.expect(!ephemeral.clusterListenerWanted());
 }
 
-test "RuntimeConfig: an ephemeral listen_port derives ephemeral ports, not privileged ones (#52)" {
+test "RuntimeConfig: an ephemeral listen_port derives ephemeral ports, not privileged ones" {
     // listen_port = 0 asks the OS for any port, so there is no base to offset
-    // from. Deriving anyway produced ports 1, 2 and 500 — all privileged, all
-    // refused on Linux. macOS happens to permit bind(0.0.0.0:<low>), so this
-    // only ever failed in CI.
+    // from — offsetting anyway yields ports 1, 2 and 500, all privileged and
+    // all refused on Linux. macOS permits bind(0.0.0.0:<low>), so a test that
+    // only runs there will not catch a regression here.
     const ephemeral = RuntimeConfig{ .listen_port = 0 };
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveMetricsPort());
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveDashboardPort());

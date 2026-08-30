@@ -58,7 +58,8 @@ const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
-const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
+const handler_mod = @import("../namespace/handler.zig");
+const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
@@ -92,6 +93,7 @@ const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 const NodeId = @import("../raft/node.zig").NodeId;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
+const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
@@ -192,6 +194,9 @@ pub const Shard = struct {
 
     /// Raft network reference (set by runtime for shard 0, null otherwise).
     raft_network: ?*RaftNetwork,
+
+    /// Per-shard counters, mirroring the global server ones for attribution.
+    shard_metrics: ?*ShardMetrics,
 
     /// This node's cluster-wide node ID, set by the runtime at start. Distinct
     /// from `raft_node.id`, which identifies the per-shard Raft group.
@@ -319,6 +324,8 @@ pub const Shard = struct {
         // queue_enqueue entries that reference them, so the registry is populated in time.)
         queue_handler.queue.ns_resolver = resolveQueueNamespace;
         queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
+        stream_handler.stream.ns_resolver = resolveQueueNamespace;
+        stream_handler.stream.ns_resolver_ctx = @ptrCast(namespace_handler);
 
         // Create Actions handler
         const actions_handler = try allocator.create(ActionsHandler);
@@ -517,6 +524,7 @@ pub const Shard = struct {
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
+            .shard_metrics = null,
             .cluster_node_id = 0,
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
@@ -551,8 +559,8 @@ pub const Shard = struct {
         self.coordinator = coord;
     }
 
-    /// Namespace resolver wired into the queue projection: hash → name via the
-    /// shard's namespace registry. `ctx` is the (stable, heap-allocated)
+    /// Namespace resolver wired into the queue and stream projections: hash →
+    /// name via the shard's namespace registry. `ctx` is the (stable, heap-allocated)
     /// `*NamespaceHandler`, so this is safe to call during replay — before the
     /// shard's back-pointers are wired.
     fn resolveQueueNamespace(ctx: *anyopaque, ns_hash: u32) ?[]const u8 {
@@ -599,6 +607,11 @@ pub const Shard = struct {
     /// Called by runtime after the registry is created.
     pub fn setMetricsRegistry(self: *Shard, registry: *MetricsRegistry) void {
         self.metrics_registry = registry;
+        // Resolved once: the shard table is sized by `initShards` before this
+        // runs, and the pointer is stable for the registry's lifetime. Without
+        // it every `flo_shard_*` series exports 0 while the global `flo_*`
+        // equivalents move, which reads as "this shard is idle".
+        self.shard_metrics = registry.shardMetrics(self.id);
         self.stream_handler.metrics_registry = registry;
         self.queue_handler.metrics_registry = registry;
         self.kv_handler.metrics_registry = registry;
@@ -743,6 +756,7 @@ pub const Shard = struct {
 
         try self.connections.put(self.allocator, fd, conn);
         if (self.metrics_registry) |m| m.server.connectionOpened();
+        if (self.shard_metrics) |sm| sm.connectionOpened();
         return conn;
     }
 
@@ -754,6 +768,7 @@ pub const Shard = struct {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             if (self.metrics_registry) |m| m.server.connectionClosed();
+            if (self.shard_metrics) |sm| sm.connectionClosed();
         }
     }
 
@@ -784,6 +799,7 @@ pub const Shard = struct {
         // Overview's commands_total + rps). Other server counters (connections,
         // bytes) are not yet wired — see the metrics gap log.
         if (self.metrics_registry) |m| m.server.recordCommand();
+        if (self.shard_metrics) |sm| sm.recordCommand();
 
         const op = req.header.op_code;
 
@@ -1028,7 +1044,7 @@ pub const Shard = struct {
             // kv_scan uses scan wire format: [count:u32]([key_len:u16][key][value_len:u32(=0)])*[has_more:u8][cursor_len:u16][cursor]
             .kv_scan => serializeWalkKeysAsScan(self.allocator, deduped[0..dedup_count], result.next_cursor),
             // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
-            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream),
+            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream, req.namespace),
             // queue_list uses rich binary format with per-queue stats
             .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // processing_list and workflow_list_definitions use binary wire format with rich fields
@@ -1405,7 +1421,8 @@ pub const Shard = struct {
 
             // Count-based retention: resolve Nth record ID, persist trim through Raft
             if (meta.retention_count > 0) {
-                const count = proj.streamRecordCount(name_hash);
+                // Retention is expressed in records, not append entries.
+                const count = proj.streamLogicalCount(name_hash);
                 if (count > meta.retention_count) {
                     const excess = count - meta.retention_count;
                     const trim_id = proj.resolveNthRecordId(name_hash, excess);
@@ -1508,6 +1525,7 @@ pub const Shard = struct {
         }
 
         if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+        if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
 
         // Accumulate data in the read buffer
         _ = conn.read_buf.write(tmp_buf[0..n]);
@@ -1762,6 +1780,7 @@ pub const Shard = struct {
                 return;
             }
             if (self.metrics_registry) |m| m.server.recordBytesSent(@intCast(written));
+            if (self.shard_metrics) |sm| sm.recordBytesSent(@intCast(written));
             conn.consumeWritten(written);
         }
 
@@ -1774,10 +1793,9 @@ pub const Shard = struct {
     /// Send an error response on a connection.
     /// `cluster_status` — report this node's Raft identity and role.
     ///
-    /// Previously unregistered, so it fell through to the dispatcher's generic
-    /// "not implemented" reply even though `flo --help` advertises the command
-    /// (#42 item 6). A single-node server answers with itself as leader of a
-    /// one-member cluster, which is the truthful answer rather than an error.
+    /// A single-node server answers with itself as leader of a one-member
+    /// cluster; that is the truthful answer, and the command is advertised in
+    /// `flo --help` regardless of whether a cluster is configured.
     fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -2252,7 +2270,9 @@ fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, n
 ///
 /// The stream CLI expects u32 name lengths and a u32 partition_count per entry
 /// (distinct from the generic name-list format used by ts_list).
-fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection) ![]u8 {
+/// `names` reach here namespace-STRIPPED, but stream metadata is keyed by the
+/// qualified name, so `ns` is needed to look each one back up.
+fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
     const cursor_bytes = next_cursor orelse &[_]u8{};
     const has_more: u8 = if (next_cursor != null) 1 else 0;
 
@@ -2273,8 +2293,9 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         pos += 4;
         @memcpy(buf[pos..][0..n.len], n);
         pos += n.len;
-        // partition_count from stream metadata
-        const pc = stream.getPartitionCount(n);
+        // partition_count from stream metadata, keyed by the qualified name
+        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+        const pc = stream.getPartitionCount(handler_mod.qualifyKey(&qbuf, ns, n) catch n);
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }

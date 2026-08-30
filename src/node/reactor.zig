@@ -157,7 +157,7 @@ pub const Reactor = struct {
             // A bare `error.PermissionDenied` here is nearly undiagnosable: it
             // names neither io_uring nor seccomp, and the usual cause is a
             // container runtime's default seccomp profile blocking the
-            // io_uring syscalls (#42 item 7).
+            // io_uring syscalls.
             const ring = linux.IoUring.init(256, 0) catch |err| {
                 switch (err) {
                     error.PermissionDenied, error.SystemOutdated => log.err(

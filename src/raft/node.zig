@@ -140,6 +140,9 @@ pub const RaftNode = struct {
     peer_count: u8,
     votes_received: u8,
     votes_needed: u8,
+    /// Which peers (indexed like peer_ids) granted a vote in the current
+    /// election. Re-delivered VoteResponses must not double-count toward quorum.
+    vote_granted_by: [MAX_PEERS]bool,
 
     // ── Log ────────────────────────────────────────────────────────────
     log: RaftLog,
@@ -181,6 +184,7 @@ pub const RaftNode = struct {
             .peer_count = 0,
             .votes_received = 0,
             .votes_needed = 0,
+            .vote_granted_by = std.mem.zeroes([MAX_PEERS]bool),
             .log = raft_log_inst,
             .config = config,
             .allocator = allocator,
@@ -289,6 +293,7 @@ pub const RaftNode = struct {
         self.leader_id = NO_VOTE;
         self.votes_received = 1; // vote for self
         self.votes_needed = self.quorum();
+        self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
         self.elections_started += 1;
         self.terms_seen += 1;
 
@@ -341,6 +346,11 @@ pub const RaftNode = struct {
         if (resp.term != self.current_term) return false;
 
         if (resp.vote_granted) {
+            // Count each peer at most once; grants from unknown nodes (or a
+            // duplicated response for self) never count toward quorum.
+            const idx = self.peerIndex(resp.from) orelse return false;
+            if (self.vote_granted_by[idx]) return false;
+            self.vote_granted_by[idx] = true;
             self.votes_received += 1;
             if (self.votes_received >= self.votes_needed) {
                 self.becomeLeader();
@@ -410,10 +420,13 @@ pub const RaftNode = struct {
             self.commit_index = @min(req.leader_commit, self.log.lastIndex());
         }
 
+        // Only the prefix this RPC verified counts as matched. lastIndex()
+        // may include a stale suffix from an old term that the leader would
+        // otherwise wrongly count toward its commit quorum.
         return .{
             .term = self.current_term,
             .success = true,
-            .match_index = self.log.lastIndex(),
+            .match_index = req.prev_log_index + req.entries.len,
             .from = self.id,
         };
     }
@@ -498,6 +511,13 @@ pub const RaftNode = struct {
             self.peers[i].match_index = 0;
             self.peers[i].inflight = false;
         }
+    }
+
+    fn peerIndex(self: *const RaftNode, peer_id: NodeId) ?usize {
+        for (0..self.peer_count) |i| {
+            if (self.peer_ids[i] == peer_id) return i;
+        }
+        return null;
     }
 
     fn isLogUpToDate(self: *const RaftNode, last_index: u64, last_term: u64) bool {
@@ -876,6 +896,211 @@ test "raft node: leader commit advancement with 3-node cluster" {
 
     // Now we have majority (self + peer 2 = 2 of 3)
     try testing.expectEqual(@as(u64, 1), node.commit_index);
+}
+
+fn testEntry(term: u64, index: u64, payload: []const u8) Entry {
+    var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, term, index, 0, payload);
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
+test "raft node: heartbeat over stale suffix does not commit unverified entries" {
+    const allocator = testing.allocator;
+
+    // Follower: entries 1-7 from term 1, plus a stale suffix 8-10 from a
+    // deposed term-2 leader that the current leader never replicated.
+    var follower = try RaftNode.init(allocator, 2, 1000, 16384, .{});
+    defer follower.deinit();
+    follower.current_term = 2;
+    for (1..8) |i| {
+        var e = testEntry(1, i, "old");
+        _ = try follower.log.append(&e);
+    }
+    for (8..11) |i| {
+        var e = testEntry(2, i, "stale");
+        _ = try follower.log.append(&e);
+    }
+
+    // Leader at term 3: same 1-7, but its own fresh 8-10.
+    var leader = try RaftNode.init(allocator, 1, 1000, 16384, .{});
+    defer leader.deinit();
+    leader.current_term = 3;
+    leader.role = .leader;
+    leader.leader_id = 1;
+    leader.commit_index = 7;
+    for (1..8) |i| {
+        var e = testEntry(1, i, "old");
+        _ = try leader.log.append(&e);
+    }
+    for (8..11) |i| {
+        var e = testEntry(3, i, "fresh");
+        _ = try leader.log.append(&e);
+    }
+    leader.addPeer(2);
+    leader.addPeer(3);
+
+    // Heartbeat at prev=7 succeeds but verifies nothing past 7.
+    const resp = try follower.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = 1,
+        .prev_log_index = 7,
+        .prev_log_term = 1,
+        .entries = &[_]Entry{},
+        .leader_commit = 7,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 7), resp.match_index);
+
+    // The leader must not count the follower's stale 8-10 as replicas of
+    // its own 8-10.
+    leader.handleAppendResponse(resp);
+    try testing.expectEqual(@as(u64, 7), leader.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 8), leader.peers[0].next_index);
+    try testing.expectEqual(@as(u64, 7), leader.commit_index);
+}
+
+test "raft node: append of N entries at prev P reports match P+N" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 2, 1000, 16384, .{});
+    defer node.deinit();
+    for (1..3) |i| {
+        var e = testEntry(1, i, "base");
+        _ = try node.log.append(&e);
+    }
+
+    const batch = [_]Entry{
+        testEntry(1, 3, "a"),
+        testEntry(1, 4, "b"),
+        testEntry(1, 5, "c"),
+    };
+    const resp = try node.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = 1,
+        .prev_log_index = 2,
+        .prev_log_term = 1,
+        .entries = &batch,
+        .leader_commit = 0,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 5), resp.match_index);
+
+    // Duplicate delivery: entries already present with the same term still
+    // count as verified.
+    const resp2 = try node.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = 1,
+        .prev_log_index = 2,
+        .prev_log_term = 1,
+        .entries = &batch,
+        .leader_commit = 0,
+    });
+    try testing.expect(resp2.success);
+    try testing.expectEqual(@as(u64, 5), resp2.match_index);
+    try testing.expectEqual(@as(u64, 5), node.log.lastIndex());
+}
+
+test "raft node: conflict truncation reports match through appended batch" {
+    const allocator = testing.allocator;
+
+    // Follower: 1-2 from term 1, stale 3-5 from term 2.
+    var node = try RaftNode.init(allocator, 2, 1000, 16384, .{});
+    defer node.deinit();
+    for (1..3) |i| {
+        var e = testEntry(1, i, "base");
+        _ = try node.log.append(&e);
+    }
+    for (3..6) |i| {
+        var e = testEntry(2, i, "stale");
+        _ = try node.log.append(&e);
+    }
+
+    // Term-3 leader overwrites 3-4; the stale 5 is truncated away.
+    const batch = [_]Entry{
+        testEntry(3, 3, "new3"),
+        testEntry(3, 4, "new4"),
+    };
+    const resp = try node.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = 1,
+        .prev_log_index = 2,
+        .prev_log_term = 1,
+        .entries = &batch,
+        .leader_commit = 0,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 4), resp.match_index);
+    try testing.expectEqual(@as(u64, 4), node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 3), node.log.entryTerm(4).?);
+}
+
+test "raft node: duplicate vote from same peer counts once" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+    try testing.expectEqual(@as(u8, 3), node.quorum());
+
+    _ = node.startElection();
+
+    // Peer 2 grants twice (network duplication) — must not reach quorum
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    const won_dup = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expect(!won_dup);
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+
+    // A second distinct peer completes the quorum
+    const won = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 3 });
+    try testing.expect(won);
+    try testing.expectEqual(Role.leader, node.role);
+}
+
+test "raft node: vote from unknown node does not count" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+
+    _ = node.startElection();
+
+    const won = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 99 });
+    try testing.expect(!won);
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(u8, 1), node.votes_received); // self only
+}
+
+test "raft node: startElection resets vote tracking" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+
+    node.addPeer(2);
+    node.addPeer(3);
+    node.addPeer(4);
+    node.addPeer(5);
+
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+
+    // New election: nothing carries over, and peer 2 may grant again
+    _ = node.startElection();
+    try testing.expectEqual(@as(u8, 1), node.votes_received);
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(@as(u8, 2), node.votes_received);
+    try testing.expectEqual(Role.candidate, node.role);
 }
 
 test "raft node: cluster size and quorum" {

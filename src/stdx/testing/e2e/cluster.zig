@@ -67,6 +67,9 @@ fn startServerWithRetry(server: *ServerProcess) !void {
     const max_retries: u8 = 3;
     var attempt: u8 = 0;
     while (true) {
+        // Only the last attempt prints the server's log tail; earlier ones are
+        // usually the same failure and would triple the output.
+        server.dump_log_on_failure = (attempt + 1 >= max_retries);
         server.start() catch |err| {
             attempt += 1;
             if (attempt >= max_retries) return err;
@@ -85,6 +88,12 @@ pub const MAX_NODES = 5;
 pub const ClusterConfig = struct {
     /// Number of nodes (2-5)
     node_count: u8 = 3,
+    /// Cluster nodes log at debug by default. Most of startup — everything
+    /// between topology verification and the acceptor going live — logs only
+    /// at debug, so at info a node that stalls in there leaves no trace of how
+    /// far it got. The log is only printed as a bounded tail on failure, so
+    /// this costs nothing when tests pass.
+    log_level: []const u8 = "debug",
     /// Durability mode for all nodes
     durability: ServerProcess.Durability = .sync,
     /// Time to wait for cluster formation (nanoseconds)
@@ -149,9 +158,13 @@ pub const ClusterContext = struct {
             .durability = config.durability,
             .shards = config.shards,
             .tiered_log = config.tiered_log,
+            .log_level = config.log_level,
             .cluster_enabled = true, // Seed node needs Raft listener
         });
-        errdefer if (self.servers[0]) |s| s.deinit();
+        // Covers every node created so far. A per-iteration `errdefer` in the
+        // join loop below would only fire for its own iteration, leaking the
+        // nodes already started when a later one fails.
+        errdefer self.deinitServers();
         startServerWithRetry(self.servers[0].?) catch |err| {
             std.debug.print("[cluster] Seed node failed to start: {}\n", .{err});
             return err;
@@ -168,11 +181,11 @@ pub const ClusterContext = struct {
                 .durability = config.durability,
                 .shards = config.shards,
                 .tiered_log = config.tiered_log,
+                .log_level = config.log_level,
                 .join_addresses = seed_endpoint,
             });
-            errdefer if (self.servers[i]) |s| s.deinit();
             startServerWithRetry(self.servers[i].?) catch |err| {
-                std.debug.print("[cluster] Node {d} failed to start: {}\n", .{ i, err });
+                std.debug.print("[cluster] Node {d} of {d} failed to start: {}\n", .{ i, config.node_count, err });
                 return err;
             };
         }
@@ -194,6 +207,18 @@ pub const ClusterContext = struct {
     /// Initialize with default 3-node configuration
     pub fn initDefault(allocator: Allocator) !Self {
         return init(allocator, .{});
+    }
+
+    /// Tear down any servers created so far. Safe to call with unset slots,
+    /// so it doubles as the error-path cleanup for a partially built cluster.
+    fn deinitServers(self: *Self) void {
+        for (0..self.node_count) |i| {
+            if (self.servers[i]) |server| {
+                server.stop();
+                server.deinit();
+                self.servers[i] = null;
+            }
+        }
     }
 
     /// Clean up all resources
