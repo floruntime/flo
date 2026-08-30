@@ -105,6 +105,15 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    // stdx is its own module, and module dependencies contribute no tests to
+    // a test root — everything in stdx (PRNG, log, helpers) was invisible to
+    // the src test runner and had never run. Compile stdx as its own root.
+    const stdx_tests = b.addTest(.{
+        .root_module = stdx_module,
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    const run_stdx_tests = b.addRunArtifact(stdx_tests);
+
     // ── E2E Tests ──
 
     const e2e_tests = b.addTest(.{
@@ -144,9 +153,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_stdx_tests.step);
 
     const unit_test_step = b.step("test-unit", "Run unit tests only");
     unit_test_step.dependOn(&run_unit_tests.step);
+    unit_test_step.dependOn(&run_stdx_tests.step);
 
     const e2e_test_step = b.step("test-e2e", "Run end-to-end tests");
     e2e_test_step.dependOn(&run_e2e_tests.step);

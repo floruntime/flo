@@ -805,7 +805,7 @@ pub const TestLogger = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TestLogger {
-        return .{ .buffer = .{}, .allocator = allocator };
+        return .{ .buffer = .empty, .allocator = allocator };
     }
 
     pub fn deinit(self: *TestLogger) void {
@@ -822,8 +822,10 @@ pub const TestLogger = struct {
 
     /// Log to this buffer instead of stdout.
     pub fn logTo(self: *TestLogger, level: Level, comptime msg: []const u8, fields: anytype) void {
-        const w = self.buffer.writer(self.allocator);
-        formatTextEntry(w, level, msg, @import("time.zig").nanoTimestamp(), null, fields);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        formatTextEntry(&aw.writer, level, msg, @import("time.zig").nanoTimestamp(), null, fields);
+        self.buffer.appendSlice(self.allocator, aw.written()) catch {};
     }
 };
 
@@ -901,7 +903,7 @@ test "test logger buffer" {
         Field.str("key", "value"),
     });
 
-    const output = test_log.buffered();
+    const output = test_log.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "test message") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "key=") != null);
 }
