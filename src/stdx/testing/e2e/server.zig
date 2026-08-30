@@ -37,6 +37,10 @@ pub const ServerProcess = struct {
     data_dir: []const u8,
     config_file: []const u8,
     log_file_path: []const u8,
+    /// Print the captured server log if startup fails. Callers that retry set
+    /// this false for all but the final attempt, so one failure is not
+    /// reported three times.
+    dump_log_on_failure: bool = true,
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
     started: bool,
@@ -116,6 +120,10 @@ pub const ServerProcess = struct {
         metrics_enabled: bool = false,
         /// Number of shards (1 = faster startup)
         shards: u8 = 1,
+        /// Server log level written into flo.toml. Raise it to see how far a
+        /// server got when it never became ready — the captured log is the
+        /// only view the harness has into a server's startup.
+        log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
         durability: Durability = .async_flush,
         /// Cold storage configuration (for tiered storage tests)
@@ -186,6 +194,13 @@ pub const ServerProcess = struct {
         self.raft_port = 0;
         self.started = false;
         self.api_key = null;
+        // `allocator.create` leaves the struct uninitialised, so the field
+        // defaults declared above do NOT apply — every field must be assigned
+        // here. `log_thread` in particular is otherwise only set inside
+        // `start()`, and a server torn down without starting would then join a
+        // garbage thread handle.
+        self.log_thread = null;
+        self.dump_log_on_failure = true;
 
         return self;
     }
@@ -277,6 +292,8 @@ pub const ServerProcess = struct {
             }
         }
 
+        try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});
+
         const config_file = try self.tmp_dir.dir.createFile(stdx.io.instance(), "flo.toml", .{});
         defer stdx.fs.closeFile(config_file);
         try stdx.fs.writeAll(config_file, fbs.buffered());
@@ -367,7 +384,10 @@ pub const ServerProcess = struct {
 
         // Wait for server to be ready
         self.waitForReady(timeout_ms) catch |err| {
-            // If readiness check fails, clean up the process
+            // The server's own output goes to a log file, so without this a
+            // startup failure surfaces only as this harness's timeout and the
+            // real bind error or panic never reaches the test output.
+            if (self.dump_log_on_failure) self.dumpLogTail();
             self.forceKill();
             return err;
         };
@@ -443,6 +463,43 @@ pub const ServerProcess = struct {
     // =========================================================================
     // Server Log Access
     // =========================================================================
+
+    /// Print the tail of this server's captured log to stderr.
+    ///
+    /// Best-effort and never fails: it runs on a path that is already
+    /// returning an error, and a diagnostic that can itself throw is worse
+    /// than no diagnostic. Bounded so a chatty server cannot bury the failure.
+    pub fn dumpLogTail(self: *Self) void {
+        const TAIL_BYTES: usize = 4096;
+
+        // A crash and a hang look identical in the log — output simply stops —
+        // and they have different causes, so report which one this is.
+        if (self.process) |*proc| {
+            var status: c_int = 0;
+            const rc = std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
+            if (rc == proc.id) {
+                std.debug.print("[server] port {d}: process already exited (raw status {d})\n", .{ self.port, status });
+            } else if (rc == 0) {
+                std.debug.print("[server] port {d}: process still running — hung, not crashed\n", .{self.port});
+            }
+        }
+        const logs = self.readLogs() catch |err| {
+            std.debug.print("[server] could not read {s}: {s}\n", .{ self.log_file_path, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(logs);
+
+        if (logs.len == 0) {
+            std.debug.print("[server] port {d}: exited without writing any output\n", .{self.port});
+            return;
+        }
+
+        const tail = if (logs.len > TAIL_BYTES) logs[logs.len - TAIL_BYTES ..] else logs;
+        std.debug.print(
+            "[server] port {d} did not become ready — last {d} bytes of {s}:\n{s}\n[server] end of log\n",
+            .{ self.port, tail.len, self.log_file_path, tail },
+        );
+    }
 
     /// Read server logs (returns owned slice - caller must free)
     pub fn readLogs(self: *Self) ![]const u8 {
@@ -593,10 +650,10 @@ pub const ServerProcess = struct {
             else
                 true;
 
-            // NOTE: Metrics and raft port checks are disabled because
-            // the rewrite has not yet wired those listeners into the runtime.
-            //   metrics:   src/metrics/ needs startup in runtime.zig
-            //   raft:      src/raft/transport.zig needs TCP listener in runtime.zig
+            // Readiness is deliberately just the client and dashboard ports.
+            // The metrics exporter binds only when enabled, and the Raft
+            // listener only when the node can have peers, so neither is a
+            // reliable readiness signal.
 
             if (main_ready and dashboard_ready) {
                 return;

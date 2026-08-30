@@ -461,8 +461,6 @@ pub const Runtime = struct {
         }
         self.shards = shards;
 
-        // 2.5 Wire cross-shard walk contexts for list/scan opcodes.
-        // Each walk opcode gets a slice of per-shard projection pointers.
         try self.wireWalkContexts(shards);
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
@@ -534,9 +532,7 @@ pub const Runtime = struct {
             const node_id = cluster_node_id;
 
             const rn = try self.allocator.create(RaftNetwork);
-            // RaftNetwork.init binds a socket and can fail; without this the
-            // allocation leaks on that path. Surfaced by CI on Linux, where the
-            // bind really does fail for a `listen_port = 0` config.
+            // RaftNetwork.init binds a socket and can fail.
             errdefer self.allocator.destroy(rn);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
             rn.setShardInbox(&shards[0].inbox);

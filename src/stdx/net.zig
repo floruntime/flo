@@ -336,11 +336,17 @@ pub fn sysRead(fd: posix.socket_t, buf: []u8) SocketError!usize {
     return @intCast(rc);
 }
 
+/// Put a socket into non-blocking mode.
+///
+/// O_NONBLOCK is not portable — 0x0004 on macOS/BSD, 0o4000 on Linux — and a
+/// wrong value here fails silently: fcntl returns success while the socket
+/// stays blocking. `std.posix.O` is target-specific, so bit-casting it is the
+/// only safe way to name the flag. F_GETFL/F_SETFL are 3/4 on both.
 pub fn sysFcntlSetNonblocking(fd: posix.socket_t) SocketError!void {
     const F_GETFL: c_int = 3;
     const F_SETFL: c_int = 4;
-    const O_NONBLOCK: c_int = 0x0004;
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
     const flags = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
     if (flags < 0) return error.FcntlFailed;
-    if (std.c.fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlFailed;
+    if (std.c.fcntl(fd, F_SETFL, flags | nonblock) < 0) return error.FcntlFailed;
 }
