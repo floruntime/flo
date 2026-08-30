@@ -60,6 +60,7 @@ const UAL = @import("../storage/ual/ual.zig").UAL;
 const persistence_mod = @import("../storage/persistence.zig");
 const ReplayRegistry = persistence_mod.ReplayRegistry;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
+const TieredLogMetrics = @import("../metrics/registry.zig").TieredLogMetrics;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // StreamHandler
@@ -76,6 +77,10 @@ pub const StreamHandler = struct {
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
+
+    /// Tier-hit counters for this shard's log, resolved once at wire-up so the
+    /// read path does not do a registry lookup per record.
+    tiered_metrics: ?*TieredLogMetrics = null,
 
     /// Maximum number of messages in a single read response.
     const MAX_READ_BATCH: usize = 1000;
@@ -1589,15 +1594,20 @@ pub const StreamHandler = struct {
         // prefix so callers see the bare batch blob `unpackBatch` expects.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
+                if (self.tiered_metrics) |tm| tm.recordHotHit();
                 return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 0 };
             }
         }
         // Warm fallback — payload copied to partition warm store on apply()
         if (self.partition.readPayloadWarm(ual_index)) |raw| {
             if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
+                if (self.tiered_metrics) |tm| tm.recordWarmHit();
                 return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 1 };
             }
         }
+        // Neither tier had it. Cold is not consulted here, so cold_hits stays 0
+        // for this path by design rather than for want of instrumentation.
+        if (self.tiered_metrics) |tm| tm.recordMiss();
         return .{ .payload = "", .tier = 0 };
     }
 

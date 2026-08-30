@@ -254,6 +254,11 @@ pub const KVHandler = struct {
         const cmd_result = shard.kv_handler.*.handleCommand(req);
         defer shard.kv_handler.*.freeResult(cmd_result);
         log.debug("KV GET: key={s}, hit={}", .{ req.key, cmd_result != .kv_not_found });
+
+        if (shard.kv_handler.metrics_registry) |mr| {
+            if (mr.registerKVNamespace(req.namespace)) |km| km.recordGet() else |_| {}
+        }
+
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -318,9 +323,12 @@ pub const KVHandler = struct {
         // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
 
-        // Register KV namespace in global metrics registry for dashboard/Prometheus
+        // Register KV namespace in global metrics registry for dashboard/Prometheus,
+        // and record the write against the per-namespace metrics it returns.
         if (shard.kv_handler.metrics_registry) |mr| {
-            _ = mr.registerKVNamespace(req.namespace) catch {};
+            if (mr.registerKVNamespace(req.namespace)) |km| {
+                km.recordSet(req.value.len, version == 1);
+            } else |_| {}
         }
 
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
@@ -386,6 +394,14 @@ pub const KVHandler = struct {
         shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
 
         log.debug("KV DELETE: key={s}", .{req.key});
+
+        if (shard.kv_handler.metrics_registry) |mr| {
+            if (mr.registerKVNamespace(req.namespace)) |km| {
+                km.recordDelete();
+                km.decrementKeyCount();
+            } else |_| {}
+        }
+
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
