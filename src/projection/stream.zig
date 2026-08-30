@@ -84,9 +84,8 @@ pub const StreamRecord = struct {
     /// User partition index (for multi-partition streams).
     partition_index: u32,
     /// Number of logical records packed into this entry's batch blob. One
-    /// entry may carry N user records, so this is what `stream info` must
-    /// count — `records.items.len` counts *entries* and under-reports batched
-    /// producers (issue #42 item 3).
+    /// entry may carry N user records, so this — not `records.items.len`,
+    /// which counts entries — is what user-visible record counts must sum.
     record_count: u32 = 1,
     /// Stored payload size of this entry, in bytes (the batch blob, without
     /// the partition prefix). Summed for the reported stream size.
@@ -193,11 +192,10 @@ pub const StreamState = struct {
     /// Append anchored to an explicit timestamp (the originating UAL entry's
     /// timestamp, in ms) so replay reproduces identical StreamIDs (FLO-103).
     pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
-        // Reserve one sequence per logical record. Reads expand a batch into
-        // `id.sequence + 0..n-1`, so reserving a single sequence for an N-record
-        // batch let the *next* append hand out IDs the batch had already used —
-        // duplicate StreamIDs within one millisecond. `nextBatchAt` existed for
-        // exactly this and had no caller until now.
+        // Reserve one sequence per logical record: reads expand a batch into
+        // `id.sequence + 0..n-1`, so reserving a single sequence for an
+        // N-record batch would let the next append in the same millisecond
+        // hand out IDs the batch has already used.
         const n = @max(1, record_count);
         const batch = try self.id_gen.nextBatchAt(ts_ms, n);
         try self.records.append(allocator, .{
@@ -829,9 +827,9 @@ pub const StreamProjection = struct {
 
     /// Optional namespace resolver (hash → name), wired at shard init. A
     /// stream_append entry carries only the namespace hash, so on replay the
-    /// apply path can't recover the namespace string on its own; without it,
-    /// recovered streams get registered under their bare name and vanish from
-    /// `stream list`, which filters on the namespace prefix (issue #42 item 2).
+    /// apply path cannot recover the namespace string on its own. Without it,
+    /// recovered streams register under their bare name and are invisible to
+    /// `stream list`, which filters on the namespace prefix.
     ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) ?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
 
@@ -1112,8 +1110,8 @@ pub const StreamProjection = struct {
     /// separate cg_delete entry.
     ///
     /// The name registry is keyed by the namespace-qualified name on both the
-    /// live and replay paths; the raw form is still removed as well, to clear
-    /// entries left by builds before the replay path was corrected (#42 item 2).
+    /// live and replay paths; the raw form is swept too, so registry entries
+    /// written under a bare name are not left behind.
     /// Metadata is keyed by the raw name. Returns true if the stream existed.
     pub fn deleteStream(self: *StreamProjection, name_hash: u64, raw_name: []const u8, qualified_name: []const u8) bool {
         var existed = false;
@@ -1341,7 +1339,7 @@ pub const StreamProjection = struct {
                     const av = decodeAppendValue(cmd.value);
                     partition_index = av.partition_index;
                     // Recover the batch size so replay rebuilds the same counts
-                    // and reserves the same ID range as the live apply (#42).
+                    // and reserves the same ID range as the live apply.
                     record_count = batchRecordCount(av.payload);
                     byte_len = @intCast(av.payload.len);
                 }
@@ -2390,7 +2388,7 @@ test "stream: multiple streams are independent" {
     try testing.expect(buf[0].id.eql(a2));
 }
 
-test "stream: batch append reserves one sequence per record (#42)" {
+test "stream: batch append reserves one sequence per record" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2401,15 +2399,15 @@ test "stream: batch append reserves one sequence per record (#42)" {
     const first = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
     const next = try s.appendToStreamAt(hash, 11, 0, ts, 1, 9);
 
-    // Reads expand the batch across sequences 0,1,2 — so the following append
-    // must start at 3. Reserving a single sequence per batch handed out
-    // sequence 1 twice, producing duplicate StreamIDs within one millisecond.
+    // Reads expand the batch across sequences 0,1,2, so the following append
+    // must start at 3. Reserving one sequence per batch would hand out
+    // sequence 1 twice — duplicate StreamIDs within a single millisecond.
     try testing.expectEqual(@as(u64, 0), first.sequence);
     try testing.expectEqual(@as(u64, 3), next.sequence);
     try testing.expect(next.greaterThan(.{ .timestamp_ms = ts, .sequence = first.sequence + 2 }));
 }
 
-test "stream: info counts logical records and bytes, not entries (#42)" {
+test "stream: info counts logical records and bytes, not entries" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2429,7 +2427,7 @@ test "stream: info counts logical records and bytes, not entries (#42)" {
     try testing.expectEqual(@as(u64, ts + 1), s.streamLastId(hash).timestamp_ms);
 }
 
-test "stream: trim decrements logical counters (#42)" {
+test "stream: trim decrements logical counters" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2451,7 +2449,7 @@ test "stream: trim decrements logical counters (#42)" {
     try testing.expectEqual(@as(u64, 0), s.streamByteSize(hash));
 }
 
-test "stream: count retention resolves by records, not batches (#42)" {
+test "stream: count retention resolves by records, not batches" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 

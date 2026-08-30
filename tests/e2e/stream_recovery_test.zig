@@ -1,9 +1,9 @@
-//! Stream Recovery E2E Tests (issue #42, items 2 and 3)
+//! Stream Recovery E2E Tests
 //!
-//! A production deployment reported that after a restart `stream list` showed
-//! nothing while `stream info` still resolved the stream, and that `info`'s
-//! counts disagreed with `stream read`. Both are covered here against the
-//! reporter's exact shape: a namespaced stream fed by a batch append.
+//! Recovery must rebuild everything a restart depends on: a namespaced stream
+//! stays visible to `stream list`, and `stream info` counts agree with what
+//! `stream read` returns. Both are exercised against the shape that breaks
+//! them — a namespaced stream fed by a batch append, across a restart.
 //!
 //! These assert on real output rather than exit status — the CLI exits 0 even
 //! on protocol errors, so `assertSucceeded` alone proves nothing.
@@ -12,7 +12,7 @@ const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 
-test "e2e/stream: a namespaced stream is still listed after restart (#42 item 2)" {
+test "e2e/stream: a namespaced stream is still listed after restart" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .durability = .sync },
     });
@@ -27,16 +27,16 @@ test "e2e/stream: a namespaced stream is still listed after restart (#42 item 2)
 
     try ctx.restartServer();
 
-    // Replay used to register the bare key while `list` filters on the
-    // namespace prefix, so the stream vanished from listings — but stayed
-    // resolvable by hash, which is why `info` and `read` still worked.
+    // `list` filters on the namespace prefix, so a stream registered under a
+    // bare key vanishes from listings while staying resolvable by hash — which
+    // is exactly how `info` and `read` can keep working when `list` does not.
     var after = try ctx.cli.run(&.{ "stream", "list", "-n", "myns" });
     defer after.deinit();
     try testing.expect(std.mem.indexOf(u8, after.stdout, "events") != null);
     try testing.expect(std.mem.indexOf(u8, after.stdout, "No streams found") == null);
 }
 
-test "e2e/stream: info counts match read across restart (#42 item 3)" {
+test "e2e/stream: info counts match read across restart" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .durability = .sync },
     });
@@ -71,7 +71,7 @@ test "e2e/stream: info counts match read across restart (#42 item 3)" {
     try testing.expect(std.mem.indexOf(u8, read_after.stdout, ": c") != null);
 }
 
-// NOTE: the same-millisecond StreamID-reuse case that batch appends used to
-// hit is covered by a projection unit test, not here: two CLI round-trips are
-// ~60ms apart, so an e2e test can never land both appends in one millisecond
-// and would pass against the unfixed code.
+// NOTE: the same-millisecond StreamID-reuse case is covered by a projection
+// unit test, not here: two CLI round-trips are ~60ms apart, so an e2e test
+// could never land both appends in one millisecond and would pass whether or
+// not the behaviour is correct.

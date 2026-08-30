@@ -643,8 +643,7 @@ pub const StreamHandler = struct {
 
         const first_id = self.stream.streamFirstId(name_hash);
         const last_id = self.stream.streamLastId(name_hash);
-        // Logical records (batch contents), not append entries — and the real
-        // stored size rather than a hardcoded 0 (#42 item 3).
+        // Logical records (batch contents), not append entries.
         const count = self.stream.streamLogicalCount(name_hash);
         const bytes = self.stream.streamByteSize(name_hash);
 
@@ -1636,7 +1635,7 @@ pub const StreamHandler = struct {
         const av = stream_mod.decodeAppendValue(cmd.value);
         const partition_index = av.partition_index;
         // A batch carries N logical records; both are read from the durable
-        // value so live apply and replay agree on counts and ID ranges (#42).
+        // value so live apply and replay agree on counts and ID ranges.
         const record_count = stream_mod.batchRecordCount(av.payload);
         const byte_len: u32 = @intCast(av.payload.len);
         // Anchor the StreamID to the entry's persisted timestamp (not the wall
@@ -1715,11 +1714,11 @@ pub const StreamHandler = struct {
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
                 _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch {};
                 // Register the NAMESPACE-QUALIFIED name, exactly as the live
-                // append path does. Registering the bare key made recovered
-                // streams invisible to `stream list`, which filters on the
-                // namespace prefix — `stream info` resolves by hash and so
-                // still found them (#42 item 2). Only the default namespace,
-                // whose qualified form is the bare name, happened to work.
+                // append path does. A bare key is invisible to `stream list`,
+                // which filters on the namespace prefix, while `stream info`
+                // still resolves it by hash — so the two disagree. Only the
+                // default namespace, whose qualified form is the bare name,
+                // is unaffected.
                 var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
                 const ns = self.stream.resolveNamespace(cmd.namespace_hash);
                 const ns_name = ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key) catch cmd.key;

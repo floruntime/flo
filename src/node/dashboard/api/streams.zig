@@ -92,11 +92,10 @@ fn boolParam(query_string: ?[]const u8, key: []const u8) bool {
 }
 
 /// Logical record count for a stream = sum of each append batch's record count
-/// (a batch may carry N records). The projection now maintains this
-/// incrementally, so this is an O(1) read. It previously re-read every UAL
-/// entry to sum batch headers, sampling the first 16k and extrapolating beyond
-/// that — and used the zero-copy `ual.read`, which returns null for any entry
-/// whose payload wraps the hot-ring boundary, silently counting those as 1.
+/// (a batch may carry N records). The projection maintains this incrementally,
+/// so this is an O(1) read and needs no UAL access — notably avoiding the
+/// zero-copy `ual.read`, which returns null for any entry whose payload wraps
+/// the hot-ring boundary and would undercount those as one record.
 fn streamLogicalCount(sp: *StreamProjection, name_hash: u64) u64 {
     return sp.streamLogicalCount(name_hash);
 }
