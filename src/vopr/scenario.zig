@@ -173,6 +173,9 @@ pub const Scenario = struct {
         var s = fromSeed(seed);
         s.small_ring = true;
         s.log_capacity = 8 * 1024;
+        // Eviction pressure needs traffic: an idle seed never outruns even an
+        // 8 KiB ring, so force the request rate to the sampling maximum.
+        s.request_percent = 60;
         // Keep single entries appendable — the point is eviction pressure,
         // not EntryTooLarge.
         s.payload_max = 256;
@@ -245,31 +248,36 @@ pub const Scenario = struct {
     pub fn fromJsonSlice(allocator: std.mem.Allocator, bytes: []const u8) !Scenario {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidField;
         const obj = parsed.value.object;
-        const hard = (obj.get("hard_state") orelse return error.MissingField).string;
-        const dura = (obj.get("durability") orelse return error.MissingField).string;
+        // A pin is hand-editable: an unrecognised mode must fail loudly, never
+        // fall through to a default and run a different scenario.
+        const hard_state: HardStateMode = if (try jsonEnum(obj, "hard_state", &.{ "persisted", "volatile" })) .persisted else .volatile_state;
+        const durability: DurabilityMode = if (try jsonEnum(obj, "durability", &.{ "sync", "async_flush" })) .sync else .async_flush;
+        const small_ring_v = obj.get("small_ring") orelse return error.MissingField;
+        if (small_ring_v != .bool) return error.InvalidField;
         return .{
             .seed = try jsonU64(obj, "seed"),
-            .node_count = @intCast(try jsonU64(obj, "node_count")),
-            .log_capacity = @intCast(try jsonU64(obj, "log_capacity")),
-            .small_ring = (obj.get("small_ring") orelse return error.MissingField).bool,
+            .node_count = try jsonInt(u8, obj, "node_count"),
+            .log_capacity = try jsonInt(usize, obj, "log_capacity"),
+            .small_ring = small_ring_v.bool,
             .ticks_safety = try jsonU64(obj, "ticks_safety"),
             .ticks_convergence = try jsonU64(obj, "ticks_convergence"),
-            .hard_state = if (std.mem.eql(u8, hard, "volatile")) .volatile_state else .persisted,
-            .durability = if (std.mem.eql(u8, dura, "async_flush")) .async_flush else .sync,
+            .hard_state = hard_state,
+            .durability = durability,
             .flush_interval_ms = try jsonU64(obj, "flush_interval_ms"),
             .msg_delay_min_ms = try jsonU64(obj, "msg_delay_min_ms"),
             .msg_delay_max_ms = try jsonU64(obj, "msg_delay_max_ms"),
-            .drop_percent = @intCast(try jsonU64(obj, "drop_percent")),
-            .duplicate_percent = @intCast(try jsonU64(obj, "duplicate_percent")),
-            .partition_permille = @intCast(try jsonU64(obj, "partition_permille")),
+            .drop_percent = try jsonInt(u8, obj, "drop_percent"),
+            .duplicate_percent = try jsonInt(u8, obj, "duplicate_percent"),
+            .partition_permille = try jsonInt(u16, obj, "partition_permille"),
             .partition_min_ms = try jsonU64(obj, "partition_min_ms"),
             .partition_max_ms = try jsonU64(obj, "partition_max_ms"),
-            .crash_permille = @intCast(try jsonU64(obj, "crash_permille")),
-            .restart_permille = @intCast(try jsonU64(obj, "restart_permille")),
-            .request_percent = @intCast(try jsonU64(obj, "request_percent")),
-            .payload_min = @intCast(try jsonU64(obj, "payload_min")),
-            .payload_max = @intCast(try jsonU64(obj, "payload_max")),
+            .crash_permille = try jsonInt(u16, obj, "crash_permille"),
+            .restart_permille = try jsonInt(u16, obj, "restart_permille"),
+            .request_percent = try jsonInt(u8, obj, "request_percent"),
+            .payload_min = try jsonInt(u32, obj, "payload_min"),
+            .payload_max = try jsonInt(u32, obj, "payload_max"),
             .election_timeout_min_ms = try jsonU64(obj, "election_timeout_min_ms"),
             .election_timeout_max_ms = try jsonU64(obj, "election_timeout_max_ms"),
             .heartbeat_interval_ms = try jsonU64(obj, "heartbeat_interval_ms"),
@@ -282,6 +290,22 @@ fn jsonU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
     const v = obj.get(key) orelse return error.MissingField;
     if (v != .integer or v.integer < 0) return error.InvalidField;
     return @intCast(v.integer);
+}
+
+/// Range-checked narrowing: an out-of-range pin value is an error, not a
+/// panic.
+fn jsonInt(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
+    return std.math.cast(T, try jsonU64(obj, key)) orelse error.InvalidField;
+}
+
+/// True when the field equals `names[0]`, false for `names[1]`, error for
+/// anything else.
+fn jsonEnum(obj: std.json.ObjectMap, key: []const u8, names: []const []const u8) !bool {
+    const v = obj.get(key) orelse return error.MissingField;
+    if (v != .string) return error.InvalidField;
+    if (std.mem.eql(u8, v.string, names[0])) return true;
+    if (std.mem.eql(u8, v.string, names[1])) return false;
+    return error.InvalidField;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -341,6 +365,17 @@ test "vopr scenario: json round-trips through fromJsonSlice" {
     try original.writeJson(&w);
     const loaded = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
     try testing.expectEqual(original, loaded);
+}
+
+test "vopr scenario: pin parsing rejects bad values instead of guessing" {
+    const bad_enum =
+        \\{"seed":1,"node_count":3,"log_capacity":65536,"small_ring":false,"ticks_safety":1,"ticks_convergence":1,"hard_state":"persisted","durability":"async","flush_interval_ms":1,"msg_delay_min_ms":1,"msg_delay_max_ms":1,"drop_percent":0,"duplicate_percent":0,"partition_permille":0,"partition_min_ms":1,"partition_max_ms":1,"crash_permille":0,"restart_permille":1,"request_percent":1,"payload_min":16,"payload_max":64,"election_timeout_min_ms":1,"election_timeout_max_ms":2,"heartbeat_interval_ms":1,"rpc_timeout_ms":1}
+    ;
+    try testing.expectError(error.InvalidField, Scenario.fromJsonSlice(testing.allocator, bad_enum));
+    const out_of_range =
+        \\{"seed":1,"node_count":3,"log_capacity":65536,"small_ring":false,"ticks_safety":1,"ticks_convergence":1,"hard_state":"persisted","durability":"sync","flush_interval_ms":1,"msg_delay_min_ms":1,"msg_delay_max_ms":1,"drop_percent":300,"duplicate_percent":0,"partition_permille":0,"partition_min_ms":1,"partition_max_ms":1,"crash_permille":0,"restart_permille":1,"request_percent":1,"payload_min":16,"payload_max":64,"election_timeout_min_ms":1,"election_timeout_max_ms":2,"heartbeat_interval_ms":1,"rpc_timeout_ms":1}
+    ;
+    try testing.expectError(error.InvalidField, Scenario.fromJsonSlice(testing.allocator, out_of_range));
 }
 
 test "vopr scenario: json emit parses and fields pair correctly" {

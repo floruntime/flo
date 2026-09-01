@@ -130,7 +130,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d}\n",
+            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} evictions={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -145,6 +145,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.messages_delivered,
             s.messages_dropped,
             s.apply_stalls,
+            s.eviction_stalls,
         },
     );
     if (!s.ok) {
@@ -153,11 +154,20 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         sim.printViolations(&vw) catch {};
         sim.printNodeStates(&vw) catch {};
         std.debug.print("{s}", .{vw.buffered()});
-        std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}\n", .{
-            s.seed,
-            if (args.small_ring) " --small-ring" else "",
-            if (args.volatile_mode) " --mode=volatile" else "",
-        });
+        // A pinned run reproduces from the pin, not the seed — the file may
+        // be hand-edited and no longer match fromSeed's sampling.
+        if (args.scenario_in) |pin| {
+            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}\n", .{
+                pin,
+                if (args.volatile_mode) " --mode=volatile" else "",
+            });
+        } else {
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}\n", .{
+                s.seed,
+                if (args.small_ring) " --small-ring" else "",
+                if (args.volatile_mode) " --mode=volatile" else "",
+            });
+        }
     }
     return s.ok;
 }
@@ -253,6 +263,12 @@ pub fn main(init: std.process.Init) !void {
     // silently ignoring the flag is this codebase's signature bug shape.
     if (args.iterations != null and (args.scenario_in != null or args.scenario_out != null)) {
         std.debug.print("--iterations cannot combine with --scenario-in/--scenario-out\n", .{});
+        std.process.exit(2);
+    }
+    // A pinned scenario is the whole input; a seed or ring flag beside it
+    // would be silently overridden — refuse rather than guess.
+    if (args.scenario_in != null and (args.seed != null or args.small_ring)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring (the pin carries both)\n", .{});
         std.process.exit(2);
     }
 
