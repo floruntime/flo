@@ -1,0 +1,283 @@
+//! vopr — deterministic cluster simulation runner
+//!
+//! One seed reproduces an entire run. Usage:
+//!
+//!   vopr [--seed=N]                 run one seed (random when omitted)
+//!        [--iterations=K]           swarm: K seeds, each in a watchdogged
+//!                                   child process (a hang inside the unit
+//!                                   under test cannot be interrupted from
+//!                                   within, so the parent kills on timeout)
+//!        [--seed-timeout=SECS]      per-seed watchdog budget (default 300)
+//!        [--mode=volatile|persisted] hard-state model (persisted is the default)
+//!        [--no-timer-reset]         drop harness timer re-arming (livelock demo)
+//!        [--small-ring]             shrink the ring so eviction outruns
+//!                                   replication (fails by design)
+//!        [--scenario-out=PATH]      write the scenario JSON, then run
+//!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
+//!        [--verbose]
+//!
+//! Exit codes: 0 clean, 1 violations or failing/hanging seeds, 2 usage.
+
+const std = @import("std");
+const src = @import("src");
+const stdx = @import("stdx");
+
+const vopr = src.vopr;
+const Scenario = vopr.Scenario;
+const Simulator = vopr.simulator.Simulator;
+
+const Args = struct {
+    seed: ?u64 = null,
+    iterations: ?u64 = null,
+    seed_timeout_s: u64 = 300,
+    volatile_mode: bool = false,
+    no_timer_reset: bool = false,
+    small_ring: bool = false,
+    scenario_out: ?[]const u8 = null,
+    scenario_in: ?[]const u8 = null,
+    verbose: bool = false,
+    self_exe: []const u8 = "",
+};
+
+fn usage() void {
+    std.debug.print(
+        "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] " ++
+            "[--mode=volatile|persisted] [--no-timer-reset] [--small-ring] " ++
+            "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
+        .{},
+    );
+}
+
+fn parseArgs(argv: []const []const u8) !Args {
+    var args = Args{ .self_exe = argv[0] };
+    for (argv[1..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--seed=")) {
+            args.seed = try std.fmt.parseInt(u64, arg["--seed=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--iterations=")) {
+            args.iterations = try std.fmt.parseInt(u64, arg["--iterations=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--seed-timeout=")) {
+            args.seed_timeout_s = try std.fmt.parseInt(u64, arg["--seed-timeout=".len..], 10);
+        } else if (std.mem.eql(u8, arg, "--mode=volatile")) {
+            args.volatile_mode = true;
+        } else if (std.mem.eql(u8, arg, "--mode=persisted")) {
+            args.volatile_mode = false;
+        } else if (std.mem.eql(u8, arg, "--no-timer-reset")) {
+            args.no_timer_reset = true;
+        } else if (std.mem.eql(u8, arg, "--small-ring")) {
+            args.small_ring = true;
+        } else if (std.mem.startsWith(u8, arg, "--scenario-out=")) {
+            args.scenario_out = arg["--scenario-out=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--scenario-in=")) {
+            args.scenario_in = arg["--scenario-in=".len..];
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            args.verbose = true;
+        } else {
+            std.debug.print("unknown argument: {s}\n", .{arg});
+            return error.Usage;
+        }
+    }
+    return args;
+}
+
+// ── Scenario file IO (parsing lives with Scenario itself) ─────────────
+
+fn loadScenario(allocator: std.mem.Allocator, path: []const u8) !Scenario {
+    const bytes = try stdx.fs.readFileAlloc(allocator, path, 64 * 1024);
+    defer allocator.free(bytes);
+    return Scenario.fromJsonSlice(allocator, bytes);
+}
+
+fn writeScenario(scenario: *const Scenario, path: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try scenario.writeJson(&w);
+    const file = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAll(file, w.buffered());
+}
+
+// ── Single-seed run ────────────────────────────────────────────────────
+
+fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
+    var scenario = if (args.scenario_in) |path|
+        try loadScenario(allocator, path)
+    else if (args.small_ring)
+        Scenario.smallRing(seed)
+    else
+        Scenario.fromSeed(seed);
+    if (args.volatile_mode) scenario.hard_state = .volatile_state;
+
+    // The scenario prints before the run: a hang inside the unit under
+    // test cannot be interrupted from in here, so the repro must already
+    // be on screen when it happens.
+    var jbuf: [4096]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    scenario.writeJson(&jw) catch {};
+    std.debug.print("[vopr] seed={d} scenario:\n{s}", .{ scenario.seed, jw.buffered() });
+
+    if (args.scenario_out) |path| {
+        try writeScenario(&scenario, path);
+        std.debug.print("[vopr] scenario written to {s}\n", .{path});
+    }
+
+    var sim = try Simulator.init(allocator, scenario, .{
+        .volatile_hard_state = args.volatile_mode or scenario.hard_state == .volatile_state,
+        .no_timer_reset = args.no_timer_reset,
+        .verbose = args.verbose,
+    });
+    defer sim.deinit();
+
+    const s = try sim.run();
+    std.debug.print(
+        "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
+            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} evictions={d}\n",
+        .{
+            s.seed,
+            if (s.ok) "OK" else "FAILED",
+            s.ticks,
+            s.ops_submitted,
+            s.ops_acked,
+            s.ops_lost,
+            s.max_committed,
+            s.elections_won,
+            s.crashes,
+            s.restarts,
+            s.messages_delivered,
+            s.messages_dropped,
+            s.apply_stalls,
+            s.eviction_stalls,
+        },
+    );
+    if (!s.ok) {
+        var vbuf: [16384]u8 = undefined;
+        var vw: std.Io.Writer = .fixed(&vbuf);
+        sim.printViolations(&vw) catch {};
+        sim.printNodeStates(&vw) catch {};
+        std.debug.print("{s}", .{vw.buffered()});
+        // A pinned run reproduces from the pin, not the seed — the file may
+        // be hand-edited and no longer match fromSeed's sampling.
+        if (args.scenario_in) |pin| {
+            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}\n", .{
+                pin,
+                if (args.volatile_mode) " --mode=volatile" else "",
+            });
+        } else {
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}\n", .{
+                s.seed,
+                if (args.small_ring) " --small-ring" else "",
+                if (args.volatile_mode) " --mode=volatile" else "",
+            });
+        }
+    }
+    return s.ok;
+}
+
+// ── Swarm mode: one watchdogged child process per seed ─────────────────
+
+const SeedResult = enum { ok, failed, hung };
+
+fn runChildSeed(allocator: std.mem.Allocator, args: Args, seed: u64) !SeedResult {
+    var seed_arg_buf: [32]u8 = undefined;
+    const seed_arg = try std.fmt.bufPrint(&seed_arg_buf, "--seed={d}", .{seed});
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ args.self_exe, seed_arg });
+    if (args.volatile_mode) try argv.append(allocator, "--mode=volatile");
+    if (args.no_timer_reset) try argv.append(allocator, "--no-timer-reset");
+    if (args.small_ring) try argv.append(allocator, "--small-ring");
+    if (args.verbose) try argv.append(allocator, "--verbose");
+
+    var child = stdx.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const pid = child.id;
+
+    const deadline = stdx.time.milliTimestamp() + @as(i64, @intCast(args.seed_timeout_s * 1000));
+    while (stdx.time.milliTimestamp() < deadline) {
+        var status: c_int = 0;
+        const rc = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
+        if (rc == pid) {
+            if (std.posix.W.IFEXITED(@bitCast(status)) and
+                std.posix.W.EXITSTATUS(@bitCast(status)) == 0)
+            {
+                return .ok;
+            }
+            return .failed;
+        }
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    // Hung inside the unit under test — the class of bug no in-process
+    // budget can catch.
+    _ = std.c.kill(pid, .KILL);
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    return .hung;
+}
+
+fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
+    const base = args.seed orelse @as(u64, @bitCast(@as(i64, @truncate(stdx.time.nanoTimestamp()))));
+    const iterations = args.iterations.?;
+    std.debug.print("[vopr] swarm: {d} seeds from base {d}, {d}s watchdog per seed\n", .{
+        iterations, base, args.seed_timeout_s,
+    });
+
+    var failed: std.ArrayListUnmanaged(u64) = .empty;
+    defer failed.deinit(allocator);
+    var hung: std.ArrayListUnmanaged(u64) = .empty;
+    defer hung.deinit(allocator);
+
+    for (0..iterations) |k| {
+        const seed = base +% k;
+        switch (try runChildSeed(allocator, args, seed)) {
+            .ok => {},
+            .failed => try failed.append(allocator, seed),
+            .hung => try hung.append(allocator, seed),
+        }
+    }
+
+    std.debug.print("[vopr] swarm done: {d} seeds, {d} failed, {d} hung\n", .{
+        iterations, failed.items.len, hung.items.len,
+    });
+    for (failed.items) |s| std.debug.print("[vopr]   FAILED seed={d}\n", .{s});
+    for (hung.items) |s| std.debug.print("[vopr]   HUNG   seed={d}\n", .{s});
+    return failed.items.len == 0 and hung.items.len == 0;
+}
+
+pub fn main(init: std.process.Init) !void {
+    stdx.io.bootFromInit(init.io);
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
+    const argv = try init.gpa.alloc([]const u8, raw_args.len);
+    defer init.gpa.free(argv);
+    for (raw_args, 0..) |a, i| argv[i] = a;
+
+    const args = parseArgs(argv) catch {
+        usage();
+        std.process.exit(2);
+    };
+
+    // Swarm children each derive their own scenario from their seed; a
+    // pinned scenario or an output path cannot apply to all of them, and
+    // silently ignoring the flag is this codebase's signature bug shape.
+    if (args.iterations != null and (args.scenario_in != null or args.scenario_out != null)) {
+        std.debug.print("--iterations cannot combine with --scenario-in/--scenario-out\n", .{});
+        std.process.exit(2);
+    }
+    // A pinned scenario is the whole input; a seed or ring flag beside it
+    // would be silently overridden — refuse rather than guess.
+    if (args.scenario_in != null and (args.seed != null or args.small_ring)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring (the pin carries both)\n", .{});
+        std.process.exit(2);
+    }
+
+    const ok = if (args.iterations != null)
+        try runSwarm(init.gpa, args)
+    else blk: {
+        const seed = args.seed orelse
+            @as(u64, @bitCast(@as(i64, @truncate(stdx.time.nanoTimestamp()))));
+        break :blk try runOne(init.gpa, args, seed);
+    };
+    if (!ok) std.process.exit(1);
+}

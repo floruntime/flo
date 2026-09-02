@@ -17,7 +17,17 @@ pub const Workload = workload.Workload;
 pub const Op = workload.Op;
 pub const OpState = workload.OpState;
 
+pub const network = @import("network.zig");
+pub const SimNetwork = network.SimNetwork;
+
+pub const simulator = @import("simulator.zig");
+pub const Simulator = simulator.Simulator;
+pub const Summary = simulator.Summary;
+pub const Invariant = simulator.Invariant;
+
 test {
     _ = scenario;
     _ = workload;
+    _ = network;
+    _ = simulator;
 }
