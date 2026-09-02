@@ -304,6 +304,9 @@ pub const Options = struct {
     no_timer_reset: bool = false,
     /// Print per-phase progress.
     verbose: bool = false,
+    /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
+    /// uses the last such line to tell a slow child from a hung one.
+    progress_every: u64 = 0,
 };
 
 pub const Summary = struct {
@@ -985,9 +988,16 @@ pub const Simulator = struct {
         try self.injectFaults();
     }
 
+    fn progress(self: *const Simulator) void {
+        if (self.options.progress_every > 0 and self.now % self.options.progress_every == 0) {
+            std.debug.print("[vopr] progress tick={d}\n", .{self.now});
+        }
+    }
+
     pub fn run(self: *Simulator) !Summary {
         while (self.now < self.scenario.ticks_safety and self.checker.violations.items.len == 0) {
             try self.tick();
+            self.progress();
         }
         var converged_ok = false;
         if (self.checker.violations.items.len == 0) {
@@ -1004,6 +1014,7 @@ pub const Simulator = struct {
             const deadline = self.now + budget;
             while (self.now < deadline and self.checker.violations.items.len == 0) {
                 try self.tick();
+                self.progress();
                 if (self.options.verbose and self.now % 5000 == 0) {
                     std.debug.print("[dbg] tick={d}\n", .{self.now});
                     for (self.nodes) |*nd| std.debug.print(
