@@ -225,11 +225,12 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
 /// Triage from the child's log: the first violation tag, or for a timeout
 /// the last progress tick (a hung child stops advancing; a slow one keeps
 /// going right up to the kill).
-fn classify(allocator: std.mem.Allocator, log_path: []const u8) struct { class: []const u8, last_tick: ?u64 } {
-    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return .{ .class = "unreadable", .last_tick = null };
+fn classify(allocator: std.mem.Allocator, log_path: []const u8) struct { class: []const u8, last_tick: ?u64, last_elapsed_ms: ?u64 } {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return .{ .class = "unreadable", .last_tick = null, .last_elapsed_ms = null };
     defer allocator.free(text);
     var class: []const u8 = "unknown";
     var last_tick: ?u64 = null;
+    var last_elapsed_ms: ?u64 = null;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
         const t = std.mem.trimStart(u8, line, " ");
@@ -240,11 +241,20 @@ fn classify(allocator: std.mem.Allocator, log_path: []const u8) struct { class: 
             class = allocator.dupe(u8, t[1..end]) catch "unknown";
         }
         if (std.mem.startsWith(u8, t, "[vopr] progress tick=")) {
-            last_tick = std.fmt.parseInt(u64, t["[vopr] progress tick=".len..], 10) catch last_tick;
+            const rest = t["[vopr] progress tick=".len..];
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            last_tick = std.fmt.parseInt(u64, rest[0..sp], 10) catch last_tick;
+            if (std.mem.indexOf(u8, rest, "elapsed_ms=")) |e| {
+                last_elapsed_ms = std.fmt.parseInt(u64, rest[e + "elapsed_ms=".len ..], 10) catch last_elapsed_ms;
+            }
         }
     }
-    return .{ .class = class, .last_tick = last_tick };
+    return .{ .class = class, .last_tick = last_tick, .last_elapsed_ms = last_elapsed_ms };
 }
+
+/// A child killed by the watchdog either stopped advancing (hung) or was
+/// still going (slow): silence longer than this before the kill is a hang.
+const HANG_SILENCE_MS: u64 = 60_000;
 
 const Failure = struct { seed: u64, class: []const u8, last_tick: ?u64, outcome: Outcome };
 
@@ -302,11 +312,15 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                         std.debug.print("[vopr] seed={d} OK\n", .{r.seed});
                     },
                     .failed, .timeout => {
-                        const c = classify(allocator, r.log_path);
-                        try failures.append(allocator, .{ .seed = r.seed, .class = c.class, .last_tick = c.last_tick, .outcome = o });
+                        var c = classify(allocator, r.log_path);
                         if (o == .timeout) {
-                            std.debug.print("[vopr] seed={d} TIMEOUT last progress tick={?d}\n", .{ r.seed, c.last_tick });
-                        } else {
+                            const budget_ms = args.seed_timeout_s * 1000;
+                            const silence = budget_ms -| (c.last_elapsed_ms orelse 0);
+                            c.class = if (silence >= HANG_SILENCE_MS) "hung" else "slow";
+                            std.debug.print("[vopr] seed={d} TIMEOUT ({s}) last progress tick={?d} silent for {d}s before the kill\n", .{ r.seed, c.class, c.last_tick, silence / 1000 });
+                        }
+                        try failures.append(allocator, .{ .seed = r.seed, .class = c.class, .last_tick = c.last_tick, .outcome = o });
+                        if (o == .timeout) {} else {
                             std.debug.print("[vopr] seed={d} FAILED [{s}]\n", .{ r.seed, c.class });
                         }
                     },
