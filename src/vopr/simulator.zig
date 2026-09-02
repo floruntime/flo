@@ -15,6 +15,7 @@
 //! failures. The seed is the whole repro.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const PRNG = @import("stdx").PRNG;
 const raft_node = @import("../raft/node.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -169,7 +170,10 @@ const Checker = struct {
     /// index exactly once. Sync mode asserts full immutability, and even
     /// async mode only permits a rewrite when a crash actually happened
     /// after the canonical entry was recorded — without one, nothing
-    /// could have legally erased it.
+    /// could have legally erased it. A legal rewrite can carry an OLDER
+    /// term, not just a newer one: when the newer quorum loses its
+    /// unflushed entries, a survivor's older flushed suffix can win the
+    /// next election and be re-committed at the same indices.
     allow_cross_term_rewrite: bool = false,
     /// canonical[i] is the first-applied (term, payload-hash) at index i+1.
     /// First applier sets it; every later applier must match. A mismatch
@@ -258,10 +262,9 @@ const Checker = struct {
             } else if (canon.term != term) {
                 const erasable = self.allow_cross_term_rewrite and latest_crash >= canon.recorded_at;
                 if (erasable) {
-                    // Keep the newest-term version as canonical.
-                    if (term > canon.term) {
-                        self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
-                    }
+                    // History at this index was legally erased; whatever
+                    // is now being applied is the surviving version.
+                    self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
                 } else {
                     self.fail(.{
                         .invariant = .state_machine_safety,
@@ -304,6 +307,9 @@ pub const Options = struct {
     no_timer_reset: bool = false,
     /// Print per-phase progress.
     verbose: bool = false,
+    /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
+    /// uses the last such line to tell a slow child from a hung one.
+    progress_every: u64 = 0,
 };
 
 pub const Summary = struct {
@@ -347,6 +353,8 @@ pub const Simulator = struct {
     /// The erasability gate for cross-term canonical rewrites: a rewrite
     /// is legal only if some crash happened after the entry was recorded.
     latest_crash_at: u64,
+    /// Wall-clock at init, for progress lines only.
+    started_ms: i64,
     /// Highest log index of any acked op — the convergence target.
     /// Tracked incrementally; recomputing it from all ops every tick is
     /// O(ops x ticks) and dominates the whole run.
@@ -386,6 +394,7 @@ pub const Simulator = struct {
             .acked_at = .empty,
             .crash_ticks = .empty,
             .latest_crash_at = 0,
+            .started_ms = stdx.time.milliTimestamp(),
             .max_acked_index = 0,
             .range_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH),
             .range_arena = try allocator.alloc(u8, @as(usize, scenario.payload_max) * MAX_BATCH + 64),
@@ -940,12 +949,17 @@ pub const Simulator = struct {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
             if (self.scenario.durability == .async_flush) {
-                // Excuse the op if any crash landed inside its flush
-                // window — that loss is the mode's documented contract.
+                // Excuse the op if any crash landed within a flush interval
+                // on EITHER side of the ack — that loss is the mode's
+                // documented contract. Before the ack matters too: the
+                // leader acks on replicas that are still unflushed, so a
+                // crash shortly before the ack can already have destroyed
+                // a replica the ack relied on.
                 const at = self.acked_at.get(op.id) orelse 0;
+                const flush = self.scenario.flush_interval_ms;
                 var excused = false;
                 for (self.crash_ticks.items) |ct| {
-                    if (ct >= at and ct <= at + self.scenario.flush_interval_ms) {
+                    if (ct + flush >= at and ct <= at + flush) {
                         excused = true;
                         break;
                     }
@@ -985,9 +999,19 @@ pub const Simulator = struct {
         try self.injectFaults();
     }
 
+    fn progress(self: *const Simulator) void {
+        if (self.options.progress_every > 0 and self.now % self.options.progress_every == 0) {
+            // Wall-clock only ever reaches a print — never a decision — so
+            // determinism is untouched; the swarm parent uses the elapsed
+            // time to tell a hung child (silent) from a slow one (advancing).
+            std.debug.print("[vopr] progress tick={d} elapsed_ms={d}\n", .{ self.now, stdx.time.milliTimestamp() - self.started_ms });
+        }
+    }
+
     pub fn run(self: *Simulator) !Summary {
         while (self.now < self.scenario.ticks_safety and self.checker.violations.items.len == 0) {
             try self.tick();
+            self.progress();
         }
         var converged_ok = false;
         if (self.checker.violations.items.len == 0) {
@@ -1004,6 +1028,7 @@ pub const Simulator = struct {
             const deadline = self.now + budget;
             while (self.now < deadline and self.checker.violations.items.len == 0) {
                 try self.tick();
+                self.progress();
                 if (self.options.verbose and self.now % 5000 == 0) {
                     std.debug.print("[dbg] tick={d}\n", .{self.now});
                     for (self.nodes) |*nd| std.debug.print(
