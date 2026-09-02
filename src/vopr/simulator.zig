@@ -949,12 +949,17 @@ pub const Simulator = struct {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
             if (self.scenario.durability == .async_flush) {
-                // Excuse the op if any crash landed inside its flush
-                // window — that loss is the mode's documented contract.
+                // Excuse the op if any crash landed within a flush interval
+                // on EITHER side of the ack — that loss is the mode's
+                // documented contract. Before the ack matters too: the
+                // leader acks on replicas that are still unflushed, so a
+                // crash shortly before the ack can already have destroyed
+                // a replica the ack relied on.
                 const at = self.acked_at.get(op.id) orelse 0;
+                const flush = self.scenario.flush_interval_ms;
                 var excused = false;
                 for (self.crash_ticks.items) |ct| {
-                    if (ct >= at and ct <= at + self.scenario.flush_interval_ms) {
+                    if (ct + flush >= at and ct <= at + flush) {
                         excused = true;
                         break;
                     }
