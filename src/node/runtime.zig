@@ -98,7 +98,7 @@ pub const RuntimeConfig = struct {
     dashboard_bind: []const u8 = "0.0.0.0",
     dashboard_cors_origins: ?[]const u8 = null,
 
-/// Start the peer-facing Raft listener even without seeds. See
+    /// Start the peer-facing Raft listener even without seeds. See
     /// `ClusterConfig.enabled`.
     cluster_enabled: bool = false,
     cluster_node_id: u32 = 0,
@@ -539,20 +539,6 @@ pub const Runtime = struct {
             self.raft_network = rn;
 
             try rn.start();
-
-            // Connect to seed nodes
-            for (self.config.cluster_seeds) |seed| {
-                const seed_port = parseSeedPort(seed) orelse continue;
-                // Retry connection a few times since seed may still be starting
-                var attempt: usize = 0;
-                while (attempt < 30) : (attempt += 1) {
-                    rn.connectToPeer("127.0.0.1", seed_port) catch {
-                        stdx.time.sleep(200 * std.time.ns_per_ms);
-                        continue;
-                    };
-                    break;
-                }
-            }
         }
 
         // 4. Create and start acceptor
@@ -636,6 +622,27 @@ pub const Runtime = struct {
             }, ctx);
             self.dashboard_server = server;
             try server.start();
+        }
+
+        // Seed dialing comes last, after every listener is up: the join
+        // handshake does a blocking connect plus a read that can wait
+        // several seconds per attempt, and running it before the acceptor
+        // held the whole node's client readiness hostage to peer latency —
+        // a joiner must accept clients even when its peers are slow or
+        // unreachable.
+        if (self.raft_network) |rn| {
+            for (self.config.cluster_seeds) |seed| {
+                const seed_port = parseSeedPort(seed) orelse continue;
+                // Retry a few times since the seed may still be starting.
+                var attempt: usize = 0;
+                while (attempt < 30) : (attempt += 1) {
+                    rn.connectToPeer("127.0.0.1", seed_port) catch {
+                        stdx.time.sleep(200 * std.time.ns_per_ms);
+                        continue;
+                    };
+                    break;
+                }
+            }
         }
 
         self.started = true;

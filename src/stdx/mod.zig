@@ -30,6 +30,12 @@ pub const testing = @import("testing/e2e/mod.zig");
 /// Deterministic seedable PRNG for VOPR-style simulation testing.
 pub const prng = @import("testing/prng.zig");
 pub const PRNG = prng.PRNG;
+
+test {
+    // The PRNG's tests live only here; without this reference they are
+    // never collected.
+    _ = prng;
+}
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.
 pub fn copy_disjoint(
@@ -48,11 +54,6 @@ pub fn copy_disjoint(
             @memcpy(dest[0..len], source[0..len]);
         },
     }
-}
-
-/// Check if a struct has no padding.
-pub fn no_padding(comptime T: type) bool {
-    return @sizeOf(T) == @bitSizeOf(T) / 8;
 }
 
 /// Maybe assertion - only asserts in debug mode.
@@ -101,23 +102,6 @@ test "copy_disjoint: inexact" {
     const source = [_]u8{ 1, 2 };
     copy_disjoint(.inexact, u8, &dest, &source);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 0, 0 }, &dest);
-}
-
-test "no_padding: struct without padding" {
-    const NoPadding = struct {
-        a: u32,
-        b: u32,
-    };
-    try std.testing.expect(no_padding(NoPadding));
-}
-
-test "no_padding: struct with padding" {
-    const WithPadding = struct {
-        a: u8,
-        // 3 bytes padding here
-        b: u32,
-    };
-    try std.testing.expect(!no_padding(WithPadding));
 }
 
 test "nullIfEmpty: non-empty string" {

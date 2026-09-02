@@ -541,6 +541,8 @@ pub const ProcessingHandler = struct {
         // replay path so a RUNNING job resumes after restart (FLO-104).
         self.startPipelines(owned_id, &def);
 
+        if (shard.metrics_registry) |m| m.processing.recordSubmitted();
+
         // Return the job ID
         shard.sendOkResponse(conn, req.header.request_id, job_id);
     }
@@ -859,6 +861,13 @@ pub const ProcessingHandler = struct {
         };
         const value = &[_]u8{@intFromEnum(status)};
         _ = persistence_mod.persistEntry(shard, entry_type, Flags.NONE, namespace, job_id, value) catch {};
+
+        // Both terminal transitions route through here.
+        if (shard.metrics_registry) |m| switch (status) {
+            .cancelled => m.processing.recordCancelled(),
+            .stopped => m.processing.recordCompleted(),
+            else => {},
+        };
     }
 
     /// Persist a processing_savepoint entry. Key = savepoint_id.
