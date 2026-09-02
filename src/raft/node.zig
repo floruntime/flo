@@ -415,9 +415,14 @@ pub const RaftNode = struct {
             }
         }
 
-        // Advance commit index
+        // Commit only what this RPC verified. Capping by lastIndex() would let
+        // an empty heartbeat commit a stale suffix left behind by a deposed
+        // leader — entries the current leader never sent and is about to
+        // overwrite. Never move commit backwards: a probe from an older prev
+        // verifies less than we may already hold committed.
+        const last_new = req.prev_log_index + req.entries.len;
         if (req.leader_commit > self.commit_index) {
-            self.commit_index = @min(req.leader_commit, self.log.lastIndex());
+            self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
         }
 
         // Only the prefix this RPC verified counts as matched. lastIndex()
@@ -1120,4 +1125,82 @@ test "raft node: cluster size and quorum" {
     node.addPeer(4);
     node.addPeer(5);
     try testing.expectEqual(@as(u8, 3), node.quorum()); // 5-node: quorum=3
+}
+
+test "raft node: follower does not commit its stale suffix on a heartbeat" {
+    const allocator = testing.allocator;
+
+    // Follower: 1-7 from term 1, plus a stale 8-10 from a deposed term-2
+    // leader. The term-3 leader has its own 8-10, already committed via a
+    // third node, so its heartbeat carries leader_commit = 10.
+    var follower = try RaftNode.init(allocator, 2, 1000, 16384, .{});
+    defer follower.deinit();
+    follower.current_term = 2;
+    follower.commit_index = 7;
+    for (1..8) |i| {
+        var e = testEntry(1, i, "old");
+        _ = try follower.log.append(&e);
+    }
+    for (8..11) |i| {
+        var e = testEntry(2, i, "stale");
+        _ = try follower.log.append(&e);
+    }
+
+    // The heartbeat verifies only 1-7. Nothing past 7 may commit — the
+    // leader is about to overwrite 8-10, and a commit here would apply
+    // entries that never existed on the leader.
+    const hb = try follower.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = 1,
+        .prev_log_index = 7,
+        .prev_log_term = 1,
+        .entries = &[_]Entry{},
+        .leader_commit = 10,
+    });
+    try testing.expect(hb.success);
+    try testing.expectEqual(@as(u64, 7), follower.commit_index);
+
+    // The real 8-10 arrive: conflict truncation, then commit through 10.
+    const batch = [_]Entry{
+        testEntry(3, 8, "fresh"),
+        testEntry(3, 9, "fresh"),
+        testEntry(3, 10, "fresh"),
+    };
+    const resp = try follower.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = 1,
+        .prev_log_index = 7,
+        .prev_log_term = 1,
+        .entries = &batch,
+        .leader_commit = 10,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 10), follower.commit_index);
+    try testing.expectEqual(@as(u64, 3), follower.log.entryTerm(10).?);
+}
+
+test "raft node: a heartbeat below the commit index never lowers it" {
+    const allocator = testing.allocator;
+
+    var follower = try RaftNode.init(allocator, 2, 1000, 16384, .{});
+    defer follower.deinit();
+    follower.current_term = 1;
+    for (1..6) |i| {
+        var e = testEntry(1, i, "e");
+        _ = try follower.log.append(&e);
+    }
+    follower.commit_index = 5;
+
+    // A leader probing from an older prev (e.g. after its own restart)
+    // verifies less than we have already committed. Commit must hold.
+    const resp = try follower.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = 1,
+        .prev_log_index = 2,
+        .prev_log_term = 1,
+        .entries = &[_]Entry{},
+        .leader_commit = 5,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 5), follower.commit_index);
 }
