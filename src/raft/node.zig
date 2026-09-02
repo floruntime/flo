@@ -440,17 +440,28 @@ pub const RaftNode = struct {
             return;
         }
         if (self.role != .leader) return;
+        // A response to an RPC from an earlier term — possibly our own
+        // earlier leadership — describes a log we may have since truncated;
+        // counting its match_index toward a current-term quorum commits an
+        // entry that peer never received.
+        if (resp.term != self.current_term) return;
 
         // Find the peer
         for (0..self.peer_count) |i| {
             if (self.peer_ids[i] == resp.from) {
                 self.peers[i].inflight = false;
                 if (resp.success) {
-                    self.peers[i].match_index = resp.match_index;
-                    self.peers[i].next_index = resp.match_index + 1;
+                    // A late or duplicated ack may report less than we already
+                    // know matched; a response can also outlive the log it
+                    // answered. Match only advances, and never past our own log.
+                    const acked = @min(resp.match_index, self.log.lastIndex());
+                    self.peers[i].match_index = @max(self.peers[i].match_index, acked);
+                    self.peers[i].next_index = self.peers[i].match_index + 1;
                 } else {
-                    // Decrement next_index for retry (log mismatch)
-                    if (self.peers[i].next_index > 1) {
+                    // A rejection of a probe below what already matched is a
+                    // late reply; backing off past match_index would only
+                    // resend entries the peer holds.
+                    if (self.peers[i].next_index > self.peers[i].match_index + 1) {
                         self.peers[i].next_index -= 1;
                     }
                 }
@@ -1198,4 +1209,85 @@ test "raft node: a heartbeat below the commit index never lowers it" {
     });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), follower.commit_index);
+}
+
+test "raft node: a success ack from an earlier term does not advance match or commit" {
+    const allocator = testing.allocator;
+
+    // Leader in term 1 proposes index 1; peer 2's ack is delayed.
+    var node = try RaftNode.init(allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    _ = try node.propose(.kv_put, 0, 0, "t1");
+
+    // Deposed (a term-2 candidate appears), then re-elected in term 3 and a
+    // term-3 entry goes at index 2.
+    _ = node.handleVoteRequest(.{ .term = 2, .candidate_id = 3, .last_log_index = 1, .last_log_term = 1 });
+    try testing.expectEqual(Role.follower, node.role);
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = 3, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectEqual(@as(u64, 3), node.current_term);
+    _ = try node.propose(.kv_put, 0, 0, "t3");
+
+    // The delayed term-1 ack finally arrives, for an index this leadership
+    // has not sent it.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 2, .from = 2 });
+    try testing.expectEqual(@as(u64, 0), node.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 0), node.commit_index);
+
+    // A current-term ack commits as normal.
+    node.handleAppendResponse(.{ .term = 3, .success = true, .match_index = 2, .from = 2 });
+    try testing.expectEqual(@as(u64, 2), node.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 2), node.commit_index);
+
+    // An ack past our own log (a reply that outlived the log it answered)
+    // is clamped to what we hold.
+    node.handleAppendResponse(.{ .term = 3, .success = true, .match_index = 9, .from = 2 });
+    try testing.expectEqual(@as(u64, 2), node.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 3), node.peers[0].next_index);
+}
+
+test "raft node: reordered success acks keep match_index monotonic" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    for (0..3) |_| _ = try node.propose(.kv_put, 0, 0, "e");
+
+    // A late ack for 1 lands after the ack for 1-3. It must not rewind
+    // progress.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 3, .from = 2 });
+    try testing.expectEqual(@as(u64, 3), node.commit_index);
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 1, .from = 2 });
+    try testing.expectEqual(@as(u64, 3), node.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 4), node.peers[0].next_index);
+}
+
+test "raft node: a late rejection never backs next_index off below the match" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = node.startElection();
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    for (0..3) |_| _ = try node.propose(.kv_put, 0, 0, "e");
+
+    // Peer 2 has 1-3. A rejection of an earlier, higher probe arrives after
+    // the success: everything up to 3 is known to match, so there is
+    // nothing to back off to.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 3, .from = 2 });
+    node.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2 });
+    try testing.expectEqual(@as(u64, 3), node.peers[0].match_index);
+    try testing.expectEqual(@as(u64, 4), node.peers[0].next_index);
 }
