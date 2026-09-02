@@ -198,7 +198,7 @@ pub const ServerConfig = struct {
         };
     }
 
-    fn dupeString(self: *ServerConfig, s: []const u8) ![]const u8 {
+    pub fn dupeString(self: *ServerConfig, s: []const u8) ![]const u8 {
         const owned = try self.allocator.dupe(u8, s);
         try self._owned_strings.append(self.allocator, owned);
         return owned;
@@ -344,48 +344,8 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         }
     }
 
-    // Parse [cluster] section (enabled field deprecated - cluster always runs)
     if (table.getTable("cluster")) |c| {
-        // Note: "enabled" field is ignored (backwards compatibility)
-        _ = c.getBool("enabled");
-
-        if (c.getInt("node_id")) |n| {
-            config.cluster.node_id = @intCast(n);
-        }
-        if (c.getInt("raft_port")) |p| {
-            config.cluster.raft_port = @intCast(p);
-        }
-        if (c.getString("discovery_mode")) |m| {
-            config.cluster.discovery_mode = ClusterConfig.DiscoveryMode.fromString(m);
-        }
-        if (c.getInt("replication_factor")) |r| {
-            config.cluster.replication_factor = @intCast(r);
-        }
-        if (c.getInt("election_timeout_min_ms")) |t| {
-            config.cluster.election_timeout_min_ms = @intCast(t);
-        }
-        if (c.getInt("election_timeout_max_ms")) |t| {
-            config.cluster.election_timeout_max_ms = @intCast(t);
-        }
-        if (c.getInt("heartbeat_interval_ms")) |t| {
-            config.cluster.heartbeat_interval_ms = @intCast(t);
-        }
-        // Parse seeds as comma-separated string (TOML parser doesn't support arrays yet)
-        // Format: "host1:port1,host2:port2,host3:port3"
-        if (c.getString("seeds")) |seeds_str| {
-            var seeds_list: std.ArrayList([]const u8) = .empty;
-            errdefer seeds_list.deinit(allocator);
-
-            var iter = std.mem.splitScalar(u8, seeds_str, ',');
-            while (iter.next()) |seed| {
-                const trimmed = std.mem.trim(u8, seed, " \t");
-                if (trimmed.len > 0) {
-                    const owned = try config.dupeString(trimmed);
-                    try seeds_list.append(allocator, owned);
-                }
-            }
-            config.cluster.seeds = try seeds_list.toOwnedSlice(allocator);
-        }
+        config.cluster = try cluster_config.parseClusterConfig(allocator, c, &config._owned_strings);
     }
 
     // Parse [cold_storage] section

@@ -262,7 +262,7 @@ pub const SocketAddrV4 = struct {
     }
 };
 
-pub const SocketError = error{ SocketCreateFailed, BindFailed, ListenFailed, AcceptFailed, ConnectFailed, WriteFailed, ReadFailed, FcntlFailed };
+pub const SocketError = error{ SocketCreateFailed, BindFailed, ListenFailed, AcceptFailed, ConnectFailed, WriteFailed, ReadFailed, FcntlFailed, Unexpected };
 
 pub fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
     // macOS rejects SOCK.NONBLOCK / SOCK.CLOEXEC in the socket() type field
@@ -349,4 +349,138 @@ pub fn sysFcntlSetNonblocking(fd: posix.socket_t) SocketError!void {
     const flags = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
     if (flags < 0) return error.FcntlFailed;
     if (std.c.fcntl(fd, F_SETFL, flags | nonblock) < 0) return error.FcntlFailed;
+}
+
+// ── Addresses for listeners and peers ────────────────────────────────
+
+/// A dotted quad or "localhost".
+pub fn parseIp4Bind(text: []const u8) error{InvalidAddress}![4]u8 {
+    if (std.mem.eql(u8, text, "localhost")) return .{ 127, 0, 0, 1 };
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, text, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4) return error.InvalidAddress;
+        out[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
+    }
+    if (i != 4) return error.InvalidAddress;
+    return out;
+}
+
+/// Resolve a host — an IPv4 literal, "localhost", or a DNS name — to an
+/// IPv4 address. Peer links are IPv4 only, so an IPv6-only name fails.
+pub fn resolveIp4(allocator: std.mem.Allocator, host: []const u8) error{ UnknownHost, NoIp4Address, OutOfMemory }![4]u8 {
+    if (parseIp4Bind(host)) |ip| return ip else |_| {}
+    var list = getAddressList(allocator, host, 0) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnknownHost,
+    };
+    defer list.deinit();
+    for (list.addrs) |a| switch (a.inner) {
+        .ip4 => |v| return v.bytes,
+        .ip6 => {},
+    };
+    return error.NoIp4Address;
+}
+
+pub const any_ip4: [4]u8 = .{ 0, 0, 0, 0 };
+
+pub fn isLoopback(ip4: [4]u8) bool {
+    return ip4[0] == 127;
+}
+
+/// An address a peer can be dialed at: not unspecified, multicast,
+/// broadcast, or link-local.
+pub fn isUnicastPeerAddress(ip4: [4]u8) bool {
+    if (std.mem.eql(u8, &ip4, &any_ip4)) return false;
+    if (ip4[0] >= 224) return false; // multicast and above, incl. 255.255.255.255
+    if (ip4[0] == 169 and ip4[1] == 254) return false;
+    return true;
+}
+
+/// Connect with a deadline. The socket is non-blocking on return.
+/// A blocking connect() waits out the kernel's SYN timeout — minutes —
+/// and the peer loop runs on one thread.
+pub fn tcpConnectIp4Timeout(ip4: [4]u8, port: u16, timeout_ms: i32) SocketError!posix.socket_t {
+    const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    errdefer sysClose(fd);
+    const addr = SocketAddrV4.initIp4(ip4, port);
+    const rc = std.c.connect(fd, addr.anyPtr(), addr.anyLen());
+    if (rc != 0) {
+        switch (posix.errno(rc)) {
+            .INPROGRESS, .AGAIN => {},
+            else => return error.ConnectFailed,
+        }
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+        const ready = posix.poll(&fds, timeout_ms) catch return error.ConnectFailed;
+        if (ready == 0) return error.ConnectFailed;
+        var err: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &len) != 0) return error.ConnectFailed;
+        if (err != 0) return error.ConnectFailed;
+    }
+    return fd;
+}
+
+/// The IPv4 address carried by a sockaddr filled in by accept/getsockname,
+/// or null if it is not AF_INET.
+pub fn ip4FromSockaddr(sa: *const posix.sockaddr) ?[4]u8 {
+    if (sa.family != posix.AF.INET) return null;
+    const sin: *const posix.sockaddr.in = @ptrCast(@alignCast(sa));
+    return @bitCast(sin.addr);
+}
+
+/// The IPv4 address and port a socket is bound to.
+pub fn sysLocalIp4(fd: posix.socket_t) SocketError!struct { ip4: [4]u8, port: u16 } {
+    var ss: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (std.c.getsockname(fd, @ptrCast(&ss), &len) != 0) return error.Unexpected;
+    const sin: *const posix.sockaddr.in = @ptrCast(@alignCast(&ss));
+    return .{ .ip4 = @bitCast(sin.addr), .port = std.mem.bigToNative(u16, sin.port) };
+}
+
+test "net: parseIp4Bind accepts dotted quads and localhost, rejects the rest" {
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, try parseIp4Bind("0.0.0.0"));
+    try std.testing.expectEqual([4]u8{ 10, 0, 1, 12 }, try parseIp4Bind("10.0.1.12"));
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, try parseIp4Bind("localhost"));
+    try std.testing.expectError(error.InvalidAddress, parseIp4Bind("10.0.1"));
+    try std.testing.expectError(error.InvalidAddress, parseIp4Bind("flo-2"));
+    try std.testing.expectError(error.InvalidAddress, parseIp4Bind("::1"));
+    try std.testing.expectError(error.InvalidAddress, parseIp4Bind(""));
+}
+
+test "net: resolveIp4 takes literals without DNS and resolves localhost" {
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 5 }, try resolveIp4(std.testing.allocator, "192.168.1.5"));
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, try resolveIp4(std.testing.allocator, "localhost"));
+    try std.testing.expectError(error.UnknownHost, resolveIp4(std.testing.allocator, "no-such-host.invalid"));
+}
+
+test "net: loopback and unicast classification" {
+    try std.testing.expect(isLoopback(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(isLoopback(.{ 127, 5, 6, 7 }));
+    try std.testing.expect(!isLoopback(.{ 10, 0, 0, 1 }));
+    try std.testing.expect(isUnicastPeerAddress(.{ 10, 0, 1, 12 }));
+    try std.testing.expect(isUnicastPeerAddress(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(!isUnicastPeerAddress(any_ip4));
+    try std.testing.expect(!isUnicastPeerAddress(.{ 224, 0, 0, 1 }));
+    try std.testing.expect(!isUnicastPeerAddress(.{ 255, 255, 255, 255 }));
+    try std.testing.expect(!isUnicastPeerAddress(.{ 169, 254, 1, 1 }));
+}
+
+test "net: a connect to a black hole gives up at the deadline" {
+    // 192.0.2.0/24 is reserved for documentation and never routed; a network
+    // that rejects it outright makes the connect fail sooner, which is also fine.
+    const started = @import("time.zig").milliTimestamp();
+    try std.testing.expectError(error.ConnectFailed, tcpConnectIp4Timeout(.{ 192, 0, 2, 1 }, 9, 300));
+    try std.testing.expect(@import("time.zig").milliTimestamp() - started < 3000);
+}
+
+test "net: sysLocalIp4 reports the bound address" {
+    const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer sysClose(fd);
+    const addr = SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try sysBind(fd, addr.anyPtr(), addr.anyLen());
+    const local = try sysLocalIp4(fd);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.ip4);
+    try std.testing.expect(local.port != 0);
 }

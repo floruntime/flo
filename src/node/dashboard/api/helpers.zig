@@ -35,10 +35,12 @@ pub const DashboardContext = struct {
     /// Opaque pointers to Shard structs (set by runtime after shard creation).
     /// Handlers cast via `getShard()` to access projections read-only.
     shard_ptrs: ?[]*anyopaque,
-    /// The node's own protocol listen port. Mutations from the dashboard thread
-    /// are issued as a loopback client request to `127.0.0.1:listen_port`, reusing
-    /// the thread-safe protocol path (the dashboard thread cannot propose directly).
+    /// The node's own client port and the address it is reachable at from
+    /// this process. Mutations from the dashboard thread are issued as a
+    /// client request to it, reusing the thread-safe protocol path (the
+    /// dashboard thread cannot propose directly).
     listen_port: u16 = 9000,
+    client_ip4: [4]u8 = .{ 127, 0, 0, 1 },
     /// Live host telemetry for this node (CPU/MEM/IO), sampled by /cluster/stats.
     host: HostStats.Sampler = .{},
 
@@ -50,6 +52,12 @@ pub const DashboardContext = struct {
             .start_time = @import("stdx").time.milliTimestamp(),
             .shard_ptrs = null,
         };
+    }
+
+    /// `host:port` of this node's client listener, for the dashboard's own writes.
+    pub fn clientEndpoint(self: *const DashboardContext, buf: *[32]u8) ![]const u8 {
+        const a = self.client_ip4;
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{ a[0], a[1], a[2], a[3], self.listen_port });
     }
 
     /// Get uptime in seconds
@@ -306,4 +314,12 @@ test "DashboardContext init and uptime" {
     const ctx = DashboardContext.init(allocator, &metrics, 4);
     try std.testing.expectEqual(@as(u32, 4), ctx.num_shards);
     try std.testing.expect(ctx.uptimeSeconds() <= 1);
+}
+
+test "dashboard: the client endpoint follows the bind address" {
+    var ctx = DashboardContext{ .allocator = std.testing.allocator, .metrics = undefined, .num_shards = 1, .start_time = 0, .shard_ptrs = null, .listen_port = 9000 };
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("127.0.0.1:9000", try ctx.clientEndpoint(&buf));
+    ctx.client_ip4 = .{ 10, 0, 1, 12 };
+    try std.testing.expectEqualStrings("10.0.1.12:9000", try ctx.clientEndpoint(&buf));
 }

@@ -18,20 +18,6 @@ const Allocator = std.mem.Allocator;
 const MetricsRegistry = @import("registry.zig").MetricsRegistry;
 const http = @import("../util/http/mod.zig");
 
-/// Parse a dotted-quad bind address. "localhost" is accepted as a convenience.
-fn parseBindIp(addr_str: []const u8) ![4]u8 {
-    if (std.mem.eql(u8, addr_str, "localhost")) return .{ 127, 0, 0, 1 };
-    var out: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, addr_str, '.');
-    var i: usize = 0;
-    while (it.next()) |part| : (i += 1) {
-        if (i >= 4) return error.InvalidAddress;
-        out[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
-    }
-    if (i != 4) return error.InvalidAddress;
-    return out;
-}
-
 pub const HttpMetricsServer = struct {
     const Self = @This();
 
@@ -69,10 +55,7 @@ pub const HttpMetricsServer = struct {
         const one: u32 = 1;
         try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
 
-        // Bind to the configured address. `[metrics] bind` was parsed and then
-        // ignored, so an operator setting 127.0.0.1 to keep the scrape endpoint
-        // private still got a 0.0.0.0 listener.
-        const bind_ip = parseBindIp(self.bind) catch {
+        const bind_ip = stdx.net.parseIp4Bind(self.bind) catch {
             std.log.err("Invalid metrics bind address '{s}'", .{self.bind});
             return error.InvalidBindAddress;
         };
