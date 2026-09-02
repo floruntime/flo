@@ -415,15 +415,12 @@ pub const RaftNode = struct {
             }
         }
 
-        // Commit only what this RPC verified. Capping by lastIndex() would let
-        // an empty heartbeat commit a stale suffix left behind by a deposed
-        // leader — entries the current leader never sent and is about to
-        // overwrite. Never move commit backwards: a probe from an older prev
-        // verifies less than we may already hold committed.
+        // Commit only what this RPC verified: capping by lastIndex() would let
+        // an empty heartbeat commit a stale suffix left by a deposed leader.
+        // Never move commit backwards — an older heartbeat, delayed or
+        // duplicated in flight, verifies less than we may already hold.
         const last_new = req.prev_log_index + req.entries.len;
-        if (req.leader_commit > self.commit_index) {
-            self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
-        }
+        self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
 
         // Only the prefix this RPC verified counts as matched. lastIndex()
         // may include a stale suffix from an old term that the leader would
@@ -1146,9 +1143,7 @@ test "raft node: follower does not commit its stale suffix on a heartbeat" {
         _ = try follower.log.append(&e);
     }
 
-    // The heartbeat verifies only 1-7. Nothing past 7 may commit — the
-    // leader is about to overwrite 8-10, and a commit here would apply
-    // entries that never existed on the leader.
+    // The heartbeat verifies only 1-7; nothing past 7 may commit.
     const hb = try follower.handleAppendEntries(.{
         .term = 3,
         .leader_id = 1,
@@ -1191,15 +1186,15 @@ test "raft node: a heartbeat below the commit index never lowers it" {
     }
     follower.commit_index = 5;
 
-    // A leader probing from an older prev (e.g. after its own restart)
-    // verifies less than we have already committed. Commit must hold.
+    // An older heartbeat, delayed in flight, lands after a newer one has
+    // already committed past its prev. It verifies only 1-2; commit must hold.
     const resp = try follower.handleAppendEntries(.{
         .term = 1,
         .leader_id = 1,
         .prev_log_index = 2,
         .prev_log_term = 1,
         .entries = &[_]Entry{},
-        .leader_commit = 5,
+        .leader_commit = 6,
     });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), follower.commit_index);
