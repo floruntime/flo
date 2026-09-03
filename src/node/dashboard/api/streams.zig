@@ -77,7 +77,7 @@ fn shardCount(ctx: *DashboardContext) usize {
 /// re-enter through the thread-safe protocol path (see api/workflows.zig).
 fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
     var ep_buf: [32]u8 = undefined;
-    const endpoint = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.listen_port});
+    const endpoint = try ctx.clientEndpoint(&ep_buf);
     var client = client_mod.Client.init(allocator, endpoint);
     errdefer client.deinit();
     try client.connect();

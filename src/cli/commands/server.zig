@@ -73,6 +73,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
                 .stringFlag("log-format", 0, "", "Log format: text, json")
                 .uintFlag("threads", 't', 0, "Number of worker threads (0=auto)")
+                .stringFlag("bind", 0, "", "Address to listen on (default: 0.0.0.0)")
                 .stringFlag("join", 'j', "", "Join existing cluster (host:port[,host:port,...])")
                 .uintFlag("node-id", 'n', 0, "Node ID (0=auto-generate from hostname:port)")
                 .uintFlag("raft-port", 0, 0, "Raft RPC port (default: listen_port + 500)")
@@ -283,6 +284,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const log_format = ctx.getString("log-format");
     const durability = ctx.getString("durability");
 
+    const bind_override = ctx.getString("bind");
+
     // Cluster flags
     const join_addrs = ctx.getString("join");
     const node_id_override = ctx.getChangedUint("node-id");
@@ -363,6 +366,10 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
             // Replace config seeds with CLI seeds
             config.cluster.seeds = join_seeds_list.items;
         }
+    }
+
+    if (bind_override) |b| {
+        if (b.len > 0) config.bind = try config.dupeString(b);
     }
 
     // Apply log configuration

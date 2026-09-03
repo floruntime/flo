@@ -30,7 +30,7 @@ const Durability = @import("../config/server.zig").Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
-const generateNodeId = @import("../raft/network.zig").generateNodeId;
+const cluster_config = @import("../config/cluster.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
@@ -379,6 +379,13 @@ pub const Runtime = struct {
         const data_dir = try stdx.fs.expandTilde(self.allocator, self.config.data_dir);
         defer self.allocator.free(data_dir);
 
+        // `[server] bind` names the interface this node serves on — clients
+        // and peers alike. Reject a bad value before any listener exists.
+        const bind_ip = stdx.net.parseIp4Bind(self.config.listen_addr) catch {
+            log.err("invalid [server] bind '{s}': expected a dotted IPv4 address or \"localhost\"", .{self.config.listen_addr});
+            return error.InvalidBindAddress;
+        };
+
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
             self.shard_count,
             self.config.listen_port,
@@ -518,9 +525,15 @@ pub const Runtime = struct {
         // runs — `flo cluster status` reports it single-node too.
         const cluster_node_id = if (self.config.cluster_node_id > 0)
             self.config.cluster_node_id
-        else
-            generateNodeId(self.config.listen_port);
+        else blk: {
+            var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const host = std.posix.gethostname(&host_buf) catch "localhost";
+            break :blk cluster_config.ClusterConfig.generateNodeId(host, self.config.listen_port);
+        };
         for (0..self.shard_count) |i| shards[i].cluster_node_id = cluster_node_id;
+        if (self.config.clusterListenerWanted()) {
+            log.info("cluster: this node is {d} ({s})", .{ cluster_node_id, if (self.config.cluster_node_id > 0) "configured" else "derived from hostname:port; set [cluster] node_id on cloned images" });
+        }
 
         // 3.5 Start the peer-facing Raft listener only when this node can
         // actually have peers. Note this cannot be decided by comparing
@@ -533,7 +546,7 @@ pub const Runtime = struct {
             const rn = try self.allocator.create(RaftNetwork);
             // RaftNetwork.init binds a socket and can fail.
             errdefer self.allocator.destroy(rn);
-            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port);
+            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip);
             rn.setShardInbox(&shards[0].inbox);
             shards[0].raft_network = rn;
             self.raft_network = rn;
@@ -543,9 +556,9 @@ pub const Runtime = struct {
 
         // 4. Create and start acceptor
         var acceptor = Acceptor.init(write_ends, shards[0].router);
-        try acceptor.listen(self.config.listen_port);
+        try acceptor.listen(bind_ip, self.config.listen_port);
         self.acceptor = acceptor;
-        log.debug("Runtime.start: acceptor listening on port {d}", .{self.config.listen_port});
+        log.debug("Runtime.start: acceptor listening on {s}:{d}", .{ self.config.listen_addr, self.config.listen_port });
 
         // 5. Spawn acceptor thread
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
@@ -600,8 +613,10 @@ pub const Runtime = struct {
 
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
-            // Loopback target for dashboard-issued mutations (see DashboardContext.listen_port).
             ctx.listen_port = self.config.listen_port;
+            // Dashboard writes go through the client port; a node bound to one
+            // interface is not reachable at 127.0.0.1.
+            ctx.client_ip4 = if (std.mem.eql(u8, &bind_ip, &stdx.net.any_ip4)) .{ 127, 0, 0, 1 } else bind_ip;
 
             // Wire shard references for read-only projection access
             if (self.shards) |s| {
@@ -624,22 +639,31 @@ pub const Runtime = struct {
             try server.start();
         }
 
-        // Seed dialing comes last, after every listener is up: the join
-        // handshake does a blocking connect plus a read that can wait
-        // several seconds per attempt, and running it before the acceptor
-        // held the whole node's client readiness hostage to peer latency —
-        // a joiner must accept clients even when its peers are slow or
-        // unreachable.
+        // Seeds are resolved here and dialed by the peer loop, so startup
+        // never waits on a peer and only that thread touches the peer table.
         if (self.raft_network) |rn| {
             for (self.config.cluster_seeds) |seed| {
-                const seed_port = parseSeedPort(seed) orelse continue;
-                // Retry a few times since the seed may still be starting.
+                const target = parseSeedAddress(seed) orelse {
+                    log.warn("cluster: ignoring seed '{s}': expected host:port", .{seed});
+                    continue;
+                };
+                // Retry a few times: in a container the seed's name may not
+                // resolve until it is up.
                 var attempt: usize = 0;
-                while (attempt < 30) : (attempt += 1) {
-                    rn.connectToPeer("127.0.0.1", seed_port) catch {
+                while (attempt < SEED_RESOLVE_ATTEMPTS) : (attempt += 1) {
+                    const ip4 = stdx.net.resolveIp4(self.allocator, target.host) catch |err| {
+                        if (attempt + 1 == SEED_RESOLVE_ATTEMPTS) log.warn("cluster: seed '{s}' did not resolve: {s}; continuing alone", .{ seed, @errorName(err) });
                         stdx.time.sleep(200 * std.time.ns_per_ms);
                         continue;
                     };
+                    switch (seedUsability(bind_ip, ip4, target.port, rn.listen_port)) {
+                        .usable => rn.dialSeed(ip4, target.port),
+                        .self => log.debug("cluster: seed '{s}' is this node; skipping", .{seed}),
+                        .unreachable_from_loopback => {
+                            log.err("cluster: [server] bind is loopback but seed '{s}' is on another host — peers could never reach this node; bind an interface they can", .{seed});
+                            return error.BindUnreachableByPeers;
+                        },
+                    }
                     break;
                 }
             }
@@ -929,11 +953,64 @@ fn detectShardCount(configured: u16) u16 {
     return @intCast(@max(1, @min(shards, 256)));
 }
 
-/// Parse port from a seed address like "127.0.0.1:9500" or "localhost:9500".
-fn parseSeedPort(seed: []const u8) ?u16 {
+const SeedAddress = struct { host: []const u8, port: u16 };
+
+const SEED_RESOLVE_ATTEMPTS: usize = 30;
+
+const SeedUsability = enum { usable, self, unreachable_from_loopback };
+
+/// Whether a resolved seed is worth dialing from a node bound to `bind`.
+/// Our own listener — the bind address, or any loopback address when bound
+/// to 0.0.0.0 — is not; a seed reached by another of our addresses is
+/// recognised on connect (our address at both ends) and dropped. A seed on
+/// another host cannot dial us back if we only listen on loopback.
+fn seedUsability(bind: [4]u8, seed_ip: [4]u8, seed_port: u16, our_raft_port: u16) SeedUsability {
+    // Listening on every interface, any loopback address is ours; bound to
+    // one address, only that address is.
+    const bind_is_any = std.mem.eql(u8, &bind, &stdx.net.any_ip4);
+    const seed_is_us = std.mem.eql(u8, &seed_ip, &bind) or (bind_is_any and stdx.net.isLoopback(seed_ip));
+    if (seed_is_us and seed_port == our_raft_port) return .self;
+    if (stdx.net.isLoopback(bind) and !stdx.net.isLoopback(seed_ip)) return .unreachable_from_loopback;
+    return .usable;
+}
+
+test "seedUsability: our own listener and unreachable binds are caught" {
+    const lo: [4]u8 = .{ 127, 0, 0, 1 };
+    const any: [4]u8 = .{ 0, 0, 0, 0 };
+    const eth: [4]u8 = .{ 10, 0, 1, 12 };
+    const other: [4]u8 = .{ 10, 0, 1, 13 };
+    try std.testing.expectEqual(SeedUsability.self, seedUsability(any, lo, 9500, 9500));
+    try std.testing.expectEqual(SeedUsability.self, seedUsability(eth, eth, 9500, 9500));
+    try std.testing.expectEqual(SeedUsability.usable, seedUsability(any, lo, 9501, 9500));
+    try std.testing.expectEqual(SeedUsability.usable, seedUsability(any, other, 9500, 9500));
+    try std.testing.expectEqual(SeedUsability.usable, seedUsability(eth, other, 9500, 9500));
+    try std.testing.expectEqual(SeedUsability.unreachable_from_loopback, seedUsability(lo, other, 9500, 9500));
+    try std.testing.expectEqual(SeedUsability.usable, seedUsability(lo, .{ 127, 0, 0, 2 }, 9500, 9500));
+}
+
+/// Split a seed like "10.0.1.10:9500" or "flo-2:9500" into host and port.
+/// Peer links are IPv4 only, so a bracketed IPv6 literal is not accepted.
+fn parseSeedAddress(seed: []const u8) ?SeedAddress {
     const colon_idx = std.mem.lastIndexOfScalar(u8, seed, ':') orelse return null;
-    if (colon_idx + 1 >= seed.len) return null;
-    return std.fmt.parseInt(u16, seed[colon_idx + 1 ..], 10) catch null;
+    if (colon_idx == 0 or colon_idx + 1 >= seed.len) return null;
+    const host = seed[0..colon_idx];
+    if (std.mem.indexOfScalar(u8, host, ':') != null or host[0] == '[') return null;
+    const port = std.fmt.parseInt(u16, seed[colon_idx + 1 ..], 10) catch return null;
+    if (port == 0) return null;
+    return .{ .host = host, .port = port };
+}
+
+test "parseSeedAddress keeps the host and rejects what the dialer cannot use" {
+    const a = parseSeedAddress("10.0.1.10:9500").?;
+    try std.testing.expectEqualStrings("10.0.1.10", a.host);
+    try std.testing.expectEqual(@as(u16, 9500), a.port);
+    const b = parseSeedAddress("flo-2:9500").?;
+    try std.testing.expectEqualStrings("flo-2", b.host);
+    try std.testing.expect(parseSeedAddress("9500") == null);
+    try std.testing.expect(parseSeedAddress(":9500") == null);
+    try std.testing.expect(parseSeedAddress("host:") == null);
+    try std.testing.expect(parseSeedAddress("host:0") == null);
+    try std.testing.expect(parseSeedAddress("[::1]:9500") == null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
