@@ -13,7 +13,6 @@
 //!                                   the parent reads them to group failures
 //!                                   by invariant and to tell slow from hung
 //!        [--mode=volatile|persisted] hard-state model (persisted is the default)
-//!        [--no-timer-reset]         drop harness timer re-arming (livelock demo)
 //!        [--small-ring]             shrink the ring so eviction outruns
 //!                                   replication (fails by design)
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
@@ -35,7 +34,6 @@ const Args = struct {
     iterations: ?u64 = null,
     seed_timeout_s: u64 = 300,
     volatile_mode: bool = false,
-    no_timer_reset: bool = false,
     small_ring: bool = false,
     scenario_out: ?[]const u8 = null,
     scenario_in: ?[]const u8 = null,
@@ -51,7 +49,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--mode=volatile|persisted] [--no-timer-reset] [--small-ring] " ++
+            "[--mode=volatile|persisted] [--small-ring] " ++
             "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -70,8 +68,6 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.volatile_mode = true;
         } else if (std.mem.eql(u8, arg, "--mode=persisted")) {
             args.volatile_mode = false;
-        } else if (std.mem.eql(u8, arg, "--no-timer-reset")) {
-            args.no_timer_reset = true;
         } else if (std.mem.eql(u8, arg, "--small-ring")) {
             args.small_ring = true;
         } else if (std.mem.startsWith(u8, arg, "--scenario-out=")) {
@@ -138,7 +134,6 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
 
     var sim = try Simulator.init(allocator, scenario, .{
         .volatile_hard_state = args.volatile_mode or scenario.hard_state == .volatile_state,
-        .no_timer_reset = args.no_timer_reset,
         .verbose = args.verbose,
         .progress_every = if (args.log_path != null) 10_000 else 0,
     });
@@ -210,7 +205,6 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ args.self_exe, seed_arg, log_arg });
     if (args.volatile_mode) try argv.append(allocator, "--mode=volatile");
-    if (args.no_timer_reset) try argv.append(allocator, "--no-timer-reset");
     if (args.small_ring) try argv.append(allocator, "--small-ring");
     if (args.verbose) try argv.append(allocator, "--verbose");
 

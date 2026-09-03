@@ -72,9 +72,9 @@ pub const Violation = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// What a correct node persists. Log appends arrive via the UAL
-/// `on_append` hook; hard state is synced once per tick, before fault
-/// injection, which is equivalent to persist-before-respond because
-/// crashes only happen at the fault stage.
+/// `on_append` hook; term and vote arrive through the node's own
+/// `HardStateSink`, before the node acts on them — the same contract as
+/// production's HARDSTATE file. Nothing else writes hard state here.
 const SimDisk = struct {
     allocator: Allocator,
     term: u64 = 0,
@@ -123,6 +123,15 @@ const SimDisk = struct {
         }) catch @panic("sim disk OOM");
     }
 
+    /// RaftNode persists through this before granting a vote or adopting a
+    /// term. The sim disk never fails a write.
+    fn persistHardState(ctx: *anyopaque, term: u64, voted_for: u32) bool {
+        const self: *SimDisk = @ptrCast(@alignCast(ctx));
+        self.term = term;
+        self.voted_for = voted_for;
+        return true;
+    }
+
     fn crash(self: *SimDisk) void {
         var i = self.entries.items.len;
         while (i > self.durable_len) : (i -= 1) {
@@ -142,7 +151,8 @@ const SimNode = struct {
     raft: RaftNode,
     disk: SimDisk,
     /// Highest term this node has ever held — restarting below it is the
-    /// term-monotonicity violation (fires only in volatile mode).
+    /// term-monotonicity violation (fires only for a node without a
+    /// hard-state sink: volatile mode).
     max_term_seen: u64,
     // Pump state, parallel to raft.peer_ids.
     sent_at: [MAX_PEERS]u64,
@@ -299,12 +309,10 @@ const Checker = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const Options = struct {
-    /// Model production's unpersisted hard state instead of the spec.
+    /// Give nodes no hard-state sink: what a node with no data dir does.
+    /// Every restart then re-enters term 0 — the double-vote hazard the
+    /// sink exists to close, kept here as the demonstrator of its absence.
     volatile_hard_state: bool = false,
-    /// Disable the harness's timer re-arming on valid AppendEntries and
-    /// vote grants — demonstrates the livelock the in-node reset gap
-    /// causes. Timers are still armed once at start/restart.
-    no_timer_reset: bool = false,
     /// Print per-phase progress.
     verbose: bool = false,
     /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
@@ -418,7 +426,6 @@ pub const Simulator = struct {
         }
         // Hooks attach after (empty) replay, mirroring production wiring.
         for (self.nodes) |*node| self.attachDisk(node);
-        for (self.nodes) |*node| self.armTimer(node);
         return self;
     }
 
@@ -441,36 +448,28 @@ pub const Simulator = struct {
         self.delivery.deinit(self.allocator);
     }
 
-    fn raftConfig(self: *const Simulator) raft_node.Config {
+    /// The node owns its election timer and its jitter; the seed comes
+    /// from the run PRNG so a seed replays exactly and identical-log
+    /// candidates do not time out in lockstep.
+    fn raftConfig(self: *Simulator) raft_node.Config {
         return .{
             .election_timeout_min_ms = self.scenario.election_timeout_min_ms,
             .election_timeout_max_ms = self.scenario.election_timeout_max_ms,
             .heartbeat_interval_ms = self.scenario.heartbeat_interval_ms,
             .max_entries_per_batch = MAX_BATCH,
             .enable_pre_vote = false,
+            .rng_seed = self.prng.random().int(u64) | 1,
         };
     }
 
+    /// Log appends and hard state both flow into the sim disk through the
+    /// node's own hooks. Volatile mode attaches no hard-state sink.
     fn attachDisk(self: *Simulator, node: *SimNode) void {
-        _ = self;
         node.raft.log.ual.on_append_ctx = @ptrCast(&node.disk);
         node.raft.log.ual.on_append = SimDisk.onAppend;
-    }
-
-    /// Timers are harness-owned: RaftNode never arms its own (a fresh
-    /// deadline of 0 means disabled), so a wired runtime must do this too.
-    /// Jitter comes from the run PRNG, not the node's deterministic
-    /// per-id formula, so identical-log candidates don't interleave
-    /// adversarially for many terms.
-    fn armTimer(self: *Simulator, node: *SimNode) void {
-        const r = self.prng.random();
-        const jitter = r.intRangeAtMost(
-            u64,
-            self.scenario.election_timeout_min_ms,
-            self.scenario.election_timeout_max_ms,
-        );
-        node.raft.election_deadline_ms = self.now + jitter;
-        node.raft.current_time_ms = self.now;
+        if (!self.options.volatile_hard_state) {
+            node.raft.hard_state_sink = .{ .ctx = @ptrCast(&node.disk), .persist = SimDisk.persistHardState };
+        }
     }
 
     fn node_(self: *Simulator, id: NodeId) *SimNode {
@@ -510,10 +509,6 @@ pub const Simulator = struct {
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
-        if (self.options.volatile_hard_state) {
-            node.disk.term = 0;
-            node.disk.voted_for = 0;
-        }
         // Replay the durable log before attaching the hook, exactly as
         // production wires persistence after segment replay — a hook
         // active during replay would re-feed the disk.
@@ -529,13 +524,14 @@ pub const Simulator = struct {
             entry.header.crc32c = entry.computeCrc();
             _ = node.raft.log.append(&entry) catch @panic("sim replay append");
         }
+        // What the sink persisted is what comes back — nothing in volatile
+        // mode, so such a node restarts at term 0.
         node.raft.current_term = node.disk.term;
         node.raft.voted_for = node.disk.voted_for;
         self.attachDisk(node);
         node.up = true;
         node.sent_at = @splat(0);
         node.last_heartbeat = @splat(0);
-        self.armTimer(node);
         self.restarts += 1;
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
@@ -596,7 +592,6 @@ pub const Simulator = struct {
         switch (msg.body) {
             .vote_req => |req| {
                 const resp = node.raft.handleVoteRequest(req);
-                if (resp.vote_granted and !self.options.no_timer_reset) self.armTimer(node);
                 try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .vote_resp = resp });
             },
             .vote_resp => |resp| {
@@ -640,12 +635,6 @@ pub const Simulator = struct {
                     });
                     return;
                 };
-                // Any append from a legitimate current-term leader proves
-                // the leader is alive — success or not. Re-arming only on
-                // success livelocks a log-mismatched follower: it deposes
-                // its leader every timeout while the one-step next_index
-                // walk restarts from scratch.
-                if (result.term == req.term and !self.options.no_timer_reset) self.armTimer(node);
                 try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .append_resp = result });
             },
             .append_resp => |resp| {
@@ -663,7 +652,6 @@ pub const Simulator = struct {
             if (result.start_election) {
                 const req = node.raft.startElection();
                 node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
-                self.armTimer(node);
                 for (0..node.raft.peer_count) |i| {
                     try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
                 }
@@ -871,13 +859,13 @@ pub const Simulator = struct {
         }
     }
 
-    // ── Durability + hard-state sync (runs before fault injection) ─────
+    // ── Log durability (runs before fault injection) ───────────────────
+    // Hard state is not synced here: it reaches the disk only through the
+    // node's sink, so a term the node never persisted is a term it loses.
 
     fn syncStableStorage(self: *Simulator) void {
         for (self.nodes) |*node| {
             if (!node.up) continue;
-            node.disk.term = node.raft.current_term;
-            node.disk.voted_for = node.raft.voted_for;
             switch (self.scenario.durability) {
                 .sync => node.disk.durable_len = node.disk.entries.items.len,
                 .async_flush => {
@@ -1158,7 +1146,7 @@ test "vopr sim: same seed twice produces identical summaries" {
     }
 }
 
-test "vopr sim: volatile hard state trips term monotonicity on restart" {
+test "vopr sim: a node without a hard-state sink trips term monotonicity on restart" {
     var scenario = Scenario.calm(5);
     // Crashes must be rarer than election timeouts, or no node lives long
     // enough to leave term 0 and there is nothing for monotonicity to
@@ -1175,6 +1163,26 @@ test "vopr sim: volatile hard state trips term monotonicity on restart" {
         if (v.invariant == .term_monotonicity) found = true;
     }
     try testing.expect(found);
+}
+
+test "vopr sim: the sink is the only path hard state takes to disk" {
+    var scenario = Scenario.calm(5);
+    scenario.crash_permille = 1;
+    scenario.restart_permille = 50;
+    scenario.ticks_safety = 10_000;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    try testing.expect(s.ok);
+    try testing.expect(s.restarts > 0);
+    try testing.expect(s.elections_won > 0);
+    // With the harness's per-tick copy gone, disk and node agree only
+    // because the node persisted every term and vote before using it.
+    for (sim.nodes) |*node| {
+        try testing.expectEqual(node.raft.current_term, node.disk.term);
+        try testing.expectEqual(node.raft.voted_for, node.disk.voted_for);
+        try testing.expect(node.disk.term > 0);
+    }
 }
 
 test "vopr sim: crashes with sync durability still converge" {
