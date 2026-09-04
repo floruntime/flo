@@ -650,7 +650,8 @@ pub const Simulator = struct {
             if (!node.up) continue;
             const result = node.raft.tick(self.now);
             if (result.start_election) {
-                const req = node.raft.startElection();
+                // The sim disk never refuses a write, so this always starts.
+                const req = node.raft.startElection() orelse unreachable;
                 node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
                 for (0..node.raft.peer_count) |i| {
                     try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
