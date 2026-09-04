@@ -4,17 +4,19 @@
 //! has one RaftNode instance. In single-node mode the node self-elects as
 //! leader immediately.
 //!
-//! Persistent state (fsync'd on every vote):
+//! Persistent state — handed to `hard_state_sink` before the node acts on
+//! a new term or vote, so a restart cannot vote twice in one term:
 //!   - current_term
 //!   - voted_for
-//!   - node_id
 //!
 //! Volatile state:
 //!   - role (follower/candidate/leader)
 //!   - commit_index
 //!   - last_applied
 //!   - leader_id
-//!   - election timer
+//!   - election timer (owned here: armed on the first tick as a follower,
+//!     re-armed by a current-term AppendEntries, a granted vote, an election
+//!     start and a step-down; jitter from the node's own PRNG)
 //!   - per-peer next_index/match_index (leader only)
 
 const std = @import("std");
@@ -59,6 +61,19 @@ pub const Config = struct {
     max_entries_per_batch: u32 = 64,
     /// Enable pre-vote protocol (prevents disruptive elections).
     enable_pre_vote: bool = true,
+    /// Seed for election-timeout jitter. 0 draws one from OS entropy; a
+    /// simulation passes a per-node seed so a run replays exactly.
+    rng_seed: u64 = 0,
+};
+
+/// Where the node writes its hard state. `persist` returns only once the
+/// state is durable and reports its own failures. A false return means the
+/// state is not durable: a vote is then not
+/// granted, an election is not started and bootstrap fails; an adopted
+/// higher term is kept in memory anyway and counted in `persist_failures`.
+pub const HardStateSink = struct {
+    ctx: *anyopaque,
+    persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId) bool,
 };
 
 /// Result of processing a tick (timer advancement).
@@ -115,12 +130,19 @@ pub const AppendResponse = struct {
 
 pub const MAX_PEERS: usize = 7;
 
+/// A timer seed from OS entropy, for nodes no simulation is replaying.
+fn entropySeed() u64 {
+    var buf: [8]u8 = undefined;
+    @import("stdx").io.instance().random(&buf);
+    return std.mem.readInt(u64, &buf, .little);
+}
+
 pub const RaftNode = struct {
     // ── Identity ────────────────────────────────────────────────────────
     id: NodeId,
     group_id: u32,
 
-    // ── Persistent state (must be fsync'd before responding to RPCs) ───
+    // ── Persistent state (through `hard_state_sink`; see the file header) ──
     current_term: u64,
     voted_for: NodeId,
 
@@ -133,6 +155,13 @@ pub const RaftNode = struct {
     // ── Election timer ─────────────────────────────────────────────────
     election_deadline_ms: u64,
     current_time_ms: u64,
+    rng: std.Random.DefaultPrng,
+
+    // ── Hard-state persistence ─────────────────────────────────────────
+    hard_state_sink: ?HardStateSink,
+    /// Persist calls that returned false. Each one is a term or vote the
+    /// node holds in memory only.
+    persist_failures: u64,
 
     // ── Leader state ───────────────────────────────────────────────────
     peers: [MAX_PEERS]PeerState,
@@ -179,6 +208,9 @@ pub const RaftNode = struct {
             .last_applied = 0,
             .election_deadline_ms = 0,
             .current_time_ms = 0,
+            .rng = std.Random.DefaultPrng.init(if (config.rng_seed != 0) config.rng_seed else entropySeed()),
+            .hard_state_sink = null,
+            .persist_failures = 0,
             .peers = std.mem.zeroes([MAX_PEERS]PeerState),
             .peer_ids = std.mem.zeroes([MAX_PEERS]NodeId),
             .peer_count = 0,
@@ -224,15 +256,21 @@ pub const RaftNode = struct {
 
     // ── Single-Node Bootstrap ───────────────────────────────────────────
 
-    /// Bootstrap as a single-node cluster. Self-elects as leader.
+    /// Bootstrap as a single-node cluster. Self-elects as leader in a new
+    /// term — term 1 on a fresh node, one past the persisted term after a
+    /// restart — and appends that term's noop at `lastIndex() + 1`, so a
+    /// restored log continues without a gap. Fails if the new term cannot
+    /// be made durable: leading in a term a crash would forget is how a
+    /// node ends up voting twice in it.
     pub fn bootstrap(self: *RaftNode) !void {
-        log.debug("Raft: bootstrapping single-node, node_id={d}, group_id={d}", .{ self.id, self.group_id });
-        self.current_term = 1;
+        log.debug("Raft: bootstrapping single-node, node_id={d}, group_id={d}, prior_term={d}, last_index={d}", .{ self.id, self.group_id, self.current_term, self.log.lastIndex() });
+        self.current_term += 1;
         self.voted_for = self.id;
+        if (!self.persistHardState()) return error.HardStateNotDurable;
         self.role = .leader;
         self.leader_id = self.id;
-        self.elections_won = 1;
-        self.terms_seen = 1;
+        self.elections_won += 1;
+        self.terms_seen += 1;
 
         // Append a noop entry to establish the leader's commit index
         var noop = entry_mod.buildEntry(
@@ -246,7 +284,8 @@ pub const RaftNode = struct {
         noop.header.crc32c = noop.computeCrc();
         const idx = try self.log.append(&noop);
         self.commit_index = idx;
-        log.debug("Raft: bootstrap complete, leader at term=1, commit_index={d}", .{idx});
+        self.last_applied = idx;
+        log.debug("Raft: bootstrap complete, leader at term={d}, commit_index={d}", .{ self.current_term, idx });
     }
 
     // ── Tick (Timer) ────────────────────────────────────────────────────
@@ -262,8 +301,11 @@ pub const RaftNode = struct {
                 result.send_heartbeats = true;
             },
             .follower, .candidate => {
-                // Check election timeout
-                if (self.election_deadline_ms > 0 and now_ms >= self.election_deadline_ms) {
+                // First tick: arm here rather than in init, which has no
+                // clock, so a node whose leader never speaks still elects.
+                if (self.election_deadline_ms == 0) {
+                    self.resetElectionTimer(now_ms);
+                } else if (now_ms >= self.election_deadline_ms) {
                     result.start_election = true;
                 }
             },
@@ -272,30 +314,53 @@ pub const RaftNode = struct {
         return result;
     }
 
-    /// Set the election deadline based on randomized timeout.
+    /// Arm the election timer: `now + min + jitter`, jitter drawn from the
+    /// node's PRNG so two nodes with identical logs do not time out in
+    /// lockstep for many terms.
     pub fn resetElectionTimer(self: *RaftNode, now_ms: u64) void {
-        // Simple deterministic "random" for testing — use node_id as seed
         const range = self.config.election_timeout_max_ms - self.config.election_timeout_min_ms;
-        const jitter = (self.current_term *% 7 +% self.id *% 13) % (range + 1);
+        const jitter = self.rng.random().intRangeAtMost(u64, 0, range);
         self.election_deadline_ms = now_ms + self.config.election_timeout_min_ms + jitter;
         self.current_time_ms = now_ms;
+    }
+
+    /// Re-arm from the last tick's clock — for events that carry no time.
+    /// Before the first tick there is no clock: arming from 0 would put the
+    /// deadline in the past and the first tick would elect against a leader
+    /// that just spoke, so the first tick arms instead.
+    fn rearmElectionTimer(self: *RaftNode) void {
+        if (self.current_time_ms == 0) return;
+        self.resetElectionTimer(self.current_time_ms);
     }
 
     // ── Election ────────────────────────────────────────────────────────
 
     /// Start an election (become candidate, increment term, vote for self).
-    /// Returns the VoteRequest to broadcast to peers.
-    pub fn startElection(self: *RaftNode) VoteRequest {
+    /// Returns the VoteRequest to broadcast to peers, or null when the
+    /// self-vote could not be made durable: the node reverts to a follower
+    /// at its old term and tries again at the next timeout. Leading on a vote
+    /// a crash would forget is how a node ends up voting twice in a term.
+    pub fn startElection(self: *RaftNode) ?VoteRequest {
+        const prior_term = self.current_term;
+        const prior_vote = self.voted_for;
         self.current_term += 1;
+        self.voted_for = self.id;
+        if (!self.persistHardState()) {
+            self.current_term = prior_term;
+            self.voted_for = prior_vote;
+            self.role = .follower;
+            self.rearmElectionTimer();
+            return null;
+        }
         self.role = .candidate;
         log.debug("Raft: starting election, node_id={d}, new_term={d}", .{ self.id, self.current_term });
-        self.voted_for = self.id;
         self.leader_id = NO_VOTE;
         self.votes_received = 1; // vote for self
         self.votes_needed = self.quorum();
         self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
         self.elections_started += 1;
         self.terms_seen += 1;
+        self.rearmElectionTimer();
 
         return .{
             .term = self.current_term,
@@ -328,8 +393,14 @@ pub const RaftNode = struct {
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id };
         }
 
-        // Grant vote
+        // Grant the vote only once it is durable: a vote held in memory
+        // alone is one this node could cast again after a crash.
         self.voted_for = req.candidate_id;
+        if (!self.persistHardState()) {
+            self.voted_for = NO_VOTE;
+            return .{ .term = self.current_term, .vote_granted = false, .from = self.id };
+        }
+        self.rearmElectionTimer();
         log.debug("Raft: vote granted to node={d}, term={d}", .{ req.candidate_id, self.current_term });
         return .{ .term = self.current_term, .vote_granted = true, .from = self.id };
     }
@@ -381,11 +452,15 @@ pub const RaftNode = struct {
             };
         }
 
-        // Valid leader — reset election timer
+        // A current-term leader is alive whether or not this batch fits our
+        // log, so the timer resets before log matching: re-arming only on
+        // success livelocks a mismatched follower, which would depose its
+        // leader every timeout while the one-step next_index walk starts over.
         self.leader_id = req.leader_id;
         if (self.role == .candidate) {
             self.role = .follower;
         }
+        self.rearmElectionTimer();
 
         // Log matching: check prev_log_index / prev_log_term
         if (req.prev_log_index > 0) {
@@ -507,8 +582,22 @@ pub const RaftNode = struct {
         self.current_term = new_term;
         self.role = .follower;
         self.voted_for = NO_VOTE;
+        // Kept in memory even if it cannot be persisted: acting in the old
+        // term is the worse outcome.
+        _ = self.persistHardState();
         self.leader_id = NO_VOTE;
         self.terms_seen += 1;
+        self.rearmElectionTimer();
+    }
+
+    /// Hand (current_term, voted_for) to the sink. True when durable, or when
+    /// there is no sink (an ephemeral node has nothing to persist to).
+    fn persistHardState(self: *RaftNode) bool {
+        const sink = self.hard_state_sink orelse return true;
+        if (sink.persist(sink.ctx, self.current_term, self.voted_for)) return true;
+        self.persist_failures += 1;
+        log.debug("Raft: hard state not durable, node_id={d}, group_id={d}, term={d}, voted_for={d} (persist_failures={d})", .{ self.id, self.group_id, self.current_term, self.voted_for, self.persist_failures });
+        return false;
     }
 
     fn becomeLeader(self: *RaftNode) void {
@@ -668,7 +757,7 @@ test "raft node: startElection transitions to candidate" {
     var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
     defer node.deinit();
 
-    const vote_req = node.startElection();
+    const vote_req = node.startElection().?;
 
     try testing.expectEqual(Role.candidate, node.role);
     try testing.expectEqual(@as(u64, 1), node.current_term);
@@ -773,7 +862,7 @@ test "raft node: election win with majority" {
     try testing.expectEqual(@as(u8, 2), node.quorum());
 
     // Start election
-    _ = node.startElection();
+    _ = node.startElection().?;
     try testing.expectEqual(Role.candidate, node.role);
     try testing.expectEqual(@as(u8, 1), node.votes_received); // self-vote
 
@@ -798,7 +887,7 @@ test "raft node: election loss — not enough votes" {
     node.addPeer(2);
     node.addPeer(3);
 
-    _ = node.startElection();
+    _ = node.startElection().?;
 
     // Receive rejection
     const won = node.handleVoteResponse(.{
@@ -891,7 +980,7 @@ test "raft node: leader commit advancement with 3-node cluster" {
     node.addPeer(3);
 
     // Win election
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
 
@@ -1059,7 +1148,7 @@ test "raft node: duplicate vote from same peer counts once" {
     node.addPeer(5);
     try testing.expectEqual(@as(u8, 3), node.quorum());
 
-    _ = node.startElection();
+    _ = node.startElection().?;
 
     // Peer 2 grants twice (network duplication) — must not reach quorum
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
@@ -1085,7 +1174,7 @@ test "raft node: vote from unknown node does not count" {
     node.addPeer(4);
     node.addPeer(5);
 
-    _ = node.startElection();
+    _ = node.startElection().?;
 
     const won = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 99 });
     try testing.expect(!won);
@@ -1104,12 +1193,12 @@ test "raft node: startElection resets vote tracking" {
     node.addPeer(4);
     node.addPeer(5);
 
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
     try testing.expectEqual(@as(u8, 2), node.votes_received);
 
     // New election: nothing carries over, and peer 2 may grant again
-    _ = node.startElection();
+    _ = node.startElection().?;
     try testing.expectEqual(@as(u8, 1), node.votes_received);
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
     try testing.expectEqual(@as(u8, 2), node.votes_received);
@@ -1219,7 +1308,7 @@ test "raft node: a success ack from an earlier term does not advance match or co
     defer node.deinit();
     node.addPeer(2);
     node.addPeer(3);
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
     _ = try node.propose(.kv_put, 0, 0, "t1");
@@ -1228,7 +1317,7 @@ test "raft node: a success ack from an earlier term does not advance match or co
     // term-3 entry goes at index 2.
     _ = node.handleVoteRequest(.{ .term = 2, .candidate_id = 3, .last_log_index = 1, .last_log_term = 1 });
     try testing.expectEqual(Role.follower, node.role);
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = 3, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
     try testing.expectEqual(@as(u64, 3), node.current_term);
@@ -1259,7 +1348,7 @@ test "raft node: reordered success acks keep match_index monotonic" {
     defer node.deinit();
     node.addPeer(2);
     node.addPeer(3);
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     for (0..3) |_| _ = try node.propose(.kv_put, 0, 0, "e");
 
@@ -1279,7 +1368,7 @@ test "raft node: a late rejection never backs next_index off below the match" {
     defer node.deinit();
     node.addPeer(2);
     node.addPeer(3);
-    _ = node.startElection();
+    _ = node.startElection().?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     for (0..3) |_| _ = try node.propose(.kv_put, 0, 0, "e");
 
@@ -1290,4 +1379,269 @@ test "raft node: a late rejection never backs next_index off below the match" {
     node.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2 });
     try testing.expectEqual(@as(u64, 3), node.peers[0].match_index);
     try testing.expectEqual(@as(u64, 4), node.peers[0].next_index);
+}
+
+test "raft node: a fresh follower arms its timer on the first tick" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 7 });
+    defer node.deinit();
+
+    try testing.expectEqual(@as(u64, 0), node.election_deadline_ms);
+    const first = node.tick(1000);
+    try testing.expect(!first.start_election);
+    try testing.expect(node.election_deadline_ms >= 1150);
+    try testing.expect(node.election_deadline_ms <= 1300);
+
+    // The timer fires once, at its deadline, without anyone else arming it.
+    const before = node.tick(node.election_deadline_ms - 1);
+    try testing.expect(!before.start_election);
+    const due = node.tick(node.election_deadline_ms);
+    try testing.expect(due.start_election);
+}
+
+test "raft node: jitter comes from the seed, not the node id" {
+    const allocator = testing.allocator;
+
+    // Same id, different seeds → different deadlines; same seed → the same.
+    var a = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 1, .election_timeout_min_ms = 100, .election_timeout_max_ms = 10_000 });
+    defer a.deinit();
+    var b = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 2, .election_timeout_min_ms = 100, .election_timeout_max_ms = 10_000 });
+    defer b.deinit();
+    var c = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 1, .election_timeout_min_ms = 100, .election_timeout_max_ms = 10_000 });
+    defer c.deinit();
+    a.resetElectionTimer(0);
+    b.resetElectionTimer(0);
+    c.resetElectionTimer(0);
+    try testing.expect(a.election_deadline_ms != b.election_deadline_ms);
+    try testing.expectEqual(a.election_deadline_ms, c.election_deadline_ms);
+
+    // Successive arms of one node vary too.
+    var seen_different = false;
+    var prev = a.election_deadline_ms;
+    for (0..8) |_| {
+        a.resetElectionTimer(0);
+        if (a.election_deadline_ms != prev) seen_different = true;
+        prev = a.election_deadline_ms;
+    }
+    try testing.expect(seen_different);
+}
+
+test "raft node: a current-term AppendEntries re-arms the timer even when the log mismatches" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 2, 1000, 8192, .{ .rng_seed = 3 });
+    defer node.deinit();
+    // Already in the leader's term, so nothing but the append itself can
+    // touch the timer (a term bump would re-arm through the step-down).
+    node.current_term = 1;
+    _ = node.tick(1000);
+    const armed_at_start = node.election_deadline_ms;
+
+    // Time passes; a heartbeat whose prev_log does not match still proves
+    // the leader is alive.
+    _ = node.tick(1200);
+    const resp = try node.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = 1,
+        .prev_log_index = 5,
+        .prev_log_term = 1,
+        .entries = &[_]Entry{},
+        .leader_commit = 0,
+    });
+    try testing.expect(!resp.success);
+    try testing.expect(node.election_deadline_ms >= 1350);
+    try testing.expect(node.election_deadline_ms > armed_at_start);
+
+    // A stale-term append proves nothing and leaves the timer alone.
+    node.current_term = 5;
+    const deadline_before = node.election_deadline_ms;
+    _ = node.tick(1400);
+    _ = try node.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = 1,
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &[_]Entry{},
+        .leader_commit = 0,
+    });
+    try testing.expectEqual(deadline_before, node.election_deadline_ms);
+}
+
+test "raft node: a granted vote and an election start re-arm the timer" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 2, 1000, 4096, .{ .rng_seed = 4 });
+    defer node.deinit();
+    _ = node.tick(1000);
+
+    _ = node.tick(1250);
+    const granted = node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(granted.vote_granted);
+    try testing.expect(node.election_deadline_ms >= 1400);
+
+    // A refused vote (already voted this term) does not.
+    const deadline_after_grant = node.election_deadline_ms;
+    _ = node.tick(1300);
+    const refused = node.handleVoteRequest(.{ .term = 1, .candidate_id = 3, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(!refused.vote_granted);
+    try testing.expectEqual(deadline_after_grant, node.election_deadline_ms);
+
+    _ = node.tick(2000);
+    _ = node.startElection().?;
+    try testing.expect(node.election_deadline_ms >= 2150);
+}
+
+const SinkRecorder = struct {
+    term: u64 = 0,
+    voted_for: NodeId = 0,
+    calls: u32 = 0,
+    fail: bool = false,
+
+    fn persist(ctx: *anyopaque, term: u64, voted_for: NodeId) bool {
+        const self: *SinkRecorder = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.fail) return false;
+        self.term = term;
+        self.voted_for = voted_for;
+        return true;
+    }
+
+    fn sink(self: *SinkRecorder) HardStateSink {
+        return .{ .ctx = @ptrCast(self), .persist = persist };
+    }
+};
+
+test "raft node: term adoption and votes reach the sink before the node acts on them" {
+    const allocator = testing.allocator;
+
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(allocator, 2, 1000, 4096, .{ .rng_seed = 5 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+
+    // A higher-term request: the term is persisted by the step-down, the
+    // vote by the grant.
+    const resp = node.handleVoteRequest(.{ .term = 4, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(resp.vote_granted);
+    try testing.expectEqual(@as(u64, 4), rec.term);
+    try testing.expectEqual(@as(NodeId, 1), rec.voted_for);
+
+    // Starting an election persists the new term and the self-vote.
+    _ = node.startElection().?;
+    try testing.expectEqual(@as(u64, 5), rec.term);
+    try testing.expectEqual(@as(NodeId, 2), rec.voted_for);
+
+    // A higher-term AppendEntries persists the adopted term with no vote.
+    _ = try node.handleAppendEntries(.{ .term = 9, .leader_id = 3, .prev_log_index = 0, .prev_log_term = 0, .entries = &[_]Entry{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(u64, 9), rec.term);
+    try testing.expectEqual(NO_VOTE, rec.voted_for);
+    try testing.expectEqual(@as(u64, 0), node.persist_failures);
+}
+
+test "raft node: a vote that cannot be made durable is not granted" {
+    const allocator = testing.allocator;
+
+    var rec = SinkRecorder{ .fail = true };
+    var node = try RaftNode.init(allocator, 2, 1000, 4096, .{ .rng_seed = 6 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+
+    const resp = node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(!resp.vote_granted);
+    try testing.expectEqual(NO_VOTE, node.voted_for);
+    try testing.expect(node.persist_failures > 0);
+
+    // Once the disk is back, the same request is granted.
+    rec.fail = false;
+    const again = node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(again.vote_granted);
+    try testing.expectEqual(@as(NodeId, 1), rec.voted_for);
+}
+
+test "raft node: bootstrap after a restart opens a new term and continues the log" {
+    const allocator = testing.allocator;
+
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(allocator, 1, 1000, 8192, .{ .rng_seed = 8 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+
+    // The durable state a restart hands back: term 3, and a log of 1-4.
+    node.current_term = 3;
+    for (1..5) |i| {
+        var e = testEntry(if (i < 3) 1 else 3, i, "restored");
+        _ = try node.log.append(&e);
+    }
+
+    try node.bootstrap();
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectEqual(@as(u64, 4), node.current_term);
+    try testing.expectEqual(@as(u64, 4), rec.term);
+    try testing.expectEqual(@as(NodeId, 1), rec.voted_for);
+    // The noop sits at 5, in term 4 — no gap, no phantom index.
+    try testing.expectEqual(@as(u64, 5), node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 4), node.log.entryTerm(5).?);
+    try testing.expectEqual(@as(u64, 5), node.commit_index);
+    try testing.expectEqual(@as(u64, 5), node.last_applied);
+    const r = try node.propose(.kv_put, 0, 0, "next");
+    try testing.expectEqual(@as(u64, 6), r.index);
+    try testing.expectEqual(@as(u64, 4), r.term);
+}
+
+test "raft node: bootstrap refuses to lead a term it cannot persist" {
+    const allocator = testing.allocator;
+
+    var rec = SinkRecorder{ .fail = true };
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+
+    try testing.expectError(error.HardStateNotDurable, node.bootstrap());
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(u64, 0), node.log.lastIndex());
+}
+
+test "raft node: an election whose self-vote cannot be persisted does not start" {
+    const allocator = testing.allocator;
+
+    var rec = SinkRecorder{ .fail = true };
+    var node = try RaftNode.init(allocator, 1, 1000, 4096, .{ .rng_seed = 10 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.addPeer(2);
+    node.addPeer(3);
+    node.current_term = 4;
+    _ = node.tick(1000);
+
+    try testing.expect(node.startElection() == null);
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(u64, 4), node.current_term);
+    try testing.expectEqual(NO_VOTE, node.voted_for);
+    try testing.expectEqual(@as(u64, 0), node.elections_started);
+
+    // A vote in term 5 is still available to another candidate: nothing
+    // of the aborted attempt survives to conflict with it.
+    rec.fail = false;
+    const resp = node.handleVoteRequest(.{ .term = 5, .candidate_id = 2, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(resp.vote_granted);
+    try testing.expectEqual(@as(u64, 5), rec.term);
+    try testing.expectEqual(@as(NodeId, 2), rec.voted_for);
+}
+
+test "raft node: events before the first tick do not arm a deadline in the past" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 2, 1000, 4096, .{ .rng_seed = 11 });
+    defer node.deinit();
+    node.current_term = 1;
+
+    // A leader speaks before this node has ever ticked.
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &[_]Entry{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(u64, 0), node.election_deadline_ms);
+
+    // The first tick arms from the real clock; it must not elect.
+    const first = node.tick(50_000);
+    try testing.expect(!first.start_election);
+    try testing.expect(node.election_deadline_ms >= 50_150);
 }

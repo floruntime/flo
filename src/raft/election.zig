@@ -47,7 +47,6 @@ pub const ElectionResult = enum(u8) {
 pub const ElectionManager = struct {
     node: *RaftNode,
     phase: ElectionPhase,
-    rng: std.Random.Xoshiro256,
 
     // Pre-vote tracking
     pre_votes_received: u8,
@@ -58,11 +57,12 @@ pub const ElectionManager = struct {
     pre_vote_successes: u64,
     pre_vote_failures: u64,
 
+    /// `seed` reseeds the node's timer jitter so a simulation is reproducible.
     pub fn init(node: *RaftNode, seed: u64) ElectionManager {
+        node.rng = std.Random.DefaultPrng.init(seed);
         return .{
             .node = node,
             .phase = .idle,
-            .rng = std.Random.Xoshiro256.init(seed),
             .pre_votes_received = 0,
             .pre_votes_needed = 0,
             .pre_vote_rounds = 0,
@@ -73,24 +73,17 @@ pub const ElectionManager = struct {
 
     // ── Timeout Randomization ───────────────────────────────────────────
 
-    /// Set election deadline using proper RNG-based randomization.
     pub fn randomizeTimeout(self: *ElectionManager, now_ms: u64) void {
-        const cfg = self.node.config;
-        const min = cfg.election_timeout_min_ms;
-        const max = cfg.election_timeout_max_ms;
-        const range = max - min;
-
-        const jitter = self.rng.random().intRangeAtMost(u64, 0, range);
-        self.node.election_deadline_ms = now_ms + min + jitter;
-        self.node.current_time_ms = now_ms;
+        self.node.resetElectionTimer(now_ms);
     }
 
     // ── Election Start ──────────────────────────────────────────────────
 
     /// Begin an election. If pre-vote is enabled, starts with a pre-vote
     /// phase. Otherwise, proceeds directly to a real election.
-    /// Returns the VoteRequest to broadcast to peers.
-    pub fn beginElection(self: *ElectionManager) VoteRequest {
+    /// Returns the VoteRequest to broadcast to peers, or null when the
+    /// node could not persist its self-vote (see `RaftNode.startElection`).
+    pub fn beginElection(self: *ElectionManager) ?VoteRequest {
         if (self.node.config.enable_pre_vote and self.node.peer_count > 0) {
             return self.startPreVote();
         } else {
@@ -115,9 +108,12 @@ pub const ElectionManager = struct {
     }
 
     /// Start a real election (increments term, votes for self).
-    fn startRealElection(self: *ElectionManager) VoteRequest {
+    fn startRealElection(self: *ElectionManager) ?VoteRequest {
+        const req = self.node.startElection() orelse {
+            self.phase = .idle;
+            return null;
+        };
         self.phase = .voting;
-        const req = self.node.startElection();
         return req;
     }
 
@@ -165,8 +161,8 @@ pub const ElectionManager = struct {
     }
 
     /// Advance from pre-vote to real election after pre-vote quorum.
-    /// Returns the VoteRequest to broadcast.
-    pub fn advanceToRealElection(self: *ElectionManager) VoteRequest {
+    /// Returns the VoteRequest to broadcast, or null (see `beginElection`).
+    pub fn advanceToRealElection(self: *ElectionManager) ?VoteRequest {
         return self.startRealElection();
     }
 
@@ -342,7 +338,7 @@ const ClusterSim = struct {
     /// Run one election round for node at src_idx.
     /// Returns whether the node became leader.
     fn runElection(self: *ClusterSim, src_idx: usize) bool {
-        const req = self.elections[src_idx].beginElection();
+        const req = self.elections[src_idx].beginElection().?;
         const responses = self.broadcastVoteRequest(self, src_idx, req);
 
         for (responses) |maybe_resp| {
@@ -353,7 +349,7 @@ const ClusterSim = struct {
                     .lost => return false,
                     .advance_to_vote => {
                         // Pre-vote succeeded, run real election
-                        const real_req = self.elections[src_idx].advanceToRealElection();
+                        const real_req = self.elections[src_idx].advanceToRealElection().?;
                         const real_responses = self.broadcastVoteRequest(self, src_idx, real_req);
                         for (real_responses) |maybe_real| {
                             if (maybe_real) |real_resp| {
@@ -448,7 +444,7 @@ test "election: pre-vote to real vote transition" {
     var em = ElectionManager.init(&node, 42);
 
     // Begin election — should start with pre-vote
-    const req = em.beginElection();
+    const req = em.beginElection().?;
     try testing.expect(req.is_pre_vote);
     try testing.expectEqual(ElectionPhase.pre_vote, em.phase);
     try testing.expectEqual(@as(u64, 1), req.term); // proposed term = current + 1
@@ -466,7 +462,7 @@ test "election: pre-vote to real vote transition" {
     try testing.expectEqual(@as(u64, 1), em.pre_vote_successes);
 
     // Now start real election
-    const real_req = em.advanceToRealElection();
+    const real_req = em.advanceToRealElection().?;
     try testing.expect(!real_req.is_pre_vote);
     try testing.expectEqual(ElectionPhase.voting, em.phase);
     try testing.expectEqual(@as(u64, 1), node.current_term); // term NOW incremented
@@ -496,7 +492,7 @@ test "election: direct voting without pre-vote" {
     var em = ElectionManager.init(&node, 42);
 
     // Begin election — should go directly to voting
-    const req = em.beginElection();
+    const req = em.beginElection().?;
     try testing.expect(!req.is_pre_vote);
     try testing.expectEqual(ElectionPhase.voting, em.phase);
     try testing.expectEqual(@as(u64, 1), node.current_term);
@@ -545,7 +541,7 @@ test "election: cancel resets phase" {
 
     var em = ElectionManager.init(&node, 42);
 
-    _ = em.beginElection();
+    _ = em.beginElection().?;
     try testing.expect(em.isActive());
     try testing.expect(em.isPreVoting());
 
@@ -592,7 +588,7 @@ test "election: 3-node cluster — leader elected" {
     }
 
     // Node 0 starts election
-    const req = sim.elections[0].beginElection();
+    const req = sim.elections[0].beginElection().?;
     try testing.expect(!req.is_pre_vote); // pre-vote disabled in basic sim
 
     // Broadcast to peers
@@ -620,7 +616,7 @@ test "election: 3-node cluster — leader dies, new leader elected" {
     defer sim.deinit();
 
     // Node 0 becomes leader
-    const req1 = sim.elections[0].beginElection();
+    const req1 = sim.elections[0].beginElection().?;
     const responses1 = sim.broadcastVoteRequest(0, req1);
     for (responses1) |maybe_resp| {
         if (maybe_resp) |resp| {
@@ -634,7 +630,7 @@ test "election: 3-node cluster — leader dies, new leader elected" {
     sim.alive[0] = false;
 
     // Node 1 starts election in higher term
-    const req2 = sim.elections[1].beginElection();
+    const req2 = sim.elections[1].beginElection().?;
     try testing.expectEqual(@as(u64, 2), req2.term); // term 2
 
     // Broadcast — node 0 is dead, only node 2 responds
@@ -660,7 +656,7 @@ test "election: 3-node cluster with pre-vote" {
     defer sim.deinit();
 
     // Node 0 starts election — should begin with pre-vote
-    const pre_req = sim.elections[0].beginElection();
+    const pre_req = sim.elections[0].beginElection().?;
     try testing.expect(pre_req.is_pre_vote);
     try testing.expectEqual(@as(u64, 0), sim.nodes[0].current_term); // not incremented
 
@@ -676,7 +672,7 @@ test "election: 3-node cluster with pre-vote" {
     try testing.expect(advance);
 
     // Now real election
-    const real_req = sim.elections[0].advanceToRealElection();
+    const real_req = sim.elections[0].advanceToRealElection().?;
     try testing.expect(!real_req.is_pre_vote);
     try testing.expectEqual(@as(u64, 1), sim.nodes[0].current_term);
 
@@ -702,7 +698,7 @@ test "election: pre-vote prevents term inflation" {
 
     // Node 0 becomes leader (skip pre-vote for setup)
     sim.nodes[0].config.enable_pre_vote = false;
-    const req = sim.elections[0].beginElection();
+    const req = sim.elections[0].beginElection().?;
     const responses = sim.broadcastVoteRequest(0, req);
     for (responses) |maybe_resp| {
         if (maybe_resp) |resp| {
@@ -720,7 +716,7 @@ test "election: pre-vote prevents term inflation" {
     sim.nodes[1].election_deadline_ms = 99999;
     sim.nodes[1].current_time_ms = 0;
 
-    const pre_req = sim.elections[2].beginElection();
+    const pre_req = sim.elections[2].beginElection().?;
     try testing.expect(pre_req.is_pre_vote);
 
     // Node 1 rejects pre-vote (has valid leader)

@@ -263,7 +263,7 @@ fn setupThreeNodeCluster(allocator: Allocator) ![3]RaftNode {
     }
 
     // Node 0 wins election
-    const vote_req = nodes[0].startElection();
+    const vote_req = nodes[0].startElection().?;
     for (1..3) |i| {
         const resp = nodes[i].handleVoteRequest(vote_req);
         _ = nodes[0].handleVoteResponse(resp);

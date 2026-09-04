@@ -60,6 +60,11 @@ const RaftNetwork = network_mode.RaftNetwork;
 
 /// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
 const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
+/// The largest entry this handler proposes: a full transaction batch. The
+/// apply loop's copy buffer and the Raft ring floor are both sized from it,
+/// because an entry that fits the ring but not the buffer would be acked
+/// and never applied.
+pub const MAX_APPLY_PAYLOAD: usize = @max(MAX_ENTRY_PAYLOAD, txn_mod.MAX_BATCH_ENTRY_PAYLOAD);
 
 /// Re-export from centralized namespace module for local convenience.
 const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
@@ -104,6 +109,10 @@ pub const KVHandler = struct {
     /// thread, no locks. Tracks open BEGIN'd txns until COMMIT/ROLLBACK.
     txn_table: txn_mod.TxnTable,
 
+    /// Copy buffer for committed entries, `MAX_APPLY_PAYLOAD` bytes. The
+    /// shard allocates it at boot; `init` itself cannot fail.
+    apply_buf: []u8,
+
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
@@ -111,10 +120,22 @@ pub const KVHandler = struct {
             .next_lsn = 1,
             .metrics_registry = null,
             .txn_table = txn_mod.TxnTable.init(allocator),
+            .apply_buf = &.{},
         };
     }
 
+    pub fn applyBuffer(self: *KVHandler) ?[]u8 {
+        if (self.apply_buf.len == 0) {
+            self.apply_buf = self.allocator.alloc(u8, MAX_APPLY_PAYLOAD) catch {
+                log.err("kv: cannot allocate the {d}-byte apply buffer; committed entries are not being applied", .{MAX_APPLY_PAYLOAD});
+                return null;
+            };
+        }
+        return self.apply_buf;
+    }
+
     pub fn deinit(self: *KVHandler) void {
+        if (self.apply_buf.len > 0) self.allocator.free(self.apply_buf);
         self.txn_table.deinit();
     }
 
@@ -1105,15 +1126,20 @@ pub const KVHandler = struct {
         const raft = shard.raft_node;
         // Copy-read each entry: getEntry()'s zero-copy read returns null for an
         // entry whose payload wraps the hot-ring byte boundary. Advancing
-        // last_applied past such an entry (as the old `else` branch did) silently
+        // last_applied past such an entry silently
         // drops a committed KV mutation — the same wrap-boundary data loss fixed
         // in the stream apply loop. getEntryCopy reconstructs wrapped payloads;
         // kv.applyEntry copies what it stores before the buffer is reused.
-        var payload_buf: [@import("../storage/persistence.zig").MAX_PERSIST_PAYLOAD]u8 = undefined;
+        const payload_buf = shard.kv_handler.applyBuffer() orelse return;
         while (raft.last_applied < raft.commit_index) {
             const next_idx = raft.last_applied + 1;
-            if (raft.log.getEntryCopy(next_idx, &payload_buf)) |e| {
+            if (raft.log.getEntryCopy(next_idx, payload_buf)) |e| {
                 shard.defaultPartition().kv.applyEntry(&e) catch {};
+            } else if (raft.log.contains(next_idx)) {
+                // Present but not copyable: the buffer fits every entry in
+                // this log, so this is a bug, not eviction. Said out loud,
+                // because the write was already acked.
+                log.err("shard {d}: committed entry index={d} could not be read for apply; the KV projection is missing it", .{ shard.id, next_idx });
             }
             // Advance even when the entry is genuinely gone (evicted past
             // read_pos) so the loop can't stall.

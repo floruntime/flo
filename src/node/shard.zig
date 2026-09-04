@@ -68,6 +68,8 @@ const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
 const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const RaftLog = @import("../raft/log.zig").RaftLog;
+const hard_state_mod = @import("../raft/hard_state.zig");
 const Durability = @import("../config/server.zig").Durability;
 const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -178,9 +180,8 @@ pub const Shard = struct {
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
 
-    /// Count of persist/flush failures (addEntry or flushSegmentToDisk errors).
-    /// Surfaced instead of being silently swallowed so disk-full / IO faults
-    /// are observable rather than presenting as silent data loss.
+    /// Count of segment flush failures. Surfaced instead of being silently
+    /// swallowed so disk-full / IO faults are observable.
     persist_failures: u64,
 
     /// Storage durability — controls segment flush timing.
@@ -205,6 +206,9 @@ pub const Shard = struct {
     /// Raft consensus node — every shard has one, bootstrapped as single-node leader.
     /// Writes go through propose() → commit → apply to projections.
     raft_node: *RaftNode,
+
+    /// Where the Raft node persists its term and vote (null if ephemeral).
+    hard_state_store: ?*HardStateStore,
 
     /// Unified waiter pool — handles blocking GET, blocking dequeue,
     /// stream long-poll, and action_await across all subsystems.
@@ -264,6 +268,7 @@ pub const Shard = struct {
         max_hot_entries: u64,
         hot_flush_seconds: u64,
         durability: Durability,
+        node_id: u32,
     ) !Shard {
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
@@ -299,6 +304,10 @@ pub const Shard = struct {
         const kv_handler = try allocator.create(KVHandler);
         errdefer allocator.destroy(kv_handler);
         kv_handler.* = KVHandler.init(allocator, &partition.kv);
+        errdefer kv_handler.deinit();
+        // Allocated here so an out-of-memory is a boot failure, not a
+        // committed write that never reaches the projection.
+        _ = kv_handler.applyBuffer() orelse return error.OutOfMemory;
 
         const stream_handler = try allocator.create(StreamHandler);
         errdefer allocator.destroy(stream_handler);
@@ -353,15 +362,17 @@ pub const Shard = struct {
         seg_writer.* = SegmentWriter.init(allocator, @as(u32, shard_id), .none);
         errdefer seg_writer.deinit();
 
-        // Create Raft consensus node — bootstrapped as single-node leader.
-        // Runtime can add peers later for multi-node clusters.
+        // Create Raft consensus node, identified by this node's cluster id
+        // (the group id tells shards apart). Bootstrapped below, after replay
+        // and the segment-writer hook.
         const raft_node = try allocator.create(RaftNode);
         errdefer allocator.destroy(raft_node);
-        raft_node.* = try RaftNode.init(allocator, @as(u32, shard_id) + 1, @as(u32, shard_id), 4096, .{});
+        raft_node.* = try RaftNode.init(allocator, node_id, @as(u32, shard_id), raftRingCapacity(ual_capacity), .{});
         errdefer raft_node.deinit();
-        try raft_node.bootstrap();
 
         var shard_data_dir: ?[]const u8 = null;
+        var hard_state_store: ?*HardStateStore = null;
+        errdefer if (hard_state_store) |store| allocator.destroy(store);
 
         // Build replay registry — handlers register their entry types
         // so replaySegments and handleInboxMessage can dispatch without
@@ -397,6 +408,25 @@ pub const Shard = struct {
             @import("stdx").fs.makePath(snaps_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
+
+            // ── Hard state ──────────────────────────────────────────────
+            // The term and vote this shard's Raft node must not forget.
+            const loaded = hard_state_mod.load(shard_dir) catch |err| {
+                log.err("shard {d}: cannot read {s}/{s}: {s}", .{ shard_id, shard_dir, hard_state_mod.FILENAME, @errorName(err) });
+                return err;
+            };
+            if (loaded) |hs| {
+                if (hs.node_id != node_id) {
+                    log.err("shard {d}: {s}/HARDSTATE belongs to node {d}, this node is {d}; the shard directories come from different nodes", .{ shard_id, shard_dir, hs.node_id, node_id });
+                    return error.NodeIdMismatch;
+                }
+                raft_node.current_term = hs.term;
+                raft_node.voted_for = hs.voted_for;
+            }
+            const store = try allocator.create(HardStateStore);
+            store.* = .{ .dir = shard_dir, .node_id = node_id, .shard_id = shard_id };
+            hard_state_store = store;
+            raft_node.hard_state_sink = .{ .ctx = @ptrCast(store), .persist = HardStateStore.persist };
 
             // ── Recovery from shard MANIFEST ────────────────────────────
             // The MANIFEST is the single source of truth for:
@@ -449,25 +479,32 @@ pub const Shard = struct {
 
             // Replay existing segment files from segs/ into partition.
             // If a snapshot was loaded, skip entries at or below replay_from.
-            var max_index: u64 = replay_from;
+            // Replay also rebuilds the Raft log (last index, term index and
+            // the hot-ring tail) from the same pass over the segments.
+            replaySegments(allocator, segs_dir_path, partition, &replay_registry, replay_from, &raft_node.log, shard_id);
 
-            replaySegments(allocator, segs_dir_path, partition, &max_index, &replay_registry, replay_from);
-
-            // Restore handler LSN counter to avoid index collisions
-            if (max_index > 0) {
-                raft_node.log.last_idx = max_index + 1;
-                raft_node.commit_index = max_index + 1;
-                raft_node.last_applied = max_index + 1;
+            // A snapshot ahead of the flushed segments (async flush, crash
+            // after the snapshot) would leave the log below what the
+            // projections hold, and every later index would be skipped as
+            // already applied. The log continues from the snapshot instead.
+            if (raft_node.log.lastIndex() < replay_from) {
+                raft_node.log.resetToSnapshot(replay_from, partition.current_term);
             }
 
             shard_data_dir = shard_dir;
         }
 
-        // Wire UAL persistence: entries auto-persist to SegmentWriter on append.
-        // This is wired AFTER segment replay so replayed entries don't get
-        // re-persisted (design: UAL → hot ring → flush to warm segments).
+        // Feed every Raft log append to the segment writer from here on.
+        // Attached after replay (a hook active during replay would re-buffer
+        // every entry just read) and before bootstrap, so the noop that
+        // opens each leadership term is durable like any other entry and
+        // the on-disk log has no holes at the next boot.
         // Only the Raft log UAL persists — partition.ual is a read cache
         // whose entries are already covered by the Raft log's persistence.
+        raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
+        raft_node.log.ual.on_append = segmentBufferCallback;
+        try raft_node.bootstrap();
+
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
         KVHandler.register(&dispatcher);
@@ -518,6 +555,7 @@ pub const Shard = struct {
             .workflow_handler = workflow_handler,
             .processing_handler = processing_handler,
             .raft_node = raft_node,
+            .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
             .persist_failures = 0,
             .durability = durability,
@@ -525,7 +563,7 @@ pub const Shard = struct {
             .pipe_registered = false,
             .raft_network = null,
             .shard_metrics = null,
-            .cluster_node_id = 0,
+            .cluster_node_id = node_id,
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
@@ -574,10 +612,6 @@ pub const Shard = struct {
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
-
-        // Feed Raft log entries to the segment writer; sync durability flushes immediately.
-        self.raft_node.log.ual.on_append_ctx = @ptrCast(self);
-        self.raft_node.log.ual.on_append = ualPersistCallback;
     }
 
     /// Flush buffered Raft log entries to a .flseg file under `shard_data_dir/segs/`.
@@ -641,6 +675,8 @@ pub const Shard = struct {
         self.segment_writer.deinit();
         self.allocator.destroy(self.segment_writer);
 
+        // The store borrows shard_data_dir, so it goes first.
+        if (self.hard_state_store) |store| self.allocator.destroy(store);
         if (self.shard_data_dir) |dir| {
             self.allocator.free(dir);
         }
@@ -2502,14 +2538,72 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
 
 /// Called by UAL.append() after every entry write. Feeds the entry to the
 /// SegmentWriter so it's included in the next segment flush to disk.
-/// This is the designed hot → warm flush path (UNIFIED_STORAGE_DESIGN §4.3).
-fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
-    const shard: *Shard = @ptrCast(@alignCast(ctx));
-    shard.segment_writer.addEntry(entry) catch |err| {
+/// The context is the heap-allocated SegmentWriter, not the Shard (returned
+/// by value from init), so the hook is valid before bootstrap.
+fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
+    writer.addEntry(entry) catch |err| {
         // Do not swallow: a failed persist means this committed entry is not
         // queued for disk and would be lost on restart. Surface it.
-        shard.persist_failures += 1;
-        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s} (persist_failures={d})", .{ shard.id, entry.header.index, @errorName(err), shard.persist_failures });
+        writer.buffer_failures += 1;
+        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s} (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+    };
+}
+
+/// Per-shard HARDSTATE writer — the sink the Raft node persists through.
+/// Heap-allocated so the sink's context pointer stays valid.
+const HardStateStore = struct {
+    /// Borrowed from `Shard.shard_data_dir`; the store is destroyed first.
+    dir: []const u8,
+    node_id: u32,
+    shard_id: u16,
+
+    fn persist(ctx: *anyopaque, term: u64, voted_for: u32) bool {
+        const self: *HardStateStore = @ptrCast(@alignCast(ctx));
+        hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for }) catch |err| {
+            log.err("shard {d}: cannot write {s}/{s}: {s}; this node will not vote until it can", .{ self.shard_id, self.dir, hard_state_mod.FILENAME, @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+};
+
+/// The Raft ring keeps recent entries for replication catch-up. A quarter
+/// of the hot buffer, capped at 16 MiB so many shards do not each take a
+/// quarter of a large buffer, and floored so the largest entry (a full
+/// transaction batch) still fits: a ring smaller than an entry rejects the
+/// write.
+pub const RAFT_RING_MAX: usize = 16 * 1024 * 1024;
+pub const RAFT_RING_MIN: usize = 2 * 1024 * 1024;
+
+comptime {
+    std.debug.assert(@import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE <= RAFT_RING_MIN);
+}
+
+pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
+    return @max(RAFT_RING_MIN, @min(hot_buffer_capacity / 4, RAFT_RING_MAX));
+}
+
+/// Feed a durable entry back into the Raft log at boot: the last index, the
+/// term index and the hot-ring tail all come from this pass. A hole in the
+/// durable history (an index no segment holds) is logged and the log
+/// restarts after it as if the prefix were compacted — nothing this node
+/// holds is lost, but no follower can be repaired from below the hole.
+fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) void {
+    _ = raft_log.append(e) catch |err| switch (err) {
+        error.IndexGap => {
+            const tip = raft_log.lastIndex();
+            if (e.header.index <= tip) {
+                log.err("shard {d}: segments hold index {d} twice (log tip {d}); the later copy is ignored", .{ shard_id, e.header.index, tip });
+                return;
+            }
+            log.warn("shard {d}: no segment holds indices {d}..{d}; treating the prefix as compacted (recurs on every boot of this data dir)", .{ shard_id, tip + 1, e.header.index - 1 });
+            raft_log.resetToSnapshot(e.header.index - 1, raft_log.lastTerm());
+            _ = raft_log.append(e) catch |again| {
+                log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(again) });
+            };
+        },
+        else => log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) }),
     };
 }
 
@@ -2521,7 +2615,7 @@ fn ualPersistCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
 /// Entries are loaded into the UAL (for payload reads) and applied to projections.
 /// Stream entries additionally rebuild the StreamProjection offset tracking,
 /// since the ProjectionRouter skips stream entries (UAL direct reads by design).
-/// Tracks the maximum entry index seen for LSN restoration.
+/// Every entry is also restored into the Raft log.
 ///
 const ReplaySegmentFile = struct {
     first_index: u64,
@@ -2534,9 +2628,10 @@ fn replaySegments(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     partition: *Partition,
-    max_index: *u64,
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
+    raft_log: *RaftLog,
+    shard_id: u16,
 ) void {
     var dir = @import("stdx").fs.openDir(dir_path, .{ .iterate = true }) catch return;
     defer @import("stdx").fs.closeDir(dir);
@@ -2565,7 +2660,7 @@ fn replaySegments(
     std.mem.sort(ReplaySegmentFile, segment_files.items, {}, replaySegmentFileLessThan);
 
     for (segment_files.items) |sf| {
-        replaySegmentFile(allocator, sf.path, partition, max_index, replay_registry, replay_from);
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, raft_log, shard_id);
     }
 }
 
@@ -2584,9 +2679,10 @@ fn replaySegmentFile(
     allocator: std.mem.Allocator,
     full_path: []const u8,
     partition: *Partition,
-    max_index: *u64,
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
+    raft_log: *RaftLog,
+    shard_id: u16,
 ) void {
     const result = SegmentReader.initFromFile(allocator, full_path) catch return;
     defer allocator.free(result.buf);
@@ -2596,11 +2692,11 @@ fn replaySegmentFile(
     while (offset < data_len) {
         const seg_entry = result.reader.readEntryAt(offset) orelse break;
 
+        // Every durable entry is part of the Raft log, snapshot or not.
+        restoreRaftEntry(shard_id, raft_log, &seg_entry);
+
         // Skip entries already covered by snapshot
         if (replay_from > 0 and seg_entry.header.index <= replay_from) {
-            if (seg_entry.header.index > max_index.*) {
-                max_index.* = seg_entry.header.index;
-            }
             offset += seg_entry.totalSize();
             continue;
         }
@@ -2612,10 +2708,6 @@ fn replaySegmentFile(
         _ = ual_index;
 
         _ = replay_registry.dispatch(&seg_entry);
-
-        if (seg_entry.header.index > max_index.*) {
-            max_index.* = seg_entry.header.index;
-        }
 
         offset += seg_entry.totalSize();
     }
@@ -2630,7 +2722,7 @@ test "Shard: init and deinit" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
     defer shard.deinit();
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
@@ -2643,7 +2735,7 @@ test "Shard: add and remove connections" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
@@ -2664,7 +2756,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
     defer shard.deinit();
 
     // Track dispatched pings
@@ -2712,7 +2804,7 @@ test "Shard: inbox shutdown message" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
     defer shard.deinit();
 
     shard.running = true;
@@ -2771,7 +2863,7 @@ test "Shard: replication gap detection surfaces silent follower divergence" {
     var registry = MetricsRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
     defer shard.deinit();
     shard.setMetricsRegistry(&registry);
 
@@ -2822,4 +2914,23 @@ test "replay: segment filenames sort by first_index" {
     const a = ReplaySegmentFile{ .first_index = 10, .path = "" };
     const b = ReplaySegmentFile{ .first_index = 3, .path = "" };
     try std.testing.expect(replaySegmentFileLessThan({}, b, a));
+}
+
+test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {
+    try std.testing.expectEqual(RAFT_RING_MIN, raftRingCapacity(4096));
+    try std.testing.expectEqual(RAFT_RING_MIN, raftRingCapacity(8 * 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), raftRingCapacity(32 * 1024 * 1024));
+    try std.testing.expectEqual(RAFT_RING_MAX, raftRingCapacity(64 * 1024 * 1024));
+    try std.testing.expectEqual(RAFT_RING_MAX, raftRingCapacity(1024 * 1024 * 1024));
+}
+
+test "the Raft ring floor holds the largest transaction batch" {
+    var log_inst = try RaftLog.init(std.testing.allocator, RAFT_RING_MIN);
+    defer log_inst.deinit();
+    const payload = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'b');
+    var e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, 1, 0, payload);
+    e.header.crc32c = e.computeCrc();
+    try std.testing.expectEqual(@as(u64, 1), try log_inst.append(&e));
 }

@@ -290,7 +290,7 @@ fn coordinatorReplicate(coords: []Coordinator, leader_idx: usize, alive: []const
 
 /// Run controller election for a candidate.
 fn coordinatorElection(coords: []Coordinator, candidate_idx: usize, alive: []const bool) bool {
-    const vote_req = coords[candidate_idx].raft.startElection();
+    const vote_req = coords[candidate_idx].raft.startElection().?;
 
     for (0..coords.len) |j| {
         if (j == candidate_idx) continue;

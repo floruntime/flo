@@ -466,18 +466,27 @@ pub const Context = struct {
 
     /// Print to stdout (unbuffered)
     pub fn print(self: *Context, comptime fmt: []const u8, fmtargs: anytype) void {
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = @import("stdx").io.writeFd(self.stdout_file, msg);
+        writeFormatted(self.allocator, self.stdout_file, fmt, fmtargs);
     }
 
     /// Print to stderr (unbuffered)
     pub fn printErr(self: *Context, comptime fmt: []const u8, fmtargs: anytype) void {
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = @import("stdx").io.writeFd(self.stderr_file, msg);
+        writeFormatted(self.allocator, self.stderr_file, fmt, fmtargs);
     }
 };
+
+/// Format into a stack buffer, or the heap when the message is larger: a
+/// value over 4 KiB must print, not vanish.
+fn writeFormatted(allocator: Allocator, file: File, comptime fmt: []const u8, fmtargs: anytype) void {
+    var buf: [4096]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, fmt, fmtargs)) |msg| {
+        _ = @import("stdx").io.writeFd(file, msg);
+    } else |_| {
+        const msg = std.fmt.allocPrint(allocator, fmt, fmtargs) catch return;
+        defer allocator.free(msg);
+        _ = @import("stdx").io.writeFd(file, msg);
+    }
+}
 
 /// Command options for initialization
 pub const CommandOptions = struct {
@@ -892,16 +901,12 @@ pub const Command = struct {
 
     /// Print to stdout (unbuffered)
     pub fn printf(self: *Command, comptime fmt: []const u8, fmtargs: anytype) void {
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = @import("stdx").io.writeFd(self.stdout_file, msg);
+        writeFormatted(self.allocator, self.stdout_file, fmt, fmtargs);
     }
 
     /// Print to stderr (unbuffered)
     pub fn printErrf(self: *Command, comptime fmt: []const u8, fmtargs: anytype) void {
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, fmtargs) catch return;
-        _ = @import("stdx").io.writeFd(self.stderr_file, msg);
+        writeFormatted(self.allocator, self.stderr_file, fmt, fmtargs);
     }
 
     // ==================== Execution ====================

@@ -298,6 +298,37 @@ pub const UAL = struct {
         return self.index_map.get(index) != null;
     }
 
+    /// Drop every entry above `after_index` and give its ring space back.
+    ///
+    /// Entries are laid out in append order, so the truncated suffix is the
+    /// bytes from the lowest dropped entry up to `write_pos`; rewinding
+    /// `write_pos` reclaims them. Rewinding only the counters would leave
+    /// the stale headers in the byte stream that `evictOldest` walks: it
+    /// then unmaps re-appended live indices and zeroes `entry_count` with
+    /// bytes still resident, after which `append`'s evict loop can never
+    /// make room and spins forever.
+    pub fn truncateAfter(self: *UAL, after_index: u64) void {
+        if (self.entry_count == 0 or after_index >= self.max_index) return;
+
+        var new_write_pos = self.write_pos;
+        var removed: u64 = 0;
+        var idx = after_index + 1;
+        while (idx <= self.max_index) : (idx += 1) {
+            if (self.index_map.fetchRemove(idx)) |kv| {
+                removed += 1;
+                new_write_pos = @min(new_write_pos, kv.value);
+            }
+        }
+
+        self.entry_count -= removed;
+        self.write_pos = new_write_pos;
+        self.max_index = after_index;
+        if (self.entry_count == 0) {
+            self.read_pos = self.write_pos;
+            self.min_live_index = 0;
+        }
+    }
+
     // ─── Internal ────────────────────────────────────────────────────
 
     /// Write data to the ring at write_pos, handling wrap-around.
@@ -600,4 +631,97 @@ test "UAL: stats tracking" {
 
     try testing.expectEqual(@as(u64, 1), ual.total_appended);
     try testing.expectEqual(@as(u64, 45), ual.total_bytes_written); // 40 header + 5 payload
+}
+
+test "UAL: truncateAfter reclaims ring space and survives re-append + eviction" {
+    const allocator = testing.allocator;
+    var ual = try UAL.init(allocator, 512, 0);
+    defer ual.deinit();
+
+    // Five 100-byte entries fill the ring; then drop the last three.
+    for (1..6) |i| {
+        var e = makeEntry(@intCast(i), "0123456789" ** 6);
+        _ = try ual.append(&e);
+    }
+    const one_entry = HEADER_SIZE + 60;
+    try testing.expectEqual(@as(u64, 5 * one_entry), ual.used());
+
+    ual.truncateAfter(2);
+    try testing.expectEqual(@as(u64, 2), ual.entry_count);
+    try testing.expectEqual(@as(u64, 2), ual.max_index);
+    try testing.expectEqual(@as(u64, 2 * one_entry), ual.used());
+    try testing.expect(!ual.contains(3));
+    try testing.expect(ual.contains(2));
+
+    // Re-append 3..5 with different payloads: they land where the dropped
+    // bytes were and read back as the new content.
+    for (3..6) |i| {
+        var e = makeEntry(@intCast(i), "new-payload-" ** 5);
+        _ = try ual.append(&e);
+    }
+    try testing.expectEqual(@as(u64, 5 * one_entry), ual.used());
+    try testing.expectEqualStrings("new-payload-" ** 5, ual.read(4).?.payload);
+    try testing.expectEqualStrings("0123456789" ** 6, ual.read(1).?.payload);
+
+    // Force eviction past the truncated region: the oldest entries go in
+    // index order and every surviving index still reads correctly.
+    for (6..12) |i| {
+        var e = makeEntry(@intCast(i), "later-entry-" ** 5);
+        _ = try ual.append(&e);
+    }
+    try testing.expect(!ual.contains(1));
+    try testing.expect(ual.contains(11));
+    try testing.expectEqualStrings("later-entry-" ** 5, ual.read(11).?.payload);
+    try testing.expect(ual.entry_count <= 5);
+    try testing.expectEqual(ual.entry_count * one_entry, ual.used());
+    var live: u64 = 0;
+    var idx: u64 = 1;
+    var copy_buf: [256]u8 = undefined;
+    while (idx <= 11) : (idx += 1) {
+        if (ual.contains(idx)) {
+            live += 1;
+            const e = ual.readCopy(idx, &copy_buf) orelse return error.LiveEntryUnreadable;
+            try testing.expectEqual(idx, e.header.index);
+        }
+    }
+    try testing.expectEqual(ual.entry_count, live);
+}
+
+test "UAL: truncateAfter below the oldest live index empties the ring" {
+    const allocator = testing.allocator;
+    var ual = try UAL.init(allocator, 400, 0);
+    defer ual.deinit();
+
+    // Ring holds ~3 entries; after 6 appends indices 1-3 are evicted.
+    for (1..7) |i| {
+        var e = makeEntry(@intCast(i), "0123456789" ** 6);
+        _ = try ual.append(&e);
+    }
+    try testing.expect(!ual.contains(1));
+    try testing.expect(ual.contains(6));
+
+    ual.truncateAfter(1);
+    try testing.expectEqual(@as(u64, 0), ual.entry_count);
+    try testing.expectEqual(@as(u64, 0), ual.used());
+    try testing.expectEqual(@as(u64, 1), ual.max_index);
+
+    // The ring is usable again from a clean state.
+    var e = makeEntry(2, "fresh");
+    _ = try ual.append(&e);
+    try testing.expectEqual(@as(u64, 1), ual.entry_count);
+    try testing.expectEqual(@as(u64, 2), ual.min_live_index);
+    try testing.expectEqualStrings("fresh", ual.read(2).?.payload);
+}
+
+test "UAL: truncateAfter at or above the tip is a no-op" {
+    const allocator = testing.allocator;
+    var ual = try UAL.init(allocator, 4096, 0);
+    defer ual.deinit();
+    var e = makeEntry(1, "data");
+    _ = try ual.append(&e);
+    const used_before = ual.used();
+    ual.truncateAfter(1);
+    ual.truncateAfter(9);
+    try testing.expectEqual(used_before, ual.used());
+    try testing.expectEqual(@as(u64, 1), ual.entry_count);
 }

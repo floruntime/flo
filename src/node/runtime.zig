@@ -31,6 +31,7 @@ const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfi
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const cluster_config = @import("../config/cluster.zig");
+const raft_hard_state = @import("../raft/hard_state.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
@@ -369,6 +370,39 @@ pub const Runtime = struct {
         }
     }
 
+    const NodeIdentity = struct {
+        id: u32,
+        source: enum { stored, configured, derived },
+    };
+
+    /// The id this node runs under. Shard 0's HARDSTATE wins once it exists;
+    /// a configured id that disagrees with it is refused rather than split
+    /// into "the id on disk" and "the id on the wire".
+    fn resolveClusterNodeId(self: *Runtime, data_dir: []const u8) !NodeIdentity {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const shard0_dir = try std.fmt.bufPrint(&dir_buf, "{s}/{d:0>5}", .{ data_dir, 0 });
+        const stored: ?u32 = blk: {
+            const hs = raft_hard_state.load(shard0_dir) catch |err| {
+                log.err("cluster: cannot read {s}/{s}: {s}", .{ shard0_dir, raft_hard_state.FILENAME, @errorName(err) });
+                return err;
+            };
+            const h = hs orelse break :blk null;
+            break :blk if (h.node_id != 0) h.node_id else null;
+        };
+        const configured: ?u32 = if (self.config.cluster_node_id > 0) self.config.cluster_node_id else null;
+
+        if (stored != null and configured != null and stored.? != configured.?) {
+            log.err("cluster: data dir {s} belongs to node {d} but [cluster] node_id = {d}; remove node_id from the config to keep this data, or point data_dir at an empty directory to start a new node", .{ data_dir, stored.?, configured.? });
+            return error.NodeIdMismatch;
+        }
+        if (stored) |id| return .{ .id = id, .source = .stored };
+        if (configured) |id| return .{ .id = id, .source = .configured };
+
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const host = std.posix.gethostname(&host_buf) catch "localhost";
+        return .{ .id = cluster_config.ClusterConfig.generateNodeId(host, self.config.listen_port), .source = .derived };
+    }
+
     /// Start the runtime: create shards, spawn threads, start acceptor.
     pub fn start(self: *Runtime) !void {
         // Expand a leading `~` to $HOME at the single point where the configured
@@ -440,6 +474,20 @@ pub const Runtime = struct {
 
         log.debug("Runtime.start: created {d} shard pipes", .{self.shard_count});
 
+        // This node's cluster identity exists whether or not the Raft listener
+        // runs — `flo cluster status` reports it single-node too. Once the
+        // data dir holds it, it is fixed: a node keeps its id across restarts
+        // and port changes, so a member that moves is an update, not a stranger.
+        const identity = try self.resolveClusterNodeId(data_dir);
+        const cluster_node_id = identity.id;
+        if (self.config.clusterListenerWanted()) {
+            log.info("cluster: this node is {d} ({s})", .{ cluster_node_id, switch (identity.source) {
+                .stored => "stored in the data dir",
+                .configured => "configured",
+                .derived => "derived from hostname:port; set [cluster] node_id on cloned images",
+            } });
+        }
+
         // 2. Create shards
         const shards = try self.allocator.alloc(Shard, self.shard_count);
         var shards_created: usize = 0;
@@ -463,6 +511,7 @@ pub const Runtime = struct {
                 self.config.tiered_log.max_hot_entries,
                 self.config.tiered_log.hot_flush_seconds,
                 self.config.durability,
+                cluster_node_id,
             );
             shards_created += 1;
         }
@@ -519,20 +568,6 @@ pub const Runtime = struct {
             threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
             threads_spawned += 1;
             log.debug("Runtime.start: spawned shard thread {d}", .{i});
-        }
-
-        // This node's cluster identity exists whether or not the Raft listener
-        // runs — `flo cluster status` reports it single-node too.
-        const cluster_node_id = if (self.config.cluster_node_id > 0)
-            self.config.cluster_node_id
-        else blk: {
-            var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-            const host = std.posix.gethostname(&host_buf) catch "localhost";
-            break :blk cluster_config.ClusterConfig.generateNodeId(host, self.config.listen_port);
-        };
-        for (0..self.shard_count) |i| shards[i].cluster_node_id = cluster_node_id;
-        if (self.config.clusterListenerWanted()) {
-            log.info("cluster: this node is {d} ({s})", .{ cluster_node_id, if (self.config.cluster_node_id > 0) "configured" else "derived from hostname:port; set [cluster] node_id on cloned images" });
         }
 
         // 3.5 Start the peer-facing Raft listener only when this node can

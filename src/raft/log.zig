@@ -3,7 +3,7 @@
 //! Wraps the UAL to provide Raft-specific semantics:
 //! - Monotonic index/term tracking
 //! - `truncateAfter()` for log conflict resolution
-//! - Term cache for log-matching even after ring eviction
+//! - A run-length term index for log-matching even after ring eviction
 //! - `lastIndex()` / `lastTerm()` for election and replication
 //!
 //! The UAL is the Raft log — there is no separate WAL. Entries carry
@@ -23,6 +23,12 @@ const UAL = ual_mod.UAL;
 // RaftLog
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// One run of consecutive indices sharing a term: `[first_index, next.first_index)`.
+pub const TermRun = struct {
+    first_index: u64,
+    term: u64,
+};
+
 pub const RaftLog = struct {
     ual: UAL,
     allocator: Allocator,
@@ -31,9 +37,11 @@ pub const RaftLog = struct {
     last_idx: u64,
     first_idx: u64,
 
-    /// Term cache — survives ring eviction so log-matching can still work.
-    /// Maps UAL index → Raft term.
-    term_cache: std.AutoHashMapUnmanaged(u64, u64),
+    /// Term index, run-length encoded and ascending by `first_index`. Terms
+    /// change per election, not per entry, so this stays a few dozen runs for
+    /// a log of any length. Survives ring eviction so log-matching works for
+    /// entries only a segment still holds.
+    term_runs: std.ArrayListUnmanaged(TermRun),
 
     /// Snapshot state — after snapshot install, entries before this are gone.
     snapshot_index: u64,
@@ -50,29 +58,35 @@ pub const RaftLog = struct {
             .allocator = allocator,
             .last_idx = 0,
             .first_idx = 0,
-            .term_cache = .{},
+            .term_runs = .empty,
             .snapshot_index = 0,
             .snapshot_term = 0,
         };
     }
 
     pub fn deinit(self: *RaftLog) void {
-        self.term_cache.deinit(self.allocator);
+        self.term_runs.deinit(self.allocator);
         self.ual.deinit();
     }
 
     // ── Append ──────────────────────────────────────────────────────────
 
-    /// Append an entry to the log. The entry's index must equal `lastIndex() + 1`.
+    /// Append an entry to the log. The entry's index must equal `lastIndex() + 1`,
+    /// or `snapshot_index + 1` for the first entry after a snapshot.
     /// Returns the assigned index.
     pub fn append(self: *RaftLog, e: *const Entry) !u64 {
-        const expected = self.last_idx + 1;
+        const expected = if (self.last_idx == 0) self.snapshot_index + 1 else self.last_idx + 1;
         if (e.header.index != expected) return error.IndexGap;
 
-        const idx = try self.ual.append(e);
+        // Extend the term index first: a failed run allocation must not leave
+        // an entry in the ring that `entryTerm` cannot answer for.
+        const runs = self.term_runs.items;
+        if (runs.len == 0 or runs[runs.len - 1].term != e.header.term) {
+            try self.term_runs.append(self.allocator, .{ .first_index = e.header.index, .term = e.header.term });
+        }
+        errdefer self.trimRunsAbove(e.header.index - 1);
 
-        // Cache the term for fast lookup
-        try self.term_cache.put(self.allocator, idx, e.header.term);
+        const idx = try self.ual.append(e);
 
         if (self.first_idx == 0) {
             self.first_idx = idx;
@@ -96,13 +110,13 @@ pub const RaftLog = struct {
         return self.ual.readCopy(index, payload_buf);
     }
 
-    /// Get the term for a given index. Uses the term cache (survives eviction).
-    /// Returns the snapshot term if index == snapshot_index.
+    /// Get the term for a given index. Answered from the term index (survives
+    /// eviction), or the snapshot term at the snapshot index.
     pub fn entryTerm(self: *const RaftLog, index: u64) ?u64 {
         if (index == 0) return @as(u64, 0);
         if (index == self.snapshot_index) return self.snapshot_term;
         if (index > self.last_idx) return null;
-        return self.term_cache.get(index);
+        return self.runTerm(index);
     }
 
     /// Read a range of entries starting from `start_index`.
@@ -126,20 +140,32 @@ pub const RaftLog = struct {
     pub fn truncateAfter(self: *RaftLog, after_index: u64) void {
         if (after_index >= self.last_idx) return;
 
-        // Remove entries from UAL index_map and term_cache
-        var idx = after_index + 1;
-        while (idx <= self.last_idx) : (idx += 1) {
-            _ = self.ual.index_map.remove(idx);
-            _ = self.term_cache.remove(idx);
-        }
-
-        // Adjust counters
-        const removed = self.last_idx - after_index;
+        self.ual.truncateAfter(after_index);
+        self.trimRunsAbove(after_index);
         self.last_idx = after_index;
-        self.ual.max_index = after_index;
-        if (self.ual.entry_count >= removed) {
-            self.ual.entry_count -= removed;
+    }
+
+    /// Drop term runs that start above `index`.
+    fn trimRunsAbove(self: *RaftLog, index: u64) void {
+        while (self.term_runs.items.len > 0) {
+            const last = self.term_runs.items[self.term_runs.items.len - 1];
+            if (last.first_index <= index) break;
+            _ = self.term_runs.pop();
         }
+    }
+
+    /// Term of the run covering `index`, or null if no run does.
+    fn runTerm(self: *const RaftLog, index: u64) ?u64 {
+        const runs = self.term_runs.items;
+        if (runs.len == 0 or index < runs[0].first_index) return null;
+        // Binary search for the last run with first_index <= index.
+        var lo: usize = 0;
+        var hi: usize = runs.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (runs[mid].first_index <= index) lo = mid else hi = mid;
+        }
+        return runs[lo].term;
     }
 
     // ── Queries ─────────────────────────────────────────────────────────
@@ -151,8 +177,8 @@ pub const RaftLog = struct {
 
     /// The term of the last log entry (0 if empty).
     pub fn lastTerm(self: *const RaftLog) u64 {
-        if (self.last_idx == 0) return 0;
-        return self.term_cache.get(self.last_idx) orelse self.snapshot_term;
+        if (self.last_idx == 0) return self.snapshot_term;
+        return self.runTerm(self.last_idx) orelse self.snapshot_term;
     }
 
     /// Number of entries in the log (logical count, not UAL physical count).
@@ -171,6 +197,10 @@ pub const RaftLog = struct {
         return index >= self.first_idx and index <= self.last_idx and self.ual.contains(index);
     }
 
+    pub fn termRunCount(self: *const RaftLog) usize {
+        return self.term_runs.items.len;
+    }
+
     // ── Snapshot Support ────────────────────────────────────────────────
 
     /// Record that a snapshot was taken at the given index and term.
@@ -180,9 +210,20 @@ pub const RaftLog = struct {
         self.snapshot_term = term;
     }
 
+    /// Forget every entry and continue from `index` as if a snapshot covered
+    /// it: the next append must be `index + 1`, and `entryTerm(index)` is
+    /// `term`. Used at boot when the durable history has a hole.
+    pub fn resetToSnapshot(self: *RaftLog, index: u64, term: u64) void {
+        self.ual.truncateAfter(0);
+        self.term_runs.clearRetainingCapacity();
+        self.last_idx = 0;
+        self.first_idx = 0;
+        self.recordSnapshot(index, term);
+    }
+
     /// Check if log-matching is possible for a given (index, term) pair.
     /// Returns true if we can verify the term at that index (either from
-    /// the term cache, the snapshot, or index 0).
+    /// the term index, the snapshot, or index 0).
     pub fn matchesTerm(self: *const RaftLog, index: u64, term: u64) bool {
         if (index == 0 and term == 0) return true;
         const actual_term = self.entryTerm(index) orelse return false;
@@ -261,6 +302,55 @@ test "raft log: term tracking across entries" {
     try testing.expectEqual(@as(u64, 1), log.entryTerm(2).?);
     try testing.expectEqual(@as(u64, 2), log.entryTerm(3).?);
     try testing.expect(log.entryTerm(4) == null); // doesn't exist
+    try testing.expectEqual(@as(usize, 2), log.termRunCount());
+}
+
+test "raft log: term index is run-length, not per entry" {
+    const allocator = testing.allocator;
+
+    var log = try RaftLog.init(allocator, 1 << 16);
+    defer log.deinit();
+
+    // 300 entries over terms 1,1,3,7 → 3 runs (a repeated term opens no new
+    // run), and every index still answers.
+    var idx: u64 = 1;
+    const terms = [_]u64{ 1, 1, 3, 7 };
+    for (terms) |t| {
+        for (0..75) |_| {
+            var e = makeEntry(.kv_put, idx, t, "x");
+            _ = try log.append(&e);
+            idx += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), log.termRunCount());
+    try testing.expectEqual(@as(u64, 1), log.entryTerm(1).?);
+    try testing.expectEqual(@as(u64, 1), log.entryTerm(150).?);
+    try testing.expectEqual(@as(u64, 3), log.entryTerm(151).?);
+    try testing.expectEqual(@as(u64, 3), log.entryTerm(225).?);
+    try testing.expectEqual(@as(u64, 7), log.entryTerm(226).?);
+    try testing.expectEqual(@as(u64, 7), log.entryTerm(300).?);
+    try testing.expect(log.entryTerm(301) == null);
+    try testing.expectEqual(@as(u64, 7), log.lastTerm());
+}
+
+test "raft log: term lookup survives ring eviction" {
+    const allocator = testing.allocator;
+
+    // A ring that holds only a few entries; the term index must still answer
+    // for everything ever appended.
+    var log = try RaftLog.init(allocator, 512);
+    defer log.deinit();
+
+    for (1..41) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), if (i < 20) 1 else 2, "0123456789" ** 4);
+        _ = try log.append(&e);
+    }
+    try testing.expect(log.getEntry(1) == null); // evicted
+    try testing.expectEqual(@as(u64, 1), log.entryTerm(1).?);
+    try testing.expectEqual(@as(u64, 1), log.entryTerm(19).?);
+    try testing.expectEqual(@as(u64, 2), log.entryTerm(20).?);
+    try testing.expect(log.matchesTerm(5, 1));
+    try testing.expect(!log.matchesTerm(5, 2));
 }
 
 test "raft log: truncateAfter" {
@@ -316,6 +406,72 @@ test "raft log: truncate then append" {
     try testing.expectEqual(@as(u64, 3), log.lastIndex());
     try testing.expectEqual(@as(u64, 2), log.lastTerm());
     try testing.expectEqual(@as(u64, 2), log.entryTerm(2).?);
+    try testing.expectEqualStrings("new-term2", log.getEntry(2).?.payload);
+}
+
+test "raft log: truncation inside a term run keeps the run's earlier indices" {
+    const allocator = testing.allocator;
+
+    var log = try RaftLog.init(allocator, 8192);
+    defer log.deinit();
+
+    for (1..3) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, "a");
+        _ = try log.append(&e);
+    }
+    for (3..8) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 2, "b");
+        _ = try log.append(&e);
+    }
+    // Cut in the middle of the term-2 run: 3-4 stay term 2, 5-7 vanish.
+    log.truncateAfter(4);
+    try testing.expectEqual(@as(u64, 2), log.entryTerm(4).?);
+    try testing.expectEqual(@as(u64, 2), log.entryTerm(3).?);
+    try testing.expect(log.entryTerm(5) == null);
+    try testing.expectEqual(@as(usize, 2), log.termRunCount());
+
+    // Re-appending in the same term does not open a new run; a new term does.
+    var e5 = makeEntry(.kv_put, 5, 2, "c");
+    _ = try log.append(&e5);
+    try testing.expectEqual(@as(usize, 2), log.termRunCount());
+    var e6 = makeEntry(.kv_put, 6, 3, "d");
+    _ = try log.append(&e6);
+    try testing.expectEqual(@as(usize, 3), log.termRunCount());
+    try testing.expectEqual(@as(u64, 3), log.lastTerm());
+
+    // Cutting a whole run away restores the previous run as the tip.
+    log.truncateAfter(5);
+    try testing.expectEqual(@as(u64, 2), log.lastTerm());
+    try testing.expectEqual(@as(usize, 2), log.termRunCount());
+}
+
+test "raft log: truncate then refill then evict does not wedge the ring" {
+    const allocator = testing.allocator;
+
+    // Small ring, ~40-byte payloads: the ring holds about six entries.
+    var log = try RaftLog.init(allocator, 512);
+    defer log.deinit();
+
+    for (1..6) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, "0123456789" ** 4);
+        _ = try log.append(&e);
+    }
+    log.truncateAfter(2);
+    // Conflict resolution then re-fills 3.. in a new term and keeps going
+    // past the ring's capacity, which forces eviction through the region
+    // the truncation reclaimed.
+    for (3..40) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 2, "abcdefghij" ** 4);
+        _ = try log.append(&e);
+    }
+    try testing.expectEqual(@as(u64, 39), log.lastIndex());
+    try testing.expectEqual(@as(u64, 2), log.lastTerm());
+    var buf: [128]u8 = undefined;
+    const tip = log.getEntryCopy(39, &buf) orelse return error.TipUnreadable;
+    try testing.expectEqualStrings("abcdefghij" ** 4, tip.payload);
+    try testing.expectEqual(@as(u64, 1), log.entryTerm(2).?);
+    try testing.expectEqual(@as(u64, 2), log.entryTerm(3).?);
+    try testing.expectEqual(log.ual.entry_count * (entry_mod.HEADER_SIZE + 40), log.ual.used());
 }
 
 test "raft log: append rejects index gap" {
@@ -331,6 +487,25 @@ test "raft log: append rejects index gap" {
     var e3 = makeEntry(.kv_put, 3, 1, "data");
     const result = log.append(&e3);
     try testing.expectError(error.IndexGap, result);
+}
+
+test "raft log: an empty log after a snapshot continues from the snapshot index" {
+    const allocator = testing.allocator;
+
+    var log = try RaftLog.init(allocator, 4096);
+    defer log.deinit();
+
+    log.recordSnapshot(10, 4);
+    var e1 = makeEntry(.kv_put, 1, 5, "data");
+    try testing.expectError(error.IndexGap, log.append(&e1));
+
+    var e11 = makeEntry(.kv_put, 11, 5, "data");
+    _ = try log.append(&e11);
+    try testing.expectEqual(@as(u64, 11), log.lastIndex());
+    try testing.expectEqual(@as(u64, 5), log.lastTerm());
+    try testing.expect(log.matchesTerm(10, 4));
+    try testing.expect(log.matchesTerm(11, 5));
+    try testing.expect(log.entryTerm(9) == null);
 }
 
 test "raft log: matchesTerm" {
@@ -375,7 +550,7 @@ test "raft log: snapshot recording" {
     try testing.expectEqual(@as(u64, 3), log.snapshot_index);
     try testing.expectEqual(@as(u64, 1), log.snapshot_term);
 
-    // entryTerm still works for snapshot index via cache
+    // entryTerm still works for snapshot index via the term index
     try testing.expectEqual(@as(u64, 1), log.entryTerm(3).?);
 }
 
@@ -444,4 +619,28 @@ test "raft log: truncate noop when after >= lastIndex" {
     // Truncate after 1 — noop since lastIndex is 1
     log.truncateAfter(1);
     try testing.expectEqual(@as(u64, 1), log.lastIndex());
+}
+
+test "raft log: resetToSnapshot forgets the log and continues past the hole" {
+    const allocator = testing.allocator;
+
+    var log = try RaftLog.init(allocator, 8192);
+    defer log.deinit();
+    for (1..4) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, "a");
+        _ = try log.append(&e);
+    }
+    var e7 = makeEntry(.kv_put, 7, 2, "b");
+    try testing.expectError(error.IndexGap, log.append(&e7));
+
+    log.resetToSnapshot(6, log.lastTerm());
+    try testing.expect(log.isEmpty());
+    try testing.expect(log.getEntry(2) == null);
+    try testing.expectEqual(@as(u64, 0), log.ual.used());
+    _ = try log.append(&e7);
+    try testing.expectEqual(@as(u64, 7), log.lastIndex());
+    try testing.expectEqual(@as(u64, 2), log.lastTerm());
+    try testing.expect(log.matchesTerm(6, 1));
+    try testing.expect(log.entryTerm(3) == null);
+    try testing.expectEqual(@as(usize, 1), log.termRunCount());
 }
