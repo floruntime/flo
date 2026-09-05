@@ -422,7 +422,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     ctx.print("  Cluster:\n", .{});
     const rc_preview = config.toRuntimeConfig();
     if (config.cluster.node_id == 0) {
-        ctx.print("    Node ID:    auto (will generate on start)\n", .{});
+        ctx.print("    Node ID:    auto (stored in the data dir after first start)\n", .{});
     } else {
         ctx.print("    Node ID:    {d}\n", .{config.cluster.node_id});
     }

@@ -603,7 +603,8 @@ pub fn generateDefaultConfig() []const u8 {
     \\# When disabled, runs in standalone mode (single node)
     \\enabled = false
     \\
-    \\# Unique node ID within the cluster (must be unique per node)
+    \\# This node's id, unique in the cluster. Read on first boot and then stored
+    \\# with the data; to change it, start from an empty data dir.
     \\# node_id = 1
     \\
     \\# Port for Raft RPC communication between cluster nodes (0 = auto: listen_port + 500)

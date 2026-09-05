@@ -22,7 +22,8 @@ pub const ClusterConfig = struct {
     /// that peers will join before it knows about them.
     enabled: bool = false,
 
-    /// This node's unique ID within the cluster
+    /// This node's unique ID within the cluster. Read on first boot and stored
+    /// in the data dir; a later boot with a different value is refused.
     /// If 0, auto-generated from hostname hash + port
     node_id: u32 = 0,
 

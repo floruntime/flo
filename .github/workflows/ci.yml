@@ -120,7 +120,7 @@ jobs:
       - name: Pins still fail by design
         # Each pin is the acceptance test for a product fix; a pin going
         # green means that fix landed and the pin should be retired here.
-        # One pin is a genuine hang, so every pin runs under a timeout —
+        # A pin may be a genuine hang, so every pin runs under a timeout —
         # a kill (exit 124) still counts as failing by design.
         run: |
           for pin in src/vopr/pins/*.json; do

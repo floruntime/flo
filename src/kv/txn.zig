@@ -40,6 +40,9 @@ const stdx_time = @import("stdx").time;
 
 pub const MAX_OPS_PER_TXN: u16 = 256;
 pub const MAX_PAYLOAD_PER_TXN: usize = 1 * 1024 * 1024;
+/// Upper bound of `batchPayloadSize`: the key+value budget plus the fixed
+/// framing of every op (kind, flags, namespace, key len, value len, expiry).
+pub const MAX_BATCH_ENTRY_PAYLOAD: usize = 3 + MAX_OPS_PER_TXN * 20 + MAX_PAYLOAD_PER_TXN;
 pub const MAX_OPEN_TXNS: usize = 1024;
 
 // ─── Op record ────────────────────────────────────────────────────────────

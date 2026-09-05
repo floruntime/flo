@@ -15,8 +15,9 @@ const std = @import("std");
 const PRNG = @import("stdx").PRNG;
 
 /// How Raft hard state (current_term, voted_for) behaves across a crash.
-/// `.persisted` is the Raft spec — the target semantics and the default.
-/// `.volatile_state` models production today (nothing persisted); running
+/// `.persisted` is the Raft spec and the default: the node persists through
+/// its hard-state sink before acting, as production does with HARDSTATE.
+/// `.volatile_state` gives nodes no sink (a node with no data dir); running
 /// in that mode demonstrates the split-brain hazard rather than testing
 /// toward the target, so `fromSeed` never selects it — a scenario must
 /// set it explicitly.

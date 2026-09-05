@@ -37,6 +37,10 @@ pub const SegmentWriter = struct {
     entry_count: u32,
     entry_type_bitmap: u32,
     compression: segment.Compression,
+    /// Entries the append hook could not buffer (allocation failure). Each
+    /// one is an entry that would be missing from disk after a restart, so
+    /// it is counted and logged rather than dropped silently.
+    buffer_failures: u64,
 
     allocator: std.mem.Allocator,
 
@@ -52,6 +56,7 @@ pub const SegmentWriter = struct {
             .entry_count = 0,
             .entry_type_bitmap = 0,
             .compression = compression,
+            .buffer_failures = 0,
             .allocator = allocator,
         };
     }

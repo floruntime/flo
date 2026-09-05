@@ -1908,3 +1908,100 @@ test "e2e/kv: txn unknown id is rejected" {
     defer result.deinit();
     try stdx.testing.assertFailed(result);
 }
+
+// =============================================================================
+// Raft log and hard state across restarts
+// =============================================================================
+
+test "e2e/kv: a 5 KiB value is stored and read back whole" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Larger than the CLI's 4 KiB print buffer. Exact equality: a truncated
+    // or empty value must fail, not pass on a substring.
+    const value = "v" ** 5000;
+    try ctx.exec(&.{ "kv", "set", "five_kib", value });
+    const got = try ctx.execCapture(&.{ "kv", "get", "five_kib", "-o", "raw" });
+    try testing.expectEqualStrings(value, got);
+}
+
+const HardStateFields = struct { node_id: u32, term: u64, voted_for: u32 };
+
+/// The shard-0 HARDSTATE file: node id at 8, term at 12, vote at 20.
+fn readHardState(data_dir: []const u8) !HardStateFields {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/00000/HARDSTATE", .{data_dir});
+    var file_buf: [64]u8 = undefined;
+    const bytes = try stdx.fs.readFile(path, &file_buf);
+    if (bytes.len != 28) return error.UnexpectedHardStateSize;
+    return .{
+        .node_id = std.mem.readInt(u32, bytes[8..12], .little),
+        .term = std.mem.readInt(u64, bytes[12..20], .little),
+        .voted_for = std.mem.readInt(u32, bytes[20..24], .little),
+    };
+}
+
+fn readHardStateTerm(data_dir: []const u8) !u64 {
+    return (try readHardState(data_dir)).term;
+}
+
+test "e2e/kv: the durable log starts at index 1 and each restart opens a new persisted term" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+    const data_dir = ctx.getDataDir();
+
+    // Term 1 was persisted at bootstrap, before any client write, and the
+    // vote is for this node's own id: the Raft node id and the stored node
+    // id are one id space.
+    const hs = try readHardState(data_dir);
+    try testing.expectEqual(@as(u64, 1), hs.term);
+    try testing.expect(hs.node_id != 0);
+    try testing.expectEqual(hs.node_id, hs.voted_for);
+
+    // The first write flushes (sync durability), and the segment it lands
+    // in starts at index 1: the leadership noop is durable like any entry.
+    try ctx.exec(&.{ "kv", "set", "first_key", "first_value" });
+    var seg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const first_seg = try std.fmt.bufPrint(&seg_buf, "{s}/00000/segs/0000000001.flseg", .{data_dir});
+    try stdx.fs.access(first_seg, .{});
+
+    try ctx.restartServer();
+    try testing.expectEqual(@as(u64, 2), try readHardStateTerm(data_dir));
+    const after = try ctx.execCapture(&.{ "kv", "get", "first_key", "-o", "raw" });
+    try testing.expectEqualStrings("first_value", after);
+
+    // A write after the restart continues the log at the next index; a log
+    // restarted at 1 would overwrite 0000000001.flseg and lose first_key at
+    // the next restart.
+    try ctx.exec(&.{ "kv", "set", "second_key", "second_value" });
+    try ctx.restartServer();
+    try testing.expectEqual(@as(u64, 3), try readHardStateTerm(data_dir));
+    const first_again = try ctx.execCapture(&.{ "kv", "get", "first_key", "-o", "raw" });
+    try testing.expectEqualStrings("first_value", first_again);
+    const second = try ctx.execCapture(&.{ "kv", "get", "second_key", "-o", "raw" });
+    try testing.expectEqualStrings("second_value", second);
+}
+
+test "e2e/kv: a 90 KB transaction batch is applied, not just acked" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Three 30 KB values in one commit: a 90 KB kv_batch entry. It must be
+    // readable immediately, not only after a restart replays the segment.
+    // `kv begin -o raw` prints `txn_id=N pinned_hash=H`.
+    const begin = try ctx.execCapture(&.{ "kv", "begin", "-r", "rk", "-o", "raw" });
+    const id_start = (std.mem.indexOf(u8, begin, "txn_id=") orelse return error.NoTxnId) + "txn_id=".len;
+    const id_end = std.mem.indexOfScalarPos(u8, begin, id_start, ' ') orelse begin.len;
+    const txn_id = begin[id_start..id_end];
+    const value = "t" ** 30_000;
+    try ctx.exec(&.{ "kv", "set", "txn_a", value, "-t", txn_id, "-r", "rk" });
+    try ctx.exec(&.{ "kv", "set", "txn_b", value, "-t", txn_id, "-r", "rk" });
+    try ctx.exec(&.{ "kv", "set", "txn_c", value, "-t", txn_id, "-r", "rk" });
+    try ctx.exec(&.{ "kv", "commit", txn_id, "-r", "rk" });
+    for ([_][]const u8{ "txn_a", "txn_b", "txn_c" }) |key| {
+        const got = try ctx.execCapture(&.{ "kv", "get", key, "-r", "rk", "-o", "raw" });
+        try testing.expectEqualStrings(value, got);
+    }
+}

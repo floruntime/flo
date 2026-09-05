@@ -66,7 +66,7 @@ const TestCluster = struct {
     /// Run an election on a specific node and deliver votes from alive peers.
     /// Returns true if the node won the election.
     fn runElection(self: *TestCluster, candidate_idx: usize) bool {
-        const vote_req = self.nodes[candidate_idx].startElection();
+        const vote_req = self.nodes[candidate_idx].startElection().?;
 
         for (0..CLUSTER_SIZE) |j| {
             if (j == candidate_idx) continue;
