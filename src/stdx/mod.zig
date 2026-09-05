@@ -27,10 +27,14 @@ pub const Mutex = sync.Mutex;
 
 pub const testing = @import("testing/e2e/mod.zig");
 
+/// Deterministic seedable PRNG for VOPR-style simulation testing.
+pub const prng = @import("testing/prng.zig");
+pub const PRNG = prng.PRNG;
+
 test {
-    // The deterministic PRNG's tests live only here; without this
-    // reference they are never collected.
-    _ = @import("testing/prng.zig");
+    // The PRNG's tests live only here; without this reference they are
+    // never collected.
+    _ = prng;
     _ = @import("net.zig");
 }
 /// Copy memory from source to destination.
