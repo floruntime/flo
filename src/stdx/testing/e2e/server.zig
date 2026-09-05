@@ -145,6 +145,9 @@ pub const ServerProcess = struct {
         raft_port: u16 = 0,
         /// Enable cluster mode (starts Raft listener) - for seed nodes without join_addresses
         cluster_enabled: bool = false,
+        /// `[server] bind` for this node; null = the server default (0.0.0.0),
+        /// reached at 127.0.0.1 by the harness.
+        bind: ?[]const u8 = null,
         /// Expose internal keys (prefixed with '_') in kv scan for testing
         /// When true, kv list/scan will show _proc:, _action:, etc. keys
         expose_internal_keys: bool = false,
@@ -360,6 +363,10 @@ pub const ServerProcess = struct {
 
         if (self.config.join_addresses) |join| {
             try argv_list.appendSlice(self.allocator, &.{ "--join", join });
+        }
+
+        if (self.config.bind) |bind| {
+            try argv_list.appendSlice(self.allocator, &.{ "--bind", bind });
         }
 
         var child = stdx.process.Child.init(argv_list.items, self.allocator);
@@ -667,8 +674,8 @@ pub const ServerProcess = struct {
 
     /// Try to establish a TCP connection to a port
     fn tryConnect(self: *Self, port: u16) bool {
-        _ = self;
-        const addr = stdx.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        const ip4 = stdx.net.parseIp4Bind(self.hostForClients()) catch .{ 127, 0, 0, 1 };
+        const addr = stdx.net.Address.initIp4(ip4, port);
         const stream = stdx.net.tcpConnectToAddress(addr) catch {
             return false;
         };
@@ -686,9 +693,15 @@ pub const ServerProcess = struct {
         return self.raft_port;
     }
 
-    /// Get the Raft endpoint for --join (127.0.0.1:raft_port)
+    /// The address clients (and the harness) reach this node at: its bind
+    /// address when one was given, else loopback.
+    pub fn hostForClients(self: *const Self) []const u8 {
+        return self.config.bind orelse "127.0.0.1";
+    }
+
+    /// Get the Raft endpoint for --join (host:raft_port)
     pub fn getRaftEndpoint(self: *const Self, allocator: Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{self.raft_port});
+        return std.fmt.allocPrint(allocator, "{s}:{d}", .{ self.hostForClients(), self.raft_port });
     }
 
     /// Get the dashboard port (0 if not enabled)
@@ -701,9 +714,9 @@ pub const ServerProcess = struct {
         return self.metrics_port;
     }
 
-    /// Get the endpoint string (127.0.0.1:port)
+    /// Get the endpoint string (host:port)
     pub fn getEndpoint(self: *const Self, allocator: Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{self.port});
+        return std.fmt.allocPrint(allocator, "{s}:{d}", .{ self.hostForClients(), self.port });
     }
 
     /// Get the data directory path

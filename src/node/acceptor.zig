@@ -74,10 +74,10 @@ pub const Acceptor = struct {
         };
     }
 
-    /// Bind and listen on the given port. Returns the listen fd.
-    pub fn listen(self: *Acceptor, port: u16) !void {
+    /// Bind to `bind` (the `[server] bind` address) and listen on `port`.
+    pub fn listen(self: *Acceptor, bind: [4]u8, port: u16) !void {
         const stdx_net = @import("stdx").net;
-        const addr = stdx_net.SocketAddrV4.initIp4(.{ 0, 0, 0, 0 }, port);
+        const addr = stdx_net.SocketAddrV4.initIp4(bind, port);
 
         const flags: u32 = std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK;
         const fd = try stdx_net.sysSocket(std.posix.AF.INET, flags, std.posix.IPPROTO.TCP);
@@ -90,7 +90,7 @@ pub const Acceptor = struct {
         try stdx_net.sysListen(fd, 128);
 
         self.listen_fd = fd;
-        log.debug("Acceptor listening on 0.0.0.0:{d} fd={d} shard_count={d}", .{ port, fd, self.shard_count });
+        log.debug("Acceptor listening on {d}.{d}.{d}.{d}:{d} fd={d} shard_count={d}", .{ bind[0], bind[1], bind[2], bind[3], port, fd, self.shard_count });
     }
 
     /// Accept one connection and route it to the correct shard.
@@ -347,7 +347,7 @@ test "Acceptor: listen and accept via TCP" {
     var acceptor = Acceptor.init(&shard_pipes, router);
 
     // Listen on ephemeral port
-    try acceptor.listen(0);
+    try acceptor.listen(.{ 0, 0, 0, 0 }, 0);
     defer acceptor.close();
 
     // Get the port we bound to
@@ -385,4 +385,14 @@ test "Acceptor: listen and accept via TCP" {
     try std.testing.expect(handed_fd >= 0);
 
     try std.testing.expectEqual(@as(u64, 1), acceptor.accepted_total);
+}
+
+test "acceptor: listens on the configured bind address" {
+    var shard_pipes = [_]i32{ -1, -1 };
+    const router = Router.init(4096, 2, 0);
+    var acceptor = Acceptor.init(&shard_pipes, router);
+    defer if (acceptor.listen_fd >= 0) @import("stdx").net.sysClose(acceptor.listen_fd);
+    try acceptor.listen(.{ 127, 0, 0, 1 }, 0);
+    const local = try @import("stdx").net.sysLocalIp4(acceptor.listen_fd);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.ip4);
 }

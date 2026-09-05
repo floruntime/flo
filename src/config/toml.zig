@@ -1,6 +1,7 @@
 //! Simple TOML parser for Flo configuration files.
-//! Supports a subset of TOML: tables, strings, integers, booleans.
-//! Does not support arrays, inline tables, or multi-line strings.
+//! Supports a subset of TOML: tables, strings, integers, booleans, and
+//! arrays of those (`seeds = ["a:9500", "b:9500"]`, one line or several).
+//! Does not support inline tables or multi-line strings.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,6 +11,7 @@ pub const Value = union(enum) {
     integer: i64,
     boolean: bool,
     table: Table,
+    array: []Value,
 
     pub fn asString(self: Value) ?[]const u8 {
         return if (self == .string) self.string else null;
@@ -52,8 +54,21 @@ pub const Table = struct {
             if (entry.value_ptr.* == .string) {
                 self.allocator.free(entry.value_ptr.string);
             }
+            if (entry.value_ptr.* == .array) {
+                freeArray(self.allocator, entry.value_ptr.array);
+            }
         }
         self.entries.deinit();
+    }
+
+    fn freeArray(allocator: Allocator, items: []Value) void {
+        for (items) |*item| switch (item.*) {
+            .string => |str| allocator.free(str),
+            .table => |*t| t.deinit(),
+            .array => |inner| freeArray(allocator, inner),
+            else => {},
+        };
+        allocator.free(items);
     }
 
     pub fn get(self: *const Table, key: []const u8) ?Value {
@@ -86,6 +101,13 @@ pub const Table = struct {
     pub fn getBool(self: *const Table, key: []const u8) ?bool {
         if (self.entries.get(key)) |val| {
             return val.asBool();
+        }
+        return null;
+    }
+
+    pub fn getArray(self: *const Table, key: []const u8) ?[]const Value {
+        if (self.entries.get(key)) |val| {
+            return if (val == .array) val.array else null;
         }
         return null;
     }
@@ -222,9 +244,39 @@ pub const Parser = struct {
             return .{ .boolean = try self.parseBoolean() };
         } else if (std.ascii.isDigit(c) or c == '-' or c == '+') {
             return .{ .integer = try self.parseInteger() };
+        } else if (c == '[') {
+            return .{ .array = try self.parseArray() };
         } else {
             return error.UnexpectedCharacter;
         }
+    }
+
+    /// `[` has been seen. Elements may span lines; a trailing comma is fine.
+    fn parseArray(self: *Parser) ParseError![]Value {
+        self.pos += 1;
+        var items: std.ArrayListUnmanaged(Value) = .empty;
+        errdefer {
+            const owned = items.toOwnedSlice(self.allocator) catch &.{};
+            Table.freeArray(self.allocator, @constCast(owned));
+        }
+        while (true) {
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.input.len) return error.UnexpectedCharacter;
+            if (self.input[self.pos] == ']') {
+                self.pos += 1;
+                break;
+            }
+            const value = try self.parseValue();
+            try items.append(self.allocator, value);
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.input.len) return error.UnexpectedCharacter;
+            if (self.input[self.pos] == ',') {
+                self.pos += 1;
+            } else if (self.input[self.pos] != ']') {
+                return error.UnexpectedCharacter;
+            }
+        }
+        return items.toOwnedSlice(self.allocator);
     }
 
     fn parseString(self: *Parser) ParseError![]const u8 {
@@ -441,4 +493,40 @@ test "parse complete server config" {
 
     const logging = table.getTable("logging").?;
     try std.testing.expectEqualStrings("info", logging.getString("level").?);
+}
+
+test "parse arrays of strings, one line or several, with a trailing comma" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\[cluster]
+        \\seeds = ["10.0.1.10:9500", "flo-2:9500"]
+        \\empty = []
+        \\multi = [
+        \\  "a:1",   # first
+        \\  "b:2",
+        \\]
+        \\ports = [1, 2, 3]
+    ;
+    var parser = Parser.init(allocator, input);
+    var root = try parser.parse();
+    defer root.deinit();
+    const cluster = root.getTable("cluster").?;
+
+    const seeds = cluster.getArray("seeds").?;
+    try std.testing.expectEqual(@as(usize, 2), seeds.len);
+    try std.testing.expectEqualStrings("10.0.1.10:9500", seeds[0].asString().?);
+    try std.testing.expectEqualStrings("flo-2:9500", seeds[1].asString().?);
+    try std.testing.expectEqual(@as(usize, 0), cluster.getArray("empty").?.len);
+    const multi = cluster.getArray("multi").?;
+    try std.testing.expectEqual(@as(usize, 2), multi.len);
+    try std.testing.expectEqualStrings("b:2", multi[1].asString().?);
+    try std.testing.expectEqual(@as(i64, 3), cluster.getArray("ports").?[2].asInt().?);
+    // A string is not an array and vice versa.
+    try std.testing.expect(cluster.getString("seeds") == null);
+    try std.testing.expect(cluster.getArray("nope") == null);
+}
+
+test "an unterminated array is an error, not a hang" {
+    var parser = Parser.init(std.testing.allocator, "seeds = [\"a:1\",");
+    try std.testing.expectError(error.UnexpectedCharacter, parser.parse());
 }

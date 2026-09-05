@@ -187,13 +187,13 @@ pub fn parseClusterConfig(
         config.gossip_suspect_timeout_ms = @intCast(t);
     }
 
-    // Parse seeds array
+    // Seeds: an array of "host:port", or one comma-separated string.
     if (table.getArray("seeds")) |seeds_array| {
         var seeds_list: std.ArrayList([]const u8) = .empty;
         errdefer seeds_list.deinit(allocator);
 
-        for (seeds_array.items()) |item| {
-            if (item.getString()) |seed| {
+        for (seeds_array) |item| {
+            if (item.asString()) |seed| {
                 const owned = try allocator.dupe(u8, seed);
                 try owned_strings.append(allocator, owned);
                 try seeds_list.append(allocator, owned);
@@ -202,7 +202,6 @@ pub fn parseClusterConfig(
 
         config.seeds = try seeds_list.toOwnedSlice(allocator);
     } else if (table.getString("seeds")) |seeds_str| {
-        // Fallback: parse comma-separated string (since TOML parser doesn't support arrays)
         var seeds_list: std.ArrayList([]const u8) = .empty;
         errdefer seeds_list.deinit(allocator);
 

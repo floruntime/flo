@@ -35,6 +35,7 @@ test {
     // The PRNG's tests live only here; without this reference they are
     // never collected.
     _ = prng;
+    _ = @import("net.zig");
 }
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.
