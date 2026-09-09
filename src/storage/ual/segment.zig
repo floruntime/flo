@@ -51,7 +51,12 @@ pub const SegmentHeader = extern struct {
     entry_count: u32 align(1),
     data_size: u32 align(1), // size of entry data section (compressed)
     compression: u8 align(1),
-    reserved: [9]u8 align(1),
+    /// The Raft commit index when this segment was sealed. A restart applies
+    /// entries at or below the highest watermark over all segments; anything
+    /// above it goes into the log only and is applied once commit is
+    /// re-established, since a new leader may truncate it.
+    commit_index_at_seal: u64 align(1),
+    reserved: [1]u8 align(1),
 
     comptime {
         if (@sizeOf(SegmentHeader) != HEADER_SIZE) {

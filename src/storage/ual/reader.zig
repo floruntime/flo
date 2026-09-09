@@ -109,6 +109,13 @@ pub const SegmentReader = struct {
     /// Find an entry by UAL index using the sparse index for O(log N) lookup.
     /// Returns null if not found.
     pub fn findByIndex(self: *const SegmentReader, target_index: u64) ?Entry {
+        const offset = self.findOffset(target_index) orelse return null;
+        return self.readEntryAt(offset);
+    }
+
+    /// Data-section offset of the entry at `target_index`, so a caller can
+    /// keep reading sequentially from there.
+    pub fn findOffset(self: *const SegmentReader, target_index: u64) ?usize {
         if (!self.containsIndex(target_index)) return null;
 
         // Binary search sparse index for the largest entry ≤ target
@@ -131,7 +138,7 @@ pub const SegmentReader = struct {
         var offset = start_offset;
         while (offset < self.data_end - self.data_start) {
             const entry = self.readEntryAt(offset) orelse break;
-            if (entry.header.index == target_index) return entry;
+            if (entry.header.index == target_index) return offset;
             if (entry.header.index > target_index) break; // past it
             offset += entry.totalSize();
         }

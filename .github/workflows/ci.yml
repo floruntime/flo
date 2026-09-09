@@ -123,6 +123,7 @@ jobs:
         # A pin may be a genuine hang, so every pin runs under a timeout —
         # a kill (exit 124) still counts as failing by design.
         run: |
+          shopt -s nullglob
           for pin in src/vopr/pins/*.json; do
             if timeout 300 ./zig-out/bin/vopr --scenario-in="$pin" > /dev/null 2>&1; then
               echo "::error::$pin passed — its product fix landed; retire the pin"; exit 1

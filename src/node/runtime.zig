@@ -541,6 +541,7 @@ pub const Runtime = struct {
         for (0..self.shard_count) |i| {
             shards[i].registerBackgroundTasks();
             shards[i].wireHandlerShardPtrs();
+            shards[i].applyDeferredTail();
         }
 
         log.debug("Runtime.start: {d} shards initialized", .{shards_created});

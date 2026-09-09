@@ -97,22 +97,13 @@ const SimDisk = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// UAL fires this on every log append. An append at an index at or
-    /// below the tip is an implicit truncate-to-(index-1): `truncateAfter`
-    /// bypasses UAL and fires no hook, so truncation must be inferred —
-    /// and it clamps durability, because the truncated suffix is gone
-    /// from the log a correct disk would persist.
+    /// UAL fires this on every log append. Truncation reaches the disk
+    /// through its own hook first, so an append never lands at or below
+    /// the tip; one that does is a log bug, not a disk event.
     fn onAppend(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
         const self: *SimDisk = @ptrCast(@alignCast(ctx));
         const idx = entry.header.index;
-        if (idx <= self.entries.items.len) {
-            var i = self.entries.items.len;
-            while (i >= idx) : (i -= 1) {
-                self.allocator.free(self.entries.items[i - 1].payload);
-            }
-            self.entries.shrinkRetainingCapacity(idx - 1);
-            self.durable_len = @min(self.durable_len, idx - 1);
-        }
+        if (idx != self.entries.items.len + 1) @panic("sim disk: append is not at the tip");
         const payload = self.allocator.dupe(u8, entry.payload) catch @panic("sim disk OOM");
         self.entries.append(self.allocator, .{
             .entry_type = entry.header.entry_type,
@@ -121,6 +112,42 @@ const SimDisk = struct {
             .timestamp_ns = entry.header.timestamp_ns,
             .payload = payload,
         }) catch @panic("sim disk OOM");
+    }
+
+    /// The log truncated a conflicting suffix; the disk drops the same one.
+    /// Durability is clamped too: the suffix is gone from the log a correct
+    /// disk would persist.
+    fn onTruncate(ctx: *anyopaque, after_index: u64) void {
+        const self: *SimDisk = @ptrCast(@alignCast(ctx));
+        var i = self.entries.items.len;
+        while (i > after_index) : (i -= 1) {
+            self.allocator.free(self.entries.items[i - 1].payload);
+        }
+        self.entries.shrinkRetainingCapacity(@intCast(@min(after_index, self.entries.items.len)));
+        self.durable_len = @min(self.durable_len, self.entries.items.len);
+    }
+
+    /// The log reads below its ring from here: the production runtime's
+    /// writer buffer plus sealed segments, as one array.
+    fn readRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) usize {
+        const self: *SimDisk = @ptrCast(@alignCast(ctx));
+        var n: usize = 0;
+        var used: usize = 0;
+        while (n < buf.len and start - 1 + n < self.entries.items.len) : (n += 1) {
+            const de = self.entries.items[start - 1 + n];
+            if (used + de.payload.len > arena.len) break;
+            @memcpy(arena[used..][0..de.payload.len], de.payload);
+            buf[n] = entry_mod.buildEntry(
+                @enumFromInt(de.entry_type),
+                de.flags,
+                de.term,
+                start + n,
+                de.timestamp_ns,
+                arena[used..][0..de.payload.len],
+            );
+            used += de.payload.len;
+        }
+        return n;
     }
 
     /// RaftNode persists through this before granting a vote or adopting a
@@ -334,7 +361,8 @@ pub const Summary = struct {
     messages_delivered: u64,
     messages_dropped: u64,
     apply_stalls: u64,
-    eviction_stalls: u64,
+    /// Replication batches read from below the leader's ring.
+    catch_up_reads: u64,
     /// Wyhash over the canonical history — two runs of one seed must agree.
     canonical_hash: u64,
     violation_count: usize,
@@ -377,7 +405,7 @@ pub const Simulator = struct {
     restarts: u64 = 0,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
-    eviction_stalls: u64 = 0,
+    catch_up_reads: u64 = 0,
 
     const RAFT_GROUP: u32 = 1;
 
@@ -462,11 +490,15 @@ pub const Simulator = struct {
         };
     }
 
-    /// Log appends and hard state both flow into the sim disk through the
-    /// node's own hooks. Volatile mode attaches no hard-state sink.
+    /// Log appends, truncations and hard state all flow into the sim disk
+    /// through the node's own hooks, and reads below the ring come back
+    /// from it. Volatile mode attaches no hard-state sink.
     fn attachDisk(self: *Simulator, node: *SimNode) void {
         node.raft.log.ual.on_append_ctx = @ptrCast(&node.disk);
         node.raft.log.ual.on_append = SimDisk.onAppend;
+        node.raft.log.on_truncate_ctx = @ptrCast(&node.disk);
+        node.raft.log.on_truncate = SimDisk.onTruncate;
+        node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
         if (!self.options.volatile_hard_state) {
             node.raft.hard_state_sink = .{ .ctx = @ptrCast(&node.disk), .persist = SimDisk.persistHardState };
         }
@@ -689,49 +721,19 @@ pub const Simulator = struct {
             const prev_index = next - 1;
             const prev_term = node.raft.log.entryTerm(prev_index) orelse blk: {
                 if (prev_index == 0) break :blk @as(u64, 0);
-                // The entry a repair needs is gone from the ring and there
-                // is no snapshot/catch-up path — the stall the --small-ring
-                // scenario exists to expose. Surfaces as convergence failure.
+                // The term index survives eviction, so this is a log bug.
+                // Surfaces as convergence failure.
                 self.apply_stalls += 1;
                 continue;
             };
 
             var entries: []OwnedEntry = &.{};
             if (want_data) {
-                var count = node.raft.log.getRange(next, self.range_entries, self.range_arena);
-                if (count == 0) {
-                    // The range a repair needs is evicted from the ring —
-                    // without a catch-up path the peer wedges silently
-                    // (term lookups still succeed via the term cache, so
-                    // the prev_term stall above never fires). Count it,
-                    // and outside the --small-ring scenario fall back to
-                    // the harness's stable storage — the same
-                    // reference-implementation role as the pump itself,
-                    // standing in for the snapshot/catch-up path the
-                    // runtime doesn't have. --small-ring keeps the wedge
-                    // observable as the acceptance test for that work.
-                    self.eviction_stalls += 1;
-                    if (!self.scenario.small_ring) {
-                        const disk = node.disk.entries.items;
-                        var k: usize = 0;
-                        var arena_used: usize = 0;
-                        while (k < MAX_BATCH and next - 1 + k < disk.len) : (k += 1) {
-                            const de = disk[next - 1 + k];
-                            if (arena_used + de.payload.len > self.range_arena.len) break;
-                            @memcpy(self.range_arena[arena_used..][0..de.payload.len], de.payload);
-                            self.range_entries[k] = entry_mod.buildEntry(
-                                @enumFromInt(de.entry_type),
-                                de.flags,
-                                de.term,
-                                next + k,
-                                de.timestamp_ns,
-                                self.range_arena[arena_used..][0..de.payload.len],
-                            );
-                            arena_used += de.payload.len;
-                        }
-                        count = k;
-                    }
-                }
+                // Below the ring the log reads the disk; counted, because
+                // a slice that never repairs from below the ring has not
+                // exercised the catch-up path.
+                if (!node.raft.log.contains(next)) self.catch_up_reads += 1;
+                const count = node.raft.log.getRange(next, self.range_entries, self.range_arena);
                 if (count > 0) {
                     const owned = try self.allocator.alloc(OwnedEntry, count);
                     var built: usize = 0;
@@ -838,23 +840,14 @@ pub const Simulator = struct {
             if (!node.up) continue;
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
-                // Never bare getEntry (the wrap-null trap), and never
-                // ring-only: a restarted node's durable log can exceed its
-                // ring, so committed-but-evicted entries fall back to disk.
-                var term: u64 = undefined;
-                var payload: []const u8 = undefined;
-                if (node.raft.log.getEntryCopy(idx, self.apply_buf)) |e| {
-                    term = e.header.term;
-                    payload = e.payload;
-                } else if (idx <= node.disk.entries.items.len) {
-                    const de = node.disk.entries.items[idx - 1];
-                    term = de.term;
-                    payload = de.payload;
-                } else {
+                // Never bare getEntry (the wrap-null trap). A restarted
+                // node's durable log can exceed its ring; the log reads the
+                // rest from the disk itself.
+                const e = node.raft.log.getEntryCopy(idx, self.apply_buf) orelse {
                     self.apply_stalls += 1;
                     break;
-                }
-                self.checker.onApply(&self.workload, node.id, idx, term, payload, self.now, self.latest_crash_at);
+                };
+                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, self.now, self.latest_crash_at);
                 node.raft.last_applied = idx;
             }
         }
@@ -1070,7 +1063,7 @@ pub const Simulator = struct {
             .messages_delivered = self.net.delivered,
             .messages_dropped = self.net.dropped,
             .apply_stalls = self.apply_stalls,
-            .eviction_stalls = self.eviction_stalls,
+            .catch_up_reads = self.catch_up_reads,
             .canonical_hash = h.final(),
             .violation_count = self.checker.violations.items.len,
         };
