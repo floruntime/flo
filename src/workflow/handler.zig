@@ -93,6 +93,10 @@ pub const WorkflowHandler = struct {
     /// timer — turning a polled (≤ batch_timeout_ms) latency into ~one tick.
     /// Single-threaded per shard (set/read only on the shard's reactor thread).
     triggers_dirty: bool = false,
+    /// Whether an applied definition installs its trigger and schedule here.
+    /// Cleared by the shard while it applies entries replicated from a peer:
+    /// those producers run on the node that owns the definition.
+    install_producers: bool = true,
 
     /// Active interval/cron schedules: "namespace:workflow_name" → ScheduleState.
     /// Registered when a workflow with a `schedule:` block is created.
@@ -508,80 +512,29 @@ pub const WorkflowHandler = struct {
             return;
         }
         const name = req.key;
-        const version = def.version;
 
-        // Build namespace-qualified key for the definitions map
+        // The applier stores the definition and (re)registers its trigger
+        // and schedule from the entry; the same applier runs at boot, so a
+        // restart keeps them too.
+        self.persistCreate(shard, req.namespace, name, yaml) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "workflow not persisted");
+            return;
+        };
+        if (!shard.applyCommitted()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "workflow not applied");
+            return;
+        }
         const ns_key = self.makeNsKey(req.namespace, name) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
-
-        // Remove old definition if exists
-        if (self.definitions.fetchRemove(ns_key)) |old| {
-            self.allocator.free(old.key); // free old ns-qualified key
-            self.allocator.free(old.value.name_owned);
-            self.allocator.free(old.value.version_owned);
-            self.allocator.free(old.value.yaml_owned);
-        }
-
-        // Duplicate all owned data
-        const owned_name = self.allocator.dupe(u8, name) catch {
-            self.allocator.free(ns_key);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        const owned_version = self.allocator.dupe(u8, version) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_name);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        const owned_yaml = self.allocator.dupe(u8, yaml) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_name);
-            self.allocator.free(owned_version);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-
-        self.definitions.put(ns_key, .{
-            .name_owned = owned_name,
-            .version_owned = owned_version,
-            .yaml_owned = owned_yaml,
-            .created_at_ms = now_ms,
-            .idempotency = def.idempotency,
-        }) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_name);
-            self.allocator.free(owned_version);
-            self.allocator.free(owned_yaml);
+        defer self.allocator.free(ns_key);
+        if (!self.definitions.contains(ns_key)) {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "definition store failed");
             return;
-        };
-
-        // Return the workflow name
-        self.persistCreate(shard, req.namespace, name, owned_yaml);
-
-        // Register stream trigger if the definition has one
-        if (def.trigger) |trigger| {
-            self.registerStreamTrigger(req.namespace, name, trigger);
-        } else {
-            // Definition updated without trigger — remove any existing trigger
-            self.unregisterStreamTrigger(req.namespace, name);
         }
 
-        // Register schedule if the definition has one
-        if (def.schedule) |schedule| {
-            self.registerSchedule(req.namespace, name, schedule);
-        } else {
-            self.unregisterSchedule(req.namespace, name);
-        }
-
-        shard.sendOkResponse(conn, req.header.request_id, owned_name);
+        shard.sendOkResponse(conn, req.header.request_id, name);
     }
 
     // ── START ───────────────────────────────────────────────────────────
@@ -735,113 +688,22 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run_id collision");
             return;
         }
+        self.allocator.free(run_ns_key);
 
-        // Duplicate for storage
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
-            self.allocator.free(run_ns_key);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        const owned_wf_name = self.allocator.dupe(u8, workflow_name) catch {
-            self.allocator.free(owned_run_id);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_wf_name);
-
-        const owned_version = self.allocator.dupe(u8, version) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_version);
-
-        const owned_input = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            self.allocator.free(owned_version);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_input);
-
-        const owned_idem: ?[]const u8 = if (idempotency_key) |k|
-            self.allocator.dupe(u8, k) catch {
-                self.allocator.free(owned_run_id);
-                self.allocator.free(owned_wf_name);
-                self.allocator.free(owned_version);
-                self.allocator.free(owned_input);
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            }
-        else
-            null;
-
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-
-        var run = RunRecord{
-            .run_id_owned = owned_run_id,
-            .workflow_name_owned = owned_wf_name,
-            .workflow_version_owned = owned_version,
-            .status = .running,
-            .input_owned = owned_input,
-            .created_at_ms = now_ms,
-            .started_at_ms = now_ms,
-            .completed_at_ms = null,
-            .idempotency_key_owned = owned_idem,
-            .signals = .empty,
-            .history = .empty,
-        };
-
-        if (shard.metrics_registry) |m| m.workflow.recordStarted();
-
-        // Add initial history event
-        const evt_type = self.allocator.dupe(u8, "workflow_started") catch {
-            self.freeRunRecord(&run);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        const evt_detail = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(evt_type);
-            self.freeRunRecord(&run);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        run.history.append(self.allocator, .{
-            .event_type_owned = evt_type,
-            .detail_owned = evt_detail,
-            .timestamp_ms = now_ms,
-        }) catch {
-            self.allocator.free(evt_type);
-            self.allocator.free(evt_detail);
-            self.freeRunRecord(&run);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "history store failed");
-            return;
-        };
-
-        self.runs.put(run_ns_key, run) catch {
-            self.allocator.free(run_ns_key);
-            self.freeRunRecord(&run);
+        // The applier creates the run from the entry.
+        const stored_key = self.startRunThroughLog(shard, req.namespace, run_id_str, workflow_name, version, input, idempotency_key, "workflow_started") orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run store failed");
             return;
         };
-
-        // Pre-compute search tags from $.input.* paths in the definition
-        if (self.runs.getPtr(run_ns_key)) |stored_run| {
-            stored_run.search_tags_owned = self.buildSearchTags(def_ns_key, stored_run);
-        }
+        if (shard.metrics_registry) |m| m.workflow.recordStarted();
 
         // Return the run ID
-        self.persistStart(shard, req.namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, if (self.runs.getPtr(run_ns_key)) |r| r.search_tags_owned else null);
-        shard.sendOkResponse(conn, req.header.request_id, owned_run_id);
+        shard.sendOkResponse(conn, req.header.request_id, self.runs.get(stored_key).?.run_id_owned);
 
         // Begin step execution. The run is already in the map; advanceWorkflow
         // will drive it through the workflow graph until it reaches a terminal
         // or a wait_for_signal step.
-        self.advanceWorkflow(shard, run_ns_key, req.namespace);
+        self.advanceWorkflow(shard, stored_key, req.namespace);
     }
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
@@ -1608,7 +1470,7 @@ pub const WorkflowHandler = struct {
                     if (signal_found) {
                         // Signal already received — follow "success" transition
                         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
-                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
+                        if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
                         const transition = wait_step.getTransition(definition.StepOutcome.success) orelse {
                             self.completeRun(shard, run_ns_key, run, .failed, "no success transition for wait step", now_ms);
                             return;
@@ -1715,7 +1577,7 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.target_not_found;
         }
 
-        const child_rid = target_handler.spawnRun(target_shard, namespace, child_name, step_input, "child_started", now_ms) orelse
+        const child_rid = target_handler.spawnRun(target_shard, namespace, child_name, step_input, "child_started") orelse
             return definition.StepOutcome.execution_failure;
 
         // Re-fetch the (possibly relocated) parent record and park it.
@@ -1746,80 +1608,12 @@ pub const WorkflowHandler = struct {
         wf_name: []const u8,
         input: []const u8,
         evt_type: []const u8,
-        now_ms: i64,
     ) ?[]const u8 {
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return null;
 
-        const run_ns_key = self.makeNsKey(namespace, run_id_str) orelse return null;
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
-            self.allocator.free(run_ns_key);
-            return null;
-        };
-        const owned_wf_name = self.allocator.dupe(u8, wf_name) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            return null;
-        };
-        const owned_version = self.allocator.dupe(u8, "latest") catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            return null;
-        };
-        const owned_input = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            self.allocator.free(owned_version);
-            return null;
-        };
-
-        var run = RunRecord{
-            .run_id_owned = owned_run_id,
-            .workflow_name_owned = owned_wf_name,
-            .workflow_version_owned = owned_version,
-            .status = .running,
-            .input_owned = owned_input,
-            .created_at_ms = now_ms,
-            .started_at_ms = now_ms,
-            .completed_at_ms = null,
-            .idempotency_key_owned = null,
-            .signals = .empty,
-            .history = .empty,
-        };
-
-        const ev_type = self.allocator.dupe(u8, evt_type) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return null;
-        };
-        const ev_detail = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(ev_type);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return null;
-        };
-        run.history.append(self.allocator, .{
-            .event_type_owned = ev_type,
-            .detail_owned = ev_detail,
-            .timestamp_ms = now_ms,
-        }) catch {
-            self.allocator.free(ev_type);
-            self.allocator.free(ev_detail);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return null;
-        };
-
-        self.runs.put(run_ns_key, run) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return null;
-        };
-
-        self.persistStart(shard, namespace, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
+        const run_ns_key = self.startRunThroughLog(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
         self.advanceWorkflow(shard, run_ns_key, namespace);
 
         // Return the stored run_id (advanceWorkflow does not insert into self.runs,
@@ -1976,22 +1770,27 @@ pub const WorkflowHandler = struct {
             return self.invokeActionLocal(shard, run, action_name, input, step_label, target_shard_id, now_ms);
         }
 
-        // Cross-shard: need to create run on the target shard's handler
-        const target_handler = self.resolveActionHandler(shard, namespace, action_name);
-
-        // Generate a run ID for the cross-shard invocation
+        // Cross-shard: the target shard creates the run on its own thread,
+        // through its own log and applier, from a message we hand it.
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch {
             return definition.StepOutcome.execution_failure;
         };
-
-        // Create the run on the target shard's handler under mutex
-        target_handler.runs_mu.lock();
-        const ok = target_handler.invokeByNameWithId(pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned);
-        target_handler.runs_mu.unlock();
-
-        if (!ok) return definition.StepOutcome.execution_failure;
+        const peer_inboxes = shard.peer_inboxes orelse return definition.StepOutcome.execution_failure;
+        if (target_shard_id >= peer_inboxes.len) return definition.StepOutcome.execution_failure;
+        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
+            return definition.StepOutcome.execution_failure;
+        };
+        if (!peer_inboxes[target_shard_id].send(.{
+            .tag = .action_start,
+            .src_shard = @intCast(shard.id),
+            .payload_len = @intCast(message.len),
+            .payload_ptr = message.ptr,
+        })) {
+            shard.allocator.free(message);
+            return definition.StepOutcome.execution_failure;
+        }
 
         // Dupe the pre_run_id for parking (it's on the stack)
         const owned_pre_id = self.allocator.dupe(u8, pre_run_id) catch {
@@ -2377,7 +2176,7 @@ pub const WorkflowHandler = struct {
         run.status = .running;
         self.addHistoryEvent(run, "child_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
-                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
+        if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
         // Clear pending child state.
         if (run.pending_child_run_id_owned) |a| self.allocator.free(a);
@@ -2450,7 +2249,7 @@ pub const WorkflowHandler = struct {
         run.status = .running;
         self.addHistoryEvent(run, "action_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
-                    if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
+        if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
         // Clear pending action state
         if (run.pending_action_run_id_owned) |a| self.allocator.free(a);
@@ -2705,7 +2504,11 @@ pub const WorkflowHandler = struct {
             else => "workflow_ended",
         };
         self.addHistoryEvent(run, event_type, detail, now_ms);
+        // completeRun mutates the run first because persistComplete
+        // serializes it; the applier then rebuilds the same state from the
+        // entry.
         self.persistComplete(shard, run_ns_key, run, status, now_ms);
+        _ = shard.applyCommitted();
     }
 
     /// Resolve the workflow's `output` mapping (same format as step inputMapping).
@@ -2857,11 +2660,19 @@ pub const WorkflowHandler = struct {
     ) void {
         const trigger_key = self.makeNsKey(namespace, workflow_name) orelse return;
 
-        // Remove old trigger if re-creating workflow (count stays balanced —
-        // we decrement here and increment again after the put below).
+        // A re-created definition keeps its place in the stream: starting
+        // over at zero would run every consumed event again. A trigger moved
+        // to another stream starts that stream from its beginning.
+        var cursor_ts: u64 = 0;
+        var cursor_seq: u64 = 0;
+        const stream_ns = trigger.namespace orelse namespace;
         if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
+            if (std.mem.eql(u8, state.stream_name_owned, trigger.stream) and std.mem.eql(u8, state.stream_namespace_owned, stream_ns)) {
+                cursor_ts = state.stream_cursor_ts;
+                cursor_seq = state.stream_cursor_seq;
+            }
             self.freeTriggerState(&state);
             _ = global_stream_trigger_count.fetchSub(1, .monotonic);
         }
@@ -2881,7 +2692,6 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_ns);
             return;
         };
-        const stream_ns = trigger.namespace orelse namespace;
         const owned_stream_ns = self.allocator.dupe(u8, stream_ns) catch {
             self.allocator.free(trigger_key);
             self.allocator.free(owned_wf);
@@ -2897,8 +2707,8 @@ pub const WorkflowHandler = struct {
             .stream_namespace_owned = owned_stream_ns,
             .batch_size = trigger.batch_size,
             .poll_interval_ms = trigger.batch_timeout_ms,
-            .stream_cursor_ts = 0,
-            .stream_cursor_seq = 0,
+            .stream_cursor_ts = cursor_ts,
+            .stream_cursor_seq = cursor_seq,
             .last_poll_ms = 0,
         }) catch {
             self.allocator.free(trigger_key);
@@ -3030,7 +2840,6 @@ pub const WorkflowHandler = struct {
         shard: *Shard,
         schedule: *const ScheduleState,
     ) void {
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const input = schedule.input_owned orelse "{}";
 
         // Generate run ID with embedded partition bits
@@ -3038,77 +2847,7 @@ pub const WorkflowHandler = struct {
         const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
 
-        // Build namespace-qualified run key
-        const run_ns_key = self.makeNsKey(schedule.namespace_owned, run_id_str) orelse return;
-
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        const owned_wf_name = self.allocator.dupe(u8, schedule.workflow_name_owned) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            return;
-        };
-        const owned_version = self.allocator.dupe(u8, "latest") catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            return;
-        };
-        const owned_input = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            self.allocator.free(owned_version);
-            return;
-        };
-
-        var run = RunRecord{
-            .run_id_owned = owned_run_id,
-            .workflow_name_owned = owned_wf_name,
-            .workflow_version_owned = owned_version,
-            .status = .running,
-            .input_owned = owned_input,
-            .created_at_ms = now_ms,
-            .started_at_ms = now_ms,
-            .completed_at_ms = null,
-            .idempotency_key_owned = null,
-            .signals = .empty,
-            .history = .empty,
-        };
-
-        // Add history event
-        const evt_type = self.allocator.dupe(u8, "schedule_started") catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        const evt_detail = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(evt_type);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        run.history.append(self.allocator, .{
-            .event_type_owned = evt_type,
-            .detail_owned = evt_detail,
-            .timestamp_ms = now_ms,
-        }) catch {
-            self.allocator.free(evt_type);
-            self.allocator.free(evt_detail);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-
-        self.runs.put(run_ns_key, run) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-
-        self.persistStart(shard, schedule.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
+        const run_ns_key = self.startRunThroughLog(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started") orelse return;
         self.advanceWorkflow(shard, run_ns_key, schedule.namespace_owned);
     }
 
@@ -3152,12 +2891,13 @@ pub const WorkflowHandler = struct {
             );
             if (result.payloads.len == 0) continue;
             defer stream_handler.allocator.free(result.payloads);
+            defer stream_handler.allocator.free(result.ids);
 
             // Start one run per event (or per batch if batch_size > 1)
             if (trigger.batch_size <= 1) {
                 // One run per event
-                for (result.payloads) |payload| {
-                    self.startRunFromTrigger(shard, trigger, payload);
+                for (result.payloads, result.ids) |payload, event_id| {
+                    self.startRunFromTrigger(shard, trigger, payload, event_id);
                 }
             } else {
                 // Batch mode: collect batch_size events into a JSON array per run
@@ -3170,7 +2910,7 @@ pub const WorkflowHandler = struct {
                         continue;
                     };
                     defer self.allocator.free(batch_json);
-                    self.startRunFromTrigger(shard, trigger, batch_json);
+                    self.startRunFromTrigger(shard, trigger, batch_json, result.ids[end - 1]);
                     i = end;
                 }
             }
@@ -3220,91 +2960,48 @@ pub const WorkflowHandler = struct {
     }
 
     /// Start a workflow run programmatically from a stream trigger event.
+    /// A trigger-started run records the event it came from as its
+    /// idempotency key ("trigger:<stream>@<ts>:<seq>", the last event of a
+    /// batch). The applier reads it back to restore the trigger's cursor at
+    /// boot, so a restart neither re-runs consumed events nor skips
+    /// unconsumed ones.
     fn startRunFromTrigger(
         self: *WorkflowHandler,
         shard: *Shard,
         trigger: *const StreamTriggerState,
         input: []const u8,
+        event_id: StreamID,
     ) void {
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
 
-        // Build namespace-qualified run key
-        const run_ns_key = self.makeNsKey(trigger.namespace_owned, run_id_str) orelse return;
+        var idem_buf: [512]u8 = undefined;
+        const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch return;
 
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        const owned_wf_name = self.allocator.dupe(u8, trigger.workflow_name_owned) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            return;
-        };
-        const owned_version = self.allocator.dupe(u8, "latest") catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            return;
-        };
-        const owned_input = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(run_ns_key);
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_wf_name);
-            self.allocator.free(owned_version);
-            return;
-        };
-
-        var run = RunRecord{
-            .run_id_owned = owned_run_id,
-            .workflow_name_owned = owned_wf_name,
-            .workflow_version_owned = owned_version,
-            .status = .running,
-            .input_owned = owned_input,
-            .created_at_ms = now_ms,
-            .started_at_ms = now_ms,
-            .completed_at_ms = null,
-            .idempotency_key_owned = null,
-            .signals = .empty,
-            .history = .empty,
-        };
-
-        // Add history event
-        const evt_type = self.allocator.dupe(u8, "trigger_started") catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        const evt_detail = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(evt_type);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-        run.history.append(self.allocator, .{
-            .event_type_owned = evt_type,
-            .detail_owned = evt_detail,
-            .timestamp_ms = now_ms,
-        }) catch {
-            self.allocator.free(evt_type);
-            self.allocator.free(evt_detail);
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-
-        self.runs.put(run_ns_key, run) catch {
-            self.freeRunRecord(&run);
-            self.allocator.free(run_ns_key);
-            return;
-        };
-
-        self.persistStart(shard, trigger.namespace_owned, owned_run_id, owned_wf_name, owned_version, owned_input, now_ms, null);
+        const run_ns_key = self.startRunThroughLog(shard, trigger.namespace_owned, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started") orelse return;
         self.advanceWorkflow(shard, run_ns_key, trigger.namespace_owned);
+    }
+
+    /// Advance a stream trigger's cursor to the event a restored run came
+    /// from. Runs apply in log order after their definition, so by the end
+    /// of replay the cursor sits at the last event that started a run.
+    fn restoreTriggerCursor(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, idem: []const u8) void {
+        const at = std.mem.lastIndexOfScalar(u8, idem, '@') orelse return;
+        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
+        if (colon <= at) return;
+        const ts = std.fmt.parseInt(u64, idem[at + 1 .. colon], 10) catch return;
+        const seq = std.fmt.parseInt(u64, idem[colon + 1 ..], 10) catch return;
+        const key = self.makeNsKey(namespace, wf_name) orelse return;
+        defer self.allocator.free(key);
+        const trigger = self.stream_triggers.getPtr(key) orelse return;
+        const event = StreamID{ .timestamp_ms = ts, .sequence = seq };
+        const cursor = StreamID{ .timestamp_ms = trigger.stream_cursor_ts, .sequence = trigger.stream_cursor_seq };
+        if (event.greaterThan(cursor)) {
+            trigger.stream_cursor_ts = ts;
+            trigger.stream_cursor_seq = seq;
+        }
     }
 
     // ── Plan Health Helpers ─────────────────────────────────────────────
@@ -3426,19 +3123,41 @@ pub const WorkflowHandler = struct {
 
     /// Persist a workflow_create entry to the UAL so the definition survives restart.
     /// The key stored is "namespace:name" so replay can directly use it as the ns-qualified map key.
-    fn persistCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) void {
+    fn persistCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) !void {
         _ = self;
         // Build ns-qualified key: "namespace:name"
         var key_buf: [600]u8 = undefined;
-        const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, name }) catch return;
-
-        _ = persistence_mod.persistEntry(shard, .workflow_create, entry_mod.Flags.NONE, namespace, ns_key, yaml) catch {};
+        const ns_key = try std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, name });
+        _ = try persistence_mod.persistEntry(shard, .workflow_create, entry_mod.Flags.NONE, namespace, ns_key, yaml);
     }
 
-    /// Persist a workflow_start entry to the UAL so the run survives restart.
-    /// Key stored is "namespace:run_id".
-    /// Value format: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at_ms:i64]
-    ///   [tags_len:u16][search_tags]?[input...]
+    /// Start a run through the one applier: encode the start entry, persist
+    /// it, apply it. Returns the run's ns-qualified key (owned by the runs
+    /// map) or null when the run could not be created.
+    fn startRunThroughLog(
+        self: *WorkflowHandler,
+        shard: *Shard,
+        namespace: []const u8,
+        run_id: []const u8,
+        wf_name: []const u8,
+        version: []const u8,
+        input: []const u8,
+        idempotency_key: ?[]const u8,
+        event_type: []const u8,
+    ) ?[]const u8 {
+        self.persistStart(shard, namespace, run_id, wf_name, version, input, idempotency_key, event_type) catch return null;
+        if (!shard.applyCommitted()) return null;
+        var key_buf: [600]u8 = undefined;
+        const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, run_id }) catch return null;
+        const entry = self.runs.getEntry(ns_key) orelse return null;
+        return entry.key_ptr.*;
+    }
+
+    /// Start entry. Key is "namespace:run_id".
+    /// Value: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at_ms:i64]
+    ///   [event_len:u16][event_type][idem_len:u16][idempotency_key][input...]
+    /// The event type is the run's first history event (manual, schedule,
+    /// trigger or child start); search tags are derived by the applier.
     fn persistStart(
         self: *WorkflowHandler,
         shard: *Shard,
@@ -3447,48 +3166,40 @@ pub const WorkflowHandler = struct {
         wf_name: []const u8,
         version: []const u8,
         input: []const u8,
-        created_at_ms: i64,
-        search_tags: ?[]const u8,
-    ) void {
+        idempotency_key: ?[]const u8,
+        event_type: []const u8,
+    ) !void {
         _ = self;
-        // Build ns-qualified key: "namespace:run_id"
         var ns_key_buf: [600]u8 = undefined;
-        const ns_key = std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id }) catch return;
-
-        const tags = search_tags orelse "";
-        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + 2 + tags.len + input.len;
-        if (value_len > 65000) return;
+        const ns_key = try std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id });
+        const idem = idempotency_key orelse "";
+        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + 2 + event_type.len + 2 + idem.len + input.len;
+        if (value_len > 65000) return error.PayloadTooLarge;
         var value_buf: [65536]u8 = undefined;
         var off: usize = 0;
-
         std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(wf_name.len), .little);
         off += 2;
         @memcpy(value_buf[off .. off + wf_name.len], wf_name);
         off += wf_name.len;
-
         std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(version.len), .little);
         off += 2;
         @memcpy(value_buf[off .. off + version.len], version);
         off += version.len;
-
         value_buf[off] = @intFromEnum(RunStatus.running);
         off += 1;
-
-        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
+        std.mem.writeInt(i64, value_buf[off..][0..8], @import("stdx").time.milliTimestamp(), .little);
         off += 8;
-
-        // [tags_len:u16][search_tags]
-        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(tags.len), .little);
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(event_type.len), .little);
         off += 2;
-        if (tags.len > 0) {
-            @memcpy(value_buf[off .. off + tags.len], tags);
-            off += tags.len;
-        }
-
+        @memcpy(value_buf[off .. off + event_type.len], event_type);
+        off += event_type.len;
+        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(idem.len), .little);
+        off += 2;
+        @memcpy(value_buf[off .. off + idem.len], idem);
+        off += idem.len;
         @memcpy(value_buf[off .. off + input.len], input);
         off += input.len;
-
-        _ = persistence_mod.persistEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]) catch {};
+        _ = try persistence_mod.persistEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]);
     }
 
     /// Persist a workflow_complete entry to the UAL so terminal state survives restarts.
@@ -3601,7 +3312,9 @@ pub const WorkflowHandler = struct {
             off += tags.len;
         }
 
-        _ = persistence_mod.persistEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch {};
+        _ = persistence_mod.persistEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch |err| {
+            log.err("workflow run {s}: completion not persisted: {s}", .{ ns_key, @errorName(err) });
+        };
     }
 
     /// Register this handler's entry types with the shared ReplayRegistry.
@@ -3616,30 +3329,27 @@ pub const WorkflowHandler = struct {
         self.replayEntry(entry);
     }
 
-    /// Replay a persisted workflow entry (called during segment replay on startup).
+    /// Apply a workflow entry: live commit, replicated entry or boot replay alike.
     pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) void {
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
 
         switch (etype) {
-            .workflow_create => self.replayCreate(cmd.key, cmd.value),
+            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000)),
             .workflow_start => self.replayStart(cmd.key, cmd.value),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value),
             else => {},
         }
     }
 
-    /// Replay a workflow_create entry. The key is "namespace:name" (ns-qualified).
-    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8) void {
-        // Extract raw name from "namespace:name"
-        const raw_name = if (std.mem.indexOfScalar(u8, ns_key_raw, ':')) |idx|
-            ns_key_raw[idx + 1 ..]
-        else
-            ns_key_raw;
+    /// Apply a workflow_create entry. The key is "namespace:name" (ns-qualified).
+    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64) void {
+        // "namespace:name"
+        const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
+        const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
+        const raw_name = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
 
-        // Allocate ns-qualified key for map lookup
         const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
-
         // Remove old definition if exists
         if (self.definitions.fetchRemove(ns_key)) |old| {
             self.allocator.free(old.key); // old ns-qualified key
@@ -3648,19 +3358,16 @@ pub const WorkflowHandler = struct {
             self.allocator.free(old.value.yaml_owned);
         }
 
-        // Parse to get version
         var def = parser.parseWorkflow(self.allocator, yaml) catch {
             self.allocator.free(ns_key);
             return;
         };
+        defer def.deinit(self.allocator);
+
         const version = self.allocator.dupe(u8, def.version) catch {
-            def.deinit(self.allocator);
             self.allocator.free(ns_key);
             return;
         };
-        const idempotency = def.idempotency;
-        def.deinit(self.allocator);
-
         const owned_name = self.allocator.dupe(u8, raw_name) catch {
             self.allocator.free(ns_key);
             self.allocator.free(version);
@@ -3672,31 +3379,43 @@ pub const WorkflowHandler = struct {
             self.allocator.free(version);
             return;
         };
-
         self.definitions.put(ns_key, .{
             .name_owned = owned_name,
             .version_owned = version,
             .yaml_owned = owned_yaml,
-            .created_at_ms = 0,
-            .idempotency = idempotency,
+            .created_at_ms = created_at_ms,
+            .idempotency = def.idempotency,
         }) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             self.allocator.free(version);
             self.allocator.free(owned_yaml);
+            return;
         };
+
+        // A definition's trigger and schedule are part of it: (re)register
+        // them here so a restart keeps them and a redefinition without one
+        // drops it.
+        if (!self.install_producers) return;
+        if (def.trigger) |trigger| {
+            self.registerStreamTrigger(namespace, raw_name, trigger);
+        } else {
+            self.unregisterStreamTrigger(namespace, raw_name);
+        }
+        if (def.schedule) |schedule| {
+            self.registerSchedule(namespace, raw_name, schedule);
+        } else {
+            self.unregisterSchedule(namespace, raw_name);
+        }
     }
 
-    /// Replay a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
+    /// Apply a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
     fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
-        // Extract raw run_id from "namespace:run_id"
-        const raw_run_id = if (std.mem.indexOfScalar(u8, ns_key_raw, ':')) |idx|
-            ns_key_raw[idx + 1 ..]
-        else
-            ns_key_raw;
+        // "namespace:run_id"
+        const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
+        const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
+        const raw_run_id = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
 
-        // Deserialize: [wf_name_len:u16][wf_name][ver_len:u16][ver][status:u8][created_at:i64]
-        //   [tags_len:u16][search_tags]?[input...]
         var off: usize = 0;
         if (off + 2 > value.len) return;
         const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
@@ -3720,86 +3439,85 @@ pub const WorkflowHandler = struct {
         const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
         off += 8;
 
-        // Read optional search tags (new format)
-        var search_tags: ?[]const u8 = null;
-        if (off + 2 <= value.len) {
-            const tags_len = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (tags_len > 0 and off + tags_len <= value.len) {
-                search_tags = value[off .. off + tags_len];
-                off += tags_len;
-            }
-        }
+        if (off + 2 > value.len) return;
+        const evt_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + evt_len > value.len) return;
+        const event_type = value[off .. off + evt_len];
+        off += evt_len;
+
+        if (off + 2 > value.len) return;
+        const idem_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + idem_len > value.len) return;
+        const idem: ?[]const u8 = if (idem_len > 0) value[off .. off + idem_len] else null;
+        off += idem_len;
 
         const input = if (off < value.len) value[off..] else "{}";
 
-        // Allocate ns-qualified key for map
+        // Already present (an idempotent re-apply): nothing to do.
+        if (self.runs.contains(ns_key_raw)) return;
+
         const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
-
-        // Duplicate all record fields
-        const owned_rid = self.allocator.dupe(u8, raw_run_id) catch {
-            self.allocator.free(ns_key);
-            return;
-        };
-        const owned_wf = self.allocator.dupe(u8, wf_name) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_rid);
-            return;
-        };
-        const owned_ver = self.allocator.dupe(u8, version) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_rid);
-            self.allocator.free(owned_wf);
-            return;
-        };
-        const owned_inp = self.allocator.dupe(u8, input) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_rid);
-            self.allocator.free(owned_wf);
-            self.allocator.free(owned_ver);
-            return;
-        };
-
-        const owned_tags: ?[]const u8 = if (search_tags) |st|
-            self.allocator.dupe(u8, st) catch null
-        else
-            null;
-
-        // Skip if already replayed (idempotent)
-        if (self.runs.contains(ns_key)) {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_rid);
-            self.allocator.free(owned_wf);
-            self.allocator.free(owned_ver);
-            self.allocator.free(owned_inp);
-            if (owned_tags) |t| self.allocator.free(t);
-            return;
-        }
-
-        self.runs.put(ns_key, .{
-            .run_id_owned = owned_rid,
-            .workflow_name_owned = owned_wf,
-            .workflow_version_owned = owned_ver,
+        var run = RunRecord{
+            .run_id_owned = self.allocator.dupe(u8, raw_run_id) catch {
+                self.allocator.free(ns_key);
+                return;
+            },
+            .workflow_name_owned = "",
+            .workflow_version_owned = "",
             .status = status,
-            .input_owned = owned_inp,
+            .input_owned = "",
             .created_at_ms = created_at_ms,
             .started_at_ms = created_at_ms,
             .completed_at_ms = null,
             .idempotency_key_owned = null,
             .signals = .empty,
             .history = .empty,
-            .search_tags_owned = owned_tags,
-        }) catch {
-            self.allocator.free(ns_key);
-            self.allocator.free(owned_rid);
-            self.allocator.free(owned_wf);
-            self.allocator.free(owned_ver);
-            self.allocator.free(owned_inp);
-            if (owned_tags) |t| self.allocator.free(t);
         };
+        run.workflow_name_owned = self.allocator.dupe(u8, wf_name) catch {
+            self.allocator.free(run.run_id_owned);
+            self.allocator.free(ns_key);
+            return;
+        };
+        run.workflow_version_owned = self.allocator.dupe(u8, version) catch {
+            self.allocator.free(run.run_id_owned);
+            self.allocator.free(run.workflow_name_owned);
+            self.allocator.free(ns_key);
+            return;
+        };
+        run.input_owned = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(run.run_id_owned);
+            self.allocator.free(run.workflow_name_owned);
+            self.allocator.free(run.workflow_version_owned);
+            self.allocator.free(ns_key);
+            return;
+        };
+        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch null else null;
+        // The run's first history event, as the start path recorded it.
+        if (event_type.len > 0) self.addHistoryEvent(&run, event_type, input, created_at_ms);
+        if (idem) |k| {
+            if (std.mem.eql(u8, event_type, "trigger_started") and std.mem.startsWith(u8, k, "trigger:")) {
+                self.restoreTriggerCursor(namespace, wf_name, k);
+            }
+        }
+
+        self.runs.put(ns_key, run) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(ns_key);
+            return;
+        };
+        // Search tags come from the definition and the input; derived here so
+        // every node computes the same ones.
+        if (self.runs.getPtr(ns_key)) |stored| {
+            if (self.makeNsKey(namespace, wf_name)) |def_ns_key| {
+                defer self.allocator.free(def_ns_key);
+                stored.search_tags_owned = self.buildSearchTags(def_ns_key, stored);
+            }
+        }
     }
 
-    /// Replay a workflow_complete entry. Updates the run's terminal status,
+    /// Apply a workflow_complete entry. Updates the run's terminal status,
     /// output, step_outputs, and history events.
     /// Value format: [status:u8][completed_at_ms:i64]
     ///   [has_output:u8][output_len:u32][output]?
@@ -3814,6 +3532,22 @@ pub const WorkflowHandler = struct {
         const run = self.runs.getPtr(ns_key_raw) orelse return;
         run.status = status;
         run.completed_at_ms = completed_at_ms;
+        // The entry carries the whole terminal state; whatever the run held
+        // (the live producer's copy, or an earlier apply) is replaced.
+        if (run.output_owned) |o| {
+            self.allocator.free(o);
+            run.output_owned = null;
+        }
+        if (run.step_outputs) |*so| {
+            var mutable = so.*;
+            mutable.deinit(self.allocator);
+            run.step_outputs = null;
+        }
+        for (run.history.items) |evt| {
+            self.allocator.free(evt.event_type_owned);
+            self.allocator.free(evt.detail_owned);
+        }
+        run.history.clearRetainingCapacity();
 
         var off: usize = 9;
 
@@ -4000,6 +3734,29 @@ test "workflow handler: init and deinit" {
     try testing.expectEqual(@as(usize, 0), handler.runCount());
 }
 
+test "workflow handler: a re-created trigger keeps its cursor on the same stream only" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    handler.registerStreamTrigger("ns", "wf", .{ .stream = "events" });
+    const key = try std.fmt.allocPrint(allocator, "ns:wf", .{});
+    defer allocator.free(key);
+    handler.stream_triggers.getPtr(key).?.stream_cursor_ts = 1700;
+    handler.stream_triggers.getPtr(key).?.stream_cursor_seq = 3;
+
+    handler.registerStreamTrigger("ns", "wf", .{ .stream = "events", .batch_size = 2 });
+    const same = handler.stream_triggers.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 1700), same.stream_cursor_ts);
+    try testing.expectEqual(@as(u64, 3), same.stream_cursor_seq);
+    try testing.expectEqual(@as(u32, 2), same.batch_size);
+
+    handler.registerStreamTrigger("ns", "wf", .{ .stream = "other" });
+    const moved = handler.stream_triggers.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 0), moved.stream_cursor_ts);
+    try testing.expectEqual(@as(u64, 0), moved.stream_cursor_seq);
+}
+
 // ── Step Executor Tests ─────────────────────────────────────────────────
 
 /// Minimal 2-step workflow: start → step_b → flo.Completed
@@ -4108,19 +3865,36 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.metrics_registry = null;
     shard.shard_metrics = null;
     const raft_node = try std.testing.allocator.create(RaftNode);
-    raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
+    raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 64 * 1024, .{});
     try raft_node.bootstrap();
     shard.raft_node = raft_node;
     shard.raft_network = null;
     shard.router = router.Router.init(1, 1, 0);
     shard.run_id_gen = .{};
     shard.waiter_pool = waiter_pool_mod.WaiterPool.init();
+    // The one applier needs a partition to append to, the registry that
+    // owns action entries, and the copy buffer it reads committed entries
+    // through.
+    const partition = try std.testing.allocator.create(Partition);
+    partition.* = try Partition.init(std.testing.allocator, 0, 256 * 1024, 0);
+    const partitions = try std.testing.allocator.alloc(*Partition, 1);
+    partitions[0] = partition;
+    shard.partitions = partitions;
+    shard.replay_registry = .{};
+    actions.registerReplay(&shard.replay_registry);
+    shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
+    shard.durability = .async_flush;
+    shard.last_replicated_index = 0;
     return shard;
 }
 
 fn destroyTestShard(shard: *Shard) void {
     shard.raft_node.deinit();
     std.testing.allocator.destroy(shard.raft_node);
+    shard.partitions[0].deinit();
+    std.testing.allocator.destroy(shard.partitions[0]);
+    std.testing.allocator.free(shard.partitions);
+    std.testing.allocator.free(shard.apply_buf);
 }
 
 /// Complete a pending test action run with outcome "success".

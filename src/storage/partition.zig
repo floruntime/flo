@@ -59,7 +59,7 @@ pub const Partition = struct {
     committed_index: u64,
 
     /// Warm store — payload copies for entries evicted from the hot ring buffer.
-    /// Populated on every apply() so reads can fall back to warm when UAL evicts.
+    /// Populated on every non-KV apply() so reads can fall back to warm when UAL evicts.
     warm_store: std.AutoHashMapUnmanaged(u64, []const u8),
 
     /// Warm store memory tracking (bounded by warm_budget).
@@ -162,13 +162,30 @@ pub const Partition = struct {
 
     // ── Write Path ──────────────────────────────────────────────────────
 
-    /// Apply a committed entry: append to UAL and route to projections.
-    /// Returns the UAL index assigned to the entry.
+    /// Apply a committed entry: route it to its projection and, for every
+    /// type but KV, append it to the hot ring and warm store. Returns the
+    /// entry's index.
     pub fn apply(self: *Partition, e: *const Entry) !u64 {
-        const index = try self.ual.append(e);
+        return self.applyWith(e, false);
+    }
+
+    /// Apply an entry replicated from a peer, whose index may collide with
+    /// this node's own; the router's index guard is bypassed and the caller
+    /// de-duplicates by what it has already received.
+    pub fn applyReplicated(self: *Partition, e: *const Entry) !u64 {
+        return self.applyWith(e, true);
+    }
+
+    fn applyWith(self: *Partition, e: *const Entry, replicated: bool) !u64 {
+        // The hot ring and the warm store exist for the stream read path,
+        // which fetches record payloads by index. The KV projection holds its
+        // own values and nothing reads a KV payload back from the partition
+        // log, so KV entries skip both copies.
+        const is_kv = @import("../projection/router.zig").routeTarget(@enumFromInt(e.header.entry_type)) == .kv;
+        const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
-        _ = self.router.apply(e);
+        _ = if (replicated) self.router.applyOutOfOrder(e) else self.router.apply(e);
 
         // Track committed index
         if (e.header.index > self.committed_index) {
@@ -179,7 +196,7 @@ pub const Partition = struct {
 
         // Save payload to warm store (survives UAL hot ring eviction).
         // Uses the entry's own index as key.
-        if (e.payload.len > 0) {
+        if (e.payload.len > 0 and !is_kv) {
             const copy = self.allocator.dupe(u8, e.payload) catch return index;
 
             // Free old copy if this index was already in warm store (idempotent apply)
@@ -517,9 +534,11 @@ test "partition: apply and read entries" {
     const idx2 = try part.apply(&e2);
     try testing.expectEqual(@as(u64, 2), idx2);
 
-    // Read back from UAL
-    const read1 = part.read(1).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(EntryType.kv_put)), read1.header.entry_type);
+    // The stream entry reads back from the ring; the KV entry is held by the
+    // projection alone and never enters it.
+    const read2 = part.read(2).?;
+    try testing.expectEqual(@as(u8, @intFromEnum(EntryType.stream_append)), read2.header.entry_type);
+    try testing.expect(part.read(1) == null);
 
     try testing.expectEqual(@as(u64, 2), part.appliedIndex());
     try testing.expectEqual(@as(u64, 2), part.committed_index);
@@ -638,7 +657,7 @@ test "partition: contains check" {
 
     try testing.expect(!part.contains(1));
 
-    var e1 = makeEntry(.kv_put, 1, 1, "data");
+    var e1 = makeEntry(.stream_append, 1, 1, "data");
     e1.header.crc32c = e1.computeCrc();
     _ = try part.apply(&e1);
 
@@ -670,7 +689,7 @@ test "partition: warm store byte tracking" {
     try testing.expectEqual(@as(usize, 0), part.warmUsed());
     try testing.expectEqual(@as(usize, 0), part.warmCount());
 
-    var e1 = makeEntry(.kv_put, 1, 1, "hello-world");
+    var e1 = makeEntry(.stream_append, 1, 1, "hello-world");
     e1.header.crc32c = e1.computeCrc();
     _ = try part.apply(&e1);
 
@@ -728,7 +747,7 @@ test "partition: warm budget zero means unlimited" {
     // Apply many entries — no eviction should happen
     var i: u64 = 1;
     while (i <= 50) : (i += 1) {
-        var e = makeEntry(.kv_put, i, 1, "0123456789ABCDEF"); // 16 bytes each
+        var e = makeEntry(.stream_append, i, 1, "0123456789ABCDEF"); // 16 bytes each
         e.header.crc32c = e.computeCrc();
         _ = try part.apply(&e);
     }
@@ -736,4 +755,22 @@ test "partition: warm budget zero means unlimited" {
     // All 50 entries should be in warm store
     try testing.expectEqual(@as(usize, 50), part.warmCount());
     try testing.expectEqual(@as(usize, 50 * 16), part.warmUsed());
+}
+
+test "partition: kv entries reach the projection but neither the ring nor the warm store" {
+    const allocator = testing.allocator;
+    var part = try Partition.init(allocator, 0, 64 * 1024, 0);
+    defer part.deinit();
+
+    var e1 = makeEntry(.kv_put, 1, 1, "kv-payload-that-would-otherwise-be-cached");
+    try testing.expectEqual(@as(u64, 1), try part.apply(&e1));
+    try testing.expectEqual(@as(u64, 0), part.warm_bytes_used);
+    try testing.expect(part.readPayloadWarm(1) == null);
+    try testing.expect(!part.ual.contains(1));
+    try testing.expectEqual(@as(u64, 1), part.committed_index);
+
+    var e2 = makeEntry(.stream_append, 2, 1, "stream-payload");
+    _ = try part.apply(&e2);
+    try testing.expectEqual(@as(u64, "stream-payload".len), part.warm_bytes_used);
+    try testing.expect(part.readPayloadWarm(2) != null);
 }

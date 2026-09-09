@@ -480,66 +480,17 @@ pub const ProcessingHandler = struct {
             return;
         };
 
-        // Duplicate all owned data
-        const owned_id = self.allocator.dupe(u8, job_id) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_id);
-
-        const owned_name = self.allocator.dupe(u8, def.name) catch {
-            self.allocator.free(owned_id);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_name);
-
-        const owned_namespace = self.allocator.dupe(u8, def.namespace) catch {
-            self.allocator.free(owned_id);
-            self.allocator.free(owned_name);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        errdefer self.allocator.free(owned_namespace);
-
-        const owned_yaml = self.allocator.dupe(u8, yaml) catch {
-            self.allocator.free(owned_id);
-            self.allocator.free(owned_name);
-            self.allocator.free(owned_namespace);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
+        // Persist through Raft; the applier builds the job record and its
+        // pipelines from the entry — the same applier a restart uses.
         const now = @import("stdx").time.milliTimestamp();
-
-        const record = JobRecord{
-            .job_id_owned = owned_id,
-            .name_owned = owned_name,
-            .namespace_owned = owned_namespace,
-            .status = .running,
-            .parallelism = def.parallelism,
-            .batch_size = def.batch_size,
-            .yaml_owned = owned_yaml,
-            .created_at_ms = now,
-            .records_processed = 0,
-        };
-
-        self.jobs.put(owned_id, record) catch {
-            self.allocator.free(owned_id);
-            self.allocator.free(owned_name);
-            self.allocator.free(owned_namespace);
-            self.allocator.free(owned_yaml);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "storage failed");
+        self.persistSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "job not persisted");
             return;
         };
-
-        // Persist through Raft → UAL so the job survives restart.
-        // Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][yaml...]
-        self.persistSubmit(shard, req.namespace, owned_id, &record);
-
-        // Build operator pipelines so the job starts consuming. Shared with the
-        // replay path so a RUNNING job resumes after restart (FLO-104).
-        self.startPipelines(owned_id, &def);
+        if (!shard.applyCommitted() or !self.jobs.contains(job_id)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "job not applied");
+            return;
+        }
 
         if (shard.metrics_registry) |m| m.processing.recordSubmitted();
 
@@ -556,9 +507,11 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.getPtr(job_id)) |job| {
-            job.status = .stopped;
-            self.persistStatusChange(shard, req.namespace, job_id, .stopped);
+        if (self.jobs.contains(job_id)) {
+            self.persistStatusChange(shard, req.namespace, job_id, .stopped) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "stop not persisted or applied");
+                return;
+            };
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -574,9 +527,11 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.getPtr(job_id)) |job| {
-            job.status = .cancelled;
-            self.persistStatusChange(shard, req.namespace, job_id, .cancelled);
+        if (self.jobs.contains(job_id)) {
+            self.persistStatusChange(shard, req.namespace, job_id, .cancelled) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "cancel not persisted or applied");
+                return;
+            };
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -712,34 +667,12 @@ pub const ProcessingHandler = struct {
                 return;
             };
 
-            const owned_sp_id = self.allocator.dupe(u8, sp_id) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            };
-            errdefer self.allocator.free(owned_sp_id);
-
-            const owned_job_id = self.allocator.dupe(u8, job_id) catch {
-                self.allocator.free(owned_sp_id);
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            };
-
             const now = @import("stdx").time.milliTimestamp();
-
-            self.savepoints.put(owned_sp_id, .{
-                .savepoint_id_owned = owned_sp_id,
-                .job_id_owned = owned_job_id,
-                .created_at_ms = now,
-                .records_at_savepoint = job.records_processed,
-            }) catch {
-                self.allocator.free(owned_sp_id);
-                self.allocator.free(owned_job_id);
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "storage failed");
+            // Persist through Raft; the applier stores the savepoint.
+            self.persistSavepoint(shard, req.namespace, sp_id, job_id, job.records_processed, now) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "savepoint not persisted or applied");
                 return;
             };
-
-            // Persist savepoint through Raft → UAL
-            self.persistSavepoint(shard, req.namespace, owned_sp_id, job_id, job.records_processed, now);
 
             shard.sendOkResponse(conn, req.header.request_id, sp_id);
         } else {
@@ -807,9 +740,11 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.getPtr(job_id)) |job| {
-            job.parallelism = parallelism;
-            self.persistRescale(shard, req.namespace, job_id, parallelism);
+        if (self.jobs.contains(job_id)) {
+            self.persistRescale(shard, req.namespace, job_id, parallelism) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "rescale not persisted or applied");
+                return;
+            };
             shard.sendOkResponse(conn, req.header.request_id, "");
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -820,39 +755,37 @@ pub const ProcessingHandler = struct {
 
     /// Persist a processing_submit entry. Key = job_id.
     /// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
-    fn persistSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, job: *const JobRecord) void {
+    fn persistSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, parallelism: u32, batch_size: u32, created_at_ms: i64, job_namespace: []const u8, yaml: []const u8) !void {
         _ = self;
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         var off: usize = 0;
 
-        value_buf[off] = @intFromEnum(job.status);
+        value_buf[off] = @intFromEnum(status);
         off += 1;
-        std.mem.writeInt(u32, value_buf[off..][0..4], job.parallelism, .little);
+        std.mem.writeInt(u32, value_buf[off..][0..4], parallelism, .little);
         off += 4;
-        std.mem.writeInt(u32, value_buf[off..][0..4], job.batch_size, .little);
+        std.mem.writeInt(u32, value_buf[off..][0..4], batch_size, .little);
         off += 4;
-        std.mem.writeInt(i64, value_buf[off..][0..8], job.created_at_ms, .little);
+        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
         off += 8;
 
-        // Embed the effective namespace so replay can recover it without re-parsing quirks
-        const ns = job.namespace_owned;
+        // Embed the effective namespace so the applier does not depend on
+        // re-parsing quirks.
+        const ns = job_namespace;
         const ns_len: u16 = @intCast(ns.len);
         std.mem.writeInt(u16, value_buf[off..][0..2], ns_len, .little);
         off += 2;
-        if (off + ns.len > value_buf.len) return;
+        if (off + ns.len + yaml.len > value_buf.len) return error.PayloadTooLarge;
         @memcpy(value_buf[off .. off + ns.len], ns);
         off += ns.len;
-
-        const yaml = job.yaml_owned;
-        if (off + yaml.len > value_buf.len) return;
         @memcpy(value_buf[off .. off + yaml.len], yaml);
         off += yaml.len;
 
-        _ = persistence_mod.persistEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]) catch {};
+        _ = try persistence_mod.persistEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]);
     }
 
     /// Persist a processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
-    fn persistStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) void {
+    fn persistStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) !void {
         _ = self;
         const entry_type: EntryType = switch (status) {
             .stopped => .processing_stop,
@@ -860,7 +793,8 @@ pub const ProcessingHandler = struct {
             else => return,
         };
         const value = &[_]u8{@intFromEnum(status)};
-        _ = persistence_mod.persistEntry(shard, entry_type, Flags.NONE, namespace, job_id, value) catch {};
+        _ = try persistence_mod.persistEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
+        if (!shard.applyCommitted()) return error.NotApplied;
 
         // Both terminal transitions route through here.
         if (shard.metrics_registry) |m| switch (status) {
@@ -872,7 +806,7 @@ pub const ProcessingHandler = struct {
 
     /// Persist a processing_savepoint entry. Key = savepoint_id.
     /// Value format: [job_id_len:u16][job_id][records_at:u64][created_at_ms:i64]
-    fn persistSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) void {
+    fn persistSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) !void {
         _ = self;
         var value_buf: [512]u8 = undefined;
         var off: usize = 0;
@@ -886,15 +820,17 @@ pub const ProcessingHandler = struct {
         std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
         off += 8;
 
-        _ = persistence_mod.persistEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]) catch {};
+        _ = try persistence_mod.persistEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]);
+        if (!shard.applyCommitted()) return error.NotApplied;
     }
 
     /// Persist a processing_rescale entry. Key = job_id, value = [parallelism:u32].
-    fn persistRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) void {
+    fn persistRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) !void {
         _ = self;
         var value_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, value_buf[0..4], parallelism, .little);
-        _ = persistence_mod.persistEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf) catch {};
+        _ = try persistence_mod.persistEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf);
+        if (!shard.applyCommitted()) return error.NotApplied;
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -914,7 +850,7 @@ pub const ProcessingHandler = struct {
         self.replayEntry(entry);
     }
 
-    /// Replay a persisted processing entry to rebuild in-memory state.
+    /// Apply a processing entry (live commit and boot replay alike).
     pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) void {
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
@@ -1411,6 +1347,7 @@ pub const ProcessingHandler = struct {
         log.debug("TICK: read {d} payloads, last_id ts={d} seq={d}", .{ result.payloads.len, result.last_id.timestamp_ms, result.last_id.sequence });
         if (result.payloads.len == 0) return;
         defer src_handler.allocator.free(result.payloads);
+        defer src_handler.allocator.free(result.ids);
 
         for (result.payloads) |payload| {
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
@@ -1460,15 +1397,19 @@ pub const ProcessingHandler = struct {
 
         const now_ms = @import("stdx").time.milliTimestamp();
         if (pipe.last_persist_ms != 0 and now_ms - pipe.last_persist_ms < CHECKPOINT_INTERVAL_MS) return;
+        // Set before the attempt so a failing disk is retried once per
+        // interval, not once per tick.
+        pipe.last_persist_ms = now_ms;
 
         var val_buf: [16]u8 = undefined;
         std.mem.writeInt(u64, val_buf[0..8], pipe.stream_cursor_ts, .little);
         std.mem.writeInt(u64, val_buf[8..16], pipe.stream_cursor_seq, .little);
-        _ = persistence_mod.persistEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch return;
-
-        pipe.persisted_cursor_ts = pipe.stream_cursor_ts;
-        pipe.persisted_cursor_seq = pipe.stream_cursor_seq;
-        pipe.last_persist_ms = now_ms;
+        _ = persistence_mod.persistEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
+            log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
+            return;
+        };
+        // The applier records the persisted cursor.
+        _ = shard.applyCommitted();
     }
 
     fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {

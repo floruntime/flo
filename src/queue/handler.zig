@@ -1,9 +1,10 @@
 //! Queue Handler — registers queue opcodes with Dispatcher and handles queue operations.
 //!
 //! Read operations (peek, stats, dlq_list) query the QueueProjection directly.
-//! Write operations (enqueue, dequeue, ack, nack) go through the QueueProjection
-//! directly for now; they will be rewired through Raft propose when the full
-//! pipeline is connected.
+//! Write operations (enqueue, ack, nack, purge) persist an entry through
+//! Raft; the projection router applies it to the QueueProjection under
+//! `Shard.applyCommitted()`. Dequeue is a projection-local lease whose ack
+//! is persisted the same way.
 //!
 //! ## Opcode Range
 //!
@@ -19,6 +20,7 @@
 //! - DLQ messages can be listed, requeued, or deleted.
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -139,14 +141,10 @@ pub const QueueHandler = struct {
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
 
-        // After a successful enqueue, notify any blocking dequeue waiters and track namespace
+        // Dequeue waiters are woken by the applier; the namespace bookkeeping
+        // is a producer decision and stays here.
         switch (result) {
-            .queue_enqueued => {
-                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-                if (req.key.len > 0) {
-                    shard.waiter_pool.notify(.queue_dequeue, req.key, @import("../node/shard.zig").resolveQueueWaiter, @ptrCast(shard));
-                }
-            },
+            .queue_enqueued => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
 
@@ -279,51 +277,44 @@ pub const QueueHandler = struct {
         };
         defer if (value_len > value_buf.len) self.allocator.free(value_slice);
 
-        // Persist through Raft for durability and replication
+        // Persist through Raft; the shard's applier routes the committed entry
+        // to the projection. Without a shard (unit tests) the same projection
+        // applies a locally built entry.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             _ = persistence_mod.persistEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+                return .{ .err = .{ .code = .internal_error, .message = "enqueue not persisted" } };
             };
-        }
-
-        // Build command entry for local projection apply
-        const next_index = self.partition.ual.max_index + 1;
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
-        var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256 + 4 + 4096]u8 = undefined;
-        const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
-            break :blk self.allocator.alloc(u8, payload_size) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "enqueue not applied" } };
+            }
+        } else {
+            const next_index = self.partition.ual.max_index + 1;
+            const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
+            var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256 + 4 + 4096]u8 = undefined;
+            const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
+                break :blk self.allocator.alloc(u8, payload_size) catch {
+                    return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
+                };
             };
-        };
-        defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
+            defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
 
-        const entry = entry_mod.buildCommandEntry(
-            .queue_enqueue,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            req.key,
-            value_slice,
-            payload_buf,
-        ) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-        };
-
-        // Persist to UAL — router fans out to queue.applyEntry() → queue.enqueue()
-        _ = self.partition.apply(&entry) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-        };
-
-        // Register in global metrics registry for dashboard/Prometheus, and
-        // record the enqueue against the per-queue metrics `registerQueue`
-        // returns.
-        if (self.metrics_registry) |mr| {
-            if (mr.registerQueue(req.namespace, req.key)) |qm| {
-                qm.recordEnqueue(1, req.value.len, false);
-            } else |_| {}
+            const entry = entry_mod.buildCommandEntry(
+                .queue_enqueue,
+                entry_mod.Flags.NONE,
+                self.partition.current_term,
+                next_index,
+                timestamp_ns,
+                ns_hash,
+                req.key,
+                value_slice,
+                payload_buf,
+            ) orelse {
+                return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+            };
+            _ = self.partition.apply(&entry) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
+            };
         }
 
         // Seq was assigned by the projection during apply
@@ -406,11 +397,15 @@ pub const QueueHandler = struct {
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+                return .{ .err = .{ .code = .internal_error, .message = "ack not persisted" } };
             };
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "ack not applied" } };
+            }
+            return .ok;
         }
 
-        // Apply locally
+        // No shard (unit tests): apply a locally built entry.
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
@@ -456,11 +451,15 @@ pub const QueueHandler = struct {
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             _ = persistence_mod.persistEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+                return .{ .err = .{ .code = .internal_error, .message = "nack not persisted" } };
             };
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "nack not applied" } };
+            }
+            return .ok;
         }
 
-        // Apply locally
+        // No shard (unit tests): apply a locally built entry.
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
@@ -569,15 +568,19 @@ pub const QueueHandler = struct {
         // Count what we're about to remove for the response (single-threaded shard).
         const count: u32 = @intCast(@min(self.queue.countQueue(q_name_hash), std.math.maxInt(u32)));
 
-        // Persist through Raft for durability and replication.
+        // Persist through Raft; the applier purges the projection.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             _ = persistence_mod.persistEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+                return .{ .err = .{ .code = .internal_error, .message = "purge not persisted" } };
             };
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "purge not applied" } };
+            }
+            return .{ .queue_purged = .{ .count = count } };
         }
 
-        // Apply locally via a command entry → router → queue.applyEntry(.queue_purge).
+        // No shard (unit tests): apply a locally built entry.
         const next_index = self.partition.ual.max_index + 1;
         const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len;
         var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256]u8 = undefined;
@@ -705,13 +708,19 @@ pub const QueueHandler = struct {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
 
-        // Persist through Raft
+        // Persist through Raft; the applier acks the projection. A failed
+        // persist means the message can reappear after a restart, which
+        // the operator must hear about.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch {};
+            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+                log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
+            };
+            _ = shard.applyCommitted();
+            return;
         }
 
-        // Apply locally
+        // No shard (unit tests): apply a locally built entry.
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
@@ -739,32 +748,6 @@ pub const QueueHandler = struct {
             .queue_peek_messages => |r| self.allocator.free(r.data),
             .queue_dlq_messages => |r| self.allocator.free(r.data),
             else => {},
-        }
-    }
-
-    // ── Replay ──────────────────────────────────────────────────────────
-
-    /// Register queue entry types with the replay registry.
-    pub fn registerReplay(self: *QueueHandler, registry: *ReplayRegistry) void {
-        registry.register(.queue_enqueue, @ptrCast(self), replayEntry);
-        registry.register(.queue_ack, @ptrCast(self), replayEntry);
-        registry.register(.queue_nack, @ptrCast(self), replayEntry);
-    }
-
-    /// Replay a queue entry — rebuild queue name registration.
-    /// The projection router already routes queue entries to QueueProjection.applyEntry(),
-    /// which handles the actual enqueue/ack/nack. This callback just ensures
-    /// queue name metadata is restored for `queue list`.
-    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
-        const self: *QueueHandler = @ptrCast(@alignCast(ctx));
-        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
-
-        if (etype == .queue_enqueue) {
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                const ns_hash = cmd.namespace_hash;
-                const q_name_hash = router.nameHash(ns_hash, cmd.key);
-                self.queue.registerQueue(q_name_hash, cmd.key, "") catch {};
-            }
         }
     }
 };

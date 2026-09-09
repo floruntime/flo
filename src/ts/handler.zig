@@ -1,8 +1,8 @@
 //! TimeSeries Handler — registers TS opcodes with Dispatcher and handles time-series operations.
 //!
 //! Read operations (ts_read, ts_query, ts_list) query the TSProjection directly.
-//! Write operations (ts_write) go through the TSProjection directly for now;
-//! they will be rewired through Raft propose when the full pipeline is connected.
+//! Write operations (ts_write) persist an entry through Raft; the projection
+//! router inserts the point under `Shard.applyCommitted()`.
 //!
 //! ## Opcode Range
 //!
@@ -28,7 +28,6 @@ const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const persistence_mod = @import("../storage/persistence.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
-const ReplayRegistry = @import("../storage/persistence.zig").ReplayRegistry;
 
 // FloQL pipeline
 const floql_parser = @import("floql/parser.zig");
@@ -193,17 +192,21 @@ pub const TSHandler = struct {
                 return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
             };
             ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "ts write persistence failed" } };
+                return .{ .err = .{ .code = .internal_error, .message = "ts write not persisted" } };
             };
+            // The projection router inserts the point when the entry applies.
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "ts write not applied" } };
+            }
         } else {
+            // No shard (unit tests): insert directly (the projection
+            // canonicalizes the tag set and owns hashing + dictionary
+            // registration).
             ual_index = self.nextUalIndex();
+            self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
+            };
         }
-
-        // Insert into the local projection (the projection canonicalizes the
-        // tag set and owns hashing + dictionary registration).
-        self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
-        };
 
         const timestamp_ms: i64 = @intCast(timestamp_ns / 1_000_000);
 
@@ -569,32 +572,7 @@ pub const TSHandler = struct {
         }
     }
 
-    // ── Replay Registration ─────────────────────────────────────────────
-
-    /// Register TS entry types with the ReplayRegistry so persisted entries
-    /// are replayed back to the TS projection on startup.
-    pub fn registerReplay(self: *TSHandler, registry: *ReplayRegistry) void {
-        registry.register(.ts_write, self, replayEntry);
-        registry.register(.ts_write_batch, self, replayEntry);
-    }
-
-    /// Replay callback — rebuild TS projection from persisted UAL entries.
-    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
-        const self: *TSHandler = @ptrCast(@alignCast(ctx));
-        if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-            if (ts_mod.TsWriteValue.decode(cmd.value, entry.header.timestamp_ns)) |rec| {
-                self.ts.insert(
-                    cmd.namespace_hash,
-                    cmd.key,
-                    rec.field_name,
-                    rec.value,
-                    rec.timestamp_ns,
-                    entry.header.index,
-                    rec.tags,
-                ) catch {};
-            }
-        }
-    }
+    // ── Helpers ─────────────────────────────────────────────
 
     /// Cast opaque shard pointer to Shard for persistEntry().
     fn shardFromPtr(ptr: *anyopaque) *Shard {

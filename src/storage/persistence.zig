@@ -1,19 +1,20 @@
 //! Shared persistence interface for durable handlers.
 //!
-//! Provides a ReplayRegistry (entry type → handler callback) and a shared
-//! persistEntry() function that builds a CommandPayload, proposes through
-//! Raft, and broadcasts to cluster peers.
+//! `ReplayRegistry` maps an entry type to its applier: the one function that
+//! mutates a subsystem's state from a committed entry, whether that entry was
+//! written here, replicated from a peer, or read back from a segment at boot.
+//! `persistEntry` builds a command entry, proposes it and broadcasts it; it
+//! does not apply.
 //!
 //! ## Usage
 //!
 //! Handler registration (in Shard.init, before segment replay):
 //!   handler.registerReplay(&replay_registry);
 //!
-//! Segment replay (replaces hardcoded if/else chains):
-//!   replay_registry.dispatch(&entry);
-//!
-//! Write path (replaces per-handler boilerplate):
+//! Write path: persist, drain the committed log, then read the result from
+//! handler or projection state:
 //!   _ = try persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, key, value);
+//!   if (!shard.applyCommitted()) return error.NotApplied;
 //!
 
 const std = @import("std");
@@ -31,15 +32,11 @@ pub const MAX_PERSIST_PAYLOAD: usize = 65536;
 // ReplayRegistry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Function pointer for replay callbacks.
-/// Called during segment replay for each entry whose EntryType is registered.
+/// An applier: called for every committed entry of a registered type.
 pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry) void;
 
-/// Maps EntryType → handler replay callback.
-///
-/// Handlers register their owned entry types during init. On startup,
-/// replaySegments() calls dispatch() for every entry, routing it to the
-/// correct handler without hardcoded type checks.
+/// Maps EntryType → applier. Handlers register their owned entry types
+/// during init; every committed entry of such a type is dispatched here.
 pub const ReplayRegistry = struct {
     callbacks: [256]?ReplayEntry = [_]?ReplayEntry{null} ** 256,
 
@@ -51,6 +48,10 @@ pub const ReplayRegistry = struct {
     /// Register a handler for a specific entry type.
     pub fn register(self: *ReplayRegistry, etype: EntryType, ctx: *anyopaque, func: ReplayFn) void {
         self.callbacks[@intFromEnum(etype)] = .{ .ctx = ctx, .func = func };
+    }
+
+    pub fn has(self: *const ReplayRegistry, etype: EntryType) bool {
+        return self.callbacks[@intFromEnum(etype)] != null;
     }
 
     /// Dispatch an entry to its registered handler (if any).
@@ -72,10 +73,7 @@ pub const ReplayRegistry = struct {
 ///
 /// Builds a CommandPayload (namespace_hash + key + value), proposes it
 /// through the shard's Raft node, and broadcasts to cluster peers.
-/// Returns the UAL index of the committed entry.
-///
-/// This replaces the per-handler boilerplate of building entries and calling
-/// propose() directly. Handlers just provide entry_type, namespace, key, value.
+/// Returns the index of the committed entry. Does not apply it.
 ///
 /// `shard` is `anytype` to avoid a circular import with node/shard.zig.
 /// It must have `.raft_node` and `.raft_network` fields.

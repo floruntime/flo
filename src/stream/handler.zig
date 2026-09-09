@@ -4,9 +4,10 @@
 //! per-stream records, then read payloads directly from the UAL
 //! (zero-copy when the entry is contiguous in the hot ring).
 //!
-//! Write operations (append) build a CommandEntry, persist it to the UAL via
-//! Partition.apply(), then update the StreamProjection's per-stream state.
-//! Raft propose will be added when the full consensus pipeline is connected.
+//! Write operations (append, trim, delete, group commit) persist an entry
+//! through Raft and read their result back from the projection after
+//! `Shard.applyCommitted()`; `replayEntry` is the only code that mutates the
+//! StreamProjection from an entry.
 //!
 //! ## Design (UNIFIED_STORAGE_DESIGN.md — P6: Zero-Copy Stream Path)
 //!
@@ -26,6 +27,7 @@
 //! Consumer groups use a Pending Entry List (PEL) for per-message ack tracking.
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -208,17 +210,10 @@ pub const StreamHandler = struct {
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
 
-        // After a successful append, notify any blocking read waiters and track namespace data
+        // Waiters and triggers are woken by the applier; the namespace
+        // bookkeeping is a producer decision and stays here.
         switch (cmd_result) {
-            .stream_append_ok => {
-                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-                if (req.key.len > 0) {
-                    shard.waiter_pool.notify(.stream_read, req.key, @import("../node/shard.zig").resolveStreamWaiter, @ptrCast(shard));
-                    shard.waiter_pool.notify(.stream_group_read, req.key, @import("../node/shard.zig").resolveGroupReadWaiter, @ptrCast(shard));
-                    // Push-wake any workflow stream triggers watching this stream.
-                    shard.notifyStreamTriggers();
-                }
-            },
+            .stream_append_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
 
@@ -411,11 +406,12 @@ pub const StreamHandler = struct {
 
         const payload_value = if (req.value.len > 0) req.value else "";
 
-        // Normally the append is persisted through Raft and applied from the
-        // committed log (same path as segment replay), so it replicates and
-        // survives restart. When no shard/consensus layer is wired (single
-        // partition or unit tests), fall back to a local-only apply straight to
-        // the partition + projection — mirrors persistAndApplyTrim's behaviour.
+        // The append is persisted through Raft and applied from the committed
+        // log by the shard's one applier, so it replicates and survives restart.
+        // The StreamID is deterministic from the entry timestamp, so the
+        // response reads it back from the projection. Without a shard (unit
+        // tests) the same applier runs on a locally built entry.
+        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
         const stream_id = if (self.shard_ptr) |sptr| blk: {
             const shard = shardFromPtr(sptr);
             // Carry the partition in the value prefix so it survives restart.
@@ -423,12 +419,13 @@ pub const StreamHandler = struct {
                 return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
             };
             defer self.allocator.free(stored_value);
-            const raft_index = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "raft persist failed" } };
+            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "append not persisted" } };
             };
-            break :blk self.applyCommittedStreamEntries(shard, raft_index) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
-            };
+            if (!shard.applyCommitted()) {
+                return .{ .err = .{ .code = .internal_error, .message = "append not applied" } };
+            }
+            break :blk self.stream.streamLastId(name_hash);
         } else self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
@@ -437,16 +434,6 @@ pub const StreamHandler = struct {
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
         self.stream.registerStream(ns_stream_name) catch {};
-
-        // Register in global metrics registry for dashboard/Prometheus, and
-        // record the append against it. `registerStream` returns the per-stream
-        // metrics, so the counters cost one call next to the registration they
-        // already do.
-        if (self.metrics_registry) |mr| {
-            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
-                sm.recordAppend(stream_mod.batchRecordCount(payload_value), payload_value.len);
-            } else |_| {}
-        }
 
         return .{ .stream_append_ok = .{
             .sequence = stream_id.sequence,
@@ -616,8 +603,9 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 
-        // Persist through Raft for durability and replication
-        const deleted = self.persistAndApplyTrim(req.namespace, name_hash, trim_id);
+        const deleted = self.persistAndApplyTrim(req.namespace, name_hash, trim_id) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "trim not persisted or applied" } };
+        };
 
         const first_id = self.stream.streamFirstId(name_hash);
         const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
@@ -648,11 +636,9 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .conflict, .message = "stream is not empty; pass --force to delete" } };
         }
 
-        self.persistAndApplyDelete(req.namespace, req.key, name_hash);
-
-        // Metrics live on the leader only; followers/replay never touch them.
-        if (self.metrics_registry) |mr| mr.unregisterStream(req.namespace, req.key, 0);
-
+        self.persistAndApplyDelete(req.namespace, req.key, name_hash) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "delete not persisted or applied" } };
+        };
         return .ok;
     }
 
@@ -908,13 +894,17 @@ pub const StreamHandler = struct {
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
 
-        if (self.stream.deleteGroup(group_name)) {
-            // Persist the removal so it survives restart (FLO-103).
-            self.persistGroupDelete(group_name);
-            return .ok;
-        } else {
+        if (self.stream.getGroup(group_name) == null) {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
         }
+        if (self.shard_ptr != null) {
+            self.persistGroupDelete(group_name) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "group delete not persisted or applied" } };
+            };
+        } else {
+            _ = self.stream.deleteGroup(group_name);
+        }
+        return .ok;
     }
 
     // ── GROUP JOIN ──────────────────────────────────────────────────────
@@ -1470,8 +1460,9 @@ pub const StreamHandler = struct {
         // prefix so the entry decodes consistently on replay.
         const stored_value = try stream_mod.encodeAppendValue(self.allocator, 0, batch_value);
         defer self.allocator.free(stored_value);
-        const raft_index = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
-        const stream_id = try self.applyCommittedStreamEntries(shard, raft_index);
+        _ = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
+        if (!shard.applyCommitted()) return error.NotApplied;
+        const stream_id = self.stream.streamLastId(router.nameHash(router.namespaceHash(namespace), stream_name));
 
         // Register the stream name so it appears in `stream list`
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -1484,8 +1475,16 @@ pub const StreamHandler = struct {
     /// Read payloads from a named stream (used by processing pipelines).
     /// Uses per-stream StreamID reads for proper stream isolation.
     /// Returns (payloads slice, last StreamID read) so the pipeline can advance its cursor.
-    pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) struct { payloads: []const []const u8, last_id: StreamID } {
+    pub const PayloadRead = struct {
+        payloads: []const []const u8,
+        /// The StreamID each payload came from, parallel to `payloads`.
+        ids: []const StreamID,
+        last_id: StreamID,
+    };
+
+    pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) PayloadRead {
         var results: [1000][]const u8 = undefined;
+        var result_ids: [1000]StreamID = undefined;
         var count: usize = 0;
         const capped = @min(limit, 1000);
 
@@ -1505,15 +1504,21 @@ pub const StreamHandler = struct {
                 for (batch_buf[0..batch_n]) |br| {
                     if (count >= capped) break;
                     results[count] = br.payload;
+                    result_ids[count] = rec.id;
                     count += 1;
                 }
             }
             last_id = rec.id;
         }
 
-        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .last_id = last_id };
+        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
+        const ids = self.allocator.alloc(StreamID, count) catch {
+            self.allocator.free(out);
+            return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
+        };
         @memcpy(out, results[0..count]);
-        return .{ .payloads = out, .last_id = last_id };
+        @memcpy(ids, result_ids[0..count]);
+        return .{ .payloads = out, .ids = ids, .last_id = last_id };
     }
 
     /// A single record extracted from a batch blob, with payload and raw header bytes.
@@ -1621,77 +1626,10 @@ pub const StreamHandler = struct {
         }
     }
 
-    // ── Raft apply ──────────────────────────────────────────────────────
-
-    /// Apply committed Raft entries up to `through_index` for stream types.
-    /// Advances `last_applied` so stream indices stay aligned with the Raft log.
-    ///
-    /// Note: when this loop drains multiple entries (e.g. when commit_index
-    /// has advanced faster than per-op apply calls), non-stream entries are
-    /// silently skipped. Their projection state is updated separately by the
-    /// projection router at `partition.apply` time (during propose) or by
-    /// their owning handler's own apply loop. Advancing `last_applied` past
-    /// them here is intentional. Trim entries are likewise skipped — they
-    /// were already applied in-place by `persistAndApplyTrim`.
-    fn applyCommittedStreamEntries(
-        self: *StreamHandler,
-        shard: *Shard,
-        through_index: u64,
-    ) !StreamID {
-        const raft = shard.raft_node;
-        var last_id = StreamID.MIN;
-
-        // Copy-read each entry: getEntry()'s zero-copy read returns null for any
-        // entry whose payload wraps the hot-ring byte boundary. Skipping such an
-        // entry here while still advancing last_applied silently drops a
-        // committed record from the stream (data loss) — reproduced by the
-        // tiered-storage warm-spill test with a small hot buffer. getEntryCopy
-        // reconstructs wrapped payloads into payload_buf; partition.apply copies
-        // it out before the next iteration reuses the buffer.
-        var payload_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
-
-        while (raft.last_applied < through_index) {
-            const next_idx = raft.last_applied + 1;
-            if (raft.log.getEntryCopy(next_idx, &payload_buf)) |entry| {
-                const etype: EntryType = @enumFromInt(entry.header.entry_type);
-                if (etype == .stream_append) {
-                    last_id = try self.applyStreamAppendEntry(&entry);
-                }
-                // .stream_trim: applied in-place by persistAndApplyTrim; skip.
-                // other types: owned by another handler's apply loop; skip.
-            }
-            raft.last_applied = next_idx;
-        }
-
-        shard.syncFlushIfNeeded();
-        return last_id;
-    }
-
-    fn applyStreamAppendEntry(self: *StreamHandler, entry: *const entry_mod.Entry) !StreamID {
-        const ual_index = try self.partition.apply(entry);
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.InvalidPayload;
-        const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
-        // The user partition rides in the value prefix so it survives restart
-        // decode it here rather than threading it from the request,
-        // keeping the live and replay paths on one source of truth.
-        const av = stream_mod.decodeAppendValue(cmd.value);
-        const partition_index = av.partition_index;
-        // A batch carries N logical records; both are read from the durable
-        // value so live apply and replay agree on counts and ID ranges.
-        const record_count = stream_mod.batchRecordCount(av.payload);
-        const byte_len: u32 = @intCast(av.payload.len);
-        // Anchor the StreamID to the entry's persisted timestamp (not the wall
-        // clock) so replay reproduces the same ID — required for the durable
-        // consumer-group cursor to line up after restart (FLO-103).
-        const ts_ms = entry.header.timestamp_ns / 1_000_000;
-        return self.stream.appendToStreamAt(name_hash, ual_index, partition_index, ts_ms, record_count, byte_len);
-    }
-
-    /// Apply a stream append directly to the local partition + projection,
-    /// bypassing Raft. Used when no shard/consensus layer is wired (single
-    /// partition or unit tests). The UAL index is assigned from the partition's
-    /// committed_index so it stays monotonic and lines up with lookups, exactly
-    /// as the Raft-driven path keeps Raft and UAL indices in lockstep.
+    /// Apply a stream append through the same applier the shard uses, on a
+    /// locally built entry. Only for when no shard is wired (unit tests). The
+    /// UAL index is assigned from the partition's committed_index so it stays
+    /// monotonic and lines up with lookups.
     fn applyLocalStreamAppend(self: *StreamHandler, req: Request, payload_value: []const u8, partition_index: u32) !StreamID {
         const ns_hash = router.namespaceHash(req.namespace);
         const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
@@ -1714,7 +1652,9 @@ pub const StreamHandler = struct {
             &payload_buf,
         ) orelse return error.PayloadTooLarge;
 
-        return self.applyStreamAppendEntry(&entry);
+        _ = try self.partition.apply(&entry);
+        replayEntry(@ptrCast(self), &entry);
+        return self.stream.streamLastId(router.nameHash(ns_hash, req.key));
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1730,13 +1670,11 @@ pub const StreamHandler = struct {
         registry.register(.cg_delete, @ptrCast(self), replayEntry);
     }
 
-    /// Replay a stream entry — rebuild StreamProjection offset tracking
-    /// and stream name registration from a persisted entry.
-    ///
-    /// `replaySegments` has already called `partition.apply(entry)` before
-    /// dispatch, so this callback must NOT re-apply — doing so would
-    /// double-write to the partition UAL ring and corrupt `entry_count`.
-    /// Use `entry.header.index` directly as the UAL index for stream lookups.
+    /// The stream applier: offset tracking, name registration, trims, deletes
+    /// and consumer-group cursors, from the entry alone. Runs for a live
+    /// commit, a replicated entry and boot replay alike. The partition has
+    /// already appended the entry to the ring, so `entry.header.index` is
+    /// the UAL index for stream lookups.
     fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
@@ -1819,7 +1757,7 @@ pub const StreamHandler = struct {
     /// Format: key = [timestamp_ms:u64 LE][sequence:u64 LE], value = [name_hash:u64 LE]
     /// After Raft commit, applies the trim locally to the projection.
     /// Returns the number of records trimmed locally.
-    fn persistAndApplyTrim(self: *StreamHandler, namespace: []const u8, name_hash: u64, trim_id: StreamID) u64 {
+    fn persistAndApplyTrim(self: *StreamHandler, namespace: []const u8, name_hash: u64, trim_id: StreamID) !u64 {
         // Encode trim target as the entry key (16 bytes) and name_hash as value (8 bytes)
         var key_buf: [16]u8 = undefined;
         std.mem.writeInt(u64, key_buf[0..8], trim_id.timestamp_ms, .little);
@@ -1828,13 +1766,15 @@ pub const StreamHandler = struct {
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, val_buf[0..8], name_hash, .little);
 
-        // Persist through Raft — on commit, replicas will see this via replayEntry
+        // Persist through Raft; the applier trims the projection. The count
+        // is what the projection lost, read back rather than returned.
         if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
-            _ = persistence_mod.persistEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf) catch {};
+            const before = self.stream.streamRecordCount(name_hash);
+            _ = try persistence_mod.persistEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf);
+            if (!shard.applyCommitted()) return error.NotApplied;
+            return before - self.stream.streamRecordCount(name_hash);
         }
-
-        // Apply locally: trim the projection
         return self.stream.trimStream(name_hash, trim_id);
     }
 
@@ -1843,23 +1783,26 @@ pub const StreamHandler = struct {
     /// Format: key = raw stream name, value = namespace-qualified name, so
     /// followers/replay can clear the name registry without the namespace
     /// string (they only carry `namespace_hash`).
-    fn persistAndApplyDelete(self: *StreamHandler, namespace: []const u8, raw_name: []const u8, name_hash: u64) void {
+    fn persistAndApplyDelete(self: *StreamHandler, namespace: []const u8, raw_name: []const u8, name_hash: u64) !void {
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qualified = ns_keys.qualifyKey(&q_buf, namespace, raw_name) catch raw_name;
 
-        // Persist through Raft — replicas/replay apply via replayEntry.
+        // Persist through Raft; the applier deletes the projection state.
         if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
-            _ = persistence_mod.persistEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified) catch {};
+            _ = try persistence_mod.persistEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified);
+            if (!shard.applyCommitted()) return error.NotApplied;
+            return;
         }
-
-        // Apply locally.
         _ = self.stream.deleteStream(name_hash, raw_name, qualified);
     }
 
     /// Public interface for background tasks (retention enforcer) to persist trims.
     pub fn persistTrim(self: *StreamHandler, name_hash: u64, trim_id: StreamID) u64 {
-        return self.persistAndApplyTrim("", name_hash, trim_id);
+        return self.persistAndApplyTrim("", name_hash, trim_id) catch |err| {
+            log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
+            return 0;
+        };
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1880,7 +1823,7 @@ pub const StreamHandler = struct {
     ///
     /// Best-effort: a failed persist leaves the in-memory group correct and the
     /// next commit retries; only durability across restart is at risk.
-    /// No-op when the shard isn't wired (unit tests, pre-Raft paths).
+    /// No-op when the shard isn't wired (unit tests).
     fn persistGroupCommit(self: *StreamHandler, group_name: []const u8, force: bool) void {
         const sptr = self.shard_ptr orelse return;
         const group = self.stream.getGroup(group_name) orelse return;
@@ -1897,14 +1840,19 @@ pub const StreamHandler = struct {
 
         // group_name is already namespace-qualified; it travels in the
         // CommandPayload key, so the namespace arg is unused on replay.
-        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch return;
+        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch |err| {
+            log.err("consumer group {s}: cursor not persisted: {s}; acked records may be redelivered after a restart", .{ group_name, @errorName(err) });
+            return;
+        };
+        _ = shardFromPtr(sptr).applyCommitted();
         group.last_committed_floor = floor;
     }
 
-    /// Persist a `cg_delete` so a group removal survives restart (FLO-103).
-    fn persistGroupDelete(self: *StreamHandler, group_name: []const u8) void {
+    /// Persist a `cg_delete`; the applier removes the group.
+    fn persistGroupDelete(self: *StreamHandler, group_name: []const u8) !void {
         const sptr = self.shard_ptr orelse return;
-        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "") catch {};
+        _ = try persistence_mod.persistEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "");
+        if (!shardFromPtr(sptr).applyCommitted()) return error.NotApplied;
     }
 };
 

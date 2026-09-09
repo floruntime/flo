@@ -50,6 +50,10 @@ const result_mod = @import("../protocol/result.zig");
 const CommandResult = result_mod.CommandResult;
 const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
+const kv_handler_mod = @import("../kv/handler.zig");
+const projection_router = @import("../projection/router.zig");
+const txn_mod = @import("../kv/txn.zig");
+const stream_mod = @import("../projection/stream.zig");
 const stream_proj_mod = @import("../projection/stream.zig");
 const StreamProjection = stream_proj_mod.StreamProjection;
 const StreamID = stream_proj_mod.StreamID;
@@ -247,9 +251,23 @@ pub const Shard = struct {
     /// create/delete through Raft for multi-node consistency).
     coordinator: ?*Coordinator,
 
-    /// Replay registry — maps EntryType → handler replay callback.
-    /// Used during segment replay and for follower entry application.
+    /// Replay registry — maps EntryType → handler apply callback for the
+    /// entry types no projection owns. Used by the one applier, whether the
+    /// entry comes from this node's Raft log, a peer, or a segment at boot.
     replay_registry: ReplayRegistry,
+
+    /// Highest entry index received from a peer. Peer entries arrive by
+    /// unacknowledged broadcast and are re-broadcast, so this is the
+    /// de-duplication watermark for `applyReplicatedEntry`.
+    last_replicated_index: u64,
+
+    /// Copy buffer for committed entries, sized for the largest entry any
+    /// handler proposes. Allocated at boot so an out-of-memory is a boot
+    /// failure, not a committed write that never reaches the projection.
+    apply_buf: []u8,
+    /// True while `applyCommitted` is draining, so a waiter woken by an
+    /// apply that proposes in turn cannot start a nested drain.
+    applying: bool,
 
     /// Self-routing run ID generator (per-shard, single-threaded).
     run_id_gen: run_id_mod.Generator,
@@ -305,9 +323,6 @@ pub const Shard = struct {
         errdefer allocator.destroy(kv_handler);
         kv_handler.* = KVHandler.init(allocator, &partition.kv);
         errdefer kv_handler.deinit();
-        // Allocated here so an out-of-memory is a boot failure, not a
-        // committed write that never reaches the projection.
-        _ = kv_handler.applyBuffer() orelse return error.OutOfMemory;
 
         const stream_handler = try allocator.create(StreamHandler);
         errdefer allocator.destroy(stream_handler);
@@ -384,8 +399,10 @@ pub const Shard = struct {
         actions_handler.registerReplay(&replay_registry);
         processing_handler.registerReplay(&replay_registry);
         stream_handler.registerReplay(&replay_registry);
-        queue_handler.registerReplay(&replay_registry);
-        ts_handler.registerReplay(&replay_registry);
+        try assertOneApplier(shard_id, &replay_registry);
+
+        const apply_buf = try allocator.alloc(u8, kv_handler_mod.MAX_APPLY_PAYLOAD);
+        errdefer allocator.free(apply_buf);
 
         if (data_dir) |dir| {
             // Build shard-specific data directory: data_dir/00000/
@@ -574,6 +591,9 @@ pub const Shard = struct {
             .partition_table = null,
             .coordinator = null,
             .replay_registry = replay_registry,
+            .apply_buf = apply_buf,
+            .applying = false,
+            .last_replicated_index = 0,
             .run_id_gen = .{},
             .metrics_registry = null,
         };
@@ -692,6 +712,7 @@ pub const Shard = struct {
         // Clean up Raft consensus node
         self.raft_node.deinit();
         self.allocator.destroy(self.raft_node);
+        self.allocator.free(self.apply_buf);
 
         // Clean up partitions (each owns UAL + all projections)
         for (self.partitions) |p| {
@@ -1128,6 +1149,7 @@ pub const Shard = struct {
             .shutdown => self.running = false,
             .raft_message => self.applyReplicatedEntry(msg),
             .action_invoke => self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self)),
+            .action_start => self.startActionRun(msg),
             .stream_event => self.workflow_handler.triggers_dirty = true,
             .deferred_response => self.deliverInboundResponse(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -1155,6 +1177,16 @@ pub const Shard = struct {
                 });
             }
         }
+    }
+
+    /// A workflow on another shard needs a run created here; its bytes are
+    /// ours to free.
+    fn startActionRun(self: *Shard, msg: InboxMessage) void {
+        const ptr = msg.payload_ptr orelse return;
+        const data: [*]u8 = @ptrCast(ptr);
+        defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
+        if (msg.payload_len == 0) return;
+        self.actions_handler.startRunFromInbox(self, data[0..msg.payload_len]);
     }
 
     /// Drive a request that another shard forwarded to us. The request bytes
@@ -1254,16 +1286,14 @@ pub const Shard = struct {
 
         // Idempotency: the leader broadcasts every committed entry to peers, and
         // the mesh re-broadcasts it for late joiners — so a follower receives each
-        // entry more than once. Skip any entry at or below the index already
-        // applied, matching the ProjectionRouter's own `applied_index` guard.
+        // entry more than once. Skip any entry at or below the highest index
+        // already received from peers. This node's own writes live in a
+        // separate index space (every node bootstraps its own log), so the
+        // projection router's guard cannot be the judge here.
         //
-        // Without this, a re-delivered entry was applied again: the stream
-        // projection got a duplicate record (and `replayEntry` below appended yet
-        // another), inflating a follower's record set to a multiple of the real
-        // count. A limit-capped `stream read` then surfaced only the earliest
-        // fraction of records — followers returned ~25/50 while the leader
-        // returned 50/50.
-        if (entry.header.index <= partition.router.applied_index) return;
+        // Without it a re-delivered entry applies again and a follower's
+        // stream record set inflates to a multiple of the real count.
+        if (entry.header.index <= self.last_replicated_index) return;
 
         // Gap detection (issue #16): cross-node replication is best-effort,
         // fire-and-forget broadcast with no ack, retransmit, or repair path. If
@@ -1271,27 +1301,162 @@ pub const Shard = struct {
         // missing index is otherwise skipped *silently* — leaving this follower
         // permanently diverged with no signal. We can't repair it yet, but we
         // refuse to hide it: a jump past the next expected index is logged
-        // loudly and counted. (Guarded on applied_index > 0 so a fresh follower
-        // joining mid-stream doesn't false-positive on its first entry.)
-        const expected_index = partition.router.applied_index + 1;
-        if (partition.router.applied_index > 0 and entry.header.index > expected_index) {
+        // loudly and counted. (Guarded on last_replicated_index > 0 so a fresh
+        // follower joining mid-stream doesn't false-positive on its first entry.)
+        const expected_index = self.last_replicated_index + 1;
+        if (self.last_replicated_index > 0 and entry.header.index > expected_index) {
             const missing = entry.header.index - expected_index;
             log.warn("shard {d}: REPLICATION GAP — expected entry index {d}, received {d} ({d} entry(ies) lost in flight; this follower has permanently diverged)", .{ self.id, expected_index, entry.header.index, missing });
             if (self.metrics_registry) |m| m.replication.recordFollowerGap(missing, entry.header.index);
         }
+        self.last_replicated_index = entry.header.index;
 
-        // Apply to the partition once: UAL ring + warm store + the router-owned
-        // projections (KV, Queue, TS). This advances `applied_index`, closing the
-        // idempotency window above for any later re-delivery of this entry.
-        _ = partition.apply(&entry) catch return;
+        // A replicated definition must not install producers here: every
+        // shard bootstraps as its own leader, so a
+        // follower would fire the same trigger the origin fires. The
+        // definition itself is applied so the follower can serve it.
+        self.workflow_handler.install_producers = false;
+        defer self.workflow_handler.install_producers = true;
+        // Other shard threads read the actions maps under runs_mu; the
+        // origin's own writes hold it, so a replicated write must too.
+        const guard_actions = switch (@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type))) {
+            .action_register, .action_delete, .action_invoke, .action_update_run => true,
+            else => false,
+        };
+        if (guard_actions) self.actions_handler.runs_mu.lock();
+        defer if (guard_actions) self.actions_handler.runs_mu.unlock();
+        if (!applyEntryCoreWith(partition, &self.replay_registry, &entry, true)) return;
+        self.notifyApplied(&entry);
+    }
 
-        // Rebuild the remaining projections (stream offset tracking, workflow,
-        // actions, namespace, processing, consumer-group cursors) through the
-        // replay registry — the SAME single source of truth `replaySegments` uses
-        // on restart. Stream entries route to `.none` in the router, so this is
-        // where their StreamProjection records are created; doing it inline here
-        // as well would double-append every stream record.
-        _ = self.replay_registry.dispatch(&entry);
+    // ─── The one applier ─────────────────────────────────────────────────
+
+    /// Apply one committed entry to this shard's state and wake whoever was
+    /// waiting on it. A leader, a follower and boot replay all run the same
+    /// core (`applyEntryCoreWith`), so the three can never disagree about
+    /// what an entry means; only the live paths notify. False when the
+    /// partition refused the entry.
+    pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry) bool {
+        if (!applyEntryCore(self.defaultPartition(), &self.replay_registry, entry)) return false;
+        self.notifyApplied(entry);
+        return true;
+    }
+
+    /// Apply everything the Raft node has committed but not yet applied.
+    /// Single-node commit is immediate, so a write handler calls this right
+    /// after `propose` and then reads its result from projection state.
+    /// False when an entry could not be applied: the caller must not report
+    /// success from state that does not hold it.
+    ///
+    /// A waiter woken by an apply may propose in turn (a dequeue acks the
+    /// message it took); that entry lands in the log and this loop reaches
+    /// it on its next pass. A nested drain would copy the next entry over
+    /// `apply_buf` while the notification is still reading the entry in
+    /// hand, so the inner call is a no-op. That no-op returns true, which
+    /// means "nothing failed", not "applied": a notification must not read
+    /// projection state for an entry it proposed.
+    pub fn applyCommitted(self: *Shard) bool {
+        if (self.applying) return true;
+        self.applying = true;
+        defer self.applying = false;
+
+        const raft = self.raft_node;
+        var all_applied = true;
+        while (raft.last_applied < raft.commit_index) {
+            const next_idx = raft.last_applied + 1;
+            // Advanced before the apply: whatever a notification does, this
+            // entry is never taken twice, and the loop cannot stall.
+            raft.last_applied = next_idx;
+            if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                if (!self.applyEntry(&e)) all_applied = false;
+            } else if (raft.log.contains(next_idx)) {
+                // Present but not copyable: the buffer fits every entry in
+                // this log, so this is a bug, not eviction. Said out loud,
+                // because the write was already acked.
+                log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
+                all_applied = false;
+            }
+        }
+        self.syncFlushIfNeeded();
+        return all_applied;
+    }
+
+    /// The namespace to meter an applied entry under. Entries carry the
+    /// hash; a bare or explicit "default" is "default" without a lookup (a
+    /// namespace is registered only on its first write, and default's first
+    /// write should still be metered), and a namespace this node has never
+    /// registered is not metered rather than mislabelled.
+    fn metricsNamespace(self: *Shard, ns_hash: u32) ?[]const u8 {
+        if (ns_hash == node_router.namespaceHash("") or ns_hash == node_router.namespaceHash("default")) return "default";
+        return self.namespace_handler.nameForHash(ns_hash);
+    }
+
+    /// Waiters, triggers and per-namespace metrics for an entry that just
+    /// applied. Keyed from the entry itself, never from the request, so a
+    /// follower's blocking read wakes on the same event a leader's does.
+    fn notifyApplied(self: *Shard, entry: *const entry_mod.Entry) void {
+        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        switch (etype) {
+            .kv_put, .kv_delete, .kv_incr, .kv_touch => {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                self.waiter_pool.notify(.kv_get, cmd.key, resolveKVWaiter, @ptrCast(self));
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
+                    if (mr.registerKVNamespace(ns)) |km| switch (etype) {
+                        // A per-key version of 1 is the key's first write.
+                        .kv_put => km.recordSet(cmd.value.len, if (self.kv_handler.kv.get(cmd.key)) |e| e.version == 1 else false),
+                        .kv_delete => {
+                            km.recordDelete();
+                            km.decrementKeyCount();
+                        },
+                        else => {},
+                    } else |_| {}
+                }
+            },
+            .kv_batch => {
+                var it = txn_mod.iterateBatch(entry.payload) orelse return;
+                while (it.next()) |op| {
+                    self.waiter_pool.notify(.kv_get, op.key, resolveKVWaiter, @ptrCast(self));
+                }
+            },
+            .stream_append => {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (cmd.key.len == 0) return;
+                self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
+                self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
+                self.notifyStreamTriggers();
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
+                    const av = stream_mod.decodeAppendValue(cmd.value);
+                    if (mr.registerStream(ns, cmd.key, 0)) |sm| {
+                        sm.recordAppend(stream_mod.batchRecordCount(av.payload), av.payload.len);
+                    } else |_| {}
+                }
+            },
+            .stream_delete => {
+                // The stream is gone on every node that applied this entry;
+                // drop its series here, not in the leader-only handler.
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
+                    mr.unregisterStream(ns, cmd.key, 0);
+                }
+            },
+            .queue_enqueue => {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (cmd.key.len == 0) return;
+                self.waiter_pool.notify(.queue_dequeue, cmd.key, resolveQueueWaiter, @ptrCast(self));
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
+                    // The value carries a 4-byte priority before the message.
+                    const body_len = cmd.value.len -| 4;
+                    if (mr.registerQueue(ns, cmd.key)) |qm| {
+                        qm.recordEnqueue(1, body_len, false);
+                    } else |_| {}
+                }
+            },
+            else => {},
+        }
     }
 
     // ─── Event loop ──────────────────────────────────────────────────────
@@ -1325,16 +1490,20 @@ pub const Shard = struct {
         _ = self.task_scheduler.tick(2_000_000); // 2ms budget
 
         // Drive processing pipelines (poll sources → write sinks)
-        self.processing_handler.tickPipelines(self);
+        // Producers run only where this shard leads: a follower that also
+        // proposed would write the same facts twice, in two logs.
+        const leads = self.raft_node.role == .leader;
+        if (leads) self.processing_handler.tickPipelines(self);
 
         // Drive workflow stream triggers (poll streams → start runs)
-        self.workflow_handler.tickStreamTriggers(self);
+        if (leads) self.workflow_handler.tickStreamTriggers(self);
 
         // Drive workflow scheduled triggers (interval → start runs)
-        self.workflow_handler.tickSchedules(self);
+        if (leads) self.workflow_handler.tickSchedules(self);
 
         // Check for completed async actions and resume waiting workflow runs
-        self.workflow_handler.checkPendingActions(self);
+        // (resuming proposes the run's next entries, so leader-only too).
+        if (leads) self.workflow_handler.checkPendingActions(self);
 
         return events.len;
     }
@@ -1435,6 +1604,8 @@ pub const Shard = struct {
     /// replicas apply the same deterministic trims.
     fn streamRetentionTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
+        // Trims are proposals: only the leader makes them.
+        if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
         const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
         var total_trimmed: u64 = 0;
@@ -2507,25 +2678,12 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
 
-        // Persist through Raft for durability and replication
-        _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch {};
-
-        // Apply locally
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
-        if (entry_mod.buildCommandEntry(
-            .queue_ack,
-            entry_mod.Flags.NONE,
-            partition.current_term,
-            partition.ual.max_index + 1,
-            now_ns,
-            0, // namespace hash not needed for ack
-            &seq_key,
-            &[_]u8{},
-            payload_buf[0..payload_size],
-        )) |entry| {
-            _ = partition.apply(&entry) catch {};
-        }
+        // Same contract as the queue handler's dequeue-ack: log, never fail
+        // the dequeue.
+        _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+            log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
+        };
+        _ = shard.applyCommitted();
     }
 
     shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
@@ -2584,6 +2742,40 @@ pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
     return @max(RAFT_RING_MIN, @min(hot_buffer_capacity / 4, RAFT_RING_MAX));
 }
 
+/// The one apply path: the partition (hot ring plus the projections the
+/// router owns — KV, queue, TS) and then the registry appliers for every
+/// other entry type. Returns false when the entry could not enter the ring,
+/// in which case nothing else sees it either.
+pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry) bool {
+    return applyEntryCoreWith(partition, registry, entry, false);
+}
+
+fn applyEntryCoreWith(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, replicated: bool) bool {
+    _ = (if (replicated) partition.applyReplicated(entry) else partition.apply(entry)) catch |err| {
+        log.err("shard {d}: entry index={d} type={s} rejected by the partition: {s}; projections are missing it", .{ partition.id, entry.header.index, @tagName(@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type))), @errorName(err) });
+        return false;
+    };
+    _ = registry.dispatch(entry);
+    return true;
+}
+
+/// Every entry type has exactly one applier: the projection router or a
+/// registry callback, never both. Two appliers is how a replayed entry gets
+/// inserted twice.
+fn assertOneApplier(shard_id: u16, registry: *const ReplayRegistry) !void {
+    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
+        const etype: entry_mod.EntryType = @enumFromInt(f.value);
+        const routed = switch (projection_router.routeTarget(etype)) {
+            .kv, .queue, .ts => true,
+            .none, .snapshot => false,
+        };
+        if (routed and registry.has(etype)) {
+            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            return error.EntryTypeHasTwoAppliers;
+        }
+    }
+}
+
 /// Feed a durable entry back into the Raft log at boot: the last index, the
 /// term index and the hot-ring tail all come from this pass. A hole in the
 /// durable history (an index no segment holds) is logged and the log
@@ -2611,11 +2803,9 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
 // Segment Replay — recover state from .flseg files on startup
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Replay all .flseg segment files in `dir_path` into the partition.
-/// Entries are loaded into the UAL (for payload reads) and applied to projections.
-/// Stream entries additionally rebuild the StreamProjection offset tracking,
-/// since the ProjectionRouter skips stream entries (UAL direct reads by design).
-/// Every entry is also restored into the Raft log.
+/// Replay all .flseg segment files in `dir_path`: every entry is restored
+/// into the Raft log and applied through `applyEntryCore`, exactly as when
+/// it was first committed.
 ///
 const ReplaySegmentFile = struct {
     first_index: u64,
@@ -2701,13 +2891,7 @@ fn replaySegmentFile(
             continue;
         }
 
-        const ual_index = partition.apply(&seg_entry) catch {
-            offset += seg_entry.totalSize();
-            continue;
-        };
-        _ = ual_index;
-
-        _ = replay_registry.dispatch(&seg_entry);
+        _ = applyEntryCore(partition, replay_registry, &seg_entry);
 
         offset += seg_entry.totalSize();
     }
@@ -2933,4 +3117,58 @@ test "the Raft ring floor holds the largest transaction batch" {
     var e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, 1, 0, payload);
     e.header.crc32c = e.computeCrc();
     try std.testing.expectEqual(@as(u64, 1), try log_inst.append(&e));
+}
+
+test "assertOneApplier refuses a registry callback for a router-owned type" {
+    const Noop = struct {
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) void {}
+    };
+    var registry: ReplayRegistry = .{};
+    var ctx: u8 = 0;
+    registry.register(.stream_append, @ptrCast(&ctx), Noop.apply);
+    try assertOneApplier(0, &registry);
+    registry.register(.ts_write, @ptrCast(&ctx), Noop.apply);
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, assertOneApplier(0, &registry));
+}
+
+test "applyCommitted: an applier that proposes does not re-enter the drain" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+
+    // An applier that proposes in turn, the way a dequeue's auto-ack does
+    // from inside a notification. It records what it observes.
+    const Probe = struct {
+        var shard_ptr: *Shard = undefined;
+        var last_applied_seen: u64 = 0;
+        var nested_saw_kv: bool = false;
+        var calls: u32 = 0;
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) void {
+            calls += 1;
+            const shard_inner = shard_ptr;
+            last_applied_seen = shard_inner.raft_node.last_applied;
+            _ = persistence_mod.persistEntry(shard_inner, .kv_put, entry_mod.Flags.NONE, "", "nested", "v") catch unreachable;
+            _ = shard_inner.applyCommitted();
+            nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
+        }
+    };
+    Probe.shard_ptr = &shard;
+    var ctx: u8 = 0;
+    shard.replay_registry.register(.raft_config, @ptrCast(&ctx), Probe.apply);
+
+    const idx = try persistence_mod.persistEntry(&shard, .raft_config, entry_mod.Flags.NONE, "", "probe", "");
+    try std.testing.expect(shard.applyCommitted());
+
+    // The entry in hand was marked applied before its applier ran, so a
+    // nested drain had nothing to take twice; and that drain was a no-op,
+    // leaving the nested proposal to the outer loop.
+    try std.testing.expectEqual(idx, Probe.last_applied_seen);
+    try std.testing.expect(!Probe.nested_saw_kv);
+    try std.testing.expect(shard.kv_handler.kv.get("nested") != null);
+    try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
+    try std.testing.expectEqual(@as(u32, 1), Probe.calls);
 }

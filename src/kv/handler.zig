@@ -8,10 +8,6 @@
 //!      KV projection via applyEntry()
 //!   4. Send the response to the client
 //!
-//! In multi-node mode the leader replicates via AppendEntries before committing.
-//! The shard's tick loop drives replication; this handler waits for commit by
-//! calling applyCommittedEntries() which reads up to commit_index.
-//!
 //! ## Handler Registration
 //!
 //! ```zig
@@ -22,7 +18,7 @@
 //! ## Dispatch Flow
 //!
 //! Acceptor → Shard → Dispatcher → KVHandler.dispatch{Get,Put,...}
-//!   → [writes] raft_node.propose() → applyCommittedEntries() → sendResponse
+//!   → [writes] raft_node.propose() → Shard.applyCommitted() → sendResponse
 //!   → [reads]  projection.get/scan() → sendResponse
 //!
 //! ## Reserved Keys
@@ -60,8 +56,8 @@ const RaftNetwork = network_mode.RaftNetwork;
 
 /// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
 const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
-/// The largest entry this handler proposes: a full transaction batch. The
-/// apply loop's copy buffer and the Raft ring floor are both sized from it,
+/// The largest entry any handler proposes: a full transaction batch. The
+/// shard's apply buffer and the Raft ring floor are both sized from it,
 /// because an entry that fits the ring but not the buffer would be acked
 /// and never applied.
 pub const MAX_APPLY_PAYLOAD: usize = @max(MAX_ENTRY_PAYLOAD, txn_mod.MAX_BATCH_ENTRY_PAYLOAD);
@@ -109,10 +105,6 @@ pub const KVHandler = struct {
     /// thread, no locks. Tracks open BEGIN'd txns until COMMIT/ROLLBACK.
     txn_table: txn_mod.TxnTable,
 
-    /// Copy buffer for committed entries, `MAX_APPLY_PAYLOAD` bytes. The
-    /// shard allocates it at boot; `init` itself cannot fail.
-    apply_buf: []u8,
-
     pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
         return .{
             .kv = kv,
@@ -120,22 +112,10 @@ pub const KVHandler = struct {
             .next_lsn = 1,
             .metrics_registry = null,
             .txn_table = txn_mod.TxnTable.init(allocator),
-            .apply_buf = &.{},
         };
     }
 
-    pub fn applyBuffer(self: *KVHandler) ?[]u8 {
-        if (self.apply_buf.len == 0) {
-            self.apply_buf = self.allocator.alloc(u8, MAX_APPLY_PAYLOAD) catch {
-                log.err("kv: cannot allocate the {d}-byte apply buffer; committed entries are not being applied", .{MAX_APPLY_PAYLOAD});
-                return null;
-            };
-        }
-        return self.apply_buf;
-    }
-
     pub fn deinit(self: *KVHandler) void {
-        if (self.apply_buf.len > 0) self.allocator.free(self.apply_buf);
         self.txn_table.deinit();
     }
 
@@ -330,11 +310,11 @@ pub const KVHandler = struct {
             return;
         };
 
-        // Apply all committed entries (in single-node mode this is synchronous)
-        applyCommittedEntries(shard);
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
 
-        // Notify any blocking GET waiters for this key via unified pool (qualified key)
-        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+            return;
+        }
 
         // Build response from the committed version
         const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
@@ -343,14 +323,6 @@ pub const KVHandler = struct {
 
         // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-
-        // Register KV namespace in global metrics registry for dashboard/Prometheus,
-        // and record the write against the per-namespace metrics it returns.
-        if (shard.kv_handler.metrics_registry) |mr| {
-            if (mr.registerKVNamespace(req.namespace)) |km| {
-                km.recordSet(req.value.len, version == 1);
-            } else |_| {}
-        }
 
         sendKVResponse(shard, conn, req.header.request_id, cmd_result);
     }
@@ -408,20 +380,13 @@ pub const KVHandler = struct {
             return;
         };
 
-        // Apply all committed entries
-        applyCommittedEntries(shard);
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
 
-        // Notify any blocking GET waiters for this key via unified pool (qualified key)
-        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+            return;
+        }
 
         log.debug("KV DELETE: key={s}", .{req.key});
-
-        if (shard.kv_handler.metrics_registry) |mr| {
-            if (mr.registerKVNamespace(req.namespace)) |km| {
-                km.recordDelete();
-                km.decrementKeyCount();
-            } else |_| {}
-        }
 
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
@@ -487,8 +452,11 @@ pub const KVHandler = struct {
             return;
         };
 
-        applyCommittedEntries(shard);
-        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+
+            return;
+        }
 
         const entry = shard.kv_handler.*.kv.get(qkey) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } });
@@ -584,7 +552,11 @@ pub const KVHandler = struct {
             return;
         };
 
-        applyCommittedEntries(shard);
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+
+            return;
+        }
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
@@ -758,8 +730,11 @@ pub const KVHandler = struct {
             return;
         };
 
-        applyCommittedEntries(shard);
-        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+
+            return;
+        }
 
         const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
         sendKVResponse(shard, conn, req.header.request_id, .{ .kv_put_ok = .{ .version = version } });
@@ -803,8 +778,10 @@ pub const KVHandler = struct {
                 sendKVResponse(shard, conn, req.header.request_id, result);
                 return;
             };
-            applyCommittedEntries(shard);
-            shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+            if (!shard.applyCommitted()) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+                return;
+            }
             sendKVResponse(shard, conn, req.header.request_id, .ok);
             return;
         }
@@ -832,8 +809,11 @@ pub const KVHandler = struct {
             return;
         };
 
-        applyCommittedEntries(shard);
-        shard.waiter_pool.notify(.kv_get, qkey, @import("../node/shard.zig").resolveKVWaiter, @ptrCast(shard));
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+
+            return;
+        }
         sendKVResponse(shard, conn, req.header.request_id, .ok);
     }
 
@@ -1045,8 +1025,8 @@ pub const KVHandler = struct {
     /// and propose the entry through RaftNode. Returns the ProposeResult with
     /// .index (becomes the entry version) and .term.
     ///
-    /// After this returns successfully, call `applyCommittedEntries()` to apply
-    /// any newly committed entries to the KV projection.
+    /// After this returns successfully, call `Shard.applyCommitted()` to apply
+    /// any newly committed entries.
     fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request, qualified_key: []const u8) !@import("../raft/node.zig").ProposeResult {
         const value: []const u8 = if (entry_type == .kv_delete) &[_]u8{} else req.value;
         return proposeKVEntryWithValue(shard, entry_type, req, qualified_key, value);
@@ -1110,42 +1090,6 @@ pub const KVHandler = struct {
         }
 
         return propose_result;
-    }
-
-    /// Apply all entries committed by Raft (commit_index > last_applied) to the
-    /// KV projection. In single-node mode this is a tight synchronous loop since
-    /// propose() advances commit_index immediately.
-    ///
-    /// Note: `kv.applyEntry` no-ops on non-KV entry types, so when this loop
-    /// drains multiple entries (e.g. when commit_index advances faster than
-    /// per-op apply calls), non-KV entries are silently skipped. Their
-    /// projection state is updated separately by the projection router at
-    /// `partition.apply` time (during propose) or by their owning handler's
-    /// own apply loop. Advancing `last_applied` past them here is intentional.
-    fn applyCommittedEntries(shard: *Shard) void {
-        const raft = shard.raft_node;
-        // Copy-read each entry: getEntry()'s zero-copy read returns null for an
-        // entry whose payload wraps the hot-ring byte boundary. Advancing
-        // last_applied past such an entry silently
-        // drops a committed KV mutation — the same wrap-boundary data loss fixed
-        // in the stream apply loop. getEntryCopy reconstructs wrapped payloads;
-        // kv.applyEntry copies what it stores before the buffer is reused.
-        const payload_buf = shard.kv_handler.applyBuffer() orelse return;
-        while (raft.last_applied < raft.commit_index) {
-            const next_idx = raft.last_applied + 1;
-            if (raft.log.getEntryCopy(next_idx, payload_buf)) |e| {
-                shard.defaultPartition().kv.applyEntry(&e) catch {};
-            } else if (raft.log.contains(next_idx)) {
-                // Present but not copyable: the buffer fits every entry in
-                // this log, so this is a bug, not eviction. Said out loud,
-                // because the write was already acked.
-                log.err("shard {d}: committed entry index={d} could not be read for apply; the KV projection is missing it", .{ shard.id, next_idx });
-            }
-            // Advance even when the entry is genuinely gone (evicted past
-            // read_pos) so the loop can't stall.
-            raft.last_applied = next_idx;
-        }
-        shard.syncFlushIfNeeded();
     }
 
     // ── Per-Shard Transactions ─────────────────────────────────────────
@@ -1271,7 +1215,11 @@ pub const KVHandler = struct {
             }
         }
 
-        applyCommittedEntries(shard);
+        if (!shard.applyCommitted()) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
+
+            return;
+        }
 
         // Drop the txn state \u2014 it's now durably committed.
         txn_table.drop(txn_id);

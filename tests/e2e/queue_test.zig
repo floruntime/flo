@@ -676,3 +676,34 @@ test "e2e/queue: ls shows multiple queues from different operations" {
     try stdx.testing.assertContains(result, "ls-tasks");
     try stdx.testing.assertContains(result, "ls-events");
 }
+
+test "e2e/queue: a blocking dequeue woken by an enqueue leaves the metrics registry clean" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+
+    var waiter = try ctx.cli.runAsync(&.{ "queue", "dequeue", "wake-metrics-q", "--block", "5000" });
+    defer waiter.deinit();
+    @import("stdx").time.sleep(150 * std.time.ns_per_ms);
+    try ctx.exec(&.{ "queue", "enqueue", "wake-metrics-q", "woken-msg" });
+
+    var result = try waiter.wait();
+    defer result.deinit();
+    try stdx.testing.assertSucceeded(result);
+    try stdx.testing.assertStdoutContains(result, "woken-msg");
+
+    // The wake path acks from inside the apply of the enqueue. The metrics
+    // registered on that path must name the real queue and nothing else:
+    // a registry entry keyed by bytes from a reused buffer would show up
+    // here as a second queue label.
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    const woken = std.mem.count(u8, resp.body, "queue=\"wake-metrics-q\"");
+    const any = std.mem.count(u8, resp.body, "queue=\"");
+    try testing.expect(woken > 0);
+    try testing.expectEqual(any, woken);
+}

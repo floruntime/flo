@@ -1383,8 +1383,8 @@ test "e2e/ts: list returns all measurements across shards" {
     // Write 8 distinctly-named measurements. With 4 shards and Wyhash
     // routing, these are very likely to land on at least 2 different shards.
     const measurements = [_][]const u8{
-        "alpha_cpu",   "bravo_mem",   "charlie_disk", "delta_net",
-        "echo_iops",   "foxtrot_lat", "golf_tput",    "hotel_err",
+        "alpha_cpu", "bravo_mem",   "charlie_disk", "delta_net",
+        "echo_iops", "foxtrot_lat", "golf_tput",    "hotel_err",
     };
 
     for (measurements) |m| {
@@ -1460,4 +1460,31 @@ test "e2e/ts: query buckets by window" {
     defer five_min.deinit();
     try testing.expect(five_min.contains("40"));
     try testing.expect(!five_min.contains("1708700520000"));
+}
+
+test "e2e/ts: points survive restart exactly once" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // One applier owns ts_write; a second one on the replay path would
+    // insert every point twice after a restart. Distinct values, counted.
+    const values = [_][]const u8{ "7101.5", "7202.5", "7303.5" };
+    const stamps = [_][]const u8{ "1708700400000", "1708700401000", "1708700402000" };
+    for (values, stamps) |v, t| {
+        try ctx.exec(&.{ "ts", "write", "restart_cpu", "--tags", "host=a", "--value", v, "--timestamp", t });
+    }
+
+    var before = try ctx.cli.run(&.{ "ts", "read", "restart_cpu", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer before.deinit();
+    try stdx.testing.assertSucceeded(before);
+    for (values) |v| try testing.expectEqual(@as(usize, 1), before.stdoutCount(v));
+
+    try ctx.restartServer();
+
+    var after = try ctx.cli.run(&.{ "ts", "read", "restart_cpu", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer after.deinit();
+    try stdx.testing.assertSucceeded(after);
+    for (values) |v| try testing.expectEqual(@as(usize, 1), after.stdoutCount(v));
 }

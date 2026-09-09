@@ -201,6 +201,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-ual", .source = "bench/bench_ual.zig" },
         .{ .name = "bench-kv", .source = "bench/bench_kv.zig" },
         .{ .name = "bench-inbox", .source = "bench/bench_inbox.zig" },
+        .{ .name = "bench-write-path", .source = "bench/bench_write_path.zig" },
     };
 
     for (bench_sources) |def| {

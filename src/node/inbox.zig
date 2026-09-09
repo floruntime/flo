@@ -54,6 +54,7 @@ pub const Tag = enum(u8) {
 
     // ── Actions ──
     action_invoke, // Cross-shard action invocation from workflow handler
+    action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
 
     // ── Workflows ──
     stream_event, // A stream was appended to — wake stream-trigger polling
