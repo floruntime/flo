@@ -11,7 +11,7 @@
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
 //!   cg_commit, cg_delete            → None (applied to StreamProjection via
 //!                                      the stream handler's replay registry,
-//!                                      not this router — FLO-103)
+//!                                      not this router)
 //!   raft_config, raft_noop          → None (consensus layer)
 //!   raft_snapshot                    → Snapshot installation
 //!   checkpoint                      → None (processing runtime)
@@ -132,8 +132,19 @@ pub const ProjectionRouter = struct {
     /// Apply a single committed entry. Routes by EntryType.
     /// Returns what happened.
     pub fn apply(self: *ProjectionRouter, entry: *const Entry) ApplyResult {
+        return self.applyWith(entry, false);
+    }
+
+    /// Apply an entry whose index may sit below `applied_index`: a peer's
+    /// broadcast shares no index space with this node's own log, so the
+    /// idempotency guard would drop it. The caller de-duplicates on its own.
+    pub fn applyOutOfOrder(self: *ProjectionRouter, entry: *const Entry) ApplyResult {
+        return self.applyWith(entry, true);
+    }
+
+    fn applyWith(self: *ProjectionRouter, entry: *const Entry, out_of_order: bool) ApplyResult {
         // Idempotency: skip already-applied entries
-        if (entry.header.index <= self.applied_index) {
+        if (!out_of_order and entry.header.index <= self.applied_index) {
             self.stats.entries_skipped += 1;
             return .skipped_already_applied;
         }
@@ -156,7 +167,7 @@ pub const ProjectionRouter = struct {
         };
 
         // Advance applied_index regardless of routing outcome
-        self.applied_index = entry.header.index;
+        self.applied_index = @max(self.applied_index, entry.header.index);
         return result;
     }
 
@@ -240,7 +251,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .kv_put, .kv_delete, .kv_batch => .kv,
         .kv_incr, .kv_touch => .kv,
 
-        // Consumer-group durability (FLO-103): cg_commit / cg_delete carry
+        // Consumer-group durability: cg_commit / cg_delete carry
         // consumer-group state, which lives on the StreamProjection. They are
         // applied via the stream handler's replay registry (registerReplay),
         // not the projection router, so route to .none here to avoid also
@@ -263,16 +274,11 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Snapshot installation
         .raft_snapshot => .snapshot,
 
-        // Workflow — restored in replaySegments, no live projection
+        // Registry-owned: applied by the owning handler's callback, never by
+        // this router (Shard.assertOneApplier enforces it).
         .workflow_create, .workflow_start, .workflow_complete => .none,
-
-        // Namespace — restored in replaySegments, no live projection
         .namespace_create, .namespace_delete, .namespace_config => .none,
-
-        // Actions — restored in replaySegments, no live projection
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
-
-        // Processing — restored in replaySegments, no live projection
         .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale, .processing_checkpoint => .none,
 
         // Checkpoint — processing runtime
@@ -345,7 +351,7 @@ test "router: routing table correctness" {
     try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_delete));
     try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_batch));
 
-    // Consumer group → none (applied via stream handler replay registry, FLO-103)
+    // Consumer group → none (applied via stream handler replay registry)
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_commit));
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_create));
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_delete));
@@ -416,7 +422,7 @@ test "router: ts entry routed to ts projection" {
     try testing.expectEqual(@as(u64, 1), router.stats.ts_entries);
 }
 
-test "router: consumer group entry not routed to a projection (FLO-103)" {
+test "router: consumer group entry not routed to a projection" {
     // cg_commit / cg_delete carry consumer-group state owned by the
     // StreamProjection and are applied via the stream handler's replay
     // registry, so the projection router must NOT route them to KV.
@@ -568,14 +574,14 @@ test "router: mixed entry types across all projections" {
     _ = router.apply(&makeEntry(.kv_put, 1));
     _ = router.apply(&makeEntry(.queue_enqueue, 2));
     _ = router.apply(&makeEntry(.ts_write, 3));
-    _ = router.apply(&makeEntry(.cg_commit, 4)); // → none (stream replay registry, FLO-103)
+    _ = router.apply(&makeEntry(.cg_commit, 4)); // → none (stream replay registry)
     _ = router.apply(&makeEntry(.queue_ack, 5));
     _ = router.apply(&makeEntry(.ts_write_batch, 6));
 
     try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // kv_put only
     try testing.expectEqual(@as(u32, 2), queue_proj.apply_count); // enqueue + ack
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count); // write + write_batch
-    // cg_commit routes to none (FLO-103), so 5 applied + 1 no-projection.
+    // cg_commit routes to none, so 5 applied + 1 no-projection.
     try testing.expectEqual(@as(u64, 5), router.stats.entries_applied);
     try testing.expectEqual(@as(u64, 1), router.stats.entries_no_projection);
 }

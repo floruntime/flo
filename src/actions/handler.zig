@@ -22,6 +22,7 @@
 //! from UAL segments on startup via the ReplayRegistry.
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -510,51 +511,33 @@ pub const ActionsHandler = struct {
         }
 
         // Version bump if re-registering
-        var version: u32 = 1;
-        if (self.actions.fetchRemove(name)) |old| {
-            version = old.value.version + 1;
-            self.allocator.free(old.value.namespace_owned);
-            self.allocator.free(old.value.name_owned);
-            self.allocator.free(old.value.owner_owned);
-        }
+        const version: u32 = if (self.actions.get(name)) |old| old.version + 1 else 1;
 
         // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
         const meta = parseRegisterValue(req.value);
-
-        const owned_name = self.allocator.dupe(u8, name) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-        const owned_ns = self.allocator.dupe(u8, namespace) catch {
-            self.allocator.free(owned_name);
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-        const owned_owner = self.allocator.dupe(u8, meta.owner) catch {
-            self.allocator.free(owned_ns);
-            self.allocator.free(owned_name);
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
-        self.actions.put(owned_name, .{
-            .name_owned = owned_name,
-            .namespace_owned = owned_ns,
-            .owner_owned = owned_owner,
-            .action_type = meta.action_type,
-            .version = version,
-            .enabled = true,
-            .created_at_ns = now_ns,
-            .timeout_ms = meta.timeout_ms,
-            .max_retries = meta.max_retries,
-        }) catch {
-            self.allocator.free(owned_owner);
-            self.allocator.free(owned_ns);
-            self.allocator.free(owned_name);
-            return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
+        // The applier stores the record from the entry; the same applier runs
+        // on restart and on followers.
+        var value_buf: [65536]u8 = undefined;
+        const value = encodeRegisterValue(&value_buf, version, now_ns, meta.action_type, req.value) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "action definition too large" } };
         };
-
-        // Persist through Raft: value = [version:u32][created_at_ns:u64][action_type:u8][original_value...]
-        if (shard) |s| self.persistRegister(s, req.namespace, name, version, now_ns, meta.action_type, req.value);
+        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch {
+            return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
+        };
+        if (shard) |s| {
+            _ = persistence.persistEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+            };
+            if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action not applied" } };
+        } else {
+            self.replayRegister(qkey, value);
+        }
+        if (!self.actions.contains(name)) {
+            return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
+        }
 
         // Version string
         var ver_buf: [12]u8 = undefined;
@@ -597,55 +580,27 @@ pub const ActionsHandler = struct {
             break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ @import("stdx").time.milliTimestamp(), seq }) catch "act-0";
         };
 
-        // Duplicate for storage
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-        errdefer self.allocator.free(owned_run_id);
-
-        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
-            self.allocator.free(owned_run_id);
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-
-        // Store input payload so action_await can return it.
         // Parse the invoke value to extract labels and actual input.
         const parsed_value = parseInvokeValue(req.value);
-        const owned_input: ?[]const u8 = if (parsed_value.input.len > 0)
-            self.allocator.dupe(u8, parsed_value.input) catch null
-        else
-            null;
-
-        const owned_labels: ?[]const u8 = if (parsed_value.labels) |l|
-            self.allocator.dupe(u8, l) catch null
-        else
-            null;
-
-        // Look up max_retries from the action's registration
-        const action_max_retries: u32 = if (self.actions.get(action_name)) |arec| arec.max_retries else 3;
-
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
-        self.runs.put(owned_run_id, .{
-            .run_id_owned = owned_run_id,
-            .action_name_owned = owned_action_name,
-            .input_owned = owned_input,
-            .labels_owned = owned_labels,
-            .status = .pending,
-            .created_at_ms = now_ms,
-            .started_at_ms = null,
-            .completed_at_ms = null,
-            .max_retries = action_max_retries,
-        }) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_action_name);
-            if (owned_input) |inp| self.allocator.free(inp);
-            if (owned_labels) |lbl| self.allocator.free(lbl);
+        // The applier creates the run from the entry.
+        var value_buf: [65536]u8 = undefined;
+        const value = encodeInvokeValue(&value_buf, action_name, now_ms, parsed_value.input, parsed_value.labels, null, null) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
+        };
+        if (shard) |s| {
+            _ = persistence.persistEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+            };
+            if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action run not applied" } };
+        } else {
+            self.replayInvoke(run_id_str, value);
+        }
+        const stored = self.runs.getPtr(run_id_str) orelse {
             return .{ .err = .{ .code = .internal_error, .message = "run store failed" } };
         };
-
-        // Persist invoke through Raft
-        if (shard) |s| self.persistInvoke(s, req.namespace, owned_run_id, action_name, now_ms, parsed_value.input, parsed_value.labels);
+        const owned_run_id = stored.run_id_owned;
 
         return .{
             .action_invoked = .{
@@ -845,14 +800,19 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
         }
 
-        if (self.actions.fetchRemove(name)) |kv| {
-            self.allocator.free(kv.value.namespace_owned);
-            self.allocator.free(kv.value.name_owned);
-            self.allocator.free(kv.value.owner_owned);
-
-            // Persist deletion through Raft
-            if (shard) |s| self.persistDelete(s, req.namespace, name);
-
+        if (self.actions.contains(name)) {
+            var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+            const qkey = ns_keys.qualifyKey(&qbuf, req.namespace, name) catch {
+                return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
+            };
+            if (shard) |s| {
+                _ = persistence.persistEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch {
+                    return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+                };
+                if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action delete not applied" } };
+            } else {
+                self.replayDelete(qkey);
+            }
             return .{ .action_deleted = {} };
         }
 
@@ -913,35 +873,18 @@ pub const ActionsHandler = struct {
             }
         }
 
-        // Find and update the run
-        if (self.runs.getPtr(task_id)) |run| {
-            run.status = .completed;
-            run.completed_at_ms = @import("stdx").time.milliTimestamp();
-            // Store worker_id from req.key
-            if (req.key.len > 0) {
-                if (run.worker_id_owned) |old| self.allocator.free(old);
-                run.worker_id_owned = self.allocator.dupe(u8, req.key) catch null;
-            }
-            // Store outcome
-            if (outcome_str.len > 0) {
-                if (run.outcome_owned) |old| self.allocator.free(old);
-                run.outcome_owned = self.allocator.dupe(u8, outcome_str) catch null;
-            }
-            // Store result
-            if (result_data.len > 0) {
-                if (run.result_owned) |old| self.allocator.free(old);
-                run.result_owned = self.allocator.dupe(u8, result_data) catch null;
-            }
-            // Clear any error from a previous failed attempt
-            if (run.error_owned) |old| {
-                self.allocator.free(old);
-                run.error_owned = null;
-            }
-            // Persist run status update through Raft
-            if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .completed, run.completed_at_ms, result_data, run.started_at_ms, run.worker_id_owned);
-            return null; // success
-        }
-        return "run not found";
+        // The applier updates the run from the entry.
+        const run = self.runs.get(task_id) orelse return "run not found";
+        const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
+        return self.applyRunUpdate(shard, req.namespace, task_id, .{
+            .status = .completed,
+            .completed_at_ms = @import("stdx").time.milliTimestamp(),
+            .started_at_ms = run.started_at_ms,
+            .result = result_data,
+            .worker_id = worker_id,
+            .outcome = outcome_str,
+            .error_message = "",
+        });
     }
 
     /// Touch (extend lease on) a running task. key = worker_id.
@@ -1006,31 +949,30 @@ pub const ActionsHandler = struct {
         // Remaining bytes are error message
         const error_message = if (offset < value.len) value[offset..] else "";
 
-        // Find and update the run
-        if (self.runs.getPtr(task_id)) |run| {
-            // Store worker_id from req.key
-            if (req.key.len > 0) {
-                if (run.worker_id_owned) |old| self.allocator.free(old);
-                run.worker_id_owned = self.allocator.dupe(u8, req.key) catch null;
-            }
-            // Store error message
-            if (error_message.len > 0) {
-                if (run.error_owned) |old| self.allocator.free(old);
-                run.error_owned = self.allocator.dupe(u8, error_message) catch null;
-            }
-            if (retry and run.attempt < run.max_retries) {
-                // Put back to pending for retry (within limit)
-                run.status = .pending;
-                run.started_at_ms = null;
-                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .pending, null, "", null, run.worker_id_owned);
-            } else {
-                run.status = .failed;
-                run.completed_at_ms = @import("stdx").time.milliTimestamp();
-                if (shard) |s| self.persistRunUpdate(s, req.namespace, task_id, .failed, run.completed_at_ms, "", run.started_at_ms, run.worker_id_owned);
-            }
-            return null; // success
+        // The applier updates the run from the entry.
+        const run = self.runs.get(task_id) orelse return "run not found";
+        const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
+        if (retry and run.attempt < run.max_retries) {
+            // Back to pending for another attempt (within the limit).
+            return self.applyRunUpdate(shard, req.namespace, task_id, .{
+                .status = .pending,
+                .completed_at_ms = null,
+                .started_at_ms = null,
+                .result = "",
+                .worker_id = worker_id,
+                .outcome = "",
+                .error_message = error_message,
+            });
         }
-        return "run not found";
+        return self.applyRunUpdate(shard, req.namespace, task_id, .{
+            .status = .failed,
+            .completed_at_ms = @import("stdx").time.milliTimestamp(),
+            .started_at_ms = run.started_at_ms,
+            .result = "",
+            .worker_id = worker_id,
+            .outcome = "",
+            .error_message = error_message,
+        });
     }
 
     // ── Serialization ───────────────────────────────────────────────────
@@ -1121,52 +1063,9 @@ pub const ActionsHandler = struct {
         var run_id_buf: [32]u8 = undefined;
         const run_id_str = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch return null;
 
-        const owned_run_id = self.allocator.dupe(u8, run_id_str) catch return null;
-        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
-            self.allocator.free(owned_run_id);
-            return null;
-        };
-        const owned_input: ?[]const u8 = if (input) |i|
-            self.allocator.dupe(u8, i) catch null
-        else
-            null;
-        const owned_caller_run_id: ?[]const u8 = if (caller_run_id) |crid|
-            self.allocator.dupe(u8, crid) catch null
-        else
-            null;
-        const owned_caller_workflow_name: ?[]const u8 = if (caller_workflow_name) |cwn|
-            self.allocator.dupe(u8, cwn) catch null
-        else
-            null;
-
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
-
-        // Lock around runs map mutation (cross-shard invokeByNameWithId may race).
-        // We must release the lock before notifyAny because that calls
-        // claimPendingRun which also acquires runs_mu.
-        self.runs_mu.lock();
-        self.runs.put(owned_run_id, .{
-            .run_id_owned = owned_run_id,
-            .action_name_owned = owned_action_name,
-            .input_owned = owned_input,
-            .caller_run_id_owned = owned_caller_run_id,
-            .caller_workflow_name_owned = owned_caller_workflow_name,
-            .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
-            .status = .pending,
-            .created_at_ms = now_ms,
-            .started_at_ms = null,
-            .completed_at_ms = null,
-        }) catch {
-            self.runs_mu.unlock();
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_action_name);
-            if (owned_input) |inp| self.allocator.free(inp);
-            if (owned_caller_run_id) |crid| self.allocator.free(crid);
-            if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
-            return null;
-        };
-
-        self.runs_mu.unlock();
+        // The applier creates the run from the entry, exactly as a client
+        // invoke does; the caller fields mark it as workflow-driven.
+        const owned_run_id = self.startRun(shard, "default", run_id_str, action_name, input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
 
         // Wake any workers waiting for this action
         shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
@@ -1174,55 +1073,74 @@ pub const ActionsHandler = struct {
         return owned_run_id;
     }
 
-    /// Like invokeByName but uses a pre-generated run ID.
-    /// Used for cross-shard invocations via inbox where the caller needs
-    /// to know the run ID before the actual run is created on the target shard.
-    /// Does NOT notify waiters — the caller must send an inbox message to
-    /// the target shard for waiter notification.
-    pub fn invokeByNameWithId(self: *ActionsHandler, pre_run_id: []const u8, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) bool {
-        if (!self.actions.contains(action_name)) return false;
+    /// Create a run through the one applier: encode the invoke entry, persist
+    /// it, apply it. Returns the stored run id (heap-owned by the runs map).
+    pub fn startRun(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
+        var value_buf: [65536]u8 = undefined;
+        const value = encodeInvokeValue(&value_buf, action_name, @import("stdx").time.milliTimestamp(), input, labels, caller_run_id, caller_workflow_name) orelse return null;
+        return self.startRunEncoded(shard, namespace, run_id, value);
+    }
 
-        const owned_run_id = self.allocator.dupe(u8, pre_run_id) catch return false;
-        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
-            self.allocator.free(owned_run_id);
-            return false;
-        };
-        const owned_input: ?[]const u8 = if (input) |i|
-            self.allocator.dupe(u8, i) catch null
-        else
-            null;
-        const owned_caller_run_id: ?[]const u8 = if (caller_run_id) |crid|
-            self.allocator.dupe(u8, crid) catch null
-        else
-            null;
-        const owned_caller_workflow_name: ?[]const u8 = if (caller_workflow_name) |cwn|
-            self.allocator.dupe(u8, cwn) catch null
-        else
-            null;
+    fn startRunEncoded(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, value: []const u8) ?[]const u8 {
+        // Other shard threads read the runs map under runs_mu, so the apply
+        // that inserts the run must happen under it too.
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+        _ = persistence.persistEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value) catch return null;
+        if (!shard.applyCommitted()) return null;
+        const stored = self.runs.getPtr(run_id) orelse return null;
+        return stored.run_id_owned;
+    }
 
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
+    /// A workflow on another shard asked this shard to start a run it will
+    /// park on: `[run_id_len:u16][run_id][invoke value]`, created here on the
+    /// owning thread through the same applier as a local invoke.
+    pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
+        if (bytes.len < 2) return;
+        const rid_len = std.mem.readInt(u16, bytes[0..2], .little);
+        if (2 + rid_len > bytes.len) return;
+        const run_id = bytes[2 .. 2 + rid_len];
+        if (self.startRunEncoded(shard, "default", run_id, bytes[2 + rid_len ..]) == null) {
+            log.err("shard {d}: action run {s} asked for by a workflow on another shard could not be started; that workflow run stays parked", .{ shard.id, run_id });
+            return;
+        }
+        shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
+    }
 
-        self.runs.put(owned_run_id, .{
-            .run_id_owned = owned_run_id,
-            .action_name_owned = owned_action_name,
-            .input_owned = owned_input,
-            .caller_run_id_owned = owned_caller_run_id,
-            .caller_workflow_name_owned = owned_caller_workflow_name,
-            .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
-            .status = .pending,
-            .created_at_ms = now_ms,
-            .started_at_ms = null,
-            .completed_at_ms = null,
-        }) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_action_name);
-            if (owned_input) |inp| self.allocator.free(inp);
-            if (owned_caller_run_id) |crid| self.allocator.free(crid);
-            if (owned_caller_workflow_name) |cwn| self.allocator.free(cwn);
-            return false;
-        };
+    /// Encode the inbox payload `startRunFromInbox` consumes. Heap-allocated
+    /// with `allocator`; the receiving shard frees it.
+    pub fn encodeStartRunMessage(allocator: Allocator, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]u8 {
+        var value_buf: [65536]u8 = undefined;
+        const value = encodeInvokeValue(&value_buf, action_name, @import("stdx").time.milliTimestamp(), input, null, caller_run_id, caller_workflow_name) orelse return null;
+        const out = allocator.alloc(u8, 2 + run_id.len + value.len) catch return null;
+        std.mem.writeInt(u16, out[0..2], @intCast(run_id.len), .little);
+        @memcpy(out[2 .. 2 + run_id.len], run_id);
+        @memcpy(out[2 + run_id.len ..], value);
+        return out;
+    }
 
-        return true;
+    const RunUpdate = struct {
+        status: ActionRunStatus,
+        completed_at_ms: ?i64,
+        started_at_ms: ?i64,
+        result: []const u8,
+        worker_id: ?[]const u8,
+        outcome: []const u8,
+        error_message: []const u8,
+    };
+
+    /// Encode a run update, persist it and apply it. Returns null on success
+    /// or the message for the client.
+    fn applyRunUpdate(self: *ActionsHandler, shard: ?*Shard, namespace: []const u8, run_id: []const u8, u: RunUpdate) ?[]const u8 {
+        var value_buf: [65536]u8 = undefined;
+        const value = encodeRunUpdateValue(&value_buf, u) orelse return "run update too large";
+        if (shard) |s| {
+            _ = persistence.persistEntry(s, .action_update_run, Flags.NONE, namespace, run_id, value) catch return "run update not persisted";
+            if (!s.applyCommitted()) return "run update not applied";
+        } else {
+            self.replayUpdateRun(run_id, value);
+        }
+        return null;
     }
 
     /// Check the status and result of an action run.
@@ -1237,95 +1155,57 @@ pub const ActionsHandler = struct {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Persistence — write mutations through Raft via shared interface
+    // Entry encoders — the layouts the appliers decode
     // ═══════════════════════════════════════════════════════════════════
 
-    /// Persist an action registration.
-    /// Value format: [version:u32][created_at_ns:u64][original_req_value...]
-    /// Key is namespace-qualified (ns\x00name) so namespace can be recovered during replay.
-    fn persistRegister(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) void {
-        _ = self;
-        var value_buf: [65536]u8 = undefined;
-        if (4 + 8 + 1 + req_value.len > value_buf.len) return;
+    /// Register entry value: [version:u32][created_at_ns:u64][action_type:u8][original_value...]
+    fn encodeRegisterValue(value_buf: []u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) ?[]const u8 {
+        if (4 + 8 + 1 + req_value.len > value_buf.len) return null;
         std.mem.writeInt(u32, value_buf[0..4], version, .little);
         std.mem.writeInt(u64, value_buf[4..12], created_at_ns, .little);
         value_buf[12] = @intFromEnum(action_type);
         if (req_value.len > 0) {
             @memcpy(value_buf[13 .. 13 + req_value.len], req_value);
         }
-        const value = value_buf[0 .. 13 + req_value.len];
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
-        _ = persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, qkey, value) catch {};
+        return value_buf[0 .. 13 + req_value.len];
     }
 
-    /// Persist an action invocation (run creation).
-    /// Value format: [action_name_len:u16][action_name][status:u8][created_at_ms:i64]
-    ///              [input_len:u32][input][labels_len:u32][labels]
-    fn persistInvoke(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, action_name: []const u8, created_at_ms: i64, input: []const u8, labels: ?[]const u8) void {
-        _ = self;
-        var value_buf: [65536]u8 = undefined;
+    fn putLenPrefixed(buf: []u8, off: *usize, comptime L: type, bytes: []const u8) bool {
+        const n = @sizeOf(L);
+        if (off.* + n + bytes.len > buf.len) return false;
+        std.mem.writeInt(L, buf[off.*..][0..n], @intCast(bytes.len), .little);
+        off.* += n;
+        @memcpy(buf[off.* .. off.* + bytes.len], bytes);
+        off.* += bytes.len;
+        return true;
+    }
+
+    /// Invoke entry value: [action_name_len:u16][action_name][status:u8][created_at_ms:i64]
+    ///   [input_len:u32][input][labels_len:u32][labels]
+    ///   [caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf]
+    fn encodeInvokeValue(value_buf: []u8, action_name: []const u8, created_at_ms: i64, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         var off: usize = 0;
-
-        // action_name
-        if (off + 2 + action_name.len > value_buf.len) return;
-        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(action_name.len), .little);
-        off += 2;
-        @memcpy(value_buf[off .. off + action_name.len], action_name);
-        off += action_name.len;
-
-        // status = pending (0)
+        if (!putLenPrefixed(value_buf, &off, u16, action_name)) return null;
+        if (off + 9 > value_buf.len) return null;
         value_buf[off] = @intFromEnum(ActionRunStatus.pending);
         off += 1;
-
-        // created_at_ms
         std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
         off += 8;
-
-        // input
-        const input_len: u32 = @intCast(input.len);
-        std.mem.writeInt(u32, value_buf[off..][0..4], input_len, .little);
-        off += 4;
-        if (input.len > 0) {
-            if (off + input.len > value_buf.len) return;
-            @memcpy(value_buf[off .. off + input.len], input);
-            off += input.len;
-        }
-
-        // labels
-        const lbl = labels orelse "";
-        const labels_len: u32 = @intCast(lbl.len);
-        std.mem.writeInt(u32, value_buf[off..][0..4], labels_len, .little);
-        off += 4;
-        if (lbl.len > 0) {
-            if (off + lbl.len > value_buf.len) return;
-            @memcpy(value_buf[off .. off + lbl.len], lbl);
-            off += lbl.len;
-        }
-
-        _ = persistence.persistEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value_buf[0..off]) catch {};
+        if (!putLenPrefixed(value_buf, &off, u32, input)) return null;
+        if (!putLenPrefixed(value_buf, &off, u32, labels orelse "")) return null;
+        if (!putLenPrefixed(value_buf, &off, u16, caller_run_id orelse "")) return null;
+        if (!putLenPrefixed(value_buf, &off, u16, caller_workflow_name orelse "")) return null;
+        return value_buf[0..off];
     }
 
-    /// Persist an action deletion.
-    fn persistDelete(self: *ActionsHandler, shard: *Shard, namespace: []const u8, name: []const u8) void {
-        _ = self;
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch return;
-        _ = persistence.persistEntry(shard, .action_delete, Flags.TOMBSTONE, namespace, qkey, "") catch {};
-    }
-
-    /// Persist a run status update (complete, fail, retry).
-    /// Value format: [status:u8][started_at:u8+i64][completed_at:u8+i64][result_len:u32][result][wid_len:u16][worker_id]
-    fn persistRunUpdate(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, status: ActionRunStatus, timestamp_ms: ?i64, result_data: []const u8, started_at_ms: ?i64, worker_id: ?[]const u8) void {
-        _ = self;
-        var value_buf: [65536]u8 = undefined;
+    /// Run update value: [status:u8][has_started:u8][started_at:i64]?[has_completed:u8][completed_at:i64]?
+    ///   [result_len:u32][result][worker_id_len:u16][worker_id][outcome_len:u16][outcome][error_len:u16][error]
+    fn encodeRunUpdateValue(value_buf: []u8, u: RunUpdate) ?[]const u8 {
         var off: usize = 0;
-
-        value_buf[off] = @intFromEnum(status);
+        if (off + 1 + 9 + 9 > value_buf.len) return null;
+        value_buf[off] = @intFromEnum(u.status);
         off += 1;
-
-        // started_at_ms
-        if (started_at_ms) |sa| {
+        if (u.started_at_ms) |sa| {
             value_buf[off] = 1;
             off += 1;
             std.mem.writeInt(i64, value_buf[off..][0..8], sa, .little);
@@ -1334,9 +1214,7 @@ pub const ActionsHandler = struct {
             value_buf[off] = 0;
             off += 1;
         }
-
-        // completed_at_ms
-        if (timestamp_ms) |ts| {
+        if (u.completed_at_ms) |ts| {
             value_buf[off] = 1;
             off += 1;
             std.mem.writeInt(i64, value_buf[off..][0..8], ts, .little);
@@ -1345,32 +1223,16 @@ pub const ActionsHandler = struct {
             value_buf[off] = 0;
             off += 1;
         }
-
-        // result
-        const rlen: u32 = @intCast(result_data.len);
-        std.mem.writeInt(u32, value_buf[off..][0..4], rlen, .little);
-        off += 4;
-        if (result_data.len > 0) {
-            if (off + result_data.len > value_buf.len) return;
-            @memcpy(value_buf[off .. off + result_data.len], result_data);
-            off += result_data.len;
-        }
-
-        // worker_id
-        const wid = worker_id orelse "";
-        const wid_len: u16 = @intCast(wid.len);
-        std.mem.writeInt(u16, value_buf[off..][0..2], wid_len, .little);
-        off += 2;
-        if (wid.len > 0) {
-            @memcpy(value_buf[off .. off + wid.len], wid);
-            off += wid.len;
-        }
-
-        _ = persistence.persistEntry(shard, .action_update_run, Flags.NONE, namespace, run_id, value_buf[0..off]) catch {};
+        if (!putLenPrefixed(value_buf, &off, u32, u.result)) return null;
+        if (!putLenPrefixed(value_buf, &off, u16, u.worker_id orelse "")) return null;
+        if (!putLenPrefixed(value_buf, &off, u16, u.outcome)) return null;
+        if (!putLenPrefixed(value_buf, &off, u16, u.error_message)) return null;
+        return value_buf[0..off];
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Replay — rebuild in-memory state from UAL entries on startup
+    // Appliers — the only code that mutates actions and runs, from an entry
+    // (live, replicated, or replayed at boot)
     // ═══════════════════════════════════════════════════════════════════
 
     /// Register this handler's entry types with the ReplayRegistry.
@@ -1416,7 +1278,7 @@ pub const ActionsHandler = struct {
         const version = std.mem.readInt(u32, value[0..4], .little);
         const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
         // The original register wire value was appended after the 13-byte
-        // header (see persistRegister), so owner/timeout_ms/max_retries replay
+        // header (see encodeRegisterValue), so owner/timeout_ms/max_retries replay
         // from there — previously they were dropped (record reset to defaults).
         const meta = parseRegisterValue(value[13..]);
 
@@ -1511,8 +1373,33 @@ pub const ActionsHandler = struct {
             if (off + labels_len <= value.len) {
                 labels = self.allocator.dupe(u8, value[off .. off + labels_len]) catch null;
             }
+            off += labels_len;
         }
 
+        // caller (workflow-driven runs)
+        var caller_run_id: ?[]const u8 = null;
+        var caller_workflow_name: ?[]const u8 = null;
+        if (off + 2 <= value.len) {
+            const crid_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (crid_len > 0 and off + crid_len <= value.len) {
+                caller_run_id = self.allocator.dupe(u8, value[off .. off + crid_len]) catch null;
+            }
+            off += crid_len;
+        }
+        if (off + 2 <= value.len) {
+            const cwn_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (cwn_len > 0 and off + cwn_len <= value.len) {
+                caller_workflow_name = self.allocator.dupe(u8, value[off .. off + cwn_len]) catch null;
+            }
+            off += cwn_len;
+        }
+
+        // A re-applied invoke replaces the run wholesale.
+        if (self.runs.fetchRemove(run_id)) |old| self.freeRun(old.value);
+
+        const max_retries: u32 = if (self.actions.get(action_name)) |arec| arec.max_retries else 3;
         const owned_run_id = self.allocator.dupe(u8, run_id) catch return;
         const owned_action_name = self.allocator.dupe(u8, action_name) catch {
             self.allocator.free(owned_run_id);
@@ -1524,19 +1411,38 @@ pub const ActionsHandler = struct {
             .action_name_owned = owned_action_name,
             .input_owned = input,
             .labels_owned = labels,
+            .caller_run_id_owned = caller_run_id,
+            .caller_workflow_name_owned = caller_workflow_name,
+            .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
             .status = status,
             .created_at_ms = created_at_ms,
             .started_at_ms = null,
             .completed_at_ms = null,
+            .max_retries = max_retries,
         }) catch {
             self.allocator.free(owned_run_id);
             self.allocator.free(owned_action_name);
             if (input) |inp| self.allocator.free(inp);
             if (labels) |lbl| self.allocator.free(lbl);
+            if (caller_run_id) |c| self.allocator.free(c);
+            if (caller_workflow_name) |c| self.allocator.free(c);
         };
     }
 
-    /// Apply a run status update from a replayed entry.
+    fn freeRun(self: *ActionsHandler, run: RunRecord) void {
+        self.allocator.free(run.run_id_owned);
+        self.allocator.free(run.action_name_owned);
+        if (run.input_owned) |v| self.allocator.free(v);
+        if (run.labels_owned) |v| self.allocator.free(v);
+        if (run.result_owned) |v| self.allocator.free(v);
+        if (run.outcome_owned) |v| self.allocator.free(v);
+        if (run.worker_id_owned) |v| self.allocator.free(v);
+        if (run.error_owned) |v| self.allocator.free(v);
+        if (run.caller_run_id_owned) |v| self.allocator.free(v);
+        if (run.caller_workflow_name_owned) |v| self.allocator.free(v);
+    }
+
+    /// Apply a run status update from its entry.
     fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
         var off: usize = 0;
 
@@ -1585,6 +1491,27 @@ pub const ActionsHandler = struct {
             if (wid_len > 0 and off + wid_len <= value.len) {
                 worker_id_data = self.allocator.dupe(u8, value[off .. off + wid_len]) catch null;
             }
+            off += wid_len;
+        }
+
+        // outcome, error
+        var outcome_data: ?[]const u8 = null;
+        var error_data: ?[]const u8 = null;
+        if (off + 2 <= value.len) {
+            const olen = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (olen > 0 and off + olen <= value.len) {
+                outcome_data = self.allocator.dupe(u8, value[off .. off + olen]) catch null;
+            }
+            off += olen;
+        }
+        if (off + 2 <= value.len) {
+            const elen = std.mem.readInt(u16, value[off..][0..2], .little);
+            off += 2;
+            if (elen > 0 and off + elen <= value.len) {
+                error_data = self.allocator.dupe(u8, value[off .. off + elen]) catch null;
+            }
+            off += elen;
         }
 
         // Apply to existing run
@@ -1606,10 +1533,24 @@ pub const ActionsHandler = struct {
                 if (run.result_owned) |old| self.allocator.free(old);
                 run.result_owned = rd;
             }
+            if (outcome_data) |od| {
+                if (run.outcome_owned) |old| self.allocator.free(old);
+                run.outcome_owned = od;
+            }
+            if (error_data) |ed| {
+                if (run.error_owned) |old| self.allocator.free(old);
+                run.error_owned = ed;
+            } else if (status == .completed) {
+                // A completion clears the error of an earlier failed attempt.
+                if (run.error_owned) |old| self.allocator.free(old);
+                run.error_owned = null;
+            }
         } else {
             // Run entry replayed before invoke entry (shouldn't happen with ordered log)
             if (result_data) |rd| self.allocator.free(rd);
             if (worker_id_data) |wid| self.allocator.free(wid);
+            if (outcome_data) |od| self.allocator.free(od);
+            if (error_data) |ed| self.allocator.free(ed);
         }
     }
 };
@@ -2245,4 +2186,52 @@ test "actions handler: freeResult non-allocated is no-op" {
     handler.freeResult(.ok);
     handler.freeResult(.{ .err = .{ .code = .invalid_request, .message = "test" } });
     handler.freeResult(.{ .action_deleted = {} });
+}
+
+test "actions: a run update applied from its entry carries outcome, error and worker" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+
+    var reg_buf: [256]u8 = undefined;
+    const reg = ActionsHandler.encodeRegisterValue(&reg_buf, 1, 1, .user, "") orelse return error.EncodeFailed;
+    h.replayRegister("default\x00echo", reg);
+
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "echo", 1000, "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
+    h.replayInvoke("act-1", inv);
+    const created = h.runs.get("act-1") orelse return error.RunMissing;
+    try std.testing.expectEqualStrings("gpu", created.labels_owned.?);
+    try std.testing.expectEqualStrings("wf-run-9", created.caller_run_id_owned.?);
+    try std.testing.expectEqual(@as(u8, 1), created.source);
+
+    // A failed attempt keeps its error and worker; a completion clears the error.
+    try std.testing.expect(h.applyRunUpdate(null, "default", "act-1", .{
+        .status = .failed,
+        .completed_at_ms = 2000,
+        .started_at_ms = 1500,
+        .result = "",
+        .worker_id = "w-1",
+        .outcome = "",
+        .error_message = "boom",
+    }) == null);
+    const failed = h.runs.get("act-1") orelse return error.RunMissing;
+    try std.testing.expectEqual(ActionRunStatus.failed, failed.status);
+    try std.testing.expectEqualStrings("boom", failed.error_owned.?);
+    try std.testing.expectEqualStrings("w-1", failed.worker_id_owned.?);
+
+    try std.testing.expect(h.applyRunUpdate(null, "default", "act-1", .{
+        .status = .completed,
+        .completed_at_ms = 3000,
+        .started_at_ms = 1500,
+        .result = "{\"ok\":true}",
+        .worker_id = "w-2",
+        .outcome = "success",
+        .error_message = "",
+    }) == null);
+    const done = h.runs.get("act-1") orelse return error.RunMissing;
+    try std.testing.expectEqual(ActionRunStatus.completed, done.status);
+    try std.testing.expectEqualStrings("success", done.outcome_owned.?);
+    try std.testing.expectEqualStrings("{\"ok\":true}", done.result_owned.?);
+    try std.testing.expectEqualStrings("w-2", done.worker_id_owned.?);
+    try std.testing.expect(done.error_owned == null);
 }

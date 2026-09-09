@@ -3006,3 +3006,58 @@ test "e2e/workflow: stream trigger fires promptly via push-wake" {
         try stdx.testing.assertContains(runs, "wfr-"); // fired via push-wake, not the 60s timer
     }
 }
+
+/// Poll `workflow list-runs` until `want` runs are listed (the name appears
+/// once in the header and once per row), or fail after ~5 s.
+fn waitForRuns(ctx: *stdx.testing.TestContext, workflow: []const u8, want: usize) !void {
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        var r = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", workflow });
+        defer r.deinit();
+        if (r.stdoutCount(workflow) == want + 1) return;
+        @import("stdx").time.sleep(100 * std.time.ns_per_ms);
+    }
+    return error.RunsNotReached;
+}
+
+test "e2e/workflow: a stream trigger survives restart and resumes at its cursor" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "st-restart-act" });
+    const workflow_def =
+        \\kind: Workflow
+        \\name: st-restart-trig
+        \\version: 1.0.0
+        \\trigger.stream: restart-trigger-events
+        \\trigger.mode: shared
+        \\start.run: @actions/st-restart-act
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-restart-trig.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // Two events consumed before the restart: one run each.
+    try ctx.exec(&.{ "stream", "append", "restart-trigger-events", "{\"order_id\":\"r1\"}" });
+    try ctx.exec(&.{ "stream", "append", "restart-trigger-events", "{\"order_id\":\"r2\"}" });
+    try waitForRuns(ctx, "st-restart-trig", 2);
+
+    // The trigger is part of the definition the applier restores at boot,
+    // and its cursor comes back from the runs it already started: the two
+    // consumed events do not run again, the new one does.
+    try ctx.restartServer();
+    try ctx.exec(&.{ "stream", "append", "restart-trigger-events", "{\"order_id\":\"r3\"}" });
+    try waitForRuns(ctx, "st-restart-trig", 3);
+    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+
+    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-restart-trig" });
+    defer list_result.deinit();
+    try stdx.testing.assertSucceeded(list_result);
+    // Header plus exactly three rows: not two (trigger lost), not five
+    // (cursor lost: the consumed events run again).
+    try testing.expectEqual(@as(usize, 4), list_result.stdoutCount("st-restart-trig"));
+}

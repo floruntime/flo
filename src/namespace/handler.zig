@@ -38,6 +38,7 @@
 //! ```
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -196,6 +197,9 @@ pub const NamespaceHandler = struct {
     /// In-memory namespace registry. Keys are owned copies of namespace names.
     /// Will be replaced by Controller Raft storage when wired.
     namespaces: std.StringHashMap(NamespaceMeta),
+    /// Namespace hash → name, for the appliers that see only the hash on
+    /// every committed entry. Kept in step with `namespaces`.
+    names_by_hash: std.AutoHashMap(u32, []const u8),
 
     const MAX_NAMESPACES: usize = 1024;
 
@@ -218,6 +222,7 @@ pub const NamespaceHandler = struct {
         return .{
             .allocator = allocator,
             .namespaces = std.StringHashMap(NamespaceMeta).init(allocator),
+            .names_by_hash = std.AutoHashMap(u32, []const u8).init(allocator),
         };
     }
 
@@ -227,6 +232,23 @@ pub const NamespaceHandler = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.namespaces.deinit();
+        self.names_by_hash.deinit();
+    }
+
+    /// Insert an owned name into both maps; frees it if either insert fails.
+    fn insertNamespace(self: *NamespaceHandler, owned: []const u8, meta: NamespaceMeta) !void {
+        try self.names_by_hash.put(router.namespaceHash(owned), owned);
+        self.namespaces.put(owned, meta) catch |err| {
+            _ = self.names_by_hash.remove(router.namespaceHash(owned));
+            return err;
+        };
+    }
+
+    /// Remove from both maps; returns the owned name for the caller to free.
+    fn removeNamespace(self: *NamespaceHandler, name: []const u8) ?[]const u8 {
+        const kv = self.namespaces.fetchRemove(name) orelse return null;
+        _ = self.names_by_hash.remove(router.namespaceHash(kv.key));
+        return kv.key;
     }
 
     // ── Namespace Data Tracking ─────────────────────────────────────────
@@ -240,22 +262,21 @@ pub const NamespaceHandler = struct {
         const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
         if (self.namespaces.getPtr(effective)) |meta| {
             meta.data_count +|= 1; // saturating add
-        } else {
-            // Auto-create namespace entry (e.g., "default" on first bare-namespace write)
-            const key = self.allocator.dupe(u8, effective) catch return;
-            const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-            self.namespaces.put(key, .{
-                .created_at_ns = timestamp,
-                .data_count = 1,
-            }) catch {
-                self.allocator.free(key);
+            return;
+        }
+        // Implicit creation (e.g. "default" on the first bare-namespace
+        // write): a namespace_create entry, applied like an explicit one so
+        // it survives restart and reaches followers.
+        if (shard) |s| {
+            _ = proposeNamespaceEntry(s, .namespace_create, effective, &.{}) catch |err| {
+                log.warn("namespace: implicit create of '{s}' not persisted: {s}; its writes are not metered until it is", .{ effective, @errorName(err) });
                 return;
             };
-            // Persist implicit namespace creation so it survives restart
-            if (shard) |s| {
-                _ = proposeNamespaceEntry(s, .namespace_create, effective, &.{}) catch {};
-            }
+            _ = s.applyCommitted();
+        } else {
+            self.applyCreate(effective);
         }
+        if (self.namespaces.getPtr(effective)) |meta| meta.data_count = 1;
     }
 
     /// Check if a namespace has had data written to it.
@@ -266,37 +287,31 @@ pub const NamespaceHandler = struct {
         return false;
     }
 
-    // ── Raft-Replicated Apply ───────────────────────────────────────────
-    // Called after Coordinator commits a namespace change via Raft.
-    // Updates the local in-memory registry to match the committed state.
+    // ── Appliers ────────────────────────────────────────────────────────
+    // Called from the registry for every committed namespace entry.
 
-    /// Apply a Raft-committed namespace creation to the local registry.
-    /// Resolve a namespace name from its `router.namespaceHash`. Linear scan over
-    /// the in-memory registry — fine given the small namespace count, and only used
-    /// on the cold replay path (e.g. re-labeling queues whose entry carries the
-    /// namespace hash but not the string). Returns null if no known namespace matches
-    /// (e.g. the implicit "default" namespace, which is never registered).
+    /// Resolve a namespace name from its `router.namespaceHash`. Runs once per
+    /// applied entry (entries carry the hash, not the string), so it is an
+    /// index lookup. Returns null for a namespace this node has never
+    /// registered, including "default" before its first write.
     pub fn nameForHash(self: *const NamespaceHandler, hash: u32) ?[]const u8 {
-        var it = self.namespaces.keyIterator();
-        while (it.next()) |key_ptr| {
-            if (router.namespaceHash(key_ptr.*) == hash) return key_ptr.*;
-        }
-        return null;
+        return self.names_by_hash.get(hash);
     }
 
+    /// Apply a committed namespace creation to the local registry.
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) void {
         if (self.namespaces.contains(name)) return; // idempotent
         const owned = self.allocator.dupe(u8, name) catch return;
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-        self.namespaces.put(owned, .{ .created_at_ns = now_ns }) catch {
+        self.insertNamespace(owned, .{ .created_at_ns = now_ns }) catch {
             self.allocator.free(owned);
         };
     }
 
     /// Apply a Raft-committed namespace deletion to the local registry.
     pub fn applyDelete(self: *NamespaceHandler, name: []const u8) void {
-        if (self.namespaces.fetchRemove(name)) |kv| {
-            self.allocator.free(kv.key);
+        if (self.removeNamespace(name)) |owned| {
+            self.allocator.free(owned);
         }
     }
 
@@ -389,12 +404,15 @@ pub const NamespaceHandler = struct {
 
         // Propose namespace_create entry through Raft → UAL (persists via segment writer)
         _ = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
             return;
         };
 
-        // Apply in-memory state directly (Raft propose already persisted the entry)
-        shard.namespace_handler.applyCreate(name);
+        if (!shard.applyCommitted()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
+
+            return;
+        }
 
         // Also propagate to coordinator if wired (cluster metadata)
         if (shard.coordinator) |coord| {
@@ -433,12 +451,15 @@ pub const NamespaceHandler = struct {
 
         // Propose namespace_delete entry through Raft → UAL (persists via segment writer)
         _ = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
             return;
         };
 
-        // Apply in-memory state directly
-        shard.namespace_handler.applyDelete(name);
+        if (!shard.applyCommitted()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
+
+            return;
+        }
 
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
@@ -486,12 +507,15 @@ pub const NamespaceHandler = struct {
         const settings_len = parsed.config.serializeSettings(&settings_buf);
 
         _ = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "raft propose failed");
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
             return;
         };
 
-        // Apply in-memory state directly
-        shard.namespace_handler.applyConfigUpdate(name, parsed.config);
+        if (!shard.applyCommitted()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
+
+            return;
+        }
 
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
@@ -508,7 +532,7 @@ pub const NamespaceHandler = struct {
     /// The entry uses CommandPayload format: key = namespace name, value = payload.
     /// Namespace entries use empty namespace ("") to get namespace_hash=0
     /// because namespaces are global, not scoped to a namespace.
-    /// In-memory state is applied directly by the caller after propose succeeds.
+    /// The caller applies it through `Shard.applyCommitted()`.
     fn proposeNamespaceEntry(
         shard: *Shard,
         entry_type: entry_mod.EntryType,
@@ -602,7 +626,7 @@ pub const NamespaceHandler = struct {
 
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
-        self.namespaces.put(owned_name, .{
+        self.insertNamespace(owned_name, .{
             .created_at_ns = now_ns,
         }) catch {
             self.allocator.free(owned_name);
@@ -637,8 +661,8 @@ pub const NamespaceHandler = struct {
             return .{ .err = .{ .code = .namespace_not_empty, .message = "namespace is not empty; use --force to delete" } };
         }
 
-        if (self.namespaces.fetchRemove(name)) |kv| {
-            self.allocator.free(kv.key);
+        if (self.removeNamespace(name)) |owned| {
+            self.allocator.free(owned);
             return .{ .namespace_deleted = {} };
         }
 
@@ -1422,4 +1446,22 @@ test "namespace handler: handleConfigSet via command" {
     // Verify it was applied
     const retrieved = handler.getSettings("myapp");
     try testing.expectEqual(@as(?u64, 1_073_741_824), retrieved.memory_budget_bytes);
+}
+
+test "namespace: a committed entry's hash resolves to the name until it is deleted" {
+    var handler = NamespaceHandler.init(std.testing.allocator);
+    defer handler.deinit();
+
+    const hash = router.namespaceHash("prod");
+    try std.testing.expect(handler.nameForHash(hash) == null);
+
+    handler.applyCreate("prod");
+    try std.testing.expectEqualStrings("prod", handler.nameForHash(hash).?);
+    // Re-applying (a replay) neither duplicates nor loses the mapping.
+    handler.applyCreate("prod");
+    try std.testing.expectEqualStrings("prod", handler.nameForHash(hash).?);
+
+    handler.applyDelete("prod");
+    try std.testing.expect(handler.nameForHash(hash) == null);
+    try std.testing.expect(handler.nameForHash(router.namespaceHash("never")) == null);
 }
