@@ -29,9 +29,26 @@ pub const TermRun = struct {
     term: u64,
 };
 
+/// Where an entry the ring no longer holds can still be read from: the
+/// durable log in production, the simulated disk under VOPR. Reads are
+/// contiguous from `start`, payloads packed into `arena`; the count may be
+/// short of `buf.len` when the source's run ends, never with a gap.
+pub const CatchUpSource = struct {
+    ctx: *anyopaque,
+    read_range: *const fn (ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) usize,
+};
+
 pub const RaftLog = struct {
     ual: UAL,
     allocator: Allocator,
+
+    /// Answers reads below the ring. Null means the ring is all there is,
+    /// which is only true in unit tests.
+    catch_up: ?CatchUpSource,
+
+    /// Fired after a truncation so the durable log drops the same suffix.
+    on_truncate_ctx: ?*anyopaque,
+    on_truncate: ?*const fn (ctx: *anyopaque, after_index: u64) void,
 
     /// Logical bounds — may differ from UAL physical bounds after truncation.
     last_idx: u64,
@@ -56,6 +73,9 @@ pub const RaftLog = struct {
         return .{
             .ual = ual,
             .allocator = allocator,
+            .catch_up = null,
+            .on_truncate_ctx = null,
+            .on_truncate = null,
             .last_idx = 0,
             .first_idx = 0,
             .term_runs = .empty,
@@ -104,10 +124,15 @@ pub const RaftLog = struct {
         return self.ual.read(index);
     }
 
-    /// Get an entry with copy (handles wrap-around in ring buffer).
+    /// Get an entry with copy (handles wrap-around in ring buffer), falling
+    /// back to the catch-up source when the ring has evicted it.
     pub fn getEntryCopy(self: *const RaftLog, index: u64, payload_buf: []u8) ?Entry {
         if (index > self.last_idx or index < self.first_idx) return null;
-        return self.ual.readCopy(index, payload_buf);
+        if (self.ual.readCopy(index, payload_buf)) |e| return e;
+        const src = self.catch_up orelse return null;
+        var one: [1]Entry = undefined;
+        if (src.read_range(src.ctx, index, &one, payload_buf) != 1) return null;
+        return one[0];
     }
 
     /// Get the term for a given index. Answered from the term index (survives
@@ -124,11 +149,17 @@ pub const RaftLog = struct {
     /// `payload_arena` (wrap-safe), so the returned entries outlive ring writes
     /// and no boundary-wrapping entry is silently skipped — a gap in a
     /// replication batch would diverge followers.
+    ///
+    /// Below the ring the catch-up source answers, bounded to this log's
+    /// tip so a stale durable tail can never be handed out as live entries.
     pub fn getRange(self: *const RaftLog, start_index: u64, buf: []Entry, payload_arena: []u8) usize {
-        if (start_index > self.last_idx) return 0;
+        if (start_index > self.last_idx or start_index < self.first_idx) return 0;
         // readRangeCopy uses an exclusive upper bound, so add 1
         const end_exclusive = @min(start_index + buf.len, self.last_idx + 1);
-        return self.ual.readRangeCopy(start_index, end_exclusive, buf, payload_arena);
+        const from_ring = self.ual.readRangeCopy(start_index, end_exclusive, buf, payload_arena);
+        if (from_ring > 0) return from_ring;
+        const src = self.catch_up orelse return 0;
+        return src.read_range(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena);
     }
 
     // ── Truncation ──────────────────────────────────────────────────────
@@ -143,6 +174,7 @@ pub const RaftLog = struct {
         self.ual.truncateAfter(after_index);
         self.trimRunsAbove(after_index);
         self.last_idx = after_index;
+        if (self.on_truncate) |cb| cb(self.on_truncate_ctx.?, after_index);
     }
 
     /// Drop term runs that start above `index`.
@@ -643,4 +675,84 @@ test "raft log: resetToSnapshot forgets the log and continues past the hole" {
     try testing.expect(log.matchesTerm(6, 1));
     try testing.expect(log.entryTerm(3) == null);
     try testing.expectEqual(@as(usize, 1), log.termRunCount());
+}
+
+/// A stand-in durable log: every entry ever appended, in order.
+const TestSource = struct {
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    payloads: std.ArrayListUnmanaged([]u8) = .empty,
+    truncated_after: ?u64 = null,
+
+    fn record(self: *TestSource, allocator: Allocator, e: *const Entry) !void {
+        const p = try allocator.dupe(u8, e.payload);
+        try self.payloads.append(allocator, p);
+        try self.entries.append(allocator, .{ .header = e.header, .payload = p });
+    }
+
+    fn deinit(self: *TestSource, allocator: Allocator) void {
+        for (self.payloads.items) |p| allocator.free(p);
+        self.payloads.deinit(allocator);
+        self.entries.deinit(allocator);
+    }
+
+    fn readRange(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) usize {
+        const self: *TestSource = @ptrCast(@alignCast(ctx));
+        var n: usize = 0;
+        var used: usize = 0;
+        while (n < buf.len and start - 1 + n < self.entries.items.len) : (n += 1) {
+            const e = self.entries.items[start - 1 + n];
+            if (used + e.payload.len > arena.len) break;
+            @memcpy(arena[used..][0..e.payload.len], e.payload);
+            buf[n] = .{ .header = e.header, .payload = arena[used..][0..e.payload.len] };
+            used += e.payload.len;
+        }
+        return n;
+    }
+
+    fn onTruncate(ctx: *anyopaque, after: u64) void {
+        const self: *TestSource = @ptrCast(@alignCast(ctx));
+        self.truncated_after = after;
+        self.entries.shrinkRetainingCapacity(@intCast(after));
+    }
+};
+
+test "raft log: reads below the ring come from the catch-up source, bounded by the log tip" {
+    const allocator = testing.allocator;
+    var source = TestSource{};
+    defer source.deinit(allocator);
+    var log = try RaftLog.init(allocator, 512);
+    defer log.deinit();
+    log.catch_up = .{ .ctx = @ptrCast(&source), .read_range = TestSource.readRange };
+
+    for (1..41) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, "0123456789" ** 4);
+        try source.record(allocator, &e);
+        _ = try log.append(&e);
+    }
+    try testing.expect(log.getEntry(1) == null); // evicted from the ring
+
+    var buf: [8]Entry = undefined;
+    var arena: [1024]u8 = undefined;
+    // Evicted range: served below the ring, contiguous from the start index.
+    try testing.expectEqual(@as(usize, 8), log.getRange(1, &buf, &arena));
+    try testing.expectEqual(@as(u64, 1), buf[0].header.index);
+    try testing.expectEqual(@as(u64, 8), buf[7].header.index);
+    // Live range: the ring answers.
+    const live = log.getRange(38, &buf, &arena);
+    try testing.expectEqual(@as(usize, 3), live);
+    try testing.expectEqual(@as(u64, 40), buf[2].header.index);
+    // A single evicted entry.
+    var payload_buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(u64, 3), log.getEntryCopy(3, &payload_buf).?.header.index);
+    // Nothing above the tip, even though a source could be asked.
+    try testing.expectEqual(@as(usize, 0), log.getRange(41, &buf, &arena));
+
+    // After a truncation the source is told, and the tip bounds what the
+    // source may hand back.
+    log.on_truncate_ctx = @ptrCast(&source);
+    log.on_truncate = TestSource.onTruncate;
+    log.truncateAfter(5);
+    try testing.expectEqual(@as(u64, 5), source.truncated_after.?);
+    try testing.expectEqual(@as(usize, 5), log.getRange(1, &buf, &arena));
+    try testing.expectEqual(@as(usize, 0), log.getRange(6, &buf, &arena));
 }

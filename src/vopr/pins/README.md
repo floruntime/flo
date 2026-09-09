@@ -6,14 +6,21 @@ which a bare seed does not.
 
 | Pin | Expected today | Why it exists |
 |---|---|---|
-| `eviction-wedge.json` | FAILS (convergence, ~109k ticks) | A core follower's gap falls below the leader's 8 KiB ring, `getRange` returns 0, and the pump heartbeats forever — there is no snapshot/catch-up path. Passes once one exists. |
+| (none) | | Every finding so far has its fix landed; the seeds below live on as unit tests. |
 
 A pin is re-recorded from a fresh swarm when an unrelated fix shifts the interleaving
 enough that its seed no longer reaches the bug (`eviction-wedge.json` moved from seed
-10 to small-ring seed 1 when the node started drawing its own timer jitter); the row
-above describes the bug, not the seed.
+10 to small-ring seed 1 when the node started drawing its own timer jitter); a row
+describes the bug, not the seed.
 
 Retired pins (fix landed, pin went green):
+
+- `eviction-wedge.json` — a core follower's gap fell below the leader's 8 KiB
+  ring, `getRange` returned 0 and the pump heartbeated forever: there was no
+  catch-up path below the ring. Fixed by giving the Raft log a catch-up source
+  (the durable log in production, the sim disk here) that `getRange` and
+  `getEntryCopy` fall through to; the `--small-ring` swarm is the standing
+  check, and the case lives on as a unit test in `src/raft/log.zig`.
 
 - `stale-suffix-commit.json` — a follower capped `commit_index` at its own
   `lastIndex()` instead of the last entry the RPC delivered, committing a deposed

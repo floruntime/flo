@@ -47,6 +47,7 @@ test {
     _ = @import("storage/ual/segment.zig");
     _ = @import("storage/ual/writer.zig");
     _ = @import("storage/ual/reader.zig");
+    _ = @import("storage/durable_log.zig");
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/memory.zig");
     _ = @import("storage/partition.zig");

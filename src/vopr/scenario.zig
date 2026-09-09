@@ -165,11 +165,9 @@ pub const Scenario = struct {
     }
 
     /// The deliberately-small-ring slice: same sampling as `fromSeed` but
-    /// the ring is shrunk below the floor so eviction outruns replication.
-    /// Until a snapshot/catch-up path exists these seeds fail convergence
-    /// *by design* — they are that work's standing acceptance test — and
-    /// the truncate/evict interaction can hang inside `ual.append`, so
-    /// anything running these seeds needs a per-seed timeout.
+    /// the ring is shrunk below the floor so eviction outruns replication
+    /// and every repair of a lagging follower reads below the ring. A seed
+    /// here converges only if that path is whole.
     pub fn smallRing(seed: u64) Scenario {
         var s = fromSeed(seed);
         s.small_ring = true;

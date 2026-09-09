@@ -14,7 +14,7 @@
 //!                                   by invariant and to tell slow from hung
 //!        [--mode=volatile|persisted] hard-state model (persisted is the default)
 //!        [--small-ring]             shrink the ring so eviction outruns
-//!                                   replication (fails by design)
+//!                                   replication and repairs read below it
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -142,7 +142,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} evictions={d}\n",
+            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -157,7 +157,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.messages_delivered,
             s.messages_dropped,
             s.apply_stalls,
-            s.eviction_stalls,
+            s.catch_up_reads,
         },
     );
     if (!s.ok) {

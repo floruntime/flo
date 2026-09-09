@@ -283,8 +283,9 @@ pub const RaftNode = struct {
         );
         noop.header.crc32c = noop.computeCrc();
         const idx = try self.log.append(&noop);
+        // `last_applied` stays where replay left it; the owner drains what
+        // this bootstrap just committed.
         self.commit_index = idx;
-        self.last_applied = idx;
         log.debug("Raft: bootstrap complete, leader at term={d}, commit_index={d}", .{ self.current_term, idx });
     }
 
@@ -1583,7 +1584,9 @@ test "raft node: bootstrap after a restart opens a new term and continues the lo
     try testing.expectEqual(@as(u64, 5), node.log.lastIndex());
     try testing.expectEqual(@as(u64, 4), node.log.entryTerm(5).?);
     try testing.expectEqual(@as(u64, 5), node.commit_index);
-    try testing.expectEqual(@as(u64, 5), node.last_applied);
+    // Nothing was applied by bootstrapping; the restored tail and the noop
+    // are the owner's to drain.
+    try testing.expectEqual(@as(u64, 0), node.last_applied);
     const r = try node.propose(.kv_put, 0, 0, "next");
     try testing.expectEqual(@as(u64, 6), r.index);
     try testing.expectEqual(@as(u64, 4), r.term);

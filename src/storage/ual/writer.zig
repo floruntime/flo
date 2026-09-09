@@ -37,6 +37,10 @@ pub const SegmentWriter = struct {
     entry_count: u32,
     entry_type_bitmap: u32,
     compression: segment.Compression,
+    /// Written into the header at seal; `DurableLog` sets it: the Raft
+    /// commit index at flush, clamped to the cut when a truncation rewrites
+    /// a file.
+    commit_index_at_seal: u64,
     /// Entries the append hook could not buffer (allocation failure). Each
     /// one is an entry that would be missing from disk after a restart, so
     /// it is counted and logged rather than dropped silently.
@@ -56,6 +60,7 @@ pub const SegmentWriter = struct {
             .entry_count = 0,
             .entry_type_bitmap = 0,
             .compression = compression,
+            .commit_index_at_seal = 0,
             .buffer_failures = 0,
             .allocator = allocator,
         };
@@ -108,6 +113,39 @@ pub const SegmentWriter = struct {
         self.entry_type_bitmap = segment.bitmapSet(self.entry_type_bitmap, entry.header.entry_type);
     }
 
+    /// Drop every buffered entry above `after_index`. Entries are
+    /// self-delimiting in `data`, so the kept prefix ends at the first
+    /// dropped header; the sparse index and metadata follow it.
+    pub fn truncateAfter(self: *SegmentWriter, after_index: u64) void {
+        if (self.entry_count == 0 or self.last_index <= after_index) return;
+        if (self.first_index > after_index) {
+            self.reset();
+            return;
+        }
+        var offset: usize = 0;
+        var kept: u32 = 0;
+        var last_kept: ?Entry = null;
+        var bitmap: u32 = 0;
+        while (offset < self.data.items.len) {
+            const e = Entry.deserialize(self.data.items[offset..]) orelse break;
+            if (e.header.index > after_index) break;
+            kept += 1;
+            last_kept = e;
+            bitmap = segment.bitmapSet(bitmap, e.header.entry_type);
+            offset += e.totalSize();
+        }
+        self.data.shrinkRetainingCapacity(offset);
+        while (self.sparse_index.items.len > 0 and self.sparse_index.items[self.sparse_index.items.len - 1].offset >= offset) {
+            _ = self.sparse_index.pop();
+        }
+        self.entry_count = kept;
+        self.entry_type_bitmap = bitmap;
+        if (last_kept) |e| {
+            self.last_index = e.header.index;
+            self.last_ts_ns = e.header.timestamp_ns;
+        }
+    }
+
     /// Current data size (entry bytes only, no header/footer/index).
     pub fn dataSize(self: *const SegmentWriter) usize {
         return self.data.items.len;
@@ -137,7 +175,8 @@ pub const SegmentWriter = struct {
             .entry_count = self.entry_count,
             .data_size = @intCast(self.data.items.len),
             .compression = @intFromEnum(self.compression),
-            .reserved = .{0} ** 9,
+            .commit_index_at_seal = self.commit_index_at_seal,
+            .reserved = .{0},
         };
         const hdr_bytes = hdr.asBytes();
         @memcpy(result[offset .. offset + segment.HEADER_SIZE], hdr_bytes);

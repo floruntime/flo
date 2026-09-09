@@ -72,6 +72,8 @@ const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
 const ual_mod = @import("../storage/ual/ual.zig");
 const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const durable_log_mod = @import("../storage/durable_log.zig");
+const DurableLog = durable_log_mod.DurableLog;
 const RaftLog = @import("../raft/log.zig").RaftLog;
 const hard_state_mod = @import("../raft/hard_state.zig");
 const Durability = @import("../config/server.zig").Durability;
@@ -183,6 +185,10 @@ pub const Shard = struct {
 
     /// Segment writer — accumulates entries for persistence to .flseg files.
     segment_writer: *SegmentWriter,
+
+    /// The writer's buffer plus the sealed segments, as one log the Raft
+    /// node can read below its ring and truncate through (null if ephemeral).
+    durable_log: ?*DurableLog,
 
     /// Count of segment flush failures. Surfaced instead of being silently
     /// swallowed so disk-full / IO faults are observable.
@@ -388,6 +394,11 @@ pub const Shard = struct {
         var shard_data_dir: ?[]const u8 = null;
         var hard_state_store: ?*HardStateStore = null;
         errdefer if (hard_state_store) |store| allocator.destroy(store);
+        var durable_log: ?*DurableLog = null;
+        errdefer if (durable_log) |dl| {
+            dl.deinit();
+            allocator.destroy(dl);
+        };
 
         // Build replay registry — handlers register their entry types
         // so replaySegments and handleInboxMessage can dispatch without
@@ -419,6 +430,12 @@ pub const Shard = struct {
             @import("stdx").fs.makePath(segs_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
+            const dl = try allocator.create(DurableLog);
+            dl.* = DurableLog.init(allocator, seg_writer, segs_dir_path) catch |err| {
+                allocator.destroy(dl);
+                return err;
+            };
+            durable_log = dl;
 
             const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
             defer allocator.free(snaps_dir_path);
@@ -498,7 +515,19 @@ pub const Shard = struct {
             // If a snapshot was loaded, skip entries at or below replay_from.
             // Replay also rebuilds the Raft log (last index, term index and
             // the hot-ring tail) from the same pass over the segments.
-            replaySegments(allocator, segs_dir_path, partition, &replay_registry, replay_from, &raft_node.log, shard_id);
+            //
+            // Only entries at or below the segments' commit watermark reach
+            // the projections; the rest is loaded into the log and drained
+            // by `applyDeferredTail` (see `SegmentHeader.commit_index_at_seal`).
+            try durable_log.?.recoverTruncation();
+            const watermark = try durable_log.?.watermark();
+            try replaySegments(allocator, durable_log.?, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id);
+            // A snapshot covers its prefix already; draining from below it
+            // would apply those entries a second time.
+            raft_node.last_applied = @max(replay_from, @min(watermark, raft_node.log.lastIndex()));
+            if (watermark == 0 and !raft_node.log.isEmpty()) {
+                log.warn("shard {d}: no segment carries a commit watermark; everything above the snapshot is applied at boot through the log instead of replay", .{shard_id});
+            }
 
             // A snapshot ahead of the flushed segments (async flush, crash
             // after the snapshot) would leave the log below what the
@@ -520,6 +549,11 @@ pub const Shard = struct {
         // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
+        if (durable_log) |dl| {
+            raft_node.log.catch_up = .{ .ctx = @ptrCast(dl), .read_range = catchUpReadRange };
+            raft_node.log.on_truncate_ctx = @ptrCast(dl);
+            raft_node.log.on_truncate = durableTruncate;
+        }
         try raft_node.bootstrap();
 
         // Build dispatcher and register all handlers
@@ -574,6 +608,7 @@ pub const Shard = struct {
             .raft_node = raft_node,
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
+            .durable_log = durable_log,
             .persist_failures = 0,
             .durability = durability,
             .shard_data_dir = shard_data_dir,
@@ -634,15 +669,28 @@ pub const Shard = struct {
         self.ts_handler.shard_ptr = @ptrCast(self);
     }
 
-    /// Flush buffered Raft log entries to a .flseg file under `shard_data_dir/segs/`.
+    /// Flush buffered Raft log entries to a .flseg file under `shard_data_dir/segs/`,
+    /// sealed under the current commit index.
     pub fn flushSegmentToDisk(self: *Shard) !void {
-        if (self.shard_data_dir == null) return;
-        if (self.segment_writer.entry_count == 0) return;
+        const dl = self.durable_log orelse return;
+        try dl.flush(self.raft_node.commit_index);
+    }
 
-        var segs_buf: [512]u8 = undefined;
-        const segs_path = std.fmt.bufPrint(&segs_buf, "{s}/segs", .{self.shard_data_dir.?}) catch return;
-        try self.segment_writer.writeToFile(segs_path);
-        self.segment_writer.reset();
+    /// Apply what replay loaded into the log above the commit watermark.
+    /// Called once the shard is at its final address and before it serves
+    /// anything, so no read observes the gap. Bootstrap re-established
+    /// commit at the tip (every shard bootstraps as its own leader), so
+    /// this drains the whole tail.
+    pub fn applyDeferredTail(self: *Shard) void {
+        const raft = self.raft_node;
+        const pending = raft.commit_index -| raft.last_applied;
+        // The bootstrap noop is always one of them.
+        if (pending > 1) {
+            log.info("shard {d}: applying {d} durable entries above the commit watermark (indices {d}..{d})", .{ self.id, pending, raft.last_applied + 1, raft.commit_index });
+        }
+        if (!self.applyCommitted()) {
+            log.err("shard {d}: not every durable entry above the commit watermark could be applied at boot; projections are missing writes", .{self.id});
+        }
     }
 
     /// Flush segments when `durability == .sync` (after projections are applied).
@@ -691,6 +739,10 @@ pub const Shard = struct {
             log.err("shard {d}: final flush on shutdown failed: {s} (buffered entries may be lost)", .{ self.id, @errorName(err) });
         };
 
+        if (self.durable_log) |dl| {
+            dl.deinit();
+            self.allocator.destroy(dl);
+        }
         // Clean up SegmentWriter
         self.segment_writer.deinit();
         self.allocator.destroy(self.segment_writer);
@@ -1369,10 +1421,11 @@ pub const Shard = struct {
             raft.last_applied = next_idx;
             if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
                 if (!self.applyEntry(&e)) all_applied = false;
-            } else if (raft.log.contains(next_idx)) {
-                // Present but not copyable: the buffer fits every entry in
-                // this log, so this is a bug, not eviction. Said out loud,
-                // because the write was already acked.
+            } else {
+                // A committed index is always within the log, in the ring
+                // or below it in the durable log, and the buffer fits every
+                // entry; an unreadable one is a bug or a damaged segment.
+                // Said out loud, because the write was already acked.
                 log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
                 all_applied = false;
             }
@@ -2708,6 +2761,19 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     };
 }
 
+fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) usize {
+    const dl: *DurableLog = @ptrCast(@alignCast(ctx));
+    return dl.readRange(start, buf, arena);
+}
+
+/// Raft log truncation, carried into the durable log.
+fn durableTruncate(ctx: *anyopaque, after_index: u64) void {
+    const dl: *DurableLog = @ptrCast(@alignCast(ctx));
+    dl.truncateAfter(after_index) catch |err| {
+        log.err("durable log: cannot truncate segments after index {d}: {s} (truncate_failures={d}); no segment is flushed until the cut completes, which every flush retries", .{ after_index, @errorName(err), dl.truncate_failures });
+    };
+}
+
 /// Per-shard HARDSTATE writer — the sink the Raft node persists through.
 /// Heap-allocated so the sink's context pointer stays valid.
 const HardStateStore = struct {
@@ -2807,62 +2873,25 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
 /// into the Raft log and applied through `applyEntryCore`, exactly as when
 /// it was first committed.
 ///
-const ReplaySegmentFile = struct {
-    first_index: u64,
-    path: []const u8,
-};
-
 /// If `replay_from` > 0, entries with index <= replay_from are skipped
-/// (already restored from a snapshot).
+/// (already restored from a snapshot). Entries above `watermark` are
+/// restored into the Raft log but not applied.
 fn replaySegments(
     allocator: std.mem.Allocator,
-    dir_path: []const u8,
+    durable_log: *DurableLog,
     partition: *Partition,
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
+    watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
-) void {
-    var dir = @import("stdx").fs.openDir(dir_path, .{ .iterate = true }) catch return;
-    defer @import("stdx").fs.closeDir(dir);
-
-    var segment_files: std.ArrayListUnmanaged(ReplaySegmentFile) = .empty;
-    defer {
-        for (segment_files.items) |sf| allocator.free(sf.path);
-        segment_files.deinit(allocator);
+) !void {
+    // Listed in Raft index order so the projection router's applied_index
+    // guard does not skip lower-index entries.
+    const files = try durable_log.segments();
+    for (files) |sf| {
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id);
     }
-
-    const io = @import("stdx").io.instance();
-    var iter = dir.iterate();
-    while (iter.next(io) catch null) |de| {
-        if (de.kind != .file) continue;
-        if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
-        const first_index = parseSegmentFilenameIndex(de.name) orelse continue;
-
-        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, de.name }) catch continue;
-        segment_files.append(allocator, .{ .first_index = first_index, .path = full_path }) catch {
-            allocator.free(full_path);
-        };
-    }
-
-    // Directory iteration order is undefined; replay in Raft index order so the
-    // projection router's applied_index guard does not skip lower-index entries.
-    std.mem.sort(ReplaySegmentFile, segment_files.items, {}, replaySegmentFileLessThan);
-
-    for (segment_files.items) |sf| {
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, raft_log, shard_id);
-    }
-}
-
-fn replaySegmentFileLessThan(_: void, a: ReplaySegmentFile, b: ReplaySegmentFile) bool {
-    return a.first_index < b.first_index;
-}
-
-/// Parse the leading index from a segment filename (`{index:0>10}.flseg`).
-fn parseSegmentFilenameIndex(name: []const u8) ?u64 {
-    if (!std.mem.endsWith(u8, name, ".flseg")) return null;
-    const index_part = name[0 .. name.len - ".flseg".len];
-    return std.fmt.parseInt(u64, index_part, 10) catch null;
 }
 
 fn replaySegmentFile(
@@ -2871,6 +2900,7 @@ fn replaySegmentFile(
     partition: *Partition,
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
+    watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
 ) void {
@@ -2881,19 +2911,17 @@ fn replaySegmentFile(
     const data_len = result.reader.data_end - result.reader.data_start;
     while (offset < data_len) {
         const seg_entry = result.reader.readEntryAt(offset) orelse break;
+        offset += seg_entry.totalSize();
 
         // Every durable entry is part of the Raft log, snapshot or not.
         restoreRaftEntry(shard_id, raft_log, &seg_entry);
 
         // Skip entries already covered by snapshot
-        if (replay_from > 0 and seg_entry.header.index <= replay_from) {
-            offset += seg_entry.totalSize();
-            continue;
-        }
+        if (replay_from > 0 and seg_entry.header.index <= replay_from) continue;
+        // Above the watermark: in the log, not yet in the projections.
+        if (seg_entry.header.index > watermark) continue;
 
         _ = applyEntryCore(partition, replay_registry, &seg_entry);
-
-        offset += seg_entry.totalSize();
     }
 }
 
@@ -3090,16 +3118,6 @@ test "Shard: replication gap detection surfaces silent follower divergence" {
     try std.testing.expectEqual(@as(u64, 7), partition.router.applied_index);
 }
 
-test "replay: segment filenames sort by first_index" {
-    try std.testing.expectEqual(@as(?u64, 2), parseSegmentFilenameIndex("0000000002.flseg"));
-    try std.testing.expectEqual(@as(?u64, 42), parseSegmentFilenameIndex("0000000042.flseg"));
-    try std.testing.expect(parseSegmentFilenameIndex("bad.flseg") == null);
-
-    const a = ReplaySegmentFile{ .first_index = 10, .path = "" };
-    const b = ReplaySegmentFile{ .first_index = 3, .path = "" };
-    try std.testing.expect(replaySegmentFileLessThan({}, b, a));
-}
-
 test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {
     try std.testing.expectEqual(RAFT_RING_MIN, raftRingCapacity(4096));
     try std.testing.expectEqual(RAFT_RING_MIN, raftRingCapacity(8 * 1024 * 1024));
@@ -3171,4 +3189,236 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     try std.testing.expect(shard.kv_handler.kv.get("nested") != null);
     try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
     try std.testing.expectEqual(@as(u32, 1), Probe.calls);
+}
+
+fn testDataDir(tmp: *std.testing.TmpDir) ![]const u8 {
+    return @import("stdx").fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+}
+
+fn testCommandEntry(entry_type: entry_mod.EntryType, index: u64, key: []const u8, value: []const u8) entry_mod.Entry {
+    const S = struct {
+        var payload_buf: [256]u8 = undefined;
+    };
+    const cmd = entry_mod.CommandPayload{
+        .namespace_hash = node_router.namespaceHash(""),
+        .key_length = @intCast(key.len),
+        .value_length = @intCast(value.len),
+        .key = key,
+        .value = value,
+    };
+    const n = cmd.serialize(&S.payload_buf).?;
+    var e = entry_mod.buildEntry(entry_type, entry_mod.Flags.NONE, 1, index, index * 1000, S.payload_buf[0..n]);
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
+test "replay applies up to the commit watermark; the tail waits for commit to be re-established" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+
+    // A segment as a follower could have flushed it: three entries, sealed
+    // while only the first two were committed.
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    try w.addEntry(&testCommandEntry(.queue_enqueue, 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+    try w.addEntry(&testCommandEntry(.queue_enqueue, 3, "q", &[_]u8{ 0, 0, 0, 0, 'B' }));
+    w.commit_index_at_seal = 2;
+    try w.writeToFile(segs);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    // Index 3 is in the log and nowhere else.
+    try std.testing.expectEqual(@as(u64, 1), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 2), shard.raft_node.last_applied);
+    try std.testing.expectEqual(@as(u64, 4), shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 4), shard.raft_node.commit_index);
+
+    shard.applyDeferredTail();
+    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 4), shard.raft_node.last_applied);
+
+    // Below the ring the log reads the segments: the wiring, not a stub.
+    const src = shard.raft_node.log.catch_up.?;
+    var buf: [4]entry_mod.Entry = undefined;
+    var arena: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena));
+    try std.testing.expectEqual(@as(u64, 3), buf[1].header.index);
+    try std.testing.expectEqualStrings("q", entry_mod.CommandPayload.deserialize(buf[1].payload).?.key);
+}
+
+test "a truncated suffix is gone from the segments a restart replays" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+
+        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "A");
+        try std.testing.expect(shard.applyCommitted());
+        // An uncommitted tail, flushed: the shape a follower is left with
+        // when its leader dies mid-batch.
+        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "C");
+        try shard.flushSegmentToDisk();
+        // The new leader's log disagrees at index 3; commit never covered it.
+        shard.raft_node.commit_index = 2;
+        shard.raft_node.log.truncateAfter(2);
+        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "D");
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
+    }
+
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.applyDeferredTail();
+    // Index 3 is D, once; the file that held C was rewritten without it.
+    try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
+    try std.testing.expectEqual(@as(u64, 4), shard.raft_node.log.lastIndex());
+}
+
+test "a committed entry the durable log cannot serve fails the drain instead of being skipped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    try w.addEntry(&testCommandEntry(.queue_enqueue, 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+    try w.addEntry(&testCommandEntry(.queue_enqueue, 3, "q", &[_]u8{ 0, 0, 0, 0, 'B' }));
+    w.commit_index_at_seal = 2;
+    try w.writeToFile(segs);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+
+    // Evict 3 and the bootstrap noop from the ring without the log knowing,
+    // and drop the writer's buffer: 3 is still in a segment, 4 is nowhere.
+    shard.raft_node.log.ual.truncateAfter(2);
+    shard.segment_writer.reset();
+    try std.testing.expect(!shard.applyCommitted());
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
+}
+
+test "a truncation the previous run recorded is finished before replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    // Indices 1-3 in one file, 4 in another, and a cut after 2 that never
+    // reached either file.
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    try w.addEntry(&testCommandEntry(.kv_put, 2, "k", "A"));
+    try w.addEntry(&testCommandEntry(.kv_put, 3, "k", "C"));
+    w.commit_index_at_seal = 3;
+    try w.writeToFile(segs);
+    w.reset();
+    try w.addEntry(&testCommandEntry(.kv_put, 4, "k", "X"));
+    w.commit_index_at_seal = 4;
+    try w.writeToFile(segs);
+    const intent = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ segs, durable_log_mod.INTENT_FILENAME });
+    defer std.testing.allocator.free(intent);
+    {
+        const f = try @import("stdx").fs.createFile(intent, .{});
+        defer @import("stdx").fs.closeFile(f);
+        try @import("stdx").fs.writeAll(f, "2\n");
+    }
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.applyDeferredTail();
+
+    try std.testing.expectEqualStrings("A", shard.kv_handler.kv.get("k").?.value);
+    try std.testing.expectEqual(@as(u64, 3), shard.raft_node.log.lastIndex());
+    try std.testing.expectError(error.FileNotFound, @import("stdx").fs.access(intent, .{}));
+}
+
+test "a snapshot ahead of the commit watermark is not drained over at boot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        _ = try persistence_mod.persistEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+        _ = try persistence_mod.persistEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
+        try std.testing.expect(shard.applyCommitted());
+        // Sealed under a lagging commit, as a follower's segment is, then a
+        // snapshot taken past it.
+        shard.raft_node.commit_index = 1;
+        try shard.flushSegmentToDisk();
+        shard.raft_node.commit_index = 3;
+        const partition = shard.partitions[0];
+        const snap = try partition.snapshot();
+        defer std.testing.allocator.free(snap);
+        var name_buf: [128]u8 = undefined;
+        const name = snapshot_mod.snapshotFilename(&name_buf, partition.router.applied_index, 1);
+        const snaps = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/snaps/{s}", .{ data_dir, name });
+        defer std.testing.allocator.free(snaps);
+        {
+            const f = try @import("stdx").fs.createFile(snaps, .{});
+            defer @import("stdx").fs.closeFile(f);
+            try @import("stdx").fs.writeAll(f, snap);
+        }
+        const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+        defer std.testing.allocator.free(shard_dir);
+        try ShardManifest.setLatestSnapshot(std.testing.allocator, shard_dir, name);
+    }
+
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.applyDeferredTail();
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
+    // Nothing the snapshot covers was offered to the projections again.
+    try std.testing.expectEqual(@as(u64, 0), shard.partitions[0].router.stats.entries_skipped);
 }
