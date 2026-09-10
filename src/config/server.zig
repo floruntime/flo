@@ -184,6 +184,7 @@ pub const ServerConfig = struct {
             .cluster_raft_port = self.cluster.raft_port,
             .cluster_gossip_port = self.cluster.gossip_port,
             .cluster_seeds = self.cluster.seeds,
+            .cluster_secret = self.cluster.secret,
             .cluster_replication_factor = self.cluster.replication_factor,
             .cluster_election_timeout_min_ms = self.cluster.election_timeout_min_ms,
             .cluster_election_timeout_max_ms = self.cluster.election_timeout_max_ms,
@@ -489,7 +490,7 @@ pub fn loadWithOverrides(
 
 /// Generate default flo.toml content
 pub fn generateDefaultConfig() []const u8 {
-    return 
+    return
     \\# Flo Server Configuration
     \\# See documentation at https://github.com/floruntime/flo
     \\
@@ -613,6 +614,11 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Seed nodes for cluster discovery (comma-separated)
     \\# Format: "host1:raft_port1,host2:raft_port2,host3:raft_port3"
     \\# seeds = "192.168.1.10:9500,192.168.1.11:9500,192.168.1.12:9500"
+    \\
+    \\# Shared secret every member must hold; required whenever the peer
+    \\# listener starts (enabled, seeds, raft_port or replication_factor > 1).
+    \\# Generate one: openssl rand -base64 32
+    \\# secret = "..."
     \\
     \\# Replication factor (number of copies of each partition)
     \\# replication_factor = 3

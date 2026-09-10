@@ -45,6 +45,11 @@ pub const ClusterConfig = struct {
     /// Example: ["192.168.1.10:9500", "192.168.1.11:9500"]
     seeds: []const []const u8 = &.{},
 
+    /// Shared secret every member proves it holds before it is a peer. The
+    /// raft port moves terms, membership and log contents, so it is never
+    /// open: required whenever the peer listener starts.
+    secret: ?[]const u8 = null,
+
     /// Replication factor for data partitions (default: 1 = no replication)
     replication_factor: u8 = 1,
 
@@ -156,6 +161,11 @@ pub fn parseClusterConfig(
     }
     if (table.getInt("raft_port")) |p| {
         config.raft_port = @intCast(p);
+    }
+    if (table.getString("secret")) |s| {
+        const owned = try allocator.dupe(u8, s);
+        try owned_strings.append(allocator, owned);
+        config.secret = owned;
     }
     if (table.getInt("gossip_port")) |p| {
         config.gossip_port = @intCast(p);

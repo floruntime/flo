@@ -371,8 +371,19 @@ pub const RaftNode = struct {
         };
     }
 
+    /// A term more than 2^32 ahead of ours is not an election we missed;
+    /// it is corruption or a hostile peer, and adopting it would strand
+    /// this node in a term nobody else will ever reach.
+    pub fn termPlausible(self: *const RaftNode, term: u64) bool {
+        return term <= self.current_term +| (1 << 32);
+    }
+
     /// Handle an incoming VoteRequest. Returns the VoteResponse.
     pub fn handleVoteRequest(self: *RaftNode, req: VoteRequest) VoteResponse {
+        if (!self.termPlausible(req.term)) {
+            log.warn("Raft: vote request for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
+            return .{ .term = self.current_term, .vote_granted = false, .from = self.id };
+        }
         // If request term > current term, update term and step down
         if (req.term > self.current_term) {
             self.stepDown(req.term);
@@ -409,6 +420,7 @@ pub const RaftNode = struct {
     /// Handle an incoming VoteResponse (candidate only).
     /// Returns true if we just won the election (became leader).
     pub fn handleVoteResponse(self: *RaftNode, resp: VoteResponse) bool {
+        if (!self.termPlausible(resp.term)) return false;
         if (resp.term > self.current_term) {
             self.stepDown(resp.term);
             return false;
@@ -438,6 +450,10 @@ pub const RaftNode = struct {
 
     /// Handle an incoming AppendEntries RPC.
     pub fn handleAppendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
+        if (!self.termPlausible(req.term)) {
+            log.warn("Raft: AppendEntries for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
+            return .{ .term = self.current_term, .success = false, .match_index = self.log.lastIndex(), .from = self.id };
+        }
         // If request term > current, step down
         if (req.term > self.current_term) {
             self.stepDown(req.term);
@@ -511,6 +527,7 @@ pub const RaftNode = struct {
 
     /// Handle an AppendEntries response (leader handles follower reply).
     pub fn handleAppendResponse(self: *RaftNode, resp: AppendResponse) void {
+        if (!self.termPlausible(resp.term)) return;
         if (resp.term > self.current_term) {
             self.stepDown(resp.term);
             return;
@@ -1647,4 +1664,27 @@ test "raft node: events before the first tick do not arm a deadline in the past"
     const first = node.tick(50_000);
     try testing.expect(!first.start_election);
     try testing.expect(node.election_deadline_ms >= 50_150);
+}
+
+test "raft node: a term more than 2^32 ahead is refused, not adopted" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 4096, .{});
+    defer node.deinit();
+    try node.bootstrap();
+    const before = node.current_term;
+
+    const absurd: u64 = before + (1 << 32) + 1;
+    const vr = node.handleVoteRequest(.{ .term = absurd, .candidate_id = 2, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(!vr.vote_granted);
+    try testing.expectEqual(before, node.current_term);
+    const ar = try node.handleAppendEntries(.{ .term = absurd, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!ar.success);
+    try testing.expectEqual(before, node.current_term);
+    try testing.expectEqual(Role.leader, node.role);
+    node.handleAppendResponse(.{ .term = absurd, .success = false, .match_index = 0, .from = 2 });
+    try testing.expectEqual(before, node.current_term);
+
+    // A term merely ahead is an election we missed, and is adopted.
+    _ = try node.handleAppendEntries(.{ .term = before + 5, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqual(before + 5, node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
 }
