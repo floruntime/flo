@@ -41,6 +41,9 @@ pub const ServerProcess = struct {
     /// this false for all but the final attempt, so one failure is not
     /// reported three times.
     dump_log_on_failure: bool = true,
+    /// The child was already collected by a diagnostic `waitpid`; a second
+    /// wait would be a syscall bug, not a result.
+    reaped: bool = false,
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
     started: bool,
@@ -145,6 +148,10 @@ pub const ServerProcess = struct {
         raft_port: u16 = 0,
         /// Enable cluster mode (starts Raft listener) - for seed nodes without join_addresses
         cluster_enabled: bool = false,
+        /// Written to `[cluster] secret` whenever the peer listener will start.
+        /// Every node of a test cluster shares the default; a test that wants a
+        /// stranger sets its own.
+        cluster_secret: []const u8 = "e2e-cluster-secret",
         /// `[server] bind` for this node; null = the server default (0.0.0.0),
         /// reached at 127.0.0.1 by the harness.
         bind: ?[]const u8 = null,
@@ -293,6 +300,12 @@ pub const ServerProcess = struct {
                 // Default to data_dir/archive
                 try config_writer.print("file_base_path = \"{s}/archive\"\n", .{self.data_dir});
             }
+        }
+
+        // Same predicate as the raft port allocation below: the config is
+        // written before the port is picked.
+        if ((self.config.raft_port > 0 or self.config.join_addresses != null or self.config.cluster_enabled) and self.config.cluster_secret.len > 0) {
+            try config_writer.print("\n[cluster]\nsecret = \"{s}\"\n", .{self.config.cluster_secret});
         }
 
         try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});
@@ -483,8 +496,9 @@ pub const ServerProcess = struct {
         // and they have different causes, so report which one this is.
         if (self.process) |*proc| {
             var status: c_int = 0;
-            const rc = std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
+            const rc = if (self.reaped) proc.id else std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
             if (rc == proc.id) {
+                self.reaped = true;
                 std.debug.print("[server] port {d}: process already exited (raw status {d})\n", .{ self.port, status });
             } else if (rc == 0) {
                 std.debug.print("[server] port {d}: process still running — hung, not crashed\n", .{self.port});
@@ -626,8 +640,11 @@ pub const ServerProcess = struct {
     /// Force kill the server process
     fn forceKill(self: *Self) void {
         if (self.process) |*proc| {
-            _ = std.c.kill(proc.id, .KILL);
-            _ = proc.wait() catch {};
+            if (!self.reaped) {
+                _ = std.c.kill(proc.id, .KILL);
+                _ = proc.wait() catch {};
+                self.reaped = true;
+            }
 
             // Wait for OS to release resources
             stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);

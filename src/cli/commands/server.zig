@@ -51,6 +51,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\Cluster mode:
                     \\  Without --join: Starts as single-node cluster (immediate leader)
                     \\  With --join:    Connects to existing cluster and requests membership
+                    \\  Every member proves the same shared secret at the peer port:
+                    \\  set [cluster] secret in flo.toml or FLO_CLUSTER_SECRET.
                     \\
                     \\Note: Shard count defines data topology and cannot be changed after
                     \\      initial data is written without running a rebalance operation.
@@ -341,6 +343,14 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     }
     if (no_dashboard) {
         config.dashboard.enabled = false;
+    }
+
+    // The peer secret may come from the environment: a container often has
+    // no config file to keep it in.
+    if (config.cluster.secret == null) {
+        if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| {
+            if (s.len > 0) config.cluster.secret = try config.dupeString(s);
+        }
     }
 
     // --join flag overrides seeds from config

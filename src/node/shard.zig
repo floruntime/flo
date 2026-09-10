@@ -82,6 +82,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const segment_mod = @import("../storage/ual/segment.zig");
 const Entry = entry_mod.Entry;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const RaftQueue = @import("../raft/raft_queue.zig").RaftQueue;
 const RaftNode = @import("../raft/node.zig").RaftNode;
 const waiter_pool_mod = @import("waiter_pool.zig");
 const WaiterPool = waiter_pool_mod.WaiterPool;
@@ -205,6 +206,11 @@ pub const Shard = struct {
 
     /// Raft network reference (set by runtime for shard 0, null otherwise).
     raft_network: ?*RaftNetwork,
+
+    /// Frames from authenticated peers, filled by the network thread (set
+    /// by the runtime for shard 0). Its wake pipe is a reactor source.
+    raft_queue: ?*RaftQueue,
+    raft_queue_registered: bool,
 
     /// Per-shard counters, mirroring the global server ones for attribution.
     shard_metrics: ?*ShardMetrics,
@@ -614,6 +620,8 @@ pub const Shard = struct {
             .shard_data_dir = shard_data_dir,
             .pipe_registered = false,
             .raft_network = null,
+            .raft_queue = null,
+            .raft_queue_registered = false,
             .shard_metrics = null,
             .cluster_node_id = node_id,
             .waiter_pool = WaiterPool.init(),
@@ -1330,7 +1338,24 @@ pub const Shard = struct {
         const ptr = msg.payload_ptr orelse return;
         const data: [*]u8 = @ptrCast(ptr);
         if (msg.payload_len == 0) return;
-        const payload = data[0..msg.payload_len];
+        self.applyReplicatedPayload(data[0..msg.payload_len]);
+    }
+
+    /// Every frame the network queued since the last drain. The network
+    /// queues only replicated entries; anything else is freed unapplied.
+    fn drainRaftQueue(self: *Shard) void {
+        const q = self.raft_queue orelse return;
+        while (q.pop()) |frame| {
+            if (frame.msg_type == .replicate_entry) {
+                self.applyReplicatedPayload(frame.payload);
+            } else {
+                self.allocator.free(frame.payload);
+            }
+        }
+    }
+
+    /// Apply one replicated entry; `payload` is owned and freed here.
+    fn applyReplicatedPayload(self: *Shard, payload: []u8) void {
         defer self.allocator.free(payload);
 
         const entry = entry_mod.Entry.deserialize(payload) orelse return;
@@ -1525,6 +1550,12 @@ pub const Shard = struct {
             });
             self.pipe_registered = true;
         }
+        if (!self.raft_queue_registered) {
+            if (self.raft_queue) |q| {
+                try self.reactor.addSource(.{ .fd = q.wake_rd, .tag = .raft_read, .interests = .{ .readable = true } });
+                self.raft_queue_registered = true;
+            }
+        }
 
         const events = try self.reactor.poll(timeout_ms);
 
@@ -1535,6 +1566,7 @@ pub const Shard = struct {
 
         // Drain inbox each tick
         _ = self.drainInbox();
+        self.drainRaftQueue();
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
@@ -1714,8 +1746,8 @@ pub const Shard = struct {
     // ─── Event processing ────────────────────────────────────────────────
 
     fn processEvent(self: *Shard, ev: ReactorEvent) void {
-        // Handle errors and hangups (but not on the acceptor pipe)
-        if (ev.tag != .acceptor_pipe and (ev.err or ev.hangup)) {
+        // Handle errors and hangups (but not on the pipes)
+        if (ev.tag != .acceptor_pipe and ev.tag != .raft_read and (ev.err or ev.hangup)) {
             self.closeConnection(ev.fd);
             return;
         }
@@ -1725,6 +1757,10 @@ pub const Shard = struct {
                 if (ev.readable) {
                     self.acceptFromPipe();
                 }
+            },
+            .raft_read => {
+                if (self.raft_queue) |q| q.drainWake();
+                self.drainRaftQueue();
             },
             .client_read => {
                 if (ev.readable) {

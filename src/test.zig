@@ -48,6 +48,10 @@ test {
     _ = @import("storage/ual/writer.zig");
     _ = @import("storage/ual/reader.zig");
     _ = @import("storage/durable_log.zig");
+    _ = @import("raft/network.zig");
+    _ = @import("raft/framer.zig");
+    _ = @import("raft/handshake.zig");
+    _ = @import("raft/raft_queue.zig");
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/memory.zig");
     _ = @import("storage/partition.zig");

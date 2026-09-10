@@ -1,9 +1,11 @@
-//! Raft Peer Network - TCP-based entry replication between cluster nodes.
+//! Raft peer network: the links between cluster nodes.
 //!
-//! Manages peer connections and broadcasts committed entries to all peers.
-//! Each entry written on this node is replicated to all connected peers.
-//! Incoming entries from peers are applied to the local KV projection
-//! via the shard's inbox mechanism.
+//! One thread owns every socket. It accepts, dials, runs the handshake,
+//! frames inbound bytes and hands whole frames to the shard through a
+//! bounded queue, and drains a bounded outbound queue per peer. It never
+//! blocks on a socket: a peer that stops reading is dropped, a peer that
+//! stops answering is re-dialled with backoff, and the shard thread never
+//! waits for any of it.
 //!
 //! ## Topology
 //!
@@ -12,154 +14,83 @@
 //! Each node then connects directly to every other node, so the cluster
 //! survives seed failure.
 //!
-//! A peer is reached at the address it advertised in its join request —
-//! its `[server] bind` address when that names an interface, otherwise the
+//! A peer is reached at the address it advertised in its hello — its
+//! `[server] bind` address when that names an interface, otherwise the
 //! source address the accepting side observed.
+//!
+//! ## Trust
+//!
+//! The raft port moves terms, membership and log contents, so a connection
+//! is a peer only after both sides have proved the cluster secret
+//! (`handshake.zig`). Every frame on a peer link is checked (`framer.zig`)
+//! and its source id must be the id the link proved; any violation closes
+//! the link.
 
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const log = @import("stdx").log;
+const stdx = @import("stdx");
+const log = stdx.log;
 const transport = @import("transport.zig");
-const entry_mod = @import("../storage/ual/entry.zig");
-const inbox_mod = @import("../node/inbox.zig");
+const handshake = @import("handshake.zig");
+const framer_mod = @import("framer.zig");
+const raft_queue_mod = @import("raft_queue.zig");
 const ReplicationMetrics = @import("../metrics/registry.zig").ReplicationMetrics;
 
-const Entry = entry_mod.Entry;
 const RaftHeader = transport.RaftHeader;
 const HEADER_SIZE = transport.HEADER_SIZE;
-const Inbox = inbox_mod.Inbox;
-const stdx_net = @import("stdx").net;
+const Framer = framer_mod.Framer;
+const RaftQueue = raft_queue_mod.RaftQueue;
+const stdx_net = stdx.net;
 
-// --- 0.16 compat: thin wrappers around std.c.* with std.posix-style errors ---
-// std.posix.{socket,connect,bind,listen,accept,close,write} were removed; the
-// libc functions still work and we link libc.
+const MsgType = transport.MsgType;
 
-const SocketError = error{ SocketCreateFailed, OutOfMemory, SystemResources, Unexpected };
-fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
-    // macOS rejects SOCK.NONBLOCK / SOCK.CLOEXEC in the socket() type field
-    // (returns EPROTONOSUPPORT). Strip them and apply via fcntl after creation.
-    const builtin = @import("builtin");
-    const strip_mask: u32 = if (builtin.os.tag == .macos)
-        posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC
-    else
-        0;
-    const want_nonblock = (sock_type & posix.SOCK.NONBLOCK) != 0;
-    const want_cloexec = (sock_type & posix.SOCK.CLOEXEC) != 0;
-    const real_type = sock_type & ~strip_mask;
+const sysSocket = stdx_net.sysSocket;
+const sysClose = stdx_net.sysClose;
+const sysBind = stdx_net.sysBind;
+const sysListen = stdx_net.sysListen;
+const SocketAddr = stdx_net.SocketAddrV4;
 
-    const rc = std.c.socket(@intCast(family), @intCast(real_type), @intCast(protocol));
-    if (rc < 0) return error.SocketCreateFailed;
-    const fd: posix.socket_t = @intCast(rc);
+fn sysAccept(fd: posix.socket_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) !posix.socket_t {
+    return stdx_net.sysAccept(fd, addr, len, 0);
+}
 
-    if (builtin.os.tag == .macos) {
-        if (want_nonblock) {
-            const F_GETFL: c_int = 3;
-            const F_SETFL: c_int = 4;
-            const O_NONBLOCK: c_int = 4;
-            const flags = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
-            if (flags >= 0) _ = std.c.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        }
-        if (want_cloexec) {
-            const F_SETFD: c_int = 2;
-            const FD_CLOEXEC: c_int = 1;
-            _ = std.c.fcntl(fd, F_SETFD, FD_CLOEXEC);
-        }
-    }
-    return fd;
-}
-fn sysClose(fd: posix.socket_t) void {
-    _ = std.c.close(fd);
-}
-fn sysBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{BindFailed}!void {
-    if (std.c.bind(fd, addr, len) != 0) return error.BindFailed;
-}
-fn sysListen(fd: posix.socket_t, backlog: u31) error{ListenFailed}!void {
-    if (std.c.listen(fd, backlog) != 0) return error.ListenFailed;
-}
-fn sysConnect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{ConnectFailed}!void {
-    if (std.c.connect(fd, addr, len) != 0) return error.ConnectFailed;
-}
-fn sysAccept(fd: posix.socket_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t, _: u32) error{AcceptFailed}!posix.socket_t {
-    const rc = std.c.accept(fd, addr, len);
-    if (rc < 0) return error.AcceptFailed;
-    return @intCast(rc);
-}
-fn sysWrite(fd: posix.socket_t, buf: []const u8) error{WriteFailed}!usize {
+/// Write what the kernel will take. `null` when the socket is gone.
+fn sysWriteSome(fd: posix.socket_t, buf: []const u8) ?usize {
     const rc = std.c.write(fd, buf.ptr, buf.len);
-    if (rc < 0) return error.WriteFailed;
-    return @intCast(rc);
+    if (rc >= 0) return @intCast(rc);
+    return switch (posix.errno(rc)) {
+        .AGAIN, .INTR => 0,
+        else => null,
+    };
 }
-
-const SocketAddr = struct {
-    sa: posix.sockaddr.in,
-
-    fn initIp4(ip4: [4]u8, port: u16) SocketAddr {
-        return .{ .sa = .{
-            .family = std.c.AF.INET,
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = @bitCast(ip4),
-            .zero = .{0} ** 8,
-        } };
-    }
-    fn anyPtr(self: *const SocketAddr) *const posix.sockaddr {
-        return @ptrCast(&self.sa);
-    }
-    fn anyLen(_: SocketAddr) posix.socklen_t {
-        return @sizeOf(posix.sockaddr.in);
-    }
-};
-const InboxMessage = inbox_mod.Message;
 
 pub const MAX_PEERS = 7;
-pub const MAX_MSG_BUF = 256 * 1024 + 128;
-pub const RECV_BUF_SIZE = 65536;
+/// Connections mid-handshake, dialled or accepted. A stranger that opens
+/// connections and never speaks holds a slot only until the deadline.
+pub const MAX_LINKS = 16;
+/// Accepted connections may hold this many of them; the rest are kept for
+/// this node's own dials, so a flood cannot stop it re-forming its mesh.
+pub const MAX_ACCEPTED_LINKS = 12;
+/// Addresses worth re-dialling: every member seen plus the seeds.
+pub const MAX_KNOWN = 32;
 pub const TICK_INTERVAL_MS = 10;
-/// Deadlines for one dial, on the loop thread, where every millisecond is
-/// one nobody else is served. Seeds get longer: they are named by an
-/// operator and may be on another network.
-pub const SEED_CONNECT_TIMEOUT_MS: i32 = 2000;
-pub const MESH_CONNECT_TIMEOUT_MS: i32 = 1000;
+pub const HANDSHAKE_DEADLINE_MS: i64 = 2000;
+/// Bytes queued for one peer before it is dropped as too slow and
+/// re-dialled. What it missed shows on it as a replication gap.
+pub const SEND_QUEUE_CAP: usize = 8 * 1024 * 1024;
+pub const DIAL_BACKOFF_MIN_MS: i64 = 200;
+pub const DIAL_BACKOFF_MAX_MS: i64 = 5000;
+/// After this many consecutive failed dials the entry is said out loud once.
+pub const DIAL_WARN_AFTER: u32 = 10;
+pub const RAFT_QUEUE_CAPACITY: usize = 1024;
+/// A warn a flood could repeat per connection is said at most once per
+/// interval, with a count of what went unsaid.
+pub const WARN_INTERVAL_MS: i64 = 1000;
 
-/// Extended message types beyond MsgType enum in transport.zig
-pub const MSG_JOIN_REQUEST: u8 = 6;
-pub const MSG_JOIN_RESPONSE: u8 = 7;
-pub const MSG_REPLICATE_ENTRY: u8 = 8;
-pub const MSG_PEER_INFO: u8 = 9;
-
-/// Join request payload: node_id(4) + raft_port(2) + main_port(2) + advertised ip4(4)
-pub const JOIN_REQ_SIZE: usize = 12;
-/// Join response payload: node_id(4); `JOIN_REJECTED` (never a real id)
-/// means a live link already carries the dialer's id.
-pub const JOIN_RESP_SIZE: usize = 4;
-pub const JOIN_REJECTED: u32 = 0;
-/// Peer info payload: node_id(4) + ip4(4) + raft_port(2)
 pub const PEER_INFO_SIZE: usize = 10;
 
-pub const JoinRequest = struct {
-    node_id: u32,
-    raft_port: u16,
-    main_port: u16,
-    /// 0.0.0.0 means "use the address you see me connecting from".
-    ip4: [4]u8,
-
-    pub fn encode(self: JoinRequest, buf: *[JOIN_REQ_SIZE]u8) void {
-        std.mem.writeInt(u32, buf[0..4], self.node_id, .little);
-        std.mem.writeInt(u16, buf[4..6], self.raft_port, .little);
-        std.mem.writeInt(u16, buf[6..8], self.main_port, .little);
-        buf[8..12].* = self.ip4;
-    }
-
-    pub fn decode(buf: *const [JOIN_REQ_SIZE]u8) JoinRequest {
-        return .{
-            .node_id = std.mem.readInt(u32, buf[0..4], .little),
-            .raft_port = std.mem.readInt(u16, buf[4..6], .little),
-            .main_port = std.mem.readInt(u16, buf[6..8], .little),
-            .ip4 = buf[8..12].*,
-        };
-    }
-};
-
+/// What one node tells another about a third: id and where to dial it.
 pub const PeerInfo = struct {
     node_id: u32,
     ip4: [4]u8,
@@ -170,7 +101,6 @@ pub const PeerInfo = struct {
         buf[4..8].* = self.ip4;
         std.mem.writeInt(u16, buf[8..10], self.raft_port, .little);
     }
-
     pub fn decode(buf: *const [PEER_INFO_SIZE]u8) PeerInfo {
         return .{
             .node_id = std.mem.readInt(u32, buf[0..4], .little),
@@ -180,27 +110,41 @@ pub const PeerInfo = struct {
     }
 };
 
-/// A dial is retried this many times, this far apart, before the peer is
-/// given up on. Seeds get five times as long: they are named by an operator
-/// and the nodes of a cluster rarely start within seconds of each other.
-pub const DIAL_ATTEMPTS: u8 = 30;
-pub const SEED_DIAL_ATTEMPTS: u8 = 150;
-pub const DIAL_RETRY_MS: i64 = 200;
+/// Bytes waiting for one peer's socket. Bounded: a peer that does not
+/// read is dropped rather than buffered without limit.
+const SendQueue = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    head: usize = 0,
 
-pub const DialKind = enum {
-    /// Named by the operator; its node id is unknown until it answers.
-    seed,
-    /// Learned through peer exchange.
-    mesh,
-};
+    fn deinit(self: *SendQueue, allocator: Allocator) void {
+        self.buf.deinit(allocator);
+    }
 
-const PendingDial = struct {
-    info: PeerInfo,
-    kind: DialKind,
-    attempts: u8 = 0,
-    not_before_ms: i64 = 0,
-    /// The rejection warning is said once per entry.
-    warned: bool = false,
+    fn pending(self: *const SendQueue) []const u8 {
+        return self.buf.items[self.head..];
+    }
+
+    fn append(self: *SendQueue, allocator: Allocator, bytes: []const u8) error{ Overflow, OutOfMemory }!void {
+        if (self.pending().len + bytes.len > SEND_QUEUE_CAP) return error.Overflow;
+        if (self.head > 0 and self.head >= self.buf.items.len / 2) {
+            std.mem.copyForwards(u8, self.buf.items, self.buf.items[self.head..]);
+            self.buf.shrinkRetainingCapacity(self.buf.items.len - self.head);
+            self.head = 0;
+        }
+        try self.buf.appendSlice(allocator, bytes);
+    }
+
+    /// Write what the kernel takes. False when the socket is gone.
+    fn flush(self: *SendQueue, fd: posix.socket_t) bool {
+        while (self.pending().len > 0) {
+            const n = sysWriteSome(fd, self.pending()) orelse return false;
+            if (n == 0) return true;
+            self.head += n;
+        }
+        self.buf.clearRetainingCapacity();
+        self.head = 0;
+        return true;
+    }
 };
 
 pub const PeerState = struct {
@@ -209,8 +153,54 @@ pub const PeerState = struct {
     fd: posix.socket_t = -1,
     ip4: [4]u8 = .{ 0, 0, 0, 0 },
     raft_port: u16 = 0,
-    recv_buf: [RECV_BUF_SIZE]u8 = undefined,
-    recv_len: usize = 0,
+    /// Who dialled this link; decides which of two crossing links survives.
+    dialed_by_me: bool = false,
+    framer: ?Framer = null,
+    out: SendQueue = .{},
+};
+
+const Role = enum { dialer, acceptor };
+const Stage = enum { connecting, hello_awaited, hello_back_awaited, verify_awaited, welcome_awaited };
+
+/// A connection between accept-or-connect and peer: the handshake in
+/// progress, driven by poll, with a deadline.
+const Link = struct {
+    active: bool = false,
+    fd: posix.socket_t = -1,
+    role: Role = .dialer,
+    stage: Stage = .connecting,
+    deadline_ms: i64 = 0,
+    my_nonce: [handshake.NONCE_LEN]u8 = undefined,
+    /// The other side's hello once it has arrived.
+    their: ?handshake.Hello = null,
+    /// Dialer: the address dialled (also the known-table key). Acceptor:
+    /// the address the peer will be recorded at, once its hello is in.
+    ip4: [4]u8 = .{ 0, 0, 0, 0 },
+    raft_port: u16 = 0,
+    /// Acceptor: where the connection came from.
+    observed_ip4: [4]u8 = .{ 0, 0, 0, 0 },
+    in: [LINK_BUF]u8 = undefined,
+    in_len: usize = 0,
+    out: [LINK_BUF]u8 = undefined,
+    out_head: usize = 0,
+    out_len: usize = 0,
+
+    const LINK_BUF = 2 * (HEADER_SIZE + handshake.HELLO_BACK_SIZE);
+};
+
+/// An address worth dialling while no link to it is up: a seed the
+/// operator named (id unknown until it answers) or a member met before.
+const Known = struct {
+    active: bool = false,
+    node_id: u32 = 0,
+    ip4: [4]u8 = .{ 0, 0, 0, 0 },
+    raft_port: u16 = 0,
+    seed: bool = false,
+    dialing: bool = false,
+    next_dial_ms: i64 = 0,
+    backoff_ms: i64 = DIAL_BACKOFF_MIN_MS,
+    failures: u32 = 0,
+    warned: bool = false,
 };
 
 pub const RaftNetwork = struct {
@@ -220,26 +210,44 @@ pub const RaftNetwork = struct {
     main_port: u16,
     advertise_ip4: [4]u8,
     listener_fd: posix.socket_t,
+    secret: []u8,
     peers: [MAX_PEERS]PeerState,
     peer_count: u8,
+    links: [MAX_LINKS]Link,
+    known: [MAX_KNOWN]Known,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
     /// Guards `pending` (entries to broadcast). Taken on the shard thread's
     /// commit path, so it is never held across anything that waits.
-    mutex: @import("stdx").Mutex,
+    mutex: stdx.Mutex,
     pending: std.ArrayListUnmanaged([]u8),
-    /// Guards `pending_peers`. Never held across a dial either.
-    dial_mutex: @import("stdx").Mutex,
-    shard_inbox: ?*Inbox,
-    /// Peers learned through peer exchange that we are still trying to reach.
-    pending_peers: [MAX_PEERS]PendingDial,
-    pending_peer_count: u8,
-    /// Optional replication metrics (issue #16). Set by the runtime when the
-    /// dashboard/metrics registry is enabled; null otherwise (logging still fires).
+    /// Guards `dial_requests`, seeds handed over by the runtime.
+    dial_mutex: stdx.Mutex,
+    dial_requests: std.ArrayListUnmanaged(PeerInfo),
+    /// The loop sleeps in poll; a broadcast or a dial request writes a byte
+    /// here so it does not wait out the tick.
+    wake_rd: posix.fd_t,
+    wake_wr: posix.fd_t,
+    /// Where whole frames from peers go. Null only in tests without a shard.
+    raft_queue: ?*RaftQueue,
+    /// While the shard's queue is above its high watermark no peer is read;
+    /// the kernel's buffers fill and the peers' writes stall — backpressure
+    /// all the way back to the sender.
+    reads_paused: bool,
+    /// One 4 MiB frame buffer for outbound framing, reused.
+    scratch: []u8,
     repl_metrics: ?*ReplicationMetrics = null,
+    refuse_warn: WarnLimiter = .{},
+    fail_warn: WarnLimiter = .{},
+
+    // Counters, written by the loop thread, read by anyone.
+    handshake_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    frames_rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    peer_disconnects: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slow_peer_drops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// `bind_ip4`: listener address; advertised to peers unless 0.0.0.0.
-    pub fn init(allocator: Allocator, node_id: u32, listen_port: u16, main_port: u16, bind_ip4: [4]u8) !RaftNetwork {
+    pub fn init(allocator: Allocator, node_id: u32, listen_port: u16, main_port: u16, bind_ip4: [4]u8, secret: []const u8) !RaftNetwork {
         const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer sysClose(fd);
 
@@ -252,6 +260,19 @@ pub const RaftNetwork = struct {
         // Port 0 asks the kernel for one; peers must be told the real one.
         const bound_port = if (listen_port == 0) (try stdx_net.sysLocalIp4(fd)).port else listen_port;
 
+        const wake_pipe = try stdx.io.pipe();
+        errdefer {
+            _ = std.c.close(wake_pipe[0]);
+            _ = std.c.close(wake_pipe[1]);
+        }
+        try stdx_net.sysFcntlSetNonblocking(wake_pipe[0]);
+        try stdx_net.sysFcntlSetNonblocking(wake_pipe[1]);
+
+        const scratch = try allocator.alloc(u8, framer_mod.MAX_FRAME_SIZE);
+        errdefer allocator.free(scratch);
+        const owned_secret = try allocator.dupe(u8, secret);
+        errdefer allocator.free(owned_secret);
+
         return .{
             .allocator = allocator,
             .node_id = node_id,
@@ -259,62 +280,61 @@ pub const RaftNetwork = struct {
             .main_port = main_port,
             .advertise_ip4 = bind_ip4,
             .listener_fd = fd,
+            .secret = owned_secret,
             .peers = [_]PeerState{.{}} ** MAX_PEERS,
             .peer_count = 0,
+            .links = [_]Link{.{}} ** MAX_LINKS,
+            .known = [_]Known{.{}} ** MAX_KNOWN,
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .mutex = .{},
             .pending = .empty,
             .dial_mutex = .{},
-            .shard_inbox = null,
-            .pending_peers = undefined,
-            .pending_peer_count = 0,
-            .repl_metrics = null,
+            .dial_requests = .empty,
+            .wake_rd = wake_pipe[0],
+            .wake_wr = wake_pipe[1],
+            .raft_queue = null,
+            .reads_paused = false,
+            .scratch = scratch,
         };
     }
 
-    /// Wire replication metrics (issue #16). Optional — when unset, the loud
-    /// log lines still fire; only the counters are skipped.
     pub fn setReplicationMetrics(self: *RaftNetwork, m: *ReplicationMetrics) void {
         self.repl_metrics = m;
     }
 
     pub fn deinit(self: *RaftNetwork) void {
         self.stop();
+        @memset(self.secret, 0);
         sysClose(self.listener_fd);
-        for (self.pending.items) |data| {
-            self.allocator.free(data);
-        }
+        for (self.pending.items) |data| self.allocator.free(data);
         self.pending.deinit(self.allocator);
-        for (&self.peers) |*p| {
-            if (p.active) {
-                sysClose(p.fd);
-                p.active = false;
-            }
-        }
+        self.dial_requests.deinit(self.allocator);
+        for (&self.peers) |*p| self.closePeer(p);
+        for (&self.links) |*l| if (l.active) {
+            sysClose(l.fd);
+            l.active = false;
+        };
+        _ = std.c.close(self.wake_rd);
+        _ = std.c.close(self.wake_wr);
+        self.allocator.free(self.scratch);
+        self.allocator.free(self.secret);
     }
 
-    pub fn setShardInbox(self: *RaftNetwork, inbox: *Inbox) void {
-        self.shard_inbox = inbox;
+    /// Frames from peers go here. Set before `start`.
+    pub fn setRaftQueue(self: *RaftNetwork, q: *RaftQueue) void {
+        self.raft_queue = q;
     }
 
     /// Ask the loop thread to join the cluster through this address. Only
     /// that thread touches the peer table, and startup does not wait.
     pub fn dialSeed(self: *RaftNetwork, ip4: [4]u8, port: u16) void {
-        self.dial_mutex.lock();
-        defer self.dial_mutex.unlock();
-        self.queueDial(.{ .node_id = 0, .ip4 = ip4, .raft_port = port }, .seed);
-    }
-
-    fn joinRequestBytes(self: *const RaftNetwork) [JOIN_REQ_SIZE]u8 {
-        var payload: [JOIN_REQ_SIZE]u8 = undefined;
-        JoinRequest.encode(.{
-            .node_id = self.node_id,
-            .raft_port = self.listen_port,
-            .main_port = self.main_port,
-            .ip4 = self.advertise_ip4,
-        }, &payload);
-        return payload;
+        {
+            self.dial_mutex.lock();
+            defer self.dial_mutex.unlock();
+            self.dial_requests.append(self.allocator, .{ .node_id = 0, .ip4 = ip4, .raft_port = port }) catch return;
+        }
+        self.wake();
     }
 
     /// Queue a serialized entry for broadcast to all peers.
@@ -322,9 +342,17 @@ pub const RaftNetwork = struct {
     pub fn broadcastEntry(self: *RaftNetwork, entry_data: []const u8) !void {
         const dup = try self.allocator.dupe(u8, entry_data);
         errdefer self.allocator.free(dup);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.pending.append(self.allocator, dup);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.pending.append(self.allocator, dup);
+        }
+        self.wake();
+    }
+
+    fn wake(self: *RaftNetwork) void {
+        const byte = [_]u8{1};
+        _ = std.c.write(self.wake_wr, &byte, 1);
     }
 
     pub fn start(self: *RaftNetwork) !void {
@@ -335,515 +363,891 @@ pub const RaftNetwork = struct {
     pub fn stop(self: *RaftNetwork) void {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
+        self.wake();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
     }
 
+    // ── The loop ─────────────────────────────────────────────────────────
+
     fn networkLoop(self: *RaftNetwork) void {
+        var fds: [2 + MAX_LINKS + MAX_PEERS]posix.pollfd = undefined;
         while (self.running.load(.acquire)) {
-            self.acceptPending();
-            self.readFromPeers();
+            self.takeDialRequests();
+            self.dialDue();
+            self.applyBackpressure();
+            if (!self.reads_paused) {
+                // Frames left in a framer when reading paused are not
+                // reported by poll; drain them before asking for more.
+                for (&self.peers) |*p| {
+                    if (p.active and p.framer.?.len > 0) self.drainFramer(p);
+                    if (self.reads_paused) break;
+                }
+            }
+
+            var n: usize = 0;
+            fds[n] = .{ .fd = self.listener_fd, .events = posix.POLL.IN, .revents = 0 };
+            n += 1;
+            fds[n] = .{ .fd = self.wake_rd, .events = posix.POLL.IN, .revents = 0 };
+            n += 1;
+            const links_at = n;
+            for (&self.links) |*l| {
+                if (!l.active) continue;
+                var ev: i16 = posix.POLL.IN;
+                if (l.stage == .connecting or l.out_len > l.out_head) ev |= posix.POLL.OUT;
+                fds[n] = .{ .fd = l.fd, .events = ev, .revents = 0 };
+                n += 1;
+            }
+            const peers_at = n;
+            for (&self.peers) |*p| {
+                if (!p.active) continue;
+                var ev: i16 = if (self.reads_paused) 0 else posix.POLL.IN;
+                if (p.out.pending().len > 0) ev |= posix.POLL.OUT;
+                // A paused peer with nothing to write is left out: poll
+                // would report its hang-up every call and spin.
+                if (ev == 0) continue;
+                fds[n] = .{ .fd = p.fd, .events = ev, .revents = 0 };
+                n += 1;
+            }
+
+            _ = posix.poll(fds[0..n], TICK_INTERVAL_MS) catch 0;
+
+            // Results are matched to links and peers by descriptor, within
+            // the range each was polled in: stepping a link can promote it
+            // to a peer, and a slot freed here may be refilled before the
+            // pass is over. New connections are accepted last for the same
+            // reason.
+            for (fds[links_at..peers_at]) |pf| {
+                if (pf.revents == 0) continue;
+                const l = self.linkByFd(pf.fd) orelse continue;
+                self.stepLink(l, pf.revents);
+            }
+            for (fds[peers_at..n]) |pf| {
+                if (pf.revents == 0) continue;
+                const p = self.peerByFd(pf.fd) orelse continue;
+                if (pf.revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                    self.dropPeer(p, "socket error");
+                    continue;
+                }
+                if (pf.revents & posix.POLL.IN != 0) self.readPeer(p);
+                if (p.active and pf.revents & posix.POLL.OUT != 0) {
+                    if (!p.out.flush(p.fd)) self.dropPeer(p, "write failed");
+                }
+                if (p.active and pf.revents & posix.POLL.HUP != 0 and p.framer.?.len == 0) self.dropPeer(p, "peer closed");
+            }
+            if (fds[1].revents != 0) self.drainWake();
+            if (fds[0].revents != 0) self.acceptPending();
+
             self.flushPending();
-            self.connectPendingPeers();
-            @import("stdx").time.sleep(TICK_INTERVAL_MS * std.time.ns_per_ms);
+            self.expireLinks();
         }
     }
+
+    fn linkByFd(self: *RaftNetwork, fd: posix.socket_t) ?*Link {
+        for (&self.links) |*l| if (l.active and l.fd == fd) return l;
+        return null;
+    }
+
+    fn peerByFd(self: *RaftNetwork, fd: posix.socket_t) ?*PeerState {
+        for (&self.peers) |*p| if (p.active and p.fd == fd) return p;
+        return null;
+    }
+
+    fn drainWake(self: *RaftNetwork) void {
+        var buf: [64]u8 = undefined;
+        while (std.c.read(self.wake_rd, &buf, buf.len) > 0) {}
+    }
+
+    fn applyBackpressure(self: *RaftNetwork) void {
+        const q = self.raft_queue orelse return;
+        if (!self.reads_paused and q.aboveHigh()) {
+            self.pauseReads();
+        } else if (self.reads_paused and q.belowLow()) {
+            self.reads_paused = false;
+            log.info("raft: shard queue drained; reading peers again", .{});
+        }
+    }
+
+    fn pauseReads(self: *RaftNetwork) void {
+        self.reads_paused = true;
+        log.warn("raft: shard queue above its high watermark; not reading peers until it drains", .{});
+    }
+
+    // ── Accept and dial ──────────────────────────────────────────────────
 
     fn acceptPending(self: *RaftNetwork) void {
         while (true) {
             var client_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            const client_fd = sysAccept(self.listener_fd, @ptrCast(&client_addr), &addr_len, 0) catch return;
-
-            // Read join request with timeout
-            var req_buf: [HEADER_SIZE + JOIN_REQ_SIZE + 16]u8 = undefined;
-            const n = readWithTimeout(client_fd, &req_buf, 2000) catch |err| {
-                log.debug("raft: join request read failed fd={d}: {s}", .{ client_fd, @errorName(err) });
-                sysClose(client_fd);
+            const fd = sysAccept(self.listener_fd, @ptrCast(&client_addr), &addr_len) catch return;
+            stdx_net.sysFcntlSetNonblocking(fd) catch {
+                sysClose(fd);
                 continue;
             };
-            if (n < HEADER_SIZE + JOIN_REQ_SIZE) {
-                sysClose(client_fd);
-                continue;
-            }
-
-            const hdr = RaftHeader.fromBytes(req_buf[0..HEADER_SIZE]);
-            if (hdr.msg_type != MSG_JOIN_REQUEST) {
-                sysClose(client_fd);
-                continue;
-            }
-
-            const join = JoinRequest.decode(req_buf[HEADER_SIZE..][0..JOIN_REQ_SIZE]);
-            const peer_node_id = join.node_id;
-            const peer_raft_port = join.raft_port;
-            if (peer_node_id == self.node_id) {
-                // Our own seed list names us (the usual case: every node lists
-                // every node), or another node carries our id. Answer so the
-                // dialer can tell which, then close.
-                _ = self.sendJoinResponse(client_fd, self.node_id);
-                sysClose(client_fd);
-                continue;
-            }
             const observed = stdx_net.ip4FromSockaddr(@ptrCast(&client_addr)) orelse {
-                sysClose(client_fd);
+                sysClose(fd);
                 continue;
             };
-            const peer_ip4 = peerAddressFor(join.ip4, observed) orelse {
-                log.warn("raft: rejected join from node {d}: advertised address {d}.{d}.{d}.{d} is not dialable", .{ peer_node_id, join.ip4[0], join.ip4[1], join.ip4[2], join.ip4[3] });
-                sysClose(client_fd);
-                continue;
-            };
-
-            if (self.peerByNodeId(peer_node_id)) |held| {
-                if (held.raft_port != peer_raft_port or !std.mem.eql(u8, &held.ip4, &peer_ip4)) {
-                    log.warn("raft: node {d} joined from {d}.{d}.{d}.{d}:{d} while linked at {d}.{d}.{d}.{d}:{d} — two nodes may share an id (set [cluster] node_id)", .{ peer_node_id, peer_ip4[0], peer_ip4[1], peer_ip4[2], peer_ip4[3], peer_raft_port, held.ip4[0], held.ip4[1], held.ip4[2], held.ip4[3], held.raft_port });
+            const maybe: ?*Link = if (self.acceptedLinks() < MAX_ACCEPTED_LINKS) self.freeLink() else null;
+            const l = maybe orelse {
+                if (self.refuse_warn.due()) |unsaid| {
+                    if (unsaid == 0) {
+                        log.warn("raft: too many connections mid-handshake; refusing one from {d}.{d}.{d}.{d}", .{ observed[0], observed[1], observed[2], observed[3] });
+                    } else {
+                        log.warn("raft: too many connections mid-handshake; refusing one from {d}.{d}.{d}.{d} ({d} more refused since the last line)", .{ observed[0], observed[1], observed[2], observed[3], unsaid });
+                    }
                 }
-                // A dial that timed out leaves its connection in our backlog
-                // and we may well accept that one first. Keep whichever link
-                // is alive; a live one wins over a newer one, and the newer
-                // dialer is told so rather than left guessing.
-                if (linkAlive(held.fd)) {
-                    _ = self.sendJoinResponse(client_fd, JOIN_REJECTED);
-                    sysClose(client_fd);
-                    continue;
-                }
-                self.dropPeer(peer_node_id);
-            }
-
-            if (self.peer_count >= MAX_PEERS) {
-                // Announcing a peer we cannot hold would send everyone dialing it.
-                log.warn("raft: no free peer slot for node {d} (at most {d} peers)", .{ peer_node_id, MAX_PEERS });
-                sysClose(client_fd);
-                continue;
-            }
-
-            if (!self.sendJoinResponse(client_fd, self.node_id)) {
-                sysClose(client_fd);
-                continue;
-            }
-
-            // Peer exchange: tell the new peer about all existing peers
-            for (&self.peers) |*p| {
-                if (!p.active or p.raft_port == 0) continue;
-                self.sendPeerInfo(client_fd, .{ .node_id = p.node_id, .ip4 = p.ip4, .raft_port = p.raft_port });
-            }
-
-            // Tell existing peers about the new peer
-            for (&self.peers) |*p| {
-                if (!p.active) continue;
-                self.sendPeerInfo(p.fd, .{ .node_id = peer_node_id, .ip4 = peer_ip4, .raft_port = peer_raft_port });
-            }
-
-            setNonBlocking(client_fd) catch {
-                sysClose(client_fd);
+                sysClose(fd);
                 continue;
             };
-
-            self.addPeerByFd(peer_node_id, client_fd, peer_ip4, peer_raft_port);
-        }
-    }
-
-    /// Answer a join. `JOIN_REJECTED` tells the dialer a live link already
-    /// carries its id.
-    fn sendJoinResponse(self: *RaftNetwork, fd: posix.socket_t, node_id: u32) bool {
-        var payload: [JOIN_RESP_SIZE]u8 = undefined;
-        std.mem.writeInt(u32, payload[0..4], node_id, .little);
-        var buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
-        _ = frameCustomMessage(MSG_JOIN_RESPONSE, 0, self.node_id, &payload, &buf);
-        _ = sysWrite(fd, &buf) catch |err| {
-            log.debug("raft: join response write failed fd={d}: {s}", .{ fd, @errorName(err) });
-            return false;
-        };
-        return true;
-    }
-
-    /// Send a MSG_PEER_INFO message to a specific fd.
-    fn sendPeerInfo(self: *RaftNetwork, fd: posix.socket_t, info: PeerInfo) void {
-        var payload: [PEER_INFO_SIZE]u8 = undefined;
-        info.encode(&payload);
-        var buf: [HEADER_SIZE + PEER_INFO_SIZE]u8 = undefined;
-        const total = frameCustomMessage(MSG_PEER_INFO, 0, self.node_id, &payload, &buf);
-        _ = sysWrite(fd, buf[0..total]) catch {};
-    }
-
-    fn readFromPeers(self: *RaftNetwork) void {
-        for (&self.peers) |*p| {
-            if (!p.active) continue;
-            const space = p.recv_buf[p.recv_len..];
-            if (space.len == 0) {
-                p.recv_len = 0;
-                continue;
-            }
-            const n = posix.read(p.fd, space) catch |err| {
-                if (err == error.WouldBlock) continue;
-                log.info("raft: peer {d} link lost: {s}", .{ p.node_id, @errorName(err) });
-                sysClose(p.fd);
-                p.active = false;
-                if (self.peer_count > 0) self.peer_count -= 1;
-                continue;
-            };
-            if (n == 0) {
-                log.info("raft: peer {d} disconnected", .{p.node_id});
-                sysClose(p.fd);
-                p.active = false;
-                if (self.peer_count > 0) self.peer_count -= 1;
-                continue;
-            }
-            p.recv_len += n;
-            self.processMessages(p);
-        }
-    }
-
-    fn processMessages(self: *RaftNetwork, peer: *PeerState) void {
-        var offset: usize = 0;
-        while (offset + HEADER_SIZE <= peer.recv_len) {
-            const hdr = RaftHeader.fromBytes(peer.recv_buf[offset..][0..HEADER_SIZE]);
-            const payload_len: usize = @intCast(hdr.payload_len);
-            const msg_size = HEADER_SIZE + payload_len;
-            if (offset + msg_size > peer.recv_len) break;
-
-            const payload = peer.recv_buf[offset + HEADER_SIZE .. offset + msg_size];
-
-            if (hdr.msg_type == MSG_REPLICATE_ENTRY) {
-                self.pushToShardInbox(payload);
-                // Rebroadcast to other peers (mesh forwarding for late joiners)
-                self.rebroadcast(peer.fd, hdr.source_node, payload);
-            } else if (hdr.msg_type == MSG_PEER_INFO and payload_len >= PEER_INFO_SIZE) {
-                const info = PeerInfo.decode(payload[0..PEER_INFO_SIZE]);
-                // Queue connection if not already connected and not ourselves
-                if (info.node_id != self.node_id and !self.hasPeer(info.node_id) and info.raft_port > 0) {
-                    self.dial_mutex.lock();
-                    defer self.dial_mutex.unlock();
-                    self.queueDial(info, .mesh);
-                }
-            }
-
-            offset += msg_size;
-        }
-
-        // Compact the buffer
-        if (offset > 0) {
-            if (offset < peer.recv_len) {
-                std.mem.copyForwards(u8, &peer.recv_buf, peer.recv_buf[offset..peer.recv_len]);
-            }
-            peer.recv_len -= offset;
-        }
-    }
-
-    fn rebroadcast(self: *RaftNetwork, sender_fd: posix.socket_t, source_node: u32, entry_data: []const u8) void {
-        // In a full mesh, the source has already sent to all its peers.
-        // Only rebroadcast if there are peers that might not have received it
-        // (e.g., nodes that joined after the source). Skip the sender and the
-        // original source node to avoid duplicates.
-        var msg_buf: [MAX_MSG_BUF]u8 = undefined;
-        if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) {
-            log.warn("raft: entry too large to re-broadcast ({d} bytes > {d} max) — not forwarded; late-joining peers will diverge", .{ entry_data.len + HEADER_SIZE, MAX_MSG_BUF });
-            if (self.repl_metrics) |m| m.recordOversizeSkipped();
-            return;
-        }
-        const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, source_node, entry_data, &msg_buf);
-        for (&self.peers) |*p| {
-            if (!p.active) continue;
-            if (p.fd == sender_fd) continue;
-            if (p.node_id == source_node) continue;
-            _ = sysWrite(p.fd, msg_buf[0..total]) catch |err| blk: {
-                log.warn("raft: failed to re-broadcast entry to peer node {d}: {s} — not delivered, no retry", .{ p.node_id, @errorName(err) });
-                if (self.repl_metrics) |m| m.recordSendFailure();
-                break :blk 0;
+            l.* = .{ .active = true, .fd = fd, .role = .acceptor, .stage = .hello_awaited, .deadline_ms = stdx.time.milliTimestamp() + HANDSHAKE_DEADLINE_MS, .observed_ip4 = observed };
+            stdx.io.instance().randomSecure(&l.my_nonce) catch {
+                self.endLink(l, "no entropy for a nonce");
             };
         }
     }
 
-    fn flushPending(self: *RaftNetwork) void {
-        // Swap out the pending list under lock
-        self.mutex.lock();
-        var to_send = self.pending;
-        self.pending = .empty;
-        self.mutex.unlock();
-
-        defer {
-            for (to_send.items) |data| {
-                self.allocator.free(data);
-            }
-            to_send.deinit(self.allocator);
-        }
-
-        for (to_send.items) |entry_data| {
-            var msg_buf: [MAX_MSG_BUF]u8 = undefined;
-            if (entry_data.len + HEADER_SIZE > MAX_MSG_BUF) {
-                log.warn("raft: committed entry too large to replicate ({d} bytes > {d} max) — NOT broadcast to any peer; all followers will diverge on this entry", .{ entry_data.len + HEADER_SIZE, MAX_MSG_BUF });
-                if (self.repl_metrics) |m| m.recordOversizeSkipped();
-                continue;
-            }
-            const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, self.node_id, entry_data, &msg_buf);
-            for (&self.peers) |*p| {
-                if (!p.active) continue;
-                _ = sysWrite(p.fd, msg_buf[0..total]) catch |err| blk: {
-                    log.warn("raft: failed to broadcast entry to peer node {d}: {s} — not delivered, no retry (follower may diverge)", .{ p.node_id, @errorName(err) });
-                    if (self.repl_metrics) |m| m.recordSendFailure();
-                    break :blk 0;
-                };
-            }
-        }
-    }
-
-    /// Remember a dial, once. Seeds have no id yet, so they are told apart
-    /// by address; a mesh entry already pending under this id takes the
-    /// newer address. A full list drops a mesh entry that has already
-    /// failed, never a seed; if nothing has failed yet the newcomer is not
-    /// queued (a later join's peer info may queue it). Caller holds
-    /// `dial_mutex`.
-    fn queueDial(self: *RaftNetwork, info: PeerInfo, kind: DialKind) void {
-        for (self.pending_peers[0..self.pending_peer_count]) |*p| {
-            if (kind == .seed) {
-                if (p.kind == .seed and p.info.raft_port == info.raft_port and std.mem.eql(u8, &p.info.ip4, &info.ip4)) return;
-            } else if (p.kind == .mesh and p.info.node_id == info.node_id) {
-                p.info = info;
-                return;
-            }
-        }
-        const entry: PendingDial = .{ .info = info, .kind = kind };
-        if (self.pending_peer_count < MAX_PEERS) {
-            self.pending_peers[self.pending_peer_count] = entry;
-            self.pending_peer_count += 1;
-            return;
-        }
-        var victim: ?usize = null;
-        for (self.pending_peers[0..self.pending_peer_count], 0..) |p, i| {
-            if (p.kind != .mesh or p.attempts == 0) continue;
-            if (victim == null or p.attempts > self.pending_peers[victim.?].attempts) victim = i;
-        }
-        const v = victim orelse {
-            log.debug("raft: dial list full; not queuing peer {d}", .{info.node_id});
-            return;
-        };
-        log.debug("raft: dial list full; dropping peer {d} after {d} attempts for peer {d}", .{ self.pending_peers[v].info.node_id, self.pending_peers[v].attempts, info.node_id });
-        self.pending_peers[v] = entry;
-    }
-
-    /// Dial one pending entry per tick, retrying at a fixed interval: the
-    /// far side's loop may be busy in a handshake of its own when we call,
-    /// and a single failed dial would otherwise mean no link for the life
-    /// of the process. The entry is copied out and the lock released
-    /// before dialing, so nothing that queues a dial or a broadcast waits
-    /// on a socket.
-    fn connectPendingPeers(self: *RaftNetwork) void {
-        const now = @import("stdx").time.milliTimestamp();
-        const picked: PendingDial = blk: {
-            self.dial_mutex.lock();
-            defer self.dial_mutex.unlock();
-            var i: usize = 0;
-            var due: ?usize = null;
-            while (i < self.pending_peer_count) {
-                const p = &self.pending_peers[i];
-                const done = switch (p.kind) {
-                    .seed => self.peerByAddress(p.info.ip4, p.info.raft_port) != null,
-                    // Both sides learn of each other from the same peer
-                    // exchange and would dial at once. A dial blocks this
-                    // single loop thread on the join response, which only the
-                    // far side's loop can send — two mutual dials both time
-                    // out. The lower id dials; the higher id waits for it.
-                    .mesh => self.hasPeer(p.info.node_id) or p.info.node_id < self.node_id,
-                };
-                if (done) {
-                    self.dropPending(i);
-                    continue;
-                }
-                // Least recently tried first, so two dead entries whose dials
-                // outlast the retry interval cannot starve the others.
-                if (p.not_before_ms <= now and (due == null or p.not_before_ms < self.pending_peers[due.?].not_before_ms)) due = i;
-                i += 1;
-            }
-            const d = due orelse return;
-            break :blk self.pending_peers[d];
-        };
-
-        const outcome = self.dial(picked.info.ip4, picked.info.raft_port, picked.kind);
-
+    fn takeDialRequests(self: *RaftNetwork) void {
         self.dial_mutex.lock();
         defer self.dial_mutex.unlock();
-        const i = self.findPending(picked) orelse return;
-        const p = &self.pending_peers[i];
-        const budget: u8 = if (p.kind == .seed) SEED_DIAL_ATTEMPTS else DIAL_ATTEMPTS;
-        switch (outcome) {
-            .linked, .finished => {
-                self.dropPending(i);
-                return;
-            },
-            // The far side may hold a link to us that died without a FIN;
-            // it will notice on its next write, and we are the side that
-            // dials. Keep trying, and say so once.
-            .rejected => if (!p.warned) {
-                p.warned = true;
-                log.warn("raft: {d}.{d}.{d}.{d}:{d} refused our join: a live link already carries our node id {d} — it may still hold a stale link to us, or another node shares our id (set [cluster] node_id)", .{ picked.info.ip4[0], picked.info.ip4[1], picked.info.ip4[2], picked.info.ip4[3], picked.info.raft_port, self.node_id });
-            },
-            .failed => {},
-        }
-        p.attempts += 1;
-        if (p.attempts >= budget) {
-            switch (p.kind) {
-                .seed => log.warn("cluster: could not join seed {d}.{d}.{d}.{d}:{d} after {d} attempts; continuing alone", .{ picked.info.ip4[0], picked.info.ip4[1], picked.info.ip4[2], picked.info.ip4[3], picked.info.raft_port, p.attempts }),
-                .mesh => log.warn("raft: giving up on peer {d} at {d}.{d}.{d}.{d}:{d} after {d} attempts", .{ picked.info.node_id, picked.info.ip4[0], picked.info.ip4[1], picked.info.ip4[2], picked.info.ip4[3], picked.info.raft_port, p.attempts }),
-            }
-            self.dropPending(i);
-            return;
-        }
-        p.not_before_ms = @import("stdx").time.milliTimestamp() + DIAL_RETRY_MS;
+        for (self.dial_requests.items) |req| self.noteKnown(req.node_id, req.ip4, req.raft_port, true);
+        self.dial_requests.clearRetainingCapacity();
     }
 
-    /// The entry a dial was started for may have moved (swap-remove) or been
-    /// replaced while the lock was released; find it again by identity.
-    fn findPending(self: *RaftNetwork, d: PendingDial) ?usize {
-        for (self.pending_peers[0..self.pending_peer_count], 0..) |p, i| {
-            if (p.kind != d.kind) continue;
-            const same = if (d.kind == .seed)
-                p.info.raft_port == d.info.raft_port and std.mem.eql(u8, &p.info.ip4, &d.info.ip4)
-            else
-                p.info.node_id == d.info.node_id;
-            if (same) return i;
+    /// Remember an address to keep a link to. Members are keyed by id; a
+    /// seed (id 0, named by the operator) by address until it answers and
+    /// its id is learned, when the entry becomes the member's. One id has
+    /// one address and one address one id: a node replaced at the same
+    /// address under a new id, or moved to a new address, retires what was
+    /// known before, or the old entry would be dialled forever.
+    fn noteKnown(self: *RaftNetwork, node_id: u32, ip4: [4]u8, port: u16, seed: bool) void {
+        if (node_id == self.node_id) return;
+        var free: ?*Known = null;
+        var keep: ?*Known = null;
+        var was_seed = seed;
+        for (&self.known) |*k| {
+            if (!k.active) {
+                if (free == null) free = k;
+                continue;
+            }
+            const same_addr = k.raft_port == port and std.mem.eql(u8, &k.ip4, &ip4);
+            const same_id = node_id != 0 and k.node_id == node_id;
+            if (node_id == 0) {
+                if (same_addr) {
+                    k.seed = k.seed or seed;
+                    return;
+                }
+                continue;
+            }
+            if (same_id or same_addr) {
+                was_seed = was_seed or k.seed;
+                if (keep == null) {
+                    keep = k;
+                } else {
+                    k.active = false;
+                }
+            }
+        }
+        if (keep) |k| {
+            const moved = k.raft_port != port or !std.mem.eql(u8, &k.ip4, &ip4);
+            k.node_id = node_id;
+            k.ip4 = ip4;
+            k.raft_port = port;
+            k.seed = was_seed;
+            if (moved) k.dialing = false;
+            return;
+        }
+        const k = free orelse {
+            log.warn("raft: known-peer table full ({d}); not remembering {d}.{d}.{d}.{d}:{d}", .{ MAX_KNOWN, ip4[0], ip4[1], ip4[2], ip4[3], port });
+            return;
+        };
+        k.* = .{ .active = true, .node_id = node_id, .ip4 = ip4, .raft_port = port, .seed = seed };
+    }
+
+    fn forgetKnown(self: *RaftNetwork, ip4: [4]u8, port: u16) void {
+        for (&self.known) |*k| {
+            if (k.active and k.raft_port == port and std.mem.eql(u8, &k.ip4, &ip4)) k.active = false;
+        }
+    }
+
+    fn knownByAddress(self: *RaftNetwork, ip4: [4]u8, port: u16) ?*Known {
+        for (&self.known) |*k| {
+            if (k.active and k.raft_port == port and std.mem.eql(u8, &k.ip4, &ip4)) return k;
         }
         return null;
     }
 
-    fn dropPending(self: *RaftNetwork, i: usize) void {
-        const last = self.pending_peer_count - 1;
-        if (i != last) self.pending_peers[i] = self.pending_peers[last];
-        self.pending_peer_count = last;
+    /// Start a non-blocking dial to every known address that has no link
+    /// and is due. Both sides dial: a restarted node remembers nobody, so
+    /// waiting to be dialled could wait forever. Two links that cross are
+    /// settled by `linkWins`, the same way on both nodes.
+    fn dialDue(self: *RaftNetwork) void {
+        const now = stdx.time.milliTimestamp();
+        for (&self.known) |*k| {
+            if (!k.active or k.dialing or k.next_dial_ms > now) continue;
+            if (k.node_id != 0) {
+                if (self.hasPeer(k.node_id)) continue;
+            } else if (self.peerByAddress(k.ip4, k.raft_port) != null) continue;
+            self.startDial(k);
+        }
     }
 
-    const DialOutcome = enum {
-        /// A new link is up.
-        linked,
-        /// Nothing more to do: it was us, or a link already exists.
-        finished,
-        /// The far side holds a live link under our id.
-        rejected,
-        /// Worth another try later.
-        failed,
-    };
+    /// Of two links to the same peer, the one dialled by the lower node id
+    /// survives; both nodes reach the same answer, so they keep the same
+    /// link instead of each dropping the one the other kept.
+    fn linkWins(self: *RaftNetwork, new_dialed_by_me: bool, held: *const PeerState) bool {
+        const new_dialer = if (new_dialed_by_me) self.node_id else held.node_id;
+        const held_dialer = if (held.dialed_by_me) self.node_id else held.node_id;
+        return new_dialer < held_dialer;
+    }
 
-    /// One dial with deadlines, on the loop thread.
-    fn dial(self: *RaftNetwork, ip4: [4]u8, port: u16, kind: DialKind) DialOutcome {
-        const connect_ms: i32 = if (kind == .seed) SEED_CONNECT_TIMEOUT_MS else MESH_CONNECT_TIMEOUT_MS;
-        const fd = stdx_net.tcpConnectIp4Timeout(ip4, port, connect_ms) catch return .failed;
-
-        // Our own listener, reached by one of our addresses (the usual seed
-        // list names every node, this one included): the connect completes
-        // from the backlog, but the answer would have to come from this very
-        // thread. A connection to ourselves has our address at both ends.
-        if (port == self.listen_port) {
-            if (stdx_net.sysLocalIp4(fd)) |local| {
-                if (std.mem.eql(u8, &local.ip4, &ip4)) {
-                    sysClose(fd);
-                    log.debug("raft: {d}.{d}.{d}.{d}:{d} is this node", .{ ip4[0], ip4[1], ip4[2], ip4[3], port });
-                    return .finished;
-                }
-            } else |_| {}
-        }
-
-        var msg_buf: [HEADER_SIZE + JOIN_REQ_SIZE]u8 = undefined;
-        _ = frameCustomMessage(MSG_JOIN_REQUEST, 0, self.node_id, &self.joinRequestBytes(), &msg_buf);
-        _ = sysWrite(fd, &msg_buf) catch {
-            sysClose(fd);
-            return .failed;
+    fn startDial(self: *RaftNetwork, k: *Known) void {
+        const l = self.freeLink() orelse return;
+        const fd = sysSocket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
+            self.dialFailed(k, "socket");
+            return;
         };
-
-        // The far side answers within a tick unless its loop is busy.
-        var resp_buf: [HEADER_SIZE + JOIN_RESP_SIZE]u8 = undefined;
-        const n = readWithTimeout(fd, resp_buf[0 .. HEADER_SIZE + JOIN_RESP_SIZE], connect_ms) catch {
-            sysClose(fd);
-            return .failed;
-        };
-        if (n < HEADER_SIZE + JOIN_RESP_SIZE) {
-            sysClose(fd);
-            return .failed;
-        }
-        const resp_hdr = RaftHeader.fromBytes(resp_buf[0..HEADER_SIZE]);
-        if (resp_hdr.msg_type != MSG_JOIN_RESPONSE) {
-            sysClose(fd);
-            return .failed;
-        }
-        const peer_node_id = std.mem.readInt(u32, resp_buf[HEADER_SIZE..][0..4], .little);
-        if (peer_node_id == JOIN_REJECTED) {
-            sysClose(fd);
-            return .rejected;
-        }
-        if (peer_node_id == self.node_id) {
-            // Normally caught above without a handshake; reaching here means
-            // the local-address check could not tell, or another node
-            // carries our id.
-            sysClose(fd);
-            log.warn("raft: {d}.{d}.{d}.{d}:{d} answered with our own node id {d} — either we dialed ourselves by an address we could not recognise, or another node shares our id (set [cluster] node_id)", .{ ip4[0], ip4[1], ip4[2], ip4[3], port, self.node_id });
-            return .finished;
-        }
-        if (self.peerByNodeId(peer_node_id)) |held| {
-            if (linkAlive(held.fd)) {
+        const addr = SocketAddr.initIp4(k.ip4, k.raft_port);
+        if (std.c.connect(fd, addr.anyPtr(), addr.anyLen()) != 0) {
+            const e = posix.errno(@as(isize, -1));
+            if (e != .INPROGRESS and e != .AGAIN) {
                 sysClose(fd);
-                return .finished;
-            }
-            self.dropPeer(peer_node_id);
-        }
-        self.addPeerByFd(peer_node_id, fd, ip4, port);
-        return .linked;
-    }
-
-    fn pushToShardInbox(self: *RaftNetwork, entry_data: []const u8) void {
-        const inbox = self.shard_inbox orelse return;
-        const dup = self.allocator.dupe(u8, entry_data) catch return;
-        _ = inbox.send(.{
-            .tag = .raft_message,
-            .src_shard = 0xFF,
-            .partition_id = 0,
-            .payload_len = @intCast(dup.len),
-            .sequence = 0,
-            .payload_ptr = dup.ptr,
-            ._padding = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-        });
-    }
-
-    fn addPeerByFd(self: *RaftNetwork, peer_node_id: u32, fd: posix.socket_t, ip4: [4]u8, raft_port: u16) void {
-        for (&self.peers) |*slot| {
-            if (!slot.active) {
-                slot.* = .{
-                    .active = true,
-                    .node_id = peer_node_id,
-                    .fd = fd,
-                    .ip4 = ip4,
-                    .raft_port = raft_port,
-                    .recv_buf = undefined,
-                    .recv_len = 0,
-                };
-                self.peer_count += 1;
-                log.info("raft: peer {d} connected at {d}.{d}.{d}.{d}:{d}", .{ peer_node_id, ip4[0], ip4[1], ip4[2], ip4[3], raft_port });
+                self.dialFailed(k, "connect");
                 return;
             }
         }
-        // No free slots
-        sysClose(fd);
+        l.* = .{ .active = true, .fd = fd, .role = .dialer, .stage = .connecting, .deadline_ms = stdx.time.milliTimestamp() + HANDSHAKE_DEADLINE_MS, .ip4 = k.ip4, .raft_port = k.raft_port };
+        stdx.io.instance().randomSecure(&l.my_nonce) catch {
+            self.endLink(l, "no entropy for a nonce");
+            return;
+        };
+        k.dialing = true;
     }
 
-    fn peerByAddress(self: *RaftNetwork, ip4: [4]u8, port: u16) ?*const PeerState {
+    fn dialFailed(self: *RaftNetwork, k: *Known, why: []const u8) void {
+        _ = self;
+        k.dialing = false;
+        k.failures += 1;
+        k.next_dial_ms = stdx.time.milliTimestamp() + k.backoff_ms;
+        k.backoff_ms = @min(k.backoff_ms * 2, DIAL_BACKOFF_MAX_MS);
+        if (k.failures >= DIAL_WARN_AFTER and !k.warned) {
+            k.warned = true;
+            if (k.seed) {
+                log.warn("cluster: could not join seed {d}.{d}.{d}.{d}:{d} after {d} attempts ({s}); still trying every {d} ms", .{ k.ip4[0], k.ip4[1], k.ip4[2], k.ip4[3], k.raft_port, k.failures, why, k.backoff_ms });
+            } else {
+                log.warn("raft: peer {d} at {d}.{d}.{d}.{d}:{d} unreachable after {d} attempts ({s}); still trying every {d} ms", .{ k.node_id, k.ip4[0], k.ip4[1], k.ip4[2], k.ip4[3], k.raft_port, k.failures, why, k.backoff_ms });
+            }
+        }
+    }
+
+    fn dialSucceeded(self: *RaftNetwork, ip4: [4]u8, port: u16) void {
+        const k = self.knownByAddress(ip4, port) orelse return;
+        k.dialing = false;
+        k.failures = 0;
+        k.backoff_ms = DIAL_BACKOFF_MIN_MS;
+        k.warned = false;
+        k.next_dial_ms = stdx.time.milliTimestamp() + DIAL_BACKOFF_MIN_MS;
+    }
+
+    fn freeLink(self: *RaftNetwork) ?*Link {
+        for (&self.links) |*l| if (!l.active) return l;
+        return null;
+    }
+
+    fn acceptedLinks(self: *const RaftNetwork) usize {
+        var n: usize = 0;
+        for (&self.links) |*l| if (l.active and l.role == .acceptor) {
+            n += 1;
+        };
+        return n;
+    }
+
+    // ── Handshake ────────────────────────────────────────────────────────
+
+    fn stepLink(self: *RaftNetwork, l: *Link, revents: i16) void {
+        if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            self.endLink(l, "socket error");
+            return;
+        }
+        if (l.stage == .connecting) {
+            if (revents & (posix.POLL.OUT | posix.POLL.HUP) == 0) return;
+            var err: c_int = 0;
+            var len: posix.socklen_t = @sizeOf(c_int);
+            if (std.c.getsockopt(l.fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &len) != 0 or err != 0) {
+                self.endLink(l, "connect refused");
+                return;
+            }
+            // Our own listener, reached by one of our addresses (the usual
+            // seed list names every node, this one included). A connection
+            // to ourselves has our address at both ends.
+            if (l.raft_port == self.listen_port) {
+                if (stdx_net.sysLocalIp4(l.fd)) |local| {
+                    if (std.mem.eql(u8, &local.ip4, &l.ip4)) {
+                        log.debug("raft: {d}.{d}.{d}.{d}:{d} is this node", .{ l.ip4[0], l.ip4[1], l.ip4[2], l.ip4[3], l.raft_port });
+                        self.forgetKnown(l.ip4, l.raft_port);
+                        self.closeLink(l);
+                        return;
+                    }
+                } else |_| {}
+            }
+            self.queueHello(l, .hello, null);
+            l.stage = .hello_back_awaited;
+            _ = self.writeLink(l);
+            return;
+        }
+        if (revents & posix.POLL.OUT != 0) {
+            if (!self.writeLink(l)) return;
+        }
+        if (revents & posix.POLL.IN != 0) {
+            const rc = std.c.read(l.fd, l.in[l.in_len..].ptr, l.in.len - l.in_len);
+            if (rc == 0) {
+                self.hungUp(l);
+                return;
+            }
+            if (rc < 0) {
+                if (posix.errno(rc) != .AGAIN) self.endLink(l, "read failed during handshake");
+                return;
+            }
+            l.in_len += @intCast(rc);
+            self.parseLink(l);
+        } else if (revents & posix.POLL.HUP != 0) {
+            self.hungUp(l);
+        }
+    }
+
+    /// The other side closed mid-handshake. After we sent our proof that
+    /// means it did not accept it: the dialer checks first and hangs up,
+    /// so this is what a wrong secret looks like from the accepting side.
+    fn hungUp(self: *RaftNetwork, l: *Link) void {
+        if (l.role == .acceptor and l.stage == .verify_awaited) {
+            self.failLink(l, "the dialer did not accept our proof: wrong cluster secret on one side, or a stranger");
+        } else {
+            self.endLink(l, "closed during handshake");
+        }
+    }
+
+    /// One handshake frame, if a whole one is in; the link's buffer holds at
+    /// most two, and nothing else is ever valid here.
+    fn parseLink(self: *RaftNetwork, l: *Link) void {
+        while (l.active and l.in_len >= HEADER_SIZE) {
+            const hdr = RaftHeader.fromBytes(l.in[0..HEADER_SIZE]).*;
+            const size = HEADER_SIZE + @as(usize, hdr.payload_len);
+            if (size > l.in.len) {
+                self.failLink(l, "oversize handshake frame");
+                return;
+            }
+            if (l.in_len < size) return;
+            const payload = l.in[HEADER_SIZE..size];
+            if (transport.computeCrc(l.in[0..HEADER_SIZE], payload) != hdr.crc32) {
+                self.failLink(l, "bad checksum in handshake");
+                return;
+            }
+            self.handleLinkFrame(l, hdr, payload);
+            if (!l.active) return;
+            std.mem.copyForwards(u8, &l.in, l.in[size..l.in_len]);
+            l.in_len -= size;
+        }
+        if (l.active and l.in_len == l.in.len) self.failLink(l, "handshake frame does not fit");
+    }
+
+    fn handleLinkFrame(self: *RaftNetwork, l: *Link, hdr: RaftHeader, payload: []const u8) void {
+        switch (l.stage) {
+            .hello_awaited => {
+                // Acceptor: the dialer says who it is.
+                if (hdr.msgType() != .hello or payload.len != handshake.Hello.SIZE) return self.failLink(l, "expected hello");
+                const hello = handshake.Hello.decode(payload[0..handshake.Hello.SIZE]);
+                if (hello.version != handshake.VERSION) return self.failLink(l, "protocol version mismatch");
+                if (hdr.source_node != hello.node_id) return self.failLink(l, "hello id does not match its frame");
+                if (hello.node_id == self.node_id) {
+                    // Our own seed list names us, or another node carries
+                    // our id. Say so, then close.
+                    self.queueWelcome(l, .rejected_same_id);
+                    _ = self.writeLink(l);
+                    self.closeLink(l);
+                    return;
+                }
+                l.ip4 = peerAddressFor(hello.ip4, l.observed_ip4) orelse {
+                    if (self.fail_warn.due()) |_| {
+                        log.warn("raft: rejected join from node {d}: advertised address {d}.{d}.{d}.{d} is not dialable", .{ hello.node_id, hello.ip4[0], hello.ip4[1], hello.ip4[2], hello.ip4[3] });
+                    }
+                    self.closeLink(l);
+                    return;
+                };
+                l.raft_port = hello.raft_port;
+                l.their = hello;
+                const mac = handshake.proof(self.secret, &hello.nonce, &l.my_nonce, self.node_id, hello.node_id);
+                self.queueHello(l, .hello_back, &mac);
+                l.stage = .verify_awaited;
+                _ = self.writeLink(l);
+            },
+            .hello_back_awaited => {
+                // The acceptor answers a hello that carries its own id
+                // before proving anything; the dialer must understand that.
+                if (hdr.msgType() == .welcome and payload.len == handshake.Welcome.SIZE) {
+                    const w = handshake.Welcome.decode(payload[0..handshake.Welcome.SIZE]) orelse return self.failLink(l, "unknown verdict");
+                    // Said before any proof, so a stranger could say it; the
+                    // address is kept and dialled again at the longest
+                    // backoff, and the warn says what it might mean.
+                    if (w.verdict == .rejected_same_id) return self.sameIdRefused(l, false);
+                    return self.failLink(l, "verdict before proof");
+                }
+                // Dialer: the acceptor proves itself first.
+                if (hdr.msgType() != .hello_back or payload.len != handshake.HELLO_BACK_SIZE) return self.failLink(l, "expected hello back");
+                const hello = handshake.Hello.decode(payload[0..handshake.Hello.SIZE]);
+                const their_mac = payload[handshake.Hello.SIZE..][0..handshake.MAC_LEN];
+                if (hello.version != handshake.VERSION) return self.failLink(l, "protocol version mismatch");
+                if (hdr.source_node != hello.node_id) return self.failLink(l, "hello id does not match its frame");
+                // Our own id coming back is our own listener reached through
+                // a stranger relaying both ways, or a twin; never a peer.
+                if (hello.node_id == self.node_id) return self.failLink(l, "hello back carries our own id");
+                const expected = handshake.proof(self.secret, &l.my_nonce, &hello.nonce, hello.node_id, self.node_id);
+                if (!handshake.proofMatches(&expected, their_mac)) return self.failLink(l, "wrong cluster secret");
+                l.their = hello;
+                const mine = handshake.proof(self.secret, &hello.nonce, &l.my_nonce, self.node_id, hello.node_id);
+                self.queueFrame(l, .verify, &mine);
+                l.stage = .welcome_awaited;
+                _ = self.writeLink(l);
+            },
+            .verify_awaited => {
+                // Acceptor: the dialer's proof, then our verdict.
+                if (hdr.msgType() != .verify or payload.len != handshake.VERIFY_SIZE) return self.failLink(l, "expected verify");
+                const their = l.their.?;
+                const expected = handshake.proof(self.secret, &l.my_nonce, &their.nonce, their.node_id, self.node_id);
+                if (!handshake.proofMatches(&expected, payload[0..handshake.MAC_LEN])) return self.failLink(l, "wrong cluster secret");
+                if (self.peerByNodeId(their.node_id)) |held| {
+                    if (held.raft_port != their.raft_port or !std.mem.eql(u8, &held.ip4, &l.ip4)) {
+                        log.warn("raft: node {d} joined from {d}.{d}.{d}.{d}:{d} while linked at {d}.{d}.{d}.{d}:{d} — two nodes may share an id (set [cluster] node_id)", .{ their.node_id, l.ip4[0], l.ip4[1], l.ip4[2], l.ip4[3], their.raft_port, held.ip4[0], held.ip4[1], held.ip4[2], held.ip4[3], held.raft_port });
+                    }
+                    // A dial that timed out leaves its connection in our
+                    // backlog and we may accept that one first: a live link
+                    // wins over a duplicate. Two links that crossed are
+                    // settled by who dialled; the loser is told so.
+                    if (linkAlive(held.fd) and !self.linkWins(false, held)) {
+                        self.queueWelcome(l, .rejected_live_link);
+                        _ = self.writeLink(l);
+                        self.closeLink(l);
+                        // A link whose far end died without a FIN peeks as
+                        // alive until something is written to it. Write
+                        // something: a restarted far end answers with a
+                        // reset, and the next dial finds the link gone. Port
+                        // 0 makes it a no-op to a live receiver, which must
+                        // not learn our bind address as a dial target.
+                        self.sendPeerInfo(held, .{ .node_id = self.node_id, .ip4 = self.advertise_ip4, .raft_port = 0 });
+                        if (!held.out.flush(held.fd)) self.dropPeer(held, "write failed");
+                        return;
+                    }
+                    self.dropPeer(held, "replaced by a new link");
+                }
+                if (self.peer_count >= MAX_PEERS) {
+                    log.warn("raft: no free peer slot for node {d} (at most {d} peers)", .{ their.node_id, MAX_PEERS });
+                    self.queueWelcome(l, .rejected_full);
+                    _ = self.writeLink(l);
+                    self.closeLink(l);
+                    return;
+                }
+                self.queueWelcome(l, .accepted);
+                _ = self.writeLink(l);
+                if (!l.active) return;
+                self.promote(l, their.node_id, l.ip4, their.raft_port);
+            },
+            .welcome_awaited => {
+                if (hdr.msgType() != .welcome or payload.len != handshake.Welcome.SIZE) return self.failLink(l, "expected welcome");
+                const w = handshake.Welcome.decode(payload[0..handshake.Welcome.SIZE]) orelse return self.failLink(l, "unknown verdict");
+                const their = l.their.?;
+                switch (w.verdict) {
+                    .accepted => {
+                        self.dialSucceeded(l.ip4, l.raft_port);
+                        self.promote(l, their.node_id, l.ip4, l.raft_port);
+                    },
+                    .rejected_live_link => {
+                        // The far side may hold a link to us that died
+                        // without a FIN; it will notice on its next write.
+                        const k = self.knownByAddress(l.ip4, l.raft_port);
+                        if (k != null and !k.?.warned) {
+                            k.?.warned = true;
+                            log.warn("raft: {d}.{d}.{d}.{d}:{d} refused our join: a live link already carries our node id {d} — it may still hold a stale link to us, or another node shares our id (set [cluster] node_id)", .{ l.ip4[0], l.ip4[1], l.ip4[2], l.ip4[3], l.raft_port, self.node_id });
+                        }
+                        self.endLink(l, "refused: live link");
+                    },
+                    .rejected_same_id => self.sameIdRefused(l, true),
+                    .rejected_full => self.endLink(l, "refused: peer table full"),
+                }
+            },
+            .connecting => self.failLink(l, "bytes before connect completed"),
+        }
+    }
+
+    /// `proven`: the verdict came after the far side proved the secret, so
+    /// it is a member's word and the address is forgotten; otherwise it is
+    /// anyone's word and the address only backs off.
+    fn sameIdRefused(self: *RaftNetwork, l: *Link, proven: bool) void {
+        const k = self.knownByAddress(l.ip4, l.raft_port);
+        if (k == null or !k.?.warned) {
+            log.warn("raft: {d}.{d}.{d}.{d}:{d} says it carries our own node id {d} — either we dialed ourselves by an address we could not recognise, or another node shares our id (set [cluster] node_id)", .{ l.ip4[0], l.ip4[1], l.ip4[2], l.ip4[3], l.raft_port, self.node_id });
+        }
+        self.closeLink(l);
+        if (proven) {
+            self.forgetKnown(l.ip4, l.raft_port);
+        } else if (k) |entry| {
+            entry.dialing = false;
+            entry.failures += 1;
+            entry.warned = true;
+            entry.backoff_ms = DIAL_BACKOFF_MAX_MS;
+            entry.next_dial_ms = stdx.time.milliTimestamp() + DIAL_BACKOFF_MAX_MS;
+        }
+    }
+
+    fn queueHello(self: *RaftNetwork, l: *Link, msg_type: MsgType, mac: ?*const [handshake.MAC_LEN]u8) void {
+        var payload: [handshake.HELLO_BACK_SIZE]u8 = undefined;
+        (handshake.Hello{
+            .version = handshake.VERSION,
+            .node_id = self.node_id,
+            .raft_port = self.listen_port,
+            .main_port = self.main_port,
+            .ip4 = self.advertise_ip4,
+            .nonce = l.my_nonce,
+        }).encode(payload[0..handshake.Hello.SIZE]);
+        if (mac) |m| {
+            payload[handshake.Hello.SIZE..][0..handshake.MAC_LEN].* = m.*;
+            self.queueFrame(l, msg_type, &payload);
+        } else {
+            self.queueFrame(l, msg_type, payload[0..handshake.Hello.SIZE]);
+        }
+    }
+
+    fn queueWelcome(self: *RaftNetwork, l: *Link, verdict: handshake.Verdict) void {
+        var payload: [handshake.Welcome.SIZE]u8 = undefined;
+        (handshake.Welcome{ .verdict = verdict, .node_id = self.node_id }).encode(&payload);
+        self.queueFrame(l, .welcome, &payload);
+    }
+
+    fn queueFrame(self: *RaftNetwork, l: *Link, msg_type: MsgType, payload: []const u8) void {
+        if (l.out_head == l.out_len) {
+            l.out_head = 0;
+            l.out_len = 0;
+        }
+        const n = transport.frameMessage(msg_type, 0, self.node_id, payload, l.out[l.out_len..]);
+        l.out_len += n;
+    }
+
+    /// False when the socket is gone (the link is ended).
+    fn writeLink(self: *RaftNetwork, l: *Link) bool {
+        while (l.out_head < l.out_len) {
+            const n = sysWriteSome(l.fd, l.out[l.out_head..l.out_len]) orelse {
+                self.endLink(l, "write failed during handshake");
+                return false;
+            };
+            if (n == 0) return true;
+            l.out_head += n;
+        }
+        return true;
+    }
+
+    /// The handshake reached its verdict: the socket becomes a peer, with
+    /// whatever handshake bytes are still unwritten carried over.
+    fn promote(self: *RaftNetwork, l: *Link, node_id: u32, ip4: [4]u8, raft_port: u16) void {
+        const dialed_by_me = l.role == .dialer;
+        if (self.peerByNodeId(node_id)) |held| {
+            if (linkAlive(held.fd) and !self.linkWins(dialed_by_me, held)) {
+                // Our own dial crossed theirs and theirs is the keeper.
+                self.closeLink(l);
+                if (dialed_by_me) {
+                    if (self.knownByAddress(ip4, raft_port)) |k| k.dialing = false;
+                }
+                return;
+            }
+            self.dropPeer(held, "replaced by a new link");
+        }
+        const slot = blk: {
+            for (&self.peers) |*p| if (!p.active) break :blk p;
+            self.endLink(l, "no peer slot");
+            return;
+        };
+        const fr = Framer.init(self.allocator) catch {
+            self.endLink(l, "out of memory");
+            return;
+        };
+        slot.* = .{ .active = true, .node_id = node_id, .fd = l.fd, .ip4 = ip4, .raft_port = raft_port, .dialed_by_me = dialed_by_me, .framer = fr, .out = .{} };
+        if (l.out_head < l.out_len) {
+            slot.out.append(self.allocator, l.out[l.out_head..l.out_len]) catch {
+                if (self.repl_metrics) |m| m.recordSendFailure();
+            };
+        }
+        // A peer that dies without a FIN is otherwise noticed only by the
+        // next write to it; in an idle cluster that could be never.
+        const on: c_int = 1;
+        _ = std.c.setsockopt(l.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, @ptrCast(&on), @sizeOf(c_int));
+        // The OS default idle is hours; probe after fifteen seconds.
+        const idle: c_int = 15;
+        const builtin = @import("builtin");
+        const idle_opt: ?u32 = switch (builtin.os.tag) {
+            .macos, .ios => 0x10, // TCP_KEEPALIVE
+            .linux => 4, // TCP_KEEPIDLE
+            else => null,
+        };
+        if (idle_opt) |opt| _ = std.c.setsockopt(l.fd, posix.IPPROTO.TCP, opt, @ptrCast(&idle), @sizeOf(c_int));
+        self.peer_count += 1;
+        if (self.repl_metrics) |m| m.setPeersLinked(self.peer_count);
+        l.active = false;
+        if (l.role == .dialer) {
+            if (self.knownByAddress(ip4, raft_port)) |k| k.dialing = false;
+        }
+        self.noteKnown(node_id, ip4, raft_port, false);
+        log.info("raft: peer {d} connected at {d}.{d}.{d}.{d}:{d}", .{ node_id, ip4[0], ip4[1], ip4[2], ip4[3], raft_port });
+
+        // Peer exchange: the newcomer learns of everyone, everyone of it.
+        for (&self.peers) |*p| {
+            if (!p.active or p == slot or p.raft_port == 0) continue;
+            self.sendPeerInfo(slot, .{ .node_id = p.node_id, .ip4 = p.ip4, .raft_port = p.raft_port });
+            self.sendPeerInfo(p, .{ .node_id = node_id, .ip4 = ip4, .raft_port = raft_port });
+        }
+        if (!slot.out.flush(slot.fd)) self.dropPeer(slot, "write failed");
+    }
+
+    fn sendPeerInfo(self: *RaftNetwork, p: *PeerState, info: PeerInfo) void {
+        var payload: [PEER_INFO_SIZE]u8 = undefined;
+        info.encode(&payload);
+        var buf: [HEADER_SIZE + PEER_INFO_SIZE]u8 = undefined;
+        const total = transport.frameMessage(.peer_info, 0, self.node_id, &payload, &buf);
+        self.enqueueTo(p, buf[0..total]);
+    }
+
+    /// A handshake that failed the checks: a stranger, a wrong secret, a
+    /// broken client. One warn, counted.
+    fn failLink(self: *RaftNetwork, l: *Link, why: []const u8) void {
+        _ = self.handshake_failures.fetchAdd(1, .monotonic);
+        if (self.repl_metrics) |m| m.recordHandshakeFailure();
+        if (self.fail_warn.due()) |unsaid| {
+            const who = if (l.role == .acceptor) l.observed_ip4 else l.ip4;
+            if (l.role == .acceptor) {
+                log.warn("raft: handshake with a dialer from {d}.{d}.{d}.{d} failed: {s}{s}", .{ who[0], who[1], who[2], who[3], why, if (unsaid > 0) " (and more since the last line)" else "" });
+            } else {
+                log.warn("raft: handshake with {d}.{d}.{d}.{d}:{d} failed: {s}{s}", .{ who[0], who[1], who[2], who[3], l.raft_port, why, if (unsaid > 0) " (and more since the last line)" else "" });
+            }
+        }
+        self.closeLink(l);
+        if (l.role == .dialer) {
+            if (self.knownByAddress(l.ip4, l.raft_port)) |k| self.dialFailed(k, why);
+        }
+    }
+
+    /// A handshake that ended for a reason that is not a check failing:
+    /// timeout, refusal, a socket error. Counted for the dial backoff.
+    fn endLink(self: *RaftNetwork, l: *Link, why: []const u8) void {
+        log.debug("raft: handshake ended ({s})", .{why});
+        self.closeLink(l);
+        if (l.role == .dialer) {
+            if (self.knownByAddress(l.ip4, l.raft_port)) |k| self.dialFailed(k, why);
+        }
+    }
+
+    fn closeLink(self: *RaftNetwork, l: *Link) void {
+        _ = self;
+        if (!l.active) return;
+        sysClose(l.fd);
+        l.active = false;
+    }
+
+    fn expireLinks(self: *RaftNetwork) void {
+        const now = stdx.time.milliTimestamp();
+        for (&self.links) |*l| {
+            if (l.active and now > l.deadline_ms) self.endLink(l, "handshake timed out");
+        }
+    }
+
+    // ── Peer links ───────────────────────────────────────────────────────
+
+    fn readPeer(self: *RaftNetwork, p: *PeerState) void {
+        const fr = &p.framer.?;
+        const space = fr.space();
+        if (space.len > 0) {
+            const rc = std.c.read(p.fd, space.ptr, space.len);
+            if (rc == 0) {
+                self.dropPeer(p, "peer closed");
+                return;
+            }
+            if (rc < 0) {
+                if (posix.errno(rc) != .AGAIN) self.dropPeer(p, "read failed");
+                return;
+            }
+            fr.commit(@intCast(rc));
+        }
+        self.drainFramer(p);
+    }
+
+    /// Hand on every whole frame in the peer's buffer. Stops, leaving the
+    /// rest buffered, as soon as the shard's queue is above its watermark:
+    /// one read can hold thousands of small frames, and a pause decided
+    /// only between reads would come after they were already dropped.
+    fn drainFramer(self: *RaftNetwork, p: *PeerState) void {
+        const fr = &p.framer.?;
+        while (p.active) {
+            if (self.raft_queue) |q| {
+                if (!self.reads_paused and q.aboveHigh()) self.pauseReads();
+                if (self.reads_paused) return;
+            }
+            const frame = fr.next(p.node_id) catch |err| {
+                _ = self.frames_rejected.fetchAdd(1, .monotonic);
+                if (self.repl_metrics) |m| m.recordFrameRejected();
+                log.warn("raft: frame from peer {d} rejected ({s}); dropping the link", .{ p.node_id, @errorName(err) });
+                self.dropPeer(p, "bad frame");
+                return;
+            } orelse break;
+            self.handleFrame(p, frame);
+            // Handling can drop the peer, and with it the buffer the
+            // frame points into.
+            if (!p.active) return;
+            fr.advance();
+        }
+    }
+
+    fn handleFrame(self: *RaftNetwork, p: *PeerState, frame: framer_mod.Frame) void {
+        switch (frame.msg_type) {
+            .replicate_entry => {
+                self.deliver(p.node_id, frame.header, frame.payload);
+                // Mesh forwarding for late joiners: the origin has sent to
+                // its own peers; ours may include one it has no link to.
+                // Only what came straight from its origin is passed on, or
+                // four nodes would pass one entry around forever.
+                self.forward(p, frame.payload);
+            },
+            .forwarded_entry => {
+                if (frame.payload.len < 4) {
+                    self.rejectFrame(p, "forwarded entry without an origin");
+                    return;
+                }
+                const origin = std.mem.readInt(u32, frame.payload[0..4], .little);
+                if (origin == self.node_id) return;
+                self.deliver(origin, frame.header, frame.payload[4..]);
+            },
+            .peer_info => {
+                if (frame.payload.len < PEER_INFO_SIZE) return;
+                const info = PeerInfo.decode(frame.payload[0..PEER_INFO_SIZE]);
+                if (info.node_id != self.node_id and info.raft_port > 0 and stdx_net.isUnicastPeerAddress(info.ip4)) {
+                    self.noteKnown(info.node_id, info.ip4, info.raft_port, false);
+                }
+            },
+            // The Raft RPCs are for the leader loop; the handshake types
+            // have no place on an established link.
+            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .hello, .hello_back, .verify, .welcome => {
+                log.warn("raft: peer {d} sent a {s} frame, which this link does not carry; dropping the link", .{ p.node_id, @tagName(frame.msg_type) });
+                self.rejectFrame(p, "unexpected frame");
+            },
+        }
+    }
+
+    fn rejectFrame(self: *RaftNetwork, p: *PeerState, why: []const u8) void {
+        _ = self.frames_rejected.fetchAdd(1, .monotonic);
+        if (self.repl_metrics) |m| m.recordFrameRejected();
+        self.dropPeer(p, why);
+    }
+
+    /// Hand an entry to the shard under the id of the node that wrote it.
+    /// A full queue drops it and counts; the copy is never leaked.
+    fn deliver(self: *RaftNetwork, origin: u32, header: RaftHeader, entry_data: []const u8) void {
+        const q = self.raft_queue orelse return;
+        const dup = self.allocator.dupe(u8, entry_data) catch {
+            if (self.repl_metrics) |m| m.recordFrameDropped();
+            return;
+        };
+        const ok = q.push(.{ .source_node = origin, .group_id = header.group_id, .msg_type = .replicate_entry, .payload = dup });
+        if (!ok) {
+            self.allocator.free(dup);
+            if (self.repl_metrics) |m| m.recordFrameDropped();
+        }
+    }
+
+    /// Pass an entry that arrived from its origin on to every other peer,
+    /// framed as ours with the origin named inside: a frame's source must
+    /// be the id its link proved, and the origin is not on this link.
+    fn forward(self: *RaftNetwork, from: *PeerState, entry_data: []const u8) void {
+        const origin = from.node_id;
+        if (4 + entry_data.len + HEADER_SIZE > self.scratch.len) return;
+        const payload_buf = self.scratch[HEADER_SIZE..];
+        std.mem.writeInt(u32, payload_buf[0..4], origin, .little);
+        @memcpy(payload_buf[4 .. 4 + entry_data.len], entry_data);
+        const total = transport.frameInPlace(.forwarded_entry, 0, self.node_id, 4 + entry_data.len, self.scratch);
+        if (total == 0) return;
+        for (&self.peers) |*p| {
+            if (!p.active or p == from or p.node_id == origin) continue;
+            self.enqueueTo(p, self.scratch[0..total]);
+        }
+    }
+
+    fn flushPending(self: *RaftNetwork) void {
+        self.mutex.lock();
+        var to_send = self.pending;
+        self.pending = .empty;
+        self.mutex.unlock();
+        defer {
+            for (to_send.items) |data| self.allocator.free(data);
+            to_send.deinit(self.allocator);
+        }
+        for (to_send.items) |entry_data| {
+            const total = transport.frameMessage(.replicate_entry, 0, self.node_id, entry_data, self.scratch);
+            if (total == 0) {
+                log.warn("raft: committed entry too large to replicate ({d} bytes > {d} max) — NOT broadcast to any peer; all followers will diverge on this entry", .{ entry_data.len + HEADER_SIZE, framer_mod.MAX_FRAME_SIZE });
+                if (self.repl_metrics) |m| m.recordOversizeSkipped();
+                continue;
+            }
+            for (&self.peers) |*p| {
+                if (!p.active) continue;
+                self.enqueueTo(p, self.scratch[0..total]);
+            }
+        }
+        for (&self.peers) |*p| {
+            if (p.active and p.out.pending().len > 0) {
+                if (!p.out.flush(p.fd)) self.dropPeer(p, "write failed");
+            }
+        }
+    }
+
+    /// Queue bytes for a peer; one SEND_QUEUE_CAP behind is dropped and
+    /// re-dialled.
+    fn enqueueTo(self: *RaftNetwork, p: *PeerState, bytes: []const u8) void {
+        p.out.append(self.allocator, bytes) catch |err| switch (err) {
+            error.Overflow => {
+                _ = self.slow_peer_drops.fetchAdd(1, .monotonic);
+                if (self.repl_metrics) |m| m.recordSlowPeerDrop();
+                log.warn("raft: peer {d} has {d} bytes unread; dropping the link, it will be re-dialled", .{ p.node_id, p.out.pending().len });
+                self.dropPeer(p, "too slow");
+            },
+            error.OutOfMemory => {
+                if (self.repl_metrics) |m| m.recordSendFailure();
+                self.dropPeer(p, "out of memory");
+            },
+        };
+    }
+
+    fn dropPeer(self: *RaftNetwork, p: *PeerState, why: []const u8) void {
+        if (!p.active) return;
+        log.info("raft: peer {d} link down ({s})", .{ p.node_id, why });
+        _ = self.peer_disconnects.fetchAdd(1, .monotonic);
+        if (self.repl_metrics) |m| m.recordPeerDisconnect();
+        self.closePeer(p);
+    }
+
+    fn closePeer(self: *RaftNetwork, p: *PeerState) void {
+        if (!p.active) return;
+        sysClose(p.fd);
+        if (p.framer) |*f| f.deinit();
+        p.framer = null;
+        p.out.deinit(self.allocator);
+        p.active = false;
+        if (self.peer_count > 0) self.peer_count -= 1;
+        if (self.repl_metrics) |m| m.setPeersLinked(self.peer_count);
+    }
+
+    pub fn peerByAddress(self: *RaftNetwork, ip4: [4]u8, port: u16) ?*const PeerState {
         for (&self.peers) |*p| {
             if (p.active and p.raft_port == port and std.mem.eql(u8, &p.ip4, &ip4)) return p;
         }
         return null;
     }
 
-    fn dropPeer(self: *RaftNetwork, node_id: u32) void {
-        for (&self.peers) |*p| {
-            if (p.active and p.node_id == node_id) {
-                log.info("raft: replacing dead link to peer {d}", .{node_id});
-                sysClose(p.fd);
-                p.active = false;
-                if (self.peer_count > 0) self.peer_count -= 1;
-                return;
-            }
-        }
-    }
-
-    fn peerByNodeId(self: *RaftNetwork, node_id: u32) ?*const PeerState {
+    fn peerByNodeId(self: *RaftNetwork, node_id: u32) ?*PeerState {
         for (&self.peers) |*p| {
             if (p.active and p.node_id == node_id) return p;
         }
@@ -851,11 +1255,27 @@ pub const RaftNetwork = struct {
     }
 
     /// Check if we already have a connection to a peer with the given node_id.
-    fn hasPeer(self: *RaftNetwork, node_id: u32) bool {
-        for (&self.peers) |*p| {
-            if (p.active and p.node_id == node_id) return true;
+    pub fn hasPeer(self: *RaftNetwork, node_id: u32) bool {
+        return self.peerByNodeId(node_id) != null;
+    }
+};
+
+/// One line per interval; the count of what was suppressed rides along.
+const WarnLimiter = struct {
+    last_ms: i64 = 0,
+    suppressed: u64 = 0,
+
+    /// The number left unsaid since the last line, or null to stay quiet.
+    fn due(self: *WarnLimiter) ?u64 {
+        const now = stdx.time.milliTimestamp();
+        if (now - self.last_ms < WARN_INTERVAL_MS) {
+            self.suppressed += 1;
+            return null;
         }
-        return false;
+        self.last_ms = now;
+        const n = self.suppressed;
+        self.suppressed = 0;
+        return n;
     }
 };
 
@@ -883,78 +1303,9 @@ fn linkAlive(fd: posix.socket_t) bool {
     return posix.errno(rc) == .AGAIN;
 }
 
-fn frameCustomMessage(msg_type: u8, group_id: u32, source_node: u32, payload: []const u8, buf: []u8) usize {
-    const total = HEADER_SIZE + payload.len;
-    if (buf.len < total) return 0;
-
-    var hdr = RaftHeader{
-        .msg_type = msg_type,
-        ._pad = .{ 0, 0, 0 },
-        .group_id = group_id,
-        .source_node = source_node,
-        .payload_len = @intCast(payload.len),
-        .crc32 = 0,
-    };
-    @memcpy(buf[0..HEADER_SIZE], hdr.asBytes());
-    if (payload.len > 0) {
-        @memcpy(buf[HEADER_SIZE..total], payload);
-    }
-    // Write CRC
-    const crc = transport.computeCrc(buf[0..HEADER_SIZE], payload);
-    std.mem.writeInt(u32, buf[16..20], crc, .little);
-    return total;
-}
-
-fn setNonBlocking(fd: posix.socket_t) !void {
-    return @import("stdx").net.sysFcntlSetNonblocking(fd);
-}
-
-fn readWithTimeout(fd: posix.socket_t, buf: []u8, timeout_ms: i32) !usize {
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const ready = try posix.poll(&fds, timeout_ms);
-    if (ready == 0) return error.Timeout;
-    return posix.read(fd, buf);
-}
-
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-test "raft network: frameCustomMessage roundtrip" {
-    var payload = [_]u8{ 1, 2, 3, 4 };
-    var buf: [128]u8 = undefined;
-    const total = frameCustomMessage(MSG_REPLICATE_ENTRY, 0, 42, &payload, &buf);
-    try testing.expectEqual(HEADER_SIZE + 4, total);
-    const hdr = RaftHeader.fromBytes(buf[0..HEADER_SIZE]);
-    try testing.expectEqual(MSG_REPLICATE_ENTRY, hdr.msg_type);
-    try testing.expectEqual(@as(u32, 42), hdr.source_node);
-    try testing.expectEqual(@as(u32, 4), hdr.payload_len);
-}
-
-test "raft network: join request and peer info carry the address" {
-    var jbuf: [JOIN_REQ_SIZE]u8 = undefined;
-    JoinRequest.encode(.{ .node_id = 7, .raft_port = 9500, .main_port = 9000, .ip4 = .{ 10, 0, 1, 12 } }, &jbuf);
-    const j = JoinRequest.decode(&jbuf);
-    try testing.expectEqual(@as(u32, 7), j.node_id);
-    try testing.expectEqual(@as(u16, 9500), j.raft_port);
-    try testing.expectEqual(@as(u16, 9000), j.main_port);
-    try testing.expectEqual([4]u8{ 10, 0, 1, 12 }, j.ip4);
-
-    var pbuf: [PEER_INFO_SIZE]u8 = undefined;
-    PeerInfo.encode(.{ .node_id = 9, .ip4 = .{ 10, 0, 1, 13 }, .raft_port = 9500 }, &pbuf);
-    const p = PeerInfo.decode(&pbuf);
-    try testing.expectEqual(@as(u32, 9), p.node_id);
-    try testing.expectEqual([4]u8{ 10, 0, 1, 13 }, p.ip4);
-    try testing.expectEqual(@as(u16, 9500), p.raft_port);
-}
-
-test "raft network: the listener binds the configured address and advertises it" {
-    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 });
-    defer rn.deinit();
-    const local = try stdx_net.sysLocalIp4(rn.listener_fd);
-    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.ip4);
-    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, rn.advertise_ip4);
-}
 
 test "raft network: the address a joiner is recorded at" {
     const remote: [4]u8 = .{ 10, 0, 1, 12 };
@@ -969,6 +1320,56 @@ test "raft network: the address a joiner is recorded at" {
     try testing.expect(peerAddressFor(.{ 255, 255, 255, 255 }, remote) == null);
 }
 
+test "raft network: the listener binds the configured address and advertises it" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    const local = try stdx_net.sysLocalIp4(rn.listener_fd);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.ip4);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, rn.advertise_ip4);
+}
+
+test "raft network: the send queue takes what the kernel will and refuses more than the cap" {
+    var pair: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+    try stdx_net.sysFcntlSetNonblocking(pair[0]);
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+
+    var q = SendQueue{};
+    defer q.deinit(testing.allocator);
+    const chunk = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(chunk);
+    @memset(chunk, 0x5a);
+    try q.append(testing.allocator, chunk);
+    // The kernel takes some; the rest waits, in order.
+    try testing.expect(q.flush(pair[0]));
+    const left = q.pending().len;
+    try testing.expect(left > 0 and left < chunk.len);
+    // Drain the far side and the rest goes.
+    var sink: [65536]u8 = undefined;
+    var drained: usize = 0;
+    while (q.pending().len > 0) {
+        const n = std.c.read(pair[1], &sink, sink.len);
+        if (n > 0) drained += @intCast(n);
+        try testing.expect(q.flush(pair[0]));
+    }
+    while (drained < chunk.len) {
+        const n = std.c.read(pair[1], &sink, sink.len);
+        if (n <= 0) break;
+        drained += @intCast(n);
+    }
+    try testing.expectEqual(chunk.len, drained);
+
+    // Over the cap is refused, and the queue keeps what it had.
+    const big = try testing.allocator.alloc(u8, SEND_QUEUE_CAP);
+    defer testing.allocator.free(big);
+    try q.append(testing.allocator, "abc");
+    try testing.expectError(error.Overflow, q.append(testing.allocator, big));
+    try testing.expectEqualStrings("abc", q.pending());
+}
+
 fn boundPort(rn: *const RaftNetwork) !u16 {
     return (try stdx_net.sysLocalIp4(rn.listener_fd)).port;
 }
@@ -977,98 +1378,484 @@ fn waitForPeer(rn: *RaftNetwork, node_id: u32, timeout_ms: u64) bool {
     var waited: u64 = 0;
     while (waited < timeout_ms) : (waited += 20) {
         if (rn.hasPeer(node_id)) return true;
-        @import("stdx").time.sleep(20 * std.time.ns_per_ms);
+        stdx.time.sleep(20 * std.time.ns_per_ms);
     }
     return false;
 }
 
+fn knownCount(rn: *const RaftNetwork) usize {
+    var n: usize = 0;
+    for (&rn.known) |k| if (k.active) {
+        n += 1;
+    };
+    return n;
+}
+
 test "raft network: a node does not join itself" {
-    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 });
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
     rn.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&rn));
     try rn.start();
     // One dial settles it: the connection has our address at both ends, so
-    // the entry is finished, not retried.
+    // the address is forgotten, not retried.
     var waited: u64 = 0;
-    while (waited < 3000 and rn.pending_peer_count > 0) : (waited += 20) @import("stdx").time.sleep(20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u8, 0), rn.pending_peer_count);
+    while (waited < 3000 and (knownCount(&rn) > 0 or rn.dial_requests.items.len > 0)) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), knownCount(&rn));
     try testing.expectEqual(@as(u8, 0), rn.peer_count);
 }
 
-test "raft network: a joiner advertising 0.0.0.0 is recorded at the address it came from" {
-    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 0, 0, 0, 0 });
+test "raft network: two nodes with the secret link, learn each other's address, and carry an entry" {
+    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 0, 0, 0, 0 }, "s3cret");
+    defer seed.deinit();
+    var q = try RaftQueue.init(testing.allocator, 8);
+    defer q.deinit();
+    seed.setRaftQueue(&q);
+    try seed.start();
+
+    var joiner = try RaftNetwork.init(testing.allocator, 2, 0, 9001, .{ 0, 0, 0, 0 }, "s3cret");
+    defer joiner.deinit();
+    joiner.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&seed));
+    try joiner.start();
+
+    try testing.expect(waitForPeer(&seed, 2, 3000));
+    try testing.expect(waitForPeer(&joiner, 1, 1000));
+    // A joiner advertising 0.0.0.0 is recorded at the address it came from.
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, seed.peerByNodeId(2).?.ip4);
+    try testing.expectEqual(joiner.listen_port, seed.peerByNodeId(2).?.raft_port);
+    try testing.expectEqual(@as(u64, 0), seed.handshake_failures.load(.monotonic));
+
+    try joiner.broadcastEntry("entry-bytes");
+    var waited: u64 = 0;
+    var got: ?raft_queue_mod.Frame = null;
+    while (waited < 3000 and got == null) : (waited += 20) {
+        got = q.pop();
+        if (got == null) stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    defer if (got) |g| testing.allocator.free(g.payload);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings("entry-bytes", got.?.payload);
+    try testing.expectEqual(@as(u32, 2), got.?.source_node);
+    try testing.expectEqual(MsgType.replicate_entry, got.?.msg_type);
+}
+
+test "raft network: a dialer with the wrong secret never becomes a peer, and the failure is counted on both sides" {
+    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "right");
     defer seed.deinit();
     try seed.start();
-    var joiner = try RaftNetwork.init(testing.allocator, 2, 0, 9001, .{ 0, 0, 0, 0 });
+    var stranger = try RaftNetwork.init(testing.allocator, 2, 0, 9001, .{ 127, 0, 0, 1 }, "wrong");
+    defer stranger.deinit();
+    stranger.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&seed));
+    try stranger.start();
+
+    var waited: u64 = 0;
+    while (waited < 3000 and stranger.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expect(stranger.handshake_failures.load(.monotonic) >= 1);
+    try testing.expect(!seed.hasPeer(2));
+    try testing.expect(!stranger.hasPeer(1));
+    try testing.expectEqual(@as(u8, 0), seed.peer_count);
+}
+
+test "raft network: a stranger that speaks garbage is dropped at the handshake with one failure" {
+    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer seed.deinit();
+    try seed.start();
+    const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&seed), 1000);
+    defer _ = std.c.close(fd);
+    const junk = [_]u8{0x41} ** 64;
+    _ = std.c.write(fd, &junk, junk.len);
+    var waited: u64 = 0;
+    while (waited < 3000 and seed.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 1), seed.handshake_failures.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), seed.peer_count);
+}
+
+test "raft network: a dial that finds nobody home is retried with backoff until the peer answers" {
+    // `a` is bound (so the dial connects) but its loop is not running, so the
+    // hello is never answered and the handshake times out.
+    var a = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 }, "s");
+    defer a.deinit();
+    var b = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
+    defer b.deinit();
+    b.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&a));
+    try b.start();
+    stdx.time.sleep(2600 * std.time.ns_per_ms);
+    try testing.expect(!b.hasPeer(2));
+    try testing.expect(b.knownByAddress(.{ 127, 0, 0, 1 }, try boundPort(&a)).?.failures >= 1);
+    try a.start();
+    try testing.expect(waitForPeer(&b, 2, 8000));
+    try testing.expect(waitForPeer(&a, 1, 2000));
+    try testing.expectEqual(@as(u32, 0), b.knownByAddress(.{ 127, 0, 0, 1 }, try boundPort(&a)).?.failures);
+}
+
+test "raft network: a peer whose link drops is re-dialled and relinks" {
+    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer seed.deinit();
+    try seed.start();
+    var joiner = try RaftNetwork.init(testing.allocator, 2, 0, 9001, .{ 127, 0, 0, 1 }, "s");
     defer joiner.deinit();
     joiner.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&seed));
     try joiner.start();
     try testing.expect(waitForPeer(&seed, 2, 3000));
-    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, seed.peerByNodeId(2).?.ip4);
-    try testing.expectEqual(joiner.listen_port, seed.peerByNodeId(2).?.raft_port);
     try testing.expect(waitForPeer(&joiner, 1, 1000));
-}
 
-test "raft network: a mesh dial that finds nobody home is retried until the peer answers" {
-    // `a` is bound (so the dial connects) but its loop is not running, so the
-    // join response never comes and the first dial times out.
-    var a = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 });
-    defer a.deinit();
-    var b = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 });
-    defer b.deinit();
-    b.queueDial(.{ .node_id = 2, .ip4 = .{ 127, 0, 0, 1 }, .raft_port = try boundPort(&a) }, .mesh);
-    try b.start();
-    @import("stdx").time.sleep(1300 * std.time.ns_per_ms);
-    try testing.expect(!b.hasPeer(2));
-    try a.start();
-    try testing.expect(waitForPeer(&b, 2, 4000));
-    try testing.expect(waitForPeer(&a, 1, 2000));
-}
-
-test "raft network: a full dial list drops a failed mesh entry, never a seed or a fresh one" {
-    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 });
-    defer rn.deinit();
-    rn.queueDial(.{ .node_id = 0, .ip4 = .{ 10, 0, 0, 9 }, .raft_port = 9500 }, .seed);
-    var id: u32 = 10;
-    while (id < 10 + MAX_PEERS - 1) : (id += 1) rn.queueDial(.{ .node_id = id, .ip4 = .{ 10, 0, 0, 1 }, .raft_port = 9500 }, .mesh);
-    try testing.expectEqual(@as(u8, MAX_PEERS), rn.pending_peer_count);
-
-    // Nothing has failed yet: the newcomer is not queued and nothing is lost.
-    rn.queueDial(.{ .node_id = 99, .ip4 = .{ 10, 0, 0, 2 }, .raft_port = 9500 }, .mesh);
-    try testing.expectEqual(@as(u8, MAX_PEERS), rn.pending_peer_count);
-    try testing.expect(rn.findPending(.{ .info = .{ .node_id = 99, .ip4 = .{ 10, 0, 0, 2 }, .raft_port = 9500 }, .kind = .mesh }) == null);
-
-    // The seed has failed most; the failed mesh entry is the one to go.
-    rn.pending_peers[0].attempts = 40;
-    rn.pending_peers[3].attempts = 12;
-    rn.queueDial(.{ .node_id = 99, .ip4 = .{ 10, 0, 0, 2 }, .raft_port = 9500 }, .mesh);
-    try testing.expectEqual(@as(u8, MAX_PEERS), rn.pending_peer_count);
-    try testing.expectEqual(@as(u32, 99), rn.pending_peers[3].info.node_id);
-    try testing.expectEqual(DialKind.seed, rn.pending_peers[0].kind);
-
-    // Queued again with a new address: the address is taken, nothing evicted.
-    rn.queueDial(.{ .node_id = 99, .ip4 = .{ 10, 0, 0, 7 }, .raft_port = 9501 }, .mesh);
-    try testing.expectEqual(@as(u8, MAX_PEERS), rn.pending_peer_count);
-    try testing.expectEqual([4]u8{ 10, 0, 0, 7 }, rn.pending_peers[3].info.ip4);
-    try testing.expectEqual(@as(u16, 9501), rn.pending_peers[3].info.raft_port);
+    // The seed's process dies and comes back on the same port.
+    const port = try boundPort(&seed);
+    seed.deinit();
+    stdx.time.sleep(300 * std.time.ns_per_ms);
+    try testing.expect(!joiner.hasPeer(1));
+    seed = try RaftNetwork.init(testing.allocator, 1, port, 9000, .{ 127, 0, 0, 1 }, "s");
+    try seed.start();
+    try testing.expect(waitForPeer(&joiner, 1, 8000));
+    try testing.expect(waitForPeer(&seed, 2, 2000));
 }
 
 test "raft network: a broadcast never waits on a dial" {
     // 192.0.2.0/24 is never routed; the dial burns its whole deadline. On a
     // network that rejects it outright the dial ends at once and this test
     // proves nothing either way.
-    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 });
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
     rn.dialSeed(.{ 192, 0, 2, 1 }, 9500);
     try rn.start();
-    @import("stdx").time.sleep(300 * std.time.ns_per_ms);
+    stdx.time.sleep(300 * std.time.ns_per_ms);
     var worst_ms: i64 = 0;
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        const t0 = @import("stdx").time.milliTimestamp();
+        const t0 = stdx.time.milliTimestamp();
         try rn.broadcastEntry("entry");
-        worst_ms = @max(worst_ms, @import("stdx").time.milliTimestamp() - t0);
-        @import("stdx").time.sleep(100 * std.time.ns_per_ms);
+        worst_ms = @max(worst_ms, stdx.time.milliTimestamp() - t0);
+        stdx.time.sleep(100 * std.time.ns_per_ms);
     }
     try testing.expect(worst_ms < 200);
+}
+
+test "raft network: peer info round-trips" {
+    var pbuf: [PEER_INFO_SIZE]u8 = undefined;
+    PeerInfo.encode(.{ .node_id = 9, .ip4 = .{ 10, 0, 1, 13 }, .raft_port = 9500 }, &pbuf);
+    const p = PeerInfo.decode(&pbuf);
+    try testing.expectEqual(@as(u32, 9), p.node_id);
+    try testing.expectEqual([4]u8{ 10, 0, 1, 13 }, p.ip4);
+    try testing.expectEqual(@as(u16, 9500), p.raft_port);
+}
+
+test "raft network: two nodes that dial each other at once keep exactly one link, and it is stable" {
+    var a = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
+    defer a.deinit();
+    var b = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 }, "s");
+    defer b.deinit();
+    a.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&b));
+    b.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&a));
+    try a.start();
+    try b.start();
+    try testing.expect(waitForPeer(&a, 2, 3000));
+    try testing.expect(waitForPeer(&b, 1, 3000));
+    // Let any crossing settle, then hold: one link each, both kept the one
+    // dialled by the lower id, and nothing flaps.
+    stdx.time.sleep(1500 * std.time.ns_per_ms);
+    const disconnects = a.peer_disconnects.load(.monotonic) + b.peer_disconnects.load(.monotonic);
+    stdx.time.sleep(1500 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u8, 1), a.peer_count);
+    try testing.expectEqual(@as(u8, 1), b.peer_count);
+    try testing.expect(a.hasPeer(2) and b.hasPeer(1));
+    try testing.expect(a.peerByNodeId(2).?.dialed_by_me);
+    try testing.expect(!b.peerByNodeId(1).?.dialed_by_me);
+    try testing.expectEqual(disconnects, a.peer_disconnects.load(.monotonic) + b.peer_disconnects.load(.monotonic));
+}
+
+test "raft network: a dialer that ignores our proof and sends a wrong one is refused by the acceptor" {
+    var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "right");
+    defer seed.deinit();
+    try seed.start();
+    const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&seed), 1000);
+    defer _ = std.c.close(fd);
+
+    // A well-formed hello from node 2 with its own nonce.
+    var nonce: [handshake.NONCE_LEN]u8 = undefined;
+    @memset(&nonce, 7);
+    var hello_payload: [handshake.Hello.SIZE]u8 = undefined;
+    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = nonce }).encode(&hello_payload);
+    var wire: [256]u8 = undefined;
+    const n = transport.frameMessage(.hello, 0, 2, &hello_payload, &wire);
+    _ = std.c.write(fd, &wire, n);
+
+    // The acceptor's hello back, with a proof we do not check.
+    var back: [HEADER_SIZE + handshake.HELLO_BACK_SIZE]u8 = undefined;
+    var got: usize = 0;
+    var waited: u64 = 0;
+    while (got < back.len and waited < 3000) : (waited += 20) {
+        const rc = std.c.read(fd, back[got..].ptr, back.len - got);
+        if (rc > 0) got += @intCast(rc) else stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(back.len, got);
+    const their = handshake.Hello.decode(back[HEADER_SIZE..][0..handshake.Hello.SIZE]);
+
+    // A proof under the wrong secret, otherwise correct in every way.
+    const bad = handshake.proof("wrong", &their.nonce, &nonce, 2, 1);
+    const vn = transport.frameMessage(.verify, 0, 2, &bad, &wire);
+    _ = std.c.write(fd, &wire, vn);
+
+    waited = 0;
+    while (waited < 3000 and seed.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 1), seed.handshake_failures.load(.monotonic));
+    try testing.expect(!seed.hasPeer(2));
+    // And the socket is closed on us.
+    var byte: [1]u8 = undefined;
+    waited = 0;
+    var closed = false;
+    while (waited < 3000 and !closed) : (waited += 20) {
+        const rc = std.c.read(fd, &byte, 1);
+        if (rc == 0) closed = true else stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    try testing.expect(closed);
+}
+
+test "raft network: of two crossing links the one dialled by the lower id wins, on both nodes" {
+    var low = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
+    defer low.deinit();
+    var high = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 }, "s");
+    defer high.deinit();
+    const held_by_low_dialed_by_high = PeerState{ .active = true, .node_id = 2, .dialed_by_me = false };
+    const held_by_low_dialed_by_low = PeerState{ .active = true, .node_id = 2, .dialed_by_me = true };
+    const held_by_high_dialed_by_low = PeerState{ .active = true, .node_id = 1, .dialed_by_me = false };
+    const held_by_high_dialed_by_high = PeerState{ .active = true, .node_id = 1, .dialed_by_me = true };
+    // Node 1 holds the link node 2 dialled; its own dial arrives: keep its own.
+    try testing.expect(low.linkWins(true, &held_by_low_dialed_by_high));
+    // Node 1 holds its own dial; node 2's dial arrives: refuse it.
+    try testing.expect(!low.linkWins(false, &held_by_low_dialed_by_low));
+    // Node 2 holds node 1's dial; its own dial completes: refuse its own.
+    try testing.expect(!high.linkWins(true, &held_by_high_dialed_by_low));
+    // Node 2 holds its own dial; node 1's dial arrives: replace with it.
+    try testing.expect(high.linkWins(false, &held_by_high_dialed_by_high));
+    // A duplicate from the same dialer never replaces a live link.
+    try testing.expect(!low.linkWins(false, &held_by_low_dialed_by_high));
+    try testing.expect(!high.linkWins(true, &held_by_high_dialed_by_high));
+}
+
+fn plainListener() !struct { fd: posix.socket_t, port: u16 } {
+    const fd = try sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const addr = SocketAddr.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try sysBind(fd, addr.anyPtr(), addr.anyLen());
+    try sysListen(fd, 4);
+    return .{ .fd = fd, .port = (try stdx_net.sysLocalIp4(fd)).port };
+}
+
+fn readExactly(fd: posix.socket_t, buf: []u8, timeout_ms: u64) !void {
+    var got: usize = 0;
+    var waited: u64 = 0;
+    while (got < buf.len and waited < timeout_ms) : (waited += 10) {
+        const rc = std.c.read(fd, buf[got..].ptr, buf.len - got);
+        if (rc > 0) got += @intCast(rc) else stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    if (got < buf.len) return error.Timeout;
+}
+
+test "raft network: a stranger that relays a node's own proof back to it is refused" {
+    // The node dials an address the stranger holds (a reused seed address).
+    var a = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer a.deinit();
+    const mirror = try plainListener();
+    defer _ = std.c.close(mirror.fd);
+    a.dialSeed(.{ 127, 0, 0, 1 }, mirror.port);
+    try a.start();
+
+    // The stranger takes the dial and reads the hello.
+    var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    var dial_fd: posix.socket_t = -1;
+    var waited: u64 = 0;
+    while (dial_fd < 0 and waited < 3000) : (waited += 10) {
+        dial_fd = sysAccept(mirror.fd, @ptrCast(&addr), &addr_len) catch -1;
+        if (dial_fd < 0) stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(dial_fd >= 0);
+    defer _ = std.c.close(dial_fd);
+    var hello_frame: [HEADER_SIZE + handshake.Hello.SIZE]u8 = undefined;
+    try readExactly(dial_fd, &hello_frame, 3000);
+    const a_hello = handshake.Hello.decode(hello_frame[HEADER_SIZE..][0..handshake.Hello.SIZE]);
+
+    // It opens a second connection to the node's own listener, claiming
+    // some other id but reusing the node's nonce, and gets the node's proof.
+    const back_fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&a), 1000);
+    defer _ = std.c.close(back_fd);
+    var forged: [handshake.Hello.SIZE]u8 = undefined;
+    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 1, .main_port = 1, .ip4 = .{ 127, 0, 0, 1 }, .nonce = a_hello.nonce }).encode(&forged);
+    var wire: [256]u8 = undefined;
+    const fn_ = transport.frameMessage(.hello, 0, 2, &forged, &wire);
+    _ = std.c.write(back_fd, &wire, fn_);
+    var back: [HEADER_SIZE + handshake.HELLO_BACK_SIZE]u8 = undefined;
+    try readExactly(back_fd, &back, 3000);
+
+    // Relayed verbatim to the dialling link: the node's own hello-back, its
+    // own proof, its own id.
+    _ = std.c.write(dial_fd, &back, back.len);
+    waited = 0;
+    while (waited < 3000 and a.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expect(a.handshake_failures.load(.monotonic) >= 1);
+    try testing.expect(!a.hasPeer(1));
+    try testing.expectEqual(@as(u8, 0), a.peer_count);
+}
+
+test "raft network: three nodes mesh, forward an entry without rejecting a frame, and stay linked" {
+    var a = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
+    defer a.deinit();
+    var b = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 }, "s");
+    defer b.deinit();
+    var c = try RaftNetwork.init(testing.allocator, 3, 0, 9003, .{ 127, 0, 0, 1 }, "s");
+    defer c.deinit();
+    var qb = try RaftQueue.init(testing.allocator, 16);
+    defer qb.deinit();
+    var qc = try RaftQueue.init(testing.allocator, 16);
+    defer qc.deinit();
+    b.setRaftQueue(&qb);
+    c.setRaftQueue(&qc);
+    try a.start();
+    b.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&a));
+    try b.start();
+    c.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&a));
+    try c.start();
+    // Peer exchange completes the mesh.
+    try testing.expect(waitForPeer(&a, 2, 3000) and waitForPeer(&a, 3, 3000));
+    try testing.expect(waitForPeer(&b, 3, 5000) and waitForPeer(&c, 2, 5000));
+    stdx.time.sleep(500 * std.time.ns_per_ms);
+    const disconnects = a.peer_disconnects.load(.monotonic) + b.peer_disconnects.load(.monotonic) + c.peer_disconnects.load(.monotonic);
+
+    try a.broadcastEntry("from-a");
+    // Each of B and C receives it from A directly and once more forwarded
+    // by the other, both under A's id; nothing is rejected, no link drops.
+    var waited: u64 = 0;
+    while (waited < 3000 and (qb.count() < 2 or qc.count() < 2)) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), qb.count());
+    try testing.expectEqual(@as(usize, 2), qc.count());
+    while (qb.pop()) |f| {
+        try testing.expectEqual(@as(u32, 1), f.source_node);
+        try testing.expectEqualStrings("from-a", f.payload);
+        testing.allocator.free(f.payload);
+    }
+    while (qc.pop()) |f| {
+        try testing.expectEqual(@as(u32, 1), f.source_node);
+        testing.allocator.free(f.payload);
+    }
+    stdx.time.sleep(500 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 0), a.frames_rejected.load(.monotonic) + b.frames_rejected.load(.monotonic) + c.frames_rejected.load(.monotonic));
+    try testing.expectEqual(disconnects, a.peer_disconnects.load(.monotonic) + b.peer_disconnects.load(.monotonic) + c.peer_disconnects.load(.monotonic));
+    try testing.expect(a.hasPeer(2) and a.hasPeer(3) and b.hasPeer(1) and b.hasPeer(3) and c.hasPeer(1) and c.hasPeer(2));
+}
+
+test "raft network: the known table keeps one entry per address and per id" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    const addr: [4]u8 = .{ 10, 0, 0, 5 };
+    rn.noteKnown(0, addr, 9500, true);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
+    // The seed answers as node 5: the seed entry becomes the member's.
+    rn.noteKnown(5, addr, 9500, false);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
+    try testing.expectEqual(@as(u32, 5), rn.knownByAddress(addr, 9500).?.node_id);
+    try testing.expect(rn.knownByAddress(addr, 9500).?.seed);
+    // Node 5 moves: the old address is forgotten.
+    rn.noteKnown(5, .{ 10, 0, 0, 6 }, 9500, false);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
+    try testing.expect(rn.knownByAddress(addr, 9500) == null);
+    // A new node takes the old address: the entry is that node's now, not
+    // one more entry that would be dialled and refused forever.
+    rn.noteKnown(7, .{ 10, 0, 0, 6 }, 9500, false);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
+    try testing.expectEqual(@as(u32, 7), rn.knownByAddress(.{ 10, 0, 0, 6 }, 9500).?.node_id);
+}
+
+test "raft network: draining a buffer of small frames stops at the shard queue's watermark" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var q = try RaftQueue.init(testing.allocator, 8);
+    defer q.deinit();
+    rn.setRaftQueue(&q);
+    var p = PeerState{ .active = true, .node_id = 2, .fd = -1, .framer = try Framer.init(testing.allocator) };
+    defer p.framer.?.deinit();
+    // Twenty frames in one read.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const n = transport.frameMessage(.replicate_entry, 0, 2, "x", p.framer.?.space());
+        p.framer.?.commit(n);
+    }
+    rn.drainFramer(&p);
+    // Six is the high watermark of eight; the rest wait in the buffer,
+    // and nothing was dropped.
+    try testing.expect(rn.reads_paused);
+    try testing.expectEqual(@as(usize, 6), q.count());
+    try testing.expect(p.framer.?.len > 0);
+    try testing.expectEqual(@as(u64, 0), q.dropped.load(.monotonic));
+    while (q.pop()) |f| testing.allocator.free(f.payload);
+    rn.applyBackpressure();
+    try testing.expect(!rn.reads_paused);
+    rn.drainFramer(&p);
+    try testing.expect(q.count() >= 6);
+    while (q.pop()) |f| testing.allocator.free(f.payload);
+}
+
+test "raft network: a node that reaches another carrying its own id is told so and backs off" {
+    var a = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
+    defer a.deinit();
+    var twin = try RaftNetwork.init(testing.allocator, 1, 0, 9002, .{ 127, 0, 0, 1 }, "s");
+    defer twin.deinit();
+    try a.start();
+    twin.dialSeed(.{ 127, 0, 0, 1 }, try boundPort(&a));
+    try twin.start();
+    // The request is taken into the known table, dialled, refused with the
+    // verdict before any proof: a whole round trip, not a failed handshake,
+    // and the address backs off to the longest interval rather than being
+    // forgotten on an unproven word.
+    const port = try boundPort(&a);
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 20) {
+        if (twin.knownByAddress(.{ 127, 0, 0, 1 }, port)) |k| {
+            if (k.warned) break;
+        }
+        stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    const k = twin.knownByAddress(.{ 127, 0, 0, 1 }, port).?;
+    try testing.expect(k.warned);
+    try testing.expectEqual(DIAL_BACKOFF_MAX_MS, k.backoff_ms);
+    try testing.expectEqual(@as(u64, 0), twin.handshake_failures.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), a.handshake_failures.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), a.peer_count);
+    try testing.expectEqual(@as(u8, 0), twin.peer_count);
+}
+
+test "raft network: a frame this link does not carry drops the peer, with the bytes after it left alone" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var p = PeerState{ .active = true, .node_id = 2, .fd = -1, .framer = try Framer.init(testing.allocator) };
+    // A vote request, a type no link carries, followed by more bytes in the
+    // same read.
+    var n = transport.frameMessage(.request_vote, 0, 2, "vote", p.framer.?.space());
+    p.framer.?.commit(n);
+    n = transport.frameMessage(.peer_info, 0, 2, "0123456789", p.framer.?.space());
+    p.framer.?.commit(n);
+    rn.drainFramer(&p);
+    try testing.expect(!p.active);
+    try testing.expect(p.framer == null);
+    try testing.expectEqual(@as(u64, 1), rn.frames_rejected.load(.monotonic));
+}
+
+test "raft network: peer info naming a non-dialable address is not remembered" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var p = PeerState{ .active = true, .node_id = 2, .fd = -1, .framer = try Framer.init(testing.allocator) };
+    defer p.framer.?.deinit();
+    var payload: [PEER_INFO_SIZE]u8 = undefined;
+    // What a poke carries: our bind address, port 0.
+    PeerInfo.encode(.{ .node_id = 3, .ip4 = .{ 0, 0, 0, 0 }, .raft_port = 0 }, &payload);
+    var n = transport.frameMessage(.peer_info, 0, 2, &payload, p.framer.?.space());
+    p.framer.?.commit(n);
+    // A real port on an address nobody can dial.
+    PeerInfo.encode(.{ .node_id = 4, .ip4 = .{ 0, 0, 0, 0 }, .raft_port = 9500 }, &payload);
+    n = transport.frameMessage(.peer_info, 0, 2, &payload, p.framer.?.space());
+    p.framer.?.commit(n);
+    // And one worth dialling.
+    PeerInfo.encode(.{ .node_id = 5, .ip4 = .{ 10, 0, 0, 5 }, .raft_port = 9500 }, &payload);
+    n = transport.frameMessage(.peer_info, 0, 2, &payload, p.framer.?.space());
+    p.framer.?.commit(n);
+    rn.drainFramer(&p);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
+    try testing.expectEqual(@as(u32, 5), rn.knownByAddress(.{ 10, 0, 0, 5 }, 9500).?.node_id);
 }

@@ -42,13 +42,59 @@ pub const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 // Message Types
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Every frame type on a peer link: the Raft RPCs and the link-level
+/// types the peer network speaks alongside them. A byte that names none
+/// of these is a broken or hostile peer.
 pub const MsgType = enum(u8) {
     append_entries = 1,
     append_entries_response = 2,
     request_vote = 3,
     request_vote_response = 4,
     install_snapshot = 5,
+    /// A committed entry, broadcast by the node that wrote it.
+    replicate_entry = 8,
+    /// A peer's id and address, so the mesh completes itself.
+    peer_info = 9,
+    /// Handshake: the dialer's hello, the acceptor's hello with its proof,
+    /// the dialer's proof, the acceptor's verdict.
+    hello = 10,
+    hello_back = 11,
+    verify = 12,
+    welcome = 13,
+    /// A committed entry passed on by a peer that received it, for a
+    /// member the origin has no link to. The payload starts with the
+    /// origin's id; the frame's own source is the peer that forwarded it.
+    forwarded_entry = 14,
 };
+
+/// Write one frame (header, checksum, payload) into `buf`; returns the
+/// frame size, or 0 when `buf` is too small.
+pub fn frameMessage(msg_type: MsgType, group_id: u32, source_node: u32, payload: []const u8, buf: []u8) usize {
+    const total = HEADER_SIZE + payload.len;
+    if (buf.len < total) return 0;
+    if (payload.len > 0) @memcpy(buf[HEADER_SIZE..total], payload);
+    return frameInPlace(msg_type, group_id, source_node, payload.len, buf);
+}
+
+/// Frame a payload already sitting at `buf[HEADER_SIZE..]`: writes the
+/// header and checksum around it. Returns the frame size, or 0 when `buf`
+/// is too small.
+pub fn frameInPlace(msg_type: MsgType, group_id: u32, source_node: u32, payload_len: usize, buf: []u8) usize {
+    const total = HEADER_SIZE + payload_len;
+    if (buf.len < total) return 0;
+    var hdr = RaftHeader{
+        .msg_type = @intFromEnum(msg_type),
+        ._pad = .{ 0, 0, 0 },
+        .group_id = group_id,
+        .source_node = source_node,
+        .payload_len = @intCast(payload_len),
+        .crc32 = 0,
+    };
+    @memcpy(buf[0..HEADER_SIZE], hdr.asBytes());
+    const crc = computeCrc(buf[0..HEADER_SIZE], buf[HEADER_SIZE..total]);
+    std.mem.writeInt(u32, buf[16..20], crc, .little);
+    return total;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Raft Header — 20 bytes, extern for exact memory layout
@@ -75,7 +121,7 @@ pub const RaftHeader = extern struct {
     }
 
     pub fn msgType(self: *const RaftHeader) ?MsgType {
-        return std.meta.intToEnum(MsgType, self.msg_type) catch null;
+        return std.enums.fromInt(MsgType, self.msg_type);
     }
 };
 

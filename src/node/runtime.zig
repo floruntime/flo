@@ -30,6 +30,8 @@ const Durability = @import("../config/server.zig").Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const RaftQueue = @import("../raft/raft_queue.zig").RaftQueue;
+const RAFT_QUEUE_CAPACITY = @import("../raft/network.zig").RAFT_QUEUE_CAPACITY;
 const cluster_config = @import("../config/cluster.zig");
 const raft_hard_state = @import("../raft/hard_state.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
@@ -108,6 +110,8 @@ pub const RuntimeConfig = struct {
     /// Port for gossip UDP communication (0 = derive from listen_port + 600)
     cluster_gossip_port: u16 = 0,
     cluster_seeds: []const []const u8 = &.{},
+    /// Proven by every peer before it is one; required with the listener.
+    cluster_secret: ?[]const u8 = null,
     cluster_replication_factor: u16 = 1,
     cluster_election_timeout_min_ms: u32 = 150,
     cluster_election_timeout_max_ms: u32 = 300,
@@ -202,6 +206,8 @@ pub const Runtime = struct {
 
     /// Raft networking layer for cluster entry replication.
     raft_network: ?*RaftNetwork,
+    /// Frames from peers to shard 0; owned here, outlives both ends.
+    raft_queue: ?*RaftQueue,
 
     /// Dashboard HTTP server (serves REST API + static files).
     dashboard_server: ?*DashboardServer,
@@ -251,6 +257,7 @@ pub const Runtime = struct {
             .pipe_write_ends = null,
             .started = false,
             .raft_network = null,
+            .raft_queue = null,
             .dashboard_server = null,
             .dashboard_ctx = null,
             .metrics_registry = null,
@@ -295,11 +302,17 @@ pub const Runtime = struct {
             self.metrics_registry = null;
         }
 
-        // Clean up raft network
+        // Clean up raft network, then the queue it fed (the shards that
+        // drained it have stopped by now).
         if (self.raft_network) |rn| {
             rn.deinit();
             self.allocator.destroy(rn);
             self.raft_network = null;
+        }
+        if (self.raft_queue) |q| {
+            q.deinit();
+            self.allocator.destroy(q);
+            self.raft_queue = null;
         }
 
         // Clean up pipes
@@ -578,16 +591,31 @@ pub const Runtime = struct {
         if (self.config.clusterListenerWanted()) {
             const raft_port = self.config.effectiveRaftPort();
             const node_id = cluster_node_id;
+            const secret = self.config.cluster_secret orelse "";
+            if (secret.len == 0) {
+                log.err("cluster: the peer listener needs [cluster] secret (the same value on every member); refusing to start it open", .{});
+                return error.ClusterSecretRequired;
+            }
+
+            const q = try self.allocator.create(RaftQueue);
+            errdefer self.allocator.destroy(q);
+            q.* = try RaftQueue.init(self.allocator, RAFT_QUEUE_CAPACITY);
+            errdefer q.deinit();
 
             const rn = try self.allocator.create(RaftNetwork);
-            // RaftNetwork.init binds a socket and can fail.
+            // RaftNetwork.init binds a socket and can fail (the port is in
+            // use). Nothing is published to the running shard thread, or
+            // to this runtime's teardown, until both exist and the network
+            // thread is up.
             errdefer self.allocator.destroy(rn);
-            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip);
-            rn.setShardInbox(&shards[0].inbox);
+            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip, secret);
+            errdefer rn.deinit();
+            rn.setRaftQueue(q);
+            try rn.start();
+            self.raft_queue = q;
+            shards[0].raft_queue = q;
             shards[0].raft_network = rn;
             self.raft_network = rn;
-
-            try rn.start();
         }
 
         // 4. Create and start acceptor

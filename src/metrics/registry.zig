@@ -396,6 +396,40 @@ pub const ReplicationMetrics = struct {
     broadcast_send_failures_total: Atomic(u64) = Atomic(u64).init(0),
     /// Follower index at which a gap was last observed (gauge, debugging aid).
     last_gap_received_index: Atomic(u64) = Atomic(u64).init(0),
+    /// Connections that failed the peer handshake: strangers, a wrong
+    /// secret, a broken client.
+    handshake_failures_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Frames from an authenticated peer that failed validation; each one
+    /// dropped the link.
+    frames_rejected_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Frames the shard's queue had no room for.
+    frames_dropped_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Peer links that went down, for any reason.
+    peer_disconnects_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Peers dropped for not reading what was queued for them.
+    slow_peer_drops_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Peer links up right now.
+    peers_linked: Atomic(u64) = Atomic(u64).init(0),
+
+    pub fn setPeersLinked(self: *ReplicationMetrics, n: u64) void {
+        self.peers_linked.store(n, .monotonic);
+    }
+
+    pub fn recordHandshakeFailure(self: *ReplicationMetrics) void {
+        _ = self.handshake_failures_total.fetchAdd(1, .monotonic);
+    }
+    pub fn recordFrameRejected(self: *ReplicationMetrics) void {
+        _ = self.frames_rejected_total.fetchAdd(1, .monotonic);
+    }
+    pub fn recordFrameDropped(self: *ReplicationMetrics) void {
+        _ = self.frames_dropped_total.fetchAdd(1, .monotonic);
+    }
+    pub fn recordPeerDisconnect(self: *ReplicationMetrics) void {
+        _ = self.peer_disconnects_total.fetchAdd(1, .monotonic);
+    }
+    pub fn recordSlowPeerDrop(self: *ReplicationMetrics) void {
+        _ = self.slow_peer_drops_total.fetchAdd(1, .monotonic);
+    }
 
     pub fn init() ReplicationMetrics {
         return .{};
@@ -421,6 +455,12 @@ pub const ReplicationMetrics = struct {
         broadcast_oversize_skipped_total: u64,
         broadcast_send_failures_total: u64,
         last_gap_received_index: u64,
+        handshake_failures_total: u64,
+        frames_rejected_total: u64,
+        frames_dropped_total: u64,
+        peer_disconnects_total: u64,
+        slow_peer_drops_total: u64,
+        peers_linked: u64,
     };
 
     pub fn snapshot(self: *const ReplicationMetrics) Snapshot {
@@ -430,6 +470,12 @@ pub const ReplicationMetrics = struct {
             .broadcast_oversize_skipped_total = self.broadcast_oversize_skipped_total.load(.monotonic),
             .broadcast_send_failures_total = self.broadcast_send_failures_total.load(.monotonic),
             .last_gap_received_index = self.last_gap_received_index.load(.monotonic),
+            .handshake_failures_total = self.handshake_failures_total.load(.monotonic),
+            .frames_rejected_total = self.frames_rejected_total.load(.monotonic),
+            .frames_dropped_total = self.frames_dropped_total.load(.monotonic),
+            .peer_disconnects_total = self.peer_disconnects_total.load(.monotonic),
+            .slow_peer_drops_total = self.slow_peer_drops_total.load(.monotonic),
+            .peers_linked = self.peers_linked.load(.monotonic),
         };
     }
 };
@@ -1380,6 +1426,30 @@ fn writeReplicationMetrics(writer: anytype, snapshot: ReplicationMetrics.Snapsho
     try writer.print("# HELP flo_replication_last_gap_received_index Follower index at which a gap was last observed\n", .{});
     try writer.print("# TYPE flo_replication_last_gap_received_index gauge\n", .{});
     try writer.print("flo_replication_last_gap_received_index {d}\n", .{snapshot.last_gap_received_index});
+
+    try writer.print("\n# HELP flo_replication_handshake_failures_total Peer connections that failed the handshake (stranger, wrong secret, broken client)\n", .{});
+    try writer.print("# TYPE flo_replication_handshake_failures_total counter\n", .{});
+    try writer.print("flo_replication_handshake_failures_total {d}\n", .{snapshot.handshake_failures_total});
+
+    try writer.print("\n# HELP flo_replication_frames_rejected_total Frames from a peer that failed validation; each dropped the link\n", .{});
+    try writer.print("# TYPE flo_replication_frames_rejected_total counter\n", .{});
+    try writer.print("flo_replication_frames_rejected_total {d}\n", .{snapshot.frames_rejected_total});
+
+    try writer.print("\n# HELP flo_replication_frames_dropped_total Peer frames the shard queue had no room for\n", .{});
+    try writer.print("# TYPE flo_replication_frames_dropped_total counter\n", .{});
+    try writer.print("flo_replication_frames_dropped_total {d}\n", .{snapshot.frames_dropped_total});
+
+    try writer.print("\n# HELP flo_replication_peer_disconnects_total Peer links that went down\n", .{});
+    try writer.print("# TYPE flo_replication_peer_disconnects_total counter\n", .{});
+    try writer.print("flo_replication_peer_disconnects_total {d}\n", .{snapshot.peer_disconnects_total});
+
+    try writer.print("\n# HELP flo_replication_slow_peer_drops_total Peers dropped for not reading what was queued for them\n", .{});
+    try writer.print("# TYPE flo_replication_slow_peer_drops_total counter\n", .{});
+    try writer.print("flo_replication_slow_peer_drops_total {d}\n", .{snapshot.slow_peer_drops_total});
+
+    try writer.print("\n# HELP flo_replication_peers_linked Peer links up right now\n", .{});
+    try writer.print("# TYPE flo_replication_peers_linked gauge\n", .{});
+    try writer.print("flo_replication_peers_linked {d}\n", .{snapshot.peers_linked});
 }
 
 /// Write per-shard metrics in Prometheus format
