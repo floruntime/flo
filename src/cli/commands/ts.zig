@@ -164,8 +164,6 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
 // Helpers
 // ========================================================================
 
-
-
 /// Parse a relative time string like "-1h", "-30m", "-7d" to epoch ms offset from now.
 /// Also accepts raw epoch ms (positive integers).
 fn parseTimeArg(s: []const u8) ?i64 {

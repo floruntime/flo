@@ -45,9 +45,6 @@ pub const Tag = enum(u8) {
     connection_handoff, // Acceptor handing off a new connection
     connection_migrate, // Connection migration between shards (v2)
 
-    // ── Cluster ──
-    raft_message, // Raft AppendEntries/RequestVote for a partition on this shard
-
     // ── System ──
     metadata_update, // Namespace/partition table changed
     shutdown, // Graceful shutdown signal

@@ -107,16 +107,16 @@ pub fn getMetricsJson(allocator: Allocator, ctx: *DashboardContext) ![]const u8 
     try wf_obj.intField("active_schedules", wf.active_schedules);
     try wf_obj.end();
 
-    // Replication divergence counters (issue #16). Non-zero values mean a
-    // follower has missed committed entries or the leader dropped a broadcast.
+    // Peer link health: links up, and what was refused, dropped or lost.
     const repl = ctx.metrics.replication.snapshot();
     var repl_obj = try obj.objectField("replication");
     try repl_obj.begin();
-    try repl_obj.intField("follower_gaps_total", repl.follower_gaps_total);
-    try repl_obj.intField("follower_entries_missing_total", repl.follower_entries_missing_total);
-    try repl_obj.intField("broadcast_oversize_skipped_total", repl.broadcast_oversize_skipped_total);
-    try repl_obj.intField("broadcast_send_failures_total", repl.broadcast_send_failures_total);
-    try repl_obj.intField("last_gap_received_index", repl.last_gap_received_index);
+    try repl_obj.intField("peers_linked", repl.peers_linked);
+    try repl_obj.intField("peer_disconnects_total", repl.peer_disconnects_total);
+    try repl_obj.intField("handshake_failures_total", repl.handshake_failures_total);
+    try repl_obj.intField("frames_rejected_total", repl.frames_rejected_total);
+    try repl_obj.intField("frames_dropped_total", repl.frames_dropped_total);
+    try repl_obj.intField("slow_peer_drops_total", repl.slow_peer_drops_total);
     try repl_obj.end();
 
     try obj.end();
@@ -162,5 +162,5 @@ test "getMetricsJson returns valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"queues\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"kv_namespaces\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"replication\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"follower_gaps_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"peers_linked\"") != null);
 }

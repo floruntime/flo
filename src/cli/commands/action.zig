@@ -900,13 +900,18 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         .{ .field = "", .header = "", .field_type = .uint_u32 }, // max_concurrency (skip)
         .{ .field = "", .header = "", .field_type = .int_i64 }, // registered_at (skip)
         .{ .field = "", .header = "", .field_type = .int_i64 }, // last_heartbeat (skip)
-        .{ .field = "", .header = "", .field_type = .skip_counted_records_u16, .sub_columns = &.{
-            .{ .field = "", .header = "", .field_type = .str_u16 }, // name
-            .{ .field = "", .header = "", .field_type = .enum_u8 }, // kind
-            .{ .field = "", .header = "", .field_type = .uint_u64 }, // run_count
-            .{ .field = "", .header = "", .field_type = .uint_u64 }, // fail_count
-            .{ .field = "", .header = "", .field_type = .int_i64 }, // last_run_at
-        } },
+        .{
+            .field = "",
+            .header = "",
+            .field_type = .skip_counted_records_u16,
+            .sub_columns = &.{
+                .{ .field = "", .header = "", .field_type = .str_u16 }, // name
+                .{ .field = "", .header = "", .field_type = .enum_u8 }, // kind
+                .{ .field = "", .header = "", .field_type = .uint_u64 }, // run_count
+                .{ .field = "", .header = "", .field_type = .uint_u64 }, // fail_count
+                .{ .field = "", .header = "", .field_type = .int_i64 }, // last_run_at
+            },
+        },
         .{ .field = "", .header = "", .field_type = .optional_str_u16 }, // metadata (skip)
         .{ .field = "machine", .header = "MACHINE", .field_type = .optional_str_u16 },
     });

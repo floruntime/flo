@@ -69,11 +69,9 @@ test "e2e/cluster: peers are reached at the address they advertise" {
     // The mesh: node 3 learned node 2's address from the seed's peer info.
     // With the seed gone, the only path from 2 to 3 is that link.
     seed.stop();
-    // Several writes, and the test waits for the last: every node commits
-    // into its own index space, so node 2's first entries carry the same
-    // indices as the seed's entries node 3 already applied and are dropped
-    // on arrival (issue #62). The seed wrote one key here (plus the namespace record the first
-    // write persists), so eight leaves margin.
+    // Two of three members remain: they elect a leader between them and
+    // node 2's writes reach node 3 through it. Several writes, and the
+    // test waits for the last.
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         var key_buf: [32]u8 = undefined;

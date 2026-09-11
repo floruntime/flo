@@ -516,8 +516,8 @@ pub const WorkflowHandler = struct {
         // The applier stores the definition and (re)registers its trigger
         // and schedule from the entry; the same applier runs at boot, so a
         // restart keeps them too.
-        self.persistCreate(shard, req.namespace, name, yaml) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "workflow not persisted");
+        self.persistCreate(shard, req.namespace, name, yaml) catch |err| {
+            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "workflow not persisted"));
             return;
         };
         if (!shard.applyCommitted()) {
@@ -3884,7 +3884,11 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     actions.registerReplay(&shard.replay_registry);
     shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
     shard.durability = .async_flush;
-    shard.last_replicated_index = 0;
+    shard.pending = try std.testing.allocator.alloc(shard_mod.Pending, shard_mod.PENDING_SLOTS);
+    @memset(shard.pending, .{});
+    shard.pending_count = 0;
+    shard.replies_held = 0;
+    shard.forward_count = 0;
     return shard;
 }
 
@@ -3895,6 +3899,7 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.destroy(shard.partitions[0]);
     std.testing.allocator.free(shard.partitions);
     std.testing.allocator.free(shard.apply_buf);
+    std.testing.allocator.free(shard.pending);
 }
 
 /// Complete a pending test action run with outcome "success".

@@ -42,7 +42,7 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo cluster status",
                     "flo cluster status --endpoint localhost:9000",
-                    "flo cluster status --json",
+                    "flo cluster status -o json",
                 })
                 .action(wrapHandler(runStatus)),
         )
@@ -53,7 +53,7 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo cluster members",
                     "flo cluster members --endpoint localhost:9000",
-                    "flo cluster members --json",
+                    "flo cluster members -o json",
                 })
                 .action(wrapHandler(runMembers)),
         )
@@ -225,17 +225,24 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
     const role_str = switch (state) {
         0 => "follower",
-        1 => "candidate",
+        1 => "electing",
         2 => "leader",
+        3 => "joining",
+        4 => "diverged",
         else => "unknown",
     };
+    // No leader is known while electing or joining.
+    const leader_shown = if (leader_id == 0) "none" else leader_name;
+    const leader_json = if (leader_id == 0) "null" else leader_name;
 
     if (json_output) {
-        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}:{d}\",\"leader_id\":\"{s}\",\"term\":{d},\"role\":\"{s}\",\"members\":{d}}}\n", .{
+        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}:{d}\",\"leader_id\":{s}{s}{s},\"term\":{d},\"role\":\"{s}\",\"members\":{d}}}\n", .{
             node_name,
             ep.host,
             ep.port,
-            leader_name,
+            if (leader_id == 0) "" else "\"",
+            leader_json,
+            if (leader_id == 0) "" else "\"",
             term,
             role_str,
             member_count,
@@ -246,7 +253,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         ctx.print("Node ID:    {s}\n", .{node_name});
         ctx.print("Address:    {s}:{d}\n", .{ ep.host, ep.port });
         ctx.print("Role:       {s}\n", .{role_str});
-        ctx.print("Leader:     {s}\n", .{leader_name});
+        ctx.print("Leader:     {s}\n", .{leader_shown});
         ctx.print("Term:       {d}\n", .{term});
         ctx.print("Members:    {d}\n\n", .{member_count});
     }
@@ -341,7 +348,6 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
             const address = if (addr.len > 0) addr else endpoint_addr;
 
             // For now, state is always "alive" for members we can see
-            // TODO: Add actual health status from gossip protocol
             const state_str = "alive";
 
             table.addRow(&.{ member_name, address, role_str, state_str }) catch return error.CommandFailed;

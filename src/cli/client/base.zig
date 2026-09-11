@@ -95,6 +95,7 @@ pub const Response = struct {
             .internal_error => "Internal server error",
             .overloaded => "Server overloaded",
             .rate_limited => "Rate limit exceeded",
+            .unavailable => "Unavailable",
             _ => "Unknown error",
         };
     }

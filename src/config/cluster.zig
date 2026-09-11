@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const log = @import("stdx").log;
 
 /// Cluster configuration loaded from [cluster] section in flo.toml
 pub const ClusterConfig = struct {
@@ -36,11 +37,6 @@ pub const ClusterConfig = struct {
     /// 0 = derive from listen_port + 500 (see RuntimeConfig)
     raft_port: u16 = 0,
 
-    /// Port for gossip UDP communication (0 = disabled)
-    /// When enabled, derives from listen_port + 600
-    /// Enables SWIM-based failure detection and membership dissemination
-    gossip_port: u16 = 0,
-
     /// Seed nodes for cluster discovery (host:port format)
     /// Example: ["192.168.1.10:9500", "192.168.1.11:9500"]
     seeds: []const []const u8 = &.{},
@@ -50,41 +46,9 @@ pub const ClusterConfig = struct {
     /// open: required whenever the peer listener starts.
     secret: ?[]const u8 = null,
 
-    /// Replication factor for data partitions (default: 1 = no replication)
-    replication_factor: u8 = 1,
-
-    /// Discovery mode: static (use seeds list) or dns (SRV records)
-    discovery_mode: DiscoveryMode = .static,
-
-    /// Raft election timeout range in milliseconds
-    election_timeout_min_ms: u32 = 150,
-    election_timeout_max_ms: u32 = 300,
-
-    /// Raft heartbeat interval in milliseconds
-    heartbeat_interval_ms: u32 = 50,
-
-    /// Maximum entries per AppendEntries RPC
-    max_entries_per_rpc: u32 = 100,
-
-    // Gossip timing configuration
-    /// Gossip ping interval in milliseconds
-    gossip_ping_interval_ms: u32 = 1000,
-    /// Gossip ping timeout in milliseconds
-    gossip_ping_timeout_ms: u32 = 500,
-    /// Gossip suspect timeout in milliseconds (before marking dead)
-    gossip_suspect_timeout_ms: u32 = 5000,
-
-    pub const DiscoveryMode = enum {
-        /// Use static seed list
-        static,
-        /// DNS-based discovery (SRV records)
-        dns,
-
-        pub fn fromString(s: []const u8) DiscoveryMode {
-            if (std.mem.eql(u8, s, "dns")) return .dns;
-            return .static;
-        }
-    };
+    /// A leader unheard for this long is replaced; election timeouts are
+    /// [½, 1] × this and heartbeats a sixth of it.
+    failover_timeout_ms: u32 = 1500,
 
     /// Check if no seeds are configured (used for INITIAL setup decisions).
     /// For runtime checks, use ClusterCoordinator.isSingleNodeCluster() instead.
@@ -139,6 +103,13 @@ pub const ClusterConfig = struct {
     }
 };
 
+pub const MIN_FAILOVER_TIMEOUT_MS: i64 = 100;
+
+/// Every key `[cluster]` reads. A key not on the list is refused at start,
+/// not ignored: a line that parses clean and changes nothing is the bug
+/// an operator finds at 2am.
+const known_keys = [_][]const u8{ "enabled", "secret", "node_id", "node_name", "raft_port", "seeds", "failover_timeout_ms" };
+
 /// Parse cluster configuration from TOML table
 pub fn parseClusterConfig(
     allocator: Allocator,
@@ -167,35 +138,25 @@ pub fn parseClusterConfig(
         try owned_strings.append(allocator, owned);
         config.secret = owned;
     }
-    if (table.getInt("gossip_port")) |p| {
-        config.gossip_port = @intCast(p);
+    if (table.getInt("failover_timeout_ms")) |t| {
+        if (t > std.math.maxInt(u32)) {
+            log.err("[cluster] failover_timeout_ms = {d} is not a duration this node can wait", .{t});
+            return error.InvalidSetting;
+        }
+        if (t < MIN_FAILOVER_TIMEOUT_MS) {
+            log.err("[cluster] failover_timeout_ms = {d} is too low: below {d} ms a busy disk's fsync looks like a dead leader and the group elects on every stall", .{ t, MIN_FAILOVER_TIMEOUT_MS });
+            return error.InvalidSetting;
+        }
+        config.failover_timeout_ms = @intCast(t);
     }
-    if (table.getString("discovery_mode")) |m| {
-        config.discovery_mode = ClusterConfig.DiscoveryMode.fromString(m);
-    }
-    if (table.getInt("replication_factor")) |r| {
-        config.replication_factor = @intCast(r);
-    }
-    if (table.getInt("election_timeout_min_ms")) |t| {
-        config.election_timeout_min_ms = @intCast(t);
-    }
-    if (table.getInt("election_timeout_max_ms")) |t| {
-        config.election_timeout_max_ms = @intCast(t);
-    }
-    if (table.getInt("heartbeat_interval_ms")) |t| {
-        config.heartbeat_interval_ms = @intCast(t);
-    }
-    if (table.getInt("max_entries_per_rpc")) |m| {
-        config.max_entries_per_rpc = @intCast(m);
-    }
-    if (table.getInt("gossip_ping_interval_ms")) |t| {
-        config.gossip_ping_interval_ms = @intCast(t);
-    }
-    if (table.getInt("gossip_ping_timeout_ms")) |t| {
-        config.gossip_ping_timeout_ms = @intCast(t);
-    }
-    if (table.getInt("gossip_suspect_timeout_ms")) |t| {
-        config.gossip_suspect_timeout_ms = @intCast(t);
+    var keys = table.entries.keyIterator();
+    while (keys.next()) |key| {
+        var known = false;
+        for (known_keys) |k| known = known or std.mem.eql(u8, k, key.*);
+        if (!known) {
+            log.err("[cluster] {s} is not a setting; the keys are enabled, secret, node_id, node_name, raft_port, seeds and failover_timeout_ms. Remove the line.", .{key.*});
+            return error.UnknownSetting;
+        }
     }
 
     // Seeds: an array of "host:port", or one comma-separated string.
@@ -299,4 +260,23 @@ test "formatNodeId with explicit name" {
     const config2 = ClusterConfig{ .node_name = "east-1" };
     const name2 = config2.formatNodeId(&buf, 0x12345678);
     try std.testing.expectEqualStrings("east-1", name2);
+}
+
+test "cluster config refuses a key it does not know and a failover below the floor" {
+    const toml = @import("toml.zig");
+    const allocator = std.testing.allocator;
+    var owned: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (owned.items) |o| allocator.free(o);
+        owned.deinit(allocator);
+    }
+    var stale = try toml.parse(allocator, "election_timeout_min_ms = 150\n");
+    defer stale.deinit();
+    try std.testing.expectError(error.UnknownSetting, parseClusterConfig(allocator, &stale, &owned));
+    var low = try toml.parse(allocator, "failover_timeout_ms = 50\n");
+    defer low.deinit();
+    try std.testing.expectError(error.InvalidSetting, parseClusterConfig(allocator, &low, &owned));
+    var fine = try toml.parse(allocator, "failover_timeout_ms = 3000\n");
+    defer fine.deinit();
+    try std.testing.expectEqual(@as(u32, 3000), (try parseClusterConfig(allocator, &fine, &owned)).failover_timeout_ms);
 }

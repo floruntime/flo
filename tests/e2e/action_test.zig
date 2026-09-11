@@ -53,9 +53,9 @@ test "e2e/action: register with all options" {
 
     // flo action register handler --owner myteam --timeout 60000 --retries 5
     try ctx.exec(&.{
-        "action",    "register",  "handler",
-        "--owner",   "myteam",    "--timeout",
-        "60000",     "--retries", "5",
+        "action",  "register",  "handler",
+        "--owner", "myteam",    "--timeout",
+        "60000",   "--retries", "5",
     });
 }
 
@@ -583,8 +583,7 @@ test "e2e/action/worker: worker fails task permanently" {
     var fail_result = try ctx.cli.run(&.{
         "worker",      "fail",    run_id,
         "--worker-id", worker_id, "--action",
-        action_name,   "--error",
-        "Permanent failure: invalid input",
+        action_name,   "--error", "Permanent failure: invalid input",
         // Note: no --retry flag
     });
     defer fail_result.deinit();

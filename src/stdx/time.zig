@@ -14,6 +14,14 @@ pub fn nanoTimestamp() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
 }
 
+/// Milliseconds from a clock that never jumps, for deadlines and
+/// intervals; its zero is arbitrary.
+pub fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
 /// Wall-clock time in milliseconds since the Unix epoch.
 pub fn milliTimestamp() i64 {
     return @intCast(@divFloor(nanoTimestamp(), std.time.ns_per_ms));

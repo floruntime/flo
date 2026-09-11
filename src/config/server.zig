@@ -178,20 +178,12 @@ pub const ServerConfig = struct {
             .dashboard_port = self.dashboard.port,
             .dashboard_bind = self.dashboard.bind,
             .dashboard_cors_origins = self.dashboard.cors_origins,
-            // Cluster configuration (always enabled, no explicit flag)
             .cluster_enabled = self.cluster.enabled,
             .cluster_node_id = self.cluster.node_id,
             .cluster_raft_port = self.cluster.raft_port,
-            .cluster_gossip_port = self.cluster.gossip_port,
             .cluster_seeds = self.cluster.seeds,
             .cluster_secret = self.cluster.secret,
-            .cluster_replication_factor = self.cluster.replication_factor,
-            .cluster_election_timeout_min_ms = self.cluster.election_timeout_min_ms,
-            .cluster_election_timeout_max_ms = self.cluster.election_timeout_max_ms,
-            .cluster_heartbeat_interval_ms = self.cluster.heartbeat_interval_ms,
-            .cluster_gossip_ping_interval_ms = self.cluster.gossip_ping_interval_ms,
-            .cluster_gossip_ping_timeout_ms = self.cluster.gossip_ping_timeout_ms,
-            .cluster_gossip_suspect_timeout_ms = self.cluster.gossip_suspect_timeout_ms,
+            .cluster_failover_timeout_ms = self.cluster.failover_timeout_ms,
             // Background task intervals
             .namespace_deletion_interval_ms = self.namespace_deletion_interval_ms,
             // KV configuration
@@ -600,8 +592,8 @@ pub fn generateDefaultConfig() []const u8 {
     \\# cors_origins = "http://localhost:5173"
     \\
     \\[cluster]
-    \\# Enable distributed cluster mode with Raft consensus
-    \\# When disabled, runs in standalone mode (single node)
+    \\# true starts this node as the first member of a cluster (same as
+    \\# --cluster); false with no seeds runs a single node.
     \\enabled = false
     \\
     \\# This node's id, unique in the cluster. Read on first boot and then stored
@@ -611,24 +603,18 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Port for Raft RPC communication between cluster nodes (0 = auto: listen_port + 500)
     \\# raft_port = 9500
     \\
-    \\# Seed nodes for cluster discovery (comma-separated)
-    \\# Format: "host1:raft_port1,host2:raft_port2,host3:raft_port3"
-    \\# seeds = "192.168.1.10:9500,192.168.1.11:9500,192.168.1.12:9500"
+    \\# Peer ports of members to join (same as --join); a node with seeds joins
+    \\# them, so it does not also set enabled = true.
+    \\# seeds = ["192.168.1.10:9500", "192.168.1.11:9500"]
     \\
     \\# Shared secret every member must hold; required whenever the peer
-    \\# listener starts (enabled, seeds, raft_port or replication_factor > 1).
+    \\# listener starts (--cluster, --join, or seeds here).
     \\# Generate one: openssl rand -base64 32
     \\# secret = "..."
     \\
-    \\# Replication factor (number of copies of each partition)
-    \\# replication_factor = 3
-    \\
-    \\# Raft election timeout range in milliseconds
-    \\# election_timeout_min_ms = 150
-    \\# election_timeout_max_ms = 300
-    \\
-    \\# Raft heartbeat interval in milliseconds
-    \\# heartbeat_interval_ms = 50
+    \\# Replacing a leader that has gone quiet begins after half of this and
+    \\# is certain by all of it; heartbeats are a sixth of it. Minimum 100.
+    \\# failover_timeout_ms = 1500
     \\
     \\[cold_storage]
     \\# Cold tier backend: none, file, s3

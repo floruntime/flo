@@ -184,7 +184,7 @@ pub fn delete(
     return client.sendRequest(.ts_delete, namespace, measurement, "");
 }
 
-/// Set retention policy  
+/// Set retention policy
 pub fn retention(
     client: *Client,
     namespace: []const u8,

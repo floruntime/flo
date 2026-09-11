@@ -1,12 +1,12 @@
 //! KV Handler — registers KV opcodes with Dispatcher and handles KV operations.
 //!
 //! Read operations (get, scan, history) query the KV projection directly.
-//! Write operations (put, delete) go through the full Raft propose pipeline:
+//! Write operations (put, delete) go through the Raft propose pipeline:
 //!   1. Build CommandPayload from the request (key + value + TTL)
-//!   2. Propose the entry to RaftNode — in single-node mode this commits immediately
-//!   3. Apply all newly committed entries (commit_index > last_applied) to the
-//!      KV projection via applyEntry()
-//!   4. Send the response to the client
+//!   2. Propose the entry to RaftNode
+//!   3. `Shard.park` the request until the entry commits and is applied
+//!      (at once with no peers, after a quorum acks otherwise)
+//!   4. A responder reads the projection and answers the client
 //!
 //! ## Handler Registration
 //!
@@ -18,7 +18,7 @@
 //! ## Dispatch Flow
 //!
 //! Acceptor → Shard → Dispatcher → KVHandler.dispatch{Get,Put,...}
-//!   → [writes] raft_node.propose() → Shard.applyCommitted() → sendResponse
+//!   → [writes] raft_node.propose() → Shard.park() → applied → respond*()
 //!   → [reads]  projection.get/scan() → sendResponse
 //!
 //! ## Reserved Keys
@@ -301,30 +301,34 @@ pub const KVHandler = struct {
         if (tryHandleInTxn(shard, conn, req, qkey, .put, req.value, put_expiry_ns)) return;
 
         // Build CommandPayload and propose through Raft (uses qualified key)
-        _ = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
+        const proposed = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondPut);
+    }
 
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-
-        // Build response from the committed version
+    /// The put applied: its version is the key's, and the namespace now
+    /// holds data.
+    fn respondPut(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch return respondOk(shard_ptr, conn_ptr, req);
         const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
-        const cmd_result = CommandResult{ .kv_put_ok = .{ .version = version } };
-        log.debug("KV PUT: key={s}, value_len={d}, version={d}", .{ req.key, req.value.len, version });
-
-        // Track namespace data for non-empty delete check
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_put_ok = .{ .version = version } });
+    }
 
-        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
+    fn respondOk(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        sendKVResponse(shard, conn, req.header.request_id, .ok);
+    }
+
+    fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
+        switch (err) {
+            error.NotLeader => sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unavailable, .message = "unavailable: electing a leader — retry" } }),
+            error.Overloaded => shard.sendErrorResponse(conn, req.header.request_id, .overloaded, "too many writes waiting for commit"),
+            else => sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "propose failed" } }),
+        }
     }
 
     fn dispatchDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -371,24 +375,8 @@ pub const KVHandler = struct {
         if (tryHandleInTxn(shard, conn, req, qkey, .delete, &[_]u8{}, 0)) return;
 
         // Propose the delete through Raft (qualified key)
-        _ = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-
-        log.debug("KV DELETE: key={s}", .{req.key});
-
-        sendKVResponse(shard, conn, req.header.request_id, .ok);
+        const proposed = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondOk);
     }
 
     // ── Extended KV: INCR / TOUCH / PERSIST / EXISTS / JSON ────────────
@@ -443,21 +431,19 @@ pub const KVHandler = struct {
         // Inside a transaction? Buffer the increment.
         if (tryHandleInTxn(shard, conn, req, qkey, .incr, &val_buf, 0)) return;
 
-        _ = proposeKVEntryWithValue(shard, .kv_incr, req, qkey, &val_buf) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
+        const proposed = proposeKVEntryWithValue(shard, .kv_incr, req, qkey, &val_buf) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondIncr);
+    }
+
+    /// The counter applied: answer with its value now.
+    fn respondIncr(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } });
             return;
         };
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-
         const entry = shard.kv_handler.*.kv.get(qkey) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } });
             return;
@@ -543,21 +529,8 @@ pub const KVHandler = struct {
         const txn_op_kind: txn_mod.TxnOpKind = if (force_persist) .persist else .touch;
         if (tryHandleInTxn(shard, conn, req, qkey, txn_op_kind, &val_buf, expiry_ns)) return;
 
-        _ = proposeKVEntryWithValue(shard, .kv_touch, req, qkey, &val_buf) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-        sendKVResponse(shard, conn, req.header.request_id, .ok);
+        const proposed = proposeKVEntryWithValue(shard, .kv_touch, req, qkey, &val_buf) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondOk);
     }
 
     /// EXISTS — return a 1-byte payload (0x00 or 0x01) wrapped in a kv_value
@@ -721,23 +694,8 @@ pub const KVHandler = struct {
         };
         defer allocator.free(merged);
 
-        _ = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-
-        const version = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 1;
-        sendKVResponse(shard, conn, req.header.request_id, .{ .kv_put_ok = .{ .version = version } });
+        const proposed = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondPut);
     }
 
     /// JSON.DEL — remove a path. Path "$" deletes the whole key.
@@ -770,19 +728,8 @@ pub const KVHandler = struct {
 
         // Path "$" → delete the entire key (use kv_delete entry).
         if (path.len == 1 and path[0] == '$') {
-            _ = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| {
-                const result: CommandResult = switch (err) {
-                    error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                    else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-                };
-                sendKVResponse(shard, conn, req.header.request_id, result);
-                return;
-            };
-            if (!shard.applyCommitted()) {
-                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-                return;
-            }
-            sendKVResponse(shard, conn, req.header.request_id, .ok);
+            const proposed = proposeKVEntry(shard, .kv_delete, req, qkey) catch |err| return proposeFailed(shard, conn, req, err);
+            shard.park(conn, req, proposed, respondOk);
             return;
         }
 
@@ -800,21 +747,8 @@ pub const KVHandler = struct {
         };
         defer allocator.free(merged);
 
-        _ = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-        sendKVResponse(shard, conn, req.header.request_id, .ok);
+        const proposed = proposeKVEntryWithValue(shard, .kv_put, req, qkey, merged) catch |err| return proposeFailed(shard, conn, req, err);
+        shard.park(conn, req, proposed, respondOk);
     }
 
     // ── Shard Walker: Local Scan ──────────────────────────────────────
@@ -1023,10 +957,8 @@ pub const KVHandler = struct {
 
     /// Build a CommandPayload from the request, set entry flags (TTL, tombstone),
     /// and propose the entry through RaftNode. Returns the ProposeResult with
-    /// .index (becomes the entry version) and .term.
-    ///
-    /// After this returns successfully, call `Shard.applyCommitted()` to apply
-    /// any newly committed entries.
+    /// .index (becomes the entry version) and .term; the caller parks the
+    /// request on it.
     fn proposeKVEntry(shard: *Shard, entry_type: entry_mod.EntryType, req: Request, qualified_key: []const u8) !@import("../raft/node.zig").ProposeResult {
         const value: []const u8 = if (entry_type == .kv_delete) &[_]u8{} else req.value;
         return proposeKVEntryWithValue(shard, entry_type, req, qualified_key, value);
@@ -1072,24 +1004,7 @@ pub const KVHandler = struct {
             }
         }
 
-        // Propose through Raft — in single-node mode this commits immediately
-        const propose_result = try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
-
-        // Broadcast to cluster peers via raft network.
-        // getEntryCopy (not getEntry): the zero-copy read returns null for an
-        // entry whose payload wraps the hot-ring boundary, which would silently
-        // drop it from replication. payload_buf is free to reuse — propose()
-        // already copied it into the ring.
-        if (shard.raft_network) |rn| {
-            if (shard.raft_node.log.getEntryCopy(propose_result.index, &payload_buf)) |committed_entry| {
-                var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
-                if (committed_entry.serialize(&entry_buf)) |serialized_len| {
-                    rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
-                }
-            }
-        }
-
-        return propose_result;
+        return try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
     }
 
     // ── Per-Shard Transactions ─────────────────────────────────────────
@@ -1193,40 +1108,22 @@ pub const KVHandler = struct {
         };
 
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const propose_result = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..written]) catch |err| {
-            const result: CommandResult = switch (err) {
-                error.NotLeader => .{ .err = .{ .code = .unavailable, .message = "not leader" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "commit: propose failed" } },
-            };
-            sendKVResponse(shard, conn, req.header.request_id, result);
-            return;
-        };
+        const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..written]) catch |err| return proposeFailed(shard, conn, req, err);
+        // The transaction stays in the table until its batch applies; the
+        // responder drops it.
+        shard.park(conn, req, proposed, respondCommitTxn);
+    }
 
-        // Broadcast to peers (mirrors proposeKVEntryWithValue).
-        // getEntryCopy (not getEntry): the zero-copy read returns null for a
-        // boundary-wrapping payload, which would silently drop it from
-        // replication. payload_buf (heap, len >= written) is free to reuse here.
-        if (shard.raft_network) |rn| {
-            if (shard.raft_node.log.getEntryCopy(propose_result.index, payload_buf)) |committed_entry| {
-                var entry_buf: [MAX_ENTRY_PAYLOAD + 64]u8 = undefined;
-                if (committed_entry.serialize(&entry_buf)) |serialized_len| {
-                    rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
-                }
-            }
-        }
-
-        if (!shard.applyCommitted()) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "committed entry not applied" } });
-
-            return;
-        }
-
-        // Drop the txn state \u2014 it's now durably committed.
+    /// The batch applied at `last_applied`: drop the transaction and say so.
+    fn respondCommitTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const txn_table = &shard.kv_handler.*.txn_table;
+        const txn_id = extractTxnId(req) orelse 0;
+        const op_count: u16 = if (txn_table.get(txn_id)) |t| @intCast(t.ops.items.len) else 0;
         txn_table.drop(txn_id);
-
-        log.debug("KV COMMIT: txn_id={d} ops={d} commit_index={d}", .{ txn_id, op_count, propose_result.index });
         sendKVResponse(shard, conn, req.header.request_id, .{ .kv_txn_commit_ok = .{
-            .commit_index = propose_result.index,
+            .commit_index = shard.raft_node.last_applied,
             .op_count = op_count,
         } });
     }

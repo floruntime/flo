@@ -49,10 +49,12 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\  3. Built-in defaults
                     \\
                     \\Cluster mode:
-                    \\  Without --join: Starts as single-node cluster (immediate leader)
-                    \\  With --join:    Connects to existing cluster and requests membership
+                    \\  Neither flag:  a single node; nothing to configure
+                    \\  --cluster:     the first member; it leads alone until others join
+                    \\  --join a:b,..: joins the members it can reach and is added by the leader
                     \\  Every member proves the same shared secret at the peer port:
                     \\  set [cluster] secret in flo.toml or FLO_CLUSTER_SECRET.
+                    \\  A cluster replicates one shard: leave --shards at its default, or set 1.
                     \\
                     \\Note: Shard count defines data topology and cannot be changed after
                     \\      initial data is written without running a rebalance operation.
@@ -63,6 +65,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     "flo server start --config /etc/flo/flo.toml",
                     "flo server start -p 9000 --data-dir /var/lib/flo",
                     "flo server start --durability sync --data-dir /var/lib/flo",
+                    "flo server start --cluster",
                     "flo server start --join 192.168.1.10:9500",
                     "flo server start --join 192.168.1.10:9500,192.168.1.11:9500",
                 })
@@ -76,10 +79,10 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("log-format", 0, "", "Log format: text, json")
                 .uintFlag("threads", 't', 0, "Number of worker threads (0=auto)")
                 .stringFlag("bind", 0, "", "Address to listen on (default: 0.0.0.0)")
+                .boolFlag("cluster", 0, "Start as the first member of a cluster: listen for peers, lead a group of one until others join")
                 .stringFlag("join", 'j', "", "Join existing cluster (host:port[,host:port,...])")
                 .uintFlag("node-id", 'n', 0, "Node ID (0=auto-generate from hostname:port)")
-                .uintFlag("raft-port", 0, 0, "Raft RPC port (default: listen_port + 500)")
-                .uintFlag("gossip-port", 0, 0, "Gossip UDP port (default: listen_port + 600, 0=disabled)")
+                .uintFlag("raft-port", 0, 0, "Peer port, with --cluster or --join (default: listen_port + 500)")
                 .uintFlag("metrics-port", 0, 0, "Metrics HTTP port (default: listen_port + 1)")
                 .uintFlag("dashboard-port", 0, 0, "Dashboard HTTP port (default: listen_port + 2)")
                 .boolFlag("no-metrics", 0, "Disable metrics server")
@@ -289,10 +292,10 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const bind_override = ctx.getString("bind");
 
     // Cluster flags
+    const cluster_first = ctx.getBool("cluster");
     const join_addrs = ctx.getString("join");
     const node_id_override = ctx.getChangedUint("node-id");
     const raft_port_override = ctx.getChangedUint16("raft-port");
-    const gossip_port_override = ctx.getChangedUint16("gossip-port");
 
     // Metrics and dashboard flags
     const metrics_port_override = ctx.getChangedUint16("metrics-port");
@@ -323,14 +326,12 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     defer config.deinit();
 
     // Apply cluster CLI overrides
+    if (cluster_first) config.cluster.enabled = true;
     if (node_id_override) |nid| {
         config.cluster.node_id = nid;
     }
     if (raft_port_override) |rp| {
         config.cluster.raft_port = rp;
-    }
-    if (gossip_port_override) |gp| {
-        config.cluster.gossip_port = gp;
     }
     if (metrics_port_override) |mp| {
         config.metrics.port = mp;
@@ -439,21 +440,20 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // Report the port Raft will actually bind, not the unset config value,
     // which reads as 0 while the listener is up on listen_port + 500.
     if (rc_preview.clusterListenerWanted()) {
-        ctx.print("    Raft port:  {d}\n", .{rc_preview.effectiveRaftPort()});
+        ctx.print("    Peer port:  {d}\n", .{rc_preview.effectiveRaftPort()});
     } else {
-        ctx.print("    Raft port:  not listening (single-node)\n", .{});
-    }
-    if (config.cluster.gossip_port > 0) {
-        ctx.print("    Gossip:     {d}\n", .{config.cluster.gossip_port});
+        ctx.print("    Peer port:  not listening (single node)\n", .{});
     }
     if (config.cluster.seeds.len > 0) {
-        ctx.print("    Join:       {s}", .{config.cluster.seeds[0]});
+        ctx.print("    Mode:       joining {s}", .{config.cluster.seeds[0]});
         for (config.cluster.seeds[1..]) |seed| {
             ctx.print(",{s}", .{seed});
         }
         ctx.print("\n", .{});
+    } else if (config.cluster.enabled) {
+        ctx.print("    Mode:       first member of a cluster\n", .{});
     } else {
-        ctx.print("    Mode:       Single-node (no seeds)\n", .{});
+        ctx.print("    Mode:       single node\n", .{});
     }
     ctx.print("\n", .{});
 
