@@ -24,7 +24,6 @@ const TestConfig = Config{
     .election_timeout_min_ms = 150,
     .election_timeout_max_ms = 300,
     .heartbeat_interval_ms = 50,
-    .max_entries_per_batch = 64,
     .enable_pre_vote = false, // simpler for deterministic testing
 };
 
@@ -66,14 +65,14 @@ const TestCluster = struct {
     /// Run an election on a specific node and deliver votes from alive peers.
     /// Returns true if the node won the election.
     fn runElection(self: *TestCluster, candidate_idx: usize) bool {
-        const vote_req = self.nodes[candidate_idx].startElection().?;
+        const vote_req = self.nodes[candidate_idx].startElectionNow().?;
 
         for (0..CLUSTER_SIZE) |j| {
             if (j == candidate_idx) continue;
             if (!self.alive[j]) continue;
 
             const resp = self.nodes[j].handleVoteRequest(vote_req);
-            if (self.nodes[candidate_idx].handleVoteResponse(resp)) {
+            if (self.nodes[candidate_idx].handleVoteResponse(resp) == .won) {
                 return true;
             }
         }
@@ -109,7 +108,8 @@ const TestCluster = struct {
             // Read entries from next_index
             const count = leader.log.getRange(peer.next_index, &entry_buf, &payload_arena);
             if (count == 0) continue;
-
+            // As the leader loop does: an ack only counts up to what was sent.
+            leader.peers[peer_idx].sent_up_to = @max(leader.peers[peer_idx].sent_up_to, peer.next_index + count - 1);
             const req = AppendRequest{
                 .term = leader.current_term,
                 .leader_id = leader.id,
@@ -200,12 +200,12 @@ test "integration: raft leader propose and replicate" {
     // Replicate to followers
     _ = try cluster.replicate(0);
 
-    // After one round, majority acked — entries committed
-    try testing.expectEqual(@as(u64, 3), cluster.nodes[0].commit_index);
-
+    // After one round, majority acked — the term's noop and the entries
+    // are committed
+    try testing.expectEqual(@as(u64, 4), cluster.nodes[0].commit_index);
     // Followers have the entries
-    try testing.expectEqual(@as(u64, 3), cluster.nodes[1].log.lastIndex());
-    try testing.expectEqual(@as(u64, 3), cluster.nodes[2].log.lastIndex());
+    try testing.expectEqual(@as(u64, 4), cluster.nodes[1].log.lastIndex());
+    try testing.expectEqual(@as(u64, 4), cluster.nodes[2].log.lastIndex());
 }
 
 test "integration: raft leader failover and re-election" {
@@ -221,10 +221,9 @@ test "integration: raft leader failover and re-election" {
     _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "before-crash-1");
     _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "before-crash-2");
     _ = try cluster.replicate(0);
-
-    try testing.expectEqual(@as(u64, 2), cluster.nodes[0].commit_index);
-    try testing.expectEqual(@as(u64, 2), cluster.nodes[1].log.lastIndex());
-    try testing.expectEqual(@as(u64, 2), cluster.nodes[2].log.lastIndex());
+    try testing.expectEqual(@as(u64, 3), cluster.nodes[0].commit_index);
+    try testing.expectEqual(@as(u64, 3), cluster.nodes[1].log.lastIndex());
+    try testing.expectEqual(@as(u64, 3), cluster.nodes[2].log.lastIndex());
 
     // ── Phase 2: Kill the leader ───────────────────────────────────────
     cluster.kill(0);
@@ -244,12 +243,12 @@ test "integration: raft leader failover and re-election" {
     _ = try cluster.nodes[1].propose(.kv_put, 0, 0, "after-crash-1");
     _ = try cluster.replicate(1);
 
-    // Committed: new leader + node 2 form majority (node 0 is dead)
-    try testing.expectEqual(@as(u64, 3), cluster.nodes[1].commit_index);
-    try testing.expectEqual(@as(u64, 3), cluster.nodes[2].log.lastIndex());
-
+    // Committed: new leader + node 2 form majority (node 0 is dead); the
+    // new term's noop precedes the entry
+    try testing.expectEqual(@as(u64, 5), cluster.nodes[1].commit_index);
+    try testing.expectEqual(@as(u64, 5), cluster.nodes[2].log.lastIndex());
     // Dead node 0 still has old data
-    try testing.expectEqual(@as(u64, 2), cluster.nodes[0].log.lastIndex());
+    try testing.expectEqual(@as(u64, 3), cluster.nodes[0].log.lastIndex());
 }
 
 test "integration: raft old leader rejoins as follower" {
@@ -280,8 +279,9 @@ test "integration: raft old leader rejoins as follower" {
     const append_resp = try cluster.nodes[0].handleAppendEntries(.{
         .term = new_term,
         .leader_id = 2, // node 1's ID
-        .prev_log_index = cluster.nodes[1].log.lastIndex() - 1,
-        .prev_log_term = 1, // our entries were in term 1
+        // Node 1's log: our two term-1 entries, then its noop and its entry.
+        .prev_log_index = cluster.nodes[1].log.lastIndex() - 2,
+        .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = cluster.nodes[1].commit_index,
     });
@@ -307,8 +307,7 @@ test "integration: raft no quorum blocks commit" {
     // Propose entry — should be appended to log but NOT committed
     _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "lonely-entry");
     _ = try cluster.replicate(0); // no alive followers to replicate to
-
-    try testing.expectEqual(@as(u64, 1), cluster.nodes[0].log.lastIndex());
+    try testing.expectEqual(@as(u64, 2), cluster.nodes[0].log.lastIndex());
     try testing.expectEqual(@as(u64, 0), cluster.nodes[0].commit_index); // stuck!
 
     // ── Revive one follower — now we have quorum again ─────────────────
@@ -316,8 +315,8 @@ test "integration: raft no quorum blocks commit" {
     _ = try cluster.replicate(0);
 
     // Now majority (leader + node 1) have the entry — committed
-    try testing.expectEqual(@as(u64, 1), cluster.nodes[0].commit_index);
-    try testing.expectEqual(@as(u64, 1), cluster.nodes[1].log.lastIndex());
+    try testing.expectEqual(@as(u64, 2), cluster.nodes[0].commit_index);
+    try testing.expectEqual(@as(u64, 2), cluster.nodes[1].log.lastIndex());
 }
 
 test "integration: raft multiple term transitions" {

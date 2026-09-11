@@ -21,7 +21,8 @@
 const std = @import("std");
 const stdx = @import("stdx");
 const log = @import("stdx").log;
-const Shard = @import("shard.zig").Shard;
+const shard_mod = @import("shard.zig");
+const Shard = shard_mod.Shard;
 const Acceptor = @import("acceptor.zig").Acceptor;
 const Inbox = @import("inbox.zig").Inbox;
 const InboxMessage = @import("inbox.zig").Message;
@@ -30,6 +31,7 @@ const Durability = @import("../config/server.zig").Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
+const RaftNodeConfig = @import("../raft/node.zig").Config;
 const RaftQueue = @import("../raft/raft_queue.zig").RaftQueue;
 const RAFT_QUEUE_CAPACITY = @import("../raft/network.zig").RAFT_QUEUE_CAPACITY;
 const cluster_config = @import("../config/cluster.zig");
@@ -50,12 +52,12 @@ const HttpMetricsServer = @import("../metrics/http_server.zig").HttpMetricsServe
 ///
 /// ## Port Derivation
 ///
-/// Auxiliary ports (metrics, dashboard, raft, gossip) default to 0, meaning
+/// Auxiliary ports (metrics, dashboard, raft) default to 0, meaning
 /// "derive from listen_port + offset". Use the `effective*Port()` methods
 /// instead of accessing the port fields directly. This allows running multiple
 /// instances with a single `--port` flag:
 ///
-///   --port 10000  →  metrics=10001, dashboard=10002, raft=10500, gossip=10600
+///   --port 10000  →  metrics=10001, dashboard=10002, raft=10500
 ///
 pub const RuntimeConfig = struct {
     // =========================================================================
@@ -66,7 +68,6 @@ pub const RuntimeConfig = struct {
     pub const PORT_OFFSET_METRICS: u16 = 1; // listen_port + 1
     pub const PORT_OFFSET_DASHBOARD: u16 = 2; // listen_port + 2
     pub const PORT_OFFSET_RAFT: u16 = 500; // listen_port + 500
-    pub const PORT_OFFSET_GOSSIP: u16 = 600; // listen_port + 600
 
     num_shards: u16 = 0,
     partition_count: u32 = 0,
@@ -107,18 +108,12 @@ pub const RuntimeConfig = struct {
     cluster_node_id: u32 = 0,
     /// Port for Raft RPC communication (0 = derive from listen_port + 500)
     cluster_raft_port: u16 = 0,
-    /// Port for gossip UDP communication (0 = derive from listen_port + 600)
-    cluster_gossip_port: u16 = 0,
     cluster_seeds: []const []const u8 = &.{},
     /// Proven by every peer before it is one; required with the listener.
     cluster_secret: ?[]const u8 = null,
-    cluster_replication_factor: u16 = 1,
-    cluster_election_timeout_min_ms: u32 = 150,
-    cluster_election_timeout_max_ms: u32 = 300,
-    cluster_heartbeat_interval_ms: u32 = 50,
-    cluster_gossip_ping_interval_ms: u32 = 1000,
-    cluster_gossip_ping_timeout_ms: u32 = 500,
-    cluster_gossip_suspect_timeout_ms: u32 = 5000,
+    /// The one timing knob: a leader unheard for this long is replaced.
+    /// Election timeouts are [½, 1] × this, heartbeats a sixth of it.
+    cluster_failover_timeout_ms: u32 = 1500,
     namespace_deletion_interval_ms: i64 = 5000,
     expose_internal_keys: bool = false,
 
@@ -156,22 +151,11 @@ pub const RuntimeConfig = struct {
 
     /// Whether this node should bring up the peer-facing Raft listener.
     ///
-    /// True when peers are actually possible: seeds are configured, a Raft port
-    /// was named explicitly, replication is on, or the operator asked for it
-    /// with `[cluster] enabled = true`. A plain single-node server matches none
-    /// of these and leaves the port unbound.
+    /// True when peers are possible: the operator started the first member
+    /// (`--cluster`, `[cluster] enabled`) or named seeds to join. A plain
+    /// single-node server leaves the port unbound.
     pub fn clusterListenerWanted(self: RuntimeConfig) bool {
-        return self.cluster_enabled or
-            self.cluster_seeds.len > 0 or
-            self.cluster_raft_port > 0 or
-            self.cluster_replication_factor > 1;
-    }
-
-    /// Get effective gossip port (derives from listen_port + 600 if set to 0)
-    pub fn effectiveGossipPort(self: RuntimeConfig) u16 {
-        if (self.cluster_gossip_port > 0) return self.cluster_gossip_port;
-        if (self.listen_port == 0) return 0;
-        return self.listen_port +| PORT_OFFSET_GOSSIP;
+        return self.cluster_enabled or self.cluster_seeds.len > 0;
     }
 };
 
@@ -243,7 +227,10 @@ pub const Runtime = struct {
     peer_shards_slice: ?[]*Shard,
 
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
-        const shard_count = detectShardCount(config.num_shards);
+        // A cluster replicates one shard until every shard has a group, so
+        // an automatic count resolves to one there; an explicit larger
+        // count is refused at start.
+        const shard_count = if (config.clusterListenerWanted() and config.num_shards == 0) 1 else detectShardCount(config.num_shards);
 
         return .{
             .allocator = allocator,
@@ -501,6 +488,30 @@ pub const Runtime = struct {
             } });
         }
 
+        // How shard 0's group comes up: alone, as the first member, or
+        // joining the seeds. Only shard 0 has peers until every shard
+        // replicates, so a cluster runs one shard.
+        if (self.config.cluster_enabled and self.config.cluster_seeds.len > 0) {
+            log.err("cluster: --cluster starts the first member and --join joins members that exist; pass one, not both", .{});
+            return error.ClusterRoleAmbiguous;
+        }
+        if (self.config.cluster_raft_port > 0 and !self.config.clusterListenerWanted()) {
+            log.err("cluster: raft_port (or --raft-port) is set but this node is neither the first member (--cluster) nor joining one (--join); pass one, or remove the port", .{});
+            return error.ClusterRoleUnset;
+        }
+        const shard0_role: shard_mod.ClusterRole = if (!self.config.clusterListenerWanted())
+            .single
+        else if (self.config.cluster_seeds.len > 0)
+            .join
+        else
+            .bootstrap;
+        if (shard0_role != .single and self.shard_count > 1) {
+            log.err("cluster: a cluster replicates one shard for now; leave --shards at its default or set 1 (this node has {d})", .{self.shard_count});
+            return error.ClusterNeedsOneShard;
+        }
+        var raft_config = RaftNodeConfig.fromFailover(self.config.cluster_failover_timeout_ms);
+        raft_config.durable_commits = self.config.durability == .sync;
+
         // 2. Create shards
         const shards = try self.allocator.alloc(Shard, self.shard_count);
         var shards_created: usize = 0;
@@ -525,6 +536,8 @@ pub const Runtime = struct {
                 self.config.tiered_log.hot_flush_seconds,
                 self.config.durability,
                 cluster_node_id,
+                if (i == 0) shard0_role else .single,
+                raft_config,
             );
             shards_created += 1;
         }
@@ -559,7 +572,7 @@ pub const Runtime = struct {
 
         log.debug("Runtime.start: {d} shards initialized", .{shards_created});
 
-        // 3. Spawn shard threads
+        // 3.5. Spawn shard threads
         const threads = try self.allocator.alloc(std.Thread, self.shard_count);
         self.shard_threads = threads;
 
@@ -578,16 +591,12 @@ pub const Runtime = struct {
             self.shard_threads = null;
         }
 
-        for (0..self.shard_count) |i| {
-            threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
-            threads_spawned += 1;
-            log.debug("Runtime.start: spawned shard thread {d}", .{i});
-        }
-
-        // 3.5 Start the peer-facing Raft listener only when this node can
-        // actually have peers. Note this cannot be decided by comparing
-        // effectiveRaftPort() against listen_port: that helper *derives*
-        // listen_port + 500, so such a check is true even for a lone node.
+        // 3. Start the peer-facing Raft listener only when this node can
+        // have peers, before the shard threads run, so shard 0 never ticks
+        // without its queue and network. Note this cannot be decided
+        // by comparing effectiveRaftPort() against listen_port: that helper
+        // *derives* listen_port + 500, so such a check is true even for a
+        // lone node.
         if (self.config.clusterListenerWanted()) {
             const raft_port = self.config.effectiveRaftPort();
             const node_id = cluster_node_id;
@@ -604,9 +613,8 @@ pub const Runtime = struct {
 
             const rn = try self.allocator.create(RaftNetwork);
             // RaftNetwork.init binds a socket and can fail (the port is in
-            // use). Nothing is published to the running shard thread, or
-            // to this runtime's teardown, until both exist and the network
-            // thread is up.
+            // use). Nothing is published to this runtime's teardown until
+            // both exist and the network thread is up.
             errdefer self.allocator.destroy(rn);
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip, secret);
             errdefer rn.deinit();
@@ -616,6 +624,12 @@ pub const Runtime = struct {
             shards[0].raft_queue = q;
             shards[0].raft_network = rn;
             self.raft_network = rn;
+        }
+
+        for (0..self.shard_count) |i| {
+            threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
+            threads_spawned += 1;
+            log.debug("Runtime.start: spawned shard thread {d}", .{i});
         }
 
         // 4. Create and start acceptor
@@ -649,8 +663,6 @@ pub const Runtime = struct {
                 }
             }
 
-            // Wire replication metrics into the raft network (issue #16) so the
-            // leader-side oversize-skip / send-failure counters are recorded.
             if (self.raft_network) |rn| rn.setReplicationMetrics(&metrics.replication);
         }
 
@@ -706,6 +718,7 @@ pub const Runtime = struct {
         // Seeds are resolved here and dialed by the peer loop, so startup
         // never waits on a peer and only that thread touches the peer table.
         if (self.raft_network) |rn| {
+            var dialed: usize = 0;
             for (self.config.cluster_seeds) |seed| {
                 const target = parseSeedAddress(seed) orelse {
                     log.warn("cluster: ignoring seed '{s}': expected host:port", .{seed});
@@ -716,12 +729,15 @@ pub const Runtime = struct {
                 var attempt: usize = 0;
                 while (attempt < SEED_RESOLVE_ATTEMPTS) : (attempt += 1) {
                     const ip4 = stdx.net.resolveIp4(self.allocator, target.host) catch |err| {
-                        if (attempt + 1 == SEED_RESOLVE_ATTEMPTS) log.warn("cluster: seed '{s}' did not resolve: {s}; continuing alone", .{ seed, @errorName(err) });
+                        if (attempt + 1 == SEED_RESOLVE_ATTEMPTS) log.warn("cluster: seed '{s}' did not resolve: {s}", .{ seed, @errorName(err) });
                         stdx.time.sleep(200 * std.time.ns_per_ms);
                         continue;
                     };
                     switch (seedUsability(bind_ip, ip4, target.port, rn.listen_port)) {
-                        .usable => rn.dialSeed(ip4, target.port),
+                        .usable => {
+                            rn.dialSeed(ip4, target.port);
+                            dialed += 1;
+                        },
                         .self => log.debug("cluster: seed '{s}' is this node; skipping", .{seed}),
                         .unreachable_from_loopback => {
                             log.err("cluster: [server] bind is loopback but seed '{s}' is on another host — peers could never reach this node; bind an interface they can", .{seed});
@@ -730,6 +746,12 @@ pub const Runtime = struct {
                     }
                     break;
                 }
+            }
+            // A joiner with nobody to dial would follow nothing forever:
+            // no vote, no leader, every write refused.
+            if (self.config.cluster_seeds.len > 0 and dialed == 0) {
+                log.err("cluster: none of the seeds could be dialled; this node cannot join anyone. Check the seed addresses, or start the first member with --cluster", .{});
+                return error.NoSeedReachable;
             }
         }
 
@@ -1144,11 +1166,9 @@ test "RuntimeConfig: the listener comes up when peers are possible" {
     const seeded = RuntimeConfig{ .listen_port = 9000, .cluster_seeds = &.{"10.0.0.1:9500"} };
     try std.testing.expect(seeded.clusterListenerWanted());
 
+    // A port alone names no role: startup refuses it rather than guessing.
     const explicit_port = RuntimeConfig{ .listen_port = 9000, .cluster_raft_port = 9500 };
-    try std.testing.expect(explicit_port.clusterListenerWanted());
-
-    const replicated = RuntimeConfig{ .listen_port = 9000, .cluster_replication_factor = 3 };
-    try std.testing.expect(replicated.clusterListenerWanted());
+    try std.testing.expect(!explicit_port.clusterListenerWanted());
 
     const enabled = RuntimeConfig{ .listen_port = 9000, .cluster_enabled = true };
     try std.testing.expect(enabled.clusterListenerWanted());
@@ -1172,14 +1192,12 @@ test "RuntimeConfig: an ephemeral listen_port derives ephemeral ports, not privi
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveMetricsPort());
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveDashboardPort());
     try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveRaftPort());
-    try std.testing.expectEqual(@as(u16, 0), ephemeral.effectiveGossipPort());
 
     // A real base still derives as documented.
     const real = RuntimeConfig{ .listen_port = 9000 };
     try std.testing.expectEqual(@as(u16, 9001), real.effectiveMetricsPort());
     try std.testing.expectEqual(@as(u16, 9002), real.effectiveDashboardPort());
     try std.testing.expectEqual(@as(u16, 9500), real.effectiveRaftPort());
-    try std.testing.expectEqual(@as(u16, 9600), real.effectiveGossipPort());
 
     // An explicit port always wins, even off an ephemeral base.
     const explicit = RuntimeConfig{ .listen_port = 0, .dashboard_port = 8080 };

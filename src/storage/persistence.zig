@@ -3,8 +3,8 @@
 //! `ReplayRegistry` maps an entry type to its applier: the one function that
 //! mutates a subsystem's state from a committed entry, whether that entry was
 //! written here, replicated from a peer, or read back from a segment at boot.
-//! `persistEntry` builds a command entry, proposes it and broadcasts it; it
-//! does not apply.
+//! `persistEntry` builds a command entry, proposes it and returns once it
+//! has committed; it does not apply.
 //!
 //! ## Usage
 //!
@@ -20,6 +20,8 @@
 const std = @import("std");
 const entry_mod = @import("ual/entry.zig");
 const router = @import("../node/router.zig");
+const proto = @import("../protocol/proto.zig");
+const result_mod = @import("../protocol/result.zig");
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -72,11 +74,13 @@ pub const ReplayRegistry = struct {
 /// Persist a key-value command through Raft for durability and replication.
 ///
 /// Builds a CommandPayload (namespace_hash + key + value), proposes it
-/// through the shard's Raft node, and broadcasts to cluster peers.
-/// Returns the index of the committed entry. Does not apply it.
+/// through the shard's Raft node and waits for it to commit — at once
+/// alone, one round trip to a majority in a cluster, with the shard's
+/// other work paused meanwhile. Returns the committed index. Does not
+/// apply it.
 ///
 /// `shard` is `anytype` to avoid a circular import with node/shard.zig.
-/// It must have `.raft_node` and `.raft_network` fields.
+/// It must have `.raft_node` and `awaitCommit`.
 pub fn persistEntry(
     shard: anytype,
     entry_type: EntryType,
@@ -106,20 +110,35 @@ pub fn persistEntry(
         payload_buf[0..payload_len],
     );
 
-    // Broadcast to cluster peers via raft network.
-    //
-    // Use getEntryCopy, not getEntry: the zero-copy getEntry returns null for an
-    // entry whose payload wraps the hot-ring byte boundary, which would silently
-    // drop the entry from the broadcast and diverge followers. payload_buf is
-    // free to reuse here — propose() already copied it into the ring.
-    if (shard.raft_network) |rn| {
-        if (shard.raft_node.log.getEntryCopy(propose_result.index, &payload_buf)) |committed_entry| {
-            var entry_buf: [MAX_PERSIST_PAYLOAD + 64]u8 = undefined;
-            if (committed_entry.serialize(&entry_buf)) |serialized_len| {
-                rn.broadcastEntry(entry_buf[0..serialized_len]) catch {};
-            }
-        }
+    switch (shard.awaitCommit(propose_result.index)) {
+        .committed => return propose_result.index,
+        .leadership_lost => return error.NotCommitted,
+        .timed_out => return error.CommitUnconfirmed,
     }
+}
 
-    return propose_result.index;
+/// What a client is told when `persistEntry` fails. The two Raft outcomes
+/// are retryable and say so; anything else is the server's fault.
+pub fn failureStatus(err: anyerror) proto.StatusCode {
+    return switch (err) {
+        error.NotCommitted, error.CommitUnconfirmed, error.NotLeader => .unavailable,
+        else => .internal_error,
+    };
+}
+
+/// The same, for handlers that answer with a `CommandResult`.
+pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
+    return switch (err) {
+        error.NotCommitted, error.CommitUnconfirmed, error.NotLeader => .unavailable,
+        else => .internal_error,
+    };
+}
+
+pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
+    return switch (err) {
+        error.NotCommitted => "unavailable: lost leadership before commit — write may still apply",
+        error.CommitUnconfirmed => "unavailable: commit not confirmed in time — write may still apply",
+        error.NotLeader => "unavailable: electing a leader — retry",
+        else => fallback,
+    };
 }

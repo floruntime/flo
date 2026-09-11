@@ -1,15 +1,14 @@
 //! Metrics Endpoint E2E Tests
 //!
 //! Drives a real flo server with the dashboard enabled and asserts the metrics
-//! JSON surfaces the replication divergence counters added for issue #16
-//! (Tier-1 "detect, don't repair"). This guards the full wiring:
+//! JSON surfaces the peer link counters. This guards the full wiring:
 //! ReplicationMetrics → MetricsRegistry → dashboard /api/v1/metrics.
 
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 
-test "e2e/metrics: replication divergence counters surfaced on /api/v1/metrics" {
+test "e2e/metrics: peer link counters surfaced on /api/v1/metrics" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
@@ -24,13 +23,13 @@ test "e2e/metrics: replication divergence counters surfaced on /api/v1/metrics" 
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(resp.isJson());
 
-    // The replication block must be present so the console can alarm on silent
-    // follower divergence.
+    // The replication block must be present so the console can alarm on a
+    // peer link that keeps dropping.
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"replication\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"follower_gaps_total\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"follower_entries_missing_total\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"broadcast_oversize_skipped_total\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"broadcast_send_failures_total\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"peers_linked\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"peer_disconnects_total\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"handshake_failures_total\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"frames_dropped_total\"") != null);
 }
 
 test "e2e/metrics: prometheus exporter serves the registry" {
@@ -54,7 +53,7 @@ test "e2e/metrics: prometheus exporter serves the registry" {
     // Prometheus exposition format, with the families that are actually recorded.
     try testing.expect(std.mem.indexOf(u8, resp.body, "# TYPE flo_commands_total counter") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "flo_uptime_seconds") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "flo_replication_follower_gaps_total 0") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "flo_replication_peers_linked 0") != null);
 
     // initShards is wired, so the shard family is sized to the real topology
     // rather than omitted (shardCount() used to stay 0).

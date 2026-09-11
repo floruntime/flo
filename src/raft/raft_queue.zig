@@ -36,8 +36,9 @@ pub const RaftQueue = struct {
     /// Read end, for the shard's reactor; write end, for the producer.
     wake_rd: std.posix.fd_t,
     wake_wr: std.posix.fd_t,
-    /// Frames the producer could not queue; each is an entry this node
-    /// never applied.
+    /// Frames the producer could not queue: a batch the leader resends, a
+    /// vote the next timeout repeats, a forwarded write its client waits
+    /// on until the term changes.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !RaftQueue {
@@ -115,6 +116,12 @@ pub const RaftQueue = struct {
         return self.len <= self.slots.len / 4 and self.bytes <= LOW_BYTES;
     }
 
+    /// Wake the consumer without a frame: for frames it holds itself.
+    pub fn poke(self: *RaftQueue) void {
+        const byte = [_]u8{1};
+        _ = std.c.write(self.wake_wr, &byte, 1);
+    }
+
     /// Empty the wake pipe; called by the consumer when the read end is
     /// readable, before draining.
     pub fn drainWake(self: *RaftQueue) void {
@@ -133,7 +140,7 @@ pub const RaftQueue = struct {
 const testing = std.testing;
 
 fn owned(payload: []const u8) !Frame {
-    return .{ .source_node = 1, .group_id = 0, .msg_type = .replicate_entry, .payload = try testing.allocator.dupe(u8, payload) };
+    return .{ .source_node = 1, .group_id = 0, .msg_type = .append_entries, .payload = try testing.allocator.dupe(u8, payload) };
 }
 
 fn wakePending(fd: std.posix.fd_t) bool {
@@ -187,7 +194,7 @@ test "raft queue: bytes bound the queue as well as frames" {
     defer testing.allocator.free(big);
     var i: usize = 0;
     while (i < 2) : (i += 1) {
-        try testing.expect(q.push(.{ .source_node = 1, .group_id = 0, .msg_type = .replicate_entry, .payload = try testing.allocator.dupe(u8, big) }));
+        try testing.expect(q.push(.{ .source_node = 1, .group_id = 0, .msg_type = .append_entries, .payload = try testing.allocator.dupe(u8, big) }));
     }
     // Two frames, but 64 MiB: above the high watermark by bytes alone.
     try testing.expect(q.aboveHigh());
@@ -195,7 +202,7 @@ test "raft queue: bytes bound the queue as well as frames" {
     // Past the hard cap a push is refused even with slots free, and the
     // refused copy stays the caller's to free.
     while (true) {
-        const f = Frame{ .source_node = 1, .group_id = 0, .msg_type = .replicate_entry, .payload = try testing.allocator.dupe(u8, big) };
+        const f = Frame{ .source_node = 1, .group_id = 0, .msg_type = .append_entries, .payload = try testing.allocator.dupe(u8, big) };
         if (!q.push(f)) {
             testing.allocator.free(f.payload);
             break;

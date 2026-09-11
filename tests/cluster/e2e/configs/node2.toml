@@ -1,11 +1,12 @@
 # Flo Cluster Node 2 — local e2e testing
-# Listen: 4451, Metrics: 4452, Dashboard: 4453, Raft: 4951, Gossip: 5051
+# Listen: 4451, Metrics: 4452, Dashboard: 4453, Peer port: 4951
 
 [server]
 port = 4451
 bind = "127.0.0.1"
 data_dir = "/tmp/flo-cluster-test/node2"
-shards = 2
+# A cluster replicates one shard for now.
+shards = 1
 
 [storage]
 durability = "async_flush"
@@ -23,6 +24,7 @@ bind = "127.0.0.1"
 # port = 0 → auto: 4451 + 2 = 4453
 
 [cluster]
-enabled = true
+# Joins the first member; the leader adds this node to the group.
 node_id = 2
-seeds = ["127.0.0.1:4941", "127.0.0.1:4951", "127.0.0.1:4961"]
+secret = "local-cluster-test-secret"
+seeds = ["127.0.0.1:4941"]

@@ -717,17 +717,12 @@ test "e2e/kv: multiple keys consistency after restart" {
 // 3-Node Cluster Tests
 // =============================================================================
 //
-// Multi-node Raft clustering is IMPLEMENTED and working. These tests exercise:
-// - Cluster formation via --join flag
+// These tests exercise:
+// - Cluster formation via --cluster and --join
 // - Leader election and re-election
-// - Data replication across nodes (AppendEntries RPC)
+// - Data replication across nodes
 // - Read-after-write consistency from any node
 // - Node failure tolerance (2/3 quorum)
-//
-// Known issue: The "writes continue after leader failure" test is flaky due to
-// a peer reconnection backoff bug - after leader kill, remaining nodes may take
-// too long to clear BackoffPending state and re-establish commit quorum.
-// See: LEADER_FAILOVER_FIX.md for details.
 //
 // To run cluster tests:
 //   zig build test-e2e -Dtest-filter="cluster"
@@ -791,18 +786,7 @@ test "e2e/kv/cluster: data available after node1 dies" {
     try testing.expect(std.mem.indexOf(u8, value3, "must_survive") != null);
 }
 
-/// Cross-node writes collide today: every node commits into its own Raft
-/// index space and gossips the entry, and a peer that already applied that
-/// index from another node drops the newcomer as a duplicate (#62). The four
-/// tests below write from more than one node and fail on exactly that, every
-/// run, until AppendEntries replaces the broadcast. Skipped rather than
-/// deleted so the leader-loop change un-skips them as its gate.
-fn skipCrossNodeWrites() error{SkipZigTest}!void {
-    return error.SkipZigTest;
-}
-
 test "e2e/kv/cluster: writes continue after leader failure" {
-    try skipCrossNodeWrites();
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
 
@@ -828,37 +812,20 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     const kill_done_time = stdx.time.milliTimestamp();
     std.debug.print("Kill complete after {d}ms\n", .{kill_done_time - kill_time});
 
-    // Give cluster time to elect new leader
-    // Note: Election timeout is 150-300ms, but we need extra time for:
-    // - Followers to detect leader absence (1-2 election timeouts)
-    // - Pre-vote phase (may fail if peers not yet discovered)
-    // - Vote phase (requires majority)
-    // - New leader to initialize
-    // - Peer connections to re-establish (backoff can add latency)
-    // - Raft commit to complete (needs majority acknowledgment)
-    std.debug.print("Waiting 10 seconds for new leader election...\n", .{});
-    @import("stdx").time.sleep(10 * std.time.ns_per_s);
-    const write_attempt_time = stdx.time.milliTimestamp();
-    std.debug.print("10s wait complete, attempting write (total time since kill: {d}ms)\n", .{write_attempt_time - kill_time});
-
-    // New writes should work via node 2 (which should become leader or forward to new leader)
-    // Retry with exponential backoff to handle peer connection issues
-    // Issue: After leader kill, peer connections may fail with BackoffPending
-    // which prevents commit quorum. More retries with longer waits help.
-    std.debug.print("Attempting write to node 1...\n", .{});
+    // The survivors elect a leader within the failover timeout; a write on
+    // node 1 is forwarded to it, or answered "electing a leader" until then.
+    std.debug.print("Writing to node 1 until the survivors have a leader...\n", .{});
     var write_success = false;
     var last_err: ?anyerror = null;
-    const retry_delays = [_]u64{ 1, 2, 3, 4, 5, 6 }; // 6 retries: 1+2+3+4+5+6 = 21 seconds max
-    for (retry_delays, 0..) |delay, attempt| {
-        if (attempt > 0) {
-            std.debug.print("Retry attempt {d} (waiting {d}s)...\n", .{ attempt + 1, delay });
-            @import("stdx").time.sleep(delay * std.time.ns_per_s);
-        }
+    var attempt: usize = 0;
+    while (attempt < 40) : (attempt += 1) {
+        if (attempt > 0) @import("stdx").time.sleep(500 * std.time.ns_per_ms);
         cluster.execOn(1, &.{ "kv", "set", "after_failure", "new_value" }) catch |err| {
             last_err = err;
             continue;
         };
         write_success = true;
+        std.debug.print("Write succeeded {d}ms after the kill\n", .{stdx.time.milliTimestamp() - kill_time});
         break;
     }
 
@@ -894,7 +861,6 @@ test "e2e/kv/cluster: writes continue after leader failure" {
 }
 
 test "e2e/kv/cluster: all nodes can write" {
-    try skipCrossNodeWrites();
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
 
@@ -1561,7 +1527,6 @@ test "e2e/kv/cluster: mget after replication" {
 }
 
 test "e2e/kv/cluster: mget reads from all nodes" {
-    try skipCrossNodeWrites();
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
 
@@ -1587,7 +1552,6 @@ test "e2e/kv/cluster: mget reads from all nodes" {
 }
 
 test "e2e/kv/cluster: mget with partial hits across cluster" {
-    try skipCrossNodeWrites();
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
 

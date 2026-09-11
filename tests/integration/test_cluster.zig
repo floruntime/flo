@@ -1,9 +1,8 @@
 //! Integration Test — Cluster Subsystem
 //!
 //! Exercises multi-node cluster behaviour in-process using deterministic
-//! (synchronous) simulation of Gossip discovery, Membership state machine,
-//! Coordinator metadata replication, PartitionTable rebalancing, and
-//! Forwarder request lifecycle.
+//! (synchronous) simulation of Coordinator metadata replication,
+//! PartitionTable rebalancing, and Forwarder request lifecycle.
 //!
 //! Pattern: same as test_raft_failover.zig — manual tick() with fixed
 //! timestamps, synchronous message delivery, no real I/O.
@@ -13,14 +12,6 @@ const testing = std.testing;
 const src = @import("src");
 
 // ─── Imports ─────────────────────────────────────────────────────────────
-
-const Gossip = src.cluster.gossip.Gossip;
-const NodeAddr = src.cluster.gossip.NodeAddr;
-const MemberState = src.cluster.gossip.MemberState;
-const GossipMessage = src.cluster.gossip.Message;
-
-const Membership = src.cluster.membership.Membership;
-const NodeState = src.cluster.membership.NodeState;
 
 const Coordinator = src.cluster.coordinator.Coordinator;
 const NodeStatus = src.cluster.coordinator.NodeStatus;
@@ -44,199 +35,11 @@ const RAFT_CONFIG = Config{
     .election_timeout_min_ms = 150,
     .election_timeout_max_ms = 300,
     .heartbeat_interval_ms = 50,
-    .max_entries_per_batch = 64,
     .enable_pre_vote = false,
 };
 
-fn testAddr(node_id: NodeId) NodeAddr {
-    return .{
-        .ip = .{ 127, 0, 0, 1 },
-        .gossip_port = @intCast(5000 + node_id),
-        .data_port = @intCast(4000 + node_id),
-    };
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
-// 1. Gossip Discovery — 3-node SWIM mesh
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: gossip 3-node discovery" {
-    const alloc = testing.allocator;
-
-    // Create 3 Gossip instances
-    var nodes: [CLUSTER_SIZE]Gossip = undefined;
-    for (0..CLUSTER_SIZE) |i| {
-        const nid: NodeId = @intCast(i + 1);
-        nodes[i] = Gossip.init(alloc, nid, testAddr(nid));
-    }
-    defer for (0..CLUSTER_SIZE) |i| nodes[i].deinit();
-
-    // Seed: each node knows about the other two
-    for (0..CLUSTER_SIZE) |i| {
-        for (0..CLUSTER_SIZE) |j| {
-            if (i == j) continue;
-            const nid: NodeId = @intCast(j + 1);
-            try nodes[i].addMember(nid, testAddr(nid), 1000);
-        }
-    }
-
-    // All nodes should see 2 alive members
-    for (0..CLUSTER_SIZE) |i| {
-        try testing.expectEqual(@as(u32, 2), nodes[i].aliveCount());
-        try testing.expectEqual(@as(u32, 2), nodes[i].memberCount());
-    }
-
-    // Tick node 0 to trigger a probe cycle
-    _ = try nodes[0].tick(2000);
-    const outbound = nodes[0].drainOutbound();
-
-    // Should have generated at least one ping
-    try testing.expect(outbound.len > 0);
-    nodes[0].clearOutbound();
-
-    // Deliver the first message to the target and get their response
-    if (outbound.len > 0) {
-        const msg = outbound[0].message;
-        // Find the target node by matching
-        for (0..CLUSTER_SIZE) |j| {
-            const target_id: NodeId = @intCast(j + 1);
-            if (target_id == msg.target or target_id != nodes[0].self_id) {
-                try nodes[j].handleMessage(msg, 2000);
-                break;
-            }
-        }
-    }
-
-    // Verify node 0 can look up node 2 and node 3
-    try testing.expect(nodes[0].isAlive(2));
-    try testing.expect(nodes[0].isAlive(3));
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 2. Gossip Failure Detection — suspect → dead
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: gossip failure detection" {
-    const alloc = testing.allocator;
-
-    var node1 = Gossip.init(alloc, 1, testAddr(1));
-    defer node1.deinit();
-
-    try node1.addMember(2, testAddr(2), 1000);
-
-    // Node 2 is alive initially
-    try testing.expect(node1.isAlive(2));
-
-    // Tick repeatedly without delivering acks → should suspect & eventually declare dead
-    var t: i64 = 2000;
-    var became_dead = false;
-    while (t < 30_000) : (t += 500) {
-        const result = try node1.tick(t);
-        node1.clearOutbound();
-        if (result.newly_dead > 0) {
-            became_dead = true;
-            break;
-        }
-    }
-
-    try testing.expect(became_dead);
-    try testing.expect(!node1.isAlive(2));
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 3. Membership — full node lifecycle: join → active → leave
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: membership join-activate-leave lifecycle" {
-    const alloc = testing.allocator;
-
-    var membership = Membership.init(alloc, 1);
-    defer membership.deinit();
-
-    // Bootstrap self as active
-    try membership.bootstrapSingle(1000);
-    try testing.expect(membership.isSelfActive());
-
-    // New node discovered
-    try membership.nodeDiscovered(2, "127.0.0.1", 4002, 4, 2000);
-    const node2 = membership.getNode(2).?;
-    try testing.expectEqual(NodeState.joining, node2.state);
-    try testing.expectEqual(@as(u32, 1), membership.nodeCount()); // excludes self
-
-    // Node 2 activated (confirmed by Raft)
-    try membership.nodeActivated(2, 3000);
-    const node2_active = membership.getNode(2).?;
-    try testing.expectEqual(NodeState.active, node2_active.state);
-    try testing.expectEqual(@as(u32, 1), membership.activeCount());
-
-    // Node 3 discovered and activated
-    try membership.nodeDiscovered(3, "127.0.0.1", 4003, 4, 4000);
-    try membership.nodeActivated(3, 5000);
-    try testing.expectEqual(@as(u32, 2), membership.activeCount());
-    try testing.expectEqual(@as(u32, 2), membership.nodeCount()); // excludes self
-
-    // Node 2 initiates graceful leave
-    try membership.nodeLeft(2, 6000);
-    const node2_left = membership.getNode(2).?;
-    try testing.expectEqual(NodeState.left, node2_left.state);
-    try testing.expectEqual(@as(u32, 1), membership.activeCount());
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 4. Membership — node failure and recovery
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: membership failure and recovery" {
-    const alloc = testing.allocator;
-
-    var membership = Membership.init(alloc, 1);
-    defer membership.deinit();
-
-    try membership.bootstrapSingle(1000);
-    try membership.nodeDiscovered(2, "127.0.0.1", 4002, 4, 2000);
-    try membership.nodeActivated(2, 3000);
-    try testing.expectEqual(NodeState.active, membership.getNode(2).?.state);
-
-    // Node 2 fails (gossip declares dead)
-    try membership.nodeFailed(2, 5000);
-    try testing.expectEqual(NodeState.failed, membership.getNode(2).?.state);
-    try testing.expectEqual(@as(u32, 0), membership.activeCount());
-
-    // Node 2 recovers
-    try membership.nodeRecovered(2, 8000);
-    try testing.expectEqual(NodeState.active, membership.getNode(2).?.state);
-    try testing.expectEqual(@as(u32, 1), membership.activeCount());
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 5. Membership — tick triggers rebalance
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: membership tick rebalance trigger" {
-    const alloc = testing.allocator;
-
-    var membership = Membership.init(alloc, 1);
-    defer membership.deinit();
-
-    try membership.bootstrapSingle(1000);
-
-    // Discover node 2 → adds to pending_adds
-    try membership.nodeDiscovered(2, "127.0.0.1", 4002, 4, 2000);
-
-    // Tick should drain pending_adds and signal rebalance needed
-    const action1 = try membership.tick(3000);
-    try testing.expect(action1.nodes_to_add > 0 or action1.rebalance_needed);
-
-    // Activate node 2
-    try membership.nodeActivated(2, 4000);
-
-    // After cooldown, tick should indicate rebalance
-    const action2 = try membership.tick(15_000);
-    _ = action2;
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 6. Coordinator — 3-node metadata replication
+// 1. Coordinator — 3-node metadata replication
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Helper to replicate from coordinator leader to alive followers.
@@ -269,6 +72,8 @@ fn coordinatorReplicate(coords: []Coordinator, leader_idx: usize, alive: []const
             prev_term = if (prev_index == 0) @as(u64, 0) else leader.raft.log.entryTerm(prev_index) orelse 0;
             const count = leader.raft.log.getRange(peer.next_index, &entry_buf, &payload_arena);
             entries = entry_buf[0..count];
+            // As the leader loop does: an ack only counts up to what was sent.
+            leader.raft.peers[peer_idx].sent_up_to = @max(leader.raft.peers[peer_idx].sent_up_to, peer.next_index + count - 1);
         } else {
             // Heartbeat: no new entries, but send leader_commit to advance follower
             prev_term = if (last == 0) @as(u64, 0) else leader.raft.log.entryTerm(last) orelse 0;
@@ -290,14 +95,14 @@ fn coordinatorReplicate(coords: []Coordinator, leader_idx: usize, alive: []const
 
 /// Run controller election for a candidate.
 fn coordinatorElection(coords: []Coordinator, candidate_idx: usize, alive: []const bool) bool {
-    const vote_req = coords[candidate_idx].raft.startElection().?;
+    const vote_req = coords[candidate_idx].raft.startElectionNow().?;
 
     for (0..coords.len) |j| {
         if (j == candidate_idx) continue;
         if (!alive[j]) continue;
 
         const resp = coords[j].raft.handleVoteRequest(vote_req);
-        if (coords[candidate_idx].raft.handleVoteResponse(resp)) {
+        if (coords[candidate_idx].raft.handleVoteResponse(resp) == .won) {
             return true;
         }
     }
@@ -365,7 +170,7 @@ test "integration: coordinator namespace replication across 3 nodes" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 7. Coordinator — leader failover preserves metadata
+// 2. Coordinator — leader failover preserves metadata
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: coordinator leader failover preserves metadata" {
@@ -433,7 +238,7 @@ test "integration: coordinator leader failover preserves metadata" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 8. PartitionTable — round-robin assignment and rebalance
+// 3. PartitionTable — round-robin assignment and rebalance
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: partition table round-robin assignment" {
@@ -514,7 +319,7 @@ test "integration: partition table node removal reassignment" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 9. PartitionTable — serialize/deserialize round-trip
+// 4. PartitionTable — serialize/deserialize round-trip
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: partition table serialize deserialize" {
@@ -552,7 +357,7 @@ test "integration: partition table serialize deserialize" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 10. Forwarder — forward and complete cycle
+// 5. Forwarder — forward and complete cycle
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder forward and complete cycle" {
@@ -589,7 +394,7 @@ test "integration: forwarder forward and complete cycle" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 11. Forwarder — timeout sweep
+// 6. Forwarder — timeout sweep
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder timeout sweep" {
@@ -622,7 +427,7 @@ test "integration: forwarder timeout sweep" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 12. Forwarder — forward to self returns local
+// 7. Forwarder — forward to self returns local
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder reject forward to self" {
@@ -641,7 +446,7 @@ test "integration: forwarder reject forward to self" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 13. Forwarder — circuit breaker trips after repeated failures
+// 8. Forwarder — circuit breaker trips after repeated failures
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder circuit breaker trips after failures" {
@@ -682,7 +487,7 @@ test "integration: forwarder circuit breaker trips after failures" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 14. Forwarder — circuit breaker half-open recovery
+// 9. Forwarder — circuit breaker half-open recovery
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder circuit breaker recovers through half-open" {
@@ -729,7 +534,7 @@ test "integration: forwarder circuit breaker recovers through half-open" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 15. Forwarder — circuit breaker reset
+// 10. Forwarder — circuit breaker reset
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: forwarder circuit breaker manual reset" {
@@ -764,7 +569,7 @@ test "integration: forwarder circuit breaker manual reset" {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 16. Partition table — node failure marks partitions unavailable
+// 11. Partition table — node failure marks partitions unavailable
 // ═════════════════════════════════════════════════════════════════════════════
 
 test "integration: partition table node failure marks unavailable" {
@@ -804,38 +609,4 @@ test "integration: partition table node failure marks unavailable" {
 
     try testing.expect(pt.isAvailable(ns_hash, 0));
     try testing.expect(pt.isAvailable(ns_hash, 1));
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 17. Gossip dead-node propagation
-// ═════════════════════════════════════════════════════════════════════════════
-
-test "integration: gossip dead node ids propagated for partition marking" {
-    const alloc = testing.allocator;
-
-    // Create 2 nodes: 1 and 2
-    var n1 = Gossip.init(alloc, 1, testAddr(1));
-    defer n1.deinit();
-    var n2 = Gossip.init(alloc, 2, testAddr(2));
-    defer n2.deinit();
-
-    // Seed: n1 knows n2
-    try n1.addMember(2, testAddr(2), 1000);
-
-    // Tick n1 repeatedly without delivering messages — n2 becomes suspect then dead
-    var time_ms: i64 = 2000;
-    var tick_result = try n1.tick(time_ms);
-    n1.clearOutbound();
-
-    // Advance time to move through suspect to dead
-    while (tick_result.newly_dead == 0) {
-        time_ms += 1000;
-        tick_result = try n1.tick(time_ms);
-        n1.clearOutbound();
-        if (time_ms > 60_000) return error.TestTimeout; // safety
-    }
-
-    // newly_dead_ids should contain node 2
-    try testing.expectEqual(@as(u32, 1), tick_result.newly_dead);
-    try testing.expectEqual(@as(NodeId, 2), tick_result.newly_dead_ids[0]);
 }

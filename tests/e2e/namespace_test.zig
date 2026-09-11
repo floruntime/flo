@@ -346,7 +346,7 @@ test "e2e/namespace: force delete removes streams" {
 
     // Try to create stream (should work since namespace is fresh)
     try ctx.exec(&.{ "stream", "create", "orders", "-n", ns });
-    
+
     // Stream info should show 0 records (fresh stream, data was deleted)
     const result = try ctx.execCapture(&.{ "stream", "info", "orders", "-n", ns });
     try testing.expect(std.mem.indexOf(u8, result, "Records: 0") != null);
@@ -440,7 +440,7 @@ test "e2e/namespace: force delete removes queues" {
 
     // Try to recreate queue (should work since namespace is fresh)
     try ctx.exec(&.{ "queue", "create", "tasks", "-n", ns });
-    
+
     // Dequeue should return nothing (queue is empty, messages were deleted)
     const result = try ctx.execCapture(&.{ "queue", "dequeue", "tasks", "-n", ns, "--timeout", "100" });
     try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);

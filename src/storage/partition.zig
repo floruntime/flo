@@ -166,17 +166,6 @@ pub const Partition = struct {
     /// type but KV, append it to the hot ring and warm store. Returns the
     /// entry's index.
     pub fn apply(self: *Partition, e: *const Entry) !u64 {
-        return self.applyWith(e, false);
-    }
-
-    /// Apply an entry replicated from a peer, whose index may collide with
-    /// this node's own; the router's index guard is bypassed and the caller
-    /// de-duplicates by what it has already received.
-    pub fn applyReplicated(self: *Partition, e: *const Entry) !u64 {
-        return self.applyWith(e, true);
-    }
-
-    fn applyWith(self: *Partition, e: *const Entry, replicated: bool) !u64 {
         // The hot ring and the warm store exist for the stream read path,
         // which fetches record payloads by index. The KV projection holds its
         // own values and nothing reads a KV payload back from the partition
@@ -185,7 +174,7 @@ pub const Partition = struct {
         const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
-        _ = if (replicated) self.router.applyOutOfOrder(e) else self.router.apply(e);
+        _ = self.router.apply(e);
 
         // Track committed index
         if (e.header.index > self.committed_index) {

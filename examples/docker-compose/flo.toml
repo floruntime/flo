@@ -16,6 +16,8 @@ level = "info"
 
 [metrics]
 enabled = true
+# The image publishes this port; the firewall, not the bind, gates it.
+bind = "0.0.0.0"
 # port = 9001 (auto: listen_port + 1)
 
 [dashboard]

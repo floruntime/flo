@@ -69,8 +69,8 @@ pub fn getWorkerDetail(allocator: Allocator, worker_id: []const u8, ctx: *Dashbo
         if (getShard(ctx, i)) |shard| {
             if (shard.worker_handler.workers.getPtr(worker_id)) |w| {
                 var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
+                errdefer json_aw.deinit();
+                const writer = &json_aw.writer;
                 try writeWorkerJson(writer, w);
                 return try json_aw.toOwnedSlice();
             }

@@ -528,8 +528,8 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
         };
         if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+            _ = persistence.persistEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch |err| {
+                return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
             };
             if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action not applied" } };
         } else {
@@ -590,8 +590,8 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         };
         if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+            _ = persistence.persistEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch |err| {
+                return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
             };
             if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action run not applied" } };
         } else {
@@ -806,8 +806,8 @@ pub const ActionsHandler = struct {
                 return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
             };
             if (shard) |s| {
-                _ = persistence.persistEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch {
-                    return .{ .err = .{ .code = .internal_error, .message = "action not persisted" } };
+                _ = persistence.persistEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch |err| {
+                    return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
                 };
                 if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action delete not applied" } };
             } else {
@@ -1135,7 +1135,7 @@ pub const ActionsHandler = struct {
         var value_buf: [65536]u8 = undefined;
         const value = encodeRunUpdateValue(&value_buf, u) orelse return "run update too large";
         if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_update_run, Flags.NONE, namespace, run_id, value) catch return "run update not persisted";
+            _ = persistence.persistEntry(s, .action_update_run, Flags.NONE, namespace, run_id, value) catch |err| return persistence.failureMessage(err, "run update not persisted");
             if (!s.applyCommitted()) return "run update not applied";
         } else {
             self.replayUpdateRun(run_id, value);

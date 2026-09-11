@@ -224,12 +224,13 @@ pub fn parseUpgrade(allocator: Allocator, request: []const u8) !?UpgradeResult {
     }
 
     // Build response
-    const response = try std.fmt.allocPrint(allocator,
+    const response = try std.fmt.allocPrint(
+        allocator,
         "HTTP/1.1 101 Switching Protocols\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Accept: {s}\r\n" ++
-        "\r\n",
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "\r\n",
         .{accept_key},
     );
 

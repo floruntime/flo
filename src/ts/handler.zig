@@ -191,8 +191,8 @@ pub const TSHandler = struct {
             }) orelse {
                 return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
             };
-            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "ts write not persisted" } };
+            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts write not persisted") } };
             };
             // The projection router inserts the point when the entry applies.
             if (!shard.applyCommitted()) {

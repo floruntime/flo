@@ -6,9 +6,9 @@
 # Config files: tests/cluster/e2e/configs/node{1,2,3}.toml
 #
 # Port layout (10-port gap avoids collisions with derived ports):
-#   Node 1: listen=4441, metrics=4442, dashboard=4443, raft=4941, gossip=5041
-#   Node 2: listen=4451, metrics=4452, dashboard=4453, raft=4951, gossip=5051
-#   Node 3: listen=4461, metrics=4462, dashboard=4463, raft=4961, gossip=5061
+#   Node 1: listen=4441, metrics=4442, dashboard=4443, peer=4941
+#   Node 2: listen=4451, metrics=4452, dashboard=4453, peer=4951
+#   Node 3: listen=4461, metrics=4462, dashboard=4463, peer=4961
 
 set -e
 
