@@ -92,7 +92,7 @@ test "integration: inbox tag filtering" {
     _ = inbox.send(makeMsg(.forward_request, 0, 1));
     _ = inbox.send(makeMsg(.forward_response, 1, 2));
     _ = inbox.send(makeMsg(.connection_handoff, 2, 3));
-    _ = inbox.send(makeMsg(.raft_message, 3, 4));
+    _ = inbox.send(makeMsg(.metadata_update, 3, 4));
     _ = inbox.send(makeMsg(.metadata_update, 0, 5));
     _ = inbox.send(makeMsg(.shutdown, 0, 6));
     _ = inbox.send(makeMsg(.forward_request, 1, 7));
@@ -118,7 +118,7 @@ test "integration: inbox tag filtering" {
     try testing.expectEqual(@as(u64, 3), batch[2].sequence);
     try testing.expectEqual(@as(u8, 2), batch[2].src_shard);
 
-    try testing.expectEqual(Tag.raft_message, batch[3].tag);
+    try testing.expectEqual(Tag.metadata_update, batch[3].tag);
     try testing.expectEqual(@as(u64, 4), batch[3].sequence);
     try testing.expectEqual(@as(u8, 3), batch[3].src_shard);
 

@@ -484,8 +484,8 @@ pub const Simulator = struct {
             .election_timeout_min_ms = self.scenario.election_timeout_min_ms,
             .election_timeout_max_ms = self.scenario.election_timeout_max_ms,
             .heartbeat_interval_ms = self.scenario.heartbeat_interval_ms,
-            .max_entries_per_batch = MAX_BATCH,
-            .enable_pre_vote = false,
+            .enable_pre_vote = true,
+            .durable_commits = self.scenario.durability == .sync,
             .rng_seed = self.prng.random().int(u64) | 1,
         };
     }
@@ -627,12 +627,22 @@ pub const Simulator = struct {
                 try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .vote_resp = resp });
             },
             .vote_resp => |resp| {
-                if (node.raft.handleVoteResponse(resp)) {
-                    self.elections_won += 1;
-                    self.checker.onLeader(node, self.now);
-                    // Send first heartbeats immediately.
-                    node.last_heartbeat = @splat(0);
-                    node.sent_at = @splat(0);
+                switch (node.raft.handleVoteResponse(resp)) {
+                    .none => {},
+                    .won => {
+                        self.elections_won += 1;
+                        self.checker.onLeader(node, self.now);
+                        // Send first heartbeats immediately.
+                        node.last_heartbeat = @splat(0);
+                        node.sent_at = @splat(0);
+                    },
+                    // The poll passed: the real request goes out now.
+                    .elect => |req| {
+                        node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
+                        for (0..node.raft.peer_count) |i| {
+                            try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
+                        }
+                    },
                 }
             },
             .append_req => |req| {
@@ -702,15 +712,6 @@ pub const Simulator = struct {
         const last = node.raft.log.lastIndex();
         for (0..node.raft.peer_count) |i| {
             const peer_id = node.raft.peer_ids[i];
-            // A stale success ack can outlive its leadership stint:
-            // handleAppendResponse takes any success response at face
-            // value, so an ack delayed across this leader's
-            // crash-restart or conflict truncation (which shrank its
-            // log) can push next_index
-            // past the tip — clamp, or prev_log below is unbuildable.
-            if (node.raft.peers[i].next_index > last + 1) {
-                node.raft.peers[i].next_index = last + 1;
-            }
             const next = node.raft.peers[i].next_index;
             const behind = next <= last;
             const inflight_timeout = self.now -| node.sent_at[i] >= self.scenario.rpc_timeout_ms;
@@ -754,6 +755,7 @@ pub const Simulator = struct {
                     }
                     entries = owned;
                     node.raft.peers[i].inflight = true;
+                    node.raft.peers[i].sent_up_to = @max(node.raft.peers[i].sent_up_to, next + count - 1);
                     node.sent_at[i] = self.now;
                 }
             }
@@ -776,9 +778,8 @@ pub const Simulator = struct {
         const chance: u8 = if (self.phase == .safety)
             self.scenario.request_percent
         else
-            // Convergence probes: low-rate traffic keeps commit advancing —
-            // a new leader cannot commit prior-term entries without fresh
-            // proposals (becomeLeader appends no noop).
+            // Convergence probes: a trickle, so the checker sees a live
+            // cluster, not one that only ever catches up.
             5;
         if (r.uintLessThan(u8, 100) >= chance) return;
 
@@ -897,9 +898,8 @@ pub const Simulator = struct {
             } else {
                 // Permanent isolation, not frozen fault rates: a live
                 // non-core node with a crash-loop-inflated term would
-                // depose the core leader through every leaked vote
-                // request (no pre-vote, no check-quorum) and turn
-                // scenario noise into false liveness failures.
+                // keep the core busy answering it and turn scenario noise
+                // into false liveness failures.
                 self.net.isolate(node.id);
             }
         }

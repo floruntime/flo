@@ -267,7 +267,6 @@ pub const PartitionTable = struct {
     }
 
     /// Mark all partitions led by a given node as unavailable
-    /// (used when gossip detects a node failure)
     pub fn markNodePartitionsUnavailable(self: *PartitionTable, node_id: NodeId) u32 {
         var count: u32 = 0;
         var iter = self.assignments.iterator();
@@ -281,7 +280,6 @@ pub const PartitionTable = struct {
     }
 
     /// Mark all partitions led by a given node as available
-    /// (used when gossip detects a node recovery)
     pub fn markNodePartitionsAvailable(self: *PartitionTable, node_id: NodeId) u32 {
         var count: u32 = 0;
         var iter = self.assignments.iterator();

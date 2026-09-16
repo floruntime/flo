@@ -279,7 +279,9 @@ pub const StatusCode = enum(u8) {
     internal_error = 9,
     overloaded = 10,
     rate_limited = 11, // Request rate limit exceeded (WebSocket)
-
+    /// The write reached no leader, or its leader changed before it
+    /// committed; the message says whether it may still apply.
+    unavailable = 12,
     _,
 };
 

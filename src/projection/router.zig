@@ -132,19 +132,8 @@ pub const ProjectionRouter = struct {
     /// Apply a single committed entry. Routes by EntryType.
     /// Returns what happened.
     pub fn apply(self: *ProjectionRouter, entry: *const Entry) ApplyResult {
-        return self.applyWith(entry, false);
-    }
-
-    /// Apply an entry whose index may sit below `applied_index`: a peer's
-    /// broadcast shares no index space with this node's own log, so the
-    /// idempotency guard would drop it. The caller de-duplicates on its own.
-    pub fn applyOutOfOrder(self: *ProjectionRouter, entry: *const Entry) ApplyResult {
-        return self.applyWith(entry, true);
-    }
-
-    fn applyWith(self: *ProjectionRouter, entry: *const Entry, out_of_order: bool) ApplyResult {
         // Idempotency: skip already-applied entries
-        if (!out_of_order and entry.header.index <= self.applied_index) {
+        if (entry.header.index <= self.applied_index) {
             self.stats.entries_skipped += 1;
             return .skipped_already_applied;
         }

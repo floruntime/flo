@@ -147,6 +147,12 @@ const SendQueue = struct {
     }
 };
 
+/// A frame the shard queued for one peer, already framed.
+const Outbound = struct {
+    peer_id: u32,
+    frame: []u8,
+};
+
 pub const PeerState = struct {
     active: bool = false,
     node_id: u32 = 0,
@@ -217,15 +223,20 @@ pub const RaftNetwork = struct {
     known: [MAX_KNOWN]Known,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
-    /// Guards `pending` (entries to broadcast). Taken on the shard thread's
-    /// commit path, so it is never held across anything that waits.
+    /// Guards `outbound`, frames the shard thread has queued for peers.
+    /// Taken on the shard thread, so it is never held across anything that
+    /// waits.
     mutex: stdx.Mutex,
-    pending: std.ArrayListUnmanaged([]u8),
+    outbound: std.ArrayListUnmanaged(Outbound),
+    /// The ids of the peers with a link up, one slot per peer slot, written
+    /// by the loop thread; the shard reads them without a lock to know whom
+    /// it can reach. A slot is 0 while its peer slot is empty.
+    linked_ids: [MAX_PEERS]std.atomic.Value(u32),
     /// Guards `dial_requests`, seeds handed over by the runtime.
     dial_mutex: stdx.Mutex,
     dial_requests: std.ArrayListUnmanaged(PeerInfo),
-    /// The loop sleeps in poll; a broadcast or a dial request writes a byte
-    /// here so it does not wait out the tick.
+    /// The loop sleeps in poll; a queued frame or a dial request writes a
+    /// byte here so it does not wait out the tick.
     wake_rd: posix.fd_t,
     wake_wr: posix.fd_t,
     /// Where whole frames from peers go. Null only in tests without a shard.
@@ -245,6 +256,9 @@ pub const RaftNetwork = struct {
     frames_rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peer_disconnects: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     slow_peer_drops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Frames queued for a peer that had no link up when the loop reached
+    /// them. Raft resends whatever mattered.
+    unlinked_drops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// `bind_ip4`: listener address; advertised to peers unless 0.0.0.0.
     pub fn init(allocator: Allocator, node_id: u32, listen_port: u16, main_port: u16, bind_ip4: [4]u8, secret: []const u8) !RaftNetwork {
@@ -288,7 +302,8 @@ pub const RaftNetwork = struct {
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .mutex = .{},
-            .pending = .empty,
+            .outbound = .empty,
+            .linked_ids = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MAX_PEERS,
             .dial_mutex = .{},
             .dial_requests = .empty,
             .wake_rd = wake_pipe[0],
@@ -307,8 +322,8 @@ pub const RaftNetwork = struct {
         self.stop();
         @memset(self.secret, 0);
         sysClose(self.listener_fd);
-        for (self.pending.items) |data| self.allocator.free(data);
-        self.pending.deinit(self.allocator);
+        for (self.outbound.items) |o| self.allocator.free(o.frame);
+        self.outbound.deinit(self.allocator);
         self.dial_requests.deinit(self.allocator);
         for (&self.peers) |*p| self.closePeer(p);
         for (&self.links) |*l| if (l.active) {
@@ -337,17 +352,49 @@ pub const RaftNetwork = struct {
         self.wake();
     }
 
-    /// Queue a serialized entry for broadcast to all peers.
-    /// Thread-safe: called from shard thread, drained by network thread.
-    pub fn broadcastEntry(self: *RaftNetwork, entry_data: []const u8) !void {
-        const dup = try self.allocator.dupe(u8, entry_data);
-        errdefer self.allocator.free(dup);
+    /// Queue one frame for a peer. Thread-safe: framed here on the caller's
+    /// thread, written by the loop thread. A peer with no link up when the
+    /// loop reaches it drops the frame, counted; Raft resends whatever
+    /// mattered. False when the payload does not fit a frame or memory is
+    /// short.
+    pub fn sendTo(self: *RaftNetwork, peer_id: u32, msg_type: MsgType, group_id: u32, payload: []const u8) bool {
+        if (payload.len > transport.MAX_PAYLOAD_SIZE) return false;
+        const buf = self.allocator.alloc(u8, HEADER_SIZE + payload.len) catch return false;
+        const total = transport.frameMessage(msg_type, group_id, self.node_id, payload, buf);
+        if (total == 0) {
+            self.allocator.free(buf);
+            return false;
+        }
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.pending.append(self.allocator, dup);
+            self.outbound.append(self.allocator, .{ .peer_id = peer_id, .frame = buf }) catch {
+                self.allocator.free(buf);
+                return false;
+            };
         }
         self.wake();
+        return true;
+    }
+
+    /// Whether a proven link to `node_id` is up right now; what `sendTo`
+    /// queues for a peer that is not is dropped at the next flush.
+    pub fn isLinked(self: *const RaftNetwork, node_id: u32) bool {
+        for (&self.linked_ids) |*slot| if (slot.load(.acquire) == node_id) return true;
+        return false;
+    }
+
+    /// The ids of the peers with a link up right now, as the loop thread
+    /// last published them.
+    pub fn linkedPeers(self: *const RaftNetwork, out: *[MAX_PEERS]u32) []u32 {
+        var n: usize = 0;
+        for (&self.linked_ids) |*slot| {
+            const id = slot.load(.acquire);
+            if (id == 0) continue;
+            out[n] = id;
+            n += 1;
+        }
+        return out[0..n];
     }
 
     fn wake(self: *RaftNetwork) void {
@@ -440,7 +487,7 @@ pub const RaftNetwork = struct {
             if (fds[1].revents != 0) self.drainWake();
             if (fds[0].revents != 0) self.acceptPending();
 
-            self.flushPending();
+            self.flushOutbound();
             self.expireLinks();
         }
     }
@@ -972,7 +1019,11 @@ pub const RaftNetwork = struct {
         slot.* = .{ .active = true, .node_id = node_id, .fd = l.fd, .ip4 = ip4, .raft_port = raft_port, .dialed_by_me = dialed_by_me, .framer = fr, .out = .{} };
         if (l.out_head < l.out_len) {
             slot.out.append(self.allocator, l.out[l.out_head..l.out_len]) catch {
-                if (self.repl_metrics) |m| m.recordSendFailure();
+                self.endLink(l, "out of memory");
+                slot.active = false;
+                if (slot.framer) |*f| f.deinit();
+                slot.framer = null;
+                return;
             };
         }
         // A peer that dies without a FIN is otherwise noticed only by the
@@ -989,6 +1040,7 @@ pub const RaftNetwork = struct {
         };
         if (idle_opt) |opt| _ = std.c.setsockopt(l.fd, posix.IPPROTO.TCP, opt, @ptrCast(&idle), @sizeOf(c_int));
         self.peer_count += 1;
+        if (self.peerSlot(slot)) |i| self.linked_ids[i].store(node_id, .release);
         if (self.repl_metrics) |m| m.setPeersLinked(self.peer_count);
         l.active = false;
         if (l.role == .dialer) {
@@ -1105,23 +1157,7 @@ pub const RaftNetwork = struct {
 
     fn handleFrame(self: *RaftNetwork, p: *PeerState, frame: framer_mod.Frame) void {
         switch (frame.msg_type) {
-            .replicate_entry => {
-                self.deliver(p.node_id, frame.header, frame.payload);
-                // Mesh forwarding for late joiners: the origin has sent to
-                // its own peers; ours may include one it has no link to.
-                // Only what came straight from its origin is passed on, or
-                // four nodes would pass one entry around forever.
-                self.forward(p, frame.payload);
-            },
-            .forwarded_entry => {
-                if (frame.payload.len < 4) {
-                    self.rejectFrame(p, "forwarded entry without an origin");
-                    return;
-                }
-                const origin = std.mem.readInt(u32, frame.payload[0..4], .little);
-                if (origin == self.node_id) return;
-                self.deliver(origin, frame.header, frame.payload[4..]);
-            },
+            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .forward_write, .forward_reply, .join_request => self.deliver(p, frame),
             .peer_info => {
                 if (frame.payload.len < PEER_INFO_SIZE) return;
                 const info = PeerInfo.decode(frame.payload[0..PEER_INFO_SIZE]);
@@ -1129,9 +1165,8 @@ pub const RaftNetwork = struct {
                     self.noteKnown(info.node_id, info.ip4, info.raft_port, false);
                 }
             },
-            // The Raft RPCs are for the leader loop; the handshake types
-            // have no place on an established link.
-            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .hello, .hello_back, .verify, .welcome => {
+            // The handshake types have no place on an established link.
+            .hello, .hello_back, .verify, .welcome => {
                 log.warn("raft: peer {d} sent a {s} frame, which this link does not carry; dropping the link", .{ p.node_id, @tagName(frame.msg_type) });
                 self.rejectFrame(p, "unexpected frame");
             },
@@ -1144,58 +1179,38 @@ pub const RaftNetwork = struct {
         self.dropPeer(p, why);
     }
 
-    /// Hand an entry to the shard under the id of the node that wrote it.
-    /// A full queue drops it and counts; the copy is never leaked.
-    fn deliver(self: *RaftNetwork, origin: u32, header: RaftHeader, entry_data: []const u8) void {
+    /// Hand a frame to the shard under the id its link proved. A full queue
+    /// drops it and counts; Raft resends whatever mattered.
+    fn deliver(self: *RaftNetwork, p: *const PeerState, frame: framer_mod.Frame) void {
         const q = self.raft_queue orelse return;
-        const dup = self.allocator.dupe(u8, entry_data) catch {
+        const dup = self.allocator.dupe(u8, frame.payload) catch {
             if (self.repl_metrics) |m| m.recordFrameDropped();
             return;
         };
-        const ok = q.push(.{ .source_node = origin, .group_id = header.group_id, .msg_type = .replicate_entry, .payload = dup });
+        const ok = q.push(.{ .source_node = p.node_id, .group_id = frame.header.group_id, .msg_type = frame.msg_type, .payload = dup });
         if (!ok) {
             self.allocator.free(dup);
             if (self.repl_metrics) |m| m.recordFrameDropped();
         }
     }
 
-    /// Pass an entry that arrived from its origin on to every other peer,
-    /// framed as ours with the origin named inside: a frame's source must
-    /// be the id its link proved, and the origin is not on this link.
-    fn forward(self: *RaftNetwork, from: *PeerState, entry_data: []const u8) void {
-        const origin = from.node_id;
-        if (4 + entry_data.len + HEADER_SIZE > self.scratch.len) return;
-        const payload_buf = self.scratch[HEADER_SIZE..];
-        std.mem.writeInt(u32, payload_buf[0..4], origin, .little);
-        @memcpy(payload_buf[4 .. 4 + entry_data.len], entry_data);
-        const total = transport.frameInPlace(.forwarded_entry, 0, self.node_id, 4 + entry_data.len, self.scratch);
-        if (total == 0) return;
-        for (&self.peers) |*p| {
-            if (!p.active or p == from or p.node_id == origin) continue;
-            self.enqueueTo(p, self.scratch[0..total]);
-        }
-    }
-
-    fn flushPending(self: *RaftNetwork) void {
+    /// Everything the shard queued since the last pass goes to its peer's
+    /// socket queue, then every socket is written as far as the kernel takes.
+    fn flushOutbound(self: *RaftNetwork) void {
         self.mutex.lock();
-        var to_send = self.pending;
-        self.pending = .empty;
+        var to_send = self.outbound;
+        self.outbound = .empty;
         self.mutex.unlock();
         defer {
-            for (to_send.items) |data| self.allocator.free(data);
+            for (to_send.items) |o| self.allocator.free(o.frame);
             to_send.deinit(self.allocator);
         }
-        for (to_send.items) |entry_data| {
-            const total = transport.frameMessage(.replicate_entry, 0, self.node_id, entry_data, self.scratch);
-            if (total == 0) {
-                log.warn("raft: committed entry too large to replicate ({d} bytes > {d} max) — NOT broadcast to any peer; all followers will diverge on this entry", .{ entry_data.len + HEADER_SIZE, framer_mod.MAX_FRAME_SIZE });
-                if (self.repl_metrics) |m| m.recordOversizeSkipped();
+        for (to_send.items) |o| {
+            const p = self.peerByNodeId(o.peer_id) orelse {
+                _ = self.unlinked_drops.fetchAdd(1, .monotonic);
                 continue;
-            }
-            for (&self.peers) |*p| {
-                if (!p.active) continue;
-                self.enqueueTo(p, self.scratch[0..total]);
-            }
+            };
+            self.enqueueTo(p, o.frame);
         }
         for (&self.peers) |*p| {
             if (p.active and p.out.pending().len > 0) {
@@ -1214,10 +1229,7 @@ pub const RaftNetwork = struct {
                 log.warn("raft: peer {d} has {d} bytes unread; dropping the link, it will be re-dialled", .{ p.node_id, p.out.pending().len });
                 self.dropPeer(p, "too slow");
             },
-            error.OutOfMemory => {
-                if (self.repl_metrics) |m| m.recordSendFailure();
-                self.dropPeer(p, "out of memory");
-            },
+            error.OutOfMemory => self.dropPeer(p, "out of memory"),
         };
     }
 
@@ -1236,6 +1248,7 @@ pub const RaftNetwork = struct {
         p.framer = null;
         p.out.deinit(self.allocator);
         p.active = false;
+        if (self.peerSlot(p)) |i| self.linked_ids[i].store(0, .release);
         if (self.peer_count > 0) self.peer_count -= 1;
         if (self.repl_metrics) |m| m.setPeersLinked(self.peer_count);
     }
@@ -1245,6 +1258,16 @@ pub const RaftNetwork = struct {
             if (p.active and p.raft_port == port and std.mem.eql(u8, &p.ip4, &ip4)) return p;
         }
         return null;
+    }
+
+    /// The index of a peer in the table, or null for a peer state that
+    /// lives elsewhere (tests hand in their own).
+    fn peerSlot(self: *const RaftNetwork, p: *const PeerState) ?usize {
+        const base = @intFromPtr(&self.peers[0]);
+        const at = @intFromPtr(p);
+        if (at < base) return null;
+        const i = (at - base) / @sizeOf(PeerState);
+        return if (i < MAX_PEERS) i else null;
     }
 
     fn peerByNodeId(self: *RaftNetwork, node_id: u32) ?*PeerState {
@@ -1424,7 +1447,10 @@ test "raft network: two nodes with the secret link, learn each other's address, 
     try testing.expectEqual(joiner.listen_port, seed.peerByNodeId(2).?.raft_port);
     try testing.expectEqual(@as(u64, 0), seed.handshake_failures.load(.monotonic));
 
-    try joiner.broadcastEntry("entry-bytes");
+    var linked: [MAX_PEERS]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{2}, seed.linkedPeers(&linked));
+
+    try testing.expect(joiner.sendTo(1, .append_entries, 0, "entry-bytes"));
     var waited: u64 = 0;
     var got: ?raft_queue_mod.Frame = null;
     while (waited < 3000 and got == null) : (waited += 20) {
@@ -1435,7 +1461,7 @@ test "raft network: two nodes with the secret link, learn each other's address, 
     try testing.expect(got != null);
     try testing.expectEqualStrings("entry-bytes", got.?.payload);
     try testing.expectEqual(@as(u32, 2), got.?.source_node);
-    try testing.expectEqual(MsgType.replicate_entry, got.?.msg_type);
+    try testing.expectEqual(MsgType.append_entries, got.?.msg_type);
 }
 
 test "raft network: a dialer with the wrong secret never becomes a peer, and the failure is counted on both sides" {
@@ -1509,7 +1535,7 @@ test "raft network: a peer whose link drops is re-dialled and relinks" {
     try testing.expect(waitForPeer(&seed, 2, 2000));
 }
 
-test "raft network: a broadcast never waits on a dial" {
+test "raft network: a send never waits on a dial, and one to a peer with no link is dropped and counted" {
     // 192.0.2.0/24 is never routed; the dial burns its whole deadline. On a
     // network that rejects it outright the dial ends at once and this test
     // proves nothing either way.
@@ -1522,11 +1548,12 @@ test "raft network: a broadcast never waits on a dial" {
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         const t0 = stdx.time.milliTimestamp();
-        try rn.broadcastEntry("entry");
+        try testing.expect(rn.sendTo(7, .append_entries, 0, "entry"));
         worst_ms = @max(worst_ms, stdx.time.milliTimestamp() - t0);
         stdx.time.sleep(100 * std.time.ns_per_ms);
     }
     try testing.expect(worst_ms < 200);
+    try testing.expectEqual(@as(u64, 5), rn.unlinked_drops.load(.monotonic));
 }
 
 test "raft network: peer info round-trips" {
@@ -1695,7 +1722,7 @@ test "raft network: a stranger that relays a node's own proof back to it is refu
     try testing.expectEqual(@as(u8, 0), a.peer_count);
 }
 
-test "raft network: three nodes mesh, forward an entry without rejecting a frame, and stay linked" {
+test "raft network: three nodes mesh, a frame reaches each peer once, and they stay linked" {
     var a = try RaftNetwork.init(testing.allocator, 1, 0, 9001, .{ 127, 0, 0, 1 }, "s");
     defer a.deinit();
     var b = try RaftNetwork.init(testing.allocator, 2, 0, 9002, .{ 127, 0, 0, 1 }, "s");
@@ -1719,13 +1746,17 @@ test "raft network: three nodes mesh, forward an entry without rejecting a frame
     stdx.time.sleep(500 * std.time.ns_per_ms);
     const disconnects = a.peer_disconnects.load(.monotonic) + b.peer_disconnects.load(.monotonic) + c.peer_disconnects.load(.monotonic);
 
-    try a.broadcastEntry("from-a");
-    // Each of B and C receives it from A directly and once more forwarded
-    // by the other, both under A's id; nothing is rejected, no link drops.
+    var linked: [MAX_PEERS]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), a.linkedPeers(&linked).len);
+    try testing.expect(a.sendTo(2, .append_entries, 0, "from-a"));
+    try testing.expect(a.sendTo(3, .append_entries, 0, "from-a"));
+    // Each of B and C receives its frame once, under A's id; nothing is
+    // rejected, no link drops.
     var waited: u64 = 0;
-    while (waited < 3000 and (qb.count() < 2 or qc.count() < 2)) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(usize, 2), qb.count());
-    try testing.expectEqual(@as(usize, 2), qc.count());
+    while (waited < 3000 and (qb.count() < 1 or qc.count() < 1)) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+    stdx.time.sleep(200 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), qb.count());
+    try testing.expectEqual(@as(usize, 1), qc.count());
     while (qb.pop()) |f| {
         try testing.expectEqual(@as(u32, 1), f.source_node);
         try testing.expectEqualStrings("from-a", f.payload);
@@ -1774,7 +1805,7 @@ test "raft network: draining a buffer of small frames stops at the shard queue's
     // Twenty frames in one read.
     var i: usize = 0;
     while (i < 20) : (i += 1) {
-        const n = transport.frameMessage(.replicate_entry, 0, 2, "x", p.framer.?.space());
+        const n = transport.frameMessage(.append_entries, 0, 2, "x", p.framer.?.space());
         p.framer.?.commit(n);
     }
     rn.drainFramer(&p);
@@ -1825,9 +1856,9 @@ test "raft network: a frame this link does not carry drops the peer, with the by
     var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
     var p = PeerState{ .active = true, .node_id = 2, .fd = -1, .framer = try Framer.init(testing.allocator) };
-    // A vote request, a type no link carries, followed by more bytes in the
-    // same read.
-    var n = transport.frameMessage(.request_vote, 0, 2, "vote", p.framer.?.space());
+    // A hello, a type no established link carries, followed by more bytes
+    // in the same read.
+    var n = transport.frameMessage(.hello, 0, 2, "hello", p.framer.?.space());
     p.framer.?.commit(n);
     n = transport.frameMessage(.peer_info, 0, 2, "0123456789", p.framer.?.space());
     p.framer.?.commit(n);

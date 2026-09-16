@@ -67,6 +67,27 @@ pub const ErrorFn = *const fn (conn: *anyopaque, request_id: u64, op_code: u16) 
 // Dispatcher
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Whether an opcode writes: what a node that does not lead the group
+/// forwards to the leader. Hybrids count as writes — a blocking dequeue
+/// acks what it takes, a group read commits its cursor, and a transaction
+/// buffers on the node that runs it — so the whole exchange happens where
+/// the log is written.
+pub fn opWrites(op: proto.OpCode) bool {
+    return switch (op) {
+        .namespace_create, .namespace_delete, .namespace_config_set => true,
+        .kv_put, .kv_delete, .kv_incr, .kv_json_set, .kv_json_del, .kv_begin_txn, .kv_commit_txn, .kv_rollback_txn, .kv_touch, .kv_persist => true,
+        .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
+        .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
+        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_extend_lease, .queue_fail, .queue_fail_auto, .queue_dlq_delete, .queue_dlq_requeue, .queue_promote_due, .queue_touch, .queue_batch_enqueue, .queue_purge => true,
+        .ts_write, .ts_delete, .ts_retention => true,
+        .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,
+        .worker_register, .worker_heartbeat, .worker_deregister, .worker_drain => true,
+        .workflow_create, .workflow_start, .workflow_signal, .workflow_cancel, .workflow_disable, .workflow_enable => true,
+        .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_restore, .processing_rescale => true,
+        else => false,
+    };
+}
+
 pub const Dispatcher = struct {
     /// Handler lookup table — indexed by OpCode (u16, capped at MAX_OPCODES).
     handlers: [proto.MAX_OPCODES]?HandlerFn,

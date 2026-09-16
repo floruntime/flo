@@ -376,6 +376,8 @@ pub const ServerProcess = struct {
 
         if (self.config.join_addresses) |join| {
             try argv_list.appendSlice(self.allocator, &.{ "--join", join });
+        } else if (self.config.cluster_enabled) {
+            try argv_list.appendSlice(self.allocator, &.{"--cluster"});
         }
 
         if (self.config.bind) |bind| {

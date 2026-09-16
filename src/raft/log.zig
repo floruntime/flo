@@ -53,6 +53,10 @@ pub const RaftLog = struct {
     /// Logical bounds — may differ from UAL physical bounds after truncation.
     last_idx: u64,
     first_idx: u64,
+    /// Index of the latest `raft_config` entry in the log, 0 when none is
+    /// (or the latest was truncated away, when the owner falls back to the
+    /// committed membership it remembers).
+    last_config_index: u64 = 0,
 
     /// Term index, run-length encoded and ascending by `first_index`. Terms
     /// change per election, not per entry, so this stays a few dozen runs for
@@ -112,6 +116,7 @@ pub const RaftLog = struct {
             self.first_idx = idx;
         }
         self.last_idx = idx;
+        if (e.header.entry_type == @intFromEnum(EntryType.raft_config)) self.last_config_index = idx;
 
         return idx;
     }
@@ -174,6 +179,7 @@ pub const RaftLog = struct {
         self.ual.truncateAfter(after_index);
         self.trimRunsAbove(after_index);
         self.last_idx = after_index;
+        if (self.last_config_index > after_index) self.last_config_index = 0;
         if (self.on_truncate) |cb| cb(self.on_truncate_ctx.?, after_index);
     }
 
@@ -184,6 +190,19 @@ pub const RaftLog = struct {
             if (last.first_index <= index) break;
             _ = self.term_runs.pop();
         }
+    }
+
+    /// First index of the term run covering `index`, or null if none does.
+    pub fn runStart(self: *const RaftLog, index: u64) ?u64 {
+        const runs = self.term_runs.items;
+        if (runs.len == 0 or index < runs[0].first_index or index > self.last_idx) return null;
+        var lo: usize = 0;
+        var hi: usize = runs.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (runs[mid].first_index <= index) lo = mid else hi = mid;
+        }
+        return runs[lo].first_index;
     }
 
     /// Term of the run covering `index`, or null if no run does.

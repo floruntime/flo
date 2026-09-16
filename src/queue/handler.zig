@@ -282,8 +282,8 @@ pub const QueueHandler = struct {
         // applies a locally built entry.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "enqueue not persisted" } };
+            _ = persistence_mod.persistEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "enqueue not persisted") } };
             };
             if (!shard.applyCommitted()) {
                 return .{ .err = .{ .code = .internal_error, .message = "enqueue not applied" } };
@@ -396,8 +396,8 @@ pub const QueueHandler = struct {
         std.mem.writeInt(u64, &seq_key, seq, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "ack not persisted" } };
+            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ack not persisted") } };
             };
             if (!shard.applyCommitted()) {
                 return .{ .err = .{ .code = .internal_error, .message = "ack not applied" } };
@@ -450,8 +450,8 @@ pub const QueueHandler = struct {
         std.mem.writeInt(u64, &seq_key, seq, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "nack not persisted" } };
+            _ = persistence_mod.persistEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "nack not persisted") } };
             };
             if (!shard.applyCommitted()) {
                 return .{ .err = .{ .code = .internal_error, .message = "nack not applied" } };
@@ -571,8 +571,8 @@ pub const QueueHandler = struct {
         // Persist through Raft; the applier purges the projection.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "purge not persisted" } };
+            _ = persistence_mod.persistEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "purge not persisted") } };
             };
             if (!shard.applyCommitted()) {
                 return .{ .err = .{ .code = .internal_error, .message = "purge not applied" } };

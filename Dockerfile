@@ -79,7 +79,7 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose ports: 9000=API, 9001=Metrics (port+1), 9002=Dashboard (port+2)
-# Raft (port+500) and Gossip (port+600) only needed for clustering
+# The peer port (port+500) is bound only by a cluster member
 EXPOSE 9000 9001 9002
 
 # Health check: try dashboard /health first (rich JSON), fall back to TCP

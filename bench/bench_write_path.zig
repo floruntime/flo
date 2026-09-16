@@ -67,7 +67,7 @@ pub fn main() !void {
     const pipe_fds = try stdx.io.pipe();
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1);
+    var shard = try Shard.init(allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 

@@ -403,8 +403,8 @@ pub const NamespaceHandler = struct {
         }
 
         // Propose namespace_create entry through Raft → UAL (persists via segment writer)
-        _ = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
+        _ = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch |err| {
+            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
 
@@ -450,8 +450,8 @@ pub const NamespaceHandler = struct {
         }
 
         // Propose namespace_delete entry through Raft → UAL (persists via segment writer)
-        _ = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
+        _ = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch |err| {
+            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
 
@@ -506,8 +506,8 @@ pub const NamespaceHandler = struct {
         var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
         const settings_len = parsed.config.serializeSettings(&settings_buf);
 
-        _ = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "not persisted");
+        _ = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch |err| {
+            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
 

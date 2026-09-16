@@ -2839,7 +2839,6 @@ test "e2e/stream: deleting a stream removes its consumer groups" {
     try testing.expect(info_keep.succeeded() or info_keep.contains("g"));
 }
 
-
 // =============================================================================
 // Stream Retention & Alter
 // =============================================================================
@@ -3151,19 +3150,18 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
     defer testing.allocator.free(leader_out);
     const leader_present = countPresent(leader_out);
 
-    // A FOLLOWER must serve the same full record set as the leader. The leader
-    // broadcasts every committed entry to peers and the mesh re-broadcasts it for
-    // late joiners, so a follower receives each entry more than once. The follower
-    // ingest path (Shard.applyReplicatedEntry) now (a) skips entries at or below
-    // the already-applied index — matching the ProjectionRouter's idempotency
-    // guard — and (b) rebuilds the stream projection solely through the replay
-    // registry instead of also appending inline. Before the fix each replicated
-    // record was appended up to 4× on a follower (duplicate delivery × duplicate
-    // apply), inflating its record set so a limit-capped read surfaced only the
-    // earliest ~quarter (follower returned 25/50 while the leader returned 50/50).
-    const follower_out = try cluster.execCaptureAnyOn(1, &.{ "stream", "read", stream_name, "--limit", "100", "-o", "json" });
-    defer testing.allocator.free(follower_out);
-    const follower_present = countPresent(follower_out);
+    // A follower must serve the same full record set as the leader: it
+    // applies the same committed log through the same applier, within a
+    // heartbeat of the leader committing it.
+    var follower_present: usize = 0;
+    var attempt: usize = 0;
+    while (attempt < 20) : (attempt += 1) {
+        const follower_out = try cluster.execCaptureAnyOn(1, &.{ "stream", "read", stream_name, "--limit", "100", "-o", "json" });
+        defer testing.allocator.free(follower_out);
+        follower_present = countPresent(follower_out);
+        if (follower_present == total) break;
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
     std.debug.print("\n[wrap-regression] leader present={d}/{d}; follower present={d}/{d} (both must be {d})\n", .{ leader_present, total, follower_present, total, total });
 
     // The wrap regression: the leader must hold and serve every committed record.
@@ -3173,17 +3171,11 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
 }
 
 test "e2e/cluster: follower serves each stream record exactly once (no replication dup)" {
-    // Dedicated regression for the follower double-apply bug. Shard.applyReplicatedEntry
-    // applied each broadcast stream record twice (inline append + replay dispatch) and
-    // had no idempotency guard, while the mesh re-broadcasts every entry — so a follower
-    // accumulated a MULTIPLE of the real record set. The symptom in a limit-capped read
-    // was 25/50 (duplicates pushed later records past the limit), but the underlying
-    // defect is duplication, so this test reads with a generous limit and asserts the
-    // follower returns EXACTLY `total` records (catches both duplication and loss).
+    // Reads with a generous limit and asserts the follower returns exactly
+    // `total` records, catching duplication and loss alike.
     //
-    // A default ring is used on purpose: the bug is independent of the hot-ring wrap
-    // boundary (it reproduces with a 64 MB ring), which keeps this regression distinct
-    // from the wrap test above.
+    // A default ring on purpose, so this stays distinct from the wrap test
+    // above: duplication or loss here has nothing to do with the ring.
     var cluster = ClusterContext.init(testing.allocator, .{
         .node_count = 3,
         .durability = .sync,
