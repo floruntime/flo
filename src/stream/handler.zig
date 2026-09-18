@@ -419,8 +419,8 @@ pub const StreamHandler = struct {
                 return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
             };
             defer self.allocator.free(stored_value);
-            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "append not persisted" } };
+            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "append not persisted") } };
             };
             if (!shard.applyCommitted()) {
                 return .{ .err = .{ .code = .internal_error, .message = "append not applied" } };
@@ -1717,9 +1717,8 @@ pub const StreamHandler = struct {
             }
         }
 
-        // Stream delete (FLO-105): key = raw stream name, value = qualified name.
-        // Reaches followers via applyReplicatedEntry's registry dispatch and
-        // restart via replaySegments — same path as stream_trim.
+        // Stream delete: key = raw stream name, value = qualified name.
+        // Applied from the committed log everywhere, like stream_trim.
         if (etype == .stream_delete) {
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 if (cmd.key.len > 0) {

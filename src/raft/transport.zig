@@ -1,9 +1,9 @@
-//! Raft Per-Shard TCP Transport — Wire format, serialization, framing.
+//! Raft transport — wire format, serialization, framing.
 //!
-//! Each shard owns TCP connections to the same shard index on remote nodes.
-//! Multiple Raft groups share one connection, demuxed by `group_id`.
+//! One peer link per node pair carries every group's frames, demuxed by
+//! `group_id`.
 //!
-//! Wire format (per §12.5 NODE_NETWORK_DESIGN.md):
+//! Wire format:
 //!
 //!   ┌─────────┬──────┬──────────┬─────────────┬─────────────┬─────────┐
 //!   │msg_type │ _pad │ group_id │ source_node  │ payload_len │  crc32  │
@@ -14,7 +14,6 @@
 //!   └─────────────────────────────────────────────────────────────────────┘
 //!
 //! CRC32C covers header[0..16] (everything except crc32 field) + payload.
-//! Port scheme: raft_port(shard) = base_port + 500 + shard_id
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -51,8 +50,13 @@ pub const MsgType = enum(u8) {
     request_vote = 3,
     request_vote_response = 4,
     install_snapshot = 5,
-    /// A committed entry, broadcast by the node that wrote it.
-    replicate_entry = 8,
+    /// A client write a follower received, carried to the leader as the
+    /// request bytes it was sent, and the leader's answer carried back.
+    forward_write = 6,
+    forward_reply = 7,
+    /// A node with no membership yet asking to be added; the leader answers
+    /// by proposing the config entry that names it.
+    join_request = 8,
     /// A peer's id and address, so the mesh completes itself.
     peer_info = 9,
     /// Handshake: the dialer's hello, the acceptor's hello with its proof,
@@ -61,10 +65,6 @@ pub const MsgType = enum(u8) {
     hello_back = 11,
     verify = 12,
     welcome = 13,
-    /// A committed entry passed on by a peer that received it, for a
-    /// member the origin has no link to. The payload starts with the
-    /// origin's id; the frame's own source is the peer that forwarded it.
-    forwarded_entry = 14,
 };
 
 /// Write one frame (header, checksum, payload) into `buf`; returns the
@@ -194,10 +194,10 @@ pub fn deserializeVoteRequest(data: []const u8) ?VoteRequest {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — VoteResponse (13 bytes)
+// Serialization — VoteResponse (14 bytes)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const VOTE_RESP_SIZE: usize = 13;
+pub const VOTE_RESP_SIZE: usize = 14;
 
 pub fn serializeVoteResponse(resp: VoteResponse, buf: []u8) ?usize {
     if (buf.len < VOTE_RESP_SIZE) return null;
@@ -208,6 +208,8 @@ pub fn serializeVoteResponse(resp: VoteResponse, buf: []u8) ?usize {
     off += 1;
     std.mem.writeInt(u32, buf[off..][0..4], resp.from, .little);
     off += 4;
+    buf[off] = if (resp.is_pre_vote) 1 else 0;
+    off += 1;
     return off;
 }
 
@@ -219,19 +221,21 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
     const granted = data[off] != 0;
     off += 1;
     const from = std.mem.readInt(u32, data[off..][0..4], .little);
-
+    off += 4;
+    const is_pre_vote = data[off] != 0;
     return .{
         .term = term,
         .vote_granted = granted,
         .from = from,
+        .is_pre_vote = is_pre_vote,
     };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — AppendResponse (21 bytes)
+// Serialization — AppendResponse (29 bytes)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 21;
+pub const APPEND_RESP_SIZE: usize = 29;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -244,6 +248,8 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u32, buf[off..][0..4], resp.from, .little);
     off += 4;
+    std.mem.writeInt(u64, buf[off..][0..8], resp.hint_index, .little);
+    off += 8;
     return off;
 }
 
@@ -257,12 +263,14 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
     const match_idx = std.mem.readInt(u64, data[off..][0..8], .little);
     off += 8;
     const from = std.mem.readInt(u32, data[off..][0..4], .little);
-
+    off += 4;
+    const hint_index = std.mem.readInt(u64, data[off..][0..8], .little);
     return .{
         .term = term,
         .success = success,
         .match_index = match_idx,
         .from = from,
+        .hint_index = hint_index,
     };
 }
 

@@ -50,8 +50,7 @@ pub const DurabilityMode = enum {
     }
 };
 
-/// AppendEntries batch ceiling — matches the `max_entries_per_batch`
-/// default in `raft/node.zig`. Payload and ring-capacity sampling are
+/// AppendEntries batch ceiling. Payload and ring-capacity sampling are
 /// constrained against this so a single batch can never evict its own
 /// head mid-apply.
 pub const MAX_BATCH: u32 = 64;

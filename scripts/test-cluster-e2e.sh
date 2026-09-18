@@ -10,9 +10,9 @@
 # Usage: ./scripts/test-cluster-e2e.sh
 #
 # Port layout (10-port gap avoids collisions with derived ports):
-#   Node 1: listen=4441, metrics=4442, dashboard=4443, raft=4941, gossip=5041
-#   Node 2: listen=4451, metrics=4452, dashboard=4453, raft=4951, gossip=5051
-#   Node 3: listen=4461, metrics=4462, dashboard=4463, raft=4961, gossip=5061
+#   Node 1: listen=4441, metrics=4442, dashboard=4443, peer=4941
+#   Node 2: listen=4451, metrics=4452, dashboard=4453, peer=4951
+#   Node 3: listen=4461, metrics=4462, dashboard=4463, peer=4961
 
 set -e
 
@@ -113,8 +113,8 @@ start_cluster() {
 
     log_info "Started nodes: $NODE1_PID, $NODE2_PID, $NODE3_PID"
 
-    # Wait for cluster to form and elect leader
-    log_info "Waiting for leader election (8s)..."
+    # The first member leads at once; wait for the two joins
+    log_info "Waiting for the joins (8s)..."
     sleep 8
 }
 

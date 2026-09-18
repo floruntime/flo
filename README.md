@@ -532,10 +532,8 @@ src/
 │
 ├── cluster/                 # Clustering
 │   ├── coordinator.zig      #   Controller Raft on Shard 0
-│   ├── partition_table.zig  #   Partition → Node mapping
-│   ├── forwarder.zig        #   Cross-node request forwarding
-│   ├── gossip.zig           #   SWIM protocol
-│   └── membership.zig       #   Join/leave/fail state machine
+│   ├── forwarder.zig        #   Cross-shard request forwarding
+│   └── partition_table.zig  #   Partition → Node mapping
 │
 ├── cli/                     # CLI client
 ├── config/                  # Configuration (flo.toml)
@@ -612,7 +610,7 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Workflows (YAML, signals, timers) | ✅ Complete |
 | Stream Processing (operators, windows, checkpoints) | ✅ Complete |
 | Web Dashboard | ✅ Complete |
-| SWIM gossip + cluster membership | ✅ Complete |
+| Cluster membership by the replicated log | ✅ Complete |
 | Cross-node request forwarding | ✅ Complete |
 | Cold Storage (S3/GCS) | � Local backend complete, remote planned |
 

@@ -101,7 +101,7 @@ test "framer: a frame split across reads comes out whole, and two in one read co
     var f = try Framer.init(testing.allocator);
     defer f.deinit();
     var wire: [256]u8 = undefined;
-    const a = frameInto(&wire, .replicate_entry, 7, "hello");
+    const a = frameInto(&wire, .append_entries, 7, "hello");
     const b = frameInto(wire[a..], .peer_info, 7, "0123456789");
     const total = a + b;
 
@@ -116,7 +116,7 @@ test "framer: a frame split across reads comes out whole, and two in one read co
         while (try f.next(7)) |fr| {
             got += 1;
             if (got == 1) {
-                try testing.expectEqual(transport.MsgType.replicate_entry, fr.msg_type);
+                try testing.expectEqual(transport.MsgType.append_entries, fr.msg_type);
                 try testing.expectEqualStrings("hello", fr.payload);
             } else {
                 try testing.expectEqualStrings("0123456789", fr.payload);
@@ -134,7 +134,7 @@ test "framer: a frame that exactly fills the buffer is delivered" {
     const payload = try testing.allocator.alloc(u8, transport.MAX_PAYLOAD_SIZE);
     defer testing.allocator.free(payload);
     @memset(payload, 0xab);
-    const n = frameInto(f.space(), .replicate_entry, 3, payload);
+    const n = frameInto(f.space(), .append_entries, 3, payload);
     try testing.expectEqual(MAX_FRAME_SIZE, n);
     f.commit(n);
     const fr = (try f.next(3)).?;
@@ -148,7 +148,7 @@ test "framer: oversize, unknown type, wrong source and bad checksum are refused"
     defer f.deinit();
 
     // Oversize is refused from the header alone, before the payload arrives.
-    var hdr = RaftHeader{ .msg_type = @intFromEnum(transport.MsgType.replicate_entry), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = 1, .payload_len = @intCast(transport.MAX_PAYLOAD_SIZE + 1), .crc32 = 0 };
+    var hdr = RaftHeader{ .msg_type = @intFromEnum(transport.MsgType.append_entries), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = 1, .payload_len = @intCast(transport.MAX_PAYLOAD_SIZE + 1), .crc32 = 0 };
     @memcpy(f.space()[0..HEADER_SIZE], hdr.asBytes());
     f.commit(HEADER_SIZE);
     try testing.expectError(error.Oversize, f.next(1));
@@ -162,7 +162,7 @@ test "framer: oversize, unknown type, wrong source and bad checksum are refused"
     f.len = 0;
 
     var wire: [64]u8 = undefined;
-    const n = frameInto(&wire, .replicate_entry, 1, "x");
+    const n = frameInto(&wire, .append_entries, 1, "x");
     @memcpy(f.space()[0..n], wire[0..n]);
     f.commit(n);
     try testing.expectError(error.SourceMismatch, f.next(2));

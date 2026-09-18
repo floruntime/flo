@@ -50,7 +50,7 @@ pub const kv = struct {
 };
 
 // =============================================================================
-// Cluster: Controller Raft, Partition Table, Gossip (NEW)
+// Cluster: Controller Raft, Partition Table
 // =============================================================================
 pub const cluster = @import("cluster/mod.zig");
 

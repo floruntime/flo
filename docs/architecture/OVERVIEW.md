@@ -186,7 +186,8 @@ Payloads are allocated from the slab allocator, not embedded in the envelope. Th
 
 ## Clustering
 
-- **SWIM gossip** — failure detection and membership protocol
+- **Raft group** — one log per cluster; the leader replicates every write to a majority before it is acknowledged, and membership is a config entry in that log
+- **Peer link** — one authenticated TCP link per node pair carrying the Raft RPCs and writes forwarded to the leader
 - **Controller Raft** — runs on Shard 0, manages partition table
 - **Partition Table** — maps partition → node, updated on membership changes
 - **Forwarder** — routes requests to the correct node when partitions aren't local

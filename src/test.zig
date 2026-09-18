@@ -52,6 +52,7 @@ test {
     _ = @import("raft/framer.zig");
     _ = @import("raft/handshake.zig");
     _ = @import("raft/raft_queue.zig");
+    _ = @import("raft/membership.zig");
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/memory.zig");
     _ = @import("storage/partition.zig");
@@ -72,8 +73,6 @@ test {
 test {
     _ = @import("raft/log.zig");
     _ = @import("raft/node.zig");
-    _ = @import("raft/election.zig");
-    _ = @import("raft/replication.zig");
     _ = @import("raft/transport.zig");
     _ = @import("raft/snapshot.zig");
 }
@@ -170,8 +169,6 @@ test {
     _ = @import("cluster/coordinator.zig");
     _ = @import("cluster/partition_table.zig");
     _ = @import("cluster/forwarder.zig");
-    _ = @import("cluster/gossip.zig");
-    _ = @import("cluster/membership.zig");
 }
 
 // Auth
