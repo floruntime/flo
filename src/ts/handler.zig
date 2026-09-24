@@ -55,7 +55,7 @@ pub const TSHandler = struct {
     /// Monotonic UAL index counter — fallback for test mode (no shard).
     next_ual_index: u64,
 
-    /// Set after init by Shard.wireHandlerShardPtrs(). Required for persistEntry() Raft writes.
+    /// Set after init by Shard.wireHandlerShardPtrs(). Required to propose Raft entries.
     shard_ptr: ?*anyopaque,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
@@ -114,11 +114,32 @@ pub const TSHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.ts_handler.handleCommand(req);
         defer shard.ts_handler.freeResult(result);
+        if (result == .parked) return shard.park(conn, req, result.parked, respondTS);
         switch (result) {
             .ts_write_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
         sendTSResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// A parked write applied: the point's timestamp is the client's or,
+    /// server-stamped, the entry's; its sequence the entry's index.
+    fn respondTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        // Checked by the write handler before the entry was proposed.
+        const client_ts = clientTimestampNs(req) catch null;
+        sendTSResponse(shard, conn, req.header.request_id, writeOk(req.key, client_ts orelse shard.answering_timestamp_ns, shard.answering_index));
+    }
+
+    /// The timestamp the client gave its point, in ns; null when it left
+    /// the choice to the server. Refused past what nanoseconds can hold.
+    fn clientTimestampNs(req: Request) error{Overflow}!?u64 {
+        const opt = req.findOption(.ts_timestamp) orelse return null;
+        const ts_ms = opt.asI64() orelse 0;
+        if (ts_ms <= 0) return null;
+        return try std.math.mul(u64, @intCast(ts_ms), 1_000_000);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -163,10 +184,11 @@ pub const TSHandler = struct {
             0.0;
 
         // Timestamp: from options, or server-generated
-        const timestamp_ns: u64 = if (req.findOption(.ts_timestamp)) |opt| blk: {
-            const ts_ms = opt.asI64() orelse 0;
-            break :blk if (ts_ms > 0) @intCast(@as(u64, @bitCast(ts_ms)) * 1_000_000) else serverTimestampNs();
-        } else serverTimestampNs();
+        const client_ts = clientTimestampNs(req) catch {
+            return .{ .err = .{ .code = .invalid_request, .message = "ts write: timestamp out of range" } };
+        };
+        const server_ts = serverTimestampNs();
+        const timestamp_ns = client_ts orelse server_ts;
 
         // Canonical tag hash — sorted pairs, so tag ordering is not part of
         // the series identity (see ts_mod.canonicalTagHash).
@@ -191,13 +213,14 @@ pub const TSHandler = struct {
             }) orelse {
                 return .{ .err = .{ .code = .invalid_request, .message = "ts write: field/tags too large" } };
             };
-            ual_index = persistence_mod.persistEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch |err| {
+            // The header keeps the server clock (segment ranges and tiering
+            // read it), taken here so the responder can answer with the
+            // timestamp a server-stamped point got; a client's own is in
+            // its request.
+            const proposed = persistence_mod.proposeEntryAt(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded, server_ts) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts write not persisted") } };
             };
-            // The projection router inserts the point when the entry applies.
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "ts write not applied" } };
-            }
+            return .{ .parked = proposed };
         } else {
             // No shard (unit tests): insert directly (the projection
             // canonicalizes the tag set and owns hashing + dictionary
@@ -208,12 +231,14 @@ pub const TSHandler = struct {
             };
         }
 
-        const timestamp_ms: i64 = @intCast(timestamp_ns / 1_000_000);
+        return writeOk(measurement, timestamp_ns, ual_index);
+    }
 
+    fn writeOk(measurement: []const u8, timestamp_ns: u64, sequence: u64) CommandResult {
         return .{ .ts_write_ok = .{
             .series_hash = std.hash.Wyhash.hash(0, measurement),
-            .timestamp_ms = timestamp_ms,
-            .sequence = ual_index,
+            .timestamp_ms = @intCast(timestamp_ns / 1_000_000),
+            .sequence = sequence,
         } };
     }
 
@@ -574,7 +599,7 @@ pub const TSHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────
 
-    /// Cast opaque shard pointer to Shard for persistEntry().
+    /// Cast opaque shard pointer to Shard for proposing entries.
     fn shardFromPtr(ptr: *anyopaque) *Shard {
         return @ptrCast(@alignCast(ptr));
     }
@@ -598,7 +623,7 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
         },
         .ts_write_ok => |w| {
             // Send [series_hash:u64][timestamp_ms:i64][sequence:u64] (24 bytes)
@@ -624,20 +649,6 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled ts response");
         },
     }
-}
-
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        .conflict => .conflict,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -869,6 +880,23 @@ test "ts handler: write with field name option" {
         .ts_write_ok => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "ts handler: a client timestamp past what nanoseconds hold is refused, not wrapped" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+
+    var opts_buf: [64]u8 = undefined;
+    var builder = OptionsBuilder.init(&opts_buf);
+    try builder.addI64(.ts_timestamp, std.math.maxInt(i64) / 1_000);
+    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", "82.5", builder.getOptions()));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u64, 0), ts.stats.points_inserted);
 }
 
 test "ts handler: write empty measurement" {

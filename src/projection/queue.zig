@@ -146,6 +146,10 @@ pub const QueueProjection = struct {
 
     /// Next sequence number.
     next_seq: u64,
+    /// What the last applied purge removed, and the sequence the last
+    /// applied enqueue got (see `Shard.answering_index`).
+    last_purge_count: u64 = 0,
+    last_enqueued_seq: ?u64 = null,
 
     /// Last applied UAL index.
     applied_index: u64,
@@ -282,6 +286,7 @@ pub const QueueProjection = struct {
                 if (removed.value.payload.len > 0) self.allocator.free(removed.value.payload);
             }
         }
+        self.last_purge_count = seqs.items.len;
         return @intCast(seqs.items.len);
     }
 
@@ -523,6 +528,7 @@ pub const QueueProjection = struct {
 
         switch (entry_type) {
             .queue_enqueue => {
+                self.last_enqueued_seq = null;
                 // Parse priority from command payload value (first 4 bytes) or default 0
                 var priority: u32 = 0;
                 var payload: []const u8 = &[_]u8{};
@@ -543,7 +549,7 @@ pub const QueueProjection = struct {
                     q_name = cmd.key;
                     q_ns_hash = cmd.namespace_hash;
                 }
-                _ = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
+                self.last_enqueued_seq = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
                 // Register queue during recovery so list works after restart. The entry
                 // only has the namespace hash; resolve the real namespace string when a
                 // resolver is wired (live enqueues already register the correct namespace
@@ -573,6 +579,7 @@ pub const QueueProjection = struct {
                 // Lease extension — not yet implemented, treat as no-op
             },
             .queue_purge => {
+                self.last_purge_count = 0;
                 // Drop all ready+leased messages for one queue. Key = queue name.
                 if (CommandPayload.deserialize(entry.payload)) |cmd| {
                     const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);

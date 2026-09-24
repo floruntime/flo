@@ -20,6 +20,11 @@ pub const CommandResult = union(enum) {
     /// Request is pending (blocked) - no response sent yet
     pending: void,
 
+    /// The write is in the log and waits for commit; the module's
+    /// responder answers once it has applied. Carries what `propose`
+    /// returned.
+    parked: @import("../raft/types.zig").ProposeResult,
+
     /// Pong response to ping
     pong: void,
 
@@ -544,6 +549,7 @@ pub const CommandResult = union(enum) {
         timeout = 0x0005,
         internal_error = 0x0006,
         unavailable = 0x0007,
+        overloaded = 0x0008,
 
         // KV errors (0x0100-0x01FF)
         kv_key_too_large = 0x0100,
@@ -591,6 +597,58 @@ pub const CommandResult = union(enum) {
 
         // Namespace errors (0x0900-0x09FF)
         namespace_not_empty = 0x0900,
+
+        /// The wire status a client is told. No `else`: a new code must
+        /// say what it is to a client, in every module at once.
+        pub fn toStatus(code: ErrorCode) flo_proto.StatusCode {
+            return switch (code) {
+                .invalid_request,
+                .kv_key_too_large,
+                .kv_value_too_large,
+                .kv_txn_cross_shard,
+                .kv_txn_too_large,
+                .kv_txn_unsupported_op,
+                .stream_offset_out_of_range,
+                .queue_message_too_large,
+                .workflow_disabled,
+                => .bad_request,
+                .unauthorized => .unauthorized,
+                .not_found,
+                .kv_namespace_not_found,
+                .kv_txn_unknown,
+                .stream_not_found,
+                .stream_partition_not_found,
+                .queue_not_found,
+                .group_not_found,
+                .group_consumer_not_found,
+                .worker_not_found,
+                .task_not_found,
+                .workflow_not_found,
+                => .not_found,
+                .already_exists,
+                .conflict,
+                .queue_duplicate_message,
+                .namespace_not_empty,
+                .workflow_already_completed,
+                .workflow_cancelled,
+                => .conflict,
+                .unavailable,
+                .not_leader,
+                .no_leader,
+                .partition_unavailable,
+                .replication_timeout,
+                .quorum_not_reached,
+                .partition_moved,
+                => .unavailable,
+                .overloaded => .overloaded,
+                .unknown,
+                .timeout,
+                .internal_error,
+                .kv_txn_timeout,
+                .group_rebalancing,
+                => .internal_error,
+            };
+        }
     };
 
     pub const KVEntry = struct {
@@ -859,6 +917,9 @@ pub const CommandResult = union(enum) {
         return switch (self) {
             .ok => .ok,
             .pending => .ok, // Pending results are not sent over wire, but map to OK if forced
+            // A responder answers a parked write once it applies. Sent as is,
+            // it is a dispatcher that forgot to park: an error, not an empty ok.
+            .parked => .error_response,
             .pong => .pong,
             .auth_ok => .auth, // Auth success response
             .err => .error_response,
@@ -950,7 +1011,7 @@ pub const CommandResult = union(enum) {
     /// Calculate serialized size for cross-core messaging
     pub fn serializedSize(self: CommandResult) usize {
         return switch (self) {
-            .ok, .pending, .pong, .kv_not_found, .kv_condition_not_met => 1,
+            .ok, .pending, .parked, .pong, .kv_not_found, .kv_condition_not_met => 1,
             .auth_ok => |a| 1 + 1 + (if (a.user_id) |u| 4 + u.len else @as(usize, 0)) + 1 + (if (a.namespace) |n| 4 + n.len else @as(usize, 0)),
             .err => |e| 1 + 2 + 4 + e.message.len,
 
@@ -1077,7 +1138,7 @@ pub const CommandResult = union(enum) {
         try writer.writeByte(@intFromEnum(std.meta.activeTag(self)));
 
         switch (self) {
-            .ok, .pending, .pong, .kv_not_found, .kv_condition_not_met => {},
+            .ok, .pending, .parked, .pong, .kv_not_found, .kv_condition_not_met => {},
             .auth_ok => |a| {
                 // Write has_user_id flag + optional user_id
                 if (a.user_id) |uid| {
@@ -1414,6 +1475,8 @@ pub const CommandResult = union(enum) {
         return switch (tag) {
             .ok => .{ .ok = {} },
             .pending => .{ .pending = {} },
+            // A parked write never crosses shards; the tag alone survives.
+            .parked => .{ .pending = {} },
             .pong => .{ .pong = {} },
             .auth_ok => blk: {
                 const has_user_id = try reader.takeByte();

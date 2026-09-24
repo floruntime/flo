@@ -74,7 +74,7 @@ pub const StreamHandler = struct {
     allocator: Allocator,
 
     /// Opaque pointer to owning Shard (avoids circular import).
-    /// Set after init by Shard.init. Required for persistEntry() Raft writes.
+    /// Set after init by Shard.init. Required to propose Raft entries.
     shard_ptr: ?*anyopaque,
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
@@ -83,6 +83,11 @@ pub const StreamHandler = struct {
     /// Tier-hit counters for this shard's log, resolved once at wire-up so the
     /// read path does not do a registry lookup per record.
     tiered_metrics: ?*TieredLogMetrics = null,
+
+    /// The id the last applied append got (see `Shard.answering_index`).
+    last_append: ?StreamID = null,
+    /// What the last applied trim removed (see `Shard.answering_index`).
+    last_trim_count: u64 = 0,
 
     /// Maximum number of messages in a single read response.
     const MAX_READ_BATCH: usize = 1000;
@@ -190,6 +195,7 @@ pub const StreamHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
+        if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
 
         // Track namespace data for stream create operations
         const op: proto.OpCode = @enumFromInt(req.header.op_code);
@@ -203,20 +209,33 @@ pub const StreamHandler = struct {
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
+    /// A parked stream write applied: read the outcome back and answer.
+    fn respondStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        const cmd_result: CommandResult = switch (op) {
+            .stream_append => shard.stream_handler.respondAppend(),
+            .stream_trim => shard.stream_handler.respondTrim(req),
+            else => .ok,
+        };
+        // Waiters and triggers are woken by the applier on every node; the
+        // write is counted against its namespace where the client is answered.
+        if (op == .stream_append) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
     /// Dedicated dispatch for stream_append — notifies blocking read waiters after append.
     fn dispatchAppend(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
-
-        // Waiters and triggers are woken by the applier; the namespace
-        // bookkeeping is a producer decision and stays here.
+        if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
         switch (cmd_result) {
             .stream_append_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
-
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
@@ -405,40 +424,52 @@ pub const StreamHandler = struct {
         }
 
         const payload_value = if (req.value.len > 0) req.value else "";
-
-        // The append is persisted through Raft and applied from the committed
-        // log by the shard's one applier, so it replicates and survives restart.
-        // The StreamID is deterministic from the entry timestamp, so the
-        // response reads it back from the projection. Without a shard (unit
-        // tests) the same applier runs on a locally built entry.
-        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
-        const stream_id = if (self.shard_ptr) |sptr| blk: {
+        // The append goes through Raft and is applied from the committed log
+        // by the shard's one applier, so it replicates and survives restart;
+        // the client is parked until then and `respondAppend` reads the
+        // StreamID back. Without a shard (unit tests) the same applier runs
+        // on a locally built entry.
+        if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
             // Carry the partition in the value prefix so it survives restart.
             const stored_value = stream_mod.encodeAppendValue(self.allocator, partition_index, payload_value) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
             };
             defer self.allocator.free(stored_value);
-            _ = persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
+            // The applier registers the stream's name by resolving the
+            // namespace, so a namespace nobody created is created first.
+            shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
+            const proposed = persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "append not persisted") } };
             };
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "append not applied" } };
-            }
-            break :blk self.stream.streamLastId(name_hash);
-        } else self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
+            return .{ .parked = proposed };
+        }
+        const stream_id = self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
+        self.registerStreamName(req);
+        return appendOk(stream_id);
+    }
 
-        // Register stream name for listing (namespace-qualified)
-        var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
-        self.stream.registerStream(ns_stream_name) catch {};
+    /// The append applied: the applier recorded its id and registered the
+    /// stream's name.
+    pub fn respondAppend(self: *StreamHandler) CommandResult {
+        const id = self.last_append orelse return .{ .err = .{ .code = .internal_error, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
+        return appendOk(id);
+    }
 
+    fn appendOk(stream_id: StreamID) CommandResult {
         return .{ .stream_append_ok = .{
             .sequence = stream_id.sequence,
             .timestamp_ms = @as(i64, @intCast(stream_id.timestamp_ms)),
         } };
+    }
+
+    /// Register the namespace-qualified name so the stream is listed.
+    fn registerStreamName(self: *StreamHandler, req: Request) void {
+        var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch req.key;
+        self.stream.registerStream(ns_stream_name) catch {};
     }
 
     // ── READ ────────────────────────────────────────────────────────────
@@ -603,13 +634,24 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 
-        const deleted = self.persistAndApplyTrim(req.namespace, name_hash, trim_id) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "trim not persisted or applied" } };
-        };
+        if (self.shard_ptr) |sptr| {
+            const proposed = self.proposeTrim(shardFromPtr(sptr), req.namespace, name_hash, trim_id) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "trim not persisted") } };
+            };
+            return .{ .parked = proposed };
+        }
+        return trimmed(name_hash, self.stream.trimStream(name_hash, trim_id), self.stream);
+    }
 
-        const first_id = self.stream.streamFirstId(name_hash);
+    /// The trim applied; the applier recorded what it removed.
+    fn respondTrim(self: *StreamHandler, req: Request) CommandResult {
+        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        return trimmed(name_hash, self.last_trim_count, self.stream);
+    }
+
+    fn trimmed(name_hash: u64, deleted: u64, stream: *StreamProjection) CommandResult {
+        const first_id = stream.streamFirstId(name_hash);
         const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
-
         return .{ .stream_trimmed = .{
             .deleted_count = deleted,
             .first_seq = first_seq,
@@ -636,9 +678,15 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .conflict, .message = "stream is not empty; pass --force to delete" } };
         }
 
-        self.persistAndApplyDelete(req.namespace, req.key, name_hash) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "delete not persisted or applied" } };
-        };
+        if (self.shard_ptr) |sptr| {
+            const proposed = self.proposeDelete(shardFromPtr(sptr), req.namespace, req.key) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "delete not persisted") } };
+            };
+            return .{ .parked = proposed };
+        }
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const qualified = ns_keys.qualifyKey(&q_buf, req.namespace, req.key) catch req.key;
+        _ = self.stream.deleteStream(name_hash, req.key, qualified);
         return .ok;
     }
 
@@ -849,11 +897,12 @@ pub const StreamHandler = struct {
 
         // Apply sweeper config from TLV options the CLI/SDK already sends.
         applyGroupConfig(self, group_name, req);
-
-        // Persist group existence + config so they survive restart (FLO-103).
-        self.persistGroupCommit(group_name, true);
-
-        return .ok;
+        // The group and its config survive a restart through the log. One
+        // the log never took would vanish on restart and never reach a
+        // follower: not created, then.
+        const result = self.groupCommitResult(group_name, true);
+        if (result == .err) _ = self.stream.deleteGroup(group_name);
+        return result;
     }
 
     // ── GROUP CONFIGURE SWEEPER ─────────────────────────────────────────
@@ -872,16 +921,19 @@ pub const StreamHandler = struct {
         const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
         const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
 
+        const before = self.stream.getGroup(group_name) orelse return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
+        const was_timeout = before.ack_timeout_ms;
+        const was_max = before.max_deliver;
         self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
         };
 
-        // Persist updated config so it survives restart (FLO-103).
-        self.persistGroupCommit(group_name, true);
-
-        return .ok;
+        // A config the log never took is a config the group does not have.
+        const result = self.groupCommitResult(group_name, true);
+        if (result == .err) self.stream.configureGroup(group_name, was_timeout, was_max) catch {};
+        return result;
     }
 
     // ── GROUP DELETE ────────────────────────────────────────────────────
@@ -897,13 +949,13 @@ pub const StreamHandler = struct {
         if (self.stream.getGroup(group_name) == null) {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
         }
-        if (self.shard_ptr != null) {
-            self.persistGroupDelete(group_name) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "group delete not persisted or applied" } };
+        if (self.shard_ptr) |sptr| {
+            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "") catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "group delete not persisted") } };
             };
-        } else {
-            _ = self.stream.deleteGroup(group_name);
+            return .{ .parked = proposed };
         }
+        _ = self.stream.deleteGroup(group_name);
         return .ok;
     }
 
@@ -1052,11 +1104,10 @@ pub const StreamHandler = struct {
             };
         };
 
-        // Persist the advanced ack-floor for restart durability, debounced to
-        // floor advances so out-of-order acks don't each force a Raft write (FLO-103).
-        self.persistGroupCommit(group_name, false);
-
-        return .ok;
+        // The advanced ack floor survives a restart through the log,
+        // debounced to floor advances so out-of-order acks do not each
+        // write an entry.
+        return self.groupCommitResult(group_name, false);
     }
 
     // ── GROUP NACK ──────────────────────────────────────────────────────
@@ -1441,7 +1492,7 @@ pub const StreamHandler = struct {
     /// Append payload to a named stream (used by processing pipelines).
     /// Computes the namespace-qualified name hash for proper stream isolation.
     /// Wraps the payload in batch format for consistency with all other appends.
-    pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !u64 {
+    pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !void {
         // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
         const batch_size = 4 + 4 + payload.len + 2;
         const batch_buf = try self.allocator.alloc(u8, batch_size);
@@ -1460,16 +1511,9 @@ pub const StreamHandler = struct {
         // prefix so the entry decodes consistently on replay.
         const stored_value = try stream_mod.encodeAppendValue(self.allocator, 0, batch_value);
         defer self.allocator.free(stored_value);
-        _ = try persistence_mod.persistEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
-        if (!shard.applyCommitted()) return error.NotApplied;
-        const stream_id = self.stream.streamLastId(router.nameHash(router.namespaceHash(namespace), stream_name));
-
-        // Register the stream name so it appears in `stream list`
-        var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, namespace, stream_name) catch stream_name;
-        self.stream.registerStream(ns_stream_name) catch {};
-
-        return stream_id.sequence;
+        // The applier registers the stream's name; the caller proposed the
+        // namespace's implicit create first where it could.
+        _ = try persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, namespace, stream_name, stored_value);
     }
 
     /// Read payloads from a named stream (used by processing pipelines).
@@ -1654,7 +1698,7 @@ pub const StreamHandler = struct {
 
         _ = try self.partition.apply(&entry);
         replayEntry(@ptrCast(self), &entry);
-        return self.stream.streamLastId(router.nameHash(ns_hash, req.key));
+        return self.last_append orelse error.AppendNotApplied;
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1680,6 +1724,7 @@ pub const StreamHandler = struct {
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
 
         if (etype == .stream_append) {
+            self.last_append = null;
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 // Recover the user partition from the value prefix so it survives
@@ -1690,11 +1735,16 @@ pub const StreamHandler = struct {
                 const record_count = stream_mod.batchRecordCount(av.payload);
                 const byte_len: u32 = @intCast(av.payload.len);
                 // Anchor to the entry timestamp so replay reproduces the same
-                // StreamIDs as the original live apply (FLO-103).
+                // StreamIDs as the original live apply.
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                _ = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch {};
-                // Register the NAMESPACE-QUALIFIED name, exactly as the live
-                // append path does. A bare key is invisible to `stream list`,
+                self.last_append = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch |err| blk: {
+                    log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
+                    break :blk null;
+                };
+                // Register the NAMESPACE-QUALIFIED name: a client's append,
+                // and a pipeline sink's on this shard, proposed any implicit
+                // create first, so the hash resolves. A bare key is invisible
+                // to `stream list`,
                 // which filters on the namespace prefix, while `stream info`
                 // still resolves it by hash — so the two disagree. Only the
                 // default namespace, whose qualified form is the bare name,
@@ -1707,12 +1757,13 @@ pub const StreamHandler = struct {
         }
 
         if (etype == .stream_trim) {
+            self.last_trim_count = 0;
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
                 if (cmd.key.len >= 16) {
                     const ts = std.mem.readInt(u64, cmd.key[0..8], .little);
                     const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
                     const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
-                    _ = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
+                    self.last_trim_count = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
                 }
             }
         }
@@ -1728,7 +1779,7 @@ pub const StreamHandler = struct {
             }
         }
 
-        // Consumer-group durability (FLO-103): cg_commit carries a group's
+        // Consumer-group durability: cg_commit carries a group's
         // ack-floor cursor + sweeper config; cg_delete removes the group. The
         // CommandPayload key is the namespace-qualified group name. Cursor
         // advance is monotonic (see StreamProjection.applyCommit), so this is
@@ -1752,82 +1803,59 @@ pub const StreamHandler = struct {
 
     // ── Trim Persistence ────────────────────────────────────────────────
 
-    /// Encode a trim as a stream_trim entry and persist through Raft.
-    /// Format: key = [timestamp_ms:u64 LE][sequence:u64 LE], value = [name_hash:u64 LE]
-    /// After Raft commit, applies the trim locally to the projection.
-    /// Returns the number of records trimmed locally.
-    fn persistAndApplyTrim(self: *StreamHandler, namespace: []const u8, name_hash: u64, trim_id: StreamID) !u64 {
-        // Encode trim target as the entry key (16 bytes) and name_hash as value (8 bytes)
+    /// A trim entry: key = the boundary id, value = the stream hash.
+    fn proposeTrim(self: *StreamHandler, shard: *Shard, namespace: []const u8, name_hash: u64, trim_id: StreamID) !persistence_mod.ProposeResult {
+        _ = self;
         var key_buf: [16]u8 = undefined;
         std.mem.writeInt(u64, key_buf[0..8], trim_id.timestamp_ms, .little);
         std.mem.writeInt(u64, key_buf[8..16], trim_id.sequence, .little);
-
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, val_buf[0..8], name_hash, .little);
-
-        // Persist through Raft; the applier trims the projection. The count
-        // is what the projection lost, read back rather than returned.
-        if (self.shard_ptr) |sptr| {
-            const shard = shardFromPtr(sptr);
-            const before = self.stream.streamRecordCount(name_hash);
-            _ = try persistence_mod.persistEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf);
-            if (!shard.applyCommitted()) return error.NotApplied;
-            return before - self.stream.streamRecordCount(name_hash);
-        }
-        return self.stream.trimStream(name_hash, trim_id);
+        return persistence_mod.proposeEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf);
     }
 
-    /// Encode a stream delete as a `stream_delete` entry and persist through
-    /// Raft, then apply locally — mirror of `persistAndApplyTrim`.
-    /// Format: key = raw stream name, value = namespace-qualified name, so
-    /// followers/replay can clear the name registry without the namespace
-    /// string (they only carry `namespace_hash`).
-    fn persistAndApplyDelete(self: *StreamHandler, namespace: []const u8, raw_name: []const u8, name_hash: u64) !void {
+    /// A delete entry: key = raw stream name, value = namespace-qualified
+    /// name, so followers and replay clear the name registry without the
+    /// namespace string (they only carry `namespace_hash`).
+    fn proposeDelete(self: *StreamHandler, shard: *Shard, namespace: []const u8, raw_name: []const u8) !persistence_mod.ProposeResult {
+        _ = self;
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qualified = ns_keys.qualifyKey(&q_buf, namespace, raw_name) catch raw_name;
-
-        // Persist through Raft; the applier deletes the projection state.
-        if (self.shard_ptr) |sptr| {
-            const shard = shardFromPtr(sptr);
-            _ = try persistence_mod.persistEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified);
-            if (!shard.applyCommitted()) return error.NotApplied;
-            return;
-        }
-        _ = self.stream.deleteStream(name_hash, raw_name, qualified);
+        return persistence_mod.proposeEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified);
     }
 
-    /// Public interface for background tasks (retention enforcer) to persist trims.
-    pub fn persistTrim(self: *StreamHandler, name_hash: u64, trim_id: StreamID) u64 {
-        return self.persistAndApplyTrim("", name_hash, trim_id) catch |err| {
+    /// Retention's trims: proposed; the trim applies when it commits.
+    /// Whether it was proposed (without a shard, applied here).
+    pub fn persistTrim(self: *StreamHandler, name_hash: u64, trim_id: StreamID) bool {
+        const sptr = self.shard_ptr orelse return self.stream.trimStream(name_hash, trim_id) > 0;
+        _ = self.proposeTrim(shardFromPtr(sptr), "", name_hash, trim_id) catch |err| {
             log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
-            return 0;
+            return false;
         };
+        return true;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Cast opaque shard pointer to a Shard-like type for persistEntry().
+    /// Cast opaque shard pointer to a Shard-like type for proposing entries.
     /// Uses anytype to avoid circular import.
     fn shardFromPtr(ptr: *anyopaque) *Shard {
         return @ptrCast(@alignCast(ptr));
     }
 
-    /// Persist a consumer group's durable state (ack-floor cursor + sweeper
-    /// config) as a `cg_commit` UAL entry so it survives restart (FLO-103).
-    ///
-    /// `force` = false debounces to floor advances only (the ack hot path):
-    /// acking entries above a still-pending low entry does not move the floor,
-    /// so no Raft write is emitted. `force` = true always emits — used on
-    /// create / configure, where config (not the cursor) is what changed.
-    ///
-    /// Best-effort: a failed persist leaves the in-memory group correct and the
-    /// next commit retries; only durability across restart is at risk.
-    /// No-op when the shard isn't wired (unit tests).
-    fn persistGroupCommit(self: *StreamHandler, group_name: []const u8, force: bool) void {
-        const sptr = self.shard_ptr orelse return;
-        const group = self.stream.getGroup(group_name) orelse return;
+    /// A group's durable state — ack-floor cursor and sweeper config — as
+    /// a `cg_commit` entry the client is parked on. `force` = false
+    /// debounces to floor advances (the ack hot path): acking entries
+    /// above a still-pending low entry moves no floor, so no entry is
+    /// written and the answer is immediate. `force` = true always writes,
+    /// for create and configure, where the config is what changed. The
+    /// floor counts as committed once the entry applies; until then an ack
+    /// writes the same floor again.
+    fn groupCommitResult(self: *StreamHandler, group_name: []const u8, force: bool) CommandResult {
+        const sptr = self.shard_ptr orelse return .ok;
+        const group = self.stream.getGroup(group_name) orelse return .ok;
         const floor = group.ackFloor();
-        if (!force and !floor.greaterThan(group.last_committed_floor)) return;
+        if (!force and !floor.greaterThan(group.last_committed_floor)) return .ok;
 
         const commit = stream_mod.GroupCommit{
             .floor = floor,
@@ -1839,19 +1867,10 @@ pub const StreamHandler = struct {
 
         // group_name is already namespace-qualified; it travels in the
         // CommandPayload key, so the namespace arg is unused on replay.
-        _ = persistence_mod.persistEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch |err| {
-            log.err("consumer group {s}: cursor not persisted: {s}; acked records may be redelivered after a restart", .{ group_name, @errorName(err) });
-            return;
+        const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch |err| {
+            return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "group state not persisted") } };
         };
-        _ = shardFromPtr(sptr).applyCommitted();
-        group.last_committed_floor = floor;
-    }
-
-    /// Persist a `cg_delete`; the applier removes the group.
-    fn persistGroupDelete(self: *StreamHandler, group_name: []const u8) !void {
-        const sptr = self.shard_ptr orelse return;
-        _ = try persistence_mod.persistEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "");
-        if (!shardFromPtr(sptr).applyCommitted()) return error.NotApplied;
+        return .{ .parked = proposed };
     }
 };
 
@@ -1981,7 +2000,7 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            const status = errorCodeToStatus(e.code);
+            const status = e.code.toStatus();
             shard.sendErrorResponse(conn, request_id, status, e.message);
         },
         .kv_not_found => {
@@ -2053,27 +2072,6 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled stream response");
         },
     }
-}
-
-/// Map CommandResult.ErrorCode to wire StatusCode.
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        .stream_not_found => .not_found,
-        .stream_offset_out_of_range => .bad_request,
-        .stream_partition_not_found => .not_found,
-        .group_not_found => .not_found,
-        .group_rebalancing => .internal_error,
-        .group_consumer_not_found => .not_found,
-        .conflict => .conflict,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

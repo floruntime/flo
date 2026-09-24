@@ -116,12 +116,6 @@ pub const RaftQueue = struct {
         return self.len <= self.slots.len / 4 and self.bytes <= LOW_BYTES;
     }
 
-    /// Wake the consumer without a frame: for frames it holds itself.
-    pub fn poke(self: *RaftQueue) void {
-        const byte = [_]u8{1};
-        _ = std.c.write(self.wake_wr, &byte, 1);
-    }
-
     /// Empty the wake pipe; called by the consumer when the read end is
     /// readable, before draining.
     pub fn drainWake(self: *RaftQueue) void {

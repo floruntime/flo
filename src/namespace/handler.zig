@@ -193,6 +193,16 @@ pub fn validateKeySize(ns: []const u8, key: []const u8) ?[]const u8 {
 
 pub const NamespaceHandler = struct {
     allocator: Allocator,
+    /// Names whose implicit create this leader proposed and has not yet
+    /// applied, so a burst of first writes proposes one. Cleared when this
+    /// node stops leading: an entry the log then drops is proposed again.
+    implicit_creates: std.StringHashMapUnmanaged(void) = .{},
+    /// The last applied create named a namespace that already existed (see
+    /// `Shard.answering_index`): two creates can both pass the handler's
+    /// check before either applies.
+    last_create_existed: bool = false,
+    implicit_failed: u64 = 0,
+    implicit_warn_ms: i64 = 0,
 
     /// In-memory namespace registry. Keys are owned copies of namespace names.
     /// Will be replaced by Controller Raft storage when wired.
@@ -227,6 +237,9 @@ pub const NamespaceHandler = struct {
     }
 
     pub fn deinit(self: *NamespaceHandler) void {
+        var ic = self.implicit_creates.keyIterator();
+        while (ic.next()) |k| self.allocator.free(k.*);
+        self.implicit_creates.deinit(self.allocator);
         var it = self.namespaces.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -264,19 +277,51 @@ pub const NamespaceHandler = struct {
             meta.data_count +|= 1; // saturating add
             return;
         }
-        // Implicit creation (e.g. "default" on the first bare-namespace
-        // write): a namespace_create entry, applied like an explicit one so
-        // it survives restart and reaches followers.
         if (shard) |s| {
-            _ = proposeNamespaceEntry(s, .namespace_create, effective, &.{}) catch |err| {
-                log.warn("namespace: implicit create of '{s}' not persisted: {s}; its writes are not metered until it is", .{ effective, @errorName(err) });
-                return;
-            };
-            _ = s.applyCommitted();
+            self.proposeImplicitCreate(effective, s, true);
         } else {
             self.applyCreate(effective);
+            if (self.namespaces.getPtr(effective)) |meta| meta.data_count = 1;
         }
-        if (self.namespaces.getPtr(effective)) |meta| meta.data_count = 1;
+    }
+
+    /// The value of a namespace_create proposed for a write that has
+    /// already applied (`counts_write`): its applier counts that write. An
+    /// explicit create, or one proposed ahead of its write, carries an
+    /// empty value.
+    const IMPLICIT_CREATE = "implicit";
+
+    /// Implicit creation (e.g. "default" on the first bare-namespace write):
+    /// a namespace_create entry, applied like an explicit one so it
+    /// survives restart and reaches followers. One in flight per name.
+    /// `counts_write`: the write that caused it has already applied and
+    /// its responder found no namespace to count against, so the create
+    /// counts it; a write that proposes the create ahead of its own entry
+    /// is counted by its responder.
+    pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard, counts_write: bool) void {
+        const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
+        if (self.namespaces.contains(effective) or self.implicit_creates.contains(effective)) return;
+        _ = proposeNamespaceEntry(s, .namespace_create, effective, if (counts_write) IMPLICIT_CREATE else "") catch |err| {
+            // Every write to the namespace tries again, so said once per
+            // interval rather than per write.
+            self.implicit_failed += 1;
+            const now = @import("stdx").time.milliTimestamp();
+            if (now - self.implicit_warn_ms >= 30_000) {
+                self.implicit_warn_ms = now;
+                log.warn("namespace: implicit create of '{s}' not persisted: {s} ({d} failed so far); its writes are not metered until it is", .{ effective, @errorName(err), self.implicit_failed });
+            }
+            return;
+        };
+        const owned = self.allocator.dupe(u8, effective) catch return;
+        self.implicit_creates.put(self.allocator, owned, {}) catch self.allocator.free(owned);
+    }
+
+    /// This node stopped leading: its implicit creates may have been
+    /// dropped with the log's tail.
+    pub fn forgetImplicitCreates(self: *NamespaceHandler) void {
+        var it = self.implicit_creates.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.implicit_creates.clearRetainingCapacity();
     }
 
     /// Check if a namespace has had data written to it.
@@ -402,24 +447,25 @@ pub const NamespaceHandler = struct {
             return;
         }
 
-        // Propose namespace_create entry through Raft → UAL (persists via segment writer)
-        _ = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch |err| {
+        const proposed = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
+        shard.park(conn, req, proposed, respondCreate);
+    }
 
-        if (!shard.applyCommitted()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
-
+    fn respondCreate(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        if (shard.namespace_handler.last_create_existed) {
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists");
             return;
         }
-
         // Also propagate to coordinator if wired (cluster metadata)
         if (shard.coordinator) |coord| {
-            _ = coord.proposeCreateNamespace(name, 32, 1) catch {};
+            _ = coord.proposeCreateNamespace(req.key, 32, 1) catch {};
             _ = coord.applyCommitted() catch {};
         }
-
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -450,17 +496,18 @@ pub const NamespaceHandler = struct {
         }
 
         // Propose namespace_delete entry through Raft → UAL (persists via segment writer)
-        _ = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch |err| {
+        const proposed = proposeNamespaceEntry(shard, .namespace_delete, name, &.{}) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
+        shard.park(conn, req, proposed, respondDelete);
+    }
 
-        if (!shard.applyCommitted()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
-
-            return;
-        }
-
+    fn respondDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const name = req.key;
+        const force = req.value.len > 0 and req.value[0] != 0;
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
             _ = coord.proposeDeleteNamespace(name) catch {};
@@ -506,23 +553,22 @@ pub const NamespaceHandler = struct {
         var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
         const settings_len = parsed.config.serializeSettings(&settings_buf);
 
-        _ = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch |err| {
+        const proposed = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
             return;
         };
+        shard.park(conn, req, proposed, respondConfigSet);
+    }
 
-        if (!shard.applyCommitted()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
-
-            return;
-        }
-
+    fn respondConfigSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
-            _ = coord.proposeUpdateNamespaceConfig(name, parsed.config) catch {};
+            const parsed = NamespaceConfig.deserializeSettings(req.value);
+            _ = coord.proposeUpdateNamespaceConfig(req.key, parsed.config) catch {};
             _ = coord.applyCommitted() catch {};
         }
-
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -532,14 +578,13 @@ pub const NamespaceHandler = struct {
     /// The entry uses CommandPayload format: key = namespace name, value = payload.
     /// Namespace entries use empty namespace ("") to get namespace_hash=0
     /// because namespaces are global, not scoped to a namespace.
-    /// The caller applies it through `Shard.applyCommitted()`.
     fn proposeNamespaceEntry(
         shard: *Shard,
         entry_type: entry_mod.EntryType,
         name: []const u8,
         value: []const u8,
-    ) !u64 {
-        return persistence_mod.persistEntry(shard, entry_type, entry_mod.Flags.NONE, "", name, value);
+    ) !persistence_mod.ProposeResult {
+        return persistence_mod.proposeEntry(shard, entry_type, entry_mod.Flags.NONE, "", name, value);
     }
 
     /// Register this handler's entry types with the ReplayRegistry.
@@ -557,13 +602,21 @@ pub const NamespaceHandler = struct {
     /// Replay a namespace UAL entry to rebuild in-memory state.
     /// Called during segment replay on startup and after Raft commit.
     pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry) void {
+        self.last_create_existed = false;
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
         const name = cmd.key;
         if (name.len == 0) return;
 
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
         switch (etype) {
-            .namespace_create => self.applyCreate(name),
+            .namespace_create => {
+                self.last_create_existed = self.namespaces.contains(name);
+                self.applyCreate(name);
+                if (std.mem.eql(u8, cmd.value, IMPLICIT_CREATE)) {
+                    if (self.namespaces.getPtr(name)) |meta| meta.data_count = @max(meta.data_count, 1);
+                }
+                if (self.implicit_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
+            },
             .namespace_delete => self.applyDelete(name),
             .namespace_config => {
                 if (cmd.value.len > 0) {
@@ -862,7 +915,7 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
         },
         .namespace_list => |n| {
             shard.sendOkResponse(conn, request_id, n.data);
@@ -884,21 +937,6 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled namespace response");
         },
     }
-}
-
-/// Map CommandResult.ErrorCode to wire StatusCode.
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .namespace_not_empty => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -17,9 +17,9 @@
 //! - List scans the `_action:` prefix in KV.
 //! - Delete removes the action.
 //!
-//! Durable via the shared persistence interface: write mutations go through
-//! Raft propose (persistence.persistEntry), and in-memory state is rebuilt
-//! from UAL segments on startup via the ReplayRegistry.
+//! Durable through the log: a write proposes an entry and parks its client
+//! until the entry applies; in-memory state is rebuilt from the same
+//! entries on startup via the ReplayRegistry.
 
 const std = @import("std");
 const log = @import("stdx").log;
@@ -74,6 +74,9 @@ pub const ActionsHandler = struct {
 
     /// Mutex protecting runs for cross-shard access.
     runs_mu: @import("stdx").Mutex = .{},
+    /// The run the last applied invoke created; a key of `runs` (see
+    /// `Shard.answering_index`).
+    last_invoked_run_id: ?[]const u8 = null,
 
     /// Monotonic counter used to produce unique run IDs when shard is null (tests).
     null_shard_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -154,7 +157,7 @@ pub const ActionsHandler = struct {
 
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.action_register, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_invoke, dispatchInvoke, preRouteByAction);
+        dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
@@ -187,44 +190,58 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.actions_handler.handleCommand(shard, req);
         defer shard.actions_handler.freeResult(result);
-        switch (result) {
-            .action_registered => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
-            else => {},
-        }
+        if (result == .parked) return shard.park(conn, req, result.parked, respondAction);
         sendActionResponse(shard, conn, req.header.request_id, result);
     }
 
-    /// Dedicated dispatch for action_invoke — notifies action_await waiters.
-    fn dispatchInvoke(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+    /// A parked action write applied: read the outcome back and answer.
+    fn respondAction(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const result = shard.actions_handler.handleCommand(shard, req);
-        defer shard.actions_handler.freeResult(result);
-
-        // After a successful invoke, notify any action_await waiters.
-        // Use notifyAny because waiter keys are compound (action_name + worker_id).
+        const h = shard.actions_handler;
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        var ver_buf: [12]u8 = undefined;
+        const result: CommandResult = blk: {
+            h.runs_mu.lock();
+            defer h.runs_mu.unlock();
+            break :blk switch (op) {
+                .action_register => h.registerOutcome(req.key, &ver_buf),
+                .action_invoke => h.invoked(),
+                .action_delete => .{ .action_deleted = {} },
+                else => .ok,
+            };
+        };
         switch (result) {
-            .action_invoked => {
-                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-                shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
-
-                // Broadcast to all other shards so their action_await waiters can
-                // try claiming this run. Workers may be connected to any shard.
-                if (shard.peer_inboxes) |inboxes| {
-                    for (inboxes, 0..) |inbox, i| {
-                        if (i == shard.id) continue;
-                        _ = inbox.send(.{
-                            .tag = .action_invoke,
-                            .src_shard = @intCast(shard.id),
-                        });
-                    }
-                }
-            },
+            .action_registered, .action_invoked => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
-
         sendActionResponse(shard, conn, req.header.request_id, result);
     }
+
+    /// A run exists for workers to take: wake this shard's action_await
+    /// waiters and tell the other shards, whose workers may take it. Run
+    /// once after an apply pass in which an invoke applied on the leader,
+    /// whoever proposed it.
+    pub fn wakeWorkers(shard: *Shard) void {
+        // Use notifyAny because waiter keys are compound (action_name + worker_id).
+        shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
+        if (shard.peer_inboxes) |inboxes| {
+            for (inboxes, 0..) |inbox, i| {
+                if (i == shard.id) continue;
+                _ = inbox.send(.{
+                    .tag = .action_invoke,
+                    .src_shard = @intCast(shard.id),
+                });
+            }
+        }
+    }
+
+    /// Why a task command was refused, with the status the worker is told.
+    const TaskError = struct { status: proto.StatusCode, message: []const u8 };
+
+    /// What a task command did: refused, proposed (the worker parks on
+    /// it), or applied here without a shard.
+    const TaskOutcome = union(enum) { refused: TaskError, parked: persistence.ProposeResult, applied };
 
     /// Dispatch for action_complete, action_fail, action_touch opcodes.
     fn dispatchActionTaskCmd(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -232,34 +249,17 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @enumFromInt(req.header.op_code);
         switch (op) {
-            .action_complete => {
-                const err_msg = shard.actions_handler.handleActionComplete(shard, req);
-                if (err_msg) |msg| {
-                    shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
-                } else {
-                    // Update worker stats on the shard that owns the worker registration
-                    const action_name = parseLeadingName(req.value);
-                    const ws = resolveWorkerShard(shard, req.namespace, req.key);
-                    ws.worker_handler.recordCompletion(req.key, action_name);
-                    shard.sendOkResponse(conn, req.header.request_id, "");
-                }
-            },
-            .action_fail => {
-                const err_msg = shard.actions_handler.handleActionFail(shard, req);
-                if (err_msg) |msg| {
-                    shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
-                } else {
-                    // Update worker stats on the shard that owns the worker registration
-                    const action_name = parseLeadingName(req.value);
-                    const ws = resolveWorkerShard(shard, req.namespace, req.key);
-                    ws.worker_handler.recordFailure(req.key, action_name);
-                    shard.sendOkResponse(conn, req.header.request_id, "");
+            .action_complete, .action_fail => {
+                const outcome = if (op == .action_complete) shard.actions_handler.handleActionComplete(shard, req) else shard.actions_handler.handleActionFail(shard, req);
+                switch (outcome) {
+                    .refused => |e| shard.sendErrorResponse(conn, req.header.request_id, e.status, e.message),
+                    .parked => |proposed| shard.park(conn, req, proposed, respondTask),
+                    .applied => respondTask(shard_ptr, conn_ptr, req),
                 }
             },
             .action_touch => {
-                const err_msg = shard.actions_handler.handleActionTouch(req);
-                if (err_msg) |msg| {
-                    shard.sendErrorResponse(conn, req.header.request_id, .not_found, msg);
+                if (shard.actions_handler.handleActionTouch(req)) |e| {
+                    shard.sendErrorResponse(conn, req.header.request_id, e.status, e.message);
                 } else {
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 }
@@ -268,6 +268,18 @@ pub const ActionsHandler = struct {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown action task opcode");
             },
         }
+    }
+
+    /// The run update applied: the worker's stats on the shard that owns
+    /// its registration, then ok.
+    fn respondTask(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        const action_name = parseLeadingName(req.value);
+        const ws = resolveWorkerShard(shard, req.namespace, req.key);
+        if (op == .action_complete) ws.worker_handler.recordCompletion(req.key, action_name) else ws.worker_handler.recordFailure(req.key, action_name);
+        shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
     /// Extract the leading [name_len:u16][name] from a value buffer.
@@ -510,17 +522,13 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "action limit reached" } };
         }
 
-        // Version bump if re-registering
-        const version: u32 = if (self.actions.get(name)) |old| old.version + 1 else 1;
-
         // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
-        const meta = parseRegisterValue(req.value);
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
 
         // The applier stores the record from the entry; the same applier runs
         // on restart and on followers.
         var value_buf: [65536]u8 = undefined;
-        const value = encodeRegisterValue(&value_buf, version, now_ns, meta.action_type, req.value) orelse {
+        const value = encodeRegisterValue(&value_buf, now_ns, req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "action definition too large" } };
         };
         var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -528,21 +536,23 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
         };
         if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch |err| {
+            const proposed = persistence.proposeEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch |err| {
                 return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
             };
-            if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action not applied" } };
-        } else {
-            self.replayRegister(qkey, value);
+            return .{ .parked = proposed };
         }
-        if (!self.actions.contains(name)) {
-            return .{ .err = .{ .code = .internal_error, .message = "action store failed" } };
-        }
-
-        // Version string
+        self.replayRegister(qkey, value);
         var ver_buf: [12]u8 = undefined;
-        const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{version}) catch "1";
+        return self.registerOutcome(name, &ver_buf);
+    }
 
+    /// The register applied: the stored version is the answer. `ver_buf`
+    /// is the caller's, since the result points into it.
+    fn registerOutcome(self: *ActionsHandler, name: []const u8, ver_buf: *[12]u8) CommandResult {
+        const stored = self.actions.get(name) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+        };
+        const ver_str = std.fmt.bufPrint(ver_buf, "{d}", .{stored.version}) catch "1";
         return .{
             .action_registered = .{
                 .name = name, // req-owned, same lifetime as request
@@ -590,21 +600,26 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         };
         if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch |err| {
+            const proposed = persistence.proposeEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch |err| {
                 return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
             };
-            if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action run not applied" } };
-        } else {
-            self.replayInvoke(run_id_str, value);
+            return .{ .parked = proposed };
         }
-        const stored = self.runs.getPtr(run_id_str) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "run store failed" } };
-        };
-        const owned_run_id = stored.run_id_owned;
+        self.replayInvoke(run_id_str, value);
+        return self.invoked();
+    }
 
+    /// The invoke applied: the run it created was the last one.
+    fn invoked(self: *ActionsHandler) CommandResult {
+        const run_id = self.last_invoked_run_id orelse {
+            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+        };
+        const stored = self.runs.getPtr(run_id) orelse {
+            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+        };
         return .{
             .action_invoked = .{
-                .run_id = owned_run_id, // points to heap-owned copy in runs map
+                .run_id = stored.run_id_owned, // points to heap-owned copy in runs map
                 .queue_position = @intCast(self.runs.count()),
             },
         };
@@ -806,13 +821,12 @@ pub const ActionsHandler = struct {
                 return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
             };
             if (shard) |s| {
-                _ = persistence.persistEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch |err| {
+                const proposed = persistence.proposeEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch |err| {
                     return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
                 };
-                if (!s.applyCommitted()) return .{ .err = .{ .code = .internal_error, .message = "action delete not applied" } };
-            } else {
-                self.replayDelete(qkey);
+                return .{ .parked = proposed };
             }
+            self.replayDelete(qkey);
             return .{ .action_deleted = {} };
         }
 
@@ -835,7 +849,7 @@ pub const ActionsHandler = struct {
     /// Complete a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
     ///         [outcome_len:u16][outcome][result_len:u16][result]
-    fn handleActionComplete(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
+    fn handleActionComplete(self: *ActionsHandler, shard: ?*Shard, req: Request) TaskOutcome {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
 
@@ -843,23 +857,23 @@ pub const ActionsHandler = struct {
         var offset: usize = 0;
 
         // Parse action_name (skip it — we use task_id to find the run)
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
-        if (offset + tid_len > value.len) return "invalid value format";
+        if (offset + tid_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const task_id = value[offset .. offset + tid_len];
         offset += tid_len;
 
         // Parse outcome
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const outcome_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
-        if (offset + outcome_len > value.len) return "invalid value format";
+        if (offset + outcome_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const outcome_str = value[offset .. offset + outcome_len];
         offset += outcome_len;
 
@@ -874,7 +888,7 @@ pub const ActionsHandler = struct {
         }
 
         // The applier updates the run from the entry.
-        const run = self.runs.get(task_id) orelse return "run not found";
+        const run = self.runs.get(task_id) orelse return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
         const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
         return self.applyRunUpdate(shard, req.namespace, task_id, .{
             .status = .completed,
@@ -889,7 +903,7 @@ pub const ActionsHandler = struct {
 
     /// Touch (extend lease on) a running task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
-    fn handleActionTouch(self: *ActionsHandler, req: Request) ?[]const u8 {
+    fn handleActionTouch(self: *ActionsHandler, req: Request) ?TaskError {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
 
@@ -897,15 +911,15 @@ pub const ActionsHandler = struct {
         var offset: usize = 0;
 
         // Parse action_name (skip)
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
         const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
         const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
-        if (offset + tid_len > value.len) return "invalid value format";
+        if (offset + tid_len > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
         const task_id = value[offset .. offset + tid_len];
 
         // Find and touch the run — reset started_at to extend the lease
@@ -914,14 +928,14 @@ pub const ActionsHandler = struct {
                 run.started_at_ms = @import("stdx").time.milliTimestamp();
                 return null; // success
             }
-            return "run not in running state";
+            return .{ .status = .conflict, .message = "run not in running state" };
         }
-        return "run not found";
+        return .{ .status = .not_found, .message = "run not found" };
     }
 
     /// Fail a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
-    fn handleActionFail(self: *ActionsHandler, shard: ?*Shard, req: Request) ?[]const u8 {
+    fn handleActionFail(self: *ActionsHandler, shard: ?*Shard, req: Request) TaskOutcome {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
 
@@ -929,20 +943,20 @@ pub const ActionsHandler = struct {
         var offset: usize = 0;
 
         // Parse action_name (skip)
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
-        if (offset + 2 > value.len) return "invalid value format";
+        if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
-        if (offset + tid_len > value.len) return "invalid value format";
+        if (offset + tid_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const task_id = value[offset .. offset + tid_len];
         offset += tid_len;
 
         // Parse retry flag
-        if (offset >= value.len) return "invalid value format";
+        if (offset >= value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const retry = value[offset] == 1;
         offset += 1;
 
@@ -950,7 +964,7 @@ pub const ActionsHandler = struct {
         const error_message = if (offset < value.len) value[offset..] else "";
 
         // The applier updates the run from the entry.
-        const run = self.runs.get(task_id) orelse return "run not found";
+        const run = self.runs.get(task_id) orelse return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
         const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
         if (retry and run.attempt < run.max_retries) {
             // Back to pending for another attempt (within the limit).
@@ -1049,62 +1063,51 @@ pub const ActionsHandler = struct {
         outcome: ?[]const u8 = null,
     };
 
-    /// Invoke an action programmatically (used by WorkflowHandler).
-    /// Returns the action run_id string (heap-owned, stored in runs map).
-    /// Returns null if the action doesn't exist or on allocation failure.
-    /// For user-hosted actions the `shard` is used to notify blocked
-    /// action_await waiters so external workers can claim the run.
-    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
+    /// An invoke a workflow proposed: the run's id and the entry's index.
+    pub const Invoked = struct { id: []const u8, index: u64 };
+
+    /// Invoke an action programmatically (used by WorkflowHandler): the
+    /// invoke is proposed and the run exists once it applies. The id is
+    /// written into `id_buf`; null if the action doesn't exist or the
+    /// invoke could not be proposed.
+    pub fn invokeByName(self: *ActionsHandler, shard: *Shard, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) ?Invoked {
         // Check action exists
         if (!self.actions.contains(action_name)) return null;
 
         // Generate run ID with embedded partition bits
         const partition_id = shard.router.keyToPartitionNs("default", action_name);
-        var run_id_buf: [32]u8 = undefined;
-        const run_id_str = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch return null;
+        const run_id_str = shard.run_id_gen.next(.action, partition_id, id_buf) catch return null;
 
         // The applier creates the run from the entry, exactly as a client
         // invoke does; the caller fields mark it as workflow-driven.
-        const owned_run_id = self.startRun(shard, "default", run_id_str, action_name, input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
-
-        // Wake any workers waiting for this action
-        shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
-
-        return owned_run_id;
-    }
-
-    /// Create a run through the one applier: encode the invoke entry, persist
-    /// it, apply it. Returns the stored run id (heap-owned by the runs map).
-    pub fn startRun(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         var value_buf: [65536]u8 = undefined;
-        const value = encodeInvokeValue(&value_buf, action_name, @import("stdx").time.milliTimestamp(), input, labels, caller_run_id, caller_workflow_name) orelse return null;
-        return self.startRunEncoded(shard, namespace, run_id, value);
+        const value = encodeInvokeValue(&value_buf, action_name, @import("stdx").time.milliTimestamp(), input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
+        const index = proposeInvoke(shard, "default", run_id_str, value) orelse return null;
+        return .{ .id = run_id_str, .index = index };
     }
 
-    fn startRunEncoded(self: *ActionsHandler, shard: *Shard, namespace: []const u8, run_id: []const u8, value: []const u8) ?[]const u8 {
-        // Other shard threads read the runs map under runs_mu, so the apply
-        // that inserts the run must happen under it too.
-        self.runs_mu.lock();
-        defer self.runs_mu.unlock();
-        _ = persistence.persistEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value) catch return null;
-        if (!shard.applyCommitted()) return null;
-        const stored = self.runs.getPtr(run_id) orelse return null;
-        return stored.run_id_owned;
+    /// Propose an invoke; the applier creates the run and wakes the
+    /// workers waiting for it. Nothing waits for the commit: a caller that
+    /// needs the run finds it once it applies.
+    fn proposeInvoke(shard: *Shard, namespace: []const u8, run_id: []const u8, value: []const u8) ?u64 {
+        const proposed = persistence.proposeEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value) catch |err| {
+            log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
+            return null;
+        };
+        return proposed.index;
     }
 
     /// A workflow on another shard asked this shard to start a run it will
-    /// park on: `[run_id_len:u16][run_id][invoke value]`, created here on the
-    /// owning thread through the same applier as a local invoke.
-    pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
+    /// park on: `[run_id_len:u16][run_id][invoke value]`. Proposed here, on
+    /// the owning thread; the run exists once the invoke applies.
+    pub fn startRunFromInbox(_: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
         if (bytes.len < 2) return;
         const rid_len = std.mem.readInt(u16, bytes[0..2], .little);
         if (2 + rid_len > bytes.len) return;
         const run_id = bytes[2 .. 2 + rid_len];
-        if (self.startRunEncoded(shard, "default", run_id, bytes[2 + rid_len ..]) == null) {
+        if (proposeInvoke(shard, "default", run_id, bytes[2 + rid_len ..]) == null) {
             log.err("shard {d}: action run {s} asked for by a workflow on another shard could not be started; that workflow run stays parked", .{ shard.id, run_id });
-            return;
         }
-        shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
     }
 
     /// Encode the inbox payload `startRunFromInbox` consumes. Heap-allocated
@@ -1129,18 +1132,19 @@ pub const ActionsHandler = struct {
         error_message: []const u8,
     };
 
-    /// Encode a run update, persist it and apply it. Returns null on success
-    /// or the message for the client.
-    fn applyRunUpdate(self: *ActionsHandler, shard: ?*Shard, namespace: []const u8, run_id: []const u8, u: RunUpdate) ?[]const u8 {
+    /// Encode a run update and propose it (or, without a shard, apply it).
+    fn applyRunUpdate(self: *ActionsHandler, shard: ?*Shard, namespace: []const u8, run_id: []const u8, u: RunUpdate) TaskOutcome {
         var value_buf: [65536]u8 = undefined;
-        const value = encodeRunUpdateValue(&value_buf, u) orelse return "run update too large";
-        if (shard) |s| {
-            _ = persistence.persistEntry(s, .action_update_run, Flags.NONE, namespace, run_id, value) catch |err| return persistence.failureMessage(err, "run update not persisted");
-            if (!s.applyCommitted()) return "run update not applied";
-        } else {
+        const value = encodeRunUpdateValue(&value_buf, u) orelse return .{ .refused = .{ .status = .bad_request, .message = "run update too large" } };
+        const s = shard orelse {
             self.replayUpdateRun(run_id, value);
-        }
-        return null;
+            return .applied;
+        };
+        // Proposed, not waited for: the dispatcher parks the worker on it.
+        const proposed = persistence.proposeEntry(s, .action_update_run, Flags.NONE, namespace, run_id, value) catch |err| {
+            return .{ .refused = .{ .status = persistence.failureStatus(err), .message = persistence.failureMessage(err, "run update not persisted") } };
+        };
+        return .{ .parked = proposed };
     }
 
     /// Check the status and result of an action run.
@@ -1158,16 +1162,16 @@ pub const ActionsHandler = struct {
     // Entry encoders — the layouts the appliers decode
     // ═══════════════════════════════════════════════════════════════════
 
-    /// Register entry value: [version:u32][created_at_ns:u64][action_type:u8][original_value...]
-    fn encodeRegisterValue(value_buf: []u8, version: u32, created_at_ns: u64, action_type: ActionType, req_value: []const u8) ?[]const u8 {
-        if (4 + 8 + 1 + req_value.len > value_buf.len) return null;
-        std.mem.writeInt(u32, value_buf[0..4], version, .little);
-        std.mem.writeInt(u64, value_buf[4..12], created_at_ns, .little);
-        value_buf[12] = @intFromEnum(action_type);
+    /// Register entry value: [created_at_ns:u64][original_value...]. The
+    /// version is the applier's to number, in log order: two registers
+    /// can both be proposed before either applies.
+    fn encodeRegisterValue(value_buf: []u8, created_at_ns: u64, req_value: []const u8) ?[]const u8 {
+        if (8 + req_value.len > value_buf.len) return null;
+        std.mem.writeInt(u64, value_buf[0..8], created_at_ns, .little);
         if (req_value.len > 0) {
-            @memcpy(value_buf[13 .. 13 + req_value.len], req_value);
+            @memcpy(value_buf[8 .. 8 + req_value.len], req_value);
         }
-        return value_buf[0 .. 13 + req_value.len];
+        return value_buf[0 .. 8 + req_value.len];
     }
 
     fn putLenPrefixed(buf: []u8, off: *usize, comptime L: type, bytes: []const u8) bool {
@@ -1252,6 +1256,12 @@ pub const ActionsHandler = struct {
     /// Dispatch a replayed entry to the appropriate replay handler.
     pub fn replayEntry(self: *ActionsHandler, e: *const Entry) void {
         const etype: EntryType = @enumFromInt(e.header.entry_type);
+        // Workflows on other shard threads read the runs map under this
+        // lock. Nothing holds it across an apply, so taking it here cannot
+        // nest.
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+        if (etype == .action_invoke) self.last_invoked_run_id = null;
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
         switch (etype) {
             .action_register => self.replayRegister(cmd.key, cmd.value),
@@ -1265,7 +1275,7 @@ pub const ActionsHandler = struct {
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
     fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8) void {
-        if (value.len < 13) return; // need version(4) + created_at_ns(8) + action_type(1)
+        if (value.len < 8) return;
 
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
@@ -1275,12 +1285,11 @@ pub const ActionsHandler = struct {
             name = key[sep + 1 ..];
         }
 
-        const version = std.mem.readInt(u32, value[0..4], .little);
-        const created_at_ns = std.mem.readInt(u64, value[4..12], .little);
-        // The original register wire value was appended after the 13-byte
-        // header (see encodeRegisterValue), so owner/timeout_ms/max_retries replay
-        // from there — previously they were dropped (record reset to defaults).
-        const meta = parseRegisterValue(value[13..]);
+        const version: u32 = if (self.actions.get(name)) |old| old.version + 1 else 1;
+        const created_at_ns = std.mem.readInt(u64, value[0..8], .little);
+        // The client's register value follows, so owner, timeout and
+        // retries replay from it.
+        const meta = parseRegisterValue(value[8..]);
 
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(name)) |old| {
@@ -1427,6 +1436,7 @@ pub const ActionsHandler = struct {
             if (caller_run_id) |c| self.allocator.free(c);
             if (caller_workflow_name) |c| self.allocator.free(c);
         };
+        self.last_invoked_run_id = owned_run_id;
     }
 
     fn freeRun(self: *ActionsHandler, run: RunRecord) void {
@@ -1835,7 +1845,7 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, errorCodeToStatus(e.code), e.message);
+            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
         },
         .action_registered => |r| {
             shard.sendOkResponse(conn, request_id, r.name);
@@ -1904,20 +1914,6 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled action response");
         },
     }
-}
-
-/// Map CommandResult.ErrorCode to wire StatusCode.
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2193,7 +2189,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     defer h.deinit();
 
     var reg_buf: [256]u8 = undefined;
-    const reg = ActionsHandler.encodeRegisterValue(&reg_buf, 1, 1, .user, "") orelse return error.EncodeFailed;
+    const reg = ActionsHandler.encodeRegisterValue(&reg_buf, 1, "") orelse return error.EncodeFailed;
     h.replayRegister("default\x00echo", reg);
 
     var inv_buf: [512]u8 = undefined;
@@ -2213,7 +2209,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
         .worker_id = "w-1",
         .outcome = "",
         .error_message = "boom",
-    }) == null);
+    }) == .applied);
     const failed = h.runs.get("act-1") orelse return error.RunMissing;
     try std.testing.expectEqual(ActionRunStatus.failed, failed.status);
     try std.testing.expectEqualStrings("boom", failed.error_owned.?);
@@ -2227,7 +2223,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
         .worker_id = "w-2",
         .outcome = "success",
         .error_message = "",
-    }) == null);
+    }) == .applied);
     const done = h.runs.get("act-1") orelse return error.RunMissing;
     try std.testing.expectEqual(ActionRunStatus.completed, done.status);
     try std.testing.expectEqualStrings("success", done.outcome_owned.?);

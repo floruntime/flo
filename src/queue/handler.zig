@@ -131,23 +131,44 @@ pub const QueueHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
+        if (result == .parked) return shard.park(conn, req, result.parked, respondQueue);
         sendQueueResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// A parked queue write applied: read the outcome back and answer.
+    fn respondQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        switch (op) {
+            .queue_enqueue => {
+                // Dequeue waiters are woken by the applier on every node; the
+                // write is counted against its namespace where the client is answered.
+                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+                var id_buf: [20]u8 = undefined;
+                sendQueueResponse(shard, conn, req.header.request_id, shard.queue_handler.respondEnqueue(&id_buf));
+            },
+            .queue_purge => sendQueueResponse(shard, conn, req.header.request_id, .{ .queue_purged = .{ .count = @intCast(@min(shard.queue_handler.queue.last_purge_count, std.math.maxInt(u32))) } }),
+            else => sendQueueResponse(shard, conn, req.header.request_id, .ok),
+        }
     }
 
     /// Dedicated dispatch for queue_enqueue — notifies blocking dequeue waiters.
     fn dispatchEnqueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        // The applier labels the queue by resolving its namespace, on
+        // followers and on replay, so a namespace nobody created is created
+        // first. Here, on the owning thread: a pipeline's queue sink reaches
+        // `handleCommand` from another shard's.
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
-
-        // Dequeue waiters are woken by the applier; the namespace bookkeeping
-        // is a producer decision and stays here.
+        if (result == .parked) return shard.park(conn, req, result.parked, respondQueue);
         switch (result) {
             .queue_enqueued => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
-
         sendQueueResponse(shard, conn, req.header.request_id, result);
     }
 
@@ -282,12 +303,10 @@ pub const QueueHandler = struct {
         // applies a locally built entry.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "enqueue not persisted") } };
             };
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "enqueue not applied" } };
-            }
+            return .{ .parked = proposed };
         } else {
             const next_index = self.partition.ual.max_index + 1;
             const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
@@ -317,13 +336,14 @@ pub const QueueHandler = struct {
             };
         }
 
-        // Seq was assigned by the projection during apply
-        const seq = self.queue.next_seq - 1;
-
-        // Return message ID as the sequence number string
         var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{seq}) catch "0";
+        return self.respondEnqueue(&id_buf);
+    }
 
+    /// The enqueue applied: answer with the sequence its applier recorded.
+    pub fn respondEnqueue(self: *QueueHandler, id_buf: *[20]u8) CommandResult {
+        const seq = self.queue.last_enqueued_seq orelse return .{ .err = .{ .code = .internal_error, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
+        const id_str = std.fmt.bufPrint(id_buf, "{d}", .{seq}) catch "0";
         return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
@@ -396,13 +416,10 @@ pub const QueueHandler = struct {
         std.mem.writeInt(u64, &seq_key, seq, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ack not persisted") } };
             };
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "ack not applied" } };
-            }
-            return .ok;
+            return .{ .parked = proposed };
         }
 
         // No shard (unit tests): apply a locally built entry.
@@ -450,13 +467,10 @@ pub const QueueHandler = struct {
         std.mem.writeInt(u64, &seq_key, seq, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "nack not persisted") } };
             };
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "nack not applied" } };
-            }
-            return .ok;
+            return .{ .parked = proposed };
         }
 
         // No shard (unit tests): apply a locally built entry.
@@ -565,20 +579,16 @@ pub const QueueHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const q_name_hash = router.nameHash(ns_hash, req.key);
 
-        // Count what we're about to remove for the response (single-threaded shard).
-        const count: u32 = @intCast(@min(self.queue.countQueue(q_name_hash), std.math.maxInt(u32)));
-
-        // Persist through Raft; the applier purges the projection.
+        // The applier purges the projection and records what it removed;
+        // the responder answers from that.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "purge not persisted") } };
             };
-            if (!shard.applyCommitted()) {
-                return .{ .err = .{ .code = .internal_error, .message = "purge not applied" } };
-            }
-            return .{ .queue_purged = .{ .count = count } };
+            return .{ .parked = proposed };
         }
+        const count: u32 = @intCast(@min(self.queue.countQueue(q_name_hash), std.math.maxInt(u32)));
 
         // No shard (unit tests): apply a locally built entry.
         const next_index = self.partition.ual.max_index + 1;
@@ -713,10 +723,9 @@ pub const QueueHandler = struct {
         // the operator must hear about.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
                 log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
             };
-            _ = shard.applyCommitted();
             return;
         }
 
@@ -763,7 +772,7 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            const status = errorCodeToStatus(e.code);
+            const status = e.code.toStatus();
             shard.sendErrorResponse(conn, request_id, status, e.message);
         },
         .queue_enqueued => |q| {
@@ -794,21 +803,6 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled queue response");
         },
     }
-}
-
-/// Map CommandResult.ErrorCode to wire StatusCode.
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        .conflict => .conflict,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
