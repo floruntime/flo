@@ -67,11 +67,31 @@ var global_stream_trigger_count: std.atomic.Value(u32) = std.atomic.Value(u32).i
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const WorkflowHandler = struct {
+    /// A run waiting for its first step: its "namespace:run_id" key and the
+    /// log index of its start.
+    const Started = struct { ns_key: []u8, index: u64 };
+
     allocator: Allocator,
 
     /// Mutex for cross-shard thread safety. Acquired when this handler is
     /// accessed from a different shard's thread via forwardToShard dispatch.
     mu: @import("stdx").Mutex,
+    /// The run the last applied start created; a key of `runs` (see
+    /// `Shard.answering_index`).
+    last_started_key: ?[]const u8 = null,
+    /// The last applied start named a run that already existed under its
+    /// idempotency key; `last_started_key` is that run.
+    last_start_existed: bool = false,
+    /// The last applied start named a run id that already existed.
+    last_start_collided: bool = false,
+    /// Runs started on this leader, in the order they were queued (not log
+    /// order: a client's start is queued once it applies, a producer's when
+    /// it is proposed), for the tick to take
+    /// their first step once the start has applied (`advanceStartedRuns`).
+    /// No start takes its first step where it is proposed or answered: a
+    /// step proposes, and the shard applies nothing in the middle of a
+    /// module's work.
+    started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
 
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
@@ -79,6 +99,11 @@ pub const WorkflowHandler = struct {
 
     /// In-memory run store: "namespace:run_id" → RunRecord.
     runs: std.StringHashMap(RunRecord),
+
+    /// (namespace, workflow, idempotency key) → the key in `runs` of the
+    /// run that key started (see `idemKey`). Kept by the start applier, so every node
+    /// and every replay decides duplicates alike, without a scan.
+    idem_index: std.StringHashMapUnmanaged([]const u8) = .{},
 
     /// Disabled workflows: "namespace:name" → void.
     disabled: std.StringHashMap(void),
@@ -194,6 +219,13 @@ pub const WorkflowHandler = struct {
         /// Shard ID where the pending child workflow run lives (cross-shard lookup).
         pending_child_shard_id: ?u16 = null,
 
+        /// The index, in this shard's log, of the entry that creates the
+        /// action or child run this run waits for; 0 when that run is
+        /// created on another shard. Once this shard has applied that index
+        /// and the run does not exist, the log dropped it (a leadership lost
+        /// before commit) and the step fails rather than waiting for ever.
+        pending_index: u64 = 0,
+
         /// Number of poll attempts taken for the current step (a `poll:` step that
         /// keeps returning `pending`). Reset on step transition.
         poll_attempt: u32 = 0,
@@ -293,6 +325,11 @@ pub const WorkflowHandler = struct {
             self.freeRunRecord(entry.value_ptr);
         }
         self.runs.deinit();
+        var ik = self.idem_index.keyIterator();
+        while (ik.next()) |k| self.allocator.free(k.*);
+        self.idem_index.deinit(self.allocator);
+        for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
+        self.started_to_advance.deinit(self.allocator);
 
         // Free disabled keys (ns-qualified)
         var diit = self.disabled.iterator();
@@ -438,23 +475,37 @@ pub const WorkflowHandler = struct {
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        // Parked outside the handler's lock: on a single node the responder
+        // runs straight away and takes the lock itself.
+        if (shard.workflow_handler.handleCommand(shard, conn, req)) |proposed| shard.park(conn, req, proposed, respondWorkflow);
+    }
+
+    /// A parked create or start applied: answer, and for a start, begin.
+    fn respondWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const h = shard.workflow_handler;
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        h.mu.lock();
+        defer h.mu.unlock();
         const op: OpCode = @enumFromInt(req.header.op_code);
-        shard.workflow_handler.handleCommand(shard, conn, req);
-        if (op == .workflow_create or op == .workflow_start) {
-            shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        switch (op) {
+            .workflow_create => h.respondCreate(shard, conn, req),
+            .workflow_start => h.respondStart(shard, conn, req),
+            else => shard.sendOkResponse(conn, req.header.request_id, ""),
         }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+    /// Answers the client, or returns the write the client is parked on.
+    pub fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         self.mu.lock();
         defer self.mu.unlock();
-
         const op: OpCode = @enumFromInt(req.header.op_code);
         switch (op) {
-            .workflow_create => self.handleCreate(shard, conn, req),
-            .workflow_start => self.handleStart(shard, conn, req),
+            .workflow_create => return self.handleCreate(shard, conn, req),
+            .workflow_start => return self.handleStart(shard, conn, req),
             .workflow_signal => self.handleSignal(shard, conn, req),
             .workflow_cancel => self.handleCancel(shard, conn, req),
             .workflow_status => self.handleStatus(shard, conn, req),
@@ -468,29 +519,42 @@ pub const WorkflowHandler = struct {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown workflow opcode");
             },
         }
+        return null;
     }
 
     // ── CREATE ──────────────────────────────────────────────────────────
 
-    fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+    /// Runs and definitions are keyed "namespace:name", and every node
+    /// reads the namespace back up to the first ':'. Checked where a
+    /// definition is created and a client starts a run: every producer's
+    /// start comes from a definition.
+    fn keyableNamespace(namespace: []const u8) bool {
+        return std.mem.indexOfAny(u8, namespace, ":\x00") == null;
+    }
+
+    fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const yaml = req.value;
+        if (!keyableNamespace(req.namespace)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
+            return null;
+        }
 
         if (yaml.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow definition is required");
-            return;
+            return null;
         }
 
         // Parse the YAML/JSON definition
         var def = parser.parseWorkflow(self.allocator, yaml) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid workflow definition");
-            return;
+            return null;
         };
         defer def.deinit(self.allocator);
 
         // Validate the definition
         var validation = validator.validateWorkflow(self.allocator, &def) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "validation failed");
-            return;
+            return null;
         };
         defer validation.deinit();
 
@@ -501,7 +565,7 @@ pub const WorkflowHandler = struct {
             } else {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow validation failed");
             }
-            return;
+            return null;
         }
 
         // Workflow name must be sent as req.key by all callers (CLI extracts
@@ -509,28 +573,30 @@ pub const WorkflowHandler = struct {
         // parsed definition to catch mismatches early.
         if (req.key.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required as key");
-            return;
+            return null;
         }
         const name = req.key;
 
         // The applier stores the definition and (re)registers its trigger
         // and schedule from the entry; the same applier runs at boot, so a
         // restart keeps them too.
-        self.persistCreate(shard, req.namespace, name, yaml) catch |err| {
+        const proposed = self.proposeCreate(shard, req.namespace, name, yaml) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "workflow not persisted"));
-            return;
+            return null;
         };
-        if (!shard.applyCommitted()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "workflow not applied");
-            return;
-        }
+        return proposed;
+    }
+
+    /// The create applied: the definition is stored under its key.
+    fn respondCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+        const name = req.key;
         const ns_key = self.makeNsKey(req.namespace, name) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
             return;
         };
         defer self.allocator.free(ns_key);
         if (!self.definitions.contains(ns_key)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "definition store failed");
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
             return;
         }
 
@@ -539,31 +605,35 @@ pub const WorkflowHandler = struct {
 
     // ── START ───────────────────────────────────────────────────────────
 
-    fn handleStart(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+    fn handleStart(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const workflow_name = req.key;
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return;
+            return null;
+        }
+        if (!keyableNamespace(req.namespace)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
+            return null;
         }
 
         // Build namespace-qualified key for definition/disabled lookups
         const def_ns_key = self.makeNsKey(req.namespace, workflow_name) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+            return null;
         };
         defer self.allocator.free(def_ns_key);
 
         // Check workflow exists
         if (!self.definitions.contains(def_ns_key)) {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
-            return;
+            return null;
         }
 
         // Check workflow is not disabled
         if (self.disabled.contains(def_ns_key)) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow is disabled");
-            return;
+            return null;
         }
 
         // Parse the value: [ver_len:u16][ver][has_idem:u8][key_len:u16]?[key]?[has_rid:u8][rid_len:u16]?[rid]?[input...]
@@ -579,13 +649,13 @@ pub const WorkflowHandler = struct {
             // Read version
             if (offset + 2 > value.len) {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                return;
+                return null;
             }
             const ver_len = std.mem.readInt(u16, value[offset..][0..2], .little);
             offset += 2;
             if (offset + ver_len > value.len) {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                return;
+                return null;
             }
             if (ver_len > 0) {
                 version = value[offset .. offset + ver_len];
@@ -599,13 +669,13 @@ pub const WorkflowHandler = struct {
                 if (has_idem == 1) {
                     if (offset + 2 > value.len) {
                         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                        return;
+                        return null;
                     }
                     const key_len = std.mem.readInt(u16, value[offset..][0..2], .little);
                     offset += 2;
                     if (offset + key_len > value.len) {
                         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                        return;
+                        return null;
                     }
                     idempotency_key = value[offset .. offset + key_len];
                     offset += key_len;
@@ -619,13 +689,13 @@ pub const WorkflowHandler = struct {
                 if (has_rid == 1) {
                     if (offset + 2 > value.len) {
                         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                        return;
+                        return null;
                     }
                     const rid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
                     offset += 2;
                     if (offset + rid_len > value.len) {
                         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed start request");
-                        return;
+                        return null;
                     }
                     explicit_run_id = value[offset .. offset + rid_len];
                     offset += rid_len;
@@ -643,25 +713,18 @@ pub const WorkflowHandler = struct {
             if (self.definitions.get(def_ns_key)) |def_rec| {
                 if (def_rec.idempotency == .required) {
                     shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "idempotency key is required for this workflow");
-                    return;
+                    return null;
                 }
             }
         }
 
-        // If idempotency key is provided, check for duplicate
+        // A key that already started a run answers with it. A start that
+        // passes this while another with its key is uncommitted is decided
+        // by the applier.
         if (idempotency_key) |idem_key| {
-            var rit = self.runs.iterator();
-            while (rit.next()) |entry| {
-                const run = entry.value_ptr;
-                if (run.idempotency_key_owned) |existing_key| {
-                    if (std.mem.eql(u8, existing_key, idem_key) and
-                        std.mem.eql(u8, run.workflow_name_owned, workflow_name))
-                    {
-                        // Return existing run_id (idempotent)
-                        shard.sendOkResponse(conn, req.header.request_id, run.run_id_owned);
-                        return;
-                    }
-                }
+            if (self.runForIdempotencyKey(req.namespace, workflow_name, idem_key)) |existing| {
+                shard.sendOkResponse(conn, req.header.request_id, existing.run_id_owned);
+                return null;
             }
         }
 
@@ -679,31 +742,143 @@ pub const WorkflowHandler = struct {
         // Build namespace-qualified key for the runs map
         const run_ns_key = self.makeNsKey(req.namespace, run_id_str) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+            return null;
         };
 
         // Guard against ID collision (e.g. replayed entry with same key)
         if (self.runs.contains(run_ns_key)) {
             self.allocator.free(run_ns_key);
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run_id collision");
-            return;
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "run id already exists");
+            return null;
         }
         self.allocator.free(run_ns_key);
 
         // The applier creates the run from the entry.
-        const stored_key = self.startRunThroughLog(shard, req.namespace, run_id_str, workflow_name, version, input, idempotency_key, "workflow_started") orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "run store failed");
+        const proposed = self.proposeStart(shard, req.namespace, run_id_str, workflow_name, version, input, idempotency_key, "workflow_started") catch |err| {
+            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "run not persisted"));
+            return null;
+        };
+        return proposed;
+    }
+
+    /// The start applied: answer with the id of the run it created, and
+    /// leave its first step to the tick.
+    fn respondStart(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+        const stored_key = self.last_started_key orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
             return;
         };
+        const run = self.runs.get(stored_key) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            return;
+        };
+        if (self.last_start_collided) {
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "run id already exists");
+            return;
+        }
+        if (self.last_start_existed) {
+            shard.sendOkResponse(conn, req.header.request_id, run.run_id_owned);
+            return;
+        }
         if (shard.metrics_registry) |m| m.workflow.recordStarted();
+        shard.sendOkResponse(conn, req.header.request_id, run.run_id_owned);
+        self.queueFirstStep(stored_key, shard.answering_index);
+    }
 
-        // Return the run ID
-        shard.sendOkResponse(conn, req.header.request_id, self.runs.get(stored_key).?.run_id_owned);
+    /// The index key for an idempotency key, any length the wire allows:
+    /// each part length-prefixed, so no byte in a name can make two
+    /// different triples the same key.
+    fn idemKey(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, key: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{d}:{s}{d}:{s}{s}", .{ namespace.len, namespace, wf_name.len, wf_name, key });
+    }
 
-        // Begin step execution. The run is already in the map; advanceWorkflow
-        // will drive it through the workflow graph until it reaches a terminal
-        // or a wait_for_signal step.
-        self.advanceWorkflow(shard, stored_key, req.namespace);
+    /// The key in `runs` of the run an idempotency key started for this
+    /// workflow in this namespace, if one has applied.
+    fn runKeyForIdempotencyKey(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, key: []const u8) ?[]const u8 {
+        const ik = self.idemKey(namespace, wf_name, key) catch return null;
+        defer self.allocator.free(ik);
+        return self.idem_index.get(ik);
+    }
+
+    fn runForIdempotencyKey(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, key: []const u8) ?*RunRecord {
+        const run_key = self.runKeyForIdempotencyKey(namespace, wf_name, key) orelse return null;
+        return self.runs.getPtr(run_key);
+    }
+
+    fn indexIdempotencyKey(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, key: []const u8, run_key: []const u8) void {
+        const ik = self.idemKey(namespace, wf_name, key) catch {
+            log.err("workflow {s}: idempotency key of run {s} not indexed (out of memory); a retry with it may start a second run", .{ wf_name, run_key });
+            return;
+        };
+        if (self.idem_index.contains(ik)) {
+            self.allocator.free(ik);
+            return;
+        }
+        self.idem_index.put(self.allocator, ik, run_key) catch {
+            self.allocator.free(ik);
+            log.err("workflow {s}: idempotency key of run {s} not indexed (out of memory); a retry with it may start a second run", .{ wf_name, run_key });
+        };
+    }
+
+    /// The caller holds `mu`.
+    fn queueFirstStep(self: *WorkflowHandler, ns_key: []const u8, index: u64) void {
+        const owned = self.allocator.dupe(u8, ns_key) catch {
+            log.err("workflow run {s} started but cannot be queued for its first step; it stays at its start", .{ns_key});
+            return;
+        };
+        self.started_to_advance.append(self.allocator, .{ .ns_key = owned, .index = index }) catch {
+            self.allocator.free(owned);
+            log.err("workflow run {s} started but cannot be queued for its first step; it stays at its start", .{ns_key});
+        };
+    }
+
+    /// Take the first step of each queued run whose start has applied, in
+    /// queue order; one not applied yet waits for a later tick, one the log
+    /// dropped is forgotten. Leader only: a step proposes.
+    pub fn advanceStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
+        if (shard.raft_node.role != .leader) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        var keep: usize = 0;
+        var i: usize = 0;
+        // A step can start a child run here, which joins the queue behind
+        // this pass and is kept, its start not yet applied.
+        while (i < self.started_to_advance.items.len) : (i += 1) {
+            const s = self.started_to_advance.items[i];
+            if (shard.raft_node.last_applied < s.index) {
+                self.started_to_advance.items[keep] = s;
+                keep += 1;
+                continue;
+            }
+            defer self.allocator.free(s.ns_key);
+            if (!self.runs.contains(s.ns_key)) {
+                log.warn("shard {d}: workflow run {s} was started but its start created no run; nothing will step it", .{ shard.id, s.ns_key });
+                continue;
+            }
+            const ns_end = std.mem.indexOfScalar(u8, s.ns_key, ':') orelse continue;
+            self.advanceWorkflow(shard, s.ns_key, s.ns_key[0..ns_end]);
+        }
+        self.started_to_advance.shrinkRetainingCapacity(keep);
+    }
+
+    /// This node stopped leading: the runs it had not taken a first step
+    /// for stay at their start. Logs how many had applied (they exist and
+    /// stay `running`) and how many had not (the log may drop them).
+    pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var applied: usize = 0;
+        for (self.started_to_advance.items) |s| {
+            if (s.index <= shard.raft_node.last_applied) {
+                // A few by name, for an operator to look up; the rest counted.
+                if (applied < 3) log.warn("shard {d}: workflow run {s} started but had not taken its first step; it stays at its start", .{ shard.id, s.ns_key });
+                applied += 1;
+            }
+            self.allocator.free(s.ns_key);
+        }
+        const unapplied = self.started_to_advance.items.len - applied;
+        if (applied + unapplied > 0) log.warn("shard {d}: stopped leading with {d} started workflow runs that had not taken their first step, and {d} starts not yet applied", .{ shard.id, applied, unapplied });
+        self.started_to_advance.clearRetainingCapacity();
     }
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
@@ -1548,9 +1723,8 @@ pub const WorkflowHandler = struct {
         const raw = run_step.targetName();
         const child_name = if (std.mem.indexOfScalar(u8, raw, ':')) |i| raw[0..i] else raw;
 
-        // Reconstruct the parent's run key up-front: spawnRun below may insert a
-        // new entry into self.runs (same map when the child is local), which can
-        // resize and invalidate the `run` pointer. We re-fetch after spawning.
+        // The parent's run key, to find the run again after the child's
+        // start is proposed.
         const parent_ns_key = self.makeNsKey(namespace, run.run_id_owned) orelse
             return definition.StepOutcome.execution_failure;
         defer self.allocator.free(parent_ns_key);
@@ -1577,12 +1751,15 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.target_not_found;
         }
 
-        const child_rid = target_handler.spawnRun(target_shard, namespace, child_name, step_input, "child_started") orelse
+        var child_id_buf: [32]u8 = undefined;
+        var child_index: u64 = 0;
+        const child_rid = target_handler.spawnRun(target_shard, namespace, child_name, step_input, "child_started", &child_id_buf, &child_index) orelse
             return definition.StepOutcome.execution_failure;
 
-        // Re-fetch the (possibly relocated) parent record and park it.
         const parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
-        self.parkForChild(parent, child_rid, step_label, child_name, target_shard_id, now_ms);
+        // The index is in the target shard's log: known only when that is
+        // this shard.
+        self.parkForChild(parent, child_rid, step_label, child_name, target_shard_id, now_ms, if (is_local) child_index else 0);
         return null; // parked
     }
 
@@ -1598,9 +1775,10 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    /// Create and start a workflow run programmatically. Used for child-workflow
-    /// invocation. Must be called with this handler's `mu` held. Returns the new
-    /// run's ID (a slice owned by the stored record) or null on failure.
+    /// Start a child run. Must be called with this handler's `mu` held.
+    /// Returns the new run's id, written into `id_buf`, and its start's log
+    /// index in `index`; the run exists once its start applies, and until
+    /// then the parent waits as for any child that has not finished.
     fn spawnRun(
         self: *WorkflowHandler,
         shard: *Shard,
@@ -1608,23 +1786,27 @@ pub const WorkflowHandler = struct {
         wf_name: []const u8,
         input: []const u8,
         evt_type: []const u8,
+        id_buf: *[32]u8,
+        index: *u64,
     ) ?[]const u8 {
-        var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return null;
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf) catch return null;
+        index.* = self.proposeRun(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
+        return run_id_str;
+    }
 
-        const run_ns_key = self.startRunThroughLog(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
-        self.advanceWorkflow(shard, run_ns_key, namespace);
-
-        // Return the stored run_id (advanceWorkflow does not insert into self.runs,
-        // so the entry is stable here).
-        const stored = self.runs.getPtr(run_ns_key) orelse return null;
-        return stored.run_id_owned;
+    /// Whether the run `run` waits for, which the caller did not find, was
+    /// lost: this shard proposed it and has applied that entry's index
+    /// without creating it.
+    fn pendingLost(shard: *Shard, run: *const RunRecord, on_shard: ?u16) bool {
+        if (run.pending_index == 0 or (on_shard orelse shard.id) != shard.id) return false;
+        return shard.raft_node.last_applied >= run.pending_index;
     }
 
     /// Park a workflow run waiting for a child workflow to reach a terminal state.
-    fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, target_shard_id: u16, now_ms: i64) void {
+    fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
         run.status = .waiting;
+        run.pending_index = index;
 
         if (run.pending_child_run_id_owned) |old| self.allocator.free(old);
         run.pending_child_run_id_owned = self.allocator.dupe(u8, child_run_id) catch null;
@@ -1792,27 +1974,9 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.execution_failure;
         }
 
-        // Dupe the pre_run_id for parking (it's on the stack)
-        const owned_pre_id = self.allocator.dupe(u8, pre_run_id) catch {
-            return definition.StepOutcome.execution_failure;
-        };
-
-        // Broadcast inbox notifications to all shards so action_await waiters
-        // on any shard can try claiming this run.
-        if (shard.peer_inboxes) |inboxes| {
-            for (inboxes, 0..) |inbox, i| {
-                _ = inbox.send(.{
-                    .tag = .action_invoke,
-                    .src_shard = @intCast(shard.id),
-                });
-                _ = i;
-            }
-        }
-
-        // Park the workflow run, awaiting action completion
-        self.parkForAction(run, owned_pre_id, step_label, action_name, target_shard_id, now_ms);
-        // Free the duped ID since parkForAction dupes it again
-        self.allocator.free(owned_pre_id);
+        // Park the workflow run, awaiting action completion. The owning shard
+        // proposes the run and wakes workers when it applies.
+        self.parkForAction(run, pre_run_id, step_label, action_name, target_shard_id, now_ms, 0);
         return null; // signals: parked
     }
 
@@ -1837,47 +2001,14 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.target_disabled;
         }
 
-        const action_run_id = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
+        var action_id_buf: [32]u8 = undefined;
+        const invoked = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
             return definition.StepOutcome.execution_failure;
         };
-
-        // Broadcast to all peer shards so action_await waiters on any shard
-        // can claim this run. invokeByName only notifies the local waiter_pool,
-        // but workers may be connected to any shard.
-        if (shard.peer_inboxes) |inboxes| {
-            for (inboxes, 0..) |inbox, i| {
-                if (i == shard.id) continue;
-                _ = inbox.send(.{
-                    .tag = .action_invoke,
-                    .src_shard = @intCast(shard.id),
-                });
-            }
-        }
-
-        if (shard.actions_handler.getRunResult(action_run_id)) |result| {
-            switch (result.status) {
-                .completed => {
-                    const outcome = result.outcome orelse definition.StepOutcome.success;
-                    if (run.step_outputs) |*so| {
-                        so.put(self.allocator, step_label, result.output orelse "{}", outcome) catch {};
-                    }
-                    return outcome;
-                },
-                .failed => {
-                    const outcome = result.outcome orelse definition.StepOutcome.failure;
-                    if (run.step_outputs) |*so| {
-                        so.put(self.allocator, step_label, result.output orelse "{}", outcome) catch {};
-                    }
-                    return outcome;
-                },
-                .pending, .running => {
-                    self.parkForAction(run, action_run_id, step_label, action_name, target_shard_id, now_ms);
-                    return null;
-                },
-                else => return definition.StepOutcome.execution_failure,
-            }
-        }
-        return definition.StepOutcome.execution_failure;
+        // The run exists once the invoke applies; `checkPendingActions`
+        // resumes this one when it finishes.
+        self.parkForAction(run, invoked.id, step_label, action_name, target_shard_id, now_ms, invoked.index);
+        return null;
     }
 
     /// Resolve the ActionsHandler responsible for the given action name.
@@ -1949,8 +2080,9 @@ pub const WorkflowHandler = struct {
     }
 
     /// Park a workflow run waiting for an async action to complete.
-    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, target_shard_id: u16, now_ms: i64) void {
+    fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
         run.status = .waiting;
+        run.pending_index = index;
 
         // Store tracking info for checkPendingActions
         if (run.pending_action_run_id_owned) |old| self.allocator.free(old);
@@ -2040,19 +2172,19 @@ pub const WorkflowHandler = struct {
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
-                if (getActionRunResult(shard, run.pending_action_shard_id, action_rid)) |result| {
-                    if (result.status == .completed or result.status == .failed) {
-                        if (resume_count < resume_keys.len) {
-                            resume_keys[resume_count] = entry.key_ptr.*;
-                            resume_count += 1;
-                        }
-                    }
+                const done = if (getActionRunResult(shard, run.pending_action_shard_id, action_rid)) |result|
+                    result.status == .completed or result.status == .failed
+                else
+                    pendingLost(shard, run, run.pending_action_shard_id);
+                if (done and resume_count < resume_keys.len) {
+                    resume_keys[resume_count] = entry.key_ptr.*;
+                    resume_count += 1;
                 }
             }
 
             // Check child workflow completion
             if (run.pending_child_run_id_owned) |child_rid| {
-                if (self.childRunTerminal(shard, entry.key_ptr.*, child_rid, run.pending_child_shard_id)) {
+                if (self.childRunTerminal(shard, entry.key_ptr.*, child_rid, run)) {
                     if (child_count < child_keys.len) {
                         child_keys[child_count] = entry.key_ptr.*;
                         child_count += 1;
@@ -2102,7 +2234,8 @@ pub const WorkflowHandler = struct {
 
     /// Whether the child run referenced by a parent is in a terminal state.
     /// `parent_ns_key` is "namespace:parent_run_id"; the child shares the namespace.
-    fn childRunTerminal(self: *WorkflowHandler, shard: *Shard, parent_ns_key: []const u8, child_run_id: []const u8, child_shard_id: ?u16) bool {
+    fn childRunTerminal(self: *WorkflowHandler, shard: *Shard, parent_ns_key: []const u8, child_run_id: []const u8, parent: *const RunRecord) bool {
+        const child_shard_id = parent.pending_child_shard_id;
         const ns_end = std.mem.indexOfScalar(u8, parent_ns_key, ':') orelse return false;
         const namespace = parent_ns_key[0..ns_end];
         const child_ns_key = self.makeNsKey(namespace, child_run_id) orelse return false;
@@ -2110,7 +2243,7 @@ pub const WorkflowHandler = struct {
 
         const tid = child_shard_id orelse shard.id;
         if (tid == shard.id) {
-            const child = self.runs.getPtr(child_ns_key) orelse return false;
+            const child = self.runs.getPtr(child_ns_key) orelse return pendingLost(shard, parent, child_shard_id);
             return child.status.isTerminal();
         }
         const peers = shard.peer_shards orelse return false;
@@ -2139,11 +2272,20 @@ pub const WorkflowHandler = struct {
         const tid = run.pending_child_shard_id orelse shard.id;
         var child_status: RunStatus = undefined;
         var child_output: ?[]u8 = null;
+        var lost = false;
         if (tid == shard.id) {
-            const child = self.runs.getPtr(child_ns_key) orelse return;
-            if (!child.status.isTerminal()) return;
-            child_status = child.status;
-            if (child.output_owned) |o| child_output = self.allocator.dupe(u8, o) catch null;
+            if (self.runs.getPtr(child_ns_key)) |child| {
+                if (!child.status.isTerminal()) return;
+                child_status = child.status;
+                if (child.output_owned) |o| child_output = self.allocator.dupe(u8, o) catch null;
+            } else {
+                // Its start's index applied without creating it: the log
+                // dropped it, and the step fails.
+                if (!pendingLost(shard, run, run.pending_child_shard_id)) return;
+                log.warn("workflow run {s}: the child run {s} its step waits for was never created (its start was dropped); the step fails", .{ run_ns_key, child_rid });
+                lost = true;
+                child_status = .failed;
+            }
         } else {
             const peers = shard.peer_shards orelse return;
             if (tid >= peers.len) return;
@@ -2164,17 +2306,21 @@ pub const WorkflowHandler = struct {
         }
         defer if (child_output) |o| self.allocator.free(o);
 
-        const outcome: []const u8 = if (child_status == .completed)
+        const outcome: []const u8 = if (lost)
+            definition.StepOutcome.execution_failure
+        else if (child_status == .completed)
             definition.StepOutcome.success
         else
             definition.StepOutcome.failure;
 
-        if (run.step_outputs) |*so| {
-            so.put(self.allocator, step_label, child_output orelse "{}", outcome) catch {};
+        if (!lost) {
+            if (run.step_outputs) |*so| {
+                so.put(self.allocator, step_label, child_output orelse "{}", outcome) catch {};
+            }
         }
 
         run.status = .running;
-        self.addHistoryEvent(run, "child_completed", outcome, now_ms);
+        self.addHistoryEvent(run, if (lost) "child_lost" else "child_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
         if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
@@ -2184,6 +2330,7 @@ pub const WorkflowHandler = struct {
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         run.pending_step_name_owned = null;
         run.pending_child_shard_id = null;
+        run.pending_index = 0;
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         run.wait_signal_type_owned = null;
 
@@ -2224,10 +2371,15 @@ pub const WorkflowHandler = struct {
         const action_rid = run.pending_action_run_id_owned orelse return;
         const step_label = run.pending_step_name_owned orelse "unknown";
 
-        // Get the action result from the correct shard
-        const result = getActionRunResult(shard, run.pending_action_shard_id, action_rid) orelse return;
+        // No run yet: wait, unless this shard has applied the invoke's index
+        // without creating it. Then the log dropped it, and the step fails.
+        const found = getActionRunResult(shard, run.pending_action_shard_id, action_rid);
+        if (found == null) {
+            if (!pendingLost(shard, run, run.pending_action_shard_id)) return;
+            log.warn("workflow run {s}: the action run {s} its step waits for was never created (its invoke was dropped); the step fails", .{ run_ns_key, action_rid });
+        }
 
-        const outcome: []const u8 = switch (result.status) {
+        const outcome: []const u8 = if (found) |result| switch (result.status) {
             .completed => blk: {
                 // Use the named outcome from the action if provided, otherwise default to "success"
                 const action_outcome = result.outcome orelse definition.StepOutcome.success;
@@ -2243,11 +2395,11 @@ pub const WorkflowHandler = struct {
                 break :blk definition.StepOutcome.failure;
             },
             else => definition.StepOutcome.execution_failure,
-        };
+        } else definition.StepOutcome.execution_failure;
 
         // Record completion before clearing state (step_label points into pending_step_name_owned)
         run.status = .running;
-        self.addHistoryEvent(run, "action_completed", outcome, now_ms);
+        self.addHistoryEvent(run, if (found == null) "action_lost" else "action_completed", outcome, now_ms);
         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
         if (shard.metrics_registry) |m| m.workflow.recordStepExecuted();
 
@@ -2257,6 +2409,7 @@ pub const WorkflowHandler = struct {
         if (run.pending_step_name_owned) |s| self.allocator.free(s);
         run.pending_step_name_owned = null;
         run.pending_action_shard_id = null;
+        run.pending_index = 0;
         if (run.wait_signal_type_owned) |s| self.allocator.free(s);
         run.wait_signal_type_owned = null;
 
@@ -2508,7 +2661,6 @@ pub const WorkflowHandler = struct {
         // serializes it; the applier then rebuilds the same state from the
         // entry.
         self.persistComplete(shard, run_ns_key, run, status, now_ms);
-        _ = shard.applyCommitted();
     }
 
     /// Resolve the workflow's `output` mapping (same format as step inputMapping).
@@ -2847,8 +2999,7 @@ pub const WorkflowHandler = struct {
         const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
 
-        const run_ns_key = self.startRunThroughLog(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started") orelse return;
-        self.advanceWorkflow(shard, run_ns_key, schedule.namespace_owned);
+        _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
     }
 
     /// Poll all active stream triggers and start workflow runs for new events.
@@ -2980,8 +3131,11 @@ pub const WorkflowHandler = struct {
         var idem_buf: [512]u8 = undefined;
         const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch return;
 
-        const run_ns_key = self.startRunThroughLog(shard, trigger.namespace_owned, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started") orelse return;
-        self.advanceWorkflow(shard, run_ns_key, trigger.namespace_owned);
+        // The first-step queue is shared with a parent run on another
+        // shard starting a child here, which holds this handler's lock.
+        self.mu.lock();
+        defer self.mu.unlock();
+        _ = self.proposeRun(shard, trigger.namespace_owned, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started");
     }
 
     /// Advance a stream trigger's cursor to the event a restored run came
@@ -3123,18 +3277,18 @@ pub const WorkflowHandler = struct {
 
     /// Persist a workflow_create entry to the UAL so the definition survives restart.
     /// The key stored is "namespace:name" so replay can directly use it as the ns-qualified map key.
-    fn persistCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) !void {
+    fn proposeCreate(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, name: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         // Build ns-qualified key: "namespace:name"
         var key_buf: [600]u8 = undefined;
         const ns_key = try std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, name });
-        _ = try persistence_mod.persistEntry(shard, .workflow_create, entry_mod.Flags.NONE, namespace, ns_key, yaml);
+        return persistence_mod.proposeEntry(shard, .workflow_create, entry_mod.Flags.NONE, namespace, ns_key, yaml);
     }
 
-    /// Start a run through the one applier: encode the start entry, persist
-    /// it, apply it. Returns the run's ns-qualified key (owned by the runs
-    /// map) or null when the run could not be created.
-    fn startRunThroughLog(
+    /// Start a run for a producer (a schedule, a trigger, a parent run):
+    /// the start is proposed and the tick takes its first step once it
+    /// applies. Returns the start's log index. The caller holds `mu`.
+    fn proposeRun(
         self: *WorkflowHandler,
         shard: *Shard,
         namespace: []const u8,
@@ -3144,13 +3298,15 @@ pub const WorkflowHandler = struct {
         input: []const u8,
         idempotency_key: ?[]const u8,
         event_type: []const u8,
-    ) ?[]const u8 {
-        self.persistStart(shard, namespace, run_id, wf_name, version, input, idempotency_key, event_type) catch return null;
-        if (!shard.applyCommitted()) return null;
+    ) ?u64 {
+        const proposed = self.proposeStart(shard, namespace, run_id, wf_name, version, input, idempotency_key, event_type) catch |err| {
+            log.err("workflow {s}: run {s} not started: {s}", .{ wf_name, run_id, @errorName(err) });
+            return null;
+        };
         var key_buf: [600]u8 = undefined;
         const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, run_id }) catch return null;
-        const entry = self.runs.getEntry(ns_key) orelse return null;
-        return entry.key_ptr.*;
+        self.queueFirstStep(ns_key, proposed.index);
+        return proposed.index;
     }
 
     /// Start entry. Key is "namespace:run_id".
@@ -3158,7 +3314,7 @@ pub const WorkflowHandler = struct {
     ///   [event_len:u16][event_type][idem_len:u16][idempotency_key][input...]
     /// The event type is the run's first history event (manual, schedule,
     /// trigger or child start); search tags are derived by the applier.
-    fn persistStart(
+    fn proposeStart(
         self: *WorkflowHandler,
         shard: *Shard,
         namespace: []const u8,
@@ -3168,7 +3324,7 @@ pub const WorkflowHandler = struct {
         input: []const u8,
         idempotency_key: ?[]const u8,
         event_type: []const u8,
-    ) !void {
+    ) !persistence_mod.ProposeResult {
         _ = self;
         var ns_key_buf: [600]u8 = undefined;
         const ns_key = try std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id });
@@ -3199,7 +3355,7 @@ pub const WorkflowHandler = struct {
         off += idem.len;
         @memcpy(value_buf[off .. off + input.len], input);
         off += input.len;
-        _ = try persistence_mod.persistEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]);
+        return persistence_mod.proposeEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]);
     }
 
     /// Persist a workflow_complete entry to the UAL so terminal state survives restarts.
@@ -3312,8 +3468,9 @@ pub const WorkflowHandler = struct {
             off += tags.len;
         }
 
-        _ = persistence_mod.persistEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch |err| {
+        _ = persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch |err| {
             log.err("workflow run {s}: completion not persisted: {s}", .{ ns_key, @errorName(err) });
+            return;
         };
     }
 
@@ -3332,6 +3489,15 @@ pub const WorkflowHandler = struct {
     /// Apply a workflow entry: live commit, replicated entry or boot replay alike.
     pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) void {
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        // Other shard threads walk these maps under this lock. Nothing
+        // holds it across an apply, so taking it here cannot nest.
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (etype == .workflow_start) {
+            self.last_started_key = null;
+            self.last_start_existed = false;
+            self.last_start_collided = false;
+        }
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
 
         switch (etype) {
@@ -3455,8 +3621,27 @@ pub const WorkflowHandler = struct {
 
         const input = if (off < value.len) value[off..] else "{}";
 
-        // Already present (an idempotent re-apply): nothing to do.
-        if (self.runs.contains(ns_key_raw)) return;
+        // Two starts with one idempotency key can both pass the handler's
+        // check before either applies; the log's order decides. The later
+        // one creates nothing, and its client is answered with the earlier
+        // run. Checked before the run id, as the handler does: a retry
+        // carrying both its key and its own run id is the same start.
+        if (idem) |k| {
+            if (self.runKeyForIdempotencyKey(namespace, wf_name, k)) |run_key| {
+                self.last_started_key = run_key;
+                self.last_start_existed = true;
+                return;
+            }
+        }
+
+        // Already present: a re-apply, or a second start with a run id
+        // the client chose, which the handler let through while the first
+        // was uncommitted. The log's order decides; the later is refused.
+        if (self.runs.getEntry(ns_key_raw)) |e| {
+            self.last_started_key = e.key_ptr.*;
+            self.last_start_collided = true;
+            return;
+        }
 
         const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
         var run = RunRecord{
@@ -3507,6 +3692,8 @@ pub const WorkflowHandler = struct {
             self.allocator.free(ns_key);
             return;
         };
+        self.last_started_key = ns_key;
+        if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
         // Search tags come from the definition and the input; derived here so
         // every node computes the same ones.
         if (self.runs.getPtr(ns_key)) |stored| {
@@ -3887,6 +4074,9 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.pending = try std.testing.allocator.alloc(shard_mod.Pending, shard_mod.PENDING_SLOTS);
     @memset(shard.pending, .{});
     shard.pending_count = 0;
+    shard.applying = false;
+    shard.last_entry_applied = true;
+    shard.wake_workers = false;
     shard.replies_held = 0;
     shard.forward_count = 0;
     return shard;
@@ -4043,6 +4233,94 @@ fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8
     };
 }
 
+test "a producer's start waits in the first-step queue until it applies, then takes its step; one whose index applied without creating a run is dropped" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "step-a");
+    registerTestAction(&actions, "step-b");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+
+    // Proposed, not yet applied: there is no run to step, so it waits.
+    try testing.expect(handler.proposeRun(&shard, "default", "run-p", "test-wf", "latest", "{}", null, "schedule_started") != null);
+    handler.advanceStartedRuns(&shard);
+    try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
+    try testing.expect(handler.runs.get("default:run-p") == null);
+
+    _ = shard.applyCommitted();
+    // A start whose index applied without creating a run (dropped with the
+    // log's tail) is dropped from the queue, not kept for ever.
+    handler.queueFirstStep("default:ghost", shard.raft_node.last_applied);
+    handler.advanceStartedRuns(&shard);
+    try testing.expectEqual(@as(usize, 0), handler.started_to_advance.items.len);
+    const run = handler.runs.get("default:run-p").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(run.pending_action_run_id_owned != null);
+}
+
+test "a step whose child run the log dropped fails once the child's start index has applied" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-c", "run-c", "test-wf");
+
+    // Parked on a child whose start is at an index this shard has applied
+    // but which created no run, as when a lost leadership truncated it.
+    const proposed = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "v");
+    _ = shard.applyCommitted();
+    const run = handler.runs.getPtr("default:run-c").?;
+    handler.parkForChild(run, "gone", "start", "child-wf", shard.id, 0, proposed.index);
+    handler.checkPendingActions(&shard);
+    const after = handler.runs.get("default:run-c").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, after.status);
+    var lost = false;
+    for (after.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "child_lost")) lost = true;
+    }
+    try testing.expect(lost);
+}
+
+test "a step whose action run the log dropped fails once the invoke's index has applied" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "step-a");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-l", "run-l", "test-wf");
+
+    handler.advanceWorkflow(&shard, "default:run-l", "default");
+    const run = handler.runs.getPtr("default:run-l").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    // Not applied yet: the run waits.
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get("default:run-l").?.status);
+
+    // Point the run at an action run no invoke created, then apply the
+    // invoke's index: the run it names does not exist, as when a lost
+    // leadership truncated the invoke from the log.
+    allocator.free(run.pending_action_run_id_owned.?);
+    run.pending_action_run_id_owned = try allocator.dupe(u8, "gone");
+    _ = shard.applyCommitted();
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get("default:run-l").?.status);
+}
+
+// The step executor tests step runs directly: after each step they apply
+// what it proposed, as the shard's tick does.
 test "step executor: linear workflow completes via action invocation" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -4063,6 +4341,7 @@ test "step executor: linear workflow completes via action invocation" {
 
     // Phase 1: advance invokes step-a asynchronously, workflow parks
     handler.advanceWorkflow(&shard, "default:run-1", "default");
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -4072,6 +4351,7 @@ test "step executor: linear workflow completes via action invocation" {
 
     // Phase 2: checkPendingActions resumes step-a, advances to step-b (parks again)
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -4081,6 +4361,7 @@ test "step executor: linear workflow completes via action invocation" {
 
     // Phase 3: checkPendingActions resumes step-b, workflow completes
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
@@ -4108,6 +4389,7 @@ test "step executor: wait_for_signal parks run" {
 
     // Phase 1: advance invokes init action, parks
     handler.advanceWorkflow(&shard, "default:run-2", "default");
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-2").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -4117,6 +4399,7 @@ test "step executor: wait_for_signal parks run" {
 
     // Phase 2: checkPendingActions resumes init, workflow transitions to wait_approval (parks for signal)
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-2").?;
     // Should be waiting for approval signal after init → wait_approval
@@ -4141,12 +4424,14 @@ test "step executor: signal resumes waiting workflow" {
 
     // Advance until init parks, then complete it
     handler.advanceWorkflow(&shard, "default:run-3", "default");
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-3").?;
         completeTestAction(&actions, run.pending_action_run_id_owned.?);
     }
     // Resume init → transitions to wait_approval → parks for signal
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.get("default:run-3").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -4168,6 +4453,7 @@ test "step executor: signal resumes waiting workflow" {
 
     // Resume execution — signal found, follow success transition → flo.Completed
     handler.advanceWorkflow(&shard, "default:run-3", "default");
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-3").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
@@ -4188,6 +4474,7 @@ test "step executor: missing definition does not crash" {
 
     // Should gracefully no-op (no definition found)
     handler.advanceWorkflow(&shard, "default:run-4", "default");
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-4").?;
     // Still running since we couldn't find the definition to advance
@@ -4209,6 +4496,7 @@ test "step executor: missing action yields target_not_found" {
     createTestRun(&handler, "default:run-5", "run-5", "test-wf");
 
     handler.advanceWorkflow(&shard, "default:run-5", "default");
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-5").?;
     // Should fail because action "step-a" is not registered
@@ -4232,12 +4520,14 @@ test "step executor: failing action follows failure transition" {
 
     // Phase 1: advance invokes step-a, parks
     handler.advanceWorkflow(&shard, "default:run-6", "default");
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-6").?;
         completeTestAction(&actions, run.pending_action_run_id_owned.?);
     }
     // Phase 2: step-a completes (success) → transitions to step_b → step-b parks
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-6").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
@@ -4246,6 +4536,7 @@ test "step executor: failing action follows failure transition" {
     }
     // Phase 3: step-b fails → follows "failure" transition → flo.Failed
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-6").?;
     // step-a succeeds → step_b → step-b fails → "failure" → flo.Failed
@@ -4268,6 +4559,7 @@ test "step executor: retry on failure" {
 
     // Initial attempt: flaky action parks
     handler.advanceWorkflow(&shard, "default:run-7", "default");
+    _ = shard.applyCommitted();
 
     // Drive attempts: 1 original + 3 retries (maxAttempts=3) = 4 total
     // Each iteration: complete current action with "failure", checkPendingActions
@@ -4279,6 +4571,7 @@ test "step executor: retry on failure" {
         const rid = run_ptr.pending_action_run_id_owned orelse break;
         completeTestActionWith(&actions, rid, "failure");
         handler.checkPendingActions(&shard);
+        _ = shard.applyCommitted();
     }
 
     const run = handler.runs.get("default:run-7").?;
@@ -4314,6 +4607,7 @@ test "step executor: poll re-arms on pending and times out after maxAttempts" {
 
     // Initial: poller invoked, parks for async completion.
     handler.advanceWorkflow(&shard, "default:run-poll", "default");
+    _ = shard.applyCommitted();
 
     // First `pending` must ARM a poll (not fail): status waiting, attempt incremented.
     {
@@ -4322,6 +4616,7 @@ test "step executor: poll re-arms on pending and times out after maxAttempts" {
         completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "pending");
     }
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-poll").?;
         try testing.expect(!run.status.isTerminal()); // pre-fix bug: would be .failed
@@ -4340,6 +4635,7 @@ test "step executor: poll re-arms on pending and times out after maxAttempts" {
             completeTestActionWith(&actions, rid, "pending");
         }
         handler.checkPendingActions(&shard);
+        _ = shard.applyCommitted();
     }
 
     const run = handler.runs.get("default:run-poll").?;
@@ -4462,6 +4758,7 @@ test "step executor: checkPendingActions handles completed async action" {
 
     // checkPendingActions should detect the completed action and resume step-a
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
 
     // After step-a resumes, workflow advances to step_b (async) — parks again
     {
@@ -4473,6 +4770,7 @@ test "step executor: checkPendingActions handles completed async action" {
 
     // Second checkPendingActions: step-b done → flo.Completed
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
 
     const run = handler.runs.get("default:run-8").?;
     // After resuming start → step_b (success) → flo.Completed

@@ -79,6 +79,12 @@ pub const ProcessingHandler = struct {
 
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
+    /// What the last applied submit and savepoint created; keys of `jobs`
+    /// and `savepoints` (see `Shard.answering_index`).
+    last_submitted_job_id: ?[]const u8 = null,
+    last_savepoint_id: ?[]const u8 = null,
+    sink_drops: u64 = 0,
+    sink_warn_ms: i64 = 0,
 
     /// Savepoint store: savepoint_id → SavepointRecord.
     savepoints: std.StringHashMap(SavepointRecord),
@@ -411,10 +417,41 @@ pub const ProcessingHandler = struct {
     fn dispatchProcessing(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
         shard.processing_handler.handleCommand(shard, conn, req);
-        if (op == .processing_submit) {
-            shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+    }
+
+    /// A parked processing write applied: read the outcome back and answer.
+    fn respondProcessing(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const h = shard.processing_handler;
+        const op: OpCode = @enumFromInt(req.header.op_code);
+        switch (op) {
+            .processing_submit => {
+                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+                const job_id = h.last_submitted_job_id orelse {
+                    shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+                    return;
+                };
+                if (!h.jobs.contains(job_id)) {
+                    shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+                    return;
+                }
+                if (shard.metrics_registry) |m| m.processing.recordSubmitted();
+                shard.sendOkResponse(conn, req.header.request_id, job_id);
+            },
+            .processing_stop, .processing_cancel => {
+                if (shard.metrics_registry) |m| if (op == .processing_cancel) m.processing.recordCancelled() else m.processing.recordCompleted();
+                shard.sendOkResponse(conn, req.header.request_id, "");
+            },
+            .processing_savepoint => {
+                const sp_id = h.last_savepoint_id orelse {
+                    shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+                    return;
+                };
+                shard.sendOkResponse(conn, req.header.request_id, sp_id);
+            },
+            else => shard.sendOkResponse(conn, req.header.request_id, ""),
         }
     }
 
@@ -483,19 +520,11 @@ pub const ProcessingHandler = struct {
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
         const now = @import("stdx").time.milliTimestamp();
-        self.persistSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch |err| {
+        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "job not persisted"));
             return;
         };
-        if (!shard.applyCommitted() or !self.jobs.contains(job_id)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "job not applied");
-            return;
-        }
-
-        if (shard.metrics_registry) |m| m.processing.recordSubmitted();
-
-        // Return the job ID
-        shard.sendOkResponse(conn, req.header.request_id, job_id);
+        shard.park(conn, req, proposed, respondProcessing);
     }
 
     // ── Stop ─────────────────────────────────────────────────────────────
@@ -508,11 +537,11 @@ pub const ProcessingHandler = struct {
         }
 
         if (self.jobs.contains(job_id)) {
-            self.persistStatusChange(shard, req.namespace, job_id, .stopped) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "stop not persisted or applied");
+            const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .stopped) catch |err| {
+                shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "stop not persisted"));
                 return;
             };
-            shard.sendOkResponse(conn, req.header.request_id, "");
+            shard.park(conn, req, proposed, respondProcessing);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -528,11 +557,11 @@ pub const ProcessingHandler = struct {
         }
 
         if (self.jobs.contains(job_id)) {
-            self.persistStatusChange(shard, req.namespace, job_id, .cancelled) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "cancel not persisted or applied");
+            const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .cancelled) catch |err| {
+                shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "cancel not persisted"));
                 return;
             };
-            shard.sendOkResponse(conn, req.header.request_id, "");
+            shard.park(conn, req, proposed, respondProcessing);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -669,12 +698,11 @@ pub const ProcessingHandler = struct {
 
             const now = @import("stdx").time.milliTimestamp();
             // Persist through Raft; the applier stores the savepoint.
-            self.persistSavepoint(shard, req.namespace, sp_id, job_id, job.records_processed, now) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "savepoint not persisted or applied");
+            const proposed = self.proposeSavepoint(shard, req.namespace, sp_id, job_id, job.records_processed, now) catch |err| {
+                shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "savepoint not persisted"));
                 return;
             };
-
-            shard.sendOkResponse(conn, req.header.request_id, sp_id);
+            shard.park(conn, req, proposed, respondProcessing);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -741,11 +769,11 @@ pub const ProcessingHandler = struct {
         }
 
         if (self.jobs.contains(job_id)) {
-            self.persistRescale(shard, req.namespace, job_id, parallelism) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "rescale not persisted or applied");
+            const proposed = self.proposeRescale(shard, req.namespace, job_id, parallelism) catch |err| {
+                shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "rescale not persisted"));
                 return;
             };
-            shard.sendOkResponse(conn, req.header.request_id, "");
+            shard.park(conn, req, proposed, respondProcessing);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -753,9 +781,9 @@ pub const ProcessingHandler = struct {
 
     // ── UAL Persistence ─────────────────────────────────────────────────
 
-    /// Persist a processing_submit entry. Key = job_id.
+    /// A processing_submit entry. Key = job_id.
     /// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
-    fn persistSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, parallelism: u32, batch_size: u32, created_at_ms: i64, job_namespace: []const u8, yaml: []const u8) !void {
+    fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, parallelism: u32, batch_size: u32, created_at_ms: i64, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         var off: usize = 0;
@@ -781,32 +809,24 @@ pub const ProcessingHandler = struct {
         @memcpy(value_buf[off .. off + yaml.len], yaml);
         off += yaml.len;
 
-        _ = try persistence_mod.persistEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]);
+        return persistence_mod.proposeEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]);
     }
 
-    /// Persist a processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
-    fn persistStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) !void {
+    /// A processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
+    fn proposeStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) !persistence_mod.ProposeResult {
         _ = self;
         const entry_type: EntryType = switch (status) {
             .stopped => .processing_stop,
             .cancelled => .processing_cancel,
-            else => return,
+            else => return error.NotATerminalStatus,
         };
         const value = &[_]u8{@intFromEnum(status)};
-        _ = try persistence_mod.persistEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
-        if (!shard.applyCommitted()) return error.NotApplied;
-
-        // Both terminal transitions route through here.
-        if (shard.metrics_registry) |m| switch (status) {
-            .cancelled => m.processing.recordCancelled(),
-            .stopped => m.processing.recordCompleted(),
-            else => {},
-        };
+        return persistence_mod.proposeEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
     }
 
-    /// Persist a processing_savepoint entry. Key = savepoint_id.
+    /// A processing_savepoint entry. Key = savepoint_id.
     /// Value format: [job_id_len:u16][job_id][records_at:u64][created_at_ms:i64]
-    fn persistSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) !void {
+    fn proposeSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64, created_at_ms: i64) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [512]u8 = undefined;
         var off: usize = 0;
@@ -820,17 +840,15 @@ pub const ProcessingHandler = struct {
         std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
         off += 8;
 
-        _ = try persistence_mod.persistEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]);
-        if (!shard.applyCommitted()) return error.NotApplied;
+        return persistence_mod.proposeEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]);
     }
 
-    /// Persist a processing_rescale entry. Key = job_id, value = [parallelism:u32].
-    fn persistRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) !void {
+    /// A processing_rescale entry. Key = job_id, value = [parallelism:u32].
+    fn proposeRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, value_buf[0..4], parallelism, .little);
-        _ = try persistence_mod.persistEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf);
-        if (!shard.applyCommitted()) return error.NotApplied;
+        return persistence_mod.proposeEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf);
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -853,6 +871,11 @@ pub const ProcessingHandler = struct {
     /// Apply a processing entry (live commit and boot replay alike).
     pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) void {
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
+        switch (etype) {
+            .processing_submit => self.last_submitted_job_id = null,
+            .processing_savepoint => self.last_savepoint_id = null,
+            else => {},
+        }
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
 
         switch (etype) {
@@ -938,6 +961,7 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_yaml);
             return;
         };
+        self.last_submitted_job_id = owned_id;
 
         // Rebuild the execution pipeline so a RUNNING job resumes consuming
         // after restart instead of just reappearing in the registry (FLO-104).
@@ -992,6 +1016,7 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_sp_id);
             self.allocator.free(owned_job_id);
         };
+        self.last_savepoint_id = owned_sp_id;
     }
 
     /// Replay a rescale entry. Value = [parallelism:u32].
@@ -1404,12 +1429,11 @@ pub const ProcessingHandler = struct {
         var val_buf: [16]u8 = undefined;
         std.mem.writeInt(u64, val_buf[0..8], pipe.stream_cursor_ts, .little);
         std.mem.writeInt(u64, val_buf[8..16], pipe.stream_cursor_seq, .little);
-        _ = persistence_mod.persistEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
+        // The applier records the persisted cursor.
+        _ = persistence_mod.proposeEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
             log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
             return;
         };
-        // The applier records the persisted cursor.
-        _ = shard.applyCommitted();
     }
 
     fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
@@ -1468,6 +1492,16 @@ pub const ProcessingHandler = struct {
         return allocator.dupe(ProcessingRecord, final) catch &.{};
     }
 
+    /// A record a sink could not write is lost to that sink (the cursor
+    /// has moved past it); said once per interval with the count.
+    fn noteSinkDrop(self: *ProcessingHandler, kind: []const u8, target: []const u8, why: []const u8) void {
+        self.sink_drops += 1;
+        const now = @import("stdx").time.milliTimestamp();
+        if (now - self.sink_warn_ms < 30_000) return;
+        self.sink_warn_ms = now;
+        log.err("pipeline {s} sink: record for '{s}' dropped: {s} ({d} sink records dropped so far)", .{ kind, target, why, self.sink_drops });
+    }
+
     /// Write a processed record to all matching sinks (TS source variant).
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
@@ -1478,7 +1512,15 @@ pub const ProcessingHandler = struct {
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
-                    _ = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                    // The applier names the stream by resolving its
+                    // namespace. Only this shard's handler may be touched
+                    // from this thread; a sink on another shard is listed
+                    // by its bare name until the namespace exists there.
+                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
+                    sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
+                        self.noteSinkDrop("stream", snk.target, @errorName(err));
+                        continue;
+                    };
                 },
                 .ts => {
                     const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
@@ -1509,7 +1551,15 @@ pub const ProcessingHandler = struct {
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
-                    _ = sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch continue;
+                    // The applier names the stream by resolving its
+                    // namespace. Only this shard's handler may be touched
+                    // from this thread; a sink on another shard is listed
+                    // by its bare name until the namespace exists there.
+                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
+                    sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
+                        self.noteSinkDrop("stream", snk.target, @errorName(err));
+                        continue;
+                    };
                 },
                 .ts => self.writeTsSinkFromJson(snk, shard, payload),
                 .kv => self.writeKvSink(snk, shard, record_key, payload),
@@ -1570,7 +1620,8 @@ pub const ProcessingHandler = struct {
         };
         const kv = self.resolveKvHandler(shard.kv_handler, snk.namespace, full_key);
         const result = kv.handleCommand(req);
-        kv.freeResult(result);
+        defer kv.freeResult(result);
+        if (result == .err) self.noteSinkDrop("kv", full_key, result.err.message);
     }
 
     /// Queue sink: enqueue the record payload into the configured queue (durable,
@@ -1590,8 +1641,12 @@ pub const ProcessingHandler = struct {
             .options = opt_buf[0..ob.offset],
         };
         const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
+        // The applier labels the queue by resolving its namespace; only
+        // this shard's handler may be touched from this thread.
+        if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
         const result = q.handleCommand(req);
-        q.freeResult(result);
+        defer q.freeResult(result);
+        if (result == .err) self.noteSinkDrop("queue", snk.target, result.err.message);
     }
 
     /// Build a minimal in-process request header carrying just the opcode.

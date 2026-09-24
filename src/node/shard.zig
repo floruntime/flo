@@ -244,6 +244,13 @@ pub const Shard = struct {
     /// the table is twice that.
     pending: []Pending,
     pending_count: u32,
+    /// The entry a responder is answering for: its index and header
+    /// timestamp, set just before the responder runs. A responder otherwise
+    /// reads what that entry's applier recorded in its module's `last_*`
+    /// fields; each applier clears its field first, so an entry it refused
+    /// answers as a failure (or zero), never with the entry before's result.
+    answering_index: u64,
+    answering_timestamp_ns: u64,
     /// The connection a responder answers on when the client's is not on
     /// this thread or no longer known: carries (owner, fd, id) and collects
     /// the bytes, which go out through `deliverDeferred`.
@@ -255,12 +262,6 @@ pub const Shard = struct {
     forward_count: u32,
     replies_held: u32,
     next_forward_id: u32,
-    /// True while `awaitCommit` runs under a write handler: a forwarded
-    /// write or a join arriving then is held for the next drain, since a
-    /// handler nested under another handler's stack overflows it.
-    awaiting: bool,
-    held_frames: std.ArrayListUnmanaged(RaftFrame),
-    held_dropped: u64,
     /// The leader disagreed with history this node had committed and
     /// applied: its projections cannot be trusted, so it takes no part
     /// until it is wiped and rejoined.
@@ -271,12 +272,9 @@ pub const Shard = struct {
     join_refused_warn_ms: u64,
     stranger_warn_ms: u64,
     frame_warn_ms: u64,
-    held_warn_ms: u64,
     late_apply_warn_ms: u64,
     election_warn_ms: u64,
     elections_unlogged: u64,
-    commit_timeouts: u64,
-    commit_warn_ms: u64,
     /// One limiter per peer for each thing the leader loop says about it.
     peer_silent_warn_ms: [raft_node_mod.MAX_PEERS]u64,
     peer_batch_warn_ms: [raft_node_mod.MAX_PEERS]u64,
@@ -333,6 +331,15 @@ pub const Shard = struct {
     /// True while `applyCommitted` is draining, so a waiter woken by an
     /// apply that proposes in turn cannot start a nested drain.
     applying: bool,
+    /// Whether the last entry the apply loop took applied; `park` answers
+    /// from it, not from the whole pass's result.
+    last_entry_applied: bool,
+    /// An invoke applied on this leader in the current pass: its workers
+    /// are woken once, after the pass.
+    wake_workers: bool,
+    /// The tick's step passes stopped at their cap with work left: the
+    /// next poll does not wait.
+    more_work: bool,
 
     /// Self-routing run ID generator (per-shard, single-threaded).
     run_id_gen: run_id_mod.Generator,
@@ -696,14 +703,13 @@ pub const Shard = struct {
             .join_asked_ms = 0,
             .pending = pending,
             .pending_count = 0,
+            .answering_index = 0,
+            .answering_timestamp_ns = 0,
             .respond_proxy = respond_proxy,
             .forwards = forwards,
             .forward_count = 0,
             .replies_held = 0,
             .next_forward_id = FORWARD_ID_FIRST,
-            .awaiting = false,
-            .held_frames = .empty,
-            .held_dropped = 0,
             .diverged = false,
             .conflicts_seen = 0,
             .join_first_asked_ms = 0,
@@ -711,12 +717,9 @@ pub const Shard = struct {
             .join_refused_warn_ms = 0,
             .stranger_warn_ms = 0,
             .frame_warn_ms = 0,
-            .held_warn_ms = 0,
             .late_apply_warn_ms = 0,
             .election_warn_ms = 0,
             .elections_unlogged = 0,
-            .commit_timeouts = 0,
-            .commit_warn_ms = 0,
             .peer_silent_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
             .peer_batch_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
             .hard_state_store = hard_state_store,
@@ -743,6 +746,9 @@ pub const Shard = struct {
             .replay_registry = replay_registry,
             .apply_buf = apply_buf,
             .applying = false,
+            .last_entry_applied = true,
+            .wake_workers = false,
+            .more_work = false,
             .run_id_gen = .{},
             .metrics_registry = null,
         };
@@ -883,8 +889,6 @@ pub const Shard = struct {
             if (f.reply) |r| self.allocator.free(r);
         };
         self.allocator.free(self.forwards);
-        for (self.held_frames.items) |f| self.allocator.free(f.payload);
-        self.held_frames.deinit(self.allocator);
         for (self.pending) |*p| if (p.active) self.allocator.free(p.bytes);
         self.allocator.free(self.pending);
         self.respond_proxy.deinit();
@@ -1062,6 +1066,11 @@ pub const Shard = struct {
             .shard => |s| self.forwardToShard(s.shard_id, conn, req),
             .remote => |r| self.forwardToRemote(conn, req, r.node_id),
         }
+        // Apply what committed during the request: on a single node, what
+        // its handler proposed on its own account (a dequeue's ack, an
+        // implicit namespace create) and anything past the entry `park`
+        // answered at. In a cluster these wait for a peer's ack.
+        _ = self.applyCommitted();
     }
 
     /// Run a request on this shard — unless it writes and this shard's
@@ -1432,6 +1441,9 @@ pub const Shard = struct {
 
         proxy.recordRequest();
         self.dispatchLocal(proxy, req);
+        // As after a client's own request: what it proposed on its own
+        // account applies before the next.
+        _ = self.applyCommitted();
 
         // Pull any queued direct response off the proxy and ship the bytes
         // back to the owner. If the handler deferred the response (e.g. a
@@ -1473,37 +1485,10 @@ pub const Shard = struct {
         self.flushToClient(fd);
     }
 
-    /// Every frame the network queued since the last drain, after any
-    /// held back by an `awaitCommit` that has since returned.
+    /// Every frame the network queued since the last drain.
     fn drainRaftQueue(self: *Shard) void {
         const q = self.raft_queue orelse return;
-        if (!self.awaiting and self.held_frames.items.len > 0) {
-            const held = self.held_frames.toOwnedSlice(self.allocator) catch return;
-            defer self.allocator.free(held);
-            for (held) |frame| {
-                defer self.allocator.free(frame.payload);
-                self.handleRaftFrame(frame);
-            }
-        }
         while (q.pop()) |frame| {
-            if (self.awaiting and (frame.msg_type == .forward_write or frame.msg_type == .join_request)) {
-                // Held frames sit outside the queue's watermarks, so they
-                // have a cap of their own; a write past it is refused to the
-                // node that sent it, so its client is answered.
-                if (self.held_frames.items.len >= HELD_FRAMES_MAX) {
-                    self.held_dropped += 1;
-                    if (frame.msg_type == .forward_write) self.refuseForward(frame);
-                    self.allocator.free(frame.payload);
-                    const now = nowMs();
-                    if (now -| self.held_warn_ms >= WARN_INTERVAL_MS) {
-                        self.held_warn_ms = now;
-                        log.warn("shard {d}: {d} forwarded writes and joins refused so far while a write waited for commit (at most {d} are held)", .{ self.id, self.held_dropped, HELD_FRAMES_MAX });
-                    }
-                    continue;
-                }
-                self.held_frames.append(self.allocator, frame) catch self.allocator.free(frame.payload);
-                continue;
-            }
             defer self.allocator.free(frame.payload);
             self.handleRaftFrame(frame);
         }
@@ -1518,11 +1503,26 @@ pub const Shard = struct {
     /// already committed (a group of one) that is right away, on the
     /// client's own connection.
     pub fn park(self: *Shard, conn: *Connection, req: proto.Request, proposed: raft_node_mod.ProposeResult, responder: HandlerFn) void {
+        // Inside the apply loop `applyCommitted` returns without draining:
+        // a single node's responder would run before its entry applied.
+        std.debug.assert(!self.applying);
         if (self.raft_node.commit_index >= proposed.index) {
-            if (!self.applyCommitted()) {
-                self.sendErrorResponse(conn, req.header.request_id, .internal_error, "committed entry not applied");
+            // Up to this write's entry and no further: its responder reads
+            // what that entry's applier recorded, which a later entry
+            // (another thread's proposal) would overwrite. The dispatch
+            // that parked this applies the rest.
+            std.debug.assert(self.raft_node.last_applied < proposed.index);
+            _ = self.applyThrough(proposed.index);
+            if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
+                if (conn.protocol == .resp) {
+                    _ = conn.queueWrite("-ERR " ++ persistence_mod.COMMITTED_NOT_APPLIED ++ "\r\n");
+                } else {
+                    self.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+                }
                 return;
             }
+            self.answering_index = proposed.index;
+            self.answering_timestamp_ns = proposed.timestamp_ns;
             responder(@ptrCast(self), @ptrCast(conn), req);
             return;
         }
@@ -1531,11 +1531,11 @@ pub const Shard = struct {
             // Cannot happen while the Raft node caps outstanding entries
             // below the table size; said out loud rather than trusted.
             log.err("shard {d}: pending slot for index {d} still holds index {d}", .{ self.id, proposed.index, slot.index });
-            self.sendErrorResponse(conn, req.header.request_id, .overloaded, "too many writes waiting for commit");
+            self.sendErrorResponse(conn, req.header.request_id, .overloaded, persistence_mod.failureMessage(error.Overloaded, ""));
             return;
         }
         const bytes = serializeRequest(self.allocator, req) catch {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "could not hold the request until commit");
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "internal error: could not hold the request until commit — write may still apply");
             return;
         };
         slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .owner_shard = conn.owner_shard, .fd = conn.fd, .conn_id = conn.id, .request_id = req.header.request_id, .bytes = bytes, .responder = responder };
@@ -1548,24 +1548,28 @@ pub const Shard = struct {
     }
 
     /// The entry at `index` applied (or could not): answer whoever waits.
-    fn answerPending(self: *Shard, index: u64, term: u64, applied: bool) void {
-        const slot = &self.pending[index % PENDING_SLOTS];
-        if (!slot.active or slot.index != index) return;
-        defer {
-            self.allocator.free(slot.bytes);
-            slot.active = false;
-            self.pending_count -= 1;
-        }
-        if (!applied) {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, "committed entry not applied");
-            return;
-        }
-        if (slot.term != term) {
+    fn answerPending(self: *Shard, index: u64, term: u64, timestamp_ns: u64, applied: bool) void {
+        const table_slot = &self.pending[index % PENDING_SLOTS];
+        if (!table_slot.active or table_slot.index != index) return;
+        // Out of the table before the responder runs, so a sweep of the
+        // table (`resolvePending`) while it runs cannot answer and free
+        // this request a second time.
+        const slot = table_slot.*;
+        table_slot.active = false;
+        self.pending_count -= 1;
+        defer self.allocator.free(slot.bytes);
+        // A different term at this index is a new leader's entry: this
+        // write never committed, whatever became of that one.
+        if (term != 0 and slot.term != term) {
             self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .unavailable, "unavailable: leader changed, write not applied — retry");
             return;
         }
+        if (!applied) {
+            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            return;
+        }
         const req = proto.Request.parse(slot.bytes) catch {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, "held request did not parse");
+            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
             return;
         };
         const proxy = self.respond_proxy;
@@ -1576,6 +1580,8 @@ pub const Shard = struct {
         proxy.response_deferred = false;
         proxy.write_buf.read_pos = 0;
         proxy.write_buf.write_pos = 0;
+        self.answering_index = index;
+        self.answering_timestamp_ns = timestamp_ns;
         slot.responder(@ptrCast(self), @ptrCast(proxy), req);
         const queued = proxy.write_buf.readable();
         if (queued > 0) {
@@ -1583,50 +1589,8 @@ pub const Shard = struct {
             const n = proxy.write_buf.read(temp_buf[0..@min(queued, temp_buf.len)]);
             self.deliverDeferred(slot.owner_shard, slot.fd, slot.conn_id, temp_buf[0..n]);
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, "no response after commit");
+            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
         }
-    }
-
-    /// Wait, on this thread, for `index` to commit: the leader loop runs
-    /// and Raft frames are handled meanwhile, and nothing else on the
-    /// shard moves. For the write handlers that answer from their own
-    /// stack; KV writes park instead. Which way it ended without a commit is the
-    /// client's to know: the entry may still commit under a later leader,
-    /// or under this one once the quorum answers.
-    pub fn awaitCommit(self: *Shard, index: u64) CommitWait {
-        const raft = self.raft_node;
-        if (raft.commit_index >= index) return .committed;
-        if (self.raft_network == null) return .timed_out;
-        const q = self.raft_queue orelse return .timed_out;
-        const outer = self.awaiting;
-        self.awaiting = true;
-        defer {
-            self.awaiting = outer;
-            // What was held is a queue the reactor does not see; wake it.
-            if (!outer and self.held_frames.items.len > 0) q.poke();
-        }
-        const deadline = nowMs() + raft.config.election_timeout_max_ms;
-        while (raft.commit_index < index) {
-            if (raft.role != .leader) return .leadership_lost;
-            const now = nowMs();
-            if (now >= deadline) {
-                // A quorum too slow for the deadline is otherwise a stream
-                // of client errors with an empty server log.
-                self.commit_timeouts += 1;
-                if (now -| self.commit_warn_ms >= WARN_INTERVAL_MS) {
-                    self.commit_warn_ms = now;
-                    log.warn("shard {d}: {d} write(s) so far waited {d} ms for a majority without a commit; the followers are slow or unreachable", .{ self.id, self.commit_timeouts, raft.config.election_timeout_max_ms });
-                }
-                return .timed_out;
-            }
-            self.pump(now);
-            var fds = [_]std.posix.pollfd{.{ .fd = q.wake_rd, .events = std.posix.POLL.IN, .revents = 0 }};
-            _ = std.posix.poll(&fds, @intCast(@min(10, deadline - now))) catch {};
-            if (fds[0].revents != 0) q.drainWake();
-            self.drainRaftQueue();
-            self.tickRaft();
-        }
-        return .committed;
     }
 
     fn resolvePending(self: *Shard, message: []const u8) void {
@@ -1719,7 +1683,7 @@ pub const Shard = struct {
                 continue;
             }
             if (leader == self.cluster_node_id) {
-                if (!self.awaiting) self.runHeldLocally(f);
+                self.runHeldLocally(f);
                 continue;
             }
             if (leader != 0) {
@@ -1743,7 +1707,7 @@ pub const Shard = struct {
         self.dropForward(f);
         defer self.allocator.free(bytes);
         const req = proto.Request.parse(bytes) catch {
-            self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "held request did not parse");
+            self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "internal error: the held write did not parse and was not written — retry");
             return;
         };
         const proxy = self.respond_proxy;
@@ -1763,18 +1727,6 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred) {
             self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "no response");
         }
-    }
-
-    /// A forwarded write this node will not run: the node that sent it
-    /// answers its client, rather than holding it for a term change.
-    fn refuseForward(self: *Shard, frame: RaftFrame) void {
-        const header_size = @sizeOf(proto.RequestHeader);
-        if (frame.payload.len < 4 + header_size) return;
-        const id = std.mem.readInt(u32, frame.payload[0..4], .little);
-        const header = @as(*align(1) const proto.RequestHeader, @ptrCast(frame.payload[4..].ptr)).*;
-        var buf: [256]u8 = undefined;
-        const serialized = proto.Response.serializeNew(.overloaded, header.request_id, "too many writes waiting for commit on the leader", &buf) catch return;
-        self.sendForwardReplyAt(frame.source_node, id, serialized, 0);
     }
 
     /// The client is gone: nothing it was waiting for needs a slot.
@@ -1832,16 +1784,10 @@ pub const Shard = struct {
     /// must have applied before handing it over: read-your-writes on the
     /// node the client wrote to.
     fn sendForwardReply(self: *Shard, peer: u32, id: u32, bytes: []const u8) void {
-        self.sendForwardReplyAt(peer, id, bytes, self.raft_node.last_applied);
-    }
-
-    /// `applied_by`: what the client's node must have applied before it
-    /// hands the answer over; 0 for an answer that committed nothing.
-    fn sendForwardReplyAt(self: *Shard, peer: u32, id: u32, bytes: []const u8, applied_by: u64) void {
         var buf: [12 + MAX_REQUEST_SIZE]u8 = undefined;
         if (12 + bytes.len > buf.len) return;
         std.mem.writeInt(u32, buf[0..4], id, .little);
-        std.mem.writeInt(u64, buf[4..12], applied_by, .little);
+        std.mem.writeInt(u64, buf[4..12], self.raft_node.last_applied, .little);
         @memcpy(buf[12 .. 12 + bytes.len], bytes);
         self.sendRaft(peer, .forward_reply, buf[0 .. 12 + bytes.len]);
     }
@@ -2041,7 +1987,7 @@ pub const Shard = struct {
             self.raft_node.role = .follower;
             self.raft_node.leader_id = 0;
         }
-        self.resolvePending(DIVERGED_MESSAGE);
+        self.stoppedLeading(DIVERGED_MESSAGE);
         // An answer already held is the leader's, and the write it
         // answers committed; the client gets it.
         for (self.forwards) |*f| {
@@ -2115,7 +2061,19 @@ pub const Shard = struct {
 
     fn leadershipLost(self: *Shard, why: []const u8) void {
         log.warn("shard {d}: stepped down ({s}); now following at term {d}", .{ self.id, why, self.raft_node.current_term });
-        self.resolvePending("unavailable: lost leadership before commit — write may still apply");
+        self.stoppedLeading("unavailable: lost leadership before commit — write may still apply");
+    }
+
+    /// What a leader had in flight is no longer its to finish: parked
+    /// writes are answered with `message`, runs it had not stepped stay at
+    /// their start, and implicit creates may have been dropped with the
+    /// log's tail.
+    fn stoppedLeading(self: *Shard, message: []const u8) void {
+        // A follower takes no step passes; its polls wait again.
+        self.more_work = false;
+        self.workflow_handler.dropStartedRuns(self);
+        self.namespace_handler.forgetImplicitCreates();
+        self.resolvePending(message);
     }
 
     /// The leader loop, once per tick and after anything that changes what
@@ -2263,11 +2221,14 @@ pub const Shard = struct {
         return true;
     }
 
-    /// Apply everything the Raft node has committed but not yet applied.
-    /// Single-node commit is immediate, so a write handler calls this right
-    /// after `propose` and then reads its result from projection state.
-    /// False when an entry could not be applied: the caller must not report
-    /// success from state that does not hold it.
+    /// Apply every committed entry not yet applied. Only the shard's own
+    /// loop calls this: at boot, on a Raft frame, on an election won alone,
+    /// after each client request (binary, RESP, or forwarded from another
+    /// shard), and in the tick; `park` applies up to its own entry through
+    /// `applyThrough`. Module code never does: applying in the middle of its own
+    /// work would run other writers' appliers and responders under its
+    /// locks and over its pointers into the maps they change. False when an
+    /// entry could not be applied.
     ///
     /// A waiter woken by an apply may propose in turn (a dequeue acks the
     /// message it took); that entry lands in the log and this loop reaches
@@ -2277,13 +2238,24 @@ pub const Shard = struct {
     /// means "nothing failed", not "applied": a notification must not read
     /// projection state for an entry it proposed.
     pub fn applyCommitted(self: *Shard) bool {
+        return self.applyThrough(std.math.maxInt(u64));
+    }
+
+    /// `applyCommitted`, stopping after index `limit`.
+    fn applyThrough(self: *Shard, limit: u64) bool {
         if (self.applying) return true;
+        // Called after every request: nothing to apply is the common case.
+        // A `sync` flush still happens, as it did before this shortcut.
+        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) {
+            self.syncFlushIfNeeded();
+            return true;
+        }
         self.applying = true;
         defer self.applying = false;
 
         const raft = self.raft_node;
         var all_applied = true;
-        while (raft.last_applied < raft.commit_index) {
+        while (raft.last_applied < @min(raft.commit_index, limit)) {
             const next_idx = raft.last_applied + 1;
             // Advanced before the apply: whatever a notification does, this
             // entry is never taken twice, and the loop cannot stall.
@@ -2291,9 +2263,11 @@ pub const Shard = struct {
             if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
                 const applied = self.applyEntry(&e);
                 if (!applied) all_applied = false;
-                self.answerPending(next_idx, e.header.term, applied);
+                self.last_entry_applied = applied;
+                self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
             } else {
-                self.answerPending(next_idx, 0, false);
+                self.last_entry_applied = false;
+                self.answerPending(next_idx, 0, 0, false);
                 // A committed index is always within the log, in the ring
                 // or below it in the durable log, and the buffer fits every
                 // entry; an unreadable one is a bug or a damaged segment.
@@ -2301,6 +2275,10 @@ pub const Shard = struct {
                 log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
                 all_applied = false;
             }
+        }
+        if (self.wake_workers) {
+            self.wake_workers = false;
+            ActionsHandler.wakeWorkers(self);
         }
         self.syncFlushIfNeeded();
         if (self.replies_held > 0) self.releaseReplies();
@@ -2367,6 +2345,14 @@ pub const Shard = struct {
                     const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
                     mr.unregisterStream(ns, cmd.key, 0);
                 }
+            },
+            // A run exists from here. Only a leader wakes waiting workers: a
+            // claim is not in the log, so a worker woken here on a follower
+            // would take a run the leader's workers also take. Woken once
+            // per pass: an ack can apply many invokes, and each wake-up is a
+            // message to every other shard.
+            .action_invoke => if (self.raft_node.role == .leader) {
+                self.wake_workers = true;
             },
             .queue_enqueue => {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
@@ -2435,9 +2421,35 @@ pub const Shard = struct {
         // Drive workflow scheduled triggers (interval → start runs)
         if (leads) self.workflow_handler.tickSchedules(self);
 
-        // Check for completed async actions and resume waiting workflow runs
-        // (resuming proposes the run's next entries, so leader-only too).
-        if (leads) self.workflow_handler.checkPendingActions(self);
+        // The producers above only proposed. What has committed (at once
+        // on a single node) applies here, outside any module's work.
+        _ = self.applyCommitted();
+
+        if (leads) {
+            // Take the first step of runs whose start has applied, then
+            // resume waiting runs whose action or child finished (both
+            // propose the run's next entries, so leader-only too). On a
+            // single node what a pass proposes applies at once, so a child
+            // started in one pass takes its first step in the next rather
+            // than a tick later.
+            var pass: u8 = 0;
+            self.more_work = true;
+            while (pass < STEP_PASSES) : (pass += 1) {
+                const before = self.raft_node.last_applied;
+                self.workflow_handler.advanceStartedRuns(self);
+                self.workflow_handler.checkPendingActions(self);
+                _ = self.applyCommitted();
+                // Only what applied can be stepped; in a cluster what a
+                // pass proposed waits for an ack, so one pass is all.
+                if (self.raft_node.last_applied == before) {
+                    self.more_work = false;
+                    break;
+                }
+            }
+            // What the tick proposed goes to the followers now, not at the
+            // next poll.
+            if (self.raft_node.role == .leader) self.pump(nowMs());
+        }
 
         return events.len;
     }
@@ -2448,7 +2460,7 @@ pub const Shard = struct {
         log.debug("Shard {d} entering reactor loop", .{self.id});
 
         while (self.running) {
-            _ = self.tick(100) catch {
+            _ = self.tick(if (self.more_work) 0 else 100) catch {
                 continue;
             };
         }
@@ -2542,7 +2554,7 @@ pub const Shard = struct {
         if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
         const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
-        var total_trimmed: u64 = 0;
+        var trims_proposed: u64 = 0;
 
         var it = proj.stream_metadata.iterator();
         while (it.next()) |kv| {
@@ -2559,7 +2571,7 @@ pub const Shard = struct {
                     // Only trim if there are records to remove
                     const first_id = proj.streamFirstId(name_hash);
                     if (!first_id.eql(StreamID.MIN) and !first_id.greaterThan(cutoff_id)) {
-                        total_trimmed += self.stream_handler.persistTrim(name_hash, cutoff_id);
+                        if (self.stream_handler.persistTrim(name_hash, cutoff_id)) trims_proposed += 1;
                     }
                 }
             }
@@ -2572,13 +2584,13 @@ pub const Shard = struct {
                     const excess = count - meta.retention_count;
                     const trim_id = proj.resolveNthRecordId(name_hash, excess);
                     if (!trim_id.eql(StreamID.MIN)) {
-                        total_trimmed += self.stream_handler.persistTrim(name_hash, trim_id);
+                        if (self.stream_handler.persistTrim(name_hash, trim_id)) trims_proposed += 1;
                     }
                 }
             }
         }
 
-        return total_trimmed;
+        return trims_proposed;
     }
 
     /// TaskScheduler callback: sweep every consumer group's PEL (FLO-102).
@@ -2827,6 +2839,8 @@ pub const Shard = struct {
                 },
                 .command => |cmd| {
                     self.executeRespCommand(conn, cmd);
+                    // As after a binary request: what it proposed applies now.
+                    _ = self.applyCommitted();
                 },
             }
 
@@ -2858,14 +2872,47 @@ pub const Shard = struct {
 
         conn.requests_total += 1;
 
+        // RESP has no request ids and no forwarding: a write parked for a
+        // peer's ack would be answered out of order behind a pipelined
+        // read, and a follower cannot take it. On a single node the answer
+        // is inline, so writes are served there only.
+        if (self.raft_node.peer_count > 0 and dispatcher_mod.opWrites(cmd.opcode)) {
+            _ = conn.queueWrite("-ERR RESP writes are served by a single-node server; use the Flo protocol on a cluster\r\n");
+            self.freeRespCommand(cmd);
+            return;
+        }
+        // An enqueue's applier labels the queue by resolving its namespace
+        // (a stream append's handler proposes this itself).
+        if (cmd.opcode == .queue_enqueue) self.namespace_handler.proposeImplicitCreate(cmd.namespace, self, false);
+
         // Dispatch to the appropriate handler and get CommandResult
         const cmd_result = self.handleRespOpcode(cmd.opcode, req);
         defer self.kv_handler.freeResult(cmd_result);
+
+        // A stream append or queue enqueue is answered once its entry
+        // applies, like any client's: on a single node, inline. (Key-value
+        // writes over RESP still go straight to the projection.) A parked
+        // request is re-parsed from its bytes, so it carries its length
+        // and checksum.
+        if (cmd_result == .parked) {
+            defer self.freeRespCommand(cmd);
+            var parked = req;
+            parked.header.payload_length = @intCast(2 + req.namespace.len + 2 + req.key.len + 4 + req.value.len + 2 + req.options.len);
+            const wire = serializeRequest(self.allocator, parked) catch {
+                _ = conn.queueWrite("-ERR internal error: write proposed, its answer lost — do not resend\r\n");
+                return;
+            };
+            defer self.allocator.free(wire);
+            parked.header.crc32 = parked.header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
+            self.park(conn, parked, cmd_result.parked, respondResp);
+            return;
+        }
 
         // Translate CommandResult → RESP and serialize
         const resp_value = resp_mod.translateResult(cmd_result);
         const response_bytes = resp_mod.serialize(self.allocator, resp_value) catch {
             _ = conn.queueWrite("-ERR internal error\r\n");
+            self.freeRespCommand(cmd);
             return;
         };
         defer self.allocator.free(response_bytes);
@@ -2874,6 +2921,25 @@ pub const Shard = struct {
 
         // Free any heap-allocated fields from translateCommand
         self.freeRespCommand(cmd);
+    }
+
+    /// A RESP write applied: the module's answer, in RESP.
+    fn respondResp(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const self: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        var id_buf: [20]u8 = undefined;
+        const result: CommandResult = switch (@as(proto.OpCode, @enumFromInt(req.header.op_code))) {
+            .stream_append => self.stream_handler.respondAppend(),
+            .queue_enqueue => self.queue_handler.respondEnqueue(&id_buf),
+            else => .ok,
+        };
+        if (result != .err) self.namespace_handler.markNamespaceHasData(req.namespace, self);
+        const bytes = resp_mod.serialize(self.allocator, resp_mod.translateResult(result)) catch {
+            _ = conn.queueWrite("-ERR internal error\r\n");
+            return;
+        };
+        defer self.allocator.free(bytes);
+        _ = conn.queueWrite(bytes);
     }
 
     /// Route a RESP opcode to the appropriate handler, returning a CommandResult.
@@ -3618,11 +3684,10 @@ pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
 
         // Same contract as the queue handler's dequeue-ack: log, never fail
-        // the dequeue.
-        _ = persistence_mod.persistEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+        // the dequeue. The ack applies when it commits.
+        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
             log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
         };
-        _ = shard.applyCommitted();
     }
 
     shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
@@ -3743,11 +3808,11 @@ pub const FORWARD_TIMEOUT_MS: u64 = 5000;
 /// can never match one in the waiter pool.
 const FORWARD_ID_FIRST: u32 = 0x8000_0000;
 pub const DIVERGED_MESSAGE = "unavailable: this node's data diverged from the group and it takes no writes; use another node";
-/// Forwarded writes and joins held while a handler waits for commit, at most.
-const HELD_FRAMES_MAX: usize = 1024;
 
-/// How `awaitCommit` ended.
-pub const CommitWait = enum { committed, leadership_lost, timed_out };
+/// How many step passes one tick takes: a chain of child starts that
+/// deep resolves in one tick on a single node; a deeper one continues on
+/// the next tick, which does not wait.
+const STEP_PASSES: u8 = 4;
 /// Steady conditions are said once per interval, not per tick.
 const WARN_INTERVAL_MS: u64 = 30_000;
 const JOIN_WARN_INTERVAL_MS: u64 = 30_000;
@@ -4189,7 +4254,7 @@ test "Shard: a frame from a node the membership does not name is dropped, a join
     try std.testing.expectEqual(raft_node_mod.Role.follower, raft.role);
 }
 
-test "Shard: a diverged node refuses writes even if it led, and a held frame past the cap is refused to its sender" {
+test "Shard: a diverged node refuses writes even if it led" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -4224,46 +4289,6 @@ test "Shard: a diverged node refuses writes even if it led, and a held frame pas
     const resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "diverged") != null);
-
-    // Held frames past the cap are refused to the node that sent them,
-    // one reply each, and not kept.
-    shard.diverged = false;
-    shard.awaiting = true;
-    var fwd: [4 + @sizeOf(proto.RequestHeader)]u8 = undefined;
-    std.mem.writeInt(u32, fwd[0..4], 77, .little);
-    @memcpy(fwd[4..], std.mem.asBytes(&header));
-    for (0..HELD_FRAMES_MAX + 3) |_| {
-        try std.testing.expect(q.push(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = try std.testing.allocator.dupe(u8, &fwd) }));
-    }
-    shard.drainRaftQueue();
-    try std.testing.expectEqual(HELD_FRAMES_MAX, shard.held_frames.items.len);
-    try std.testing.expectEqual(@as(u64, 3), shard.held_dropped);
-    try std.testing.expectEqual(@as(usize, 3), rn.outbound.items.len);
-    // A refusal committed nothing: the sender hands it over at once.
-    const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
-    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, reply[4..12], .little));
-    shard.awaiting = false;
-    shard.drainRaftQueue();
-}
-
-test "Shard: a forwarded write arriving while a write awaits commit is held for the next drain" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var q = try RaftQueue.init(std.testing.allocator, 8);
-    defer q.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
-    defer shard.deinit();
-    shard.raft_queue = &q;
-
-    shard.awaiting = true;
-    try std.testing.expect(q.push(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = try std.testing.allocator.dupe(u8, "xx") }));
-    shard.drainRaftQueue();
-    try std.testing.expectEqual(@as(usize, 1), shard.held_frames.items.len);
-    try std.testing.expectEqual(@as(usize, 0), q.count());
-    shard.awaiting = false;
-    shard.drainRaftQueue();
-    try std.testing.expectEqual(@as(usize, 0), shard.held_frames.items.len);
 }
 
 test "Shard: a forward waits for its leader's answer, is answered when that leader is replaced, and runs here once this node leads" {
@@ -4344,8 +4369,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "lost the link") != null);
 
     // A write held while no leader was known, then this node leads: it
-    // runs here as the client's own request — but never under a handler
-    // that is itself waiting for commit.
+    // runs here as the client's own request.
     raft.leader_id = 0;
     header.request_id = 6;
     header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
@@ -4353,10 +4377,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     raft.role = .leader;
     raft.leader_id = 8;
-    shard.awaiting = true;
-    shard.sweepForwards(now);
-    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
-    shard.awaiting = false;
     shard.sweepForwards(now);
     try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
     n = std.c.read(pair[1], &out, out.len);
@@ -4395,6 +4415,646 @@ test "Shard: a data directory that belonged to a group refuses to run alone, and
     try std.testing.expect(member.raft_node.timer_enabled);
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, member.raft_node.memberIds(&ids));
+}
+
+/// Writes parked behind a second member's ack, driven over a socket pair
+/// the way a client drives them.
+const ParkTest = struct {
+    /// The shard leads alone, then adds member 2: from here nothing
+    /// commits until `ack`.
+    fn joinPeer(sh: *Shard) !void {
+        try std.testing.expect(sh.applyCommitted());
+        sh.handleJoinRequest(2);
+        try ack(sh);
+    }
+
+    /// Member 2 acks everything in the log; the shard applies it.
+    fn ack(sh: *Shard) !void {
+        const r = sh.raft_node;
+        const last = r.log.lastIndex();
+        r.peers[0].sent_up_to = last;
+        r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = 2 });
+        try std.testing.expect(sh.applyCommitted());
+    }
+
+    /// A request as the wire carries it: a parked request is re-parsed
+    /// from its bytes, so its length and checksum must hold.
+    fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
+        var header: proto.RequestHeader = undefined;
+        @memset(std.mem.asBytes(&header), 0);
+        header.magic = proto.MAGIC;
+        header.version = proto.VERSION;
+        header.op_code = @intFromEnum(op);
+        header.request_id = id;
+        header.payload_length = @intCast(2 + ns.len + 2 + key.len + 4 + value.len + 2 + options.len);
+        var req: proto.Request = .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
+        const wire = try Shard.serializeRequest(std.testing.allocator, req);
+        defer std.testing.allocator.free(wire);
+        req.header.crc32 = req.header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
+        return req;
+    }
+
+    fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
+        sh.dispatchRequest(c, try request(op, id, "", key, value, ""));
+    }
+
+    /// Every response the shard has for `c`, flushed and read from `fd`
+    /// without blocking; fails unless exactly `into.len` whole responses
+    /// arrived and nothing is left.
+    fn responses(sh: *Shard, c: *Connection, fd: std.posix.fd_t, buf: []u8, into: []proto.Response) !void {
+        sh.flushToClient(c.fd);
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = std.c.recv(fd, buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+            if (n <= 0) break;
+            total += @intCast(n);
+        }
+        var off: usize = 0;
+        for (into) |*r| {
+            r.* = try proto.Response.parse(buf[off..total]);
+            off += @sizeOf(proto.ResponseHeader) + r.data.len;
+        }
+        try std.testing.expectEqual(total, off);
+    }
+};
+
+test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    const raft = shard.raft_node;
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    var f64_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &f64_bytes, @bitCast(@as(f64, 1.5)), .little);
+    // Two appends and two enqueues, interleaved with a time-series write:
+    // each responder must run right after its own entry applies, before
+    // the next entry's applier overwrites what it reads. Answering after
+    // the whole batch applied would give the first of each pair the
+    // second's id.
+    try ParkTest.send(&shard, conn, .stream_append, 10, "s", "a");
+    try ParkTest.send(&shard, conn, .queue_enqueue, 11, "q", "m1");
+    try ParkTest.send(&shard, conn, .ts_write, 12, "cpu", &f64_bytes);
+    const ts_index = raft.log.lastIndex();
+    try ParkTest.send(&shard, conn, .stream_append, 13, "s", "b");
+    try ParkTest.send(&shard, conn, .queue_enqueue, 14, "q", "m2");
+    try std.testing.expectEqual(@as(u32, 5), shard.pending_count);
+    var buf: [2048]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &.{});
+
+    try ParkTest.ack(&shard);
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+
+    var rs: [5]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &rs);
+    for (rs, 0..) |resp, i| {
+        // Answered in log order.
+        try std.testing.expectEqual(@as(u64, 10 + i), resp.header.request_id);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    }
+    const first_seq = std.mem.readInt(u64, rs[0].data[0..8], .little);
+    const first_ts = std.mem.readInt(u64, rs[0].data[8..16], .little);
+    // The second record's id follows the first's: the next sequence in the
+    // same millisecond, or a later millisecond.
+    const seq = std.mem.readInt(u64, rs[3].data[0..8], .little);
+    const ts = std.mem.readInt(u64, rs[3].data[8..16], .little);
+    try std.testing.expect(ts > first_ts or (ts == first_ts and seq == first_seq + 1));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, rs[1].data[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, rs[4].data[0..8], .little));
+    // Server-stamped: the point's timestamp is its entry header's clock,
+    // its sequence its entry's index.
+    const hdr_ms = raft.log.getEntry(ts_index).?.header.timestamp_ns / 1_000_000;
+    try std.testing.expectEqual(hdr_ms, std.mem.readInt(u64, rs[2].data[8..16], .little));
+    try std.testing.expectEqual(ts_index, std.mem.readInt(u64, rs[2].data[16..24], .little));
+}
+
+test "Shard: on a cluster leader a workflow's first step invokes its action without waiting for the commit, and the run resumes once the action's completion applies" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    const raft = shard.raft_node;
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    // An action workers take, and a workflow whose first step invokes it.
+    const reg: [8]u8 = .{0} ** 8;
+    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", &reg);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 20, "flow", def);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+
+    // The start is answered once it applies; its first step waits.
+    try ParkTest.send(&shard, conn, .workflow_start, 21, "flow", "");
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    const wf = shard.workflow_handler;
+    const Run = struct {
+        fn byId(h: *WorkflowHandler, id: []const u8) *WorkflowHandler.RunRecord {
+            var it = h.runs.valueIterator();
+            while (it.next()) |r| if (std.mem.eql(u8, r.run_id_owned, id)) return r;
+            @panic("no run with that id");
+        }
+    };
+    var a_id_buf: [32]u8 = undefined;
+    const a_id = a_id_buf[0..one[0].data.len];
+    @memcpy(a_id, one[0].data);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.running, Run.byId(wf, a_id).status);
+    try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
+
+    // Only a leader takes a step: a follower's proposal would be refused.
+    raft.role = .follower;
+    wf.advanceStartedRuns(&shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.running, Run.byId(wf, a_id).status);
+    raft.role = .leader;
+
+    // A second client's start is parked when the first run takes its
+    // step. The step proposes the invoke and moves on: nothing waits for
+    // its commit with the workflow's lock held.
+    try ParkTest.send(&shard, conn, .workflow_start, 22, "flow", "");
+    wf.advanceStartedRuns(&shard);
+    const a = Run.byId(wf, a_id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, a.status);
+    const action_run = a.pending_action_run_id_owned.?;
+    try std.testing.expect(shard.actions_handler.runs.get(action_run) == null);
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+    // One ack commits both: the second start is answered (its responder
+    // takes the workflow's lock, which nothing holds), and the invoke
+    // applies, so workers can take the action run.
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, shard.actions_handler.runs.get(action_run).?.status);
+    wf.advanceStartedRuns(&shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, one[0].data).status);
+
+    // The action's completion is parked like any write; once it applies,
+    // the run resumes and follows its success transition.
+    var done: [64]u8 = undefined;
+    var off: usize = 0;
+    inline for (.{ "act", action_run, "success" }) |part| {
+        std.mem.writeInt(u16, done[off..][0..2], @intCast(part.len), .little);
+        off += 2;
+        @memcpy(done[off .. off + part.len], part);
+        off += part.len;
+    }
+    try ParkTest.send(&shard, conn, .action_complete, 24, "", done[0..off]);
+    // Proposed, not applied: the run still waits.
+    wf.checkPendingActions(&shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, a_id).status);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 24), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    wf.checkPendingActions(&shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, Run.byId(wf, a_id).status);
+}
+
+test "Shard: what the tick's workflow steps propose is sent to the followers in that tick" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const reg: [8]u8 = .{0} ** 8;
+    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", &reg);
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 60, "flow", def);
+    try ParkTest.ack(&shard);
+    try ParkTest.send(&shard, conn, .workflow_start, 61, "flow", "");
+    try ParkTest.ack(&shard);
+
+    // The tick takes the run's first step, which proposes an invoke; the
+    // follower hears of it before the tick ends, not at the next poll.
+    const raft = shard.raft_node;
+    const before = raft.log.lastIndex();
+    const sent = rn.outbound.items.len;
+    _ = try shard.tick(0);
+    try std.testing.expect(raft.log.lastIndex() > before);
+    try std.testing.expect(rn.outbound.items.len > sent);
+    // What went out carries the new entry, not only a heartbeat.
+    try std.testing.expectEqual(raft.log.lastIndex(), raft.peers[0].sent_up_to);
+}
+
+test "Shard: a step-down forgets the queued first steps and the in-flight implicit creates" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 20, "gate", def);
+    try ParkTest.ack(&shard);
+    try ParkTest.send(&shard, conn, .workflow_start, 21, "gate", "");
+    try ParkTest.ack(&shard);
+    shard.namespace_handler.markNamespaceHasData("other", &shard);
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.implicit_creates.count());
+
+    // What this leader had in flight may be gone with its log's tail.
+    shard.leadershipLost("test");
+    try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.implicit_creates.count());
+}
+
+test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [2048]u8 = undefined;
+
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 80, "a", "gate", def, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 81, "b", "gate", def, ""));
+    try ParkTest.ack(&shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+
+    const keyed = [_]u8{ 0, 0, 1, 3, 0, 'k', 'e', 'y', 0 };
+    const named = [_]u8{ 0, 0, 0, 1, 2, 0, 'r', '1' };
+    // A retry carrying both its key and its own run id is the same start.
+    const both = [_]u8{ 0, 0, 1, 1, 0, 'z', 1, 2, 0, 'r', '2' };
+    // A key longer than any fixed buffer is still a key.
+    var long: [2 + 1 + 2 + 2000 + 1]u8 = undefined;
+    @memset(&long, 'x');
+    long[0] = 0;
+    long[1] = 0;
+    long[2] = 1;
+    std.mem.writeInt(u16, long[3..5], 2000, .little);
+    long[long.len - 1] = 0;
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 82, "a", "gate", &keyed, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 83, "b", "gate", &keyed, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 84, "a", "gate", &named, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 85, "a", "gate", &named, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 86, "a", "gate", &both, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 87, "a", "gate", &both, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 88, "a", "gate", &long, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 89, "a", "gate", &long, ""));
+    try ParkTest.ack(&shard);
+    var rs: [8]proto.Response = undefined;
+    var big: [4096]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &big, &rs);
+    // One key in two namespaces is two runs.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[1].header.status);
+    try std.testing.expect(!std.mem.eql(u8, rs[0].data, rs[1].data));
+    // The run id is the first start's; the second is refused.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[2].header.status);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.conflict), rs[3].header.status);
+    // Key and run id together: the retry is answered with the first run.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[5].header.status);
+    try std.testing.expectEqualStrings(rs[4].data, rs[5].data);
+    // A long key: one run, both answered with it.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[7].header.status);
+    try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
+    try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
+
+    // A namespace a run key cannot carry is refused, for a definition and
+    // for a start, before anything is proposed.
+    const before = shard.raft_node.log.lastIndex();
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""));
+    try ParkTest.responses(&shard, conn, pair[1], &big, &two);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
+    try std.testing.expectEqualStrings("invalid namespace name", two[1].data);
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+}
+
+test "Shard: a RESP stream append answers with its record's sequence once its entry applies" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    conn.protocol = .resp;
+
+    const a = std.testing.allocator;
+    shard.executeRespCommand(conn, .{ .opcode = .stream_append, .namespace = "", .key = try a.dupe(u8, "s"), .value = try a.dupe(u8, "a") });
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+
+    // `XADD` answers once, with the record's sequence, not nil.
+    const id = shard.stream_handler.stream.streamLastId(node_router.nameHash(node_router.namespaceHash(""), "s"));
+    var want_buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, ":{d}\r\n", .{id.sequence});
+    shard.flushToClient(conn.fd);
+    var buf: [64]u8 = undefined;
+    const n = std.c.recv(pair[1], &buf, buf.len, std.c.MSG.DONTWAIT);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings(want, buf[0..@intCast(n)]);
+    // Counted against its namespace, as a Flo-protocol write is.
+    try std.testing.expect(shard.namespace_handler.namespaceHasData("default"));
+}
+
+test "Shard: a RESP write on a cluster is refused in RESP, not parked" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    conn.protocol = .resp;
+
+    const a = std.testing.allocator;
+    const before = shard.raft_node.log.lastIndex();
+    shard.executeRespCommand(conn, .{ .opcode = .stream_append, .namespace = "", .key = try a.dupe(u8, "s"), .value = try a.dupe(u8, "a") });
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    shard.flushToClient(conn.fd);
+    var buf: [128]u8 = undefined;
+    const n = std.c.recv(pair[1], &buf, buf.len, std.c.MSG.DONTWAIT);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.startsWith(u8, buf[0..@intCast(n)], "-ERR "));
+}
+
+test "Shard: concurrent conditional writes are decided in log order: one run per idempotency key, one create per namespace, one version per register" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [2048]u8 = undefined;
+
+    const def =
+        \\{"kind":"Workflow","name":"gate","version":"1.0.0",
+        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 70, "gate", def);
+    try ParkTest.ack(&shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+
+    // Each pair passes its handler's check before the other applies.
+    const start = [_]u8{ 0, 0, 1, 3, 0, 'k', 'e', 'y', 0 };
+    try ParkTest.send(&shard, conn, .workflow_start, 71, "gate", &start);
+    try ParkTest.send(&shard, conn, .workflow_start, 72, "gate", &start);
+    try ParkTest.send(&shard, conn, .namespace_create, 73, "team", "");
+    try ParkTest.send(&shard, conn, .namespace_create, 74, "team", "");
+    try ParkTest.send(&shard, conn, .action_register, 75, "act", "");
+    try ParkTest.send(&shard, conn, .action_register, 76, "act", "");
+    try std.testing.expectEqual(@as(u32, 6), shard.pending_count);
+    try ParkTest.ack(&shard);
+
+    var rs: [6]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &rs);
+    // The second start is answered with the first's run, and created none.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[0].header.status);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[1].header.status);
+    try std.testing.expectEqualStrings(rs[0].data, rs[1].data);
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    // The second create finds the namespace there.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[2].header.status);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.conflict), rs[3].header.status);
+    // Two registers are two versions.
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[5].header.status);
+    try std.testing.expectEqual(@as(u32, 2), shard.actions_handler.actions.get("act").?.version);
+}
+
+test "Shard: park answers from its own entry when a later one has already committed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // On a single node both appends commit as they are proposed; the second
+    // stands for another thread's proposal landing before this write parks.
+    // The first write's responder must read the first's record.
+    const Seen = struct {
+        var index: u64 = 0;
+        var id: ?StreamID = null;
+        fn respond(shard_ptr: *anyopaque, _: *anyopaque, _: proto.Request) void {
+            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
+            index = sh.raft_node.last_applied;
+            id = sh.stream_handler.last_append;
+        }
+    };
+    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
+    defer std.testing.allocator.free(v);
+    const first = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    shard.park(conn, try ParkTest.request(.stream_append, 50, "", "s", "a", ""), first, Seen.respond);
+    try std.testing.expectEqual(first.index, Seen.index);
+    // The dispatch that parked applies the rest; the second record is not
+    // the one the first write was answered with.
+    try std.testing.expect(shard.applyCommitted());
+    const hash = node_router.nameHash(node_router.namespaceHash(""), "s");
+    try std.testing.expect(Seen.id.?.eql(shard.stream_handler.stream.streamFirstId(hash)));
+    try std.testing.expect(!Seen.id.?.eql(shard.stream_handler.stream.streamLastId(hash)));
+}
+
+test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // The append's applier names the stream by resolving its namespace, so
+    // the namespace's create must apply first, here and on every replay.
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "a", ""));
+    try ParkTest.ack(&shard);
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    var q_buf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const names = shard.stream_handler.stream.stream_names;
+    try std.testing.expect(names.contains(try handler_mod.qualifyKey(&q_buf, "fresh", "s")));
+    try std.testing.expect(!names.contains("s"));
+}
+
+test "Shard: a parked request leaves the pending table before its responder runs, so a sweep during it answers the client once" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // A responder that sweeps the pending table: the request it answers
+    // must not be in it.
+    const Sweep = struct {
+        fn respond(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
+            sh.resolvePending("swept");
+            sh.sendOkResponse(@ptrCast(@alignCast(conn_ptr)), req.header.request_id, "answered");
+        }
+    };
+    // Any entry will do: the responder under test never reads it.
+    const proposed = try persistence_mod.proposeEntry(&shard, .namespace_create, entry_mod.Flags.NONE, "", "k", "");
+    shard.park(conn, try ParkTest.request(.kv_put, 30, "", "k", "v", ""), proposed, Sweep.respond);
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+    try ParkTest.ack(&shard);
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+    // One answer, the responder's.
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 30), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqualStrings("answered", one[0].data);
+}
+
+test "Shard: a burst of first writes to a new namespace proposes one implicit create, and a write after it applied proposes another if the namespace is gone" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    const raft = shard.raft_node;
+    const ns = shard.namespace_handler;
+
+    const Count = struct {
+        fn creates(r: *RaftNode, from: u64) u32 {
+            var n: u32 = 0;
+            var i = from;
+            while (i <= r.log.lastIndex()) : (i += 1) {
+                if (r.log.getEntry(i).?.header.entry_type == @intFromEnum(entry_mod.EntryType.namespace_create)) n += 1;
+            }
+            return n;
+        }
+    };
+    const first = raft.log.lastIndex() + 1;
+    for (0..3) |_| ns.markNamespaceHasData("fresh", &shard);
+    try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, first));
+
+    // Once it applies the namespace exists, counted once however many
+    // writes the burst held.
+    try ParkTest.ack(&shard);
+    try std.testing.expectEqual(@as(u32, 1), ns.namespaces.get("fresh").?.data_count);
+
+    // Applied, it no longer stands in the way: a namespace removed since
+    // is created again by its next write.
+    ns.applyDelete("fresh");
+    const again = raft.log.lastIndex() + 1;
+    ns.markNamespaceHasData("fresh", &shard);
+    try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, again));
 }
 
 test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {
@@ -4448,7 +5108,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
             calls += 1;
             const shard_inner = shard_ptr;
             last_applied_seen = shard_inner.raft_node.last_applied;
-            _ = persistence_mod.persistEntry(shard_inner, .kv_put, entry_mod.Flags.NONE, "", "nested", "v") catch unreachable;
+            _ = persistence_mod.proposeEntry(shard_inner, .kv_put, entry_mod.Flags.NONE, "", "nested", "v") catch unreachable;
             _ = shard_inner.applyCommitted();
             nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
         }
@@ -4457,7 +5117,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     var ctx: u8 = 0;
     shard.replay_registry.register(.raft_config, @ptrCast(&ctx), Probe.apply);
 
-    const idx = try persistence_mod.persistEntry(&shard, .raft_config, entry_mod.Flags.NONE, "", "probe", "");
+    const idx = (try persistence_mod.proposeEntry(&shard, .raft_config, entry_mod.Flags.NONE, "", "probe", "")).index;
     try std.testing.expect(shard.applyCommitted());
 
     // The entry in hand was marked applied before its applier ran, so a
@@ -4553,16 +5213,16 @@ test "a truncated suffix is gone from the segments a restart replays" {
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
 
-        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "A");
+        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "A");
         try std.testing.expect(shard.applyCommitted());
         // An uncommitted tail, flushed: the shape a follower is left with
         // when its leader dies mid-batch.
-        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "C");
+        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "C");
         try shard.flushSegmentToDisk();
         // The new leader's log disagrees at index 3; commit never covered it.
         shard.raft_node.commit_index = 2;
         shard.raft_node.log.truncateAfter(2);
-        _ = try persistence_mod.persistEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "D");
+        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "D");
         try std.testing.expect(shard.applyCommitted());
         try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
     }
@@ -4667,8 +5327,8 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
         var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
-        _ = try persistence_mod.persistEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
-        _ = try persistence_mod.persistEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
+        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
         try std.testing.expect(shard.applyCommitted());
         // Sealed under a lagging commit, as a follower's segment is, then a
         // snapshot taken past it.

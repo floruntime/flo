@@ -127,11 +127,7 @@ pub const VoteOutcome = union(enum) {
     elect: VoteRequest,
 };
 
-/// Result of calling propose() on the leader.
-pub const ProposeResult = struct {
-    index: u64,
-    term: u64,
-};
+pub const ProposeResult = @import("types.zig").ProposeResult;
 
 /// Vote request (RequestVote RPC arguments).
 pub const VoteRequest = struct {
@@ -869,7 +865,7 @@ pub const RaftNode = struct {
         }
 
         log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @intFromEnum(entry_type), payload.len });
-        return .{ .index = idx, .term = self.current_term };
+        return .{ .index = idx, .term = self.current_term, .timestamp_ns = timestamp_ns };
     }
 
     // ── Internal ────────────────────────────────────────────────────────

@@ -3,18 +3,19 @@
 //! `ReplayRegistry` maps an entry type to its applier: the one function that
 //! mutates a subsystem's state from a committed entry, whether that entry was
 //! written here, replicated from a peer, or read back from a segment at boot.
-//! `persistEntry` builds a command entry, proposes it and returns once it
-//! has committed; it does not apply.
+//! `proposeEntry` builds a command entry and proposes it; the caller parks
+//! the client on the result and answers from a responder once the entry
+//! has applied. Nothing waits for a commit: a producer that needs the
+//! applied state picks it up once the entry applies.
 //!
 //! ## Usage
 //!
 //! Handler registration (in Shard.init, before segment replay):
 //!   handler.registerReplay(&replay_registry);
 //!
-//! Write path: persist, drain the committed log, then read the result from
-//! handler or projection state:
-//!   _ = try persistence.persistEntry(shard, .action_register, Flags.NONE, namespace, key, value);
-//!   if (!shard.applyCommitted()) return error.NotApplied;
+//! Client write: propose, park, read the result back in the responder:
+//!   const p = try persistence.proposeEntry(shard, .action_register, Flags.NONE, namespace, key, value);
+//!   return .{ .parked = p };   // the dispatcher parks with the module's responder
 //!
 
 const std = @import("std");
@@ -68,27 +69,40 @@ pub const ReplayRegistry = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// persistEntry
+// proposeEntry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Persist a key-value command through Raft for durability and replication.
-///
-/// Builds a CommandPayload (namespace_hash + key + value), proposes it
-/// through the shard's Raft node and waits for it to commit — at once
-/// alone, one round trip to a majority in a cluster, with the shard's
-/// other work paused meanwhile. Returns the committed index. Does not
-/// apply it.
+pub const ProposeResult = @import("../raft/types.zig").ProposeResult;
+
+/// Propose a key-value command through Raft: a CommandPayload
+/// (namespace_hash + key + value) in the log, not yet committed or
+/// applied. The caller parks on the result or, for a producer that does
+/// not read the outcome, moves on.
 ///
 /// `shard` is `anytype` to avoid a circular import with node/shard.zig.
-/// It must have `.raft_node` and `awaitCommit`.
-pub fn persistEntry(
+pub fn proposeEntry(
     shard: anytype,
     entry_type: EntryType,
     flags: u16,
     namespace: []const u8,
     key: []const u8,
     value: []const u8,
-) !u64 {
+) !ProposeResult {
+    const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
+    return proposeEntryAt(shard, entry_type, flags, namespace, key, value, timestamp_ns);
+}
+
+/// `proposeEntry` with the entry's header timestamp chosen by the caller,
+/// for a responder that answers from it.
+pub fn proposeEntryAt(
+    shard: anytype,
+    entry_type: EntryType,
+    flags: u16,
+    namespace: []const u8,
+    key: []const u8,
+    value: []const u8,
+    timestamp_ns: u64,
+) !ProposeResult {
     const ns_hash = router.namespaceHash(namespace);
 
     var payload_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
@@ -100,45 +114,34 @@ pub fn persistEntry(
         .value = value,
     };
     const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
-
-    const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-
-    const propose_result = try shard.raft_node.propose(
-        entry_type,
-        flags,
-        timestamp_ns,
-        payload_buf[0..payload_len],
-    );
-
-    switch (shard.awaitCommit(propose_result.index)) {
-        .committed => return propose_result.index,
-        .leadership_lost => return error.NotCommitted,
-        .timed_out => return error.CommitUnconfirmed,
-    }
+    return shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
 }
 
-/// What a client is told when `persistEntry` fails. The Raft outcomes are
-/// retryable and say so; anything else is the server's fault.
+/// What a client is told when its write cannot be proposed. The Raft
+/// outcomes are retryable and say so; anything else is the server's fault.
 pub fn failureStatus(err: anyerror) proto.StatusCode {
-    return switch (err) {
-        error.NotCommitted, error.CommitUnconfirmed, error.NotLeader => .unavailable,
-        else => .internal_error,
-    };
+    return failureCode(err).toStatus();
 }
 
 /// The same, for handlers that answer with a `CommandResult`.
 pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
-        error.NotCommitted, error.CommitUnconfirmed, error.NotLeader => .unavailable,
+        error.NotLeader => .unavailable,
+        error.Overloaded => .overloaded,
         else => .internal_error,
     };
 }
 
+/// A write committed but this node did not apply it (its applier refused
+/// it, or the entry could not be read back): resending it writes it twice.
+pub const COMMITTED_NOT_APPLIED = "internal error: write committed but not applied on this node — do not resend";
+/// A write committed and applied, but its answer could not be built.
+pub const ANSWER_LOST = "internal error: write committed but its answer was lost — do not resend";
+
 pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
     return switch (err) {
-        error.NotCommitted => "unavailable: lost leadership before commit — write may still apply",
-        error.CommitUnconfirmed => "unavailable: commit not confirmed in time — write may still apply",
         error.NotLeader => "unavailable: electing a leader — retry",
+        error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         else => fallback,
     };
 }

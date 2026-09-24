@@ -39,6 +39,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
+const persistence_mod = @import("../storage/persistence.zig");
 const txn_mod = @import("./txn.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
@@ -324,11 +325,7 @@ pub const KVHandler = struct {
     }
 
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
-        switch (err) {
-            error.NotLeader => sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unavailable, .message = "unavailable: electing a leader — retry" } }),
-            error.Overloaded => shard.sendErrorResponse(conn, req.header.request_id, .overloaded, "too many writes waiting for commit"),
-            else => sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .internal_error, .message = "propose failed" } }),
-        }
+        shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
     }
 
     fn dispatchDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -1891,36 +1888,13 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, &buf);
         },
         .err => |e| {
-            const status = errorCodeToStatus(e.code);
+            const status = e.code.toStatus();
             shard.sendErrorResponse(conn, request_id, status, e.message);
         },
         else => {
             shard.sendErrorResponse(conn, request_id, .internal_error, "unexpected result type");
         },
     }
-}
-
-/// Map CommandResult.ErrorCode to wire StatusCode.
-fn errorCodeToStatus(code: CommandResult.ErrorCode) proto.StatusCode {
-    return switch (code) {
-        .invalid_request => .bad_request,
-        .unauthorized => .unauthorized,
-        .not_found => .not_found,
-        .already_exists => .conflict,
-        .timeout => .internal_error,
-        .internal_error => .internal_error,
-        .unavailable => .internal_error,
-        .kv_key_too_large => .bad_request,
-        .kv_value_too_large => .bad_request,
-        .kv_namespace_not_found => .not_found,
-        .kv_txn_unknown => .not_found,
-        .kv_txn_cross_shard => .bad_request,
-        .kv_txn_too_large => .bad_request,
-        .kv_txn_timeout => .internal_error,
-        .kv_txn_unsupported_op => .bad_request,
-        .conflict => .conflict,
-        else => .internal_error,
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
