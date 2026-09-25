@@ -162,12 +162,8 @@ pub fn read(
 
     if (block_ms) |ms| {
         try builder.addU32(.block_ms, ms);
-        // Adjust socket read timeout for blocking requests
-        if (ms == 0) {
-            client.setReadTimeoutSec(0); // infinite
-        } else {
-            client.setReadTimeoutSec(ms / 1000 + 5);
-        }
+        // Read for as long as the server waits, plus 5 s; 0 does not wait.
+        if (ms > 0) client.setReadTimeoutSec(ms / 1000 + 5);
     }
 
     // Add partition if specified
@@ -350,12 +346,8 @@ pub fn groupReadWithOptions(
 
     if (block_ms) |ms| {
         try builder.addU32(.block_ms, ms);
-        // Adjust socket read timeout for blocking requests
-        if (ms == 0) {
-            client.setReadTimeoutSec(0); // infinite
-        } else {
-            client.setReadTimeoutSec(ms / 1000 + 5);
-        }
+        // Read for as long as the server waits, plus 5 s; 0 does not wait.
+        if (ms > 0) client.setReadTimeoutSec(ms / 1000 + 5);
     }
 
     if (opts.mode) |m| {

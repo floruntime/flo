@@ -85,7 +85,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("end", 'e', "", "Ending StreamID (timestamp-sequence, inclusive)")
                 .uintFlag("limit", 'l', 10, "Maximum records to read")
                 .boolFlag("follow", 'f', "Follow mode - continuously tail for new records (like tail -f)")
-                .uintFlag("block", 'b', 0, "Block for new data (ms, 0=forever). Single read unlike --follow.")
+                .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait). Single read unlike --follow.")
                 .uintFlag("partition", 'P', 0, "Partition to read from (default: 0)")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing (reads from same partition as append)")
                 .action(wrapHandler(runRead)),
@@ -183,7 +183,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (required)")
                         .uintFlag("limit", 'l', 1, "Maximum records to read")
-                        .uintFlag("block", 'b', 0, "Block timeout (ms, 0=wait forever)")
+                        .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait)")
                         .stringFlag("mode", 'm', "", "Consumer mode: shared, exclusive, key_shared")
                         .uintFlag("max-standbys", 0, 0, "Max standby consumers in exclusive mode (0=singleton, no standbys)")
                         .uintFlag("slots", 's', 16, "Number of hash slots for key_shared mode")

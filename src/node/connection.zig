@@ -33,7 +33,7 @@ pub const RingBuffer = struct {
     write_pos: usize,
     allocator: std.mem.Allocator,
 
-    const DEFAULT_CAPACITY: usize = 64 * 1024; // 64 KB
+    pub const DEFAULT_CAPACITY: usize = 64 * 1024; // 64 KB
 
     pub fn init(allocator: std.mem.Allocator) !RingBuffer {
         return initWithCapacity(allocator, DEFAULT_CAPACITY);
@@ -104,6 +104,18 @@ pub const RingBuffer = struct {
         return to_write;
     }
 
+    /// Copy up to `out.len` bytes from the front without consuming them.
+    pub fn copyOut(self: *const RingBuffer, out: []u8) usize {
+        const to_copy = @min(out.len, self.readable());
+        if (to_copy == 0) return 0;
+        const mask = self.buf.len - 1;
+        const start = self.read_pos & mask;
+        const first_len = @min(to_copy, self.buf.len - start);
+        @memcpy(out[0..first_len], self.buf[start .. start + first_len]);
+        if (to_copy > first_len) @memcpy(out[first_len..to_copy], self.buf[0 .. to_copy - first_len]);
+        return to_copy;
+    }
+
     /// Read up to `out.len` bytes, consuming them.
     pub fn read(self: *RingBuffer, out: []u8) usize {
         const avail = self.readable();
@@ -123,6 +135,18 @@ pub const RingBuffer = struct {
 
         self.read_pos += to_read;
         return to_read;
+    }
+
+    /// Reallocate to `new_cap` (a power of two, at least what is held),
+    /// keeping the held bytes in order.
+    pub fn resize(self: *RingBuffer, new_cap: usize) !void {
+        std.debug.assert(new_cap >= self.readable() and new_cap & (new_cap - 1) == 0);
+        const fresh = try self.allocator.alloc(u8, new_cap);
+        const held = self.read(fresh[0..self.readable()]);
+        self.allocator.free(self.buf);
+        self.buf = fresh;
+        self.read_pos = 0;
+        self.write_pos = held;
     }
 
     /// Compact: if both cursors have advanced far, reset them.
@@ -319,6 +343,28 @@ pub const Connection = struct {
     /// processRequests checks this to suppress the default "not implemented" error.
     response_deferred: bool,
 
+    /// `queueWrite` refused an answer: a client connection is closed at its
+    /// next flush.
+    write_overflow: bool = false,
+
+    /// Set when the connection must close; the shard closes it once the
+    /// tick's events are handled, never while code up the stack still holds
+    /// it.
+    closing: bool = false,
+
+    /// The client's requests are not read or run while its unsent answers
+    /// pile up; resumed once they drain, or once it has read nothing for a
+    /// while (see `Shard.STALL_MS`).
+    reads_paused: bool = false,
+    /// When the paused client last read anything, on the monotonic clock.
+    paused_progress_ms: u64 = 0,
+    /// Pacing is off until the unsent answers drain: a client that stopped
+    /// reading while paused may be sending its whole pipeline before it
+    /// reads, and pausing it again would leave both sides waiting.
+    pacing_off: bool = false,
+    /// Queued on the shard's resume list; keeps it to one entry.
+    resume_queued: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32, owner_shard: u16) !Connection {
         var read_buf = try RingBuffer.init(allocator);
         errdefer read_buf.deinit();
@@ -356,12 +402,49 @@ pub const Connection = struct {
         self.protocol = detectProtocolFull(data);
     }
 
-    /// Queue response data for write coalescing.
-    /// Returns the number of bytes queued.
+    /// The most a connection holds unsent; a client that lets more pile up
+    /// is not reading, and is closed.
+    pub const MAX_WRITE_BUFFER: usize = 4 * 1024 * 1024;
+
+    /// Queue response data for write coalescing: all of it or none. The
+    /// buffer grows to hold it, up to `MAX_WRITE_BUFFER`; past that nothing is
+    /// queued and `write_overflow` is set, because a frame cut short would
+    /// desynchronise the client for good. Returns the bytes queued.
     pub fn queueWrite(self: *Connection, data: []const u8) usize {
-        const written = self.write_buf.write(data);
-        return written;
+        if (data.len > self.write_buf.writable()) {
+            const need = self.write_buf.readable() + data.len;
+            const cap = std.math.ceilPowerOfTwo(usize, need) catch need;
+            if (cap > MAX_WRITE_BUFFER) {
+                self.write_overflow = true;
+                return 0;
+            }
+            self.write_buf.resize(cap) catch {
+                self.write_overflow = true;
+                return 0;
+            };
+        }
+        return self.write_buf.write(data);
     }
+
+    /// Once everything is sent, give back a buffer grown for a large answer.
+    pub fn shrinkWriteBuffer(self: *Connection) void {
+        if (self.write_buf.readable() == 0 and self.write_buf.buf.len > KEEP_CAPACITY) {
+            self.write_buf.resize(RingBuffer.DEFAULT_CAPACITY) catch {};
+        }
+    }
+
+    /// Once every request is taken, give back a buffer grown for a large
+    /// one: large requests are rare, unlike large answers.
+    pub fn shrinkReadBuffer(self: *Connection) void {
+        if (self.read_buf.readable() == 0 and self.read_buf.buf.len > RingBuffer.DEFAULT_CAPACITY) {
+            self.read_buf.resize(RingBuffer.DEFAULT_CAPACITY) catch {};
+        }
+    }
+
+    /// A grown buffer up to this size is kept: a client whose answers are
+    /// routinely this large would otherwise reallocate on every flush.
+    /// Anything larger is idle memory a few such clients could pin.
+    pub const KEEP_CAPACITY: usize = 256 * 1024;
 
     /// Check if there's pending write data.
     pub fn hasPendingWrites(self: *const Connection) bool {
@@ -542,4 +625,48 @@ test "Connection: detect RESP from read buffer" {
     _ = conn.read_buf.write("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
     conn.detectAndSetProtocol();
     try std.testing.expectEqual(Protocol.resp, conn.protocol);
+}
+
+test "Connection: an answer larger than the buffer is queued whole, in order, and the buffer shrinks back" {
+    var conn = try Connection.init(std.testing.allocator, -1, 1, 0);
+    defer conn.deinit();
+    // Wrap the ring first so growth has to keep a split tail in order.
+    const head = [_]u8{'h'} ** (RingBuffer.DEFAULT_CAPACITY - 10);
+    try std.testing.expectEqual(head.len, conn.queueWrite(&head));
+    conn.consumeWritten(head.len - 5);
+    const big = try std.testing.allocator.alloc(u8, 200 * 1024);
+    defer std.testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+    try std.testing.expectEqual(big.len, conn.queueWrite(big));
+    try std.testing.expect(!conn.write_overflow);
+    var out = try std.testing.allocator.alloc(u8, 5 + big.len);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(out.len, conn.write_buf.read(out));
+    try std.testing.expectEqualSlices(u8, "hhhhh", out[0..5]);
+    try std.testing.expectEqualSlices(u8, big, out[5..]);
+    // Grown to 256 KiB: kept, as the next answer is likely as large.
+    conn.shrinkWriteBuffer();
+    try std.testing.expectEqual(Connection.KEEP_CAPACITY, conn.write_buf.buf.len);
+
+    // Grown past that: given back once sent, not before.
+    const bigger = try std.testing.allocator.alloc(u8, Connection.KEEP_CAPACITY + 1);
+    defer std.testing.allocator.free(bigger);
+    @memset(bigger, 'b');
+    try std.testing.expectEqual(bigger.len, conn.queueWrite(bigger));
+    conn.shrinkWriteBuffer();
+    try std.testing.expect(conn.write_buf.buf.len > Connection.KEEP_CAPACITY);
+    conn.consumeWritten(conn.write_buf.readable());
+    conn.shrinkWriteBuffer();
+    try std.testing.expectEqual(RingBuffer.DEFAULT_CAPACITY, conn.write_buf.buf.len);
+}
+
+test "Connection: past the cap nothing is queued and the connection is marked, never cut short" {
+    var conn = try Connection.init(std.testing.allocator, -1, 1, 0);
+    defer conn.deinit();
+    const huge = try std.testing.allocator.alloc(u8, Connection.MAX_WRITE_BUFFER + 1);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectEqual(@as(usize, 0), conn.queueWrite(huge));
+    try std.testing.expect(conn.write_overflow);
+    try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
 }

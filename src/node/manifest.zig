@@ -51,15 +51,16 @@ pub const SystemManifest = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
         defer parsed.deinit();
 
-        const root = parsed.value.object;
+        // A hand-edited file is refused, never cast into a wrong topology.
+        const root = if (parsed.value == .object) parsed.value.object else return error.InvalidManifest;
 
         const shards: u16 = if (root.get("shards")) |s|
-            if (s == .integer) @intCast(s.integer) else return error.InvalidManifest
+            if (s == .integer) std.math.cast(u16, s.integer) orelse return error.InvalidManifest else return error.InvalidManifest
         else
             return error.InvalidManifest;
 
         const partitions: u32 = if (root.get("partitions")) |p|
-            if (p == .integer) @intCast(p.integer) else 0
+            if (p == .integer) std.math.cast(u32, p.integer) orelse return error.InvalidManifest else 0
         else
             0;
 
@@ -199,6 +200,22 @@ test "create and load manifest" {
     try std.testing.expect(loaded != null);
     try std.testing.expectEqual(@as(u16, 8), loaded.?.shards);
     try std.testing.expectEqual(@as(u32, 256), loaded.?.partitions);
+}
+
+test "a manifest with a count out of range, or not an object, is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
+    defer allocator.free(path);
+    const file_path = try std.fs.path.join(allocator, &.{ path, SystemManifest.FILENAME });
+    defer allocator.free(file_path);
+    for ([_][]const u8{ "{\"shards\": 70000}", "{\"shards\": -1}", "{\"shards\": 4, \"partitions\": -1}", "[4]" }) |body| {
+        const f = try @import("stdx").fs.createFileAbsolute(file_path, .{ .truncate = true });
+        try @import("stdx").fs.writeAll(f, body);
+        @import("stdx").fs.closeFile(f);
+        try std.testing.expectError(error.InvalidManifest, SystemManifest.load(allocator, path));
+    }
 }
 
 test "validate matching topology" {

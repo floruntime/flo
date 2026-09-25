@@ -15,13 +15,10 @@ const proto = @import("../../protocol/proto.zig");
 /// - routing_key: Explicit routing override for shard co-location (same as {tag} in key)
 pub fn get(client: *Client, namespace: []const u8, key: []const u8, wait_ms: ?u32, block_ms: ?u32, routing_key: ?[]const u8, txn_id: ?u64) !Response {
     if (wait_ms != null or block_ms != null or routing_key != null or txn_id != null) {
-        // Adjust socket read timeout for blocking requests:
-        // - 0 means "wait forever" → disable socket timeout
-        // - N > 0 means "wait N ms" → set timeout to N/1000 + 5s buffer
+        // A blocking request waits N ms on the server: read for that long
+        // plus 5 s. 0 does not wait, so the default timeout stands.
         const effective_ms: u32 = wait_ms orelse block_ms orelse 0;
-        if (effective_ms == 0 and (wait_ms != null or block_ms != null)) {
-            client.setReadTimeoutSec(0); // infinite
-        } else if (effective_ms > 0) {
+        if (effective_ms > 0) {
             const timeout_sec: u32 = effective_ms / 1000 + 5; // requested + 5s buffer
             client.setReadTimeoutSec(timeout_sec);
         }

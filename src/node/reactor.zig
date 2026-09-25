@@ -510,8 +510,15 @@ pub const Reactor = struct {
                 .sec = @intCast(ms / 1000),
                 .nsec = @intCast((@as(u64, ms) % 1000) * 1_000_000),
             };
-            _ = try self.ring.timeout(TIMEOUT_SENTINEL, &ts, 0, 0);
-            _ = try self.ring.submit_and_wait(1);
+            // count = 1: the timeout completes with the first other event,
+            // so a wake does not leave it armed to fire an empty tick later.
+            _ = try self.ring.timeout(TIMEOUT_SENTINEL, &ts, 1, 0);
+            // A signal landing on this thread (a stop, say) is an empty poll,
+            // as on kqueue, not a failed tick.
+            _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                error.SignalInterrupt => return &.{},
+                else => return err,
+            };
             const n = try self.ring.copy_cqes(&self.cqe_buf, 0);
             return self.iouringProcessCqes(n);
         } else {

@@ -1,6 +1,6 @@
 //! Self-routing Run IDs
 //!
-//! Format: `{prefix}-{hex(u64)}`
+//! Format: `{prefix}{hex(u64)}-{hex(shard)}`, e.g. `act-1a2b3c4d5e6f00-3`
 //!
 //! The packed u64 encodes:
 //!   ```
@@ -8,14 +8,19 @@
 //!   ```
 //!
 //! This makes every run ID self-routing: the server extracts the partition
-//! directly from the ID bits, with no entity-name lookup required.
+//! directly from the ID bits, with no entity-name lookup required. The suffix
+//! names the shard that minted it: a shard mints ids for partitions it does
+//! not own (a workflow starting an action on another shard), so two shards'
+//! generators share a partition's id space and only the suffix keeps them
+//! apart.
 //!
 //! ## Constraints
 //!
 //! - Max partition ID: 16,383 (14 bits). Configure `partition_count ≤ 16384`.
-//! - Max sequence: 255 per millisecond per shard (single-threaded — plenty).
+//! - Sequence: 256 per millisecond per shard; past that the id's millisecond
+//!   runs ahead of the clock rather than repeat an id.
 //! - Timestamp range: ~139 years from custom epoch (2024-01-01 → ~2163).
-//! - Max encoded length: prefix (4) + hex (16) = 20 bytes.
+//! - Max encoded length: prefix (4) + hex (16) + '-' + shard hex (2) = 23 bytes.
 
 const std = @import("std");
 
@@ -25,8 +30,8 @@ const EPOCH_MS: u64 = 1_704_067_200_000;
 /// Maximum partition ID encodable in 14 bits.
 pub const MAX_PARTITION: u32 = 0x3FFF; // 16383
 
-/// Maximum total length of a generated run ID (prefix + hex).
-pub const MAX_ID_LEN: usize = 20;
+/// Maximum total length of a generated run ID.
+pub const MAX_ID_LEN: usize = 23;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Prefix
@@ -54,25 +59,34 @@ pub const Prefix = enum {
 
 /// Per-shard run ID generator. Single-threaded — no atomics needed.
 pub const Generator = struct {
+    /// The shard this generator mints for, written into every id.
+    shard: u16 = 0,
     last_ms: u64 = 0,
     sequence: u8 = 0,
 
-    /// Generate a new run ID into `buf`. Returns the slice written.
+    /// Generate a new run ID into `buf` (at least `MAX_ID_LEN` bytes).
+    /// Never fails, and never repeats while the process runs: the
+    /// millisecond it records is a logical clock that does not go back when
+    /// the wall clock does, and moves on by one when a millisecond's 256 ids
+    /// are spent.
     ///
     /// `partition_id` is the partition this entity belongs to (from router).
     /// The caller must ensure `partition_id <= MAX_PARTITION`.
-    pub fn next(self: *Generator, prefix: Prefix, partition_id: u32, buf: []u8) error{SequenceExhausted}![]const u8 {
-        const now_ms = currentMs();
+    pub fn next(self: *Generator, prefix: Prefix, partition_id: u32, buf: []u8) []const u8 {
+        std.debug.assert(buf.len >= MAX_ID_LEN);
+        const now_ms = @max(currentMs(), self.last_ms);
 
         if (now_ms == self.last_ms) {
-            if (self.sequence == 255) return error.SequenceExhausted;
-            self.sequence += 1;
+            if (self.sequence == 255) {
+                self.last_ms += 1;
+                self.sequence = 0;
+            } else self.sequence += 1;
         } else {
             self.last_ms = now_ms;
             self.sequence = 0;
         }
 
-        const ts_bits: u64 = now_ms & 0x3FF_FFFF_FFFF; // 42 bits
+        const ts_bits: u64 = self.last_ms & 0x3FF_FFFF_FFFF; // 42 bits
         const part_bits: u64 = @as(u64, partition_id & 0x3FFF); // 14 bits
         const seq_bits: u64 = @as(u64, self.sequence); // 8 bits
 
@@ -80,8 +94,11 @@ pub const Generator = struct {
 
         const pfx = prefix.string();
         @memcpy(buf[0..pfx.len], pfx);
-        const enc_len = hexEncode(id_bits, buf[pfx.len..]);
-        return buf[0 .. pfx.len + enc_len];
+        var len = pfx.len + hexEncode(id_bits, buf[pfx.len..]);
+        buf[len] = '-';
+        len += 1;
+        len += hexEncode(self.shard, buf[len..]);
+        return buf[0..len];
     }
 };
 
@@ -102,11 +119,25 @@ pub fn extractTimestamp(run_id: []const u8) ?u64 {
     return (id_bits >> 22) + EPOCH_MS;
 }
 
-/// Decode the hex payload from a prefixed run ID.
+/// Whether `run_id` has the form this generator mints for `prefix`
+/// (`{prefix}{hex}-{hex}`). A client may not choose such an id: one the
+/// server mints later could equal it.
+pub fn looksGenerated(prefix: Prefix, run_id: []const u8) bool {
+    const p = prefix.string();
+    if (!std.mem.startsWith(u8, run_id, p)) return false;
+    const rest = run_id[p.len..];
+    const dash = std.mem.indexOfScalar(u8, rest, '-') orelse return false;
+    return hexDecode(rest[0..dash]) != null and dash + 1 < rest.len and hexDecode(rest[dash + 1 ..]) != null;
+}
+
+/// Decode the hex payload from a prefixed run ID: what follows the first
+/// dash, up to the shard suffix if there is one.
 fn decodePayload(run_id: []const u8) ?u64 {
     const dash_pos = std.mem.indexOfScalar(u8, run_id, '-') orelse return null;
     if (dash_pos + 1 >= run_id.len) return null;
-    return hexDecode(run_id[dash_pos + 1 ..]);
+    const rest = run_id[dash_pos + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
+    return hexDecode(rest[0..end]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -199,7 +230,7 @@ test "run ID encode/decode partition roundtrip" {
     const partitions = [_]u32{ 0, 1, 42, 1000, 4095, 16383 };
     for (partitions) |pid| {
         var buf: [32]u8 = undefined;
-        const id = try gen.next(.workflow, pid, &buf);
+        const id = gen.next(.workflow, pid, &buf);
         const extracted = extractPartition(id).?;
         try std.testing.expectEqual(pid, extracted);
     }
@@ -210,7 +241,7 @@ test "run IDs are unique" {
     var ids: [10]u64 = undefined;
     for (&ids) |*slot| {
         var buf: [32]u8 = undefined;
-        const id = try gen.next(.workflow, 100, &buf);
+        const id = gen.next(.workflow, 100, &buf);
         slot.* = decodePayload(id).?;
     }
     // All IDs should be distinct
@@ -225,16 +256,16 @@ test "prefix strings" {
     var gen = Generator{};
     var buf: [32]u8 = undefined;
 
-    const wf = try gen.next(.workflow, 0, &buf);
+    const wf = gen.next(.workflow, 0, &buf);
     try std.testing.expect(std.mem.startsWith(u8, wf, "wfr-"));
 
-    const act = try gen.next(.action, 0, &buf);
+    const act = gen.next(.action, 0, &buf);
     try std.testing.expect(std.mem.startsWith(u8, act, "act-"));
 
-    const job = try gen.next(.job, 0, &buf);
+    const job = gen.next(.job, 0, &buf);
     try std.testing.expect(std.mem.startsWith(u8, job, "job-"));
 
-    const sp = try gen.next(.savepoint, 0, &buf);
+    const sp = gen.next(.savepoint, 0, &buf);
     try std.testing.expect(std.mem.startsWith(u8, sp, "sp-"));
 }
 
@@ -247,7 +278,7 @@ test "preRouteByRunId extracts partition" {
     const proto = @import("../protocol/proto.zig");
     var gen = Generator{};
     var buf: [32]u8 = undefined;
-    const id = try gen.next(.workflow, 777, &buf);
+    const id = gen.next(.workflow, 777, &buf);
 
     const req = proto.Request{
         .header = std.mem.zeroes(proto.RequestHeader),
@@ -258,4 +289,54 @@ test "preRouteByRunId extracts partition" {
 
     const hash = preRouteByRunId(req).?;
     try std.testing.expectEqual(@as(u64, 777), hash);
+}
+
+test "looksGenerated: the generator's own form, and nothing else" {
+    var gen = Generator{};
+    var buf: [MAX_ID_LEN]u8 = undefined;
+    const minted = gen.next(.workflow, 7, &buf);
+    try std.testing.expect(looksGenerated(.workflow, minted));
+    try std.testing.expect(looksGenerated(.workflow, "wfr-1a2b-3"));
+    // A client's own numbering never collides with the minted form.
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-2025"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-1a2b-"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-"));
+    try std.testing.expect(!looksGenerated(.workflow, "wfr-order-17"));
+    try std.testing.expect(!looksGenerated(.workflow, "order-123"));
+    try std.testing.expect(!looksGenerated(.action, minted));
+}
+
+test "two shards minting for one partition in one millisecond never mint the same id" {
+    var a = Generator{ .shard = 0 };
+    var b = Generator{ .shard = 1 };
+    var buf_a: [MAX_ID_LEN]u8 = undefined;
+    var buf_b: [MAX_ID_LEN]u8 = undefined;
+    // Same clock, same partition, same sequence: only the suffix differs.
+    a.last_ms = currentMs() + 1000;
+    b.last_ms = a.last_ms;
+    const ia = a.next(.action, 7, &buf_a);
+    const ib = b.next(.action, 7, &buf_b);
+    try std.testing.expect(!std.mem.eql(u8, ia, ib));
+    try std.testing.expectEqual(extractPartition(ia), extractPartition(ib));
+}
+
+test "a generator never repeats an id: not past 256 in a millisecond, not when the clock goes back" {
+    var gen = Generator{ .shard = 2 };
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| std.testing.allocator.free(k.*);
+        seen.deinit();
+    }
+    // Pinned ahead of the wall clock: every call lands in the same logical
+    // millisecond until its sequence is spent, then the next.
+    gen.last_ms = currentMs() + 60_000;
+    var buf: [MAX_ID_LEN]u8 = undefined;
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        const id = gen.next(.workflow, 5, &buf);
+        const gop = try seen.getOrPut(try std.testing.allocator.dupe(u8, id));
+        try std.testing.expect(!gop.found_existing);
+    }
+    try std.testing.expectEqual(@as(usize, 600), seen.count());
 }

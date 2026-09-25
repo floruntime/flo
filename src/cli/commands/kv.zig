@@ -51,8 +51,8 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                     "flo kv get balance:alice --routing-key user:123",
                 })
                 .arg("key", "Key to retrieve")
-                .uintFlag("wait", 'w', 0, "Wait until key exists (ms, 0=forever)")
-                .uintFlag("block", 'b', 0, "Block for changes (ms, 0=forever)")
+                .uintFlag("wait", 'w', 0, "Wait until key exists (ms, at most 300000; 0 = don't wait)")
+                .uintFlag("block", 'b', 0, "Block for changes (ms, at most 300000; 0 = don't wait). On timeout, prints the unchanged value")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runGet)),

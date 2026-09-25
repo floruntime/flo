@@ -118,7 +118,9 @@ pub fn proposeEntryAt(
 }
 
 /// What a client is told when its write cannot be proposed. The Raft
-/// outcomes are retryable and say so; anything else is the server's fault.
+/// outcomes are retryable and say so; a write too large to encode is the
+/// request's fault and fails the same way every time; anything else is the
+/// server's.
 pub fn failureStatus(err: anyerror) proto.StatusCode {
     return failureCode(err).toStatus();
 }
@@ -128,6 +130,7 @@ pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
         error.NotLeader => .unavailable,
         error.Overloaded => .overloaded,
+        error.PayloadTooLarge => .invalid_request,
         else => .internal_error,
     };
 }
@@ -142,6 +145,18 @@ pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
     return switch (err) {
         error.NotLeader => "unavailable: electing a leader — retry",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
+        error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
         else => fallback,
     };
+}
+
+test "persistence: a write too large to encode is the request's fault, not a retry" {
+    // The message names the limit.
+    try std.testing.expectEqual(64 * 1024, MAX_PERSIST_PAYLOAD);
+    try std.testing.expectEqual(result_mod.CommandResult.ErrorCode.invalid_request, failureCode(error.PayloadTooLarge));
+    try std.testing.expectEqual(proto.StatusCode.bad_request, failureStatus(error.PayloadTooLarge));
+    try std.testing.expectEqualStrings("bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB", failureMessage(error.PayloadTooLarge, "x"));
+    // The Raft outcomes are retryable; anything else is the server's.
+    try std.testing.expectEqual(proto.StatusCode.unavailable, failureStatus(error.NotLeader));
+    try std.testing.expectEqual(result_mod.CommandResult.ErrorCode.internal_error, failureCode(error.IndexGap));
 }

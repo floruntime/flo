@@ -69,7 +69,7 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .arg("queue", "Queue name")
                 .uintFlag("count", 'c', 1, "Number of messages to dequeue")
                 .uintFlag("timeout", 't', 30000, "Visibility timeout (ms)")
-                .uintFlag("block", 'b', 0, "Block timeout (ms, 0=no block)")
+                .uintFlag("block", 'b', 0, "Block for messages (ms, at most 300000; 0 = don't wait)")
                 .action(wrapHandler(runDequeue)),
         )
         .subcommand(
