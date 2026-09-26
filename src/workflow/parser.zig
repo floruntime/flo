@@ -100,12 +100,11 @@ fn getInt(obj: JsonValue, key: []const u8) ?i64 {
     return if (val == .integer) val.integer else null;
 }
 
-/// Narrow a client-supplied integer to the field's type. Definitions arrive
-/// over the network and release builds keep safety checks, so a bare
-/// `@intCast` on a value that does not fit panics and takes the node down.
+/// Definitions are client input and releases build ReleaseSafe, so an
+/// out-of-range bare `@intCast` would panic the node; this logs and rejects.
 fn fitInt(comptime T: type, field: []const u8, v: i64) ParseError!T {
     return std.math.cast(T, v) orelse {
-        log.warn("workflow definition: {s} = {d} is out of range ({d}..{d})", .{ field, v, std.math.minInt(T), std.math.maxInt(T) });
+        log.warn("workflow definition: {s} = {d} must be between {d} and {d}", .{ field, v, std.math.minInt(T), std.math.maxInt(T) });
         return ParseError.InvalidFieldType;
     };
 }
@@ -442,7 +441,10 @@ fn parseRunStep(allocator: Allocator, obj: JsonValue) ParseError!Step {
 
 fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, wait_obj: JsonValue) ParseError!Step {
     const signal_type = getString(wait_obj, "type") orelse return ParseError.MissingRequiredField;
-    const timeout_ms: ?i64 = getInt(wait_obj, "timeoutMs") orelse getInt(wait_obj, "timeout_ms");
+    const timeout_ms: ?i64 = if (getInt(wait_obj, "timeoutMs") orelse getInt(wait_obj, "timeout_ms")) |t|
+        try fitInt(u63, "waitForSignal.timeout_ms", t)
+    else
+        null;
     const on_timeout: ?[]u8 = if (getString(wait_obj, "onTimeout") orelse getString(wait_obj, "on_timeout")) |t|
         allocator.dupe(u8, t) catch return ParseError.OutOfMemory
     else
@@ -704,7 +706,7 @@ fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
 fn parsePollConfig(obj: JsonValue) ParseError!definition.PollConfig {
     if (obj != .object) return ParseError.InvalidFieldType;
 
-    const initial_delay_ms: i64 = getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms") orelse 0;
+    const initial_delay_ms: i64 = if (getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms")) |d| try fitInt(u63, "poll.initial_delay_ms", d) else 0;
     const max_attempts: u32 = if (getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts") orelse getInt(obj, "max")) |m| try fitInt(u32, "poll.max_attempts", m) else 10;
     const base_delay_ms: u32 = if (getInt(obj, "baseDelayMs") orelse getInt(obj, "base_delay_ms")) |d| try fitInt(u32, "poll.base_delay_ms", d) else 1000;
     const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| try fitInt(u32, "poll.max_delay_ms", d) else 60000;
@@ -861,10 +863,13 @@ fn parseHealthConfig(root: JsonValue) ParseError!?HealthConfig {
     const health_obj = getObject(root, "health") orelse return null;
 
     // Parse window like "5m" -> 300000 ms
-    const window_ms: i64 = blk: {
-        const window_str = getString(health_obj, "window") orelse "5m";
-        break :blk parseTimeString(window_str) orelse 300000;
-    };
+    const window_ms: i64 = if (getString(health_obj, "window")) |window_str|
+        parseTimeString(window_str) orelse {
+            log.warn("workflow definition: health.window = \"{s}\" is not a duration like 30s, 5m, 1h or 1d", .{window_str});
+            return ParseError.InvalidFieldType;
+        }
+    else
+        300000;
 
     return .{
         .window_ms = window_ms,
@@ -920,7 +925,8 @@ fn parseFallbackConfig(allocator: Allocator, root: JsonValue) ParseError!?Fallba
     };
 }
 
-/// Parse time string like "5m", "1h", "30s" to milliseconds
+/// Parse a duration like "30s", "5m", "1h", "1d" to milliseconds; null if
+/// malformed or the result overflows i64.
 fn parseTimeString(s: []const u8) ?i64 {
     if (s.len < 2) return null;
 
@@ -935,7 +941,6 @@ fn parseTimeString(s: []const u8) ?i64 {
         'd' => 24 * 60 * 60 * 1000,
         else => return null,
     };
-    // Checked: an overflowing multiply panics in release builds.
     return std.math.mul(i64, num, unit_ms) catch null;
 }
 
@@ -1223,8 +1228,8 @@ fn rangeTestWorkflow(comptime top: []const u8, comptime step: []const u8) []cons
         "\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
 }
 
-/// A workflow whose one inline plan carries `executor` fields on its executor
-/// and `plan` fields on the plan itself.
+/// A workflow with one inline plan: `plan` fields (each with a trailing comma)
+/// go on the plan, `executor` fields (each with a leading comma) on its executor.
 fn rangeTestPlan(comptime executor: []const u8, comptime plan: []const u8) []const u8 {
     return rangeTestWorkflow("\"plans\":{\"p\":{" ++ plan ++ "\"executors\":[{\"name\":\"e\",\"run\":\"@actions/x\"" ++ executor ++ "}]}},", "");
 }
@@ -1252,6 +1257,10 @@ test "parseWorkflow: integers outside the field's type are rejected, not cast" {
         rangeTestPlan(",\"rateLimit\":{\"maxPerMinute\":5000000000}", ""),
         rangeTestPlan(",\"rateLimit\":{\"maxPerHour\":-1}", ""),
         rangeTestPlan("", "\"health\":{\"minSamples\":-1},"),
+        rangeTestPlan("", "\"health\":{\"window\":\"9999999999999999d\"},"),
+        rangeTestPlan("", "\"health\":{\"window\":\"soon\"},"),
+        rangeTestWorkflow("", "\"poll\":{\"initialDelayMs\":-1},"),
+        "{\"kind\":\"Workflow\",\"name\":\"w\",\"version\":\"1\",\"start\":{\"waitForSignal\":{\"type\":\"go\",\"timeoutMs\":-1},\"transitions\":{\"success\":\"flo.Completed\"}}}",
     };
     for (cases) |json| {
         std.testing.expectError(ParseError.InvalidFieldType, parseWorkflow(allocator, json)) catch |err| {

@@ -668,7 +668,7 @@ pub const RetryPolicy = struct {
     pub fn calculateDelay(self: RetryPolicy, attempt: u32) u32 {
         const delay: u32 = switch (self.backoff) {
             .constant => self.initial_delay_ms,
-            .linear => self.initial_delay_ms * (attempt + 1),
+            .linear => self.initial_delay_ms *| (attempt +| 1),
             .exponential => blk: {
                 const multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
                 break :blk self.initial_delay_ms *| multiplier;
@@ -1008,7 +1008,7 @@ pub const ExecutorHealth = struct {
     pub fn updateBreakerState(self: *ExecutorHealth, config: CircuitBreakerConfig, success: bool, now_ms: i64) void {
         switch (self.breaker_state) {
             .closed => {
-                if (!success and self.api_consecutive_failures >= @as(i32, @intCast(config.failure_threshold))) {
+                if (!success and @as(i64, self.api_consecutive_failures) >= config.failure_threshold) {
                     self.breaker_state = .open;
                     self.breaker_opened_at_ms = now_ms;
                 }
@@ -1436,4 +1436,18 @@ test "ExecutorHealth: circuit breaker state machine" {
     health.recordApiAttempt(true, 50, now_ms);
     health.updateBreakerState(config, true, now_ms);
     try testing.expectEqual(CircuitBreakerState.closed, health.breaker_state);
+}
+
+test "RetryPolicy: linear backoff saturates instead of overflowing" {
+    const policy = RetryPolicy{ .backoff = .linear, .initial_delay_ms = std.math.maxInt(u32), .max_delay_ms = std.math.maxInt(u32) };
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), policy.calculateDelay(1));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), policy.calculateDelay(std.math.maxInt(u32)));
+}
+
+test "ExecutorHealth: a failure threshold above i32 max never trips the breaker" {
+    var health = ExecutorHealth{ .executor_name = "e" };
+    const cfg = CircuitBreakerConfig{ .failure_threshold = std.math.maxInt(u32) };
+    health.api_consecutive_failures = std.math.maxInt(i32);
+    health.updateBreakerState(cfg, false, 0);
+    try std.testing.expectEqual(CircuitBreakerState.closed, health.breaker_state);
 }

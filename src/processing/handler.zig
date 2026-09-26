@@ -780,35 +780,11 @@ pub const ProcessingHandler = struct {
     // ── UAL Persistence ─────────────────────────────────────────────────
 
     /// A processing_submit entry. Key = job_id.
-    /// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
     fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, parallelism: u32, batch_size: u32, created_at_ms: i64, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
-        var off: usize = 0;
-
-        value_buf[off] = @intFromEnum(status);
-        off += 1;
-        std.mem.writeInt(u32, value_buf[off..][0..4], parallelism, .little);
-        off += 4;
-        std.mem.writeInt(u32, value_buf[off..][0..4], batch_size, .little);
-        off += 4;
-        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
-        off += 8;
-
-        // Embed the effective namespace so the applier does not depend on
-        // re-parsing quirks. The namespace comes from the client's YAML, so
-        // bound it by the buffer before narrowing its length to the u16 prefix.
-        const ns = job_namespace;
-        if (off + 2 + ns.len + yaml.len > value_buf.len) return error.PayloadTooLarge;
-        const ns_len: u16 = @intCast(ns.len);
-        std.mem.writeInt(u16, value_buf[off..][0..2], ns_len, .little);
-        off += 2;
-        @memcpy(value_buf[off .. off + ns.len], ns);
-        off += ns.len;
-        @memcpy(value_buf[off .. off + yaml.len], yaml);
-        off += yaml.len;
-
-        return persistence_mod.proposeEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]);
+        const len = try encodeSubmit(&value_buf, status, parallelism, batch_size, created_at_ms, job_namespace, yaml);
+        return persistence_mod.proposeEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..len]);
     }
 
     /// A processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
@@ -1826,6 +1802,50 @@ pub const ProcessingHandler = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Unit Tests
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Value format: [status:u8][parallelism:u32][batch_size:u32][created_at_ms:i64][ns_len:u16][namespace][yaml...]
+fn encodeSubmit(buf: []u8, status: ProcessingHandler.JobStatus, parallelism: u32, batch_size: u32, created_at_ms: i64, job_namespace: []const u8, yaml: []const u8) error{PayloadTooLarge}!usize {
+    var off: usize = 0;
+
+    buf[off] = @intFromEnum(status);
+    off += 1;
+    std.mem.writeInt(u32, buf[off..][0..4], parallelism, .little);
+    off += 4;
+    std.mem.writeInt(u32, buf[off..][0..4], batch_size, .little);
+    off += 4;
+    std.mem.writeInt(i64, buf[off..][0..8], created_at_ms, .little);
+    off += 8;
+
+    // Embed the effective namespace so the applier does not depend on
+    // re-parsing quirks.
+    const ns = job_namespace;
+    const ns_len = std.math.cast(u16, ns.len) orelse return error.PayloadTooLarge;
+    if (off + 2 + ns.len + yaml.len > buf.len) return error.PayloadTooLarge;
+    std.mem.writeInt(u16, buf[off..][0..2], ns_len, .little);
+    off += 2;
+    @memcpy(buf[off .. off + ns.len], ns);
+    off += ns.len;
+    @memcpy(buf[off .. off + yaml.len], yaml);
+    off += yaml.len;
+    return off;
+}
+
+test "processing: a submit entry too large for the persist buffer is refused, not written" {
+    const allocator = std.testing.allocator;
+    var buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
+
+    const long = try allocator.alloc(u8, 70_000);
+    defer allocator.free(long);
+    @memset(long, 'n');
+
+    // A namespace too long for its u16 length prefix, and a YAML too long
+    // for the buffer.
+    try std.testing.expectError(error.PayloadTooLarge, encodeSubmit(&buf, .running, 1, 100, 0, long, "kind: Processing"));
+    try std.testing.expectError(error.PayloadTooLarge, encodeSubmit(&buf, .running, 1, 100, 0, "default", long));
+
+    const len = try encodeSubmit(&buf, .running, 1, 100, 0, "default", "kind: Processing");
+    try std.testing.expectEqual(@as(usize, 19 + "default".len + "kind: Processing".len), len);
+}
 
 test "ProcessingHandler: all opcodes are registered" {
     const Dispatch = @import("../node/dispatcher.zig").Dispatcher;

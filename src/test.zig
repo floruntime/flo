@@ -103,6 +103,9 @@ test {
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");
     _ = @import("workflow/parser.zig");
+    _ = @import("workflow/definition.zig");
+    _ = @import("workflow/plan_types.zig");
+    _ = @import("util/yaml_to_json.zig");
     _ = @import("processing/handler.zig");
     _ = @import("processing/operator.zig");
     _ = @import("processing/collector.zig");
