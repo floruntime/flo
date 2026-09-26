@@ -2,6 +2,7 @@
 //! Parses TOML config and converts to RuntimeConfig
 
 const std = @import("std");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const toml = @import("toml.zig");
 const RuntimeConfig = @import("../node/runtime.zig").RuntimeConfig;
@@ -57,10 +58,12 @@ pub const ClusterConfig = cluster_config.ClusterConfig;
 const tiered_log_config = @import("tiered_log.zig");
 pub const TieredLogConfig = tiered_log_config.TieredLogConfig;
 
-/// Maximum supported shards per node
-/// Thread-per-shard architecture limits: 128 cores * 4 over-subscription = 512 practical max
-/// We allow up to 1024 for future-proofing, but warn above 512
-pub const MAX_SHARDS: u16 = 1024;
+/// Maximum shards per node: a cross-shard message names its sender in one byte.
+pub const MAX_SHARDS: u16 = 256;
+
+/// Maximum partitions: a run id carries its partition in 14 bits, and one
+/// past that would route its status and signals to another partition.
+pub const MAX_PARTITIONS: u32 = @import("../node/run_id.zig").MAX_PARTITION + 1;
 
 /// Server configuration loaded from flo.toml
 pub const ServerConfig = struct {
@@ -224,9 +227,17 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             config.data_dir = try config.dupeString(d);
         }
         if (server.getInt("shards")) |s| {
+            if (s < 0 or s > MAX_SHARDS) {
+                log.err("[server] shards = {d}: must be 0 (automatic) to {d}", .{ s, MAX_SHARDS });
+                return error.InvalidShardCount;
+            }
             config.shards = @intCast(s);
         }
         if (server.getInt("partition_count")) |pc| {
+            if (pc < 0 or pc > MAX_PARTITIONS) {
+                log.err("[server] partition_count = {d}: must be 0 (automatic) to {d}", .{ pc, MAX_PARTITIONS });
+                return error.InvalidPartitionCount;
+            }
             config.partition_count = @intCast(pc);
         }
     }
@@ -418,7 +429,7 @@ pub fn loadWithOverrides(
     config_path: ?[]const u8,
     port_override: ?u16,
     data_dir_override: ?[]const u8,
-    shards_override: ?u16,
+    shards_override: ?u32,
     partition_count_override: ?u32,
     log_level_override: ?[]const u8,
     log_format_override: ?[]const u8,
@@ -447,9 +458,17 @@ pub fn loadWithOverrides(
         config.data_dir = try config.dupeString(d);
     }
     if (shards_override) |s| {
-        config.shards = s;
+        if (s > MAX_SHARDS) {
+            log.err("--shards {d}: must be 0 (automatic) to {d}", .{ s, MAX_SHARDS });
+            return error.InvalidShardCount;
+        }
+        config.shards = @intCast(s);
     }
     if (partition_count_override) |pc| {
+        if (pc > MAX_PARTITIONS) {
+            log.err("--partitions {d}: must be 0 (automatic) to {d}", .{ pc, MAX_PARTITIONS });
+            return error.InvalidPartitionCount;
+        }
         config.partition_count = pc;
     }
     if (log_level_override) |level| {
@@ -677,4 +696,37 @@ test "toRuntimeConfig conversion" {
     const runtime_config = config.toRuntimeConfig();
     try std.testing.expectEqual(@as(u16, 9001), runtime_config.listen_port);
     try std.testing.expectEqual(@as(u16, 4), runtime_config.num_shards);
+}
+
+test "a shard or partition count out of range is refused, not cast, from the file or the command line" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    for ([_][]const u8{ "[server]\nshards = 257\n", "[server]\nshards = -1\n", "[server]\nshards = 70000\n" }) |body| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+        defer allocator.free(path);
+        const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+        try @import("stdx").fs.writeAll(f, body);
+        @import("stdx").fs.closeFile(f);
+        try std.testing.expectError(error.InvalidShardCount, load(allocator, path));
+    }
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, "[server]\npartition_count = 16385\n");
+    @import("stdx").fs.closeFile(f);
+    try std.testing.expectError(error.InvalidPartitionCount, load(allocator, path));
+
+    const g = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    @import("stdx").fs.closeFile(g);
+    try std.testing.expectError(error.InvalidShardCount, loadWithOverrides(allocator, path, null, null, 70000, null, null, null, null));
+    try std.testing.expectError(error.InvalidPartitionCount, loadWithOverrides(allocator, path, null, null, null, MAX_PARTITIONS + 1, null, null, null));
+    var config = try loadWithOverrides(allocator, path, null, null, MAX_SHARDS, null, null, null, null);
+    defer config.deinit();
+    try std.testing.expectEqual(MAX_SHARDS, config.shards);
+    var most = try loadWithOverrides(allocator, path, null, null, null, MAX_PARTITIONS, null, null, null);
+    defer most.deinit();
+    try std.testing.expectEqual(MAX_PARTITIONS, most.partition_count);
 }

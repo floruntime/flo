@@ -47,7 +47,7 @@ pub fn purge(client: *Client, namespace: []const u8, queue: []const u8) !Respons
 }
 
 /// Dequeue messages from a queue
-/// block_ms: null = no blocking, 0 = block forever, >0 = block for N ms
+/// block_ms: null or 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
 pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count: u32, timeout_ms: u32, block_ms: ?u32) !Response {
     var options_buf: [48]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
@@ -58,12 +58,8 @@ pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count:
     // Only add block_ms option if blocking is requested
     if (block_ms) |ms| {
         try builder.addU32(.block_ms, ms);
-        // Adjust socket read timeout for blocking requests
-        if (ms == 0) {
-            client.setReadTimeoutSec(0); // infinite
-        } else {
-            client.setReadTimeoutSec(ms / 1000 + 5);
-        }
+        // Read for as long as the server waits, plus 5 s; 0 does not wait.
+        if (ms > 0) client.setReadTimeoutSec(ms / 1000 + 5);
     }
 
     return client.sendRequestWithOptions(.queue_dequeue, namespace, queue, "", builder.getOptions());

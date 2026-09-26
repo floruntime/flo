@@ -71,7 +71,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .arg("input", "Input payload (JSON)")
                 .stringFlag("version", 'v', "latest", "Workflow version")
                 .stringFlag("idempotency-key", 'k', "", "Idempotency key for dedup")
-                .stringFlag("run-id", 'r', "", "Custom run ID (optional)")
+                .stringFlag("run-id", 'r', "", "Custom run ID (optional; not wfr-<hex>-<hex>, which the server mints)")
                 .action(wrapHandler(runStart)),
         )
         .subcommand(

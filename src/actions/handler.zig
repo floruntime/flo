@@ -77,6 +77,8 @@ pub const ActionsHandler = struct {
     /// The run the last applied invoke created; a key of `runs` (see
     /// `Shard.answering_index`).
     last_invoked_run_id: ?[]const u8 = null,
+    /// The last invoke named a run id already taken, and was refused.
+    last_invoke_existed: bool = false,
 
     /// Monotonic counter used to produce unique run IDs when shard is null (tests).
     null_shard_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -334,7 +336,9 @@ pub const ActionsHandler = struct {
         // No pending work — register blocking waiter.
         // Encode compound key: [namespace\x00][action_name][worker_id]
         // min_version packs both lengths: (ns_len << 16) | action_name_len
-        const block_ms = req.getBlockMs() orelse 30_000; // default 30s for action_await
+        // Absent means 30 s; 0 means do not wait.
+        const block_ms: u32 = if (req.findOption(.block_ms)) |opt| (opt.asU32() orelse 30_000) else 30_000;
+        if (block_ms == 0) return shard.sendOkResponse(conn, req.header.request_id, "");
         var compound_key_buf: [256]u8 = undefined;
         const ns_len: usize = @min(namespace.len, 64);
         const action_len: usize = @min(action_name.len, 128);
@@ -582,12 +586,12 @@ pub const ActionsHandler = struct {
         var run_id_buf: [32]u8 = undefined;
         const run_id_str = if (shard) |s| blk: {
             const partition_id = s.router.keyToPartitionNs(req.namespace, action_name);
-            break :blk s.run_id_gen.next(.action, partition_id, &run_id_buf) catch "act-0";
+            break :blk s.run_id_gen.next(.action, partition_id, &run_id_buf);
         } else blk: {
             // Monotonic counter so concurrent null-shard invocations (tests)
             // don't collide when called within the same millisecond.
             const seq = self.null_shard_seq.fetchAdd(1, .monotonic);
-            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ @import("stdx").time.milliTimestamp(), seq }) catch "act-0";
+            break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ @import("stdx").time.milliTimestamp(), seq }) catch unreachable;
         };
 
         // Parse the invoke value to extract labels and actual input.
@@ -611,6 +615,7 @@ pub const ActionsHandler = struct {
 
     /// The invoke applied: the run it created was the last one.
     fn invoked(self: *ActionsHandler) CommandResult {
+        if (self.last_invoke_existed) return .{ .err = .{ .code = .internal_error, .message = "internal error: the server minted a run id already in use — retry" } };
         const run_id = self.last_invoked_run_id orelse {
             return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
         };
@@ -1076,7 +1081,7 @@ pub const ActionsHandler = struct {
 
         // Generate run ID with embedded partition bits
         const partition_id = shard.router.keyToPartitionNs("default", action_name);
-        const run_id_str = shard.run_id_gen.next(.action, partition_id, id_buf) catch return null;
+        const run_id_str = shard.run_id_gen.next(.action, partition_id, id_buf);
 
         // The applier creates the run from the entry, exactly as a client
         // invoke does; the caller fields mark it as workflow-driven.
@@ -1261,7 +1266,10 @@ pub const ActionsHandler = struct {
         // nest.
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
-        if (etype == .action_invoke) self.last_invoked_run_id = null;
+        if (etype == .action_invoke) {
+            self.last_invoked_run_id = null;
+            self.last_invoke_existed = false;
+        }
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
         switch (etype) {
             .action_register => self.replayRegister(cmd.key, cmd.value),
@@ -1342,6 +1350,14 @@ pub const ActionsHandler = struct {
 
     /// Rebuild a RunRecord from a persisted invoke entry.
     fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
+        // An id already taken is refused, not overwritten: the run under it
+        // may be running or finished, and its caller waits on that run.
+        if (self.runs.contains(run_id)) {
+            self.last_invoke_existed = true;
+            // A workflow's own invoke has no client to see the refusal.
+            log.warn("action invoke refused: run id '{s}' is already in use", .{run_id});
+            return;
+        }
         var off: usize = 0;
 
         // action_name
@@ -1404,9 +1420,6 @@ pub const ActionsHandler = struct {
             }
             off += cwn_len;
         }
-
-        // A re-applied invoke replaces the run wholesale.
-        if (self.runs.fetchRemove(run_id)) |old| self.freeRun(old.value);
 
         const max_retries: u32 = if (self.actions.get(action_name)) |arec| arec.max_retries else 3;
         const owned_run_id = self.allocator.dupe(u8, run_id) catch return;
@@ -2021,6 +2034,34 @@ test "actions handler: invoke" {
         else => return error.TestUnexpectedResult,
     }
 
+    try testing.expectEqual(@as(usize, 1), handler.runCount());
+}
+
+test "actions handler: an invoke naming a run id already taken is refused, and the run it names is kept" {
+    const allocator = testing.allocator;
+    var handler = ActionsHandler.init(allocator);
+    defer handler.deinit();
+    _ = handler.handleCommand(null, makeRequest(.action_register, "process", ""));
+
+    var buf: [256]u8 = undefined;
+    const value = ActionsHandler.encodeInvokeValue(&buf, "process", 1, "first", null, null, null).?;
+    handler.last_invoked_run_id = null;
+    handler.last_invoke_existed = false;
+    handler.replayInvoke("act-1", value);
+    try testing.expect(handler.invoked() == .action_invoked);
+    handler.runs.getPtr("act-1").?.status = .running;
+
+    const again = ActionsHandler.encodeInvokeValue(&buf, "process", 2, "second", null, null, null).?;
+    handler.last_invoked_run_id = null;
+    handler.last_invoke_existed = false;
+    handler.replayInvoke("act-1", again);
+    switch (handler.invoked()) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.internal_error, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    const kept = handler.runs.getPtr("act-1").?;
+    try testing.expectEqual(ActionRunStatus.running, kept.status);
+    try testing.expectEqualStrings("first", kept.input_owned.?);
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 }
 

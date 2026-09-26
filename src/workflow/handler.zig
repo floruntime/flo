@@ -699,6 +699,10 @@ pub const WorkflowHandler = struct {
                     }
                     explicit_run_id = value[offset .. offset + rid_len];
                     offset += rid_len;
+                    if (run_id_mod.looksGenerated(.workflow, explicit_run_id.?)) {
+                        shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: run ids of the form wfr-<hex>-<hex> are the server's; choose another");
+                        return null;
+                    }
                 }
             }
 
@@ -736,7 +740,7 @@ pub const WorkflowHandler = struct {
             rid
         else blk: {
             const partition_id = shard.router.keyToPartitionNs(req.namespace, workflow_name);
-            break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch "wfr-0";
+            break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
         };
 
         // Build namespace-qualified key for the runs map
@@ -748,7 +752,7 @@ pub const WorkflowHandler = struct {
         // Guard against ID collision (e.g. replayed entry with same key)
         if (self.runs.contains(run_ns_key)) {
             self.allocator.free(run_ns_key);
-            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "run id already exists");
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "conflict: a run with this id already exists");
             return null;
         }
         self.allocator.free(run_ns_key);
@@ -773,7 +777,7 @@ pub const WorkflowHandler = struct {
             return;
         };
         if (self.last_start_collided) {
-            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "run id already exists");
+            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "conflict: a run with this id already exists");
             return;
         }
         if (self.last_start_existed) {
@@ -1790,7 +1794,7 @@ pub const WorkflowHandler = struct {
         index: *u64,
     ) ?[]const u8 {
         const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf) catch return null;
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf);
         index.* = self.proposeRun(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
         return run_id_str;
     }
@@ -1956,9 +1960,7 @@ pub const WorkflowHandler = struct {
         // through its own log and applier, from a message we hand it.
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
-        const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf) catch {
-            return definition.StepOutcome.execution_failure;
-        };
+        const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
         const peer_inboxes = shard.peer_inboxes orelse return definition.StepOutcome.execution_failure;
         if (target_shard_id >= peer_inboxes.len) return definition.StepOutcome.execution_failure;
         const message = ActionsHandler.encodeStartRunMessage(shard.allocator, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
@@ -2997,7 +2999,7 @@ pub const WorkflowHandler = struct {
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
     }
@@ -3126,7 +3128,7 @@ pub const WorkflowHandler = struct {
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
-        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf) catch return;
+        const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         var idem_buf: [512]u8 = undefined;
         const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch return;

@@ -74,7 +74,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("data-dir", 'd', "", "Data directory for storage")
                 .stringFlag("durability", 0, "", "Storage durability: sync, async_flush, ephemeral")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
-                .uintFlag("partitions", 0, 0, "Number of virtual partitions (0=auto: max(4096, shards×32))")
+                .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
                 .stringFlag("log-format", 0, "", "Log format: text, json")
                 .uintFlag("threads", 't', 0, "Number of worker threads (0=auto)")
@@ -283,7 +283,9 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const config_path = ctx.getString("config");
     const port = stdx.nullIfZero(u16, ctx.getUint16("port"));
     const data_dir = ctx.getString("data-dir");
-    const shards = ctx.getChangedUint16("shards");
+    // Read wide so an out-of-range count is refused by the config check,
+    // not truncated on the way in.
+    const shards = ctx.getChangedUint("shards");
     const partitions = ctx.getChangedUint("partitions");
     const log_level = ctx.getString("log-level");
     const log_format = ctx.getString("log-format");
@@ -310,7 +312,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         port,
         stdx.nullIfEmpty(u8, data_dir),
         shards,
-        if (partitions) |p| @as(u32, @intCast(p)) else null,
+        partitions,
         stdx.nullIfEmpty(u8, log_level),
         stdx.nullIfEmpty(u8, log_format),
         stdx.nullIfEmpty(u8, durability),
@@ -319,6 +321,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
             error.InvalidDurability => {
                 ctx.printErr("Invalid --durability value. Use: sync, async_flush, or ephemeral\n", .{});
             },
+            // Already logged, naming the file or the flag.
+            error.InvalidShardCount, error.InvalidPartitionCount => {},
             else => ctx.printErr("Error loading configuration: {}\n", .{err}),
         }
         return error.CommandFailed;

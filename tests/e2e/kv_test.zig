@@ -956,15 +956,30 @@ test "e2e/kv: blocking get receives value when key is set" {
     try stdx.testing.assertContains(result, value);
 }
 
-test "e2e/kv: blocking get with infinite timeout receives value" {
+test "e2e/kv: the longest wait receives the value, a wait of 0 answers at once, and a longer wait is refused" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const key = "blocking_infinite_key";
-    const value = "infinite_wait_value";
+    const key = "blocking_longest_key";
+    const value = "longest_wait_value";
 
-    // Start blocking GET with infinite timeout (--wait 0)
-    var async_get = try ctx.cli.runAsync(&.{ "kv", "get", key, "--wait", "0" });
+    // For both flags: 0 does not wait (a missing key answers null at
+    // once), and one millisecond over the longest wait is refused, not
+    // shortened.
+    for ([_][]const u8{ "--wait", "--block" }) |flag| {
+        const t0 = @import("stdx").time.monotonicMs();
+        var now = try ctx.cli.run(&.{ "kv", "get", "never_set_key", flag, "0", "-o", "json" });
+        defer now.deinit();
+        try testing.expect(now.stdoutContains("\"value\":null"));
+        try testing.expect(@import("stdx").time.monotonicMs() - t0 < 2_000);
+
+        var over = try ctx.cli.run(&.{ "kv", "get", "never_set_key", flag, "300001" });
+        defer over.deinit();
+        try testing.expect(over.stderrContains("a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms"));
+    }
+
+    // Start a blocking GET with the longest wait
+    var async_get = try ctx.cli.runAsync(&.{ "kv", "get", key, "--wait", "300000" });
     defer async_get.deinit();
 
     // Small delay to ensure blocking GET is registered

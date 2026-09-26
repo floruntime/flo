@@ -152,7 +152,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .about("Wait for tasks")
                 .arg("task_types", "Task types to wait for")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
-                .uintFlag("block", 'b', 5000, "Block timeout (ms)")
+                .uintFlag("block", 'b', 5000, "Block for tasks (ms, at most 300000; 0 = don't wait)")
                 .uintFlag("timeout", 't', 30000, "Visibility timeout (ms)")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")

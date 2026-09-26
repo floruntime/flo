@@ -555,8 +555,17 @@ pub const ShardMetrics = struct {
     reactor_loops: Atomic(u64) = Atomic(u64).init(0),
     /// Total inbox messages processed
     inbox_processed: Atomic(u64) = Atomic(u64).init(0),
-    /// Current inbox messages pending (snapshot gauge)
+    /// Current inbox messages pending (snapshot gauge), as the shard last
+    /// saw after a drain; `live_pending` is read instead when set.
     inbox_pending: Atomic(u64) = Atomic(u64).init(0),
+    /// Reads the shard's inbox depth at scrape time, from any thread, so a
+    /// shard that has stopped draining still shows what waits for it.
+    live_pending: ?LivePending = null,
+
+    pub const LivePending = struct {
+        ctx: *const anyopaque,
+        read: *const fn (ctx: *const anyopaque) u64,
+    };
 
     pub fn init(id: u16) ShardMetrics {
         return .{ .shard_id = id };
@@ -632,7 +641,7 @@ pub const ShardMetrics = struct {
             .partitions = self.partitions.load(.monotonic),
             .reactor_loops = self.reactor_loops.load(.monotonic),
             .inbox_processed = self.inbox_processed.load(.monotonic),
-            .inbox_pending = self.inbox_pending.load(.monotonic),
+            .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
         };
     }
 };
