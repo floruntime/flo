@@ -93,7 +93,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo namespace config myapp",
                     "flo ns config myapp --set kv_max_hot_versions=50",
                     "flo ns config myapp --set stream_retention_s=86400",
-                    "flo ns config myapp --set memory_budget_bytes=1073741824",
                 })
                 .arg("name", "Name of the namespace")
                 .stringFlag("set", 's', "Set a configuration value (key=value)", "")
@@ -294,8 +293,7 @@ fn runConfig(ctx: *commander.Context) commander.Error!void {
         const parsed = parseSettingKeyValue(key, val_str, &config) catch {
             ctx.printErr("Error: Unknown setting '{s}'. Valid settings:\n", .{key});
             ctx.printErr("  kv_max_hot_versions, kv_version_ttl_s, stream_retention_bytes,\n", .{});
-            ctx.printErr("  stream_retention_s, queue_max_dlq_size, queue_max_lease_s,\n", .{});
-            ctx.printErr("  memory_budget_bytes\n", .{});
+            ctx.printErr("  stream_retention_s, queue_max_dlq_size, queue_max_lease_s\n", .{});
             return error.CommandFailed;
         };
         if (!parsed) {
@@ -336,7 +334,10 @@ fn runConfig(ctx: *commander.Context) commander.Error!void {
             return error.CommandFailed;
         };
 
-        const de = NamespaceConfig.deserializeSettings(data);
+        const de = NamespaceConfig.deserializeSettings(data) catch {
+            ctx.printErr("Invalid response from server\n", .{});
+            return error.CommandFailed;
+        };
         const s = de.config;
 
         ctx.print("Namespace: {s}\n", .{name});
@@ -347,7 +348,6 @@ fn runConfig(ctx: *commander.Context) commander.Error!void {
         printSetting(ctx, "stream_retention_s", if (s.stream_retention_s) |v| fmtU64(v) else null);
         printSetting(ctx, "queue_max_dlq_size", if (s.queue_max_dlq_size) |v| fmtU32(v) else null);
         printSetting(ctx, "queue_max_lease_s", if (s.queue_max_lease_s) |v| fmtU32(v) else null);
-        printSetting(ctx, "memory_budget_bytes", if (s.memory_budget_bytes) |v| fmtU64(v) else null);
     }
 }
 
@@ -387,8 +387,6 @@ fn parseSettingKeyValue(key: []const u8, val_str: []const u8, config: *Namespace
         config.queue_max_dlq_size = std.fmt.parseInt(u32, val_str, 10) catch return false;
     } else if (std.mem.eql(u8, key, "queue_max_lease_s")) {
         config.queue_max_lease_s = std.fmt.parseInt(u32, val_str, 10) catch return false;
-    } else if (std.mem.eql(u8, key, "memory_budget_bytes")) {
-        config.memory_budget_bytes = std.fmt.parseInt(u64, val_str, 10) catch return false;
     } else {
         return error.UnknownSetting;
     }

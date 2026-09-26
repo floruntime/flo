@@ -543,7 +543,10 @@ pub const NamespaceHandler = struct {
             return;
         }
 
-        const parsed = NamespaceConfig.deserializeSettings(req.value);
+        const parsed = NamespaceConfig.deserializeSettings(req.value) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown or malformed setting");
+            return;
+        };
         if (parsed.config.settingsEmpty()) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "no valid settings provided");
             return;
@@ -565,7 +568,8 @@ pub const NamespaceHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
-            const parsed = NamespaceConfig.deserializeSettings(req.value);
+            // Validated before the entry was proposed.
+            const parsed = NamespaceConfig.deserializeSettings(req.value) catch unreachable;
             _ = coord.proposeUpdateNamespaceConfig(req.key, parsed.config) catch {};
             _ = coord.applyCommitted() catch {};
         }
@@ -620,7 +624,7 @@ pub const NamespaceHandler = struct {
             .namespace_delete => self.applyDelete(name),
             .namespace_config => {
                 if (cmd.value.len > 0) {
-                    const parsed = NamespaceConfig.deserializeSettings(cmd.value);
+                    const parsed = NamespaceConfig.deserializeSettings(cmd.value) catch return;
                     self.applyConfigUpdate(name, parsed.config);
                 }
             },
@@ -801,7 +805,9 @@ pub const NamespaceHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "settings payload is required" } };
         }
 
-        const parsed = NamespaceConfig.deserializeSettings(req.value);
+        const parsed = NamespaceConfig.deserializeSettings(req.value) catch {
+            return .{ .err = .{ .code = .invalid_request, .message = "unknown or malformed setting" } };
+        };
         if (parsed.config.settingsEmpty()) {
             return .{ .err = .{ .code = .invalid_request, .message = "no valid settings provided" } };
         }
@@ -1453,7 +1459,7 @@ test "namespace handler: handleConfigGet returns TLV" {
     switch (result) {
         .namespace_config_get => |payload| {
             // Deserialize the returned TLV
-            const de = NamespaceConfig.deserializeSettings(payload.data);
+            const de = try NamespaceConfig.deserializeSettings(payload.data);
             try testing.expectEqual(@as(?u32, 42), de.config.kv_max_hot_versions);
             if (payload.allocated) {
                 allocator.free(payload.data);
@@ -1471,7 +1477,7 @@ test "namespace handler: handleConfigSet via command" {
     handler.applyCreate("myapp");
 
     // Build TLV for settings
-    const config = NamespaceConfig{ .memory_budget_bytes = 1_073_741_824 };
+    const config = NamespaceConfig{ .stream_retention_bytes = 1_073_741_824 };
     var tlv_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
     const tlv_len = config.serializeSettings(&tlv_buf);
 
@@ -1483,7 +1489,24 @@ test "namespace handler: handleConfigSet via command" {
 
     // Verify it was applied
     const retrieved = handler.getSettings("myapp");
-    try testing.expectEqual(@as(?u64, 1_073_741_824), retrieved.memory_budget_bytes);
+    try testing.expectEqual(@as(?u64, 1_073_741_824), retrieved.stream_retention_bytes);
+}
+
+test "namespace handler: handleConfigSet refuses an unknown setting" {
+    const allocator = testing.allocator;
+    var handler = NamespaceHandler.init(allocator);
+    defer handler.deinit();
+
+    handler.applyCreate("myapp");
+
+    // One known setting followed by an unknown tag: nothing may be applied.
+    const tlv = [_]u8{ 2, @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s), 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 };
+    const result = handler.handleCommand(makeRequest(.namespace_config_set, "myapp", &tlv));
+    switch (result) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(handler.getSettings("myapp").settingsEmpty());
 }
 
 test "namespace: a committed entry's hash resolves to the name until it is deleted" {

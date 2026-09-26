@@ -63,7 +63,7 @@ pub const MAX_NODES: usize = 64;
 ///
 /// Registry fields (name, partition_count, etc.) are set at creation time.
 /// Settings fields (nullable) are admin-settable via `namespace_config_set`.
-/// Null settings mean "use system default / unlimited (memory controller decides)".
+/// Null settings mean "use system default".
 /// Settings are both defaults AND ceilings: per-resource overrides can only
 /// be MORE restrictive than these.
 pub const NamespaceConfig = struct {
@@ -100,9 +100,6 @@ pub const NamespaceConfig = struct {
     /// Max lease hold time for queue messages (seconds).
     /// null = system default (30s).
     queue_max_lease_s: ?u32 = null,
-    /// Memory budget for this namespace (bytes).
-    /// null = fair share of shard budget.
-    memory_budget_bytes: ?u64 = null,
 
     // ── Settings TLV serialization ──────────────────────────────────────
 
@@ -115,11 +112,11 @@ pub const NamespaceConfig = struct {
         stream_retention_s = 4,
         queue_max_dlq_size = 5,
         queue_max_lease_s = 6,
-        memory_budget_bytes = 7,
+        _,
     };
 
-    /// Maximum serialized size of settings TLV: 1 (count) + 7 * (1 tag + 8 max value) = 64 bytes
-    pub const MAX_SETTINGS_SIZE: usize = 1 + 7 * 9;
+    /// Maximum serialized size of settings TLV: 1 (count) + 6 * (1 tag + 8 max value) = 55 bytes
+    pub const MAX_SETTINGS_SIZE: usize = 1 + 6 * 9;
 
     /// Returns true if all configurable settings are null (no overrides).
     pub fn settingsEmpty(self: NamespaceConfig) bool {
@@ -128,8 +125,7 @@ pub const NamespaceConfig = struct {
             self.stream_retention_bytes == null and
             self.stream_retention_s == null and
             self.queue_max_dlq_size == null and
-            self.queue_max_lease_s == null and
-            self.memory_budget_bytes == null;
+            self.queue_max_lease_s == null;
     }
 
     /// Merge configurable settings from `other` into self.
@@ -141,7 +137,6 @@ pub const NamespaceConfig = struct {
         if (other.stream_retention_s) |v| self.stream_retention_s = v;
         if (other.queue_max_dlq_size) |v| self.queue_max_dlq_size = v;
         if (other.queue_max_lease_s) |v| self.queue_max_lease_s = v;
-        if (other.memory_budget_bytes) |v| self.memory_budget_bytes = v;
     }
 
     /// Serialize configurable settings to TLV format: [count:u8] ([tag:u8][value:u32/u64])*
@@ -192,13 +187,6 @@ pub const NamespaceConfig = struct {
             pos += 4;
             count += 1;
         }
-        if (self.memory_budget_bytes) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.memory_budget_bytes);
-            pos += 1;
-            std.mem.writeInt(u64, buf[pos..][0..8], v, .little);
-            pos += 8;
-            count += 1;
-        }
 
         buf[0] = count;
         return pos;
@@ -206,7 +194,10 @@ pub const NamespaceConfig = struct {
 
     /// Deserialize configurable settings from TLV format.
     /// Returns a NamespaceConfig with only settings populated and bytes consumed.
-    pub fn deserializeSettings(data: []const u8) struct { config: NamespaceConfig, consumed: usize } {
+    /// The payload arrives from clients, so an unknown tag or a truncated value
+    /// is refused rather than skipped: a setting the server doesn't understand
+    /// must not be acknowledged as applied.
+    pub fn deserializeSettings(data: []const u8) error{InvalidSettings}!struct { config: NamespaceConfig, consumed: usize } {
         var s: NamespaceConfig = .{};
         if (data.len == 0) return .{ .config = s, .consumed = 0 };
 
@@ -214,46 +205,42 @@ pub const NamespaceConfig = struct {
         var pos: usize = 1;
 
         for (0..count) |_| {
-            if (pos >= data.len) break;
+            if (pos >= data.len) return error.InvalidSettings;
             const tag: SettingsTag = @enumFromInt(data[pos]);
             pos += 1;
             switch (tag) {
                 .kv_max_hot_versions => {
-                    if (pos + 4 > data.len) break;
+                    if (pos + 4 > data.len) return error.InvalidSettings;
                     s.kv_max_hot_versions = std.mem.readInt(u32, data[pos..][0..4], .little);
                     pos += 4;
                 },
                 .kv_version_ttl_s => {
-                    if (pos + 8 > data.len) break;
+                    if (pos + 8 > data.len) return error.InvalidSettings;
                     s.kv_version_ttl_s = std.mem.readInt(u64, data[pos..][0..8], .little);
                     pos += 8;
                 },
                 .stream_retention_bytes => {
-                    if (pos + 8 > data.len) break;
+                    if (pos + 8 > data.len) return error.InvalidSettings;
                     s.stream_retention_bytes = std.mem.readInt(u64, data[pos..][0..8], .little);
                     pos += 8;
                 },
                 .stream_retention_s => {
-                    if (pos + 8 > data.len) break;
+                    if (pos + 8 > data.len) return error.InvalidSettings;
                     s.stream_retention_s = std.mem.readInt(u64, data[pos..][0..8], .little);
                     pos += 8;
                 },
                 .queue_max_dlq_size => {
-                    if (pos + 4 > data.len) break;
+                    if (pos + 4 > data.len) return error.InvalidSettings;
                     s.queue_max_dlq_size = std.mem.readInt(u32, data[pos..][0..4], .little);
                     pos += 4;
                 },
                 .queue_max_lease_s => {
-                    if (pos + 4 > data.len) break;
+                    if (pos + 4 > data.len) return error.InvalidSettings;
                     s.queue_max_lease_s = std.mem.readInt(u32, data[pos..][0..4], .little);
                     pos += 4;
                 },
-                .memory_budget_bytes => {
-                    if (pos + 8 > data.len) break;
-                    s.memory_budget_bytes = std.mem.readInt(u64, data[pos..][0..8], .little);
-                    pos += 8;
-                },
                 .end => break,
+                _ => return error.InvalidSettings,
             }
         }
 
@@ -707,7 +694,7 @@ pub const Coordinator = struct {
         const hash = hashNamespace(name);
 
         if (self.namespaces.getPtr(hash)) |ns| {
-            const result = NamespaceConfig.deserializeSettings(data[4 + name_len ..][0..settings_len]);
+            const result = NamespaceConfig.deserializeSettings(data[4 + name_len ..][0..settings_len]) catch return;
             ns.mergeSettings(result.config);
             log.debug("Coordinator: updated namespace config={s}", .{name});
         }
@@ -769,7 +756,6 @@ pub const Coordinator = struct {
                 .stream_retention_s = ns.stream_retention_s,
                 .queue_max_dlq_size = ns.queue_max_dlq_size,
                 .queue_max_lease_s = ns.queue_max_lease_s,
-                .memory_budget_bytes = ns.memory_budget_bytes,
             };
         }
         return .{};
@@ -908,7 +894,7 @@ pub const Coordinator = struct {
             const slen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2;
             if (pos + slen > data.len) return error.InvalidSnapshot;
-            const result = NamespaceConfig.deserializeSettings(data[pos..][0..slen]);
+            const result = NamespaceConfig.deserializeSettings(data[pos..][0..slen]) catch return error.InvalidSnapshot;
             pos += slen;
 
             var ns_config = result.config;
@@ -1189,21 +1175,19 @@ test "NamespaceConfig settings serialize/deserialize roundtrip" {
         .stream_retention_s = 86400,
         .queue_max_dlq_size = 500,
         .queue_max_lease_s = 60,
-        .memory_budget_bytes = 2_147_483_648,
     };
 
     var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
     const len = original.serializeSettings(&buf);
     try testing.expect(len > 0);
 
-    const result = NamespaceConfig.deserializeSettings(buf[0..len]);
+    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
     try testing.expectEqual(original.kv_max_hot_versions, result.config.kv_max_hot_versions);
     try testing.expectEqual(original.kv_version_ttl_s, result.config.kv_version_ttl_s);
     try testing.expectEqual(original.stream_retention_bytes, result.config.stream_retention_bytes);
     try testing.expectEqual(original.stream_retention_s, result.config.stream_retention_s);
     try testing.expectEqual(original.queue_max_dlq_size, result.config.queue_max_dlq_size);
     try testing.expectEqual(original.queue_max_lease_s, result.config.queue_max_lease_s);
-    try testing.expectEqual(original.memory_budget_bytes, result.config.memory_budget_bytes);
     try testing.expectEqual(len, result.consumed);
 }
 
@@ -1216,14 +1200,13 @@ test "NamespaceConfig settings serialize/deserialize partial" {
     var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
     const len = original.serializeSettings(&buf);
 
-    const result = NamespaceConfig.deserializeSettings(buf[0..len]);
+    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
     try testing.expectEqual(@as(?u32, 100), result.config.kv_max_hot_versions);
     try testing.expectEqual(@as(?u64, 7200), result.config.stream_retention_s);
     try testing.expectEqual(@as(?u64, null), result.config.kv_version_ttl_s);
     try testing.expectEqual(@as(?u64, null), result.config.stream_retention_bytes);
     try testing.expectEqual(@as(?u32, null), result.config.queue_max_dlq_size);
     try testing.expectEqual(@as(?u32, null), result.config.queue_max_lease_s);
-    try testing.expectEqual(@as(?u64, null), result.config.memory_budget_bytes);
 }
 
 test "NamespaceConfig settings empty roundtrip" {
@@ -1234,8 +1217,20 @@ test "NamespaceConfig settings empty roundtrip" {
     const len = original.serializeSettings(&buf);
     try testing.expectEqual(@as(usize, 1), len); // just the count byte = 0
 
-    const result = NamespaceConfig.deserializeSettings(buf[0..len]);
+    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
     try testing.expect(result.config.settingsEmpty());
+}
+
+test "NamespaceConfig settings refuse an unknown tag or a truncated value" {
+    // Tag 7 was a namespace memory budget nothing enforced; it is now unknown.
+    const unknown = [_]u8{ 1, 7, 0, 0, 0, 64, 0, 0, 0, 0 };
+    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&unknown));
+
+    const truncated = [_]u8{ 1, @intFromEnum(NamespaceConfig.SettingsTag.kv_version_ttl_s), 1, 2 };
+    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&truncated));
+
+    const missing_entry = [_]u8{2};
+    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&missing_entry));
 }
 
 test "NamespaceConfig settings merge" {
@@ -1314,7 +1309,7 @@ test "Coordinator snapshot roundtrip with settings" {
     // Set config on events
     _ = try coord.proposeUpdateNamespaceConfig("events", .{
         .kv_max_hot_versions = 100,
-        .memory_budget_bytes = 4_294_967_296,
+        .stream_retention_bytes = 4_294_967_296,
     });
     _ = try coord.applyCommitted();
 
@@ -1332,7 +1327,7 @@ test "Coordinator snapshot roundtrip with settings" {
     // Verify settings survived the roundtrip
     const settings = coord2.getNamespaceSettings("events");
     try testing.expectEqual(@as(?u32, 100), settings.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 4_294_967_296), settings.memory_budget_bytes);
+    try testing.expectEqual(@as(?u64, 4_294_967_296), settings.stream_retention_bytes);
     try testing.expectEqual(@as(?u64, null), settings.stream_retention_s);
 
     // logs should have empty settings
