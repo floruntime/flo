@@ -95,7 +95,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo ns config myapp --set stream_retention_s=86400",
                 })
                 .arg("name", "Name of the namespace")
-                .stringFlag("set", 's', "Set a configuration value (key=value)", "")
+                .stringFlag("set", 's', "", "Set a configuration value (key=value)")
                 .action(wrapHandler(runConfig)),
         )
         .build();
