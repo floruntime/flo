@@ -74,7 +74,7 @@ test "integration: inbox fill to capacity" {
 
     // Now sends should work again
     for (0..4) |i| {
-        const ok = inbox.send(makeMsg(.forward_response, 1, @as(u64, @intCast(i)) + 100));
+        const ok = inbox.send(makeMsg(.reply, 1, @as(u64, @intCast(i)) + 100));
         try testing.expect(ok);
     }
     try testing.expectEqual(@as(usize, 16), inbox.pending());
@@ -90,13 +90,13 @@ test "integration: inbox tag filtering" {
 
     // Send mixed tags
     _ = inbox.send(makeMsg(.forward_request, 0, 1));
-    _ = inbox.send(makeMsg(.forward_response, 1, 2));
-    _ = inbox.send(makeMsg(.connection_handoff, 2, 3));
-    _ = inbox.send(makeMsg(.metadata_update, 3, 4));
-    _ = inbox.send(makeMsg(.metadata_update, 0, 5));
+    _ = inbox.send(makeMsg(.reply, 1, 2));
+    _ = inbox.send(makeMsg(.action_start, 2, 3));
+    _ = inbox.send(makeMsg(.shutdown, 3, 4));
+    _ = inbox.send(makeMsg(.shutdown, 0, 5));
     _ = inbox.send(makeMsg(.shutdown, 0, 6));
     _ = inbox.send(makeMsg(.forward_request, 1, 7));
-    _ = inbox.send(makeMsg(.forward_response, 2, 8));
+    _ = inbox.send(makeMsg(.reply, 2, 8));
 
     try testing.expectEqual(@as(usize, 8), inbox.pending());
 
@@ -110,19 +110,19 @@ test "integration: inbox tag filtering" {
     try testing.expectEqual(@as(u64, 1), batch[0].sequence);
     try testing.expectEqual(@as(u8, 0), batch[0].src_shard);
 
-    try testing.expectEqual(Tag.forward_response, batch[1].tag);
+    try testing.expectEqual(Tag.reply, batch[1].tag);
     try testing.expectEqual(@as(u64, 2), batch[1].sequence);
     try testing.expectEqual(@as(u8, 1), batch[1].src_shard);
 
-    try testing.expectEqual(Tag.connection_handoff, batch[2].tag);
+    try testing.expectEqual(Tag.action_start, batch[2].tag);
     try testing.expectEqual(@as(u64, 3), batch[2].sequence);
     try testing.expectEqual(@as(u8, 2), batch[2].src_shard);
 
-    try testing.expectEqual(Tag.metadata_update, batch[3].tag);
+    try testing.expectEqual(Tag.shutdown, batch[3].tag);
     try testing.expectEqual(@as(u64, 4), batch[3].sequence);
     try testing.expectEqual(@as(u8, 3), batch[3].src_shard);
 
-    try testing.expectEqual(Tag.metadata_update, batch[4].tag);
+    try testing.expectEqual(Tag.shutdown, batch[4].tag);
     try testing.expectEqual(@as(u64, 5), batch[4].sequence);
 
     try testing.expectEqual(Tag.shutdown, batch[5].tag);
@@ -132,7 +132,7 @@ test "integration: inbox tag filtering" {
     try testing.expectEqual(@as(u64, 7), batch[6].sequence);
     try testing.expectEqual(@as(u8, 1), batch[6].src_shard);
 
-    try testing.expectEqual(Tag.forward_response, batch[7].tag);
+    try testing.expectEqual(Tag.reply, batch[7].tag);
     try testing.expectEqual(@as(u64, 8), batch[7].sequence);
     try testing.expectEqual(@as(u8, 2), batch[7].src_shard);
 

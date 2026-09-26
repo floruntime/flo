@@ -29,6 +29,9 @@ test {
 test {
     _ = @import("node/reactor.zig");
     _ = @import("node/inbox.zig");
+    _ = @import("node/mailbox.zig");
+    _ = @import("node/reply_to.zig");
+    _ = @import("node/reply_pool.zig");
     _ = @import("node/slab.zig");
     _ = @import("node/router.zig");
     _ = @import("node/dispatcher.zig");
@@ -169,7 +172,6 @@ test {
 test {
     _ = @import("cluster/coordinator.zig");
     _ = @import("cluster/partition_table.zig");
-    _ = @import("cluster/forwarder.zig");
 }
 
 // Auth

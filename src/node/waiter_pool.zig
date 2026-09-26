@@ -44,7 +44,7 @@
 //! // In handler — register a waiter
 //! shard.waiter_pool.register(.{
 //!     .kind = .kv_get,
-//!     .fd = conn.fd,
+//!     .reply_to = conn.replyTo(),
 //!     .request_id = req.header.request_id,
 //!     .key = req.key,
 //!     .min_version = current_version,
@@ -61,6 +61,7 @@
 
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
+const ReplyTo = @import("reply_to.zig").ReplyTo;
 const log = @import("stdx").log;
 const StreamID = @import("../stream/stream_id.zig").StreamID;
 
@@ -112,18 +113,9 @@ pub const Waiter = struct {
     /// What this waiter is blocking on.
     kind: WaiterKind,
 
-    /// Connection file descriptor.
-    fd: i32,
-
-    /// Shard that owns the connection. The waiter itself lives on the data
-    /// shard; resolving it must marshal the response to this shard's thread.
-    owner_shard: u16,
-
-    /// Connection generation id at registration time. The owner shard
-    /// verifies this against the live connection on delivery so that fd
-    /// reuse (close + accept of a new connection at the same fd) can't
-    /// misdirect a stale blocking-read response to the wrong client.
-    conn_id: u32,
+    /// Where the answer goes. The waiter lives on the data shard; the
+    /// asker may be another shard's client or another node.
+    reply_to: ReplyTo,
 
     /// Original request ID — needed for matching the response.
     request_id: u64,
@@ -176,15 +168,9 @@ pub const WaiterPool = struct {
 
     pub const RegisterOpts = struct {
         kind: WaiterKind,
-        fd: i32,
-        /// Shard that owns the connection (its fd, buffers, reactor entry).
-        /// Required — no default, because a wrong value silently routes
-        /// the deferred response to the wrong shard's connection table.
-        owner_shard: u16,
-        /// Connection generation id, used by the owner shard to detect
-        /// fd reuse before writing a stale response. Required for the
-        /// same reason as `owner_shard`.
-        conn_id: u32,
+        /// Required — no default: a wrong address sends the answer to
+        /// another client.
+        reply_to: ReplyTo,
         request_id: u64,
         key: []const u8,
         min_version: u64 = 0,
@@ -208,9 +194,7 @@ pub const WaiterPool = struct {
 
         var w = &self.waiters[self.count];
         w.kind = opts.kind;
-        w.fd = opts.fd;
-        w.owner_shard = opts.owner_shard;
-        w.conn_id = opts.conn_id;
+        w.reply_to = opts.reply_to;
         w.request_id = opts.request_id;
         w.key_buf = undefined;
         @memcpy(w.key_buf[0..opts.key.len], opts.key);
@@ -322,7 +306,7 @@ pub const WaiterPool = struct {
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
-            if (w.owner_shard == owner_shard and w.fd == fd and w.conn_id == conn_id) {
+            if (w.reply_to.isSocket(owner_shard, fd, conn_id)) {
                 self.swapRemove(i);
                 continue;
             }
@@ -367,9 +351,7 @@ test "WaiterPool: register and count" {
 
     const ok = pool.register(.{
         .kind = .kv_get,
-        .fd = 10,
-        .owner_shard = 0,
-        .conn_id = 1,
+        .reply_to = ReplyTo.socketOf(0, 10, 1),
         .request_id = 1,
         .key = "mykey",
         .timeout_ms = 5000,
@@ -384,9 +366,7 @@ test "WaiterPool: register rejects empty key" {
     var pool = WaiterPool.init();
     const ok = pool.register(.{
         .kind = .kv_get,
-        .fd = 10,
-        .owner_shard = 0,
-        .conn_id = 1,
+        .reply_to = ReplyTo.socketOf(0, 10, 1),
         .request_id = 1,
         .key = "",
         .timeout_ms = 5000,
@@ -397,13 +377,13 @@ test "WaiterPool: register rejects empty key" {
 
 test "WaiterPool: a closed connection removes its own waiters, not another shard's or an older one's on the same fd" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a", .timeout_ms = 1_000 });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 2, .key = "b", .timeout_ms = 1_000 });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 3, .key = "c", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "a", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 2, .key = "b", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 20, 2), .request_id = 3, .key = "c", .timeout_ms = 1_000 });
     // Forwarded here for a client of shard 3 whose socket is also fd 10.
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 3, .conn_id = 1, .request_id = 4, .key = "d", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(3, 10, 1), .request_id = 4, .key = "d", .timeout_ms = 1_000 });
     // An earlier connection on shard 0 that also held fd 10.
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 9, .request_id = 5, .key = "e", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 9), .request_id = 5, .key = "e", .timeout_ms = 1_000 });
     try std.testing.expectEqual(@as(u16, 5), pool.totalActive());
 
     pool.removeByConnection(0, 10, 1);
@@ -414,16 +394,16 @@ test "WaiterPool: a closed connection removes its own waiters, not another shard
 test "WaiterPool: a waiter's deadline is its wait from now, on the monotonic clock" {
     var pool = WaiterPool.init();
     const before = @import("stdx").time.monotonicMs();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 1, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a", .timeout_ms = 2_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 1, 1), .request_id = 1, .key = "a", .timeout_ms = 2_000 });
     const after = @import("stdx").time.monotonicMs();
     try std.testing.expect(pool.waiters[0].expires_at_ms >= before + 2_000 and pool.waiters[0].expires_at_ms <= after + 2_000);
 }
 
 test "WaiterPool: notify wakes matching waiters" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 2, .key = "other", .min_version = 0, .timeout_ms = 1_000 });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 30, .owner_shard = 0, .conn_id = 3, .request_id = 3, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 20, 2), .request_id = 2, .key = "other", .min_version = 0, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(0, 30, 3), .request_id = 3, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
 
     // Resolver that always satisfies
     const always_resolve = struct {
@@ -443,7 +423,7 @@ test "WaiterPool: notify wakes matching waiters" {
 
 test "WaiterPool: notify respects resolver returning false" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 5, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "mykey", .min_version = 5, .timeout_ms = 1_000 });
 
     // Resolver that never satisfies (version too low)
     const never_resolve = struct {

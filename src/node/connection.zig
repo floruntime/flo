@@ -20,6 +20,7 @@
 //! reduces syscall overhead on high-throughput connections.
 
 const std = @import("std");
+const ReplyTo = @import("reply_to.zig").ReplyTo;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Ring Buffer
@@ -334,10 +335,13 @@ pub const Connection = struct {
     id: u32,
 
     /// ID of the shard that owns this connection (accepted it and owns its
-    /// fd, buffers, and reactor registration). Blocking-read waiters carry
-    /// this so a deferred response produced on another (data) shard can be
-    /// marshalled back to the owning shard's thread for the socket write.
+    /// fd, buffers, and reactor registration). Answers read it through
+    /// `replyTo`, which a proxy overrides.
     owner_shard: u16,
+
+    /// Set on a proxy (no socket of its own) to the address of the request
+    /// it is running; see `replyTo`.
+    proxy_for: ?ReplyTo = null,
 
     /// Set by handlers that intentionally defer the response (e.g. blocking GET).
     /// processRequests checks this to suppress the default "not implemented" error.
@@ -364,6 +368,12 @@ pub const Connection = struct {
     pacing_off: bool = false,
     /// Queued on the shard's resume list; keeps it to one entry.
     resume_queued: bool = false,
+
+    /// Where an answer to the request this connection is running goes: the
+    /// client itself, or, on a proxy, whoever the proxied request came from.
+    pub fn replyTo(self: *const Connection) ReplyTo {
+        return self.proxy_for orelse ReplyTo.socketOf(self.owner_shard, self.fd, self.id);
+    }
 
     pub fn init(allocator: std.mem.Allocator, fd: i32, conn_id: u32, owner_shard: u16) !Connection {
         var read_buf = try RingBuffer.init(allocator);
