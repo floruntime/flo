@@ -677,9 +677,9 @@ pub const StreamHandler = struct {
 
     // ── DELETE ──────────────────────────────────────────────────────────
 
-    /// Delete a stream entirely (records + metadata + name registry + metrics).
-    /// Consumer groups are namespace-level and intentionally left intact
-    /// (FLO-105 option A). Idempotent: deleting a missing stream returns ok.
+    /// Delete a stream entirely (records + metadata + name registry + metrics)
+    /// and its consumer groups, which belong to exactly one stream and would
+    /// otherwise outlive it. Idempotent: deleting a missing stream returns ok.
     /// Refuses a non-empty stream unless `force` (option 0x2C) is set.
     fn handleDelete(self: *StreamHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
@@ -924,7 +924,7 @@ pub const StreamHandler = struct {
 
     // ── GROUP CONFIGURE SWEEPER ─────────────────────────────────────────
 
-    /// Update a group's ack_timeout_ms / max_deliver at runtime (FLO-102).
+    /// Update a group's ack_timeout_ms / max_deliver at runtime.
     /// Wire value: [group_len:u16][group]; config carried as TLV options
     /// (ack_timeout_ms = 0x30, max_deliver = 0x31). A missing option leaves
     /// that field unchanged.
@@ -1238,7 +1238,7 @@ pub const StreamHandler = struct {
 
     // ── GROUP CLAIM ─────────────────────────────────────────────────────
 
-    /// Cursor-based PEL claim (FLO-102). Scans the group's pending entry list
+    /// Cursor-based PEL claim. Scans the group's pending entry list
     /// from `start_id` in StreamID order, claims up to `count` entries whose
     /// idle time ≥ `min_idle_ms` for `consumer`, and returns the full records
     /// (payload + headers) plus a trailing 16-byte next-cursor.
@@ -2259,7 +2259,7 @@ fn makeBatchValueWithHeader(buf: []u8, payload: []const u8, hdr_key: []const u8,
     return buf[0..total];
 }
 
-/// Count records a partition-filtered read returns for `stream` (FLO-105 test).
+/// Count records a partition-filtered read returns for `stream`.
 fn readPartitionCount(handler: *StreamHandler, stream: []const u8, partition_index: u32) !u32 {
     var opt_buf: [16]u8 = undefined;
     var builder = OptionsBuilder.init(&opt_buf);
@@ -2299,8 +2299,8 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_configure_sweeper)] != null);
     try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
 
-    // 17 original + stream_group_claim + stream_group_configure_sweeper (FLO-102)
-    // + stream_delete (FLO-105).
+    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_delete)] != null);
+
     try testing.expectEqual(@as(u16, 20), dispatcher.handler_count);
 }
 
@@ -2464,14 +2464,14 @@ test "stream handler: partition_index survives restart/replay" {
         }
     }
 
-    // After restart, partitions must still be isolated. Before FLO-105 every
-    // record rebuilt as partition 0, so this read 3/0/0 instead of 1/1/1.
+    // After restart, partitions must still be isolated; if replay lost the
+    // partition, every record would rebuild as partition 0 and read 3/0/0.
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 0));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
 }
 
-test "stream handler: delete removes one stream, leaves siblings + --force gating (FLO-105)" {
+test "stream handler: delete removes one stream, leaves siblings + --force gating" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2509,7 +2509,7 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     try testing.expect(std.meta.activeTag(again) == .ok);
 }
 
-test "stream handler: stream_delete replay/follower path wipes the stream (FLO-105)" {
+test "stream handler: stream_delete replay/follower path wipes the stream" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2749,7 +2749,7 @@ test "stream handler: group read and ack" {
 // covered by the Go SDK e2e test. The handler tests below exercise the wire
 // parse + response shape on an empty PEL, which needs no append pipeline.
 
-test "stream handler: group claim wire parse + empty response (FLO-102)" {
+test "stream handler: group claim wire parse + empty response" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2787,7 +2787,7 @@ test "stream handler: group claim wire parse + empty response (FLO-102)" {
     }
 }
 
-test "stream handler: group configure sweeper (FLO-102)" {
+test "stream handler: group configure sweeper" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2820,7 +2820,7 @@ test "stream handler: group configure sweeper (FLO-102)" {
     }
 }
 
-test "stream handler: group pending consumer filter wire parse (FLO-102)" {
+test "stream handler: group pending consumer filter wire parse" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
