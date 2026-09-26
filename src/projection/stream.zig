@@ -215,18 +215,19 @@ pub const StreamState = struct {
         return batch.first;
     }
 
-    /// Read records with IDs in [from_id, to_id] inclusive.
-    pub fn readRange(self: *const StreamState, from_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+    /// Read records with IDs in (after_id, to_id]: the start is a cursor,
+    /// exclusive like `readAfter`, the end inclusive.
+    pub fn readRange(self: *const StreamState, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
-        const start_idx = self.lowerBound(from_id);
+        const start_idx = self.lowerBound(after_id);
         if (start_idx >= items.len) return 0;
         var n: usize = 0;
         var i = start_idx;
         while (i < items.len and n < buf.len) : (i += 1) {
             const rec = &items[i];
             if (rec.id.greaterThan(to_id)) break;
-            if (rec.id.lessThan(from_id)) continue;
+            if (!rec.id.greaterThan(after_id)) continue;
             if (filter_partition) |fp| {
                 if (rec.partition_index != fp) continue;
             }
@@ -989,10 +990,10 @@ pub const StreamProjection = struct {
         return id;
     }
 
-    /// Read records from a stream by ID range [from_id, to_id] inclusive.
-    pub fn readStreamRange(self: *StreamProjection, name_hash: u64, from_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+    /// Read records from a stream with IDs in (after_id, to_id].
+    pub fn readStreamRange(self: *StreamProjection, name_hash: u64, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const ss = self.streams.getPtr(name_hash) orelse return 0;
-        const n = ss.readRange(from_id, to_id, filter_partition, buf);
+        const n = ss.readRange(after_id, to_id, filter_partition, buf);
         self.stats.reads += n;
         return n;
     }

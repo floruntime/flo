@@ -499,8 +499,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         first_batch = false;
 
         if (result.last_id) |last_id| {
-            // Advance start position past the last record we received
-            current_start = last_id.next();
+            // The start is exclusive: the last record received is the cursor.
+            current_start = last_id;
         }
 
         // If not in follow mode, we're done after one read

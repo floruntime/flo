@@ -225,7 +225,7 @@ pub const StreamHandler = struct {
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    /// Dedicated dispatch for stream_append — notifies blocking read waiters after append.
+    /// Dedicated dispatch for stream_append; parks until the append commits.
     fn dispatchAppend(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -273,8 +273,7 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Park on the window just read; every append to this stream
-            // re-runs it (`Shard.resolveStreamWaiter`).
+            // Park on the window just read (`Shard.resolveStreamWaiter`).
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
@@ -2411,7 +2410,6 @@ test "stream handler: read honors count" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb4, "4"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb5, "5"), ""));
 
-    // Read with count 2
     var opts_buf: [32]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
     try builder.addU32(.count, 2);

@@ -379,11 +379,13 @@ test "e2e/stream: read with --start and --end (range query)" {
     _ = extractStreamId(out1);
 
     // Read range from id2 to id4
-    var result = try ctx.cli.run(&.{ "stream", "read", "range-test", "--start", id2, "--end", id4 });
+    var result = try ctx.cli.run(&.{ "stream", "read", "range-test", "--start", id2, "--end", id4, "-o", "json" });
     defer result.deinit();
 
-    // Should contain msgs 2-4, not 1 or 5
-    try testing.expect(result.contains("range-msg-2") or result.contains("range-msg-3") or result.contains("range-msg-4"));
+    // The start is a cursor (exclusive), the end inclusive: msgs 3 and 4.
+    try testing.expectEqual(@as(usize, 2), result.stdoutCount("range-msg-"));
+    try testing.expect(result.stdoutContains("range-msg-3"));
+    try testing.expect(result.stdoutContains("range-msg-4"));
 }
 
 test "e2e/stream: read empty stream returns empty" {

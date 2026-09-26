@@ -26,7 +26,7 @@
 //! | Kind          | Trigger                       | Response                          |
 //! |---------------|-------------------------------|-----------------------------------|
 //! | `kv_get`      | KV put/delete on matching key | Value response (with version)     |
-//! | `stream_read` | Stream append on matching key | Messages from last offset         |
+//! | `stream_read` | Stream append on matching key | Records after the read's cursor   |
 //! | `queue_dequeue`| Queue enqueue on matching key| Dequeued message                  |
 //! | `action_await`| Action invoked matching key   | Task payload                      |
 //!
@@ -91,11 +91,11 @@ pub const WaiterKind = enum(u8) {
     stream_group_read,
 };
 
-/// The window a parked stream read resumes from: records of one stream
-/// strictly after `after`, up to `end`, optionally in one partition. The
-/// wake-up re-runs the read itself, so it returns exactly what a fresh read
-/// would, in the right namespace, and never misses an append that was
-/// proposed before the read parked but applied after.
+/// The window a parked stream read covers: records of one stream strictly
+/// after `after`, up to `end` inclusive, optionally in one partition. Each
+/// wake-up re-runs this read rather than comparing a version, so it answers
+/// only with records the read asked for, and an append proposed before the
+/// read parked but applied after still wakes it.
 pub const StreamWindow = struct {
     name_hash: u64 = 0,
     after: StreamID = StreamID.MIN,
@@ -135,11 +135,12 @@ pub const Waiter = struct {
     /// Minimum version/offset threshold.
     ///   - KV:     trigger when `entry.lsn > min_version`
     ///   - Stream: unused; see `stream`
-    ///   - Queue:  0 (trigger on any enqueue)
-    ///   - Worker: 0 (trigger on any task for this action)
+    ///   - Queue:  the queue's name hash
+    ///   - Worker: `(ns_len << 16) | action_len`, splitting `key` into both
     min_version: u64,
 
-    /// Stream and stream-group reads: what the read covers.
+    /// Stream reads: the window re-run on wake. Group reads: `name_hash`,
+    /// and `after` = the stream's last id when the read parked.
     stream: StreamWindow,
 
     /// Deadline on the monotonic clock, so a wall-clock step cannot hold a
@@ -231,8 +232,9 @@ pub const WaiterPool = struct {
     ///   3. Queues it on the connection's write buffer
     ///   4. Flushes to the client
     ///
-    /// Returns `true` if the waiter was satisfied (should be removed).
-    pub const ResolverFn = *const fn (waiter: *const Waiter, ctx: *anyopaque) bool;
+    /// Returns `true` if the waiter was satisfied (should be removed); a
+    /// resolver that returns `false` may update the waiter for its next try.
+    pub const ResolverFn = *const fn (waiter: *Waiter, ctx: *anyopaque) bool;
 
     /// Wake all waiters matching `kind` + `key`.
     ///
@@ -424,7 +426,7 @@ test "WaiterPool: notify wakes matching waiters" {
 
     // Resolver that always satisfies
     const always_resolve = struct {
-        fn resolve(_: *const Waiter, _: *anyopaque) bool {
+        fn resolve(_: *Waiter, _: *anyopaque) bool {
             return true;
         }
     }.resolve;
@@ -444,7 +446,7 @@ test "WaiterPool: notify respects resolver returning false" {
 
     // Resolver that never satisfies (version too low)
     const never_resolve = struct {
-        fn resolve(_: *const Waiter, _: *anyopaque) bool {
+        fn resolve(_: *Waiter, _: *anyopaque) bool {
             return false;
         }
     }.resolve;
