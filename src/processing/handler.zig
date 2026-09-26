@@ -85,6 +85,10 @@ pub const ProcessingHandler = struct {
     last_savepoint_id: ?[]const u8 = null,
     sink_drops: u64 = 0,
     sink_warn_ms: i64 = 0,
+    chain_errors: u64 = 0,
+    chain_warn_ms: i64 = 0,
+    /// The job whose pipeline is ticking, so a drop or chain error names it.
+    ticking_job: []const u8 = "",
 
     /// Savepoint store: savepoint_id → SavepointRecord.
     savepoints: std.StringHashMap(SavepointRecord),
@@ -153,7 +157,7 @@ pub const ProcessingHandler = struct {
         stream_cursor_seq: u64, // Stream source: last StreamID sequence read
         last_poll_ms: i64, // last time this pipeline was ticked
 
-        // Durable-cursor checkpointing (FLO-104): the last cursor persisted via a
+        // Durable-cursor checkpointing: the last cursor persisted via a
         // processing_checkpoint UAL entry, plus when. Debounces persistence so a
         // continuously-fed pipeline doesn't emit a Raft write per poll.
         persisted_cursor_ts: u64 = 0,
@@ -512,10 +516,7 @@ pub const ProcessingHandler = struct {
         // always routes back to the shard that created and stores the job.
         const partition_id: u32 = shard.id;
         var id_buf: [32]u8 = undefined;
-        const job_id = shard.run_id_gen.next(.job, partition_id, &id_buf) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "id generation failed");
-            return;
-        };
+        const job_id = shard.run_id_gen.next(.job, partition_id, &id_buf);
 
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
@@ -691,10 +692,7 @@ pub const ProcessingHandler = struct {
             // Generate savepoint ID with partition from parent job
             const partition_id = run_id_mod.extractPartition(job_id) orelse 0;
             var id_buf: [32]u8 = undefined;
-            const sp_id = shard.run_id_gen.next(.savepoint, partition_id, &id_buf) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "id generation failed");
-                return;
-            };
+            const sp_id = shard.run_id_gen.next(.savepoint, partition_id, &id_buf);
 
             const now = @import("stdx").time.milliTimestamp();
             // Persist through Raft; the applier stores the savepoint.
@@ -915,7 +913,7 @@ pub const ProcessingHandler = struct {
         const yaml = value[off..];
 
         // Extract name from YAML by re-parsing. Keep `def` alive so we can also
-        // rebuild the execution pipeline below (FLO-104) — createPipeline
+        // rebuild the execution pipeline below — createPipeline
         // deep-copies what it retains, so freeing `def` at function end is safe.
         var def = parser.parseJobDefinition(self.allocator, yaml) catch return;
         defer def.deinit(self.allocator);
@@ -964,7 +962,7 @@ pub const ProcessingHandler = struct {
         self.last_submitted_job_id = owned_id;
 
         // Rebuild the execution pipeline so a RUNNING job resumes consuming
-        // after restart instead of just reappearing in the registry (FLO-104).
+        // after restart instead of just reappearing in the registry.
         // Guard against a double build on idempotent replay. The persisted
         // source cursor is restored separately by replayCheckpoint, which lands
         // after this submit entry in log order.
@@ -1029,17 +1027,27 @@ pub const ProcessingHandler = struct {
     }
 
     /// Replay a processing_checkpoint entry: restore a pipeline's persisted
-    /// stream source cursor (FLO-104). It lands after the submit entry in log
-    /// order, so replaySubmit has already rebuilt the pipeline; we just advance
-    /// its cursor so it resumes where it left off instead of from MIN.
-    /// Key = pipeline_key; value = [cursor_ts:u64 LE][cursor_seq:u64 LE].
+    /// source cursor. It lands after the submit entry in log order, so
+    /// replaySubmit has already rebuilt the pipeline; we just advance its
+    /// cursor so it resumes where it left off instead of from the start.
+    /// Key = pipeline_key; value = [a:u64 LE][b:u64 LE] — a stream source's
+    /// (timestamp, sequence), or a TS source's next timestamp and 0.
     fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
         if (value.len < 16) return;
         const pipe = self.pipelines.getPtr(key) orelse return;
-        pipe.stream_cursor_ts = std.mem.readInt(u64, value[0..8], .little);
-        pipe.stream_cursor_seq = std.mem.readInt(u64, value[8..16], .little);
-        pipe.persisted_cursor_ts = pipe.stream_cursor_ts;
-        pipe.persisted_cursor_seq = pipe.stream_cursor_seq;
+        const a = std.mem.readInt(u64, value[0..8], .little);
+        const b = std.mem.readInt(u64, value[8..16], .little);
+        // Forward only: this is also the live applier, and a leader may
+        // have read further by the time its checkpoint commits.
+        switch (pipe.source_kind) {
+            .stream => if (a > pipe.stream_cursor_ts or (a == pipe.stream_cursor_ts and b > pipe.stream_cursor_seq)) {
+                pipe.stream_cursor_ts = a;
+                pipe.stream_cursor_seq = b;
+            },
+            .ts => pipe.ts_cursor_ns = @max(pipe.ts_cursor_ns, a),
+        }
+        pipe.persisted_cursor_ts = a;
+        pipe.persisted_cursor_seq = b;
     }
 
     // ── Pipeline Execution ──────────────────────────────────────────────
@@ -1047,7 +1055,7 @@ pub const ProcessingHandler = struct {
     /// Build the tag registry + execution pipelines for a parsed job definition
     /// and register them under `job_id`. Shared by live submit and replay so a
     /// RUNNING job actually resumes consuming after restart, not just a registry
-    /// entry (FLO-104). Does not take ownership of `def` — createPipeline
+    /// entry. Does not take ownership of `def` — createPipeline
     /// deep-copies everything it retains, so the caller may free `def` after.
     fn startPipelines(self: *ProcessingHandler, job_id: []const u8, def: *definition.JobDefinition) void {
         if (def.sinks.items.len == 0) return;
@@ -1292,12 +1300,15 @@ pub const ProcessingHandler = struct {
             // the averages toward zero. `records_processed` counts source reads.
             const before = job.records_processed;
             const t0 = @import("stdx").time.nanoTimestamp();
+            self.ticking_job = base_job_id;
+            defer self.ticking_job = "";
             switch (pipe.source_kind) {
-                .ts => self.tickTsSource(pipe, shard, job),
+                .ts => self.tickTsSource(pipeline_key, pipe, shard, job),
                 .stream => self.tickStreamSource(pipeline_key, pipe, shard, job),
             }
             const processed = job.records_processed - before;
             if (processed > 0) {
+                if (shard.metrics_registry) |m| m.processing.recordProcessed(processed);
                 const dur: u64 = @intCast(@max(@as(i128, 0), @import("stdx").time.nanoTimestamp() - t0));
                 pipe.last_read_count = @intCast(@min(processed, std.math.maxInt(u32)));
                 pipe.tick_ns_last = dur;
@@ -1309,7 +1320,7 @@ pub const ProcessingHandler = struct {
     }
 
     /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
-    fn tickTsSource(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
+    fn tickTsSource(self: *ProcessingHandler, pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, job: *JobRecord) void {
         var point_buf: [256]StoredPoint = undefined;
         // Tags are part of the series key now, so a configured tag set selects
         // the series directly instead of being scanned for after the fact (which
@@ -1333,16 +1344,21 @@ pub const ProcessingHandler = struct {
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
             const json = std.fmt.bufPrint(&json_buf, "{{\"measurement\":\"{s}\",\"value\":{},\"timestamp_ms\":{d}}}", .{ pipe.src_measurement, pt.field_value, ts_ms }) catch continue;
 
-            // Apply operator chain (or pass through directly)
-            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, shard.allocator) catch null;
+            // Apply operator chain (or pass through directly). A record
+            // the chain failed on is counted and skipped: passing it through
+            // raw would write what the operators were there to change.
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, shard.allocator) catch |err| blk: {
+                self.noteChainError(shard, err);
+                break :blk @as(?[]const ProcessingRecord, &.{});
+            };
 
             if (output_records) |records| {
-                defer shard.allocator.free(records);
+                defer if (records.len > 0) shard.allocator.free(records);
                 for (records) |rec| {
                     self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), rec.tags);
                 }
             } else {
-                // No operators or chain failed — direct passthrough
+                // No operators — direct passthrough
                 self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), 0);
             }
 
@@ -1356,6 +1372,9 @@ pub const ProcessingHandler = struct {
 
             job.records_processed += 1;
         }
+        // As a stream source does: a restart resumes here, not from the
+        // measurement's first point.
+        maybePersistCheckpoint(pipeline_key, pipe, shard, job.namespace_owned);
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
@@ -1376,10 +1395,13 @@ pub const ProcessingHandler = struct {
 
         for (result.payloads) |payload| {
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
-            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), shard.allocator) catch null;
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), shard.allocator) catch |err| blk: {
+                self.noteChainError(shard, err);
+                break :blk @as(?[]const ProcessingRecord, &.{});
+            };
 
             if (output_records) |records| {
-                defer shard.allocator.free(records);
+                defer if (records.len > 0) shard.allocator.free(records);
                 log.debug("TICK: chain returned {d} records for job", .{records.len});
                 for (records) |rec| {
                     log.debug("TICK: value_len={d} first50='{s}'", .{ rec.value.len, if (rec.value.len > 50) rec.value[0..50] else rec.value });
@@ -1398,27 +1420,27 @@ pub const ProcessingHandler = struct {
         pipe.stream_cursor_seq = result.last_id.sequence;
 
         // Persist the advanced cursor durably (throttled) so the pipeline
-        // resumes from here after restart instead of re-reading from the start
-        // (FLO-104). At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
+        // resumes from here after restart instead of re-reading from the start.
+        // At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
         // of progress, which redelivers — it never skips records.
         maybePersistCheckpoint(pipeline_key, pipe, shard, job.namespace_owned);
     }
 
-    /// Apply the operator chain to a single input value.
-    /// Returns owned slice of output records (caller must free), or null if no operators.
     /// Minimum wall-clock gap between durable cursor checkpoints per pipeline.
     /// Bounds Raft write amplification; a crash loses at most this much progress
     /// (redelivered on resume — at-least-once, never skipped).
     const CHECKPOINT_INTERVAL_MS: i64 = 1000;
 
-    /// Persist a pipeline's stream source cursor as a processing_checkpoint UAL
-    /// entry, debounced (FLO-104). Key = pipeline_key (job_id, or job_id\0idx for
-    /// multi-source); value = [cursor_ts:u64 LE][cursor_seq:u64 LE]. On restart,
-    /// replayCheckpoint restores this onto the rebuilt pipeline.
+    /// Persist a pipeline's source cursor as a processing_checkpoint UAL entry,
+    /// debounced. Key = pipeline_key (job_id, or job_id\0idx for multi-source);
+    /// value as `replayCheckpoint` reads it.
     fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, namespace: []const u8) void {
+        const a: u64, const b: u64 = switch (pipe.source_kind) {
+            .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
+            .ts => .{ pipe.ts_cursor_ns, 0 },
+        };
         // Only when the cursor actually advanced past what we last persisted.
-        if (pipe.stream_cursor_ts == pipe.persisted_cursor_ts and
-            pipe.stream_cursor_seq == pipe.persisted_cursor_seq) return;
+        if (a == pipe.persisted_cursor_ts and b == pipe.persisted_cursor_seq) return;
 
         const now_ms = @import("stdx").time.milliTimestamp();
         if (pipe.last_persist_ms != 0 and now_ms - pipe.last_persist_ms < CHECKPOINT_INTERVAL_MS) return;
@@ -1427,15 +1449,19 @@ pub const ProcessingHandler = struct {
         pipe.last_persist_ms = now_ms;
 
         var val_buf: [16]u8 = undefined;
-        std.mem.writeInt(u64, val_buf[0..8], pipe.stream_cursor_ts, .little);
-        std.mem.writeInt(u64, val_buf[8..16], pipe.stream_cursor_seq, .little);
+        std.mem.writeInt(u64, val_buf[0..8], a, .little);
+        std.mem.writeInt(u64, val_buf[8..16], b, .little);
         // The applier records the persisted cursor.
         _ = persistence_mod.proposeEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
             log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
+            if (shard.metrics_registry) |m| m.processing.recordError();
             return;
         };
+        if (shard.metrics_registry) |m| m.processing.recordCheckpoint();
     }
 
+    /// Apply the operator chain to a single input value.
+    /// Returns owned slice of output records (caller must free), or null if no operators.
     fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
 
@@ -1494,12 +1520,24 @@ pub const ProcessingHandler = struct {
 
     /// A record a sink could not write is lost to that sink (the cursor
     /// has moved past it); said once per interval with the count.
-    fn noteSinkDrop(self: *ProcessingHandler, kind: []const u8, target: []const u8, why: []const u8) void {
+    fn noteSinkDrop(self: *ProcessingHandler, shard: *Shard, kind: []const u8, target: []const u8, why: []const u8) void {
         self.sink_drops += 1;
+        if (shard.metrics_registry) |m| m.processing.recordDropped();
         const now = @import("stdx").time.milliTimestamp();
         if (now - self.sink_warn_ms < 30_000) return;
         self.sink_warn_ms = now;
-        log.err("pipeline {s} sink: record for '{s}' dropped: {s} ({d} sink records dropped so far)", .{ kind, target, why, self.sink_drops });
+        log.err("job '{s}': {s} sink '{s}': record dropped: {s} ({d} sink records dropped so far)", .{ self.ticking_job, kind, target, why, self.sink_drops });
+    }
+
+    /// A record the operator chain failed on is skipped; said once per
+    /// interval with the count.
+    fn noteChainError(self: *ProcessingHandler, shard: *Shard, err: anyerror) void {
+        self.chain_errors += 1;
+        if (shard.metrics_registry) |m| m.processing.recordError();
+        const now = @import("stdx").time.milliTimestamp();
+        if (now - self.chain_warn_ms < 30_000) return;
+        self.chain_warn_ms = now;
+        log.err("job '{s}': operator chain failed on a record ({s}); record skipped ({d} so far)", .{ self.ticking_job, @errorName(err), self.chain_errors });
     }
 
     /// Write a processed record to all matching sinks (TS source variant).
@@ -1518,7 +1556,7 @@ pub const ProcessingHandler = struct {
                     // by its bare name until the namespace exists there.
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        self.noteSinkDrop("stream", snk.target, @errorName(err));
+                        self.noteSinkDrop(shard, "stream", snk.target, @errorName(err));
                         continue;
                     };
                 },
@@ -1533,7 +1571,10 @@ pub const ProcessingHandler = struct {
                         timestamp_ns,
                         ual_idx,
                         src_tags,
-                    ) catch continue;
+                    ) catch |err| {
+                        self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
+                        continue;
+                    };
                 },
                 .kv => self.writeKvSink(snk, shard, "", payload),
                 .queue => self.writeQueueSink(snk, shard, payload),
@@ -1557,7 +1598,7 @@ pub const ProcessingHandler = struct {
                     // by its bare name until the namespace exists there.
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        self.noteSinkDrop("stream", snk.target, @errorName(err));
+                        self.noteSinkDrop(shard, "stream", snk.target, @errorName(err));
                         continue;
                     };
                 },
@@ -1582,18 +1623,24 @@ pub const ProcessingHandler = struct {
             var it = FlatPairIterator.init(snk.ts_field_keys);
             while (it.next()) |pair| {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
-                const value = extractJsonFloat(payload, pair.value) orelse continue;
+                const value = extractJsonFloat(payload, pair.value) orelse {
+                    self.noteSinkDrop(shard, "ts", snk.measurement, "the record has no numeric field for it");
+                    continue;
+                };
                 const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch continue;
+                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
+                    self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
+                    continue;
+                };
             }
             return;
         }
 
         // value_field shorthand — extract the named JSON field and store it as "value".
         const value = extractJsonFloat(payload, snk.value_field) orelse
-            (std.fmt.parseFloat(f64, payload) catch return);
+            (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard, "ts", snk.measurement, "the record is not a number"));
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch {};
+        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
     }
 
     /// KV sink: write the record under `key_prefix + separator + record_key`,
@@ -1621,7 +1668,7 @@ pub const ProcessingHandler = struct {
         const kv = self.resolveKvHandler(shard.kv_handler, snk.namespace, full_key);
         const result = kv.handleCommand(req);
         defer kv.freeResult(result);
-        if (result == .err) self.noteSinkDrop("kv", full_key, result.err.message);
+        if (result == .err) self.noteSinkDrop(shard, "kv", full_key, result.err.message);
     }
 
     /// Queue sink: enqueue the record payload into the configured queue (durable,
@@ -1646,7 +1693,7 @@ pub const ProcessingHandler = struct {
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
         const result = q.handleCommand(req);
         defer q.freeResult(result);
-        if (result == .err) self.noteSinkDrop("queue", snk.target, result.err.message);
+        if (result == .err) self.noteSinkDrop(shard, "queue", snk.target, result.err.message);
     }
 
     /// Build a minimal in-process request header carrying just the opcode.
@@ -1801,7 +1848,7 @@ test "ProcessingHandler: init and deinit" {
     h.deinit();
 }
 
-test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor (FLO-104)" {
+test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     const allocator = std.testing.allocator;
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
@@ -1834,6 +1881,60 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor (F
     handler.replayCheckpoint("missing", &val);
     handler.replayCheckpoint("job-cp", &[_]u8{0});
     try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
+}
+
+test "processing: a TS source's checkpoint restores its cursor, and never moves it back" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    const src = definition.SourceSpec{
+        .kind = .ts,
+        .name = "t",
+        .stream = "",
+        .namespace = "default",
+        .partition = 0,
+        .batch_size = 0,
+        .ts_measurement = "cpu",
+        .ts_field = "value",
+    };
+    try handler.pipelines.put("job-ts", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    var val: [16]u8 = undefined;
+    std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
+    std.mem.writeInt(u64, val[8..16], 0, .little);
+    handler.replayCheckpoint("job-ts", &val);
+    const pipe = handler.pipelines.getPtr("job-ts").?;
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.ts_cursor_ns);
+    try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.persisted_cursor_ts);
+
+    // A checkpoint that commits after the pipeline read further does not
+    // move it back.
+    pipe.ts_cursor_ns = 1_700_000_000_500;
+    handler.replayCheckpoint("job-ts", &val);
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_500), pipe.ts_cursor_ns);
+}
+
+test "processing: a stream source's checkpoint never moves its cursor back" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .partition = 0, .batch_size = 0 };
+    try handler.pipelines.put("job-fw", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    const pipe = handler.pipelines.getPtr("job-fw").?;
+    pipe.stream_cursor_ts = 2000;
+    pipe.stream_cursor_seq = 3;
+    var val: [16]u8 = undefined;
+    for ([_][2]u64{ .{ 1999, 9 }, .{ 2000, 2 } }) |older| {
+        std.mem.writeInt(u64, val[0..8], older[0], .little);
+        std.mem.writeInt(u64, val[8..16], older[1], .little);
+        handler.replayCheckpoint("job-fw", &val);
+        try std.testing.expectEqual(@as(u64, 2000), pipe.stream_cursor_ts);
+        try std.testing.expectEqual(@as(u64, 3), pipe.stream_cursor_seq);
+    }
+    std.mem.writeInt(u64, val[0..8], 2000, .little);
+    std.mem.writeInt(u64, val[8..16], 4, .little);
+    handler.replayCheckpoint("job-fw", &val);
+    try std.testing.expectEqual(@as(u64, 4), pipe.stream_cursor_seq);
 }
 
 test "ProcessingHandler: applyOperatorChain with no operators returns null" {

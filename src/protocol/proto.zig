@@ -313,8 +313,8 @@ pub const OptionTag = enum(u8) {
     max_retries = 0x14, // u8: Maximum retry attempts before DLQ
     count = 0x15, // u32: Number of messages to dequeue
     send_to_dlq = 0x16, // u8: Whether to send failed messages to DLQ (0/1)
-    block_ms = 0x17, // u32: Block timeout - wait until exists (0=forever, like queue dequeue)
-    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (0=forever)
+    block_ms = 0x17, // u32: Block timeout - wait until exists (at most 5 min; 0 = don't wait)
+    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (at most 5 min; 0 = don't wait)
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // All stream positioning uses StreamID (timestamp_ms + sequence) - no legacy offset/timestamp modes
@@ -916,10 +916,12 @@ pub const Request = struct {
         return null;
     }
 
-    /// Get block_ms option if present (convenience method)
+    /// The block_ms option, or null for no wait: 0 means do not wait, as
+    /// if it were absent.
     pub fn getBlockMs(self: Request) ?u32 {
         if (self.findOption(.block_ms)) |opt| {
-            return opt.asU32();
+            const ms = opt.asU32() orelse return null;
+            return if (ms == 0) null else ms;
         }
         return null;
     }
@@ -932,10 +934,12 @@ pub const Request = struct {
         return null;
     }
 
-    /// Get wait_ms option (watch for NEXT version change)
+    /// The wait_ms option (watch for the next version change), or null for
+    /// no wait: 0 means do not wait, as if it were absent.
     pub fn getWaitMs(self: Request) ?u32 {
         if (self.findOption(.wait_ms)) |opt| {
-            return opt.asU32();
+            const ms = opt.asU32() orelse return null;
+            return if (ms == 0) null else ms;
         }
         return null;
     }

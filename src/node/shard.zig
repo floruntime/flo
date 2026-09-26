@@ -112,6 +112,8 @@ const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
 const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
+/// A read buffer grows to hold one whole request (and the start of the next).
+const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Shard
@@ -337,9 +339,26 @@ pub const Shard = struct {
     /// An invoke applied on this leader in the current pass: its workers
     /// are woken once, after the pass.
     wake_workers: bool,
-    /// The tick's step passes stopped at their cap with work left: the
-    /// next poll does not wait.
+    /// The next poll does not wait: the tick's step passes stopped at their
+    /// cap with work left, or resumed connections proposed writes the next
+    /// pump sends. Only a leader sets it; nothing clears it on a follower.
     more_work: bool,
+    /// Connections marked closing (`markClosing`), closed at the end of the
+    /// tick. Room for one entry per connection is reserved as each is
+    /// added, so marking never fails.
+    closing_fds: std.ArrayListUnmanaged(i32) = .empty,
+    /// Paused connections to read again (`flushToClient`, the stall check);
+    /// their buffered requests run at the end of the tick. The end of the
+    /// tick runs a swapped-out snapshot (`resume_running`), so what is
+    /// queued while it runs waits for the next tick: one entry per
+    /// connection at most, and both lists are reserved as above.
+    resume_fds: std.ArrayListUnmanaged(i32) = .empty,
+    resume_running: std.ArrayListUnmanaged(i32) = .empty,
+    /// Connections paused now, and when the stall check next runs.
+    paused_count: u32 = 0,
+    stall_check_ms: u64 = 0,
+    overflow_warn_ms: u64 = 0,
+    overflow_unsaid: u64 = 0,
 
     /// Self-routing run ID generator (per-shard, single-threaded).
     run_id_gen: run_id_mod.Generator,
@@ -370,6 +389,10 @@ pub const Shard = struct {
 
         var inbox = try Inbox.init(allocator, 1024);
         errdefer inbox.deinit();
+        // Without its wake a shard sees another's message only at its poll
+        // timeout; a shard that cannot have one does not start.
+        try inbox.initWake();
+        try reactor.addSource(.{ .fd = inbox.wake_rd, .tag = .inbox_ready, .interests = .{ .readable = true } });
 
         // Forward-proxy Connection: drives requests forwarded from peer
         // shards. fd=-1 means "no kernel socket" — handlers only touch
@@ -749,7 +772,7 @@ pub const Shard = struct {
             .last_entry_applied = true,
             .wake_workers = false,
             .more_work = false,
-            .run_id_gen = .{},
+            .run_id_gen = .{ .shard = @intCast(shard_id) },
             .metrics_registry = null,
         };
     }
@@ -825,6 +848,11 @@ pub const Shard = struct {
         }
     }
 
+    fn inboxPending(ctx: *const anyopaque) u64 {
+        const inbox: *const Inbox = @ptrCast(@alignCast(ctx));
+        return inbox.pending();
+    }
+
     /// Wire the global MetricsRegistry into this shard and its handlers.
     /// Called by runtime after the registry is created.
     pub fn setMetricsRegistry(self: *Shard, registry: *MetricsRegistry) void {
@@ -834,6 +862,7 @@ pub const Shard = struct {
         // it every `flo_shard_*` series exports 0 while the global `flo_*`
         // equivalents move, which reads as "this shard is idle".
         self.shard_metrics = registry.shardMetrics(self.id);
+        if (self.shard_metrics) |sm| sm.live_pending = .{ .ctx = &self.inbox, .read = inboxPending };
         self.stream_handler.metrics_registry = registry;
         // Tier-hit counters are per log; resolve once so the read path avoids a
         // registry lookup per record. Also the only caller of registerTieredLog,
@@ -844,6 +873,9 @@ pub const Shard = struct {
     }
 
     pub fn deinit(self: *Shard) void {
+        self.closing_fds.deinit(self.allocator);
+        self.resume_fds.deinit(self.allocator);
+        self.resume_running.deinit(self.allocator);
         // Close all connections (close fds + free buffers)
         var it = self.connections.iterator();
         while (it.next()) |entry| {
@@ -999,6 +1031,16 @@ pub const Shard = struct {
         log.debug("Shard {d} new connection: fd={d} conn_id={d}", .{ self.id, fd, self.next_conn_id });
         self.next_conn_id += 1;
 
+        errdefer {
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
+        // Stale entries for closed fds stay until the tick ends, so reserve
+        // past them.
+        try self.closing_fds.ensureTotalCapacity(self.allocator, self.connections.count() + 1 + self.closing_fds.items.len);
+        const resume_room = self.connections.count() + 1 + self.resume_fds.items.len;
+        try self.resume_fds.ensureTotalCapacity(self.allocator, resume_room);
+        try self.resume_running.ensureTotalCapacity(self.allocator, resume_room);
         try self.connections.put(self.allocator, fd, conn);
         if (self.metrics_registry) |m| m.server.connectionOpened();
         if (self.shard_metrics) |sm| sm.connectionOpened();
@@ -1010,6 +1052,7 @@ pub const Shard = struct {
         if (self.connections.fetchRemove(fd)) |kv| {
             // Roll back any KV transactions still owned by this connection.
             _ = self.kv_handler.txn_table.dropByConnection(kv.value.id);
+            if (kv.value.reads_paused) self.paused_count -= 1;
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             if (self.metrics_registry) |m| m.server.connectionClosed();
@@ -1020,8 +1063,7 @@ pub const Shard = struct {
     /// Remove connection, unregister from reactor, and close the fd.
     pub fn closeConnection(self: *Shard, fd: i32) void {
         log.debug("Shard {d} closing connection: fd={d}", .{ self.id, fd });
-        // Clean up any pending waiters for this connection
-        self.waiter_pool.removeByFd(fd);
+        if (self.connections.get(fd)) |conn| self.waiter_pool.removeByConnection(@intCast(self.id), fd, conn.id);
         if (self.forward_count > 0) {
             if (self.connections.get(fd)) |conn| self.dropForwardsFor(fd, conn.id);
         }
@@ -1050,6 +1092,16 @@ pub const Shard = struct {
         if (self.shard_metrics) |sm| sm.recordCommand();
 
         const op = req.header.op_code;
+
+        // A wait longer than the server keeps a waiter is refused here, once
+        // for every kind, not shortened where it is registered.
+        inline for (.{ proto.OptionTag.block_ms, proto.OptionTag.wait_ms }) |tag| {
+            if (req.findOption(tag)) |opt| {
+                if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
+                    return self.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)");
+                }
+            }
+        }
 
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
@@ -1339,21 +1391,29 @@ pub const Shard = struct {
 
     // ─── Inbox draining ──────────────────────────────────────────────────
 
-    /// Drain pending inbox messages (called each reactor tick).
+    /// Drain pending inbox messages (called each reactor tick), at most one
+    /// ring's worth: a flood of messages must not starve the shard's I/O and
+    /// Raft heartbeats. What is left keeps the next tick from sleeping
+    /// (`Inbox.prepareSleep`).
     pub fn drainInbox(self: *Shard) usize {
         var buf: [64]InboxMessage = undefined;
         var total: usize = 0;
 
-        while (true) {
-            const count = self.inbox.drain(&buf);
+        while (total < self.inbox.capacity) {
+            const count = self.inbox.drain(buf[0..@min(buf.len, self.inbox.capacity - total)]);
             if (count == 0) break;
             for (buf[0..count]) |msg| {
                 self.handleInboxMessage(msg);
                 total += 1;
             }
         }
+        const left = self.inbox.pending();
 
         self.inbox_messages_processed += total;
+        if (self.shard_metrics) |sm| {
+            sm.recordInboxProcessed(total);
+            sm.setInboxPending(left);
+        }
         return total;
     }
 
@@ -1420,11 +1480,21 @@ pub const Shard = struct {
         if (msg.payload_len == 0) return;
 
         const bytes = data[0..msg.payload_len];
-        const req = proto.Request.parse(bytes) catch return;
-
         const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
         const conn_id: u32 = @truncate(msg.sequence >> 32);
         const owner_shard: u16 = msg.src_shard;
+
+        // A forwarded request that fails to parse is still answered: its
+        // client is waiting on it.
+        const req = proto.Request.parse(bytes) catch {
+            const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
+            var err_buf: [256]u8 = undefined;
+            // The owning shard parsed it before forwarding, so the fault is
+            // the server's, not the client's.
+            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: another shard could not read this request", &err_buf) catch return;
+            self.deliverDeferred(owner_shard, fd, conn_id, serialized);
+            return;
+        };
 
         // Reset the proxy for this dispatch. fd stays the *original* fd —
         // it's not registered on this shard, but handlers only read it for
@@ -1438,6 +1508,7 @@ pub const Shard = struct {
         proxy.response_deferred = false;
         proxy.write_buf.read_pos = 0;
         proxy.write_buf.write_pos = 0;
+        proxy.write_overflow = false;
 
         proxy.recordRequest();
         self.dispatchLocal(proxy, req);
@@ -1449,18 +1520,54 @@ pub const Shard = struct {
         // back to the owner. If the handler deferred the response (e.g. a
         // blocking group_read registered a waiter), the waiter's later
         // resolution will deliver via the same cross-shard inbox path.
-        const pending = proxy.write_buf.readable();
-        if (pending > 0) {
-            var temp_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            const n = proxy.write_buf.read(temp_buf[0..@min(pending, temp_buf.len)]);
-            self.deliverDeferred(owner_shard, fd, conn_id, temp_buf[0..n]);
+        var err_buf: [256]u8 = undefined;
+        if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
+            defer answer.free(self.allocator);
+            self.deliverDeferred(owner_shard, fd, conn_id, answer.bytes());
         } else if (!proxy.response_deferred) {
             // Handler produced nothing — report not_implemented like the
             // owner-side processRequests would.
-            var err_buf: [256]u8 = undefined;
             const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
             self.deliverDeferred(owner_shard, fd, conn_id, serialized);
         }
+    }
+
+    /// An answer a handler queued on a proxy connection, taken whole — a cut
+    /// answer desynchronises its client — or an error answer in its place.
+    const ProxyAnswer = union(enum) {
+        owned: []u8,
+        err: []const u8,
+
+        fn bytes(self: ProxyAnswer) []const u8 {
+            return switch (self) {
+                .owned => |b| b,
+                .err => |b| b,
+            };
+        }
+
+        fn free(self: ProxyAnswer, allocator: std.mem.Allocator) void {
+            if (self == .owned) allocator.free(self.owned);
+        }
+    };
+
+    /// Null when the handler queued nothing. An answer the proxy refused as
+    /// too large, or that could not be copied, is replaced by an error
+    /// answer written into `err_buf`.
+    fn takeProxyAnswer(self: *Shard, proxy: *Connection, request_id: u64, err_buf: *[256]u8) ?ProxyAnswer {
+        const pending = proxy.write_buf.readable();
+        if (proxy.write_overflow) {
+            proxy.write_overflow = false;
+            proxy.write_buf.consume(pending);
+            return .{ .err = proto.Response.serializeNew(.internal_error, request_id, "internal error: answer too large to send — ask for less", err_buf) catch unreachable };
+        }
+        if (pending == 0) return null;
+        const answer = self.allocator.alloc(u8, pending) catch {
+            proxy.write_buf.consume(pending);
+            return .{ .err = proto.Response.serializeNew(.internal_error, request_id, "internal error: out of memory for the answer", err_buf) catch unreachable };
+        };
+        _ = proxy.write_buf.read(answer);
+        proxy.shrinkWriteBuffer();
+        return .{ .owned = answer };
     }
 
     /// Write a deferred blocking-read response that was resolved on another
@@ -1580,14 +1687,14 @@ pub const Shard = struct {
         proxy.response_deferred = false;
         proxy.write_buf.read_pos = 0;
         proxy.write_buf.write_pos = 0;
+        proxy.write_overflow = false;
         self.answering_index = index;
         self.answering_timestamp_ns = timestamp_ns;
         slot.responder(@ptrCast(self), @ptrCast(proxy), req);
-        const queued = proxy.write_buf.readable();
-        if (queued > 0) {
-            var temp_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            const n = proxy.write_buf.read(temp_buf[0..@min(queued, temp_buf.len)]);
-            self.deliverDeferred(slot.owner_shard, slot.fd, slot.conn_id, temp_buf[0..n]);
+        var err_buf: [256]u8 = undefined;
+        if (self.takeProxyAnswer(proxy, slot.request_id, &err_buf)) |answer| {
+            defer answer.free(self.allocator);
+            self.deliverDeferred(slot.owner_shard, slot.fd, slot.conn_id, answer.bytes());
         } else if (!proxy.response_deferred) {
             self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
         }
@@ -1718,12 +1825,12 @@ pub const Shard = struct {
         proxy.response_deferred = false;
         proxy.write_buf.read_pos = 0;
         proxy.write_buf.write_pos = 0;
+        proxy.write_overflow = false;
         self.dispatchLocal(proxy, req);
-        const queued = proxy.write_buf.readable();
-        if (queued > 0) {
-            var temp_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            const n = proxy.write_buf.read(temp_buf[0..@min(queued, temp_buf.len)]);
-            self.deliverDeferred(owner, fd, conn_id, temp_buf[0..n]);
+        var err_buf: [256]u8 = undefined;
+        if (self.takeProxyAnswer(proxy, request_id, &err_buf)) |answer| {
+            defer answer.free(self.allocator);
+            self.deliverDeferred(owner, fd, conn_id, answer.bytes());
         } else if (!proxy.response_deferred) {
             self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "no response");
         }
@@ -1756,7 +1863,17 @@ pub const Shard = struct {
     fn runForwardedWrite(self: *Shard, frame: RaftFrame) void {
         if (frame.payload.len < 4) return self.badFrame(frame);
         const id = std.mem.readInt(u32, frame.payload[0..4], .little);
-        const req = proto.Request.parse(frame.payload[4..]) catch return self.badFrame(frame);
+        const req = proto.Request.parse(frame.payload[4..]) catch {
+            // The forwarder holds its client until this is answered.
+            self.badFrame(frame);
+            const body = frame.payload[4..];
+            const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
+            var err_buf: [256]u8 = undefined;
+            // The forwarder parsed it first, so the likely cause is two
+            // nodes running different versions.
+            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: the leader could not read this request — are all nodes on the same version?", &err_buf) catch return;
+            return self.sendForwardReply(frame.source_node, id, serialized);
+        };
         const proxy = self.forward_proxy;
         proxy.fd = @bitCast(id);
         proxy.id = frame.source_node;
@@ -1766,15 +1883,14 @@ pub const Shard = struct {
         proxy.response_deferred = false;
         proxy.write_buf.read_pos = 0;
         proxy.write_buf.write_pos = 0;
+        proxy.write_overflow = false;
         proxy.recordRequest();
         self.dispatchLocal(proxy, req);
-        const queued = proxy.write_buf.readable();
-        if (queued > 0) {
-            var temp_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            const n = proxy.write_buf.read(temp_buf[0..@min(queued, temp_buf.len)]);
-            self.sendForwardReply(frame.source_node, id, temp_buf[0..n]);
+        var err_buf: [256]u8 = undefined;
+        if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
+            defer answer.free(self.allocator);
+            self.sendForwardReply(frame.source_node, id, answer.bytes());
         } else if (!proxy.response_deferred) {
-            var err_buf: [256]u8 = undefined;
             const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
             self.sendForwardReply(frame.source_node, id, serialized);
         }
@@ -1784,12 +1900,23 @@ pub const Shard = struct {
     /// must have applied before handing it over: read-your-writes on the
     /// node the client wrote to.
     fn sendForwardReply(self: *Shard, peer: u32, id: u32, bytes: []const u8) void {
-        var buf: [12 + MAX_REQUEST_SIZE]u8 = undefined;
-        if (12 + bytes.len > buf.len) return;
+        // The forwarder holds its client until a reply comes: one that
+        // cannot be sent whole is replaced by one that can.
+        if (12 + bytes.len > transport.MAX_PAYLOAD_SIZE) {
+            var err_buf: [256]u8 = undefined;
+            const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
+            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: answer too large to send", &err_buf) catch return;
+            return self.sendForwardReply(peer, id, serialized);
+        }
+        const buf = self.allocator.alloc(u8, 12 + bytes.len) catch {
+            log.warn("shard {d}: out of memory for a forwarded write's reply to node {d}", .{ self.id, peer });
+            return;
+        };
+        defer self.allocator.free(buf);
         std.mem.writeInt(u32, buf[0..4], id, .little);
         std.mem.writeInt(u64, buf[4..12], self.raft_node.last_applied, .little);
-        @memcpy(buf[12 .. 12 + bytes.len], bytes);
-        self.sendRaft(peer, .forward_reply, buf[0 .. 12 + bytes.len]);
+        @memcpy(buf[12..], bytes);
+        self.sendRaft(peer, .forward_reply, buf);
     }
 
     fn takeForwardReply(self: *Shard, frame: RaftFrame) void {
@@ -1949,6 +2076,20 @@ pub const Shard = struct {
             .forward_reply => self.takeForwardReply(frame),
             .install_snapshot, .peer_info, .hello, .hello_back, .verify, .welcome => {},
         }
+    }
+
+    /// Rate-limits the write-overflow close line: the count of lines left
+    /// unsaid, or null to stay quiet.
+    fn overflowWarnDue(self: *Shard) ?u64 {
+        const now = nowMs();
+        if (now -| self.overflow_warn_ms < WARN_INTERVAL_MS) {
+            self.overflow_unsaid += 1;
+            return null;
+        }
+        self.overflow_warn_ms = now;
+        const unsaid = self.overflow_unsaid;
+        self.overflow_unsaid = 0;
+        return unsaid;
     }
 
     /// A member's bug can arrive at heartbeat rate; one line per interval.
@@ -2391,7 +2532,15 @@ pub const Shard = struct {
             }
         }
 
-        const events = try self.reactor.poll(timeout_ms);
+        // Only a tick that may sleep announces it; only one that did has a
+        // wake to take back and a pipe to empty.
+        const may_sleep = timeout_ms > 0 and self.inbox.prepareSleep();
+        const events = self.reactor.poll(if (may_sleep) timeout_ms else 0) catch |err| {
+            if (may_sleep) self.inbox.woke();
+            return err;
+        };
+        if (may_sleep) self.inbox.woke();
+        if (self.shard_metrics) |sm| sm.recordReactorLoop();
 
         // Process all I/O events
         for (events) |ev| {
@@ -2451,6 +2600,7 @@ pub const Shard = struct {
             if (self.raft_node.role == .leader) self.pump(nowMs());
         }
 
+        self.settleConnections();
         return events.len;
     }
 
@@ -2459,10 +2609,33 @@ pub const Shard = struct {
         self.running = true;
         log.debug("Shard {d} entering reactor loop", .{self.id});
 
+        var last_warn_ms: u64 = 0;
+        var unsaid: u64 = 0;
+        var failing = false;
         while (self.running) {
-            _ = self.tick(if (self.more_work) 0 else 100) catch {
+            // Connections re-queued while the last tick settled run next.
+            const busy = self.more_work or self.resume_fds.items.len > 0;
+            _ = self.tick(if (busy) 0 else 100) catch |err| {
+                // A shard whose tick keeps failing serves nothing: say so,
+                // not once per tick, and do not spin a core while it lasts.
+                const now = nowMs();
+                if (now -| last_warn_ms >= 10_000) {
+                    if (unsaid > 0) {
+                        log.err("shard {d}: tick failed: {s} ({d} more in the last 10 s); the shard is not serving while this repeats — restart the node if it persists", .{ self.id, @errorName(err), unsaid });
+                    } else {
+                        log.err("shard {d}: tick failed: {s}; the shard is not serving while this repeats — restart the node if it persists", .{ self.id, @errorName(err) });
+                    }
+                    last_warn_ms = now;
+                    unsaid = 0;
+                } else unsaid += 1;
+                failing = true;
+                @import("stdx").time.sleep(10 * std.time.ns_per_ms);
                 continue;
             };
+            if (failing) {
+                failing = false;
+                log.info("shard {d}: ticking again", .{self.id});
+            }
         }
 
         log.debug("Shard {d} reactor loop exited", .{self.id});
@@ -2608,7 +2781,7 @@ pub const Shard = struct {
 
     fn processEvent(self: *Shard, ev: ReactorEvent) void {
         // Handle errors and hangups (but not on the pipes)
-        if (ev.tag != .acceptor_pipe and ev.tag != .raft_read and (ev.err or ev.hangup)) {
+        if (ev.tag != .acceptor_pipe and ev.tag != .raft_read and ev.tag != .inbox_ready and (ev.err or ev.hangup)) {
             self.closeConnection(ev.fd);
             return;
         }
@@ -2670,11 +2843,34 @@ pub const Shard = struct {
     /// Read data from a client socket, parse request(s), and dispatch.
     fn readFromClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
+        // A readable event can still arrive after a pause (same poll batch,
+        // or an interest change not yet submitted); what it would read
+        // could not drain, and would look like one oversized request.
+        if (conn.reads_paused or conn.closing) return;
 
-        // Read available data from socket
+        // Read no more than the read buffer has room for: bytes read and
+        // not kept would be requests silently lost.
         var tmp_buf: [65536]u8 = undefined;
+        if (conn.read_buf.writable() == 0) {
+            // A request may be larger than the buffer: grow it to hold one
+            // whole request. Full at that size, the client sent more than a
+            // request can be (a binary request says so in its header first;
+            // a RESP command cannot).
+            const cap = conn.read_buf.buf.len * 2;
+            if (cap > MAX_READ_BUFFER) {
+                if (conn.protocol == .resp) {
+                    _ = conn.queueWrite("-ERR request over 256 KiB\r\n");
+                } else {
+                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
+                }
+                self.flushToClient(fd);
+                return self.markClosing(fd);
+            }
+            conn.read_buf.resize(cap) catch return self.markClosing(fd);
+        }
+        const room = @min(tmp_buf.len, conn.read_buf.writable());
 
-        const n = posix.read(fd, &tmp_buf) catch |err| {
+        const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeConnection(fd);
             return;
@@ -2701,6 +2897,8 @@ pub const Shard = struct {
             .resp => self.processRespRequests(fd, conn),
             else => self.processRequests(fd, conn),
         }
+        // Closing is deferred, so the connection is still ours here.
+        conn.shrinkReadBuffer();
     }
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.
@@ -2708,44 +2906,44 @@ pub const Shard = struct {
         const header_size = @sizeOf(proto.RequestHeader);
 
         while (conn.read_buf.readable() >= header_size) {
+            if (conn.closing) return;
+            if (shouldPause(conn)) return self.pauseReads(fd, conn);
             // We need contiguous bytes for parsing. Copy readable data out.
             const available = conn.read_buf.readable();
             const to_copy = @min(available, MAX_REQUEST_SIZE);
 
+            // A contiguous copy to parse; bytes are consumed only once a
+            // whole request is taken, so the rest stay in order.
             var parse_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            // Copy data out of ring buffer WITHOUT consuming (we'll consume on success).
-            // Use a peek + manual copy approach: read(), but we'll re-insert on failure.
-            const copied = conn.read_buf.read(parse_buf[0..to_copy]);
-            if (copied < header_size) {
-                // Not enough — put it back
-                _ = conn.read_buf.write(parse_buf[0..copied]);
-                break;
+            const copied = conn.read_buf.copyOut(parse_buf[0..to_copy]);
+            if (copied < header_size) break;
+
+            // A request that cannot fit is refused as soon as its header
+            // says so; waiting for its bytes would never end.
+            const promised = std.mem.bytesToValue(proto.RequestHeader, parse_buf[0..header_size]);
+            if (promised.magic == proto.MAGIC and @as(u64, header_size) + promised.payload_length > MAX_REQUEST_SIZE) {
+                self.sendErrorResponse(conn, promised.request_id, .bad_request, "bad request: request over 256 KiB");
+                self.flushToClient(fd);
+                self.markClosing(fd);
+                return;
             }
 
             const req = proto.Request.parse(parse_buf[0..copied]) catch |err| {
                 switch (err) {
-                    error.IncompleteRequest, error.IncompletePayload => {
-                        // Not enough data yet — put it back and wait
-                        _ = conn.read_buf.write(parse_buf[0..copied]);
-                        break;
-                    },
+                    // Not enough data yet — wait for more
+                    error.IncompleteRequest, error.IncompletePayload => break,
                     else => {
                         // Bad request — send error and close
-                        _ = conn.read_buf.write(parse_buf[0..copied]);
                         self.sendErrorResponse(conn, 0, .bad_request, "Invalid request");
                         self.flushToClient(fd);
-                        self.closeConnection(fd);
+                        self.markClosing(fd);
                         return;
                     },
                 }
             };
 
             const consumed = header_size + req.header.payload_length;
-
-            // Put back any unconsumed bytes (from requests after this one)
-            if (copied > consumed) {
-                _ = conn.read_buf.write(parse_buf[consumed..copied]);
-            }
+            conn.read_buf.consume(consumed);
 
             // Dispatch request, detecting if the handler sent a response
             const pending_before = conn.write_buf.readable();
@@ -2766,6 +2964,97 @@ pub const Shard = struct {
         }
     }
 
+    /// Unsent answers above which a connection's requests stop being read:
+    /// a client that reads while it sends is paced, and a connection holds
+    /// one large answer at a time rather than piling them up to the cap.
+    const PAUSE_READS_AT: usize = 64 * 1024;
+
+    /// How long a paused client may read nothing before pacing is lifted.
+    /// A client that sends its whole pipeline before reading any answer
+    /// cannot finish sending while paused; unpaced, it gets what the
+    /// write cap allows, and is closed past it as it would be without
+    /// pacing.
+    pub const STALL_MS: u64 = 1000;
+
+    fn shouldPause(conn: *const Connection) bool {
+        return !conn.pacing_off and conn.write_buf.readable() > PAUSE_READS_AT;
+    }
+
+    /// Stop reading and running this connection's requests until its unsent
+    /// answers drain (`flushToClient` resumes it) or it stalls.
+    fn pauseReads(self: *Shard, fd: i32, conn: *Connection) void {
+        conn.reads_paused = true;
+        conn.paused_progress_ms = @import("stdx").time.monotonicMs();
+        self.paused_count += 1;
+        self.reactor.modifyInterests(fd, .{ .readable = false, .writable = true }) catch {};
+    }
+
+    fn resumeReads(self: *Shard, fd: i32, conn: *Connection) void {
+        conn.reads_paused = false;
+        self.paused_count -= 1;
+        self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch {};
+        // What it had already sent runs at the end of the tick, not inside
+        // whoever resumed it.
+        if (conn.read_buf.readable() > 0 and !conn.resume_queued) {
+            conn.resume_queued = true;
+            self.resume_fds.appendAssumeCapacity(fd);
+        }
+    }
+
+    /// Lift pacing from paused clients that have read nothing for
+    /// `STALL_MS`. Walks the connections, so it runs at most every
+    /// `STALL_MS / 4` and only while one is paused.
+    fn liftStalledPauses(self: *Shard) void {
+        if (self.paused_count == 0) return;
+        const now = @import("stdx").time.monotonicMs();
+        if (now < self.stall_check_ms) return;
+        self.stall_check_ms = now + STALL_MS / 4;
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value_ptr.*;
+            if (!conn.reads_paused or conn.closing) continue;
+            if (now - conn.paused_progress_ms < STALL_MS) continue;
+            conn.pacing_off = true;
+            self.resumeReads(entry.key_ptr.*, conn);
+        }
+    }
+
+    /// Close `fd` once the tick's events are handled: code up the stack may
+    /// still hold its connection.
+    fn markClosing(self: *Shard, fd: i32) void {
+        const conn = self.getConnection(fd) orelse return;
+        if (conn.closing) return;
+        conn.closing = true;
+        self.closing_fds.appendAssumeCapacity(fd);
+    }
+
+    /// End of tick: close what was marked closing; run what a paused
+    /// connection had buffered once its answers drained or it stalled.
+    fn settleConnections(self: *Shard) void {
+        self.liftStalledPauses();
+        std.mem.swap(std.ArrayListUnmanaged(i32), &self.resume_fds, &self.resume_running);
+        var ran = false;
+        for (self.resume_running.items) |fd| {
+            const conn = self.getConnection(fd) orelse continue;
+            conn.resume_queued = false;
+            if (conn.closing or conn.reads_paused) continue;
+            ran = true;
+            switch (conn.protocol) {
+                .resp => self.processRespRequests(fd, conn),
+                else => self.processRequests(fd, conn),
+            }
+        }
+        self.resume_running.clearRetainingCapacity();
+        // What they proposed goes out at the next tick's pump; that tick
+        // must not sleep first.
+        if (ran and self.raft_node.role == .leader) self.more_work = true;
+        for (self.closing_fds.items) |fd| {
+            const conn = self.getConnection(fd) orelse continue;
+            if (conn.closing) self.closeConnection(fd);
+        }
+        self.closing_fds.clearRetainingCapacity();
+    }
+
     // ─── RESP Protocol Handler ──────────────────────────────────────────
 
     /// Process RESP (Redis protocol) requests from a connection's read buffer.
@@ -2776,37 +3065,30 @@ pub const Shard = struct {
         defer resp_parser.deinit();
 
         while (conn.read_buf.readable() > 0) {
+            if (conn.closing) return;
+            if (shouldPause(conn)) return self.pauseReads(fd, conn);
             // Peek all available data without consuming
             const available = conn.read_buf.readable();
             var parse_buf: [MAX_REQUEST_SIZE]u8 = undefined;
             const to_copy = @min(available, MAX_REQUEST_SIZE);
-            const copied = conn.read_buf.read(parse_buf[0..to_copy]);
+            const copied = conn.read_buf.copyOut(parse_buf[0..to_copy]);
             if (copied == 0) break;
 
             // Try to parse a complete RESP value
             const parsed = resp_parser.parse(parse_buf[0..copied]) catch {
                 // Parse error — send RESP error and close
-                _ = conn.read_buf.write(parse_buf[0..copied]);
                 _ = conn.queueWrite("-ERR invalid RESP data\r\n");
                 self.flushToClient(fd);
-                self.closeConnection(fd);
+                self.markClosing(fd);
                 return;
             };
 
-            if (parsed == null) {
-                // Incomplete — put data back and wait for more
-                _ = conn.read_buf.write(parse_buf[0..copied]);
-                break;
-            }
+            // Incomplete — wait for more
+            if (parsed == null) break;
 
             const result = parsed.?;
             var resp_value = result.value;
-            const consumed = result.consumed;
-
-            // Put back unconsumed bytes
-            if (copied > consumed) {
-                _ = conn.read_buf.write(parse_buf[consumed..copied]);
-            }
+            conn.read_buf.consume(result.consumed);
 
             defer resp_mod.freeValue(self.allocator, &resp_value);
 
@@ -2977,6 +3259,19 @@ pub const Shard = struct {
     /// Flush pending write data from a connection to the socket.
     pub fn flushToClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
+        if (conn.closing) return;
+        if (conn.write_overflow) {
+            if (self.overflowWarnDue()) |unsaid| {
+                const why = "over 4 MiB of answers unsent (client not reading, or one answer too large)";
+                if (unsaid == 0) {
+                    log.warn("shard {d}: closing connection {d}: " ++ why, .{ self.id, conn.id });
+                } else {
+                    log.warn("shard {d}: closing connection {d}: " ++ why ++ " ({d} more since the last line)", .{ self.id, conn.id, unsaid });
+                }
+            }
+            self.markClosing(fd);
+            return;
+        }
 
         while (conn.hasPendingWrites()) {
             const data = conn.pendingWriteData();
@@ -2987,19 +3282,23 @@ pub const Shard = struct {
                     return;
                 }
                 // Write error — close connection
-                self.closeConnection(fd);
+                self.markClosing(fd);
                 return;
             };
             if (written == 0) {
-                self.closeConnection(fd);
+                self.markClosing(fd);
                 return;
             }
             if (self.metrics_registry) |m| m.server.recordBytesSent(@intCast(written));
             if (self.shard_metrics) |sm| sm.recordBytesSent(@intCast(written));
             conn.consumeWritten(written);
+            if (conn.reads_paused) conn.paused_progress_ms = @import("stdx").time.monotonicMs();
         }
 
-        // All writes flushed — disarm writable
+        // All writes flushed — disarm writable, and read again if paused.
+        conn.shrinkWriteBuffer();
+        conn.pacing_off = false;
+        if (conn.reads_paused) return self.resumeReads(fd, conn);
         self.reactor.disarmWritable(fd) catch {};
     }
 
@@ -3110,7 +3409,10 @@ pub const Shard = struct {
     pub fn sendOkResponse(self: *Shard, conn: *Connection, request_id: u64, data: []const u8) void {
         _ = self;
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
-        const serialized = proto.Response.serializeNew(.ok, request_id, data, &buf) catch return;
+        // A client waits for every request's answer: one too large to
+        // frame is answered with an error, never left out.
+        const serialized = proto.Response.serializeNew(.ok, request_id, data, &buf) catch
+            proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
         _ = conn.queueWrite(serialized);
     }
 
@@ -3581,8 +3883,13 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     switch (waiter.kind) {
         .kv_get => {
-            // KV blocking GET timeout → not_found
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .not_found, "");
+            // A watch on a key that exists but did not change answers what is
+            // there now, so the asker can tell "unchanged" from "gone".
+            if (shard.defaultPartition().kv.get(waiter.key())) |entry| {
+                sendKVWaiterValue(shard, waiter, entry.value, entry.version);
+            } else {
+                shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .not_found, "");
+            }
         },
         .queue_dequeue => {
             // Queue blocking dequeue timeout → empty messages response (count = 0)
@@ -3603,15 +3910,22 @@ pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const entry = shard.defaultPartition().kv.get(waiter.key()) orelse return false;
     if (entry.version <= waiter.min_version) return false;
+    sendKVWaiterValue(shard, waiter, entry.value, entry.version);
+    return true;
+}
 
-    var resp = proto.Response.init(waiter.request_id, .ok, entry.value);
-    resp.prefix = entry.version;
+fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
+    var resp = proto.Response.init(waiter.request_id, .ok, value);
+    resp.prefix = version;
     const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
     var buf: [MAX_BUF]u8 = undefined;
     if (resp.serialize(&buf)) |serialized| {
         shard.deliverDeferred(waiter.owner_shard, waiter.fd, waiter.conn_id, serialized);
-    } else |_| {}
-    return true;
+    } else |_| {
+        // The waiter is gone once this returns; an asker left without an
+        // answer would hang until its own timeout.
+        shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .internal_error, "internal error: value too large to send");
+    }
 }
 
 /// Stream waiter resolver: re-run the parked read's window. The read is the
@@ -4243,6 +4557,632 @@ test "Shard: a frame from a node the membership does not name is dropped, a join
     shard.handleRaftFrame(.{ .source_node = 9, .group_id = 0, .msg_type = .append_entries, .payload = buf[0..n] });
     try std.testing.expectEqual(term0 + 5, raft.current_term);
     try std.testing.expectEqual(raft_node_mod.Role.follower, raft.role);
+}
+
+fn readAnswer(fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, out: []u8, want: usize) !usize {
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < want and tries < 10_000) : (tries += 1) {
+        shard.flushToClient(conn_fd);
+        const n = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    return got;
+}
+
+test "Shard: a forwarded request that cannot be parsed is answered, and a large answer arrives whole" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    try @import("stdx").net.sysFcntlSetNonblocking(pair[1]);
+    // As an accepted socket is: a full kernel buffer must not block the flush.
+    try @import("stdx").net.sysFcntlSetNonblocking(pair[0]);
+    const conn = try shard.addConnection(pair[0]);
+    const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
+
+    // Junk where a request should be, with a readable request id.
+    const junk = try std.testing.allocator.alloc(u8, 40);
+    @memset(junk, 0xee);
+    std.mem.writeInt(u64, junk[8..16], 77, .little);
+    shard.runForwardedRequest(.{ .tag = .forward_request, .src_shard = 0, .payload_len = @intCast(junk.len), .sequence = seq, .payload_ptr = junk.ptr });
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 77), resp.header.request_id);
+
+    // A 200 KB value read through the forward path comes back whole.
+    const value = try std.testing.allocator.alloc(u8, 200 * 1024);
+    defer std.testing.allocator.free(value);
+    for (value, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(proto.OpCode.kv_put);
+    header.request_id = 1;
+    header.payload_length = @intCast(2 + 2 + 3 + 4 + value.len + 2);
+    const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
+    defer std.testing.allocator.free(put);
+    std.mem.bytesAsValue(proto.RequestHeader, put[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(put[@sizeOf(proto.RequestHeader)..]);
+    shard.dispatchRequest(conn, try proto.Request.parse(put));
+    _ = shard.applyCommitted();
+    var drain_buf: [4096]u8 = undefined;
+    _ = try readAnswer(pair[1], &shard, conn.fd, &drain_buf, 1);
+
+    header.op_code = @intFromEnum(proto.OpCode.kv_get);
+    header.request_id = 2;
+    header.payload_length = 2 + 2 + 3 + 4 + 2;
+    const get = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = "" });
+    std.mem.bytesAsValue(proto.RequestHeader, get[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(get[@sizeOf(proto.RequestHeader)..]);
+    shard.runForwardedRequest(.{ .tag = .forward_request, .src_shard = 0, .payload_len = @intCast(get.len), .sequence = seq, .payload_ptr = get.ptr });
+    const big_out = try std.testing.allocator.alloc(u8, 300 * 1024);
+    defer std.testing.allocator.free(big_out);
+    const got = try readAnswer(pair[1], &shard, conn.fd, big_out, @sizeOf(proto.ResponseHeader) + value.len);
+    const answer = try proto.Response.parse(big_out[0..got]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), answer.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, answer.data, value) != null);
+}
+
+test "Shard: a KV watch that times out answers the value still there, and a wait on a missing key answers not found" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const conn = c.conn;
+    const pair = c.pair;
+
+    const put = try testRequest(.kv_put, 1, "w", "v1");
+    defer std.testing.allocator.free(put);
+    shard.dispatchRequest(conn, try proto.Request.parse(put));
+    _ = shard.applyCommitted();
+    var out: [512]u8 = undefined;
+    _ = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const present = try handler_mod.qualifyKey(&qbuf, "", "w");
+    const version = shard.defaultPartition().kv.get(present).?.version;
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .fd = conn.fd, .owner_shard = 0, .conn_id = conn.id, .request_id = 7, .key = present, .min_version = version, .timeout_ms = 1 }));
+    shard.waiter_pool.waiters[0].expires_at_ms = 0;
+    shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
+    var n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader) + 8 + 2);
+    var resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
+    try std.testing.expect(std.mem.endsWith(u8, resp.data, "v1"));
+    try std.testing.expectEqual(version, std.mem.readInt(u64, resp.data[0..8], .little));
+
+    var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .fd = conn.fd, .owner_shard = 0, .conn_id = conn.id, .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
+    shard.waiter_pool.waiters[0].expires_at_ms = 0;
+    shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
+    n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.not_found), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 8), resp.header.request_id);
+}
+
+test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minutes is refused rather than shortened" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    const Case = struct { op: proto.OpCode, tag: proto.OptionTag, ms: u32, key: []const u8, value: []const u8, status: proto.StatusCode, waits: bool };
+    const await_value = [_]u8{ 1, 0, 0, 0, 1, 0, 'a' };
+    const cases = [_]Case{
+        .{ .op = .queue_dequeue, .tag = .block_ms, .ms = 0, .key = "q", .value = "", .status = .ok, .waits = false },
+        .{ .op = .kv_get, .tag = .block_ms, .ms = 0, .key = "missing", .value = "", .status = .not_found, .waits = false },
+        .{ .op = .kv_get, .tag = .wait_ms, .ms = 0, .key = "missing", .value = "", .status = .not_found, .waits = false },
+        .{ .op = .action_await, .tag = .block_ms, .ms = 0, .key = "", .value = &await_value, .status = .ok, .waits = false },
+        .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS, .key = "missing", .value = "", .status = .ok, .waits = true },
+        .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS + 1, .key = "missing", .value = "", .status = .bad_request, .waits = false },
+        .{ .op = .kv_get, .tag = .wait_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS + 1, .key = "missing", .value = "", .status = .bad_request, .waits = false },
+    };
+    for (cases, 0..) |case, i| {
+        var opt_buf: [16]u8 = undefined;
+        var opts = proto.OptionsBuilder.init(&opt_buf);
+        try opts.addU32(case.tag, case.ms);
+        const bytes = try testRequestWith(case.op, 30 + i, case.key, case.value, opt_buf[0..opts.offset]);
+        defer std.testing.allocator.free(bytes);
+        const active = shard.waiter_pool.totalActive();
+        shard.dispatchRequest(c.conn, try proto.Request.parse(bytes));
+        if (case.waits) {
+            try std.testing.expectEqual(active + 1, shard.waiter_pool.totalActive());
+            continue;
+        }
+        try std.testing.expectEqual(active, shard.waiter_pool.totalActive());
+        var out: [512]u8 = undefined;
+        const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+        const resp = try proto.Response.parse(out[0..n]);
+        try std.testing.expectEqual(@as(u64, 30 + i), resp.header.request_id);
+        try std.testing.expectEqual(@intFromEnum(case.status), resp.header.status);
+    }
+}
+
+test "Shard: a proxy answer comes out whole; one the proxy refused comes out as an error, and the next is unaffected" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const proxy = shard.forward_proxy;
+    var err_buf: [256]u8 = undefined;
+    try std.testing.expect(shard.takeProxyAnswer(proxy, 1, &err_buf) == null);
+
+    // Past the proxy's cap: an error naming the request, and nothing left behind.
+    const huge = try std.testing.allocator.alloc(u8, Connection.MAX_WRITE_BUFFER - 1);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'h');
+    _ = proxy.queueWrite(huge[0..16]);
+    try std.testing.expectEqual(@as(usize, 0), proxy.queueWrite(huge));
+    const refused = shard.takeProxyAnswer(proxy, 2, &err_buf).?;
+    defer refused.free(std.testing.allocator);
+    const resp = try proto.Response.parse(refused.bytes());
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 2), resp.header.request_id);
+    try std.testing.expect(!proxy.write_overflow);
+    try std.testing.expectEqual(@as(usize, 0), proxy.write_buf.readable());
+
+    // Larger than the proxy's first buffer: whole.
+    try std.testing.expectEqual(huge.len, proxy.queueWrite(huge));
+    const whole = shard.takeProxyAnswer(proxy, 3, &err_buf).?;
+    defer whole.free(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, huge, whole.bytes());
+}
+
+/// A client request as it arrives on the wire, CRC set; the caller frees it.
+fn testRequest(op: proto.OpCode, request_id: u64, key: []const u8, value: []const u8) ![]u8 {
+    return testRequestWith(op, request_id, key, value, "");
+}
+
+fn testRequestWith(op: proto.OpCode, request_id: u64, key: []const u8, value: []const u8, options: []const u8) ![]u8 {
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(op);
+    header.request_id = request_id;
+    header.payload_length = @intCast(2 + 2 + key.len + 4 + value.len + 2 + options.len);
+    const bytes = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
+    std.mem.bytesAsValue(proto.RequestHeader, bytes[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(bytes[@sizeOf(proto.RequestHeader)..]);
+    return bytes;
+}
+
+/// A shard alone and a connected client socket pair, both ends non-blocking
+/// as an accepted socket is.
+const TestClient = struct {
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+
+    fn open(shard: *Shard) !TestClient {
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        try @import("stdx").net.sysFcntlSetNonblocking(pair[1]);
+        try @import("stdx").net.sysFcntlSetNonblocking(pair[0]);
+        return .{ .pair = pair, .conn = try shard.addConnection(pair[0]) };
+    }
+};
+
+test "Shard: a client that sends without reading is paced: its requests wait until its answers drain, then run in order" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    // A small kernel buffer, so unsent answers stay with the shard.
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+
+    const value = try std.testing.allocator.alloc(u8, 2 * Shard.PAUSE_READS_AT);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'v');
+    const put = try testRequest(.kv_put, 1, "k", value);
+    defer std.testing.allocator.free(put);
+    try std.testing.expectEqual(put.len, feedClient(c.pair[1], &shard, c.conn.fd, put));
+    var drain: [4096]u8 = undefined;
+    _ = try readAnswer(c.pair[1], &shard, c.conn.fd, &drain, @sizeOf(proto.ResponseHeader));
+
+    // Three reads of it in one write: the first answer alone passes the
+    // pause mark, so the other two wait unread.
+    var gets: [3][]u8 = undefined;
+    for (&gets, 0..) |*g, i| g.* = try testRequest(.kv_get, 11 + i, "k", "");
+    defer for (gets) |g| std.testing.allocator.free(g);
+    const all = try std.mem.concat(std.testing.allocator, u8, &gets);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(isize, @intCast(all.len)), std.c.write(c.pair[1], all.ptr, all.len));
+    shard.readFromClient(c.conn.fd);
+    try std.testing.expect(c.conn.reads_paused);
+    try std.testing.expectEqual(gets[1].len + gets[2].len, c.conn.read_buf.readable());
+
+    // Read on the client side: each drained answer lets the next request run.
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + value.len;
+    const out = try std.testing.allocator.alloc(u8, 3 * answer_len);
+    defer std.testing.allocator.free(out);
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < out.len and tries < 100_000) : (tries += 1) {
+        shard.flushToClient(c.conn.fd);
+        shard.settleConnections();
+        const n = std.c.read(c.pair[1], out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    try std.testing.expectEqual(out.len, got);
+    for (0..3) |i| {
+        const resp = try proto.Response.parse(out[i * answer_len ..][0..answer_len]);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@as(u64, 11 + i), resp.header.request_id);
+    }
+    try std.testing.expect(!c.conn.reads_paused);
+
+    // The same over RESP.
+    const r = try TestClient.open(&shard);
+    defer _ = std.c.close(r.pair[1]);
+    _ = std.c.setsockopt(r.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+    const get = "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+    const three = get ** 3;
+    try std.testing.expectEqual(@as(isize, three.len), std.c.write(r.pair[1], three, three.len));
+    shard.readFromClient(r.conn.fd);
+    try std.testing.expect(r.conn.reads_paused);
+    try std.testing.expectEqual(2 * get.len, r.conn.read_buf.readable());
+    const bulk_len = std.fmt.comptimePrint("${d}\r\n", .{2 * Shard.PAUSE_READS_AT}).len + value.len + 2;
+    const rout = try std.testing.allocator.alloc(u8, 3 * bulk_len);
+    defer std.testing.allocator.free(rout);
+    got = 0;
+    tries = 0;
+    while (got < rout.len and tries < 100_000) : (tries += 1) {
+        shard.flushToClient(r.conn.fd);
+        shard.settleConnections();
+        const n = std.c.read(r.pair[1], rout[got..].ptr, rout.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    try std.testing.expectEqual(rout.len, got);
+    try std.testing.expect(!r.conn.reads_paused);
+}
+
+test "Shard: a client that sends its whole pipeline before reading is unpaced once it stalls, and gets every answer; one that reads stays paced" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+    _ = std.c.setsockopt(c.pair[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+
+    const value = [_]u8{'v'} ** 1024;
+    const put = try testRequest(.kv_put, 1, "k", &value);
+    defer std.testing.allocator.free(put);
+    try std.testing.expectEqual(put.len, feedClient(c.pair[1], &shard, c.conn.fd, put));
+    var drain: [4096]u8 = undefined;
+    _ = try readAnswer(c.pair[1], &shard, c.conn.fd, &drain, @sizeOf(proto.ResponseHeader));
+
+    // A thousand reads, all sent before any answer is read: their bytes
+    // are more than the kernel buffers hold, so the client cannot finish
+    // sending while paced; their answers (about 1 MiB) fit the cap.
+    const count = 1000;
+    var gets: [count][]u8 = undefined;
+    for (&gets, 0..) |*g, i| g.* = try testRequest(.kv_get, 100 + i, "k", "");
+    defer for (gets) |g| std.testing.allocator.free(g);
+    const all = try std.mem.concat(std.testing.allocator, u8, &gets);
+    defer std.testing.allocator.free(all);
+    var sent: usize = 0;
+    var tries: usize = 0;
+    while (sent < all.len and tries < 10_000) : (tries += 1) {
+        const n = std.c.write(c.pair[1], all[sent..].ptr, all.len - sent);
+        if (n > 0) sent += @intCast(n);
+        shard.readFromClient(c.conn.fd);
+        shard.flushToClient(c.conn.fd);
+        shard.settleConnections();
+        // Time passes with the client reading nothing.
+        if (c.conn.reads_paused) {
+            c.conn.paused_progress_ms -|= Shard.STALL_MS;
+            shard.stall_check_ms = 0;
+        }
+    }
+    try std.testing.expectEqual(all.len, sent);
+    // Unpaced until it drains: not paused again with its answers unread.
+    shard.readFromClient(c.conn.fd);
+    shard.settleConnections();
+    try std.testing.expect(c.conn.pacing_off);
+    try std.testing.expect(!c.conn.reads_paused);
+    try std.testing.expect(c.conn.write_buf.readable() > Shard.PAUSE_READS_AT);
+
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + value.len;
+    const out = try std.testing.allocator.alloc(u8, count * answer_len);
+    defer std.testing.allocator.free(out);
+    var got: usize = 0;
+    tries = 0;
+    while (got < out.len and tries < 100_000) : (tries += 1) {
+        shard.readFromClient(c.conn.fd);
+        shard.flushToClient(c.conn.fd);
+        shard.settleConnections();
+        const n = std.c.read(c.pair[1], out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    try std.testing.expectEqual(out.len, got);
+    for (0..count) |i| {
+        const resp = try proto.Response.parse(out[i * answer_len ..][0..answer_len]);
+        try std.testing.expectEqual(@as(u64, 100 + i), resp.header.request_id);
+    }
+    try std.testing.expect(!c.conn.pacing_off);
+    try std.testing.expect(!c.conn.closing);
+
+    // A paused client that reads something is not unpaced; while paused,
+    // nothing more of what it sends is taken.
+    const again = try std.mem.concat(std.testing.allocator, u8, gets[0..90]);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqual(@as(isize, @intCast(again.len)), std.c.write(c.pair[1], again.ptr, again.len));
+    shard.readFromClient(c.conn.fd);
+    try std.testing.expect(c.conn.reads_paused);
+    const held = c.conn.read_buf.readable();
+    try std.testing.expectEqual(@as(isize, 40), std.c.write(c.pair[1], all.ptr, 40));
+    shard.readFromClient(c.conn.fd);
+    try std.testing.expectEqual(held, c.conn.read_buf.readable());
+    c.conn.paused_progress_ms -|= Shard.STALL_MS;
+    try std.testing.expect(std.c.read(c.pair[1], &drain, drain.len) > 0);
+    shard.flushToClient(c.conn.fd);
+    shard.stall_check_ms = 0;
+    shard.settleConnections();
+    try std.testing.expect(c.conn.reads_paused);
+}
+
+test "Shard: a connection marked closing runs no more of its requests and is closed at the end of the tick" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const fd = c.conn.fd;
+
+    // The first answer finds the connection over its cap, so the flush
+    // after it marks the connection closing; the second request must not run.
+    c.conn.write_overflow = true;
+    var pings: [2][]u8 = undefined;
+    for (&pings, 0..) |*p, i| p.* = try testRequest(.kv_get, 21 + i, "k", "");
+    defer for (pings) |p| std.testing.allocator.free(p);
+    const both = try std.mem.concat(std.testing.allocator, u8, &pings);
+    defer std.testing.allocator.free(both);
+    try std.testing.expectEqual(@as(isize, @intCast(both.len)), std.c.write(c.pair[1], both.ptr, both.len));
+    shard.readFromClient(fd);
+    try std.testing.expectEqual(@as(u64, 1), shard.requests_dispatched);
+    // Still open for whoever up the stack holds it; gone once settled.
+    try std.testing.expect(shard.getConnection(fd) != null);
+    shard.settleConnections();
+    try std.testing.expect(shard.getConnection(fd) == null);
+
+    // The same over RESP: the second command stays unread.
+    const r = try TestClient.open(&shard);
+    defer _ = std.c.close(r.pair[1]);
+    const rfd = r.conn.fd;
+    const ping = "*1\r\n$4\r\nPING\r\n";
+    r.conn.write_overflow = true;
+    const two = ping ++ ping;
+    try std.testing.expectEqual(@as(isize, two.len), std.c.write(r.pair[1], two, two.len));
+    shard.readFromClient(rfd);
+    try std.testing.expectEqual(ping.len, r.conn.read_buf.readable());
+    try std.testing.expect(shard.getConnection(rfd) != null);
+    shard.settleConnections();
+    try std.testing.expect(shard.getConnection(rfd) == null);
+}
+
+/// Feed `data` to the shard through the client's socket end, reading on the
+/// shard's side as the kernel buffer fills, then until the shard has taken
+/// everything written (a kernel may still hold the tail after the last
+/// write returns). Returns how much was written.
+fn feedClient(client_fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, data: []const u8) usize {
+    var sent: usize = 0;
+    var tries: usize = 0;
+    while (tries < 100_000) : (tries += 1) {
+        if (sent < data.len) {
+            const n = std.c.write(client_fd, data[sent..].ptr, data.len - sent);
+            if (n > 0) sent += @intCast(n);
+        }
+        shard.readFromClient(conn_fd);
+        const conn = shard.getConnection(conn_fd) orelse break;
+        if (conn.closing or conn.reads_paused) break;
+        if (sent == data.len and unreadBytes(conn_fd) == 0) break;
+    }
+    return sent;
+}
+
+/// Bytes the kernel holds for `fd` that nobody has read yet.
+fn unreadBytes(fd: std.posix.fd_t) c_int {
+    // std's Darwin table has no FIONREAD; it is _IOR('f', 127, int) there.
+    const fionread: c_int = if (@import("builtin").os.tag == .linux) @intCast(std.os.linux.T.FIONREAD) else 0x4004667f;
+    var n: c_int = 0;
+    _ = std.c.ioctl(fd, fionread, &n);
+    return n;
+}
+
+test "Shard: a request larger than the read buffer is read whole; one that cannot fit is refused with its own id, and the connection closed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const conn = c.conn;
+    const pair = c.pair;
+
+    // Twice the default buffer: stored whole, so every byte arrived in order.
+    const value = try std.testing.allocator.alloc(u8, 2 * RingBuffer.DEFAULT_CAPACITY);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'v');
+    const put = try testRequest(.kv_put, 4, "k", value);
+    defer std.testing.allocator.free(put);
+    try std.testing.expectEqual(put.len, feedClient(pair[1], &shard, conn.fd, put));
+    var out: [512]u8 = undefined;
+    var n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const stored = shard.defaultPartition().kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?;
+    try std.testing.expectEqualSlices(u8, value, stored.value);
+    try std.testing.expect(!conn.closing);
+    // Grown for it, given back once it is taken.
+    try std.testing.expectEqual(RingBuffer.DEFAULT_CAPACITY, conn.read_buf.buf.len);
+
+    // One byte over: refused from its header alone, answered under its
+    // own id, before the client has sent the rest.
+    var header = std.mem.bytesToValue(proto.RequestHeader, put[0..@sizeOf(proto.RequestHeader)]);
+    header.request_id = 5;
+    header.payload_length = MAX_REQUEST_SIZE - @sizeOf(proto.RequestHeader) + 1;
+    try std.testing.expectEqual(@sizeOf(proto.RequestHeader), feedClient(pair[1], &shard, conn.fd, std.mem.asBytes(&header)));
+    try std.testing.expect(conn.closing);
+    n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
+    try std.testing.expectEqualStrings("bad request: request over 256 KiB", resp.data);
+
+    // A RESP command cannot say its size up front: refused in RESP once
+    // the buffer is full at its cap.
+    const r = try TestClient.open(&shard);
+    defer _ = std.c.close(r.pair[1]);
+    const big = try std.testing.allocator.alloc(u8, MAX_READ_BUFFER + 64);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    const head = "*2\r\n$3\r\nGET\r\n$600000\r\n";
+    @memcpy(big[0..head.len], head);
+    _ = feedClient(r.pair[1], &shard, r.conn.fd, big);
+    try std.testing.expect(r.conn.closing);
+    var rout: [64]u8 = undefined;
+    const rn = std.c.read(r.pair[1], &rout, rout.len);
+    try std.testing.expectEqualStrings("-ERR request over 256 KiB\r\n", rout[0..@intCast(rn)]);
+
+    // Not a request at all, whatever its length field says: invalid, not
+    // too large.
+    const j = try TestClient.open(&shard);
+    defer _ = std.c.close(j.pair[1]);
+    var junk: [@sizeOf(proto.RequestHeader)]u8 = [_]u8{0xff} ** @sizeOf(proto.RequestHeader);
+    try std.testing.expectEqual(@as(isize, junk.len), std.c.write(j.pair[1], &junk, junk.len));
+    shard.readFromClient(j.conn.fd);
+    try std.testing.expect(j.conn.closing);
+    n = try readAnswer(j.pair[1], &shard, j.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "256 KiB") == null);
+}
+
+test "Shard: requests resumed at the end of a tick run, and keep the next poll from waiting on a leader only" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const ping = try testRequest(.ping, 7, "", "");
+    defer std.testing.allocator.free(ping);
+
+    // A paused connection holding one request, resumed: it runs at the
+    // end of the tick.
+    const role = shard.raft_node.role;
+    defer shard.raft_node.role = role;
+    for ([_]bool{ true, false }) |leads| {
+        shard.raft_node.role = if (leads) .leader else .follower;
+        shard.more_work = false;
+        const before = shard.requests_dispatched;
+        shard.pauseReads(c.conn.fd, c.conn);
+        _ = c.conn.read_buf.write(ping);
+        shard.resumeReads(c.conn.fd, c.conn);
+        shard.settleConnections();
+        try std.testing.expectEqual(before + 1, shard.requests_dispatched);
+        // A follower never clears it: set there, its shard would spin.
+        try std.testing.expectEqual(leads, shard.more_work);
+    }
+}
+
+test "Shard: an answer too large to frame is answered with an error" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const conn = c.conn;
+    const pair = c.pair;
+    const big = try std.testing.allocator.alloc(u8, MAX_REQUEST_SIZE + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    shard.sendOkResponse(conn, 9, big);
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+}
+
+test "Shard: the inbox gauges follow the drain" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    shard.shard_metrics = &sm;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
+    try std.testing.expectEqual(@as(usize, 3), shard.drainInbox());
+    try std.testing.expectEqual(@as(u64, 3), sm.inbox_processed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), sm.inbox_pending.load(.monotonic));
+
+    // Read at scrape time from the inbox itself: what waits for a shard
+    // that has stopped draining still shows.
+    sm.live_pending = .{ .ctx = &shard.inbox, .read = Shard.inboxPending };
+    try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
+    try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
+    try std.testing.expectEqual(@as(u64, 2), sm.snapshot().inbox_pending);
+    _ = shard.drainInbox();
+    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().inbox_pending);
+}
+
+test "Shard: a forwarded write that cannot be parsed is answered, so its forwarder's client is not held" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    try std.testing.expect(shard.applyCommitted());
+    shard.raft_network = &rn;
+    defer {
+        for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        rn.outbound.clearRetainingCapacity();
+    }
+    var payload: [4 + 40]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], 91, .little);
+    @memset(payload[4..], 0xee);
+    std.mem.writeInt(u64, payload[4 + 8 ..][0..8], 5, .little);
+    shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = &payload });
+    try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
+    const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
+    try std.testing.expectEqual(@as(u32, 91), std.mem.readInt(u32, reply[0..4], .little));
+    const resp = try proto.Response.parse(reply[12..]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
 }
 
 test "Shard: a diverged node refuses writes even if it led" {

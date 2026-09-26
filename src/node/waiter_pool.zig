@@ -17,8 +17,9 @@
 //! 3. **Fixed-capacity, zero alloc** — The pool is a flat array with
 //!    swap-remove.  No heap allocations on the hot path.
 //!
-//! 4. **Connection-safe** — Waiters store `conn_fd + request_id`.  If the
-//!    connection closes before the waiter fires, `removeByFd()` cleans up.
+//! 4. **Connection-safe** — Waiters name their connection by owner shard, fd
+//!    and conn id; if it closes before the waiter fires, `removeByConnection()`
+//!    cleans up.
 //!
 //! ## Supported Blocking Operations
 //!
@@ -65,6 +66,10 @@ const StreamID = @import("../stream/stream_id.zig").StreamID;
 
 /// Maximum concurrent waiters per shard across all subsystems.
 pub const MAX_WAITERS: u16 = 256;
+
+/// The longest any blocking request waits: a wait with no end would leave
+/// its client unanswered. A longer wait is refused when it is dispatched.
+pub const MAX_BLOCK_MS: u32 = 5 * 60 * 1000;
 
 /// Classification of what a waiter is waiting for.
 /// Used by `notify()` to filter which waiters to wake and by
@@ -137,9 +142,9 @@ pub const Waiter = struct {
     /// Stream and stream-group reads: what the read covers.
     stream: StreamWindow,
 
-    /// Deadline as `@import("stdx").time.milliTimestamp()`.
-    /// `maxInt(i64)` = no timeout (infinite wait).
-    expires_at_ms: i64,
+    /// Deadline on the monotonic clock, so a wall-clock step cannot hold a
+    /// waiter past its cap or end it early; always set.
+    expires_at_ms: u64,
 
     /// Slot is occupied.
     active: bool,
@@ -182,7 +187,8 @@ pub const WaiterPool = struct {
         key: []const u8,
         min_version: u64 = 0,
         stream: StreamWindow = .{},
-        timeout_ms: u32 = 0, // 0 = infinite
+        /// At most `MAX_BLOCK_MS`; callers do not register a wait of 0.
+        timeout_ms: u32,
     };
 
     /// Register a new waiter.  Returns `true` on success, `false` if pool full or key too long.
@@ -193,11 +199,10 @@ pub const WaiterPool = struct {
         }
         if (opts.key.len == 0 or opts.key.len > 256) return false;
 
-        const now_ms = @import("stdx").time.milliTimestamp();
-        const expires: i64 = if (opts.timeout_ms == 0)
-            std.math.maxInt(i64)
-        else
-            now_ms + @as(i64, @intCast(opts.timeout_ms));
+        const now_ms = @import("stdx").time.monotonicMs();
+        // Waits of 0 and over the cap never get here (see the fields' docs);
+        // clamped rather than trusted all the same.
+        const expires: u64 = now_ms + std.math.clamp(opts.timeout_ms, 1, MAX_BLOCK_MS);
 
         var w = &self.waiters[self.count];
         w.kind = opts.kind;
@@ -288,7 +293,7 @@ pub const WaiterPool = struct {
     /// The `on_timeout` callback sends the appropriate "no data" response
     /// for the waiter's kind (not_found for KV, empty list for stream, etc.)
     pub fn expireTimeouts(self: *WaiterPool, on_timeout: TimeoutFn, ctx: *anyopaque) void {
-        const now_ms = @import("stdx").time.milliTimestamp();
+        const now_ms = @import("stdx").time.monotonicMs();
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
@@ -307,12 +312,14 @@ pub const WaiterPool = struct {
 
     // ── Connection Cleanup ──────────────────────────────────────────────
 
-    /// Remove all waiters for a given connection fd.
-    /// Called when a connection closes to avoid dangling responses.
-    pub fn removeByFd(self: *WaiterPool, fd: i32) void {
+    /// Remove the waiters of one closed connection, named by the shard that
+    /// owns its socket, its fd and its generation: a waiter registered for
+    /// another shard's client can hold the same fd number.
+    pub fn removeByConnection(self: *WaiterPool, owner_shard: u16, fd: i32, conn_id: u32) void {
         var i: u16 = 0;
         while (i < self.count) {
-            if (self.waiters[i].fd == fd) {
+            const w = &self.waiters[i];
+            if (w.owner_shard == owner_shard and w.fd == fd and w.conn_id == conn_id) {
                 self.swapRemove(i);
                 continue;
             }
@@ -385,23 +392,35 @@ test "WaiterPool: register rejects empty key" {
     try std.testing.expectEqual(@as(u16, 0), pool.totalActive());
 }
 
-test "WaiterPool: removeByFd cleans up" {
+test "WaiterPool: a closed connection removes its own waiters, not another shard's or an older one's on the same fd" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a" });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 2, .key = "b" });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 3, .key = "c" });
-    try std.testing.expectEqual(@as(u16, 3), pool.totalActive());
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .stream_read, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 2, .key = "b", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 3, .key = "c", .timeout_ms = 1_000 });
+    // Forwarded here for a client of shard 3 whose socket is also fd 10.
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 3, .conn_id = 1, .request_id = 4, .key = "d", .timeout_ms = 1_000 });
+    // An earlier connection on shard 0 that also held fd 10.
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 9, .request_id = 5, .key = "e", .timeout_ms = 1_000 });
+    try std.testing.expectEqual(@as(u16, 5), pool.totalActive());
 
-    pool.removeByFd(10);
-    try std.testing.expectEqual(@as(u16, 1), pool.totalActive());
-    try std.testing.expectEqual(@as(u16, 1), pool.countByKind(.kv_get));
+    pool.removeByConnection(0, 10, 1);
+    try std.testing.expectEqual(@as(u16, 3), pool.totalActive());
+    try std.testing.expectEqual(@as(u16, 3), pool.countByKind(.kv_get));
+}
+
+test "WaiterPool: a waiter's deadline is its wait from now, on the monotonic clock" {
+    var pool = WaiterPool.init();
+    const before = @import("stdx").time.monotonicMs();
+    _ = pool.register(.{ .kind = .kv_get, .fd = 1, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "a", .timeout_ms = 2_000 });
+    const after = @import("stdx").time.monotonicMs();
+    try std.testing.expect(pool.waiters[0].expires_at_ms >= before + 2_000 and pool.waiters[0].expires_at_ms <= after + 2_000);
 }
 
 test "WaiterPool: notify wakes matching waiters" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 0 });
-    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 2, .key = "other", .min_version = 0 });
-    _ = pool.register(.{ .kind = .stream_read, .fd = 30, .owner_shard = 0, .conn_id = 3, .request_id = 3, .key = "mykey", .min_version = 0 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 20, .owner_shard = 0, .conn_id = 2, .request_id = 2, .key = "other", .min_version = 0, .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .stream_read, .fd = 30, .owner_shard = 0, .conn_id = 3, .request_id = 3, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
 
     // Resolver that always satisfies
     const always_resolve = struct {
@@ -421,7 +440,7 @@ test "WaiterPool: notify wakes matching waiters" {
 
 test "WaiterPool: notify respects resolver returning false" {
     var pool = WaiterPool.init();
-    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 5 });
+    _ = pool.register(.{ .kind = .kv_get, .fd = 10, .owner_shard = 0, .conn_id = 1, .request_id = 1, .key = "mykey", .min_version = 5, .timeout_ms = 1_000 });
 
     // Resolver that never satisfies (version too low)
     const never_resolve = struct {

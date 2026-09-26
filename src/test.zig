@@ -42,6 +42,7 @@ test {
     _ = @import("node/network/jwks.zig");
     _ = @import("node/manifest.zig");
     _ = @import("node/shard_manifest.zig");
+    _ = @import("storage/persistence.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");

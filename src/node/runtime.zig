@@ -27,7 +27,8 @@ const Acceptor = @import("acceptor.zig").Acceptor;
 const Inbox = @import("inbox.zig").Inbox;
 const InboxMessage = @import("inbox.zig").Message;
 const proto = @import("../protocol/proto.zig");
-const Durability = @import("../config/server.zig").Durability;
+const server_config = @import("../config/server.zig");
+const Durability = server_config.Durability;
 const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
@@ -227,6 +228,10 @@ pub const Runtime = struct {
     peer_shards_slice: ?[]*Shard,
 
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
+        if (config.num_shards > server_config.MAX_SHARDS) {
+            log.err("shards = {d}: at most {d} per node", .{ config.num_shards, server_config.MAX_SHARDS });
+            return error.InvalidShardCount;
+        }
         // A cluster replicates one shard until every shard has a group, so
         // an automatic count resolves to one there; an explicit larger
         // count is refused at start.
@@ -1039,7 +1044,7 @@ fn detectShardCount(configured: u16) u16 {
     if (configured > 0) return configured;
     const cpus = std.Thread.getCpuCount() catch 1;
     const shards = if (cpus >= 4) cpus - 1 else cpus;
-    return @intCast(@max(1, @min(shards, 256)));
+    return @intCast(@max(1, @min(shards, server_config.MAX_SHARDS)));
 }
 
 const SeedAddress = struct { host: []const u8, port: u16 };
@@ -1115,6 +1120,12 @@ test "Runtime: detect shard count" {
     const auto = detectShardCount(0);
     try std.testing.expect(auto >= 1);
     try std.testing.expect(auto <= 256);
+}
+
+test "Runtime: more shards than a node can address are refused" {
+    try std.testing.expectError(error.InvalidShardCount, Runtime.init(std.testing.allocator, .{ .num_shards = server_config.MAX_SHARDS + 1, .listen_port = 0 }));
+    var ok = try Runtime.init(std.testing.allocator, .{ .num_shards = server_config.MAX_SHARDS, .listen_port = 0 });
+    ok.deinit();
 }
 
 test "Runtime: init and deinit" {

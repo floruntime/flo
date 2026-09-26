@@ -1830,7 +1830,10 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             var resp = proto.Response.init(request_id, .ok, v.value);
             resp.prefix = v.version;
             var buf: [MAX_RESPONSE_BUF]u8 = undefined;
-            const serialized = resp.serialize(&buf) catch return;
+            // The client waits for an answer; one that cannot be framed
+            // is an error, not silence.
+            const serialized = resp.serialize(&buf) catch
+                return shard.sendErrorResponse(conn, request_id, .internal_error, "internal error: value too large to send");
             _ = conn.queueWrite(serialized);
         },
         .kv_not_found => {

@@ -1165,22 +1165,28 @@ test "e2e/stream: blocking read returns data when appended" {
     try testing.expect(result.contains("blocking-msg-1"));
 }
 
-test "e2e/stream: blocking read with infinite timeout receives data" {
-    // Test: --block 0 means wait forever. Append data to unblock.
+test "e2e/stream: the longest blocking read receives data, and --block 0 answers at once" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const stream_name = "block-read-infinite";
+    const stream_name = "block-read-longest";
 
-    // Start blocking read with infinite timeout (--block 0)
-    var reader = try ctx.cli.runAsync(&.{ "stream", "read", stream_name, "--block", "0", "--start", "0-0", "--limit", "5" });
+    // 0 does not wait: an empty stream answers at once, with no records.
+    const t0 = @import("stdx").time.monotonicMs();
+    var now = try ctx.cli.run(&.{ "stream", "read", "block-read-empty", "--block", "0", "--start", "0-0", "--limit", "5" });
+    defer now.deinit();
+    try testing.expect(now.stdoutContains("No records"));
+    try testing.expect(@import("stdx").time.monotonicMs() - t0 < 2_000);
+
+    // Start a blocking read with the longest wait
+    var reader = try ctx.cli.runAsync(&.{ "stream", "read", stream_name, "--block", "300000", "--start", "0-0", "--limit", "5" });
     defer reader.deinit();
 
     // Give the blocking read time to register
     @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
     // Append data to unblock the reader
-    try ctx.exec(&.{ "stream", "append", stream_name, "infinite-wait-msg" });
+    try ctx.exec(&.{ "stream", "append", stream_name, "longest-wait-msg" });
 
     // Wait for the reader to complete
     var result = try reader.wait();
@@ -1188,7 +1194,7 @@ test "e2e/stream: blocking read with infinite timeout receives data" {
 
     // Should have received the appended message
     try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("infinite-wait-msg"));
+    try testing.expect(result.contains("longest-wait-msg"));
 }
 
 test "e2e/stream: blocking read times out with empty result" {

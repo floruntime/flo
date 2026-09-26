@@ -183,7 +183,7 @@ pub fn workerRegister(
 /// Await task (blocking)
 /// key = worker_id
 /// value = [count:u32][task_types...] + options for block_ms, timeout_ms
-/// block_ms: null = no blocking, 0 = block forever, >0 = block for N ms
+/// block_ms: null = the server's 30 s default, 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
 pub fn workerAwait(
     client: *Client,
     namespace: []const u8,
@@ -214,12 +214,8 @@ pub fn workerAwait(
 
     if (block_ms) |b| {
         try builder.addU32(.block_ms, b);
-        // Adjust socket read timeout for blocking requests
-        if (b == 0) {
-            client.setReadTimeoutSec(0); // infinite
-        } else {
-            client.setReadTimeoutSec(b / 1000 + 5);
-        }
+        // Read for as long as the server waits, plus 5 s; 0 does not wait.
+        if (b > 0) client.setReadTimeoutSec(b / 1000 + 5);
     }
 
     if (timeout_ms) |t| {
