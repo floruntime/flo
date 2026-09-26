@@ -61,9 +61,9 @@
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
 const log = @import("stdx").log;
+const StreamID = @import("../stream/stream_id.zig").StreamID;
 
 /// Maximum concurrent waiters per shard across all subsystems.
-/// At 64 bytes per slot this is 16 KB — fits in L1 cache.
 pub const MAX_WAITERS: u16 = 256;
 
 /// Classification of what a waiter is waiting for.
@@ -86,9 +86,21 @@ pub const WaiterKind = enum(u8) {
     stream_group_read,
 };
 
+/// The window a parked stream read resumes from: records of one stream
+/// strictly after `after`, up to `end`, optionally in one partition. The
+/// wake-up re-runs the read itself, so it returns exactly what a fresh read
+/// would, in the right namespace, and never misses an append that was
+/// proposed before the read parked but applied after.
+pub const StreamWindow = struct {
+    name_hash: u64 = 0,
+    after: StreamID = StreamID.MIN,
+    end: StreamID = StreamID.MAX,
+    partition: ?u32 = null,
+    limit: u32 = 0,
+};
+
 /// A single pending waiter registration.
 ///
-/// Kept deliberately small (≤64 bytes) for cache-friendly scanning.
 /// The key is copied into `key_buf` to avoid lifetime issues with
 /// request payloads.
 pub const Waiter = struct {
@@ -117,10 +129,13 @@ pub const Waiter = struct {
 
     /// Minimum version/offset threshold.
     ///   - KV:     trigger when `entry.lsn > min_version`
-    ///   - Stream: trigger when `offset > min_version` (last seen offset)
+    ///   - Stream: unused; see `stream`
     ///   - Queue:  0 (trigger on any enqueue)
     ///   - Worker: 0 (trigger on any task for this action)
     min_version: u64,
+
+    /// Stream and stream-group reads: what the read covers.
+    stream: StreamWindow,
 
     /// Deadline as `@import("stdx").time.milliTimestamp()`.
     /// `maxInt(i64)` = no timeout (infinite wait).
@@ -166,6 +181,7 @@ pub const WaiterPool = struct {
         request_id: u64,
         key: []const u8,
         min_version: u64 = 0,
+        stream: StreamWindow = .{},
         timeout_ms: u32 = 0, // 0 = infinite
     };
 
@@ -193,6 +209,7 @@ pub const WaiterPool = struct {
         @memcpy(w.key_buf[0..opts.key.len], opts.key);
         w.key_len = @intCast(opts.key.len);
         w.min_version = opts.min_version;
+        w.stream = opts.stream;
         w.expires_at_ms = expires;
         w.active = true;
         self.count += 1;

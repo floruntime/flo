@@ -319,7 +319,7 @@ pub const OptionTag = enum(u8) {
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // All stream positioning uses StreamID (timestamp_ms + sequence) - no legacy offset/timestamp modes
     // 0x20 reserved
-    stream_start = 0x21, // [16]u8: Start StreamID for reads (inclusive)
+    stream_start = 0x21, // [16]u8: Read records after this StreamID (exclusive)
     stream_end = 0x22, // [16]u8: End StreamID for reads (inclusive)
     stream_tail = 0x23, // void: Flag indicating tail read (start from end of stream)
     partition = 0x24, // u32: Explicit partition index

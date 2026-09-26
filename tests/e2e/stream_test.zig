@@ -341,10 +341,12 @@ test "e2e/stream: read with --limit" {
         try ctx.exec(&.{ "stream", "append", "limit-test", msg });
     }
 
-    var result = try ctx.cli.run(&.{ "stream", "read", "limit-test", "--limit", "2" });
+    var result = try ctx.cli.run(&.{ "stream", "read", "limit-test", "--limit", "2", "-o", "json" });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
+    try testing.expectEqual(@as(usize, 2), result.stdoutCount("limit-msg-"));
+    try testing.expect(result.stdoutContains("limit-msg-1"));
+    try testing.expect(!result.stdoutContains("limit-msg-2"));
 }
 
 test "e2e/stream: read with --output json output" {
@@ -1303,7 +1305,34 @@ test "e2e/stream: blocking read from tail receives new data" {
     defer result.deinit();
 
     // Should have received the new data (not the old data)
-    try testing.expect(result.contains("new-tail-data"));
+    try testing.expect(result.stdoutContains("new-tail-data"));
+    try testing.expect(!result.stdoutContains("old-data"));
+}
+
+test "e2e/stream: blocking read in a namespace wakes on append and returns only what is past its cursor" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const stream_name = "block-read-cursor";
+    const out = try ctx.execCapture(&.{ "stream", "append", stream_name, "before-cursor", "-n", "careflow" });
+    const cursor = extractStreamId(out) orelse return error.NoStreamId;
+
+    const started = stdx.time.milliTimestamp();
+    var reader = try ctx.cli.runAsync(&.{ "stream", "read", stream_name, "-n", "careflow", "--start", cursor, "--block", "5000", "--limit", "5", "-o", "json" });
+    defer reader.deinit();
+    stdx.time.sleep(300 * std.time.ns_per_ms);
+
+    // The same stream name in the default namespace must not wake it.
+    try ctx.exec(&.{ "stream", "append", stream_name, "wrong-namespace" });
+    try ctx.exec(&.{ "stream", "append", stream_name, "after-cursor", "-n", "careflow" });
+
+    var result = try reader.wait();
+    defer result.deinit();
+
+    // Woken by the append, not by the block timeout.
+    try testing.expect(stdx.time.milliTimestamp() - started < 4000);
+    try testing.expectEqual(@as(usize, 1), result.stdoutCount("\"data\""));
+    try testing.expect(result.stdoutContains("after-cursor"));
 }
 
 test "e2e/stream: blocking read on different streams independent" {

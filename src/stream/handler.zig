@@ -90,7 +90,7 @@ pub const StreamHandler = struct {
     last_trim_count: u64 = 0,
 
     /// Maximum number of messages in a single read response.
-    const MAX_READ_BATCH: usize = 1000;
+    pub const MAX_READ_BATCH: usize = 1000;
     const DEFAULT_READ_BATCH: usize = 100;
 
     pub fn init(allocator: Allocator, partition: *Partition) StreamHandler {
@@ -273,7 +273,8 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Register waiter with UAL max index as version (monotonically increasing)
+            // Park on the window just read; every append to this stream
+            // re-runs it (`Shard.resolveStreamWaiter`).
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_read,
                 .fd = conn.fd,
@@ -281,7 +282,7 @@ pub const StreamHandler = struct {
                 .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = req.key,
-                .min_version = shard.defaultPartition().ual.max_index,
+                .stream = shard.stream_handler.readWindow(req),
                 .timeout_ms = bms,
             });
             if (!registered) {
@@ -304,7 +305,7 @@ pub const StreamHandler = struct {
     ///
     /// Mirrors `dispatchRead` but for consumer group reads.  When no messages
     /// are available and `block_ms` is set, registers a waiter that gets woken
-    /// when new data is appended to the stream (see `dispatchAppend`).
+    /// when new data is appended to the stream (see `Shard.resolveGroupReadWaiter`).
     fn dispatchGroupRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -337,9 +338,11 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Register waiter — woken by dispatchAppend or expired by timeout.
+            // Nothing deliverable now, so the next deliverable record is the
+            // next append: wake when the stream's last id moves past this one.
             // (A wildcard key is already rejected by handleCommand above, so the
             // key here is always a single concrete stream.)
+            const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .fd = conn.fd,
@@ -347,7 +350,7 @@ pub const StreamHandler = struct {
                 .conn_id = conn.id,
                 .request_id = req.header.request_id,
                 .key = req.key,
-                .min_version = shard.defaultPartition().ual.max_index,
+                .stream = .{ .name_hash = name_hash, .after = shard.stream_handler.stream.streamLastId(name_hash) },
                 .timeout_ms = bms,
             });
             if (!registered) {
@@ -479,73 +482,88 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
-        const capped = @min(limit, MAX_READ_BATCH);
+        const window = self.readWindow(req);
+        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        const records = self.readRecords(window, &buf);
+        const result = self.messages(records, req.key);
 
-        const ns_hash = router.namespaceHash(req.namespace);
-        const name_hash = router.nameHash(ns_hash, req.key);
+        if (self.metrics_registry) |mr| {
+            if (result == .stream_messages) if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
+                // Each record is one append; sum their batch contents so the
+                // counter matches what the caller actually receives.
+                var n: u64 = 0;
+                for (records) |rec| n += rec.record_count;
+                if (n == 0) sm.recordEmptyRead() else sm.recordRead(n, result.stream_messages.data.len);
+            } else |_| {};
+        }
+        return result;
+    }
 
-        // Determine start ID
-        var start_id = StreamID.MIN;
+    /// What a read request covers. `stream_start` is exclusive: a reader
+    /// passes back the last id it saw and gets what came after it.
+    pub fn readWindow(self: *StreamHandler, req: Request) waiter_pool_mod.StreamWindow {
+        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        var window: waiter_pool_mod.StreamWindow = .{
+            .name_hash = name_hash,
+            .limit = readLimit(req),
+        };
 
         if (req.findOption(.stream_tail) != null) {
-            start_id = self.stream.streamLastId(name_hash);
+            window.after = self.stream.streamLastId(name_hash);
         } else if (req.findOption(.stream_start)) |opt| {
             if (opt.asStreamId()) |sid| {
                 if (sid.timestamp_ms > 0) {
-                    start_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                    window.after = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
                 } else if (sid.sequence > 0) {
                     // Bare sequence — convert to StreamID for lookup
-                    start_id = StreamID.fromSeq(sid.sequence);
+                    window.after = StreamID.fromSeq(sid.sequence);
                 }
             }
         }
 
-        // Determine end ID (for range reads)
-        var end_id = StreamID.MAX;
         if (req.findOption(.stream_end)) |opt| {
             if (opt.asStreamId()) |sid| {
                 if (sid.timestamp_ms > 0) {
-                    end_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                    window.end = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
                 }
             }
         }
 
-        // Parse optional partition filter
-        var partition_filter: ?u32 = null;
         if (req.findOption(.partition)) |opt| {
-            partition_filter = opt.asU32();
+            window.partition = opt.asU32();
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
                 var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
                 const pc = self.stream.getPartitionCount(metaKey(&qbuf, req));
-                partition_filter = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
+                window.partition = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
+        return window;
+    }
 
-        // StreamID-based read path
-        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const count = if (end_id.eql(StreamID.MAX))
-            self.stream.readStreamAfter(name_hash, start_id, partition_filter, buf[0..capped])
+    /// The `count` option, bounded; absent or zero means the default batch.
+    fn readLimit(req: Request) u32 {
+        const asked = req.getCount() orelse 0;
+        return @intCast(if (asked == 0) DEFAULT_READ_BATCH else @min(asked, MAX_READ_BATCH));
+    }
+
+    /// The records in `window`, at most `window.limit` of them.
+    pub fn readRecords(self: *StreamHandler, window: waiter_pool_mod.StreamWindow, buf: *[MAX_READ_BATCH]StreamRecord) []StreamRecord {
+        const out = buf[0..window.limit];
+        const count = if (window.end.eql(StreamID.MAX))
+            self.stream.readStreamAfter(window.name_hash, window.after, window.partition, out)
         else
-            self.stream.readStreamRange(name_hash, start_id, end_id, partition_filter, buf[0..capped]);
+            self.stream.readStreamRange(window.name_hash, window.after, window.end, window.partition, out);
+        return out[0..count];
+    }
 
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
+    /// A read response carrying `records`. The caller frees it.
+    pub fn messages(self: *StreamHandler, records: []const StreamRecord, stream_name: []const u8) CommandResult {
+        const data = self.serializeStreamRecordsWithPayloads(records, stream_name) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
-
-        if (self.metrics_registry) |mr| {
-            if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
-                // `count` is append entries; sum their batch contents so the
-                // counter matches what the caller actually receives.
-                var records: u64 = 0;
-                for (buf[0..count]) |rec| records += rec.record_count;
-                if (records == 0) sm.recordEmptyRead() else sm.recordRead(records, data.len);
-            } else |_| {}
-        }
-
-        const last_id = if (count > 0) buf[count - 1].id else StreamID.MIN;
+        const last_id = if (records.len > 0) records[records.len - 1].id else StreamID.MIN;
         return .{ .stream_messages = .{
             .data = data,
             .next_timestamp_ms = last_id.timestamp_ms,
@@ -1041,8 +1059,7 @@ pub const StreamHandler = struct {
         };
         _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
 
-        const limit = req.getLimit() orelse DEFAULT_READ_BATCH;
-        const capped = @min(limit, MAX_READ_BATCH);
+        const capped: usize = readLimit(req);
 
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
@@ -2373,7 +2390,7 @@ test "stream handler: read" {
     }
 }
 
-test "stream handler: read with limit" {
+test "stream handler: read honors count" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2394,10 +2411,10 @@ test "stream handler: read with limit" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb4, "4"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb5, "5"), ""));
 
-    // Read with limit 2
+    // Read with count 2
     var opts_buf: [32]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU32(.limit, 2);
+    try builder.addU32(.count, 2);
     const opts = builder.getOptions();
 
     const result = handler.handleCommand(makeRequest(.stream_read, "s1", "", opts));
