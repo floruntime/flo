@@ -3401,7 +3401,12 @@ pub const Shard = struct {
     /// Serialize a status+data response and deliver it via `deliverDeferred`.
     pub fn deliverDeferredResponse(self: *Shard, owner_shard: u16, fd: i32, conn_id: u32, request_id: u64, status: proto.StatusCode, data: []const u8) void {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
-        const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch return;
+        // Same rule as `sendOkResponse`: a parked client is answered, never
+        // left to its own timeout because the answer is too large to frame.
+        const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch blk: {
+            log.warn("shard {d}: deferred answer to request {d} is {d} bytes, over the frame limit; answered with an error", .{ self.id, request_id, data.len });
+            break :blk proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
+        };
         self.deliverDeferred(owner_shard, fd, conn_id, serialized);
     }
 
@@ -3906,7 +3911,7 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
 
 /// KV waiter resolver: look up the key in the KV projection and send the value
 /// if version > min_version. Returns true if waiter was satisfied.
-pub fn resolveKVWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const entry = shard.defaultPartition().kv.get(waiter.key()) orelse return false;
     if (entry.version <= waiter.min_version) return false;
@@ -3928,54 +3933,52 @@ fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, ve
     }
 }
 
-/// Stream waiter resolver: read new messages starting after min_version (UAL index).
-/// Returns true if there are new messages to send.
-pub fn resolveStreamWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+/// Stream waiter resolver: re-run the parked read's window. The read is the
+/// test — an append to a same-named stream in another namespace, or one the
+/// window excludes, finds nothing and leaves the waiter parked.
+pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const partition = shard.defaultPartition();
+    const handler = shard.stream_handler;
+    const window = &waiter.stream;
+    var buf: [StreamHandler.MAX_READ_BATCH]@import("../projection/stream.zig").StreamRecord = undefined;
+    const records = handler.readRecords(window.*, &buf);
+    if (records.len == 0) {
+        // Everything up to the stream's last id (or `end`) was scanned and none
+        // of it is in the window; ids only grow, so the next wake starts there
+        // instead of rescanning from the parked cursor.
+        const last = handler.stream.streamLastId(window.name_hash);
+        const scanned = if (last.greaterThan(window.end)) window.end else last;
+        if (scanned.greaterThan(window.after)) window.after = scanned;
+        return false;
+    }
 
-    // min_version tracks the UAL max_index at the time of waiter registration
-    if (partition.ual.max_index <= waiter.min_version) return false; // no new writes
-
-    const router = @import("router.zig");
-    const ns_hash = router.namespaceHash("default");
-    const name_hash = router.nameHash(ns_hash, waiter.key());
-
-    // Read all records from the stream (the handler already checked for data before registering)
-    var records: [100]@import("../projection/stream.zig").StreamRecord = undefined;
-    const count = partition.stream.readStreamAfter(name_hash, @import("../projection/stream.zig").StreamID.MIN, null, &records);
-    if (count == 0) return false;
-
-    // Serialize with full message format including payloads
-    const data = shard.stream_handler.serializeStreamRecordsWithPayloads(records[0..count], waiter.key()) catch return false;
-    defer shard.stream_handler.allocator.free(data);
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
+    const result = handler.messages(records, waiter.key());
+    defer handler.freeResult(result);
+    switch (result) {
+        .stream_messages => |m| shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, m.data),
+        else => shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .internal_error, ""),
+    }
     return true;
 }
 
 /// Group read waiter resolver: wake the client so it retries its group read.
 ///
-/// Unlike `resolveStreamWaiter` which reads directly from the projection,
-/// group reads require PEL state management (consumer tracking, ack deadlines)
-/// that only `handleGroupRead` handles correctly.  Instead of duplicating that
-/// logic, we send an empty OK response to break the client's blocking poll.
-/// The client immediately retries `stream_group_read` and gets data through
-/// the normal `handleGroupRead` code path.
-pub fn resolveGroupReadWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+/// Group reads require PEL state management (consumer tracking, ack
+/// deadlines) that only `handleGroupRead` handles correctly, so instead of
+/// duplicating it we send an empty OK response to break the client's
+/// blocking poll; the client retries and gets data through `handleGroupRead`.
+pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const partition = shard.defaultPartition();
+    const last = shard.stream_handler.stream.streamLastId(waiter.stream.name_hash);
+    if (!last.greaterThan(waiter.stream.after)) return false;
 
-    // Only wake if there have been new UAL writes since registration
-    if (partition.ual.max_index <= waiter.min_version) return false;
-
-    // Send empty OK — client will retry and get data via handleGroupRead
     shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, "");
     return true;
 }
 
 /// Queue waiter resolver: try to dequeue a message.
 /// Returns true if a message was available and sent.
-pub fn resolveQueueWaiter(waiter: *const Waiter, ctx: *anyopaque) bool {
+pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const partition = shard.defaultPartition();
 
@@ -5912,6 +5915,181 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     const names = shard.stream_handler.stream.stream_names;
     try std.testing.expect(names.contains(try handler_mod.qualifyKey(&q_buf, "fresh", "s")));
     try std.testing.expect(!names.contains("s"));
+}
+
+test "Shard: a blocking stream read wakes on its own namespace's append, even one proposed before it parked, and returns only what is past its cursor" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+
+    // An append's value is a batch: [count:u32]([len:u32][payload][header_count:u16])*
+    const first = "\x01\x00\x00\x00" ++ "\x0c\x00\x00\x00" ++ "first-record" ++ "\x00\x00";
+    const second = "\x01\x00\x00\x00" ++ "\x0d\x00\x00\x00" ++ "second-record" ++ "\x00\x00";
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", first, ""));
+    try ParkTest.ack(&shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    const cursor_seq = std.mem.readInt(u64, one[0].data[0..8], .little);
+    const cursor_ms = std.mem.readInt(u64, one[0].data[8..16], .little);
+
+    // Proposed, not yet applied, when the read parks: the read finds
+    // nothing and must still wake when this applies.
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "app", "s", second, ""));
+
+    var opts_buf: [64]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts_buf);
+    try ob.addStreamId(.stream_start, cursor_ms, cursor_seq);
+    try ob.addU32(.block_ms, 5000);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 3, "app", "s", "", ob.getOptions()));
+    // The same stream name in another namespace has nothing to wake it.
+    var other_buf: [64]u8 = undefined;
+    var other = proto.OptionsBuilder.init(&other_buf);
+    try other.addU32(.block_ms, 5000);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 4, "other", "s", "", other.getOptions()));
+    try std.testing.expectEqual(@as(u16, 2), shard.waiter_pool.countByKind(.stream_read));
+
+    try ParkTest.ack(&shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    const read = if (two[0].header.request_id == 3) two[0] else two[1];
+    try std.testing.expectEqual(@as(u64, 3), read.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), read.header.status);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, read.data[0..4], .little));
+    try std.testing.expect(std.mem.indexOf(u8, read.data, "second-record") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read.data, "first-record") == null);
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
+}
+
+test "Shard: a blocking read on one partition skips other partitions' appends without rescanning them, and wakes on its own" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    const other = "\x01\x00\x00\x00" ++ "\x0b\x00\x00\x00" ++ "other-part1" ++ "\x00\x00";
+    const mine = "\x01\x00\x00\x00" ++ "\x0a\x00\x00\x00" ++ "mine-part2" ++ "\x00\x00";
+
+    var read_buf: [64]u8 = undefined;
+    var ro = proto.OptionsBuilder.init(&read_buf);
+    try ro.addU32(.partition, 2);
+    try ro.addU32(.block_ms, 5000);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 1, "", "s", "", ro.getOptions()));
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
+
+    var p1_buf: [16]u8 = undefined;
+    var p1 = proto.OptionsBuilder.init(&p1_buf);
+    try p1.addU32(.partition, 1);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "", "s", other, p1.getOptions()));
+    try ParkTest.ack(&shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+    // Still parked, with its cursor at the last id it scanned.
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
+    const scanned = shard.stream_handler.stream.streamLastId(shard.waiter_pool.waiters[0].stream.name_hash);
+    try std.testing.expect(shard.waiter_pool.waiters[0].stream.after.eql(scanned));
+
+    var p2_buf: [16]u8 = undefined;
+    var p2 = proto.OptionsBuilder.init(&p2_buf);
+    try p2.addU32(.partition, 2);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 3, "", "s", mine, p2.getOptions()));
+    try ParkTest.ack(&shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    const read = if (two[0].header.request_id == 1) two[0] else two[1];
+    try std.testing.expectEqual(@as(u64, 1), read.header.request_id);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, read.data[0..4], .little));
+    try std.testing.expect(std.mem.indexOf(u8, read.data, "mine-part2") != null);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_read));
+}
+
+test "Shard: a blocking group read wakes on its own namespace's append, not a same-named stream elsewhere" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    const rec = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "r" ++ "\x00\x00";
+    // [group_len:u16][group][consumer_len:u16][consumer]
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.block_ms, 5000);
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_group_read, 1, "app", "s", group_consumer, ob.getOptions()));
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
+
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "other", "s", rec, ""));
+    try ParkTest.ack(&shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
+
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 3, "app", "s", rec, ""));
+    try ParkTest.ack(&shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    try std.testing.expect(two[0].header.request_id == 1 or two[1].header.request_id == 1);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+}
+
+test "Shard: a deferred answer too large to frame reaches its client as an error" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    const big = try std.testing.allocator.alloc(u8, MAX_REQUEST_SIZE + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    shard.deliverDeferredResponse(0, conn.fd, conn.id, 9, .ok, big);
+    var buf: [512]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
 }
 
 test "Shard: a parked request leaves the pending table before its responder runs, so a sweep during it answers the client once" {

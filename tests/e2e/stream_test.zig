@@ -341,10 +341,12 @@ test "e2e/stream: read with --limit" {
         try ctx.exec(&.{ "stream", "append", "limit-test", msg });
     }
 
-    var result = try ctx.cli.run(&.{ "stream", "read", "limit-test", "--limit", "2" });
+    var result = try ctx.cli.run(&.{ "stream", "read", "limit-test", "--limit", "2", "-o", "json" });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
+    try testing.expectEqual(@as(usize, 2), result.stdoutCount("limit-msg-"));
+    try testing.expect(result.stdoutContains("limit-msg-1"));
+    try testing.expect(!result.stdoutContains("limit-msg-2"));
 }
 
 test "e2e/stream: read with --output json output" {
@@ -376,12 +378,13 @@ test "e2e/stream: read with --start and --end (range query)" {
     const id4 = extractStreamId(out4) orelse return error.NoStreamId;
     _ = extractStreamId(out1);
 
-    // Read range from id2 to id4
-    var result = try ctx.cli.run(&.{ "stream", "read", "range-test", "--start", id2, "--end", id4 });
+    var result = try ctx.cli.run(&.{ "stream", "read", "range-test", "--start", id2, "--end", id4, "-o", "json" });
     defer result.deinit();
 
-    // Should contain msgs 2-4, not 1 or 5
-    try testing.expect(result.contains("range-msg-2") or result.contains("range-msg-3") or result.contains("range-msg-4"));
+    // The start is a cursor (exclusive), the end inclusive: msgs 3 and 4.
+    try testing.expectEqual(@as(usize, 2), result.stdoutCount("range-msg-"));
+    try testing.expect(result.stdoutContains("range-msg-3"));
+    try testing.expect(result.stdoutContains("range-msg-4"));
 }
 
 test "e2e/stream: read empty stream returns empty" {
@@ -1309,7 +1312,34 @@ test "e2e/stream: blocking read from tail receives new data" {
     defer result.deinit();
 
     // Should have received the new data (not the old data)
-    try testing.expect(result.contains("new-tail-data"));
+    try testing.expect(result.stdoutContains("new-tail-data"));
+    try testing.expect(!result.stdoutContains("old-data"));
+}
+
+test "e2e/stream: blocking read in a namespace wakes on append and returns only what is past its cursor" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const stream_name = "block-read-cursor";
+    const out = try ctx.execCapture(&.{ "stream", "append", stream_name, "before-cursor", "-n", "careflow" });
+    const cursor = extractStreamId(out) orelse return error.NoStreamId;
+
+    const started = stdx.time.milliTimestamp();
+    var reader = try ctx.cli.runAsync(&.{ "stream", "read", stream_name, "-n", "careflow", "--start", cursor, "--block", "5000", "--limit", "5", "-o", "json" });
+    defer reader.deinit();
+    stdx.time.sleep(300 * std.time.ns_per_ms);
+
+    // The same stream name in the default namespace must not wake it.
+    try ctx.exec(&.{ "stream", "append", stream_name, "wrong-namespace" });
+    try ctx.exec(&.{ "stream", "append", stream_name, "after-cursor", "-n", "careflow" });
+
+    var result = try reader.wait();
+    defer result.deinit();
+
+    // Woken by the append, not by the block timeout.
+    try testing.expect(stdx.time.milliTimestamp() - started < 4000);
+    try testing.expectEqual(@as(usize, 1), result.stdoutCount("\"data\""));
+    try testing.expect(result.stdoutContains("after-cursor"));
 }
 
 test "e2e/stream: blocking read on different streams independent" {

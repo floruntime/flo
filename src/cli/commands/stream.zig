@@ -81,7 +81,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     "flo stream read logs --output json",
                 })
                 .arg("stream", "Stream name")
-                .stringFlag("start", 's', "0-0", "Starting StreamID (timestamp-sequence, 0-0=beginning, $=latest)")
+                .stringFlag("start", 's', "0-0", "Read records after this StreamID (exclusive; timestamp-sequence, 0-0=beginning, $=latest)")
                 .stringFlag("end", 'e', "", "Ending StreamID (timestamp-sequence, inclusive)")
                 .uintFlag("limit", 'l', 10, "Maximum records to read")
                 .boolFlag("follow", 'f', "Follow mode - continuously tail for new records (like tail -f)")
@@ -499,8 +499,8 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         first_batch = false;
 
         if (result.last_id) |last_id| {
-            // Advance start position past the last record we received
-            current_start = last_id.next();
+            // The start is exclusive: the last record received is the cursor.
+            current_start = last_id;
         }
 
         // If not in follow mode, we're done after one read

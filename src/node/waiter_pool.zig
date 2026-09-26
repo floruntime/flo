@@ -26,7 +26,7 @@
 //! | Kind          | Trigger                       | Response                          |
 //! |---------------|-------------------------------|-----------------------------------|
 //! | `kv_get`      | KV put/delete on matching key | Value response (with version)     |
-//! | `stream_read` | Stream append on matching key | Messages from last offset         |
+//! | `stream_read` | Stream append on matching key | Records after the read's cursor   |
 //! | `queue_dequeue`| Queue enqueue on matching key| Dequeued message                  |
 //! | `action_await`| Action invoked matching key   | Task payload                      |
 //!
@@ -62,9 +62,9 @@
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
 const log = @import("stdx").log;
+const StreamID = @import("../stream/stream_id.zig").StreamID;
 
 /// Maximum concurrent waiters per shard across all subsystems.
-/// At 64 bytes per slot this is 16 KB — fits in L1 cache.
 pub const MAX_WAITERS: u16 = 256;
 
 /// The longest any blocking request waits: a wait with no end would leave
@@ -91,9 +91,21 @@ pub const WaiterKind = enum(u8) {
     stream_group_read,
 };
 
+/// The window a parked stream read covers: records of one stream strictly
+/// after `after`, up to `end` inclusive, optionally in one partition. Each
+/// wake-up re-runs this read rather than comparing a version, so it answers
+/// only with records the read asked for, and an append proposed before the
+/// read parked but applied after still wakes it.
+pub const StreamWindow = struct {
+    name_hash: u64 = 0,
+    after: StreamID = StreamID.MIN,
+    end: StreamID = StreamID.MAX,
+    partition: ?u32 = null,
+    limit: u32 = 0,
+};
+
 /// A single pending waiter registration.
 ///
-/// Kept deliberately small (≤64 bytes) for cache-friendly scanning.
 /// The key is copied into `key_buf` to avoid lifetime issues with
 /// request payloads.
 pub const Waiter = struct {
@@ -121,11 +133,16 @@ pub const Waiter = struct {
     key_len: u16,
 
     /// Minimum version/offset threshold.
-    ///   - KV:     trigger when `entry.lsn > min_version`
-    ///   - Stream: trigger when `offset > min_version` (last seen offset)
-    ///   - Queue:  0 (trigger on any enqueue)
-    ///   - Worker: 0 (trigger on any task for this action)
+    ///   - KV:     trigger when `entry.version > min_version`
+    ///   - Stream: unused; see `stream`
+    ///   - Queue:  the queue's name hash
+    ///   - Worker: `(ns_len << 16) | action_len`, the lengths that locate the
+    ///             namespace and action name inside `key`
     min_version: u64,
+
+    /// Stream reads: the window re-run on wake. Group reads: `name_hash`,
+    /// and `after` = the stream's last id when the read parked.
+    stream: StreamWindow,
 
     /// Deadline on the monotonic clock, so a wall-clock step cannot hold a
     /// waiter past its cap or end it early; always set.
@@ -171,6 +188,7 @@ pub const WaiterPool = struct {
         request_id: u64,
         key: []const u8,
         min_version: u64 = 0,
+        stream: StreamWindow = .{},
         /// At most `MAX_BLOCK_MS`; callers do not register a wait of 0.
         timeout_ms: u32,
     };
@@ -198,6 +216,7 @@ pub const WaiterPool = struct {
         @memcpy(w.key_buf[0..opts.key.len], opts.key);
         w.key_len = @intCast(opts.key.len);
         w.min_version = opts.min_version;
+        w.stream = opts.stream;
         w.expires_at_ms = expires;
         w.active = true;
         self.count += 1;
@@ -214,8 +233,9 @@ pub const WaiterPool = struct {
     ///   3. Queues it on the connection's write buffer
     ///   4. Flushes to the client
     ///
-    /// Returns `true` if the waiter was satisfied (should be removed).
-    pub const ResolverFn = *const fn (waiter: *const Waiter, ctx: *anyopaque) bool;
+    /// Returns `true` if the waiter was satisfied (should be removed); a
+    /// resolver that returns `false` may update the waiter for its next try.
+    pub const ResolverFn = *const fn (waiter: *Waiter, ctx: *anyopaque) bool;
 
     /// Wake all waiters matching `kind` + `key`.
     ///
@@ -407,7 +427,7 @@ test "WaiterPool: notify wakes matching waiters" {
 
     // Resolver that always satisfies
     const always_resolve = struct {
-        fn resolve(_: *const Waiter, _: *anyopaque) bool {
+        fn resolve(_: *Waiter, _: *anyopaque) bool {
             return true;
         }
     }.resolve;
@@ -427,7 +447,7 @@ test "WaiterPool: notify respects resolver returning false" {
 
     // Resolver that never satisfies (version too low)
     const never_resolve = struct {
-        fn resolve(_: *const Waiter, _: *anyopaque) bool {
+        fn resolve(_: *Waiter, _: *anyopaque) bool {
             return false;
         }
     }.resolve;

@@ -1588,7 +1588,7 @@ const Waiter = waiter_pool_mod.Waiter;
 /// Waiter key is compound: [namespace\x00][action_name][worker_id]
 /// min_version packs: (ns_len << 16) | action_name_len.
 /// Uses hash-based routing to check only the shard that owns each action.
-fn resolveActionAwait(waiter: *const Waiter, ctx: *anyopaque) bool {
+fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const full_key = waiter.key_buf[0..waiter.key_len];
     const ns_len: usize = @intCast(waiter.min_version >> 16);
