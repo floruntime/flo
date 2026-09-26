@@ -135,7 +135,7 @@ pub const PollConfig = struct {
     pub fn calculateDelay(self: PollConfig, attempt: u32) u32 {
         const delay: u32 = switch (self.backoff) {
             .constant => self.base_delay_ms,
-            .linear => self.base_delay_ms * (attempt + 1),
+            .linear => self.base_delay_ms *| (attempt +| 1),
             .exponential => blk: {
                 const multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
                 break :blk self.base_delay_ms *| multiplier;
@@ -1899,4 +1899,10 @@ test "RunStep: resolveTransition with specific target_not_found handler" {
 
     // target_disabled: no exact → no execution_failure → falls to failure
     try testing.expectEqualStrings(BuiltinTerminal.Failed, step.resolveTransition(StepOutcome.target_disabled).?.target);
+}
+
+test "PollConfig: linear backoff saturates instead of overflowing" {
+    const cfg = PollConfig{ .backoff = .linear, .base_delay_ms = std.math.maxInt(u32), .max_delay_ms = std.math.maxInt(u32) };
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), cfg.calculateDelay(1));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), cfg.calculateDelay(std.math.maxInt(u32)));
 }

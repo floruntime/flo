@@ -29,6 +29,7 @@ const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const types = @import("types.zig");
 const yaml_to_json = @import("../util/yaml_to_json.zig");
+const log = @import("stdx").log;
 
 // Re-export types for convenience
 pub const WorkflowDefinition = definition.WorkflowDefinition;
@@ -97,6 +98,15 @@ fn getInt(obj: JsonValue, key: []const u8) ?i64 {
     if (obj != .object) return null;
     const val = obj.object.get(key) orelse return null;
     return if (val == .integer) val.integer else null;
+}
+
+/// Definitions are client input and releases build ReleaseSafe, so an
+/// out-of-range bare `@intCast` would panic the node; this logs and rejects.
+fn fitInt(comptime T: type, field: []const u8, v: i64) ParseError!T {
+    return std.math.cast(T, v) orelse {
+        log.warn("workflow definition: {s} = {d} must be between {d} and {d}", .{ field, v, std.math.minInt(T), std.math.maxInt(T) });
+        return ParseError.InvalidFieldType;
+    };
 }
 
 fn getFloat(obj: JsonValue, key: []const u8) ?f64 {
@@ -431,7 +441,10 @@ fn parseRunStep(allocator: Allocator, obj: JsonValue) ParseError!Step {
 
 fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, wait_obj: JsonValue) ParseError!Step {
     const signal_type = getString(wait_obj, "type") orelse return ParseError.MissingRequiredField;
-    const timeout_ms: ?i64 = getInt(wait_obj, "timeoutMs") orelse getInt(wait_obj, "timeout_ms");
+    const timeout_ms: ?i64 = if (getInt(wait_obj, "timeoutMs") orelse getInt(wait_obj, "timeout_ms")) |t|
+        try fitInt(u63, "waitForSignal.timeout_ms", t)
+    else
+        null;
     const on_timeout: ?[]u8 = if (getString(wait_obj, "onTimeout") orelse getString(wait_obj, "on_timeout")) |t|
         allocator.dupe(u8, t) catch return ParseError.OutOfMemory
     else
@@ -574,10 +587,11 @@ fn parseSchedule(allocator: Allocator, root: JsonValue) ParseError!?ScheduleDef 
     }
 
     // max_concurrent (default 1)
-    if (getInt(sched_obj, "maxConcurrent")) |mc| {
-        sched.max_concurrent = @intCast(mc);
-    } else if (getInt(sched_obj, "max_concurrent")) |mc| {
-        sched.max_concurrent = @intCast(mc);
+    if (getInt(sched_obj, "maxConcurrent") orelse getInt(sched_obj, "max_concurrent")) |mc| {
+        sched.max_concurrent = fitInt(u32, "schedule.max_concurrent", mc) catch |err| {
+            if (sched.cron_expr) |c| allocator.free(c);
+            return err;
+        };
     }
 
     // input override
@@ -633,13 +647,12 @@ fn parseTrigger(allocator: Allocator, root: JsonValue) ParseError!?StreamTrigger
     // batch_size (default 1)
     if (getInt(trig_obj, "batchSize") orelse getInt(trig_obj, "batch_size")) |bs| {
         if (bs < 1) return ParseError.InvalidFieldType;
-        trig.batch_size = @intCast(bs);
+        trig.batch_size = try fitInt(u32, "trigger.batch_size", bs);
     }
 
     // batch_timeout_ms (default 5000)
     if (getInt(trig_obj, "batchTimeoutMs") orelse getInt(trig_obj, "batch_timeout_ms")) |bt| {
-        if (bt < 0) return ParseError.InvalidFieldType;
-        trig.batch_timeout_ms = @intCast(bt);
+        trig.batch_timeout_ms = try fitInt(u32, "trigger.batch_timeout_ms", bt);
     }
 
     if (!trig.isValid()) {
@@ -674,10 +687,10 @@ fn parseBackoffStr(backoff_str: []const u8) BackoffType {
 fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
     if (obj != .object) return ParseError.InvalidFieldType;
 
-    const max_attempts: u32 = if (getInt(obj, "max") orelse getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts")) |m| @intCast(m) else 3;
-    const initial_delay_ms: u32 = if (getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms")) |d| @intCast(d) else 1000;
-    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| @intCast(d) else 30000;
-    const within_ms: ?u64 = if (getInt(obj, "withinMs") orelse getInt(obj, "within_ms")) |w| @intCast(w) else null;
+    const max_attempts: u32 = if (getInt(obj, "max") orelse getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts")) |m| try fitInt(u32, "retry.max_attempts", m) else 3;
+    const initial_delay_ms: u32 = if (getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms")) |d| try fitInt(u32, "retry.initial_delay_ms", d) else 1000;
+    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| try fitInt(u32, "retry.max_delay_ms", d) else 30000;
+    const within_ms: ?u64 = if (getInt(obj, "withinMs") orelse getInt(obj, "within_ms")) |w| try fitInt(u64, "retry.within_ms", w) else null;
 
     const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
 
@@ -693,10 +706,10 @@ fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
 fn parsePollConfig(obj: JsonValue) ParseError!definition.PollConfig {
     if (obj != .object) return ParseError.InvalidFieldType;
 
-    const initial_delay_ms: i64 = getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms") orelse 0;
-    const max_attempts: u32 = if (getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts") orelse getInt(obj, "max")) |m| @intCast(m) else 10;
-    const base_delay_ms: u32 = if (getInt(obj, "baseDelayMs") orelse getInt(obj, "base_delay_ms")) |d| @intCast(d) else 1000;
-    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| @intCast(d) else 60000;
+    const initial_delay_ms: i64 = if (getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms")) |d| try fitInt(u63, "poll.initial_delay_ms", d) else 0;
+    const max_attempts: u32 = if (getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts") orelse getInt(obj, "max")) |m| try fitInt(u32, "poll.max_attempts", m) else 10;
+    const base_delay_ms: u32 = if (getInt(obj, "baseDelayMs") orelse getInt(obj, "base_delay_ms")) |d| try fitInt(u32, "poll.base_delay_ms", d) else 1000;
+    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| try fitInt(u32, "poll.max_delay_ms", d) else 60000;
 
     const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
 
@@ -774,7 +787,7 @@ fn parseExecutors(allocator: Allocator, root: JsonValue) ParseError![]ExecutorCo
 fn parseExecutorConfig(allocator: Allocator, obj: JsonValue) ParseError!ExecutorConfig {
     const name = getString(obj, "name") orelse return ParseError.MissingRequiredField;
     const action = getString(obj, "run") orelse return ParseError.MissingRequiredField;
-    const priority: i32 = if (getInt(obj, "priority")) |p| @intCast(p) else 100;
+    const priority: i32 = if (getInt(obj, "priority")) |p| try fitInt(i32, "executor.priority", p) else 100;
 
     // Retry policy
     const retry: ?RetryPolicy = if (getObject(obj, "retry")) |r|
@@ -815,9 +828,9 @@ fn parseCircuitBreakerConfig(obj: JsonValue) ParseError!CircuitBreakerConfig {
     if (obj != .object) return ParseError.InvalidFieldType;
 
     return .{
-        .failure_threshold = if (getInt(obj, "failureThreshold") orelse getInt(obj, "failure_threshold")) |f| @intCast(f) else 5,
+        .failure_threshold = if (getInt(obj, "failureThreshold") orelse getInt(obj, "failure_threshold")) |f| try fitInt(u32, "breaker.failure_threshold", f) else 5,
         .cooldown_ms = getInt(obj, "cooldownMs") orelse getInt(obj, "cooldown_ms") orelse 60000,
-        .half_open_max_calls = if (getInt(obj, "halfOpenMaxCalls") orelse getInt(obj, "half_open_max_calls")) |h| @intCast(h) else 2,
+        .half_open_max_calls = if (getInt(obj, "halfOpenMaxCalls") orelse getInt(obj, "half_open_max_calls")) |h| try fitInt(u32, "breaker.half_open_max_calls", h) else 2,
     };
 }
 
@@ -840,9 +853,9 @@ fn parseRateLimitConfig(obj: JsonValue) ParseError!RateLimitConfig {
     if (obj != .object) return ParseError.InvalidFieldType;
 
     return .{
-        .max_per_second = if (getInt(obj, "maxPerSecond")) |m| @intCast(m) else null,
-        .max_per_minute = if (getInt(obj, "maxPerMinute")) |m| @intCast(m) else null,
-        .max_per_hour = if (getInt(obj, "maxPerHour")) |m| @intCast(m) else null,
+        .max_per_second = if (getInt(obj, "maxPerSecond")) |m| try fitInt(u32, "rateLimit.maxPerSecond", m) else null,
+        .max_per_minute = if (getInt(obj, "maxPerMinute")) |m| try fitInt(u32, "rateLimit.maxPerMinute", m) else null,
+        .max_per_hour = if (getInt(obj, "maxPerHour")) |m| try fitInt(u32, "rateLimit.maxPerHour", m) else null,
     };
 }
 
@@ -850,15 +863,18 @@ fn parseHealthConfig(root: JsonValue) ParseError!?HealthConfig {
     const health_obj = getObject(root, "health") orelse return null;
 
     // Parse window like "5m" -> 300000 ms
-    const window_ms: i64 = blk: {
-        const window_str = getString(health_obj, "window") orelse "5m";
-        break :blk parseTimeString(window_str) orelse 300000;
-    };
+    const window_ms: i64 = if (getString(health_obj, "window")) |window_str|
+        parseTimeString(window_str) orelse {
+            log.warn("workflow definition: health.window = \"{s}\" is not a duration like 30s, 5m, 1h or 1d", .{window_str});
+            return ParseError.InvalidFieldType;
+        }
+    else
+        300000;
 
     return .{
         .window_ms = window_ms,
         .decay = getFloat(health_obj, "decay") orelse 0.9,
-        .min_samples = if (getInt(health_obj, "minSamples")) |m| @intCast(m) else 50,
+        .min_samples = if (getInt(health_obj, "minSamples")) |m| try fitInt(u32, "health.minSamples", m) else 50,
     };
 }
 
@@ -909,7 +925,8 @@ fn parseFallbackConfig(allocator: Allocator, root: JsonValue) ParseError!?Fallba
     };
 }
 
-/// Parse time string like "5m", "1h", "30s" to milliseconds
+/// Parse a duration like "30s", "5m", "1h", "1d" to milliseconds; null if
+/// malformed or the result overflows i64.
 fn parseTimeString(s: []const u8) ?i64 {
     if (s.len < 2) return null;
 
@@ -917,13 +934,14 @@ fn parseTimeString(s: []const u8) ?i64 {
     const num_str = s[0 .. s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
 
-    return switch (unit) {
-        's' => num * 1000,
-        'm' => num * 60 * 1000,
-        'h' => num * 60 * 60 * 1000,
-        'd' => num * 24 * 60 * 60 * 1000,
-        else => null,
+    const unit_ms: i64 = switch (unit) {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 60 * 60 * 1000,
+        'd' => 24 * 60 * 60 * 1000,
+        else => return null,
     };
+    return std.math.mul(i64, num, unit_ms) catch null;
 }
 
 // =============================================================================
@@ -1200,4 +1218,76 @@ test "parseWorkflow: YAML with direct step output passthrough" {
     try testing.expectEqualStrings("audio-pipeline", def.name);
     try testing.expect(def.output != null);
     try testing.expectEqualStrings("$.steps.encode.output", def.output.?);
+}
+
+/// Build a minimal JSON workflow around `top` (top-level fields, each with a
+/// trailing comma) and `step` (extra fields on the start step, same shape).
+fn rangeTestWorkflow(comptime top: []const u8, comptime step: []const u8) []const u8 {
+    return "{\"kind\":\"Workflow\",\"name\":\"w\",\"version\":\"1\"," ++ top ++
+        "\"start\":{\"run\":\"@actions/x\"," ++ step ++
+        "\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\"}}}";
+}
+
+/// A workflow with one inline plan: `plan` fields (each with a trailing comma)
+/// go on the plan, `executor` fields (each with a leading comma) on its executor.
+fn rangeTestPlan(comptime executor: []const u8, comptime plan: []const u8) []const u8 {
+    return rangeTestWorkflow("\"plans\":{\"p\":{" ++ plan ++ "\"executors\":[{\"name\":\"e\",\"run\":\"@actions/x\"" ++ executor ++ "}]}},", "");
+}
+
+test "parseWorkflow: integers outside the field's type are rejected, not cast" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        rangeTestWorkflow("\"schedule\":{\"cron\":\"* * * * *\",\"max_concurrent\":5000000000},", ""),
+        rangeTestWorkflow("\"schedule\":{\"cron\":\"* * * * *\",\"maxConcurrent\":-1},", ""),
+        rangeTestWorkflow("\"trigger\":{\"stream\":\"s\",\"batch_size\":5000000000},", ""),
+        rangeTestWorkflow("\"trigger\":{\"stream\":\"s\",\"batch_timeout_ms\":5000000000},", ""),
+        rangeTestWorkflow("\"trigger\":{\"stream\":\"s\",\"batch_timeout_ms\":-1},", ""),
+        rangeTestWorkflow("", "\"retry\":{\"max\":-1},"),
+        rangeTestWorkflow("", "\"retry\":{\"initial_delay_ms\":5000000000},"),
+        rangeTestWorkflow("", "\"retry\":{\"max_delay_ms\":-1},"),
+        rangeTestWorkflow("", "\"retry\":{\"within_ms\":-1},"),
+        rangeTestWorkflow("", "\"poll\":{\"maxAttempts\":5000000000},"),
+        rangeTestWorkflow("", "\"poll\":{\"baseDelayMs\":-1},"),
+        rangeTestWorkflow("", "\"poll\":{\"maxDelayMs\":5000000000},"),
+        rangeTestPlan(",\"priority\":3000000000", ""),
+        rangeTestPlan(",\"retry\":{\"max\":5000000000}", ""),
+        rangeTestPlan(",\"breaker\":{\"failureThreshold\":-1}", ""),
+        rangeTestPlan(",\"breaker\":{\"halfOpenMaxCalls\":5000000000}", ""),
+        rangeTestPlan(",\"rateLimit\":{\"maxPerSecond\":-1}", ""),
+        rangeTestPlan(",\"rateLimit\":{\"maxPerMinute\":5000000000}", ""),
+        rangeTestPlan(",\"rateLimit\":{\"maxPerHour\":-1}", ""),
+        rangeTestPlan("", "\"health\":{\"minSamples\":-1},"),
+        rangeTestPlan("", "\"health\":{\"window\":\"9999999999999999d\"},"),
+        rangeTestPlan("", "\"health\":{\"window\":\"soon\"},"),
+        rangeTestWorkflow("", "\"poll\":{\"initialDelayMs\":-1},"),
+        "{\"kind\":\"Workflow\",\"name\":\"w\",\"version\":\"1\",\"start\":{\"waitForSignal\":{\"type\":\"go\",\"timeoutMs\":-1},\"transitions\":{\"success\":\"flo.Completed\"}}}",
+    };
+    for (cases) |json| {
+        std.testing.expectError(ParseError.InvalidFieldType, parseWorkflow(allocator, json)) catch |err| {
+            std.debug.print("workflow: {s}\n", .{json});
+            return err;
+        };
+    }
+}
+
+test "parseWorkflow: integers at the field type's limits are accepted" {
+    const allocator = std.testing.allocator;
+    const json = rangeTestWorkflow(
+        "\"plans\":{\"p\":{\"executors\":[{\"name\":\"e\",\"run\":\"@actions/x\",\"priority\":-2147483648}]}}," ++
+            "\"trigger\":{\"stream\":\"s\",\"batch_size\":4294967295,\"batch_timeout_ms\":4294967295},",
+        "\"retry\":{\"max\":4294967295,\"within_ms\":9223372036854775807},",
+    );
+    var def = try parseWorkflow(allocator, json);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), def.plans[0].executors[0].priority);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.trigger.?.batch_size);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.trigger.?.batch_timeout_ms);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.start.run.retry.?.max_attempts);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(i64)), def.start.run.retry.?.within_ms);
+}
+
+test "parseTimeString: overflowing durations are rejected, not multiplied" {
+    try std.testing.expectEqual(@as(?i64, null), parseTimeString("9999999999999999d"));
+    try std.testing.expectEqual(@as(?i64, null), parseTimeString("-9999999999999999d"));
 }

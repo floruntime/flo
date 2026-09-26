@@ -1671,7 +1671,7 @@ pub const WorkflowHandler = struct {
 
                     // Record timeout deadline if configured
                     if (wait_step.timeout_ms) |timeout_ms| {
-                        run.wait_timeout_at_ms = now_ms + timeout_ms;
+                        run.wait_timeout_at_ms = now_ms +| timeout_ms;
                         if (wait_step.on_timeout) |target| {
                             if (run.wait_timeout_target_owned) |old| self.allocator.free(old);
                             run.wait_timeout_target_owned = self.allocator.dupe(u8, target) catch null;
@@ -2127,7 +2127,7 @@ pub const WorkflowHandler = struct {
             else
                 @intCast(poll_cfg.calculateDelay(run.poll_attempt - 1));
             run.poll_attempt += 1;
-            run.poll_next_at_ms = now_ms + delay;
+            run.poll_next_at_ms = now_ms +| delay;
             run.status = .waiting;
             self.addHistoryEvent(run, "poll_scheduled", step_label, now_ms);
             return .parked;
@@ -4648,6 +4648,47 @@ test "step executor: poll re-arms on pending and times out after maxAttempts" {
         if (std.mem.eql(u8, evt.event_type_owned, "poll_scheduled")) polls += 1;
     }
     try testing.expect(polls >= 1);
+}
+
+test "step executor: a maximal wait timeout or poll delay saturates instead of overflowing" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "poller");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:wait-max", "wait-max", "{\"kind\":\"Workflow\",\"name\":\"wait-max\",\"version\":\"1.0.0\"," ++
+        "\"start\":{\"waitForSignal\":{\"type\":\"go\",\"timeoutMs\":9223372036854775807},\"transitions\":{\"success\":\"flo.Completed\"}}}");
+    createTestRun(&handler, "default:run-wait-max", "run-wait-max", "wait-max");
+    handler.advanceWorkflow(&shard, "default:run-wait-max", "default");
+    _ = shard.applyCommitted();
+    {
+        const run = handler.runs.get("default:run-wait-max").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        try testing.expectEqual(@as(i64, std.math.maxInt(i64)), run.wait_timeout_at_ms);
+    }
+
+    createTestDef(&handler, "default:poll-max", "poll-max", "{\"kind\":\"Workflow\",\"name\":\"poll-max\",\"version\":\"1.0.0\"," ++
+        "\"start\":{\"run\":\"@actions/poller\",\"poll\":{\"maxAttempts\":2,\"initialDelayMs\":9223372036854775807}," ++
+        "\"transitions\":{\"success\":\"flo.Completed\",\"failure\":\"flo.Failed\",\"timeout\":\"flo.TimedOut\"}}}");
+    createTestRun(&handler, "default:run-poll-max", "run-poll-max", "poll-max");
+    handler.advanceWorkflow(&shard, "default:run-poll-max", "default");
+    _ = shard.applyCommitted();
+    {
+        const run = handler.runs.getPtr("default:run-poll-max").?;
+        completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "pending");
+    }
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+    {
+        const run = handler.runs.get("default:run-poll-max").?;
+        try testing.expectEqual(@as(u32, 1), run.poll_attempt);
+        try testing.expectEqual(@as(i64, std.math.maxInt(i64)), run.poll_next_at_ms);
+    }
 }
 
 test "step executor: checkPendingActions handles completed async action" {
