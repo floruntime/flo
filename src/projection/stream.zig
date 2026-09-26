@@ -2089,6 +2089,22 @@ test "stream: appendToStream creates stream and returns StreamID" {
     try testing.expect(s.streamLastId(hash).eql(id2));
 }
 
+test "stream: the next append in the same millisecond is past a cursor at the previous one" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 7;
+    const first = try s.appendToStreamAt(hash, 1, 0, 1_000, 1, 0);
+    const second = try s.appendToStreamAt(hash, 2, 0, 1_000, 1, 0);
+    try testing.expectEqual(first.timestamp_ms, second.timestamp_ms);
+
+    var buf: [4]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 1), s.readStreamAfter(hash, first, null, &buf));
+    try testing.expect(buf[0].id.eql(second));
+    try testing.expectEqual(@as(usize, 1), s.readStreamRange(hash, first, StreamID.MAX, null, &buf));
+    try testing.expect(buf[0].id.eql(second));
+}
+
 test "stream: readStreamRange and readStreamAfter" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();

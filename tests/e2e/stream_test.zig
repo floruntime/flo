@@ -378,7 +378,6 @@ test "e2e/stream: read with --start and --end (range query)" {
     const id4 = extractStreamId(out4) orelse return error.NoStreamId;
     _ = extractStreamId(out1);
 
-    // Read range from id2 to id4
     var result = try ctx.cli.run(&.{ "stream", "read", "range-test", "--start", id2, "--end", id4, "-o", "json" });
     defer result.deinit();
 

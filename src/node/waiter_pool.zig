@@ -133,10 +133,11 @@ pub const Waiter = struct {
     key_len: u16,
 
     /// Minimum version/offset threshold.
-    ///   - KV:     trigger when `entry.lsn > min_version`
+    ///   - KV:     trigger when `entry.version > min_version`
     ///   - Stream: unused; see `stream`
     ///   - Queue:  the queue's name hash
-    ///   - Worker: `(ns_len << 16) | action_len`, splitting `key` into both
+    ///   - Worker: `(ns_len << 16) | action_len`, the lengths that locate the
+    ///             namespace and action name inside `key`
     min_version: u64,
 
     /// Stream reads: the window re-run on wake. Group reads: `name_hash`,

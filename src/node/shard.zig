@@ -3403,8 +3403,10 @@ pub const Shard = struct {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // Same rule as `sendOkResponse`: a parked client is answered, never
         // left to its own timeout because the answer is too large to frame.
-        const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch
-            proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
+        const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch blk: {
+            log.warn("shard {d}: deferred answer to request {d} is {d} bytes, over the frame limit; answered with an error", .{ self.id, request_id, data.len });
+            break :blk proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
+        };
         self.deliverDeferred(owner_shard, fd, conn_id, serialized);
     }
 
@@ -3941,9 +3943,9 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     var buf: [StreamHandler.MAX_READ_BATCH]@import("../projection/stream.zig").StreamRecord = undefined;
     const records = handler.readRecords(window.*, &buf);
     if (records.len == 0) {
-        // Everything up to the stream's last id was scanned and none of it is
-        // in the window (another partition); ids only grow, so the next wake
-        // starts there instead of rescanning from the parked cursor.
+        // Everything up to the stream's last id (or `end`) was scanned and none
+        // of it is in the window; ids only grow, so the next wake starts there
+        // instead of rescanning from the parked cursor.
         const last = handler.stream.streamLastId(window.name_hash);
         const scanned = if (last.greaterThan(window.end)) window.end else last;
         if (scanned.greaterThan(window.after)) window.after = scanned;
@@ -6006,7 +6008,7 @@ test "Shard: a blocking read on one partition skips other partitions' appends wi
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
-    // Still parked, and its cursor moved past what it has already scanned.
+    // Still parked, with its cursor at the last id it scanned.
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
     const scanned = shard.stream_handler.stream.streamLastId(shard.waiter_pool.waiters[0].stream.name_hash);
     try std.testing.expect(shard.waiter_pool.waiters[0].stream.after.eql(scanned));
