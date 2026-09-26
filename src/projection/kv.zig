@@ -72,7 +72,7 @@ pub const ScanEntry = struct {
 // KV Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Default version chain length per key.
+/// Version chain length per key; nothing overrides it yet.
 pub const DEFAULT_VERSION_CHAIN_LEN: usize = 64;
 
 /// A historical version entry — stores previous value and metadata.

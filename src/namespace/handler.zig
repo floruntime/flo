@@ -224,7 +224,7 @@ pub const NamespaceHandler = struct {
         /// Tracks whether data has been written to this namespace.
         /// Incremented by markNamespaceHasData(), used for non-empty delete check.
         data_count: u32 = 0,
-        /// Per-namespace settings (synced from coordinator)
+        /// Per-namespace settings, as applied from this shard's log.
         config: NamespaceConfig = .{},
     };
 
@@ -625,8 +625,9 @@ pub const NamespaceHandler = struct {
             .namespace_delete => self.applyDelete(name),
             .namespace_config => {
                 if (cmd.value.len > 0) {
-                    // Entries are re-encoded by the server before they are proposed,
-                    // so one that fails to decode means corruption, not client input.
+                    // Entries are re-encoded by the server before they are proposed, so
+                    // one that fails to decode came from a build with different tags (or
+                    // is corrupt), not from a client.
                     const parsed = NamespaceConfig.deserializeSettings(cmd.value) catch {
                         log.err("namespace: dropped undecodable config entry for namespace={s}", .{name});
                         return;

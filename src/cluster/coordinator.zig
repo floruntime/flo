@@ -184,25 +184,26 @@ pub const NamespaceConfig = struct {
         return pos;
     }
 
-    /// Deserialize configurable settings from TLV format into a NamespaceConfig
-    /// with only settings populated. `data` must be exactly one TLV block.
-    /// Clients send this payload, so anything but a well-formed block of known,
-    /// distinct tags is refused rather than partly read: a client must never be
-    /// told a setting was applied when the server dropped it.
+    /// Decodes exactly one TLV block of distinct, known tags into a NamespaceConfig
+    /// with only settings populated, and refuses anything else rather than reading
+    /// part of it: a client must never be told a setting was applied when the
+    /// server dropped it.
     pub fn deserializeSettings(data: []const u8) error{InvalidSettings}!NamespaceConfig {
         var s: NamespaceConfig = .{};
         if (data.len == 0) return s;
 
         const count = data[0];
         var pos: usize = 1;
-        var seen: u8 = 0;
+        comptime for (std.meta.fields(SettingsTag)) |f| std.debug.assert(f.value < 64);
+        var seen: u64 = 0;
 
         for (0..count) |_| {
             if (pos >= data.len) return error.InvalidSettings;
             const tag: SettingsTag = @enumFromInt(data[pos]);
             pos += 1;
-            if (@intFromEnum(tag) < 8) {
-                const bit = @as(u8, 1) << @intCast(@intFromEnum(tag));
+            // Unknown tags skip this and are refused by the switch.
+            if (@intFromEnum(tag) < 64) {
+                const bit = @as(u64, 1) << @intCast(@intFromEnum(tag));
                 if (seen & bit != 0) return error.InvalidSettings;
                 seen |= bit;
             }
