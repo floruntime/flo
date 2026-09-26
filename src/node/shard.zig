@@ -2670,7 +2670,7 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
-        // Consumer-group PEL sweeper (FLO-102) — runs every 1 second. Re-nacks
+        // Consumer-group PEL sweeper — runs every 1 second. Re-nacks
         // pending entries idle past their group's ack_timeout_ms and drops
         // poison entries past max_deliver. Local in-memory PEL mutation only
         // (PEL is not persisted), so no Raft round-trip.
@@ -2766,7 +2766,7 @@ pub const Shard = struct {
         return trims_proposed;
     }
 
-    /// TaskScheduler callback: sweep every consumer group's PEL (FLO-102).
+    /// TaskScheduler callback: sweep every consumer group's PEL.
     /// Re-nacks entries idle past ack_timeout_ms and drops poison entries
     /// past max_deliver. Returns renacked + dropped for scheduler accounting.
     fn streamGroupSweepTask(ctx: *anyopaque, _: u64) u64 {
