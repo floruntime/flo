@@ -684,3 +684,21 @@ test "e2e/namespace: create survives server restart" {
     const val = try ctx.execCapture(&.{ "kv", "get", "mykey", "-n", "restart_test" });
     try testing.expect(std.mem.indexOf(u8, val, "myval") != null);
 }
+
+test "e2e/namespace: config refuses an unknown setting" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "cfg_ns" });
+
+    // A known setting round-trips, so the refusal below isn't a broken config path.
+    try ctx.exec(&.{ "ns", "config", "cfg_ns", "--set", "stream_retention_s=86400" });
+
+    var result = try ctx.cli.run(&.{ "ns", "config", "cfg_ns", "--set", "memory_budget_bytes=1073741824" });
+    defer result.deinit();
+    try stdx.testing.assertStderrContains(result, "Unknown setting 'memory_budget_bytes'");
+
+    const shown = try ctx.execCapture(&.{ "ns", "config", "cfg_ns" });
+    try testing.expect(std.mem.indexOf(u8, shown, "stream_retention_s: 86400") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "memory_budget_bytes") == null);
+}
