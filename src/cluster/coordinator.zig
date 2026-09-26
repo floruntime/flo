@@ -63,9 +63,8 @@ pub const MAX_NODES: usize = 64;
 ///
 /// Registry fields (name, partition_count, etc.) are set at creation time.
 /// Settings fields (nullable) are admin-settable via `namespace_config_set`.
-/// Null settings mean "use system default".
-/// Settings are both defaults AND ceilings: per-resource overrides can only
-/// be MORE restrictive than these.
+/// They are stored, replicated and reported, but nothing enforces them yet:
+/// the KV, stream and queue projections run on their own defaults.
 pub const NamespaceConfig = struct {
     // ── Registry fields (set at creation) ───────────────────────────────
 
@@ -83,29 +82,22 @@ pub const NamespaceConfig = struct {
     // ── Admin-configurable settings ─────────────────────────────────────
 
     /// Max version entries kept in KV projection memory per key.
-    /// null = unlimited (memory controller is the backstop).
     kv_max_hot_versions: ?u32 = null,
     /// Auto-expire historical versions older than this (seconds).
-    /// null = no TTL on versions.
     kv_version_ttl_s: ?u64 = null,
     /// Max stream size in bytes per stream.
-    /// null = unlimited.
     stream_retention_bytes: ?u64 = null,
     /// Max age of stream messages (seconds).
-    /// null = no time-based retention.
     stream_retention_s: ?u64 = null,
     /// Dead-letter queue capacity per queue.
-    /// null = system default (1000).
     queue_max_dlq_size: ?u32 = null,
     /// Max lease hold time for queue messages (seconds).
-    /// null = system default (30s).
     queue_max_lease_s: ?u32 = null,
 
     // ── Settings TLV serialization ──────────────────────────────────────
 
     /// Setting tags for TLV serialization of configurable fields.
     pub const SettingsTag = enum(u8) {
-        end = 0,
         kv_max_hot_versions = 1,
         kv_version_ttl_s = 2,
         stream_retention_bytes = 3,
@@ -115,7 +107,7 @@ pub const NamespaceConfig = struct {
         _,
     };
 
-    /// Maximum serialized size of settings TLV: 1 (count) + 6 * (1 tag + 8 max value) = 55 bytes
+    /// Count byte plus every setting at its widest (tag + u64).
     pub const MAX_SETTINGS_SIZE: usize = 1 + 6 * 9;
 
     /// Returns true if all configurable settings are null (no overrides).
@@ -192,22 +184,28 @@ pub const NamespaceConfig = struct {
         return pos;
     }
 
-    /// Deserialize configurable settings from TLV format.
-    /// Returns a NamespaceConfig with only settings populated and bytes consumed.
-    /// The payload arrives from clients, so an unknown tag or a truncated value
-    /// is refused rather than skipped: a setting the server doesn't understand
-    /// must not be acknowledged as applied.
-    pub fn deserializeSettings(data: []const u8) error{InvalidSettings}!struct { config: NamespaceConfig, consumed: usize } {
+    /// Deserialize configurable settings from TLV format into a NamespaceConfig
+    /// with only settings populated. `data` must be exactly one TLV block.
+    /// Clients send this payload, so anything but a well-formed block of known,
+    /// distinct tags is refused rather than partly read: a client must never be
+    /// told a setting was applied when the server dropped it.
+    pub fn deserializeSettings(data: []const u8) error{InvalidSettings}!NamespaceConfig {
         var s: NamespaceConfig = .{};
-        if (data.len == 0) return .{ .config = s, .consumed = 0 };
+        if (data.len == 0) return s;
 
         const count = data[0];
         var pos: usize = 1;
+        var seen: u8 = 0;
 
         for (0..count) |_| {
             if (pos >= data.len) return error.InvalidSettings;
             const tag: SettingsTag = @enumFromInt(data[pos]);
             pos += 1;
+            if (@intFromEnum(tag) < 8) {
+                const bit = @as(u8, 1) << @intCast(@intFromEnum(tag));
+                if (seen & bit != 0) return error.InvalidSettings;
+                seen |= bit;
+            }
             switch (tag) {
                 .kv_max_hot_versions => {
                     if (pos + 4 > data.len) return error.InvalidSettings;
@@ -239,12 +237,12 @@ pub const NamespaceConfig = struct {
                     s.queue_max_lease_s = std.mem.readInt(u32, data[pos..][0..4], .little);
                     pos += 4;
                 },
-                .end => break,
                 _ => return error.InvalidSettings,
             }
         }
 
-        return .{ .config = s, .consumed = pos };
+        if (pos != data.len) return error.InvalidSettings;
+        return s;
     }
 };
 
@@ -694,8 +692,11 @@ pub const Coordinator = struct {
         const hash = hashNamespace(name);
 
         if (self.namespaces.getPtr(hash)) |ns| {
-            const result = NamespaceConfig.deserializeSettings(data[4 + name_len ..][0..settings_len]) catch return;
-            ns.mergeSettings(result.config);
+            const settings = NamespaceConfig.deserializeSettings(data[4 + name_len ..][0..settings_len]) catch {
+                log.err("Coordinator: dropped undecodable config update for namespace={s}", .{name});
+                return;
+            };
+            ns.mergeSettings(settings);
             log.debug("Coordinator: updated namespace config={s}", .{name});
         }
     }
@@ -894,10 +895,9 @@ pub const Coordinator = struct {
             const slen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2;
             if (pos + slen > data.len) return error.InvalidSnapshot;
-            const result = NamespaceConfig.deserializeSettings(data[pos..][0..slen]) catch return error.InvalidSnapshot;
+            var ns_config = NamespaceConfig.deserializeSettings(data[pos..][0..slen]) catch return error.InvalidSnapshot;
             pos += slen;
 
-            var ns_config = result.config;
             ns_config.name = name;
             ns_config.partition_count = pc;
             ns_config.replication_factor = repl;
@@ -1182,13 +1182,12 @@ test "NamespaceConfig settings serialize/deserialize roundtrip" {
     try testing.expect(len > 0);
 
     const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expectEqual(original.kv_max_hot_versions, result.config.kv_max_hot_versions);
-    try testing.expectEqual(original.kv_version_ttl_s, result.config.kv_version_ttl_s);
-    try testing.expectEqual(original.stream_retention_bytes, result.config.stream_retention_bytes);
-    try testing.expectEqual(original.stream_retention_s, result.config.stream_retention_s);
-    try testing.expectEqual(original.queue_max_dlq_size, result.config.queue_max_dlq_size);
-    try testing.expectEqual(original.queue_max_lease_s, result.config.queue_max_lease_s);
-    try testing.expectEqual(len, result.consumed);
+    try testing.expectEqual(original.kv_max_hot_versions, result.kv_max_hot_versions);
+    try testing.expectEqual(original.kv_version_ttl_s, result.kv_version_ttl_s);
+    try testing.expectEqual(original.stream_retention_bytes, result.stream_retention_bytes);
+    try testing.expectEqual(original.stream_retention_s, result.stream_retention_s);
+    try testing.expectEqual(original.queue_max_dlq_size, result.queue_max_dlq_size);
+    try testing.expectEqual(original.queue_max_lease_s, result.queue_max_lease_s);
 }
 
 test "NamespaceConfig settings serialize/deserialize partial" {
@@ -1201,12 +1200,12 @@ test "NamespaceConfig settings serialize/deserialize partial" {
     const len = original.serializeSettings(&buf);
 
     const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expectEqual(@as(?u32, 100), result.config.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 7200), result.config.stream_retention_s);
-    try testing.expectEqual(@as(?u64, null), result.config.kv_version_ttl_s);
-    try testing.expectEqual(@as(?u64, null), result.config.stream_retention_bytes);
-    try testing.expectEqual(@as(?u32, null), result.config.queue_max_dlq_size);
-    try testing.expectEqual(@as(?u32, null), result.config.queue_max_lease_s);
+    try testing.expectEqual(@as(?u32, 100), result.kv_max_hot_versions);
+    try testing.expectEqual(@as(?u64, 7200), result.stream_retention_s);
+    try testing.expectEqual(@as(?u64, null), result.kv_version_ttl_s);
+    try testing.expectEqual(@as(?u64, null), result.stream_retention_bytes);
+    try testing.expectEqual(@as(?u32, null), result.queue_max_dlq_size);
+    try testing.expectEqual(@as(?u32, null), result.queue_max_lease_s);
 }
 
 test "NamespaceConfig settings empty roundtrip" {
@@ -1218,19 +1217,31 @@ test "NamespaceConfig settings empty roundtrip" {
     try testing.expectEqual(@as(usize, 1), len); // just the count byte = 0
 
     const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expect(result.config.settingsEmpty());
+    try testing.expect(result.settingsEmpty());
 }
 
-test "NamespaceConfig settings refuse an unknown tag or a truncated value" {
-    // Tag 7 was a namespace memory budget nothing enforced; it is now unknown.
-    const unknown = [_]u8{ 1, 7, 0, 0, 0, 64, 0, 0, 0, 0 };
-    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&unknown));
+test "NamespaceConfig settings refuse anything but a well-formed block of known tags" {
+    const lease = @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s);
+    const ttl = @intFromEnum(NamespaceConfig.SettingsTag.kv_version_ttl_s);
+    const bad = [_][]const u8{
+        // 7 is the first unassigned tag; 0 is not a tag either.
+        &.{ 1, 7, 0, 0, 0, 64, 0, 0, 0, 0 },
+        &.{ 1, 0 },
+        // Value shorter than its tag's width.
+        &.{ 1, ttl, 1, 2 },
+        // Count promises more entries than the block holds.
+        &.{2},
+        // Bytes past the counted entries.
+        &.{ 1, lease, 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 },
+        // The same setting twice.
+        &.{ 2, lease, 60, 0, 0, 0, lease, 90, 0, 0, 0 },
+    };
+    for (bad) |data| {
+        try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(data));
+    }
 
-    const truncated = [_]u8{ 1, @intFromEnum(NamespaceConfig.SettingsTag.kv_version_ttl_s), 1, 2 };
-    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&truncated));
-
-    const missing_entry = [_]u8{2};
-    try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(&missing_entry));
+    const good = try NamespaceConfig.deserializeSettings(&.{ 1, lease, 60, 0, 0, 0 });
+    try testing.expectEqual(@as(?u32, 60), good.queue_max_lease_s);
 }
 
 test "NamespaceConfig settings merge" {

@@ -547,14 +547,14 @@ pub const NamespaceHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown or malformed setting");
             return;
         };
-        if (parsed.config.settingsEmpty()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "no valid settings provided");
+        if (parsed.settingsEmpty()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "no settings provided");
             return;
         }
 
         // Serialize settings as the value portion of the UAL entry
         var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-        const settings_len = parsed.config.serializeSettings(&settings_buf);
+        const settings_len = parsed.serializeSettings(&settings_buf);
 
         const proposed = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
@@ -568,9 +568,10 @@ pub const NamespaceHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         // Also propagate to coordinator if wired
         if (shard.coordinator) |coord| {
-            // Validated before the entry was proposed.
+            // dispatchConfigSet validated these bytes before parking; park hands
+            // back the same CRC-checked request.
             const parsed = NamespaceConfig.deserializeSettings(req.value) catch unreachable;
-            _ = coord.proposeUpdateNamespaceConfig(req.key, parsed.config) catch {};
+            _ = coord.proposeUpdateNamespaceConfig(req.key, parsed) catch {};
             _ = coord.applyCommitted() catch {};
         }
         shard.sendOkResponse(conn, req.header.request_id, "");
@@ -624,8 +625,13 @@ pub const NamespaceHandler = struct {
             .namespace_delete => self.applyDelete(name),
             .namespace_config => {
                 if (cmd.value.len > 0) {
-                    const parsed = NamespaceConfig.deserializeSettings(cmd.value) catch return;
-                    self.applyConfigUpdate(name, parsed.config);
+                    // Entries are re-encoded by the server before they are proposed,
+                    // so one that fails to decode means corruption, not client input.
+                    const parsed = NamespaceConfig.deserializeSettings(cmd.value) catch {
+                        log.err("namespace: dropped undecodable config entry for namespace={s}", .{name});
+                        return;
+                    };
+                    self.applyConfigUpdate(name, parsed);
                 }
             },
             else => {},
@@ -808,11 +814,11 @@ pub const NamespaceHandler = struct {
         const parsed = NamespaceConfig.deserializeSettings(req.value) catch {
             return .{ .err = .{ .code = .invalid_request, .message = "unknown or malformed setting" } };
         };
-        if (parsed.config.settingsEmpty()) {
-            return .{ .err = .{ .code = .invalid_request, .message = "no valid settings provided" } };
+        if (parsed.settingsEmpty()) {
+            return .{ .err = .{ .code = .invalid_request, .message = "no settings provided" } };
         }
 
-        self.applyConfigUpdate(name, parsed.config);
+        self.applyConfigUpdate(name, parsed);
         return .{ .namespace_config_set = {} };
     }
 
@@ -1460,7 +1466,7 @@ test "namespace handler: handleConfigGet returns TLV" {
         .namespace_config_get => |payload| {
             // Deserialize the returned TLV
             const de = try NamespaceConfig.deserializeSettings(payload.data);
-            try testing.expectEqual(@as(?u32, 42), de.config.kv_max_hot_versions);
+            try testing.expectEqual(@as(?u32, 42), de.kv_max_hot_versions);
             if (payload.allocated) {
                 allocator.free(payload.data);
             }

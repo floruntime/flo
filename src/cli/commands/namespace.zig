@@ -88,7 +88,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("config")
-                .about("Get or set namespace configuration")
+                .about("Get or set namespace settings (recorded, not yet enforced)")
                 .examples(&.{
                     "flo namespace config myapp",
                     "flo ns config myapp --set kv_max_hot_versions=50",
@@ -315,7 +315,7 @@ fn runConfig(ctx: *commander.Context) commander.Error!void {
             return error.CommandFailed;
         }
 
-        ctx.print("Updated namespace '{s}': {s}={s}\n", .{ name, key, val_str });
+        ctx.print("Recorded for namespace '{s}': {s}={s} (namespace settings are not enforced yet)\n", .{ name, key, val_str });
     } else {
         // Get current config
         var result = client_mod.namespace.configGet(&client, name) catch |err| {
@@ -338,10 +338,10 @@ fn runConfig(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Invalid response from server\n", .{});
             return error.CommandFailed;
         };
-        const s = de.config;
+        const s = de;
 
         ctx.print("Namespace: {s}\n", .{name});
-        ctx.print("Configuration:\n", .{});
+        ctx.print("Settings (recorded, not yet enforced):\n", .{});
         printSetting(ctx, "kv_max_hot_versions", if (s.kv_max_hot_versions) |v| fmtU32(v) else null);
         printSetting(ctx, "kv_version_ttl_s", if (s.kv_version_ttl_s) |v| fmtU64(v) else null);
         printSetting(ctx, "stream_retention_bytes", if (s.stream_retention_bytes) |v| fmtU64(v) else null);

@@ -105,6 +105,7 @@ const ShardManifest = shard_manifest.ShardManifest;
 const Forwarder = @import("../cluster/forwarder.zig").Forwarder;
 const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
 const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
+const NamespaceConfig = @import("../cluster/coordinator.zig").NamespaceConfig;
 const NodeId = @import("../raft/node.zig").NodeId;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
@@ -5884,6 +5885,46 @@ test "Shard: park answers from its own entry when a later one has already commit
     const hash = node_router.nameHash(node_router.namespaceHash(""), "s");
     try std.testing.expect(Seen.id.?.eql(shard.stream_handler.stream.streamFirstId(hash)));
     try std.testing.expect(!Seen.id.?.eql(shard.stream_handler.stream.streamLastId(hash)));
+}
+
+test "Shard: a namespace config set with a setting the server does not know is refused and proposes nothing" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    try ParkTest.send(&shard, conn, .namespace_create, 1, "cfg", "");
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+
+    const lease = @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s);
+    const last = shard.raft_node.log.lastIndex();
+    try ParkTest.send(&shard, conn, .namespace_config_set, 2, "cfg", &.{ 2, lease, 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 });
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expect(shard.namespace_handler.getSettings("cfg").settingsEmpty());
+
+    // The same known setting on its own goes through.
+    try ParkTest.send(&shard, conn, .namespace_config_set, 3, "cfg", &.{ 1, lease, 60, 0, 0, 0 });
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(?u32, 60), shard.namespace_handler.getSettings("cfg").queue_max_lease_s);
 }
 
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
