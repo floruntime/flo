@@ -46,8 +46,8 @@ Each shard is a dedicated OS thread that owns:
 - **Dispatcher** — Opcode→handler table for request routing
 - **ConnectionPool** — All connections assigned to this shard
 - **Partitions** — Raft groups with UAL + Projections (partition_id % shard_count = shard_id)
-- **Inbox** — MPSC ring buffer for receiving cross-shard messages
-- **Slab allocator** — For cross-shard payload lifetimes
+- **Mailbox** — an inbox for other shards' requests, a reply ring for answers to its own, and wake flags; each ring is an MPSC ring buffer
+- **Slab allocator** — per-shard slab pools (not yet used for cross-shard payloads)
 
 The shard's main loop:
 
@@ -160,7 +160,7 @@ Write latency: ~1 RTT to quorum + local UAL write.
 1. Client sends request to Shard
 2. Dispatcher maps opcode to Handler
 3. Handler queries Projection directly (no Raft needed)
-4. If cross-shard: Inbox message → remote Shard → response
+4. If cross-shard: request on the owner's inbox → answer on the asker's reply ring
 5. Response sent to client
 ```
 
@@ -174,23 +174,22 @@ Shards communicate via 32-byte envelopes on lock-free MPSC ring buffers:
 const Envelope = extern struct {
     tag: u8,              // message type
     src_shard: u8,        // sender shard ID
-    partition_id: u16,    // target partition
-    payload_ptr: *anyopaque, // slab-allocated payload
+    partition_id: u16,    // unused
     payload_len: u32,
-    sequence: u64,        // for response matching
-    padding: [8]u8,
+    sequence: u64,        // forward_request: (conn_id << 32) | fd of the client
+    payload_ptr: *anyopaque, // heap-allocated payload
+    padding: [8]u8,       // reply slot u16, generation u32
 };
 ```
 
-Payloads are allocated from the slab allocator, not embedded in the envelope. This keeps the MPSC ring's cache line footprint minimal.
+Payloads are allocated on the heap, not embedded in the envelope. This keeps the MPSC ring's cache line footprint minimal.
 
 ## Clustering
 
 - **Raft group** — one log per cluster; the leader replicates every write to a majority before it is acknowledged, and membership is a config entry in that log
 - **Peer link** — one authenticated TCP link per node pair carrying the Raft RPCs and writes forwarded to the leader
 - **Controller Raft** — runs on Shard 0, manages partition table
-- **Partition Table** — maps partition → node, updated on membership changes
-- **Forwarder** — routes requests to the correct node when partitions aren't local
+- **Partition Table** — maps partition → node, updated on membership changes (not yet used for routing)
 
 ## Performance
 

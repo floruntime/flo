@@ -276,9 +276,7 @@ pub const StreamHandler = struct {
             // Park on the window just read (`Shard.resolveStreamWaiter`).
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_read,
-                .fd = conn.fd,
-                .owner_shard = conn.owner_shard,
-                .conn_id = conn.id,
+                .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .stream = shard.stream_handler.readWindow(req),
@@ -344,9 +342,7 @@ pub const StreamHandler = struct {
             const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
-                .fd = conn.fd,
-                .owner_shard = conn.owner_shard,
-                .conn_id = conn.id,
+                .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = req.key,
                 .stream = .{ .name_hash = name_hash, .after = shard.stream_handler.stream.streamLastId(name_hash) },

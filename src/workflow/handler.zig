@@ -113,7 +113,7 @@ pub const WorkflowHandler = struct {
     stream_triggers: std.StringHashMap(StreamTriggerState),
 
     /// Set when a stream this shard watches was just appended to (via a
-    /// `stream_event` inbox notification or a local append). The next
+    /// peer's `stream_appended` wake flag or a local append). The next
     /// `tickStreamTriggers` force-polls all triggers, bypassing their poll
     /// timer — turning a polled (≤ batch_timeout_ms) latency into ~one tick.
     /// Single-threaded per shard (set/read only on the shard's reactor thread).
@@ -1775,7 +1775,6 @@ pub const WorkflowHandler = struct {
         return switch (target) {
             .local => shard.id,
             .shard => |t| t.shard_id,
-            .remote => shard.id,
         };
     }
 
@@ -1961,17 +1960,18 @@ pub const WorkflowHandler = struct {
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
-        const peer_inboxes = shard.peer_inboxes orelse return definition.StepOutcome.execution_failure;
-        if (target_shard_id >= peer_inboxes.len) return definition.StepOutcome.execution_failure;
+        const peer_mailboxes = shard.peer_mailboxes orelse return definition.StepOutcome.execution_failure;
+        if (target_shard_id >= peer_mailboxes.len) return definition.StepOutcome.execution_failure;
         const message = ActionsHandler.encodeStartRunMessage(shard.allocator, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
             return definition.StepOutcome.execution_failure;
         };
-        if (!peer_inboxes[target_shard_id].send(.{
+        if (!peer_mailboxes[target_shard_id].inbox.send(.{
             .tag = .action_start,
             .src_shard = @intCast(shard.id),
             .payload_len = @intCast(message.len),
             .payload_ptr = message.ptr,
         })) {
+            if (shard.shard_metrics) |sm| sm.recordCrossShardOverloaded(.engine);
             shard.allocator.free(message);
             return definition.StepOutcome.execution_failure;
         }
@@ -2027,7 +2027,6 @@ pub const WorkflowHandler = struct {
                 }
                 return shard.actions_handler;
             },
-            .remote => return shard.actions_handler,
         }
     }
 
@@ -2047,7 +2046,6 @@ pub const WorkflowHandler = struct {
                 }
                 return shard.stream_handler;
             },
-            .remote => return shard.stream_handler,
         }
     }
 
@@ -2059,7 +2057,6 @@ pub const WorkflowHandler = struct {
         return switch (target) {
             .local => shard.id,
             .shard => |t| t.shard_id,
-            .remote => shard.id,
         };
     }
 
@@ -3009,7 +3006,7 @@ pub const WorkflowHandler = struct {
     pub fn tickStreamTriggers(self: *WorkflowHandler, shard: *Shard) void {
         const now_ms = @import("stdx").time.milliTimestamp();
 
-        // A `stream_event` notification (push-wake) forces an immediate poll of
+        // A `stream_appended` wake flag (push-wake) forces an immediate poll of
         // every trigger this tick, bypassing each trigger's poll-interval timer.
         // The timer remains as a fallback for events that arrive without a
         // notification (e.g. appended before the trigger registered).
@@ -4048,7 +4045,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.id = 0;
     shard.actions_handler = actions;
     shard.peer_shards = null;
-    shard.peer_inboxes = null;
+    shard.peer_mailboxes = null;
     // `Shard = undefined` means field defaults do not apply — anything the code
     // under test reads must be assigned here or it holds garbage.
     shard.metrics_registry = null;

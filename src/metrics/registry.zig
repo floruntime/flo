@@ -561,6 +561,24 @@ pub const ShardMetrics = struct {
     /// Reads the shard's inbox depth at scrape time, from any thread, so a
     /// shard that has stopped draining still shows what waits for it.
     live_pending: ?LivePending = null,
+    /// Client requests this shard has sent to other shards and not yet had
+    /// answered.
+    cross_shard_in_flight: Atomic(u64) = Atomic(u64).init(0),
+    /// Requests to another shard refused at once, before they ran, for want
+    /// of a reply slot or of room in its inbox, by class (`CrossShardClass`).
+    cross_shard_overloaded: [2]Atomic(u64) = .{ Atomic(u64).init(0), Atomic(u64).init(0) },
+    /// Answers dropped for want of a reply slot or of room on the asker's
+    /// reply ring. Both are reserved before every request, so a count means
+    /// an answer came twice or long after its slot expired.
+    replies_dropped: Atomic(u64) = Atomic(u64).init(0),
+    /// Client requests another shard did not answer in time; clients still
+    /// connected were told the request may still apply.
+    cross_shard_timeouts: Atomic(u64) = Atomic(u64).init(0),
+    /// How long the oldest unanswered request to another shard has waited,
+    /// in seconds, blocking reads aside, as of the last sweep (once a second).
+    oldest_cross_shard_wait_s: Atomic(u64) = Atomic(u64).init(0),
+
+    pub const CrossShardClass = enum(u1) { client_forward, engine };
 
     pub const LivePending = struct {
         ctx: *const anyopaque,
@@ -617,6 +635,26 @@ pub const ShardMetrics = struct {
         self.inbox_pending.store(count, .monotonic);
     }
 
+    pub fn setCrossShardInFlight(self: *ShardMetrics, count: u64) void {
+        self.cross_shard_in_flight.store(count, .monotonic);
+    }
+
+    pub fn recordCrossShardOverloaded(self: *ShardMetrics, class: CrossShardClass) void {
+        _ = self.cross_shard_overloaded[@intFromEnum(class)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn setOldestCrossShardWait(self: *ShardMetrics, seconds: u64) void {
+        self.oldest_cross_shard_wait_s.store(seconds, .monotonic);
+    }
+
+    pub fn recordCrossShardTimeout(self: *ShardMetrics) void {
+        _ = self.cross_shard_timeouts.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordReplyDropped(self: *ShardMetrics) void {
+        _ = self.replies_dropped.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         shard_id: u16,
         connections: u64,
@@ -628,6 +666,11 @@ pub const ShardMetrics = struct {
         reactor_loops: u64,
         inbox_processed: u64,
         inbox_pending: u64,
+        cross_shard_in_flight: u64,
+        cross_shard_overloaded: [2]u64,
+        replies_dropped: u64,
+        cross_shard_timeouts: u64,
+        oldest_cross_shard_wait_s: u64,
     };
 
     pub fn snapshot(self: *const ShardMetrics) Snapshot {
@@ -642,6 +685,11 @@ pub const ShardMetrics = struct {
             .reactor_loops = self.reactor_loops.load(.monotonic),
             .inbox_processed = self.inbox_processed.load(.monotonic),
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
+            .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
+            .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic) },
+            .replies_dropped = self.replies_dropped.load(.monotonic),
+            .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
+            .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
         };
     }
 };
@@ -1413,6 +1461,13 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_reactor_loops_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.reactor_loops });
     try writer.print("flo_shard_inbox_processed_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_processed });
     try writer.print("flo_shard_inbox_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_pending });
+    try writer.print("flo_shard_cross_shard_requests_in_flight{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_in_flight });
+    inline for (std.meta.fields(ShardMetrics.CrossShardClass)) |c| {
+        try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ c.name ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[c.value] });
+    }
+    try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
+    try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
+    try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
 }
 
 // ============================================================================
