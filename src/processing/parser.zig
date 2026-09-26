@@ -55,6 +55,7 @@ const Allocator = mem.Allocator;
 const job_definition = @import("definition.zig");
 const yaml_to_json = @import("../util/yaml_to_json.zig");
 const interpolate = @import("../util/interpolate.zig");
+const log = @import("stdx").log;
 
 // Re-export types for convenience
 pub const JobDefinition = job_definition.JobDefinition;
@@ -102,6 +103,15 @@ fn getInt(obj: JsonValue, key: []const u8) ?i64 {
         .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
         else => null,
     };
+}
+
+/// Narrow a client-supplied integer to u32. Definitions arrive over the
+/// network and release builds keep safety checks, so a bare `@intCast` on a
+/// value that does not fit panics and takes the node down.
+fn fitU32(field: []const u8, v: i64) ?u32 {
+    const narrowed = std.math.cast(u32, v);
+    if (narrowed == null) log.warn("processing definition: {s} = {d} is out of range (0..{d})", .{ field, v, std.math.maxInt(u32) });
+    return narrowed;
 }
 
 fn getObject(obj: JsonValue, key: []const u8) ?JsonValue {
@@ -228,7 +238,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidParallelism,
         };
         if (v <= 0) return error.InvalidParallelism;
-        parallelism = @intCast(v);
+        parallelism = fitU32("parallelism", v) orelse return error.InvalidParallelism;
     }
 
     // --- batch_size (top-level integer default for all sources) ---
@@ -239,7 +249,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidFormat,
         };
         if (v <= 0) return error.InvalidFormat;
-        batch_size = @intCast(v);
+        batch_size = fitU32("batch_size", v) orelse return error.InvalidFormat;
     }
 
     // --- sources (required array) ---
@@ -507,12 +517,12 @@ fn appendTsSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(ts_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = fitU32("ts.batch_size", v) orelse return error.InvalidFormat;
     }
 
     var poll_interval_ms: u32 = 1000;
     if (getInt(ts_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_interval_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_interval_ms = fitU32("ts.poll_interval_ms", v) orelse return error.InvalidFormat;
     }
 
     const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -584,13 +594,13 @@ fn appendStreamSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(stream_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = fitU32("stream.batch_size", v) orelse return error.InvalidFormat;
     }
 
     // Poll interval (default 1000ms) — how often the pipeline reads from the source.
     var poll_ms: u32 = 1000;
     if (getInt(stream_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_ms = fitU32("stream.poll_interval_ms", v) orelse return error.InvalidFormat;
     }
 
     // `partitions:` as string → range/list/all expansion
@@ -602,7 +612,7 @@ fn appendStreamSource(
     // `partitions:` as integer → single partition; default → all
     var partition: u32 = job_definition.PARTITION_ALL;
     if (getInt(stream_obj, "partitions")) |v| {
-        partition = @intCast(@as(i64, v));
+        partition = fitU32("stream.partitions", v) orelse return error.InvalidPartitions;
     }
 
     const name_dup = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -666,9 +676,12 @@ fn expandPartitions(
         const end = std.fmt.parseInt(u32, end_str, 10) catch return error.InvalidPartitions;
         if (start > end) return error.InvalidPartitions;
 
+        // Stop on `end` rather than testing `p <= end`: an end of maxInt(u32)
+        // would otherwise overflow the increment.
         var p = start;
-        while (p <= end) : (p += 1) {
+        while (true) : (p += 1) {
             try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, poll_ms, sources);
+            if (p == end) break;
         }
         return;
     }
@@ -2425,4 +2438,59 @@ test "parser: classify operator with default tag" {
         }
     }
     try std.testing.expect(has_default);
+}
+
+/// Build a minimal JSON definition around `top` (top-level fields, each with a
+/// trailing comma) and one `source` object.
+fn rangeTestDef(comptime top: []const u8, comptime source: []const u8) []const u8 {
+    return "{\"kind\":\"Processing\"," ++ top ++ "\"sources\":[" ++ source ++ "],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}";
+}
+
+const range_test_stream = "{\"name\":\"s\",\"stream\":{\"name\":\"in\"}}";
+
+test "parser: integers that do not fit u32 are rejected, not cast" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { err: ParseError, def: []const u8 }{
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("\"batch_size\":5000000000,", range_test_stream) },
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("\"batch_size\":\"5000000000\",", range_test_stream) },
+        .{ .err = error.InvalidParallelism, .def = rangeTestDef("\"parallelism\":5000000000,", range_test_stream) },
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("", "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"batch_size\":5000000000}}") },
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("", "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"poll_interval_ms\":5000000000}}") },
+        .{ .err = error.InvalidPartitions, .def = rangeTestDef("", "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"partitions\":5000000000}}") },
+        .{ .err = error.InvalidPartitions, .def = rangeTestDef("", "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"partitions\":-1}}") },
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("", "{\"name\":\"t\",\"ts\":{\"measurement\":\"m\",\"batch_size\":5000000000}}") },
+        .{ .err = error.InvalidFormat, .def = rangeTestDef("", "{\"name\":\"t\",\"ts\":{\"measurement\":\"m\",\"poll_interval_ms\":5000000000}}") },
+    };
+    for (cases) |c| {
+        std.testing.expectError(c.err, parseJobDefinition(allocator, c.def)) catch |err| {
+            std.debug.print("definition: {s}\n", .{c.def});
+            return err;
+        };
+    }
+}
+
+test "parser: u32 maximum is accepted for batch_size, parallelism and poll interval" {
+    const allocator = std.testing.allocator;
+    const text = rangeTestDef(
+        "\"batch_size\":4294967295,\"parallelism\":4294967295,",
+        "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"poll_interval_ms\":4294967295}}",
+    );
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.batch_size);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.parallelism);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.sources.items[0].batch_size);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), def.sources.items[0].ts_poll_interval_ms);
+}
+
+test "parser: partition range ending at u32 maximum does not overflow" {
+    const allocator = std.testing.allocator;
+    const text = rangeTestDef("", "{\"name\":\"s\",\"stream\":{\"name\":\"in\",\"partitions\":\"4294967294-4294967295\"}}");
+    var def = try parseJobDefinition(allocator, text);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), def.sources.items.len);
+    try std.testing.expectEqual(@as(u32, 4294967294), def.sources.items[0].partition);
+    try std.testing.expectEqual(@as(u32, 4294967295), def.sources.items[1].partition);
 }

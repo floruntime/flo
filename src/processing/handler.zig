@@ -796,12 +796,13 @@ pub const ProcessingHandler = struct {
         off += 8;
 
         // Embed the effective namespace so the applier does not depend on
-        // re-parsing quirks.
+        // re-parsing quirks. The namespace comes from the client's YAML, so
+        // bound it by the buffer before narrowing its length to the u16 prefix.
         const ns = job_namespace;
+        if (off + 2 + ns.len + yaml.len > value_buf.len) return error.PayloadTooLarge;
         const ns_len: u16 = @intCast(ns.len);
         std.mem.writeInt(u16, value_buf[off..][0..2], ns_len, .little);
         off += 2;
-        if (off + ns.len + yaml.len > value_buf.len) return error.PayloadTooLarge;
         @memcpy(value_buf[off .. off + ns.len], ns);
         off += ns.len;
         @memcpy(value_buf[off .. off + yaml.len], yaml);
