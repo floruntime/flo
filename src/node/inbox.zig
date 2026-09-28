@@ -1,8 +1,7 @@
 //! Inbox — MPSC lock-free ring buffer for cross-shard communication
 //!
-//! Each shard has exactly one Inbox. Any shard can push envelopes; only
-//! the owning shard drains them. This is the sole mechanism for cross-shard
-//! mutable communication — no shared state otherwise.
+//! Each shard's `Mailbox` holds two of these rings, for requests and for
+//! replies. Any shard can push envelopes; only the owning shard drains them.
 //!
 //! ## Design
 //!
@@ -20,45 +19,29 @@
 //! ──────  ─────          ────           ───────────
 //!  0      tag            Tag (u8)       message type
 //!  1      src_shard      u8             who sent it
-//!  2      partition_id   u16            target partition
+//!  2      partition_id   u16            unused
 //!  4      payload_len    u32            payload size for deallocation
-//!  8      sequence       u64            for response matching
-//! 16      payload_ptr    ?*anyopaque    slab-allocated payload (ownership transfers)
-//! 24      _padding       [8]u8          reserved / cache-line alignment
+//!  8      sequence       u64            forward_request: (conn_id << 32) | fd of the client
+//! 16      payload_ptr    ?*anyopaque    heap-allocated payload (ownership transfers)
+//! 24      _padding       [8]u8          reply slot u16, generation u32; rest spare
 //! ```
 //!
 //! The receiver shard frees the payload after processing.
 
 const std = @import("std");
-const stdx = @import("stdx");
 const assert = std.debug.assert;
 const Atomic = std.atomic.Value;
+const Wake = @import("mailbox.zig").Wake;
 
 /// Message tags for cross-shard communication
 pub const Tag = enum(u8) {
-    // ── Request / Response ──
-    forward_request, // request routed to this shard for execution
-    forward_response, // response from another shard back to connection owner
-    deferred_response, // blocking-read response resolved on a data shard,
-    // delivered to the connection-owning shard for the socket write
-
-    // ── Connection Lifecycle ──
-    connection_handoff, // Acceptor handing off a new connection
-    connection_migrate, // Connection migration between shards (v2)
-
-    // ── System ──
-    metadata_update, // Namespace/partition table changed
+    forward_request, // request routed to this shard for execution; names the reply slot
+    reply, // the answer to a request this shard sent, on its reply ring; names the slot
     shutdown, // Graceful shutdown signal
-
-    // ── Actions ──
-    action_invoke, // Cross-shard action invocation from workflow handler
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
-
-    // ── Workflows ──
-    stream_event, // A stream was appended to — wake stream-trigger polling
 };
 
-/// 32-byte compact envelope — payload is slab-allocated separately.
+/// 32-byte compact envelope — the payload is allocated separately.
 ///
 /// Field order is chosen for extern-struct alignment: no implicit padding,
 /// exactly 32 bytes on both 64-bit platforms.
@@ -67,12 +50,23 @@ pub const Message = extern struct {
     src_shard: u8 = 0, // u8  — offset 1
     partition_id: u16 = 0, // u16 — offset 2
     payload_len: u32 = 0, // u32 — offset 4  (payload size for dealloc)
-    sequence: u64 = 0, // u64 — offset 8  (request/response matching)
-    payload_ptr: ?*anyopaque = null, // ptr — offset 16 (slab-allocated)
+    sequence: u64 = 0, // u64 — offset 8
+    payload_ptr: ?*anyopaque = null, // ptr — offset 16
     _padding: [8]u8 = .{0} ** 8, // [8]u8 — offset 24
 
     comptime {
         assert(@sizeOf(Message) == 32);
+    }
+
+    /// The reply slot a request holds on its sender, or that an answer frees
+    /// (`ReplyPool`), kept in the first six spare bytes.
+    pub fn setReplySlot(self: *Message, slot: u16, gen: u32) void {
+        std.mem.writeInt(u16, self._padding[0..2], slot, .little);
+        std.mem.writeInt(u32, self._padding[2..6], gen, .little);
+    }
+
+    pub fn replySlot(self: Message) struct { slot: u16, gen: u32 } {
+        return .{ .slot = std.mem.readInt(u16, self._padding[0..2], .little), .gen = std.mem.readInt(u32, self._padding[2..6], .little) };
     }
 };
 
@@ -105,17 +99,9 @@ pub const Inbox = struct {
     /// Allocator used for slot buffer
     allocator: std.mem.Allocator,
 
-    /// Wake pipe (see `initWake`): a producer writes one byte when the
-    /// consumer said it was about to sleep, so a message is seen at once
-    /// rather than at the reactor's poll timeout. -1 until `initWake`.
-    wake_rd: std.posix.fd_t = -1,
-    wake_wr: std.posix.fd_t = -1,
-    /// Set by the consumer before it sleeps; cleared when it wakes, or by
-    /// the producer that wakes it. With `commit_tail`, the two sides'
-    /// store-then-load pairs are all sequentially consistent, so either the
-    /// consumer sees the message before sleeping or the producer sees `idle`
-    /// and writes the pipe — never neither, on any CPU's memory ordering.
-    idle: Atomic(bool) = Atomic(bool).init(false),
+    /// Written to when a send finds the consumer asleep; shared with the
+    /// consumer's other rings (see `Mailbox`). Null in rings no one sleeps on.
+    wake: ?*Wake = null,
 
     /// Initialize an Inbox with the given capacity (rounded up to power of 2, min 16).
     pub fn init(allocator: std.mem.Allocator, requested_capacity: usize) !Inbox {
@@ -142,46 +128,9 @@ pub const Inbox = struct {
         };
     }
 
-    /// Release the slot buffer and the wake pipe.
+    /// Release the slot buffer.
     pub fn deinit(self: *Inbox) void {
         self.allocator.free(self.slots);
-        if (self.wake_rd >= 0) _ = std.c.close(self.wake_rd);
-        if (self.wake_wr >= 0) _ = std.c.close(self.wake_wr);
-        self.wake_rd = -1;
-        self.wake_wr = -1;
-    }
-
-    /// Create the wake pipe; its read end is the consumer's reactor source.
-    pub fn initWake(self: *Inbox) !void {
-        const fds = try stdx.io.pipe();
-        errdefer {
-            _ = std.c.close(fds[0]);
-            _ = std.c.close(fds[1]);
-        }
-        try stdx.net.sysFcntlSetNonblocking(fds[0]);
-        try stdx.net.sysFcntlSetNonblocking(fds[1]);
-        self.wake_rd = fds[0];
-        self.wake_wr = fds[1];
-    }
-
-    /// Consumer, before blocking: announce the sleep, then look again.
-    /// False means a message arrived in between — do not block.
-    pub fn prepareSleep(self: *Inbox) bool {
-        self.idle.store(true, .seq_cst);
-        if (self.commit_tail.load(.seq_cst) != self.read_tail) {
-            self.idle.store(false, .seq_cst);
-            return false;
-        }
-        return true;
-    }
-
-    /// Consumer, after the reactor returns: stop announcing the sleep and
-    /// empty the pipe.
-    pub fn woke(self: *Inbox) void {
-        self.idle.store(false, .seq_cst);
-        if (self.wake_rd < 0) return;
-        var buf: [64]u8 = undefined;
-        while (std.c.read(self.wake_rd, &buf, buf.len) > 0) {}
     }
 
     /// Non-blocking send. Returns true on success, false if ring is full (backpressure).
@@ -211,13 +160,7 @@ pub const Inbox = struct {
                 std.atomic.spinLoopHint();
             }
             self.commit_tail.store(head +% 1, .seq_cst);
-
-            // Only the producer that finds the consumer asleep writes: a
-            // busy consumer costs a load, never a syscall.
-            if (self.wake_wr >= 0 and self.idle.load(.seq_cst) and self.idle.swap(false, .seq_cst)) {
-                const byte = [_]u8{1};
-                _ = std.c.write(self.wake_wr, &byte, 1);
-            }
+            if (self.wake) |w| w.ring();
             return true;
         }
     }
@@ -239,6 +182,11 @@ pub const Inbox = struct {
         // Advance consumer cursor (single writer — plain atomic store)
         @atomicStore(usize, &self.read_tail, tail +% count, .release);
         return count;
+    }
+
+    /// Unread messages, read as the consumer's half of the wake handshake.
+    pub fn pendingSeqCst(self: *const Inbox) usize {
+        return self.commit_tail.load(.seq_cst) -% self.read_tail;
     }
 
     /// Returns the number of unread messages.
@@ -313,7 +261,7 @@ test "Inbox: full-ring backpressure" {
     try std.testing.expectEqual(@as(usize, 8), drained);
 
     // Now there's room again
-    const ok2 = inbox.send(makeMsg(.forward_response, 1, 100));
+    const ok2 = inbox.send(makeMsg(.reply, 1, 100));
     try std.testing.expect(ok2);
 }
 
@@ -365,7 +313,7 @@ test "Inbox: drain partial batch" {
     defer inbox.deinit();
 
     for (0..20) |i| {
-        _ = inbox.send(makeMsg(.metadata_update, 0, @intCast(i)));
+        _ = inbox.send(makeMsg(.shutdown, 0, @intCast(i)));
     }
 
     // Small batch
@@ -388,82 +336,4 @@ test "Inbox: empty drain returns zero" {
 
     var batch: [16]Message = undefined;
     try std.testing.expectEqual(@as(usize, 0), inbox.drain(&batch));
-}
-
-fn wakeReadable(fd: std.posix.fd_t, timeout_ms: i32) bool {
-    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-    const ready = std.posix.poll(&fds, timeout_ms) catch return false;
-    return ready > 0;
-}
-
-test "Inbox: a send wakes a consumer that said it would sleep, and only then" {
-    var inbox = try Inbox.init(std.testing.allocator, 16);
-    defer inbox.deinit();
-    try inbox.initWake();
-
-    // Awake consumer: no syscall, no byte.
-    try std.testing.expect(inbox.send(makeMsg(.forward_request, 0, 1)));
-    try std.testing.expect(!wakeReadable(inbox.wake_rd, 0));
-    // A message already waiting: the consumer must not sleep.
-    try std.testing.expect(!inbox.prepareSleep());
-    var batch: [16]Message = undefined;
-    _ = inbox.drain(&batch);
-
-    // Empty and about to sleep: the next send writes the pipe once.
-    try std.testing.expect(inbox.prepareSleep());
-    try std.testing.expect(inbox.send(makeMsg(.forward_request, 0, 2)));
-    try std.testing.expect(inbox.send(makeMsg(.forward_request, 0, 3)));
-    try std.testing.expect(wakeReadable(inbox.wake_rd, 0));
-    var bytes: [8]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 1), std.c.read(inbox.wake_rd, &bytes, bytes.len));
-    inbox.woke();
-    try std.testing.expect(!wakeReadable(inbox.wake_rd, 0));
-    // Awake again: a send costs no syscall.
-    try std.testing.expect(inbox.send(makeMsg(.forward_request, 0, 4)));
-    try std.testing.expect(!wakeReadable(inbox.wake_rd, 0));
-
-    // Woken by something else (a timeout, a socket) with nothing sent: the
-    // consumer is awake, so the next send still costs no syscall.
-    _ = inbox.drain(&batch);
-    try std.testing.expect(inbox.prepareSleep());
-    inbox.woke();
-    try std.testing.expect(inbox.send(makeMsg(.forward_request, 0, 5)));
-    try std.testing.expect(!wakeReadable(inbox.wake_rd, 0));
-}
-
-test "Inbox: a message sent while the consumer goes to sleep is never slept through" {
-    var inbox = try Inbox.init(std.testing.allocator, 1024);
-    defer inbox.deinit();
-    try inbox.initWake();
-
-    const Producer = struct {
-        fn run(ib: *Inbox, n: usize) void {
-            var i: usize = 0;
-            while (i < n) {
-                if (ib.send(makeMsg(.forward_request, 0, i))) i += 1;
-                var spin: usize = i % 97;
-                while (spin > 0) : (spin -= 1) std.atomic.spinLoopHint();
-            }
-        }
-    };
-    const N: usize = 20_000;
-    const t = try std.Thread.spawn(.{}, Producer.run, .{ &inbox, N });
-    var got: usize = 0;
-    var batch: [64]Message = undefined;
-    while (got < N) {
-        if (inbox.prepareSleep()) {
-            // Asleep with nothing seen: a message that arrives now must
-            // write the pipe. A lost wakeup would sleep the full second.
-            if (inbox.pending() > 0) try std.testing.expect(wakeReadable(inbox.wake_rd, 1000));
-            _ = wakeReadable(inbox.wake_rd, 1);
-        }
-        inbox.woke();
-        while (true) {
-            const n = inbox.drain(&batch);
-            if (n == 0) break;
-            got += n;
-        }
-    }
-    t.join();
-    try std.testing.expectEqual(N, got);
 }

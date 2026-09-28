@@ -24,7 +24,7 @@ const log = @import("stdx").log;
 const shard_mod = @import("shard.zig");
 const Shard = shard_mod.Shard;
 const Acceptor = @import("acceptor.zig").Acceptor;
-const Inbox = @import("inbox.zig").Inbox;
+const Mailbox = @import("mailbox.zig").Mailbox;
 const InboxMessage = @import("inbox.zig").Message;
 const proto = @import("../protocol/proto.zig");
 const server_config = @import("../config/server.zig");
@@ -214,8 +214,8 @@ pub const Runtime = struct {
     /// Cross-shard stream handler array — allocated during wirePeerStreamHandlers, freed on deinit.
     peer_stream_handlers_slice: ?[]const *StreamHandler,
 
-    /// Cross-shard inbox array — allocated during wirePeerInboxes, freed on deinit.
-    peer_inboxes_slice: ?[]*Inbox,
+    /// Every shard's mailbox — allocated during wirePeerMailboxes, freed on deinit.
+    peer_mailboxes_slice: ?[]*Mailbox,
 
     /// Cross-shard KV handler array — allocated during wirePeerKvHandlers, freed on deinit.
     peer_kv_handlers_slice: ?[]const *KVHandler,
@@ -259,7 +259,7 @@ pub const Runtime = struct {
             .peer_kv_handlers_slice = null,
             .peer_ts_handlers_slice = null,
             .peer_queue_handlers_slice = null,
-            .peer_inboxes_slice = null,
+            .peer_mailboxes_slice = null,
             .peer_shards_slice = null,
         };
     }
@@ -346,10 +346,9 @@ pub const Runtime = struct {
             self.peer_queue_handlers_slice = null;
         }
 
-        // Clean up peer inbox array
-        if (self.peer_inboxes_slice) |s| {
+        if (self.peer_mailboxes_slice) |s| {
             self.allocator.free(s);
-            self.peer_inboxes_slice = null;
+            self.peer_mailboxes_slice = null;
         }
 
         // Clean up peer shards array
@@ -560,8 +559,8 @@ pub const Runtime = struct {
         try self.wirePeerTsHandlers(shards);
         try self.wirePeerQueueHandlers(shards);
 
-        // 2.56 Wire cross-shard inbox references for inbox messaging.
-        try self.wirePeerInboxes(shards);
+        // 2.56 Give every shard every shard's mailbox.
+        try self.wirePeerMailboxes(shards);
 
         // 2.57 Wire cross-shard shard pointers for pre-route forwarding.
         try self.wirePeerShards(shards);
@@ -829,17 +828,16 @@ pub const Runtime = struct {
         }
     }
 
-    /// Wire cross-shard inbox references so shards can send messages to
-    /// other shards' inboxes (e.g., action_invoke notifications).
-    fn wirePeerInboxes(self: *Runtime, shards: []Shard) !void {
+    /// Give every shard every shard's mailbox (requests, replies and wakes).
+    fn wirePeerMailboxes(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
-        const inboxes = try self.allocator.alloc(*Inbox, n);
+        const mailboxes = try self.allocator.alloc(*Mailbox, n);
         for (0..n) |i| {
-            inboxes[i] = &shards[i].inbox;
+            mailboxes[i] = shards[i].mailbox;
         }
-        self.peer_inboxes_slice = inboxes;
+        self.peer_mailboxes_slice = mailboxes;
         for (0..n) |i| {
-            shards[i].peer_inboxes = inboxes;
+            shards[i].peer_mailboxes = mailboxes;
         }
     }
 
@@ -989,7 +987,7 @@ pub const Runtime = struct {
         // 3. Send shutdown to each shard
         if (self.shards) |shards| {
             for (shards) |*shard| {
-                _ = shard.inbox.send(.{
+                _ = shard.mailbox.inbox.send(.{
                     .tag = .shutdown,
                     .src_shard = 0xFF, // from runtime
                     .partition_id = 0,

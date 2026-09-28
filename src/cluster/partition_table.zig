@@ -9,10 +9,6 @@
 //!   - Computing an initial assignment when a namespace is created
 //!   - Reassigning partitions during rebalancing
 //!
-//! Each shard caches a read-only copy of the table. When the Controller
-//! commits an assignment change, it broadcasts a `metadata_update` inbox
-//! message to invalidate local caches.
-//!
 //! Wire format: The table is serialized for snapshot transfer and
 //! Controller Raft log entries.
 

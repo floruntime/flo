@@ -2957,7 +2957,7 @@ test "e2e/workflow: steps.outcome resolves in input mapping" {
 // initial (last_poll_ms=0) poll elapse BEFORE appending — so the only thing that
 // can fire a run within the assert window is the stream-append notification path.
 // Multi-shard so the trigger and the stream's data are (usually) on different
-// shards, exercising the cross-shard `stream_event` broadcast.
+// shards, exercising the cross-shard `stream_appended` wake flag.
 test "e2e/workflow: stream trigger fires promptly via push-wake" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .shards = 4 },

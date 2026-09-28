@@ -35,7 +35,11 @@ const reactor_mod = @import("reactor.zig");
 const Reactor = reactor_mod.Reactor;
 const ReactorEvent = reactor_mod.Event;
 const Tag = reactor_mod.Tag;
-const Inbox = @import("inbox.zig").Inbox;
+const mailbox_mod = @import("mailbox.zig");
+const Mailbox = mailbox_mod.Mailbox;
+const ReplyTo = @import("reply_to.zig").ReplyTo;
+const reply_pool_mod = @import("reply_pool.zig");
+const ReplyPool = reply_pool_mod.ReplyPool;
 const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -102,10 +106,7 @@ const ReplayRegistry = persistence_mod.ReplayRegistry;
 const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
-const Forwarder = @import("../cluster/forwarder.zig").Forwarder;
-const PartitionTable = @import("../cluster/partition_table.zig").PartitionTable;
 const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
-const NodeId = @import("../raft/node.zig").NodeId;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
@@ -129,8 +130,24 @@ pub const Shard = struct {
     /// Unified event loop.
     reactor: Reactor,
 
-    /// Cross-shard message inbox.
-    inbox: Inbox,
+    /// What other shards put in front of this one: requests, replies and
+    /// wakes (heap-allocated so peers can hold its address).
+    mailbox: *Mailbox,
+    /// A slot per client request forwarded to another shard, until its
+    /// answer comes back or `expireReplySlots` takes it back.
+    reply_pool: ReplyPool,
+    /// Answers dropped for want of a reply slot or of room on the asker's
+    /// reply ring. Both are reserved before every request, so a count means
+    /// an answer came twice or long after its slot expired.
+    replies_dropped: u64 = 0,
+    /// Client requests refused before reaching another shard, and when that
+    /// was last said; when unanswered slots are next swept.
+    forwards_refused: u64 = 0,
+    refuse_warn_ms: u64 = 0,
+    reply_sweep_ms: u64 = 0,
+    /// Unanswered requests given up on since that was last said, and when.
+    slots_expired: u64 = 0,
+    expire_warn_ms: u64 = 0,
 
     /// Opcode → handler routing table.
     dispatcher: Dispatcher,
@@ -294,28 +311,22 @@ pub const Shard = struct {
     /// Maximum age of entries in the hot ring (seconds). 0 = disabled.
     hot_flush_seconds: u64,
 
-    /// Cross-node request forwarder (null in single-node mode).
-    forwarder: ?*Forwarder,
-
     /// Cross-shard shard pointer array (null until wired by runtime).
     /// Enables direct dispatch on another shard's handlers for pre-routed requests.
     peer_shards: ?[]*Shard,
 
-    /// Cross-shard inbox array (null until wired by runtime).
-    /// Enables sending messages to other shards' inboxes.
-    peer_inboxes: ?[]*Inbox,
+    /// Every shard's mailbox, this one's included (null until wired by
+    /// runtime).
+    peer_mailboxes: ?[]*Mailbox,
 
     /// Per-shard proxy Connection used to drive forwarded requests on this
     /// shard's reactor thread. The real Connection lives on the owner shard;
-    /// this proxy carries (fd, conn_id, owner_shard) so handlers register
-    /// waiters with the correct routing target, and accumulates direct
-    /// responses in its `write_buf` for cross-shard delivery via the inbox.
+    /// this proxy carries the requester's address (`Connection.proxy_for`) so
+    /// handlers register waiters with the correct routing target, and accumulates direct
+    /// responses in its `write_buf` for delivery on the asker's reply ring.
     /// Reused sequentially — safe because each shard's reactor is single-
     /// threaded and `drainInbox` processes one message at a time.
     forward_proxy: *Connection,
-
-    /// Cluster partition table (null in single-node mode).
-    partition_table: ?*PartitionTable,
 
     /// Controller Raft coordinator (set on Shard 0 — routes namespace
     /// create/delete through Raft for multi-node consistency).
@@ -387,12 +398,13 @@ pub const Shard = struct {
         var slab = try SlabAllocator.init(allocator);
         errdefer slab.deinit();
 
-        var inbox = try Inbox.init(allocator, 1024);
-        errdefer inbox.deinit();
         // Without its wake a shard sees another's message only at its poll
         // timeout; a shard that cannot have one does not start.
-        try inbox.initWake();
-        try reactor.addSource(.{ .fd = inbox.wake_rd, .tag = .inbox_ready, .interests = .{ .readable = true } });
+        var reply_pool = try ReplyPool.init(allocator, ReplyPool.slotsFor(shard_count), shard_count);
+        errdefer reply_pool.deinit(allocator);
+        const mailbox = try Mailbox.create(allocator, 1024, reply_pool.ringCapacity());
+        errdefer mailbox.destroy(allocator);
+        try reactor.addSource(.{ .fd = mailbox.wake.rd, .tag = .inbox_ready, .interests = .{ .readable = true } });
 
         // Forward-proxy Connection: drives requests forwarded from peer
         // shards. fd=-1 means "no kernel socket" — handlers only touch
@@ -697,7 +709,8 @@ pub const Shard = struct {
             .id = shard_id,
             .allocator = allocator,
             .reactor = reactor,
-            .inbox = inbox,
+            .mailbox = mailbox,
+            .reply_pool = reply_pool,
             .dispatcher = dispatcher,
             .connections = .{},
             .router = Router.init(partition_count, shard_count, shard_id),
@@ -760,11 +773,9 @@ pub const Shard = struct {
             .waiter_pool = WaiterPool.init(),
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
-            .forwarder = null,
             .peer_shards = null,
-            .peer_inboxes = null,
+            .peer_mailboxes = null,
             .forward_proxy = forward_proxy,
-            .partition_table = null,
             .coordinator = null,
             .replay_registry = replay_registry,
             .apply_buf = apply_buf,
@@ -778,16 +789,6 @@ pub const Shard = struct {
     }
 
     // ─── Cluster wiring ──────────────────────────────────────────────────
-
-    /// Wire a cross-node forwarder (enables cluster mode forwarding).
-    pub fn setForwarder(self: *Shard, fwd: *Forwarder) void {
-        self.forwarder = fwd;
-    }
-
-    /// Wire a cluster partition table (enables cluster-aware routing).
-    pub fn setPartitionTable(self: *Shard, pt: *PartitionTable) void {
-        self.partition_table = pt;
-    }
 
     /// Wire the Controller Raft coordinator (enables Raft-replicated namespace ops).
     /// Should only be called on Shard 0.
@@ -849,8 +850,8 @@ pub const Shard = struct {
     }
 
     fn inboxPending(ctx: *const anyopaque) u64 {
-        const inbox: *const Inbox = @ptrCast(@alignCast(ctx));
-        return inbox.pending();
+        const mailbox: *const Mailbox = @ptrCast(@alignCast(ctx));
+        return mailbox.inbox.pending();
     }
 
     /// Wire the global MetricsRegistry into this shard and its handlers.
@@ -862,7 +863,7 @@ pub const Shard = struct {
         // it every `flo_shard_*` series exports 0 while the global `flo_*`
         // equivalents move, which reads as "this shard is idle".
         self.shard_metrics = registry.shardMetrics(self.id);
-        if (self.shard_metrics) |sm| sm.live_pending = .{ .ctx = &self.inbox, .read = inboxPending };
+        if (self.shard_metrics) |sm| sm.live_pending = .{ .ctx = self.mailbox, .read = inboxPending };
         self.stream_handler.metrics_registry = registry;
         // Tier-hit counters are per log; resolve once so the read path avoids a
         // registry lookup per record. Also the only caller of registerTieredLog,
@@ -952,7 +953,8 @@ pub const Shard = struct {
         self.forward_proxy.deinit();
         self.allocator.destroy(self.forward_proxy);
 
-        self.inbox.deinit();
+        self.mailbox.destroy(self.allocator);
+        self.reply_pool.deinit(self.allocator);
         self.slab.deinit();
         self.reactor.deinit();
     }
@@ -1116,7 +1118,6 @@ pub const Shard = struct {
         switch (self.resolveTarget(op, req)) {
             .local => self.dispatchLocal(conn, req),
             .shard => |s| self.forwardToShard(s.shard_id, conn, req),
-            .remote => |r| self.forwardToRemote(conn, req, r.node_id),
         }
         // Apply what committed during the request: on a single node, what
         // its handler proposed on its own account (a dequeue's ack, an
@@ -1134,7 +1135,7 @@ pub const Shard = struct {
                 self.sendErrorResponse(conn, req.header.request_id, .unavailable, DIVERGED_MESSAGE);
                 return;
             }
-            if (conn.owner_shard == REMOTE_OWNER) {
+            if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
                 self.sendErrorResponse(conn, req.header.request_id, .unavailable, "unavailable: electing a leader — retry");
@@ -1146,54 +1147,12 @@ pub const Shard = struct {
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
     }
 
-    /// Pure routing decision: pre-route → partition table (cluster) or
-    /// local shard mapping (single-node). No side effects.
+    /// Pure routing decision: pre-route → the shard that owns the key. No
+    /// side effects.
     fn resolveTarget(self: *Shard, op: u16, req: proto.Request) node_router.RouteTarget {
         if (op >= proto.MAX_OPCODES) return .{ .local = .{ .partition_id = 0 } };
         const hash = if (self.dispatcher.pre_route[op]) |f| f(req) orelse return .{ .local = .{ .partition_id = 0 } } else return .{ .local = .{ .partition_id = 0 } };
-
-        if (self.partition_table) |pt| {
-            const ns_hash = node_router.namespaceHash(req.namespace);
-            return self.router.routeCluster(hash, ns_hash, pt);
-        }
         return self.router.route(hash);
-    }
-
-    /// Forward a request to a remote node via the cluster forwarder.
-    fn forwardToRemote(self: *Shard, conn: *Connection, req: proto.Request, node_id: NodeId) void {
-        const fwd = self.forwarder orelse {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "no forwarder configured");
-            return;
-        };
-        const now_ms = @import("stdx").time.milliTimestamp();
-        const result = fwd.forward(
-            node_id,
-            req.header.request_id,
-            @as(u64, conn.id),
-            req.header.payload_length,
-            now_ms,
-        ) catch {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "forward failed");
-            return;
-        };
-        switch (result) {
-            .queued => {
-                log.debug("Forwarded request {d} to node {d}", .{ req.header.request_id, node_id });
-            },
-            .no_route => {
-                self.sendErrorResponse(conn, req.header.request_id, .internal_error, "no route to node");
-            },
-            .overloaded => {
-                self.sendErrorResponse(conn, req.header.request_id, .overloaded, "forward queue full");
-            },
-            .circuit_open => {
-                self.sendErrorResponse(conn, req.header.request_id, .overloaded, "node circuit breaker open");
-            },
-            .local => {
-                // Shouldn't happen — routeCluster already checked. Dispatch locally.
-                self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
-            },
-        }
     }
 
     /// Allocate and re-serialize a parsed Request back to wire bytes so it
@@ -1243,11 +1202,13 @@ pub const Shard = struct {
     /// The target shard re-parses and dispatches the request on its own
     /// reactor thread (its handlers' state is therefore only ever touched by
     /// one thread). The response — direct bytes or a deferred blocking-read
-    /// completion — is shipped back to the owner shard via `deferred_response`
-    /// and written to the client there. See `runForwardedRequest`.
+    /// completion — comes back on this shard's reply ring naming the reply
+    /// slot taken here first, and is written to the client. See
+    /// `runForwardedRequest` and `deliverReply`.
     ///
-    /// If the target inbox is full, falls back to an `overloaded` error so
-    /// the client retries instead of hanging.
+    /// When every reply slot is taken, or the target's inbox is full, the
+    /// client is answered `overloaded` — the request did not run — and
+    /// retries instead of hanging.
     fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request) void {
         const peers = self.peer_shards orelse {
             // No peer shards wired — fall back to local dispatch
@@ -1263,38 +1224,76 @@ pub const Shard = struct {
             self.dispatchLocal(conn, req);
             return;
         }
-        const target = peers[target_shard_id];
+        const target = (self.peer_mailboxes orelse return self.dispatchLocal(conn, req))[target_shard_id];
+
+        // Room for the answer first: nothing is copied for a request that
+        // cannot be sent.
+        // A read that may wait on purpose is not a slow answer while it waits.
+        const blocking = req.getBlockMs() != null or req.getWaitMs() != null or req.header.op_code == @intFromEnum(proto.OpCode.action_await);
+        const ticket = self.reply_pool.take(target_shard_id, conn.fd, conn.id, req.header.request_id, nowMs(), blocking) catch |err|
+            return self.refuseForward(conn, req, target_shard_id, switch (err) {
+                error.TargetBusy => .target_busy,
+                error.PoolFull => .pool_full,
+            });
 
         // Serialize request (header + recomposed payload) onto the heap so the
         // target shard can re-parse it after the source buffer is gone.
         const buf = serializeRequest(self.allocator, req) catch {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "forward alloc failed");
+            _ = self.reply_pool.release(ticket, target_shard_id);
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "internal error: out of memory forwarding the request — retry");
             return;
         };
 
-        // Pack (conn_id << 32) | fd into sequence so the target/owner can
-        // verify the connection's generation before writing a response.
+        // Pack (conn_id << 32) | fd into sequence: the target shard runs the
+        // request on a proxy with this identity (`loadProxy`).
         const fd_bits: u64 = @as(u32, @bitCast(conn.fd));
         const seq: u64 = (@as(u64, conn.id) << 32) | fd_bits;
-
-        const ok = target.inbox.send(.{
+        var msg: InboxMessage = .{
             .tag = .forward_request,
             .src_shard = @intCast(self.id),
             .payload_len = @intCast(buf.len),
             .sequence = seq,
             .payload_ptr = buf.ptr,
-        });
-        if (!ok) {
+        };
+        msg.setReplySlot(ticket.slot, ticket.gen);
+        if (!target.inbox.send(msg)) {
             self.allocator.free(buf);
-            self.sendErrorResponse(conn, req.header.request_id, .overloaded, "forward inbox full");
-            return;
+            _ = self.reply_pool.release(ticket, target_shard_id);
+            return self.refuseForward(conn, req, target_shard_id, .inbox_full);
         }
+        if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
 
-        // The response will arrive asynchronously via the inbox. Suppress
-        // the "not implemented" guard in processRequests so the connection
-        // waits for the cross-shard reply rather than getting a stub error.
+        // The answer arrives on this shard's reply ring. Suppress the "not
+        // implemented" guard in processRequests so the connection waits for
+        // it rather than getting a stub error.
         conn.recordForward();
         conn.response_deferred = true;
+    }
+
+    const ForwardRefusal = enum { target_busy, pool_full, inbox_full };
+
+    /// A client's request refused before it was sent to `target`: answered
+    /// `overloaded` (it did not run, so resending is safe), counted, and
+    /// said once per interval.
+    fn refuseForward(self: *Shard, conn: *Connection, req: proto.Request, target: u16, why: ForwardRefusal) void {
+        if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.client_forward);
+        var msg_buf: [128]u8 = undefined;
+        const message = switch (why) {
+            .target_busy => std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} is not keeping up; this request was not run — back off and retry", .{target}),
+            .inbox_full => std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} is behind on taking requests; this request was not run — back off and retry", .{target}),
+            .pool_full => std.fmt.bufPrint(&msg_buf, "overloaded: too many requests in flight to other shards; this request was not run — back off and retry", .{}),
+        } catch "overloaded: this request was not run — back off and retry";
+        self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
+        self.forwards_refused += 1;
+        const now = nowMs();
+        if (now -| self.refuse_warn_ms < WARN_INTERVAL_MS) return;
+        self.refuse_warn_ms = now;
+        const reason = switch (why) {
+            .target_busy => "it holds its full share of this shard's reply slots",
+            .inbox_full => "its inbox is full",
+            .pool_full => "every reply slot is taken",
+        };
+        log.warn("shard {d}: refusing client requests for shard {d}: {s} ({d} refused so far; {d} in flight to other shards, {d} of them to shard {d})", .{ self.id, target, reason, self.forwards_refused, self.reply_pool.taken(), self.reply_pool.heldBy(target), target });
     }
 
     // ─── Cross-Shard Walk ────────────────────────────────────────────────
@@ -1391,23 +1390,35 @@ pub const Shard = struct {
 
     // ─── Inbox draining ──────────────────────────────────────────────────
 
-    /// Drain pending inbox messages (called each reactor tick), at most one
-    /// ring's worth: a flood of messages must not starve the shard's I/O and
-    /// Raft heartbeats. What is left keeps the next tick from sleeping
-    /// (`Inbox.prepareSleep`).
+    /// Take the mailbox (called each reactor tick): the wakes, every reply,
+    /// then at most one inbox's worth of requests — a flood of requests must
+    /// not starve the shard's I/O and Raft heartbeats. What is left keeps the
+    /// next tick from sleeping (`Mailbox.prepareSleep`). Replies go first and
+    /// in full: each was reserved before its request was sent, so the ring
+    /// holds no more than this shard asked for.
     pub fn drainInbox(self: *Shard) usize {
-        var buf: [64]InboxMessage = undefined;
-        var total: usize = 0;
+        const flags = self.mailbox.wake.take();
+        if (flags & mailbox_mod.Flag.stream_appended.bit() != 0) self.workflow_handler.triggers_dirty = true;
+        if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self));
 
-        while (total < self.inbox.capacity) {
-            const count = self.inbox.drain(buf[0..@min(buf.len, self.inbox.capacity - total)]);
+        var buf: [64]InboxMessage = undefined;
+        while (true) {
+            const count = self.mailbox.replies.drain(&buf);
+            if (count == 0) break;
+            for (buf[0..count]) |msg| self.handleInboxMessage(msg);
+        }
+
+        const inbox = &self.mailbox.inbox;
+        var total: usize = 0;
+        while (total < inbox.capacity) {
+            const count = inbox.drain(buf[0..@min(buf.len, inbox.capacity - total)]);
             if (count == 0) break;
             for (buf[0..count]) |msg| {
                 self.handleInboxMessage(msg);
                 total += 1;
             }
         }
-        const left = self.inbox.pending();
+        const left = inbox.pending();
 
         self.inbox_messages_processed += total;
         if (self.shard_metrics) |sm| {
@@ -1420,33 +1431,29 @@ pub const Shard = struct {
     fn handleInboxMessage(self: *Shard, msg: InboxMessage) void {
         switch (msg.tag) {
             .shutdown => self.running = false,
-            .action_invoke => self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self)),
             .action_start => self.startActionRun(msg),
-            .stream_event => self.workflow_handler.triggers_dirty = true,
-            .deferred_response => self.deliverInboundResponse(msg),
+            .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
-            else => {},
         }
     }
 
     /// Push-wake stream triggers after a stream append. The trigger for a stream
     /// lives on the workflow-definition's shard, which is usually NOT the shard
     /// that owns the stream's data — so we mark the local handler dirty (covers
-    /// the co-located case) and broadcast a `stream_event` to all peers, whose
-    /// next tick force-polls their triggers. No-op when no trigger exists on the
-    /// node, so streams that nobody watches incur zero cross-shard chatter.
+    /// the co-located case) and set every peer's `stream_appended` flag, whose
+    /// next tick force-polls its triggers. A flag, not a message: a burst of
+    /// appends is one wake, and it can never fill an inbox. No-op when no
+    /// trigger exists on the node, so streams that nobody watches incur zero
+    /// cross-shard chatter.
     pub fn notifyStreamTriggers(self: *Shard) void {
         if (!WorkflowHandler.anyStreamTriggers()) return;
 
         self.workflow_handler.triggers_dirty = true;
 
-        if (self.peer_inboxes) |inboxes| {
-            for (inboxes, 0..) |inbox, i| {
+        if (self.peer_mailboxes) |mailboxes| {
+            for (mailboxes, 0..) |mb, i| {
                 if (i == self.id) continue;
-                _ = inbox.send(.{
-                    .tag = .stream_event,
-                    .src_shard = @intCast(self.id),
-                });
+                mb.wake.set(.stream_appended);
             }
         }
     }
@@ -1471,8 +1478,8 @@ pub const Shard = struct {
     /// reactor thread — so per-shard handler state is only ever touched by
     /// the owning thread. Direct responses queued onto the proxy's write_buf
     /// are then shipped back to the owner via `deliverDeferred`. Waiter-based
-    /// (blocking) responses already use the owner_shard/fd/conn_id captured
-    /// at registration time and round-trip through `deliverDeferred`.
+    /// (blocking) responses use the address captured at registration time
+    /// and round-trip through `deliverDeferred`.
     fn runForwardedRequest(self: *Shard, msg: InboxMessage) void {
         const ptr = msg.payload_ptr orelse return;
         const data: [*]u8 = @ptrCast(ptr);
@@ -1482,7 +1489,8 @@ pub const Shard = struct {
         const bytes = data[0..msg.payload_len];
         const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
         const conn_id: u32 = @truncate(msg.sequence >> 32);
-        const owner_shard: u16 = msg.src_shard;
+        const held = msg.replySlot();
+        const reply_to: ReplyTo = .{ .socket = .{ .shard = msg.src_shard, .fd = fd, .conn_id = conn_id, .slot = held.slot, .gen = held.gen } };
 
         // A forwarded request that fails to parse is still answered: its
         // client is waiting on it.
@@ -1492,23 +1500,13 @@ pub const Shard = struct {
             // The owning shard parsed it before forwarding, so the fault is
             // the server's, not the client's.
             const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: another shard could not read this request", &err_buf) catch return;
-            self.deliverDeferred(owner_shard, fd, conn_id, serialized);
+            self.deliverDeferred(reply_to, serialized);
             return;
         };
 
-        // Reset the proxy for this dispatch. fd stays the *original* fd —
-        // it's not registered on this shard, but handlers only read it for
-        // waiter registration metadata, which is correct.
         const proxy = self.forward_proxy;
-        proxy.fd = fd;
-        proxy.id = conn_id;
-        proxy.owner_shard = owner_shard;
+        loadProxy(proxy, reply_to);
         proxy.protocol = .binary;
-        proxy.state = .active;
-        proxy.response_deferred = false;
-        proxy.write_buf.read_pos = 0;
-        proxy.write_buf.write_pos = 0;
-        proxy.write_overflow = false;
 
         proxy.recordRequest();
         self.dispatchLocal(proxy, req);
@@ -1523,13 +1521,36 @@ pub const Shard = struct {
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
-            self.deliverDeferred(owner_shard, fd, conn_id, answer.bytes());
+            self.deliverDeferred(reply_to, answer.bytes());
         } else if (!proxy.response_deferred) {
             // Handler produced nothing — report not_implemented like the
             // owner-side processRequests would.
             const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
-            self.deliverDeferred(owner_shard, fd, conn_id, serialized);
+            self.deliverDeferred(reply_to, serialized);
         }
+    }
+
+    /// Ready a proxy to run a request whose answer goes to `reply_to`. The
+    /// proxy also takes the requester's fd and generation as its own, so
+    /// per-connection state kept by id (a KV transaction's owner) belongs to
+    /// that requester.
+    fn loadProxy(proxy: *Connection, reply_to: ReplyTo) void {
+        proxy.proxy_for = reply_to;
+        switch (reply_to) {
+            .socket => |s| {
+                proxy.fd = s.fd;
+                proxy.id = s.conn_id;
+            },
+            .remote => |r| {
+                proxy.fd = @bitCast(r.forward_id);
+                proxy.id = r.node;
+            },
+        }
+        proxy.state = .active;
+        proxy.response_deferred = false;
+        proxy.write_buf.read_pos = 0;
+        proxy.write_buf.write_pos = 0;
+        proxy.write_overflow = false;
     }
 
     /// An answer a handler queued on a proxy connection, taken whole — a cut
@@ -1570,26 +1591,66 @@ pub const Shard = struct {
         return .{ .owned = answer };
     }
 
-    /// Write a deferred blocking-read response that was resolved on another
-    /// (data) shard. Runs on this shard's thread — this shard owns the
-    /// connection — so the socket write is single-threaded as required.
-    ///
-    /// `msg.sequence` is packed `(conn_id << 32) | fd`. The conn_id check
-    /// guards against fd reuse: if the original connection has closed and the
-    /// fd was reassigned to a new connection, drop the response instead of
-    /// delivering it to the wrong client.
-    fn deliverInboundResponse(self: *Shard, msg: InboxMessage) void {
-        const ptr = msg.payload_ptr orelse return;
-        const data: [*]u8 = @ptrCast(ptr);
-        defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
-        if (msg.payload_len == 0) return;
+    /// The answer to a request this shard's client sent another shard. It
+    /// frees the slot it names; one that is not the slot's current answer (a
+    /// second answer, one for a slot reused since, or one from a shard it was
+    /// not asked of) is dropped, so a client never hears twice about one
+    /// request. An answer with no bytes is the other shard saying it could
+    /// not send one. The connection's generation guards fd reuse: a client
+    /// gone since hears nothing.
+    fn deliverReply(self: *Shard, msg: InboxMessage) void {
+        const bytes: []u8 = if (msg.payload_ptr) |p| @as([*]u8, @ptrCast(p))[0..msg.payload_len] else &.{};
+        defer if (bytes.len > 0) self.allocator.free(bytes);
+        const held = msg.replySlot();
+        const slot = self.reply_pool.release(.{ .slot = held.slot, .gen = held.gen }, msg.src_shard) orelse return;
+        if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
+        const conn = self.getConnection(slot.fd) orelse return; // connection gone
+        if (conn.id != slot.conn_id) return; // fd reused for a new connection
+        if (bytes.len == 0) {
+            var buf: [128]u8 = undefined;
+            const message = std.fmt.bufPrint(&buf, "internal error: shard {d} lost its answer — the request may still apply", .{msg.src_shard}) catch "internal error: the answer was lost — the request may still apply";
+            return self.sendErrorResponse(conn, slot.request_id, .internal_error, message);
+        }
+        _ = conn.queueWrite(bytes);
+        self.flushToClient(slot.fd);
+    }
 
-        const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
-        const conn_id: u32 = @truncate(msg.sequence >> 32);
-        const conn = self.getConnection(fd) orelse return; // connection gone
-        if (conn.id != conn_id) return; // fd reused for a new connection
-        _ = conn.queueWrite(data[0..msg.payload_len]);
-        self.flushToClient(fd);
+    /// Answer the clients whose requests another shard has not answered by
+    /// `reply_pool.SLOT_DEADLINE_MS`, and take their slots back: whatever
+    /// lost the answer, the slot is not lost with it.
+    fn expireReplySlots(self: *Shard) void {
+        const now = nowMs();
+        if (now < self.reply_sweep_ms) return;
+        self.reply_sweep_ms = now + 1000;
+        const Expired = struct {
+            shard: *Shard,
+            count: u64 = 0,
+            /// Expired per target, to name the one with the most.
+            per_target: [@import("../config/server.zig").MAX_SHARDS]u32 = @splat(0),
+            pub fn expired(ctx: *@This(), slot: ReplyPool.Slot) void {
+                ctx.count += 1;
+                ctx.per_target[slot.target] += 1;
+                if (ctx.shard.shard_metrics) |sm| sm.recordCrossShardTimeout();
+                const conn = ctx.shard.getConnection(slot.fd) orelse return;
+                if (conn.id != slot.conn_id) return;
+                var buf: [128]u8 = undefined;
+                const message = std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — the request may still apply", .{ slot.target, reply_pool_mod.SLOT_DEADLINE_MS / 1000 }) catch "unavailable: no answer — the request may still apply";
+                ctx.shard.sendErrorResponse(conn, slot.request_id, .unavailable, message);
+            }
+        };
+        var gone = Expired{ .shard = self };
+        const oldest = self.reply_pool.expire(now, &gone);
+        if (self.shard_metrics) |sm| {
+            sm.setCrossShardInFlight(self.reply_pool.taken());
+            sm.setOldestCrossShardWait(if (oldest) |t| (now -| t) / 1000 else 0);
+        }
+        if (gone.count == 0) return;
+        self.slots_expired += gone.count;
+        if (now -| self.expire_warn_ms < WARN_INTERVAL_MS) return;
+        self.expire_warn_ms = now;
+        const worst = std.mem.indexOfMax(u32, &gone.per_target);
+        log.warn("shard {d}: since the last report, {d} client requests to other shards went unanswered for {d} s (most in this sweep: {d}, to shard {d}); clients still connected were told they may still apply", .{ self.id, self.slots_expired, reply_pool_mod.SLOT_DEADLINE_MS / 1000, gone.per_target[worst], worst });
+        self.slots_expired = 0;
     }
 
     /// Every frame the network queued since the last drain.
@@ -1645,7 +1706,7 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "internal error: could not hold the request until commit — write may still apply");
             return;
         };
-        slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .owner_shard = conn.owner_shard, .fd = conn.fd, .conn_id = conn.id, .request_id = req.header.request_id, .bytes = bytes, .responder = responder };
+        slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .responder = responder };
         self.pending_count += 1;
         conn.response_deferred = true;
         // A leader counts itself toward the quorum; when commits are
@@ -1668,35 +1729,28 @@ pub const Shard = struct {
         // A different term at this index is a new leader's entry: this
         // write never committed, whatever became of that one.
         if (term != 0 and slot.term != term) {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .unavailable, "unavailable: leader changed, write not applied — retry");
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, "unavailable: leader changed, write not applied — retry");
             return;
         }
         if (!applied) {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
             return;
         }
         const req = proto.Request.parse(slot.bytes) catch {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
             return;
         };
         const proxy = self.respond_proxy;
-        proxy.fd = slot.fd;
-        proxy.id = slot.conn_id;
-        proxy.owner_shard = slot.owner_shard;
-        proxy.state = .active;
-        proxy.response_deferred = false;
-        proxy.write_buf.read_pos = 0;
-        proxy.write_buf.write_pos = 0;
-        proxy.write_overflow = false;
+        loadProxy(proxy, slot.reply_to);
         self.answering_index = index;
         self.answering_timestamp_ns = timestamp_ns;
         slot.responder(@ptrCast(self), @ptrCast(proxy), req);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, slot.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
-            self.deliverDeferred(slot.owner_shard, slot.fd, slot.conn_id, answer.bytes());
+            self.deliverDeferred(slot.reply_to, answer.bytes());
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
         }
     }
 
@@ -1705,7 +1759,7 @@ pub const Shard = struct {
         log.warn("shard {d}: {d} write(s) were waiting for commit; answering each: {s}", .{ self.id, self.pending_count, message });
         for (self.pending) |*slot| {
             if (!slot.active) continue;
-            self.deliverDeferredResponse(slot.owner_shard, slot.fd, slot.conn_id, slot.request_id, .unavailable, message);
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, message);
             self.allocator.free(slot.bytes);
             slot.active = false;
             self.pending_count -= 1;
@@ -1727,7 +1781,7 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "could not hold the request for the leader");
             return;
         };
-        slot.* = .{ .active = true, .id = self.next_forward_id, .owner_shard = conn.owner_shard, .fd = conn.fd, .conn_id = conn.id, .request_id = req.header.request_id, .bytes = bytes, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
+        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
         self.next_forward_id +%= 1;
         if (self.next_forward_id == 0) self.next_forward_id = FORWARD_ID_FIRST;
         self.forward_count += 1;
@@ -1777,7 +1831,7 @@ pub const Shard = struct {
                     self.late_apply_warn_ms = now;
                     log.warn("shard {d}: answering a write the leader committed at index {d} before this node applied it (applied {d}); this node is behind", .{ self.id, f.applied_by, self.raft_node.last_applied });
                 }
-                self.deliverDeferred(f.owner_shard, f.fd, f.conn_id, reply);
+                self.deliverDeferred(f.reply_to, reply);
                 self.dropForward(f);
                 continue;
             }
@@ -1807,44 +1861,35 @@ pub const Shard = struct {
     fn runHeldLocally(self: *Shard, f: *Forward) void {
         const bytes = f.bytes;
         f.bytes = &.{};
-        const owner = f.owner_shard;
-        const fd = f.fd;
-        const conn_id = f.conn_id;
+        const reply_to = f.reply_to;
         const request_id = f.request_id;
         self.dropForward(f);
         defer self.allocator.free(bytes);
         const req = proto.Request.parse(bytes) catch {
-            self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "internal error: the held write did not parse and was not written — retry");
+            self.deliverDeferredResponse(reply_to, request_id, .internal_error, "internal error: the held write did not parse and was not written — retry");
             return;
         };
         const proxy = self.respond_proxy;
-        proxy.fd = fd;
-        proxy.id = conn_id;
-        proxy.owner_shard = owner;
-        proxy.state = .active;
-        proxy.response_deferred = false;
-        proxy.write_buf.read_pos = 0;
-        proxy.write_buf.write_pos = 0;
-        proxy.write_overflow = false;
+        loadProxy(proxy, reply_to);
         self.dispatchLocal(proxy, req);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
-            self.deliverDeferred(owner, fd, conn_id, answer.bytes());
+            self.deliverDeferred(reply_to, answer.bytes());
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(owner, fd, conn_id, request_id, .internal_error, "no response");
+            self.deliverDeferredResponse(reply_to, request_id, .internal_error, "no response");
         }
     }
 
     /// The client is gone: nothing it was waiting for needs a slot.
     fn dropForwardsFor(self: *Shard, fd: i32, conn_id: u32) void {
         for (self.forwards) |*f| {
-            if (f.active and f.owner_shard == self.id and f.fd == fd and f.conn_id == conn_id) self.dropForward(f);
+            if (f.active and f.reply_to.isSocket(@intCast(self.id), fd, conn_id)) self.dropForward(f);
         }
     }
 
     fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, message: []const u8) void {
-        self.deliverDeferredResponse(f.owner_shard, f.fd, f.conn_id, f.request_id, status, message);
+        self.deliverDeferredResponse(f.reply_to, f.request_id, status, message);
         self.dropForward(f);
     }
 
@@ -1875,15 +1920,8 @@ pub const Shard = struct {
             return self.sendForwardReply(frame.source_node, id, serialized);
         };
         const proxy = self.forward_proxy;
-        proxy.fd = @bitCast(id);
-        proxy.id = frame.source_node;
-        proxy.owner_shard = REMOTE_OWNER;
+        loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
         proxy.protocol = .binary;
-        proxy.state = .active;
-        proxy.response_deferred = false;
-        proxy.write_buf.read_pos = 0;
-        proxy.write_buf.write_pos = 0;
-        proxy.write_overflow = false;
         proxy.recordRequest();
         self.dispatchLocal(proxy, req);
         var err_buf: [256]u8 = undefined;
@@ -1935,7 +1973,7 @@ pub const Shard = struct {
         const resp = proto.Response.parse(bytes) catch return self.badFrame(frame);
         if (resp.header.request_id != f.request_id) return self.badFrame(frame);
         if (self.raft_node.last_applied >= committed) {
-            self.deliverDeferred(f.owner_shard, f.fd, f.conn_id, bytes);
+            self.deliverDeferred(f.reply_to, bytes);
             self.dropForward(f);
             return;
         }
@@ -1952,7 +1990,7 @@ pub const Shard = struct {
         const applied = self.raft_node.last_applied;
         for (self.forwards) |*f| {
             if (!f.active or f.reply == null or f.applied_by > applied) continue;
-            self.deliverDeferred(f.owner_shard, f.fd, f.conn_id, f.reply.?);
+            self.deliverDeferred(f.reply_to, f.reply.?);
             self.dropForward(f);
         }
     }
@@ -2134,7 +2172,7 @@ pub const Shard = struct {
         for (self.forwards) |*f| {
             if (!f.active) continue;
             if (f.reply) |reply| {
-                self.deliverDeferred(f.owner_shard, f.fd, f.conn_id, reply);
+                self.deliverDeferred(f.reply_to, reply);
                 self.dropForward(f);
             } else {
                 self.finishForward(f, .unavailable, DIVERGED_MESSAGE);
@@ -2534,12 +2572,12 @@ pub const Shard = struct {
 
         // Only a tick that may sleep announces it; only one that did has a
         // wake to take back and a pipe to empty.
-        const may_sleep = timeout_ms > 0 and self.inbox.prepareSleep();
+        const may_sleep = timeout_ms > 0 and self.mailbox.prepareSleep();
         const events = self.reactor.poll(if (may_sleep) timeout_ms else 0) catch |err| {
-            if (may_sleep) self.inbox.woke();
+            if (may_sleep) self.mailbox.wake.woke();
             return err;
         };
-        if (may_sleep) self.inbox.woke();
+        if (may_sleep) self.mailbox.wake.woke();
         if (self.shard_metrics) |sm| sm.recordReactorLoop();
 
         // Process all I/O events
@@ -2554,6 +2592,7 @@ pub const Shard = struct {
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
+        self.expireReplySlots();
 
         // Run cooperative background tasks (hot_flush, TTL sweep, etc.)
         _ = self.task_scheduler.tick(2_000_000); // 2ms budget
@@ -3346,24 +3385,26 @@ pub const Shard = struct {
         _ = conn.queueWrite(serialized);
     }
 
-    /// Deliver an already-serialized deferred response to a connection.
+    /// Deliver an already-serialized answer to wherever `reply_to` says.
     ///
-    /// Blocking-read waiters live on the data shard, but a connection's fd,
-    /// buffers, and reactor registration belong to `owner_shard`. When that is
-    /// this shard, write directly. Otherwise marshal the bytes to the owning
-    /// shard's inbox so the socket write happens on the owning thread — never
-    /// touch another shard's connection from here.
+    /// A connection's fd, buffers, and reactor registration belong to the
+    /// shard that owns it. When that is this shard, write directly;
+    /// otherwise marshal the bytes to that shard so the socket write happens
+    /// on its thread — never touch another shard's connection from here. A
+    /// node that forwarded the request gets the answer over the peer link.
     ///
-    /// `conn_id` is the connection's generation id at waiter-registration
-    /// time. We verify it against the live connection before writing so that
-    /// fd reuse (close + accept at the same fd) cannot misdirect a stale
-    /// blocking-read response to the wrong client.
-    pub fn deliverDeferred(self: *Shard, owner_shard: u16, fd: i32, conn_id: u32, bytes: []const u8) void {
+    /// The connection's generation is checked against the live connection
+    /// before writing, so that fd reuse (close + accept at the same fd)
+    /// cannot misdirect a stale answer to the wrong client.
+    pub fn deliverDeferred(self: *Shard, reply_to: ReplyTo, bytes: []const u8) void {
         const my_id: u16 = @intCast(self.id);
-        if (owner_shard == REMOTE_OWNER) {
-            self.sendForwardReply(conn_id, @bitCast(fd), bytes);
-            return;
-        }
+        const to = switch (reply_to) {
+            .remote => |r| return self.sendForwardReply(r.node, r.forward_id, bytes),
+            .socket => |s| s,
+        };
+        const owner_shard = to.shard;
+        const fd = to.fd;
+        const conn_id = to.conn_id;
         if (owner_shard == my_id) {
             const conn = self.getConnection(fd) orelse return;
             if (conn.id != conn_id) return; // fd was reused for a new connection
@@ -3372,42 +3413,45 @@ pub const Shard = struct {
             return;
         }
 
-        const peers = self.peer_shards orelse return;
-        if (owner_shard >= peers.len) return;
-
-        const payload = self.allocator.alloc(u8, bytes.len) catch {
-            log.warn("deferred response dropped: alloc failed (fd={d})", .{fd});
+        const mailboxes = self.peer_mailboxes orelse return;
+        if (owner_shard >= mailboxes.len) return;
+        if (to.slot == ReplyTo.NO_SLOT) {
+            // Another shard's client reaches this one only by a request that
+            // took a reply slot there.
+            self.replies_dropped += 1;
+            if (self.shard_metrics) |sm| sm.recordReplyDropped();
+            log.err("shard {d}: dropped an answer for a client of shard {d} (fd {d}): it holds no reply slot. This is a bug; that client gets no answer", .{ my_id, owner_shard, fd });
             return;
-        };
-        @memcpy(payload, bytes);
-        // Pack (conn_id << 32) | fd into the inbox sequence field so the
-        // receiver can verify the connection generation. fd is i32 but
-        // always positive — masking to u32 is safe.
-        const fd_bits: u64 = @as(u32, @bitCast(fd));
-        const seq: u64 = (@as(u64, conn_id) << 32) | fd_bits;
-        const ok = peers[owner_shard].inbox.send(.{
-            .tag = .deferred_response,
-            .src_shard = @intCast(my_id),
-            .payload_len = @intCast(payload.len),
-            .sequence = seq,
-            .payload_ptr = payload.ptr,
-        });
-        if (!ok) {
-            self.allocator.free(payload);
-            log.warn("deferred response dropped: inbox full (owner_shard={d} fd={d})", .{ owner_shard, fd });
+        }
+
+        var msg: InboxMessage = .{ .tag = .reply, .src_shard = @intCast(my_id) };
+        msg.setReplySlot(to.slot, to.gen);
+        // Without room for a copy, an answer with no bytes still frees the
+        // slot and tells the client its answer was lost.
+        if (self.allocator.alloc(u8, bytes.len)) |payload| {
+            @memcpy(payload, bytes);
+            msg.payload_len = @intCast(payload.len);
+            msg.payload_ptr = payload.ptr;
+        } else |_| {}
+        if (!mailboxes[owner_shard].replies.send(msg)) {
+            if (msg.payload_ptr) |p| self.allocator.free(@as([*]u8, @ptrCast(p))[0..msg.payload_len]);
+            self.replies_dropped += 1;
+            if (self.shard_metrics) |sm| sm.recordReplyDropped();
+            log.err("shard {d}: dropped an answer for a client of shard {d} (fd {d}): its reply ring is full; that client is answered when its slot expires", .{ my_id, owner_shard, fd });
         }
     }
 
     /// Serialize a status+data response and deliver it via `deliverDeferred`.
-    pub fn deliverDeferredResponse(self: *Shard, owner_shard: u16, fd: i32, conn_id: u32, request_id: u64, status: proto.StatusCode, data: []const u8) void {
+    pub fn deliverDeferredResponse(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, data: []const u8) void {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // Same rule as `sendOkResponse`: a parked client is answered, never
-        // left to its own timeout because the answer is too large to frame.
+        // left to its own timeout because the answer is too large to frame
+        // (and on another shard, never left holding its reply slot).
         const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch blk: {
             log.warn("shard {d}: deferred answer to request {d} is {d} bytes, over the frame limit; answered with an error", .{ self.id, request_id, data.len });
             break :blk proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
         };
-        self.deliverDeferred(owner_shard, fd, conn_id, serialized);
+        self.deliverDeferred(reply_to, serialized);
     }
 
     /// Send an OK response with data payload on a connection.
@@ -3893,18 +3937,18 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             if (shard.defaultPartition().kv.get(waiter.key())) |entry| {
                 sendKVWaiterValue(shard, waiter, entry.value, entry.version);
             } else {
-                shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .not_found, "");
+                shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .not_found, "");
             }
         },
         .queue_dequeue => {
             // Queue blocking dequeue timeout → empty messages response (count = 0)
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, 0, .little);
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, &buf);
+            shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, &buf);
         },
         // stream_read / action_await / stream_group_read → empty OK response
         .stream_read, .action_await, .stream_group_read => {
-            shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, "");
+            shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, "");
         },
     }
 }
@@ -3925,11 +3969,11 @@ fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, ve
     const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
     var buf: [MAX_BUF]u8 = undefined;
     if (resp.serialize(&buf)) |serialized| {
-        shard.deliverDeferred(waiter.owner_shard, waiter.fd, waiter.conn_id, serialized);
+        shard.deliverDeferred(waiter.reply_to, serialized);
     } else |_| {
         // The waiter is gone once this returns; an asker left without an
         // answer would hang until its own timeout.
-        shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .internal_error, "internal error: value too large to send");
+        shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .internal_error, "internal error: value too large to send");
     }
 }
 
@@ -3955,8 +3999,8 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const result = handler.messages(records, waiter.key());
     defer handler.freeResult(result);
     switch (result) {
-        .stream_messages => |m| shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, m.data),
-        else => shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .internal_error, ""),
+        .stream_messages => |m| shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, m.data),
+        else => shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .internal_error, ""),
     }
     return true;
 }
@@ -3972,7 +4016,7 @@ pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const last = shard.stream_handler.stream.streamLastId(waiter.stream.name_hash);
     if (!last.greaterThan(waiter.stream.after)) return false;
 
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, "");
+    shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, "");
     return true;
 }
 
@@ -4007,7 +4051,7 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         };
     }
 
-    shard.deliverDeferredResponse(waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, .ok, data);
+    shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, data);
     return true;
 }
 
@@ -4090,9 +4134,7 @@ pub const Pending = struct {
     active: bool = false,
     index: u64 = 0,
     term: u64 = 0,
-    owner_shard: u16 = 0,
-    fd: i32 = -1,
-    conn_id: u32 = 0,
+    reply_to: ReplyTo = undefined,
     request_id: u64 = 0,
     bytes: []u8 = &.{},
     responder: HandlerFn = undefined,
@@ -4103,9 +4145,7 @@ pub const PENDING_SLOTS: usize = 2 * raft_node_mod.MAX_OUTSTANDING;
 const Forward = struct {
     active: bool = false,
     id: u32 = 0,
-    owner_shard: u16 = 0,
-    fd: i32 = -1,
-    conn_id: u32 = 0,
+    reply_to: ReplyTo = undefined,
     request_id: u64 = 0,
     bytes: []u8 = &.{},
     /// The leader it went to and the term then; 0 until it has gone.
@@ -4133,9 +4173,6 @@ const STEP_PASSES: u8 = 4;
 /// Steady conditions are said once per interval, not per tick.
 const WARN_INTERVAL_MS: u64 = 30_000;
 const JOIN_WARN_INTERVAL_MS: u64 = 30_000;
-/// The `owner_shard` of a connection that stands for a client on another
-/// node: `fd` is then the forward id and `conn_id` the node.
-pub const REMOTE_OWNER: u16 = 0xFFFF;
 
 /// Most entries in one AppendEntries, and the payload bytes they may
 /// hold: a batch is sized by bytes, and must hold the largest entry any
@@ -4430,7 +4467,7 @@ test "Shard: inbox shutdown message" {
     try std.testing.expect(shard.running);
 
     // Send shutdown via inbox
-    const sent = shard.inbox.send(.{
+    const sent = shard.mailbox.inbox.send(.{
         .tag = .shutdown,
         .src_shard = 1,
 
@@ -4662,7 +4699,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const present = try handler_mod.qualifyKey(&qbuf, "", "w");
     const version = shard.defaultPartition().kv.get(present).?.version;
-    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .fd = conn.fd, .owner_shard = 0, .conn_id = conn.id, .request_id = 7, .key = present, .min_version = version, .timeout_ms = 1 }));
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 7, .key = present, .min_version = version, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
     var n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader) + 8 + 2);
@@ -4674,7 +4711,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
 
     var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
-    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .fd = conn.fd, .owner_shard = 0, .conn_id = conn.id, .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
     n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
@@ -4996,6 +5033,196 @@ test "Shard: a connection marked closing runs no more of its requests and is clo
     try std.testing.expect(shard.getConnection(rfd) == null);
 }
 
+/// Two shards of one node, wired to each other as the runtime wires them.
+const TwoShards = struct {
+    pipes: [2][2]std.posix.fd_t,
+    shards: [2]Shard,
+    mailboxes: [2]*Mailbox,
+    peers: [2]*Shard,
+
+    fn init(self: *TwoShards) !void {
+        for (&self.pipes, 0..) |*p, i| {
+            p.* = try @import("stdx").io.pipe();
+            self.shards[i] = try Shard.init(std.testing.allocator, @intCast(i), 2, 4096, p[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        }
+        for (0..2) |i| {
+            self.mailboxes[i] = self.shards[i].mailbox;
+            self.peers[i] = &self.shards[i];
+        }
+        for (&self.shards) |*s| {
+            s.peer_mailboxes = &self.mailboxes;
+            s.peer_shards = &self.peers;
+        }
+    }
+
+    fn deinit(self: *TwoShards) void {
+        for (&self.shards) |*s| s.deinit();
+        for (self.pipes) |p| {
+            _ = std.c.close(p[0]);
+            _ = std.c.close(p[1]);
+        }
+    }
+};
+
+/// The next answer on a test client's socket, parsed.
+fn nextAnswer(c: TestClient, shard: *Shard, out: []u8) !proto.Response {
+    const n = try readAnswer(c.pair[1], shard, c.conn.fd, out, @sizeOf(proto.ResponseHeader));
+    return proto.Response.parse(out[0..n]);
+}
+
+test "Shard: a request forwarded to another shard is answered on the asker's reply ring, once, and only by the shard asked" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+
+    const ping = try testRequest(.ping, 41, "", "");
+    defer std.testing.allocator.free(ping);
+    a.forwardToShard(1, c.conn, try proto.Request.parse(ping));
+    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), b.drainInbox());
+    // The answer waits on the asker's reply ring, not its inbox.
+    try std.testing.expectEqual(@as(usize, 1), a.mailbox.replies.pending());
+    try std.testing.expectEqual(@as(usize, 0), a.mailbox.inbox.pending());
+
+    // Held back: a copy of it arriving from a shard that was not asked
+    // frees nothing and reaches no one.
+    var held: [1]InboxMessage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), a.mailbox.replies.drain(&held));
+    const len = held[0].payload_len;
+    const copy = try std.testing.allocator.alloc(u8, len);
+    @memcpy(copy, @as([*]u8, @ptrCast(held[0].payload_ptr.?))[0..len]);
+    var impostor = held[0];
+    impostor.src_shard = 0;
+    impostor.payload_ptr = copy.ptr;
+    try std.testing.expect(a.mailbox.replies.send(impostor));
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+
+    // The real answer frees the slot and reaches the client.
+    try std.testing.expect(a.mailbox.replies.send(held[0]));
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().cross_shard_in_flight);
+    var out: [256]u8 = undefined;
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 41), resp.header.request_id);
+    try std.testing.expectEqualStrings("PONG", resp.data);
+
+    // A second answer naming the same, now freed, slot is dropped.
+    const again = try std.testing.allocator.alloc(u8, len);
+    @memset(again, 0);
+    var dup = held[0];
+    dup.payload_ptr = again.ptr;
+    try std.testing.expect(a.mailbox.replies.send(dup));
+    _ = a.drainInbox();
+    a.flushToClient(c.conn.fd);
+    try std.testing.expect(std.c.read(c.pair[1], &out, out.len) < 0);
+}
+
+test "Shard: an answer the other shard could not send, a request no slot is left for, and one never answered each reach the client, and the slot comes back" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    var out: [256]u8 = undefined;
+
+    // An answer with no bytes (the answering shard had no room to copy it):
+    // the client hears its answer was lost, and the slot is free.
+    const p1 = try testRequest(.ping, 51, "", "");
+    defer std.testing.allocator.free(p1);
+    a.forwardToShard(1, c.conn, try proto.Request.parse(p1));
+    var fwd: [1]InboxMessage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.drain(&fwd));
+    std.testing.allocator.free(@as([*]u8, @ptrCast(fwd[0].payload_ptr.?))[0..fwd[0].payload_len]);
+    var empty: InboxMessage = .{ .tag = .reply, .src_shard = 1 };
+    const t = fwd[0].replySlot();
+    empty.setReplySlot(t.slot, t.gen);
+    try std.testing.expect(a.mailbox.replies.send(empty));
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    var resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 51), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+
+    // Shard 1 holding its full share: the next request for it is refused
+    // at once, and told it did not run.
+    const p2 = try testRequest(.ping, 52, "", "");
+    defer std.testing.allocator.free(p2);
+    while (a.reply_pool.take(1, -1, 0, 0, Shard.nowMs(), false)) |_| {} else |err| try std.testing.expectEqual(error.TargetBusy, err);
+    a.forwardToShard(1, c.conn, try proto.Request.parse(p2));
+    resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 52), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "was not run") != null);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_overloaded[@intFromEnum(ShardMetrics.CrossShardClass.client_forward)]);
+    for (a.reply_pool.slots, 0..) |s, i| {
+        if (s.active) _ = a.reply_pool.release(.{ .slot = @intCast(i), .gen = s.gen }, 1);
+    }
+
+    // Never answered: past the deadline its client is told the request may
+    // still apply, the slot comes back, and the late answer is dropped.
+    const p3 = try testRequest(.ping, 53, "", "");
+    defer std.testing.allocator.free(p3);
+    a.forwardToShard(1, c.conn, try proto.Request.parse(p3));
+    // Waiting since the clock's zero: shown as the oldest wait, not yet
+    // given up on. (Times are set, not subtracted: a monotonic clock can
+    // read less than any interval a test would take off it.)
+    for (a.reply_pool.slots) |*s| {
+        if (s.active) s.taken_ms = 0;
+    }
+    a.reply_sweep_ms = 0;
+    const before = Shard.nowMs() / 1000;
+    a.expireReplySlots();
+    const after = Shard.nowMs() / 1000;
+    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+    const oldest = sm.snapshot().oldest_cross_shard_wait_s;
+    try std.testing.expect(oldest >= before and oldest <= after);
+    // The tick sweeps: once past its due time, the slot is taken back
+    // without anything else asking.
+    for (a.reply_pool.slots) |*s| {
+        if (s.active) s.due_ms = 0;
+    }
+    a.reply_sweep_ms = 0;
+    _ = try a.tick(0);
+    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().oldest_cross_shard_wait_s);
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 53), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_timeouts);
+    _ = b.drainInbox();
+    _ = a.drainInbox();
+    a.flushToClient(c.conn.fd);
+    try std.testing.expect(std.c.read(c.pair[1], &out, out.len) < 0);
+}
+
+test "Shard: an answer for another shard's client that holds no reply slot is dropped and counted, never sent" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    var sm = ShardMetrics{ .shard_id = 1 };
+    two.shards[1].shard_metrics = &sm;
+    defer two.shards[1].shard_metrics = null;
+    two.shards[1].deliverDeferred(ReplyTo.socketOf(0, 5, 1), "x");
+    try std.testing.expectEqual(@as(u64, 1), two.shards[1].replies_dropped);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().replies_dropped);
+    try std.testing.expectEqual(@as(usize, 0), two.shards[0].mailbox.replies.pending());
+}
+
 /// Feed `data` to the shard through the client's socket end, reading on the
 /// shard's side as the kernel buffer fills, then until the shard has taken
 /// everything written (a kernel may still hold the tail after the last
@@ -5146,6 +5373,22 @@ test "Shard: an answer too large to frame is answered with an error" {
     try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
 }
 
+test "Shard: a wake flag from another shard is acted on at the next drain, once however often it was set" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.workflow_handler.triggers_dirty = false;
+    for (0..5) |_| shard.mailbox.wake.set(.stream_appended);
+    try std.testing.expect(!shard.mailbox.prepareSleep());
+    try std.testing.expectEqual(@as(usize, 0), shard.drainInbox());
+    try std.testing.expect(shard.workflow_handler.triggers_dirty);
+    try std.testing.expectEqual(@as(u32, 0), shard.mailbox.wake.flags.load(.monotonic));
+    try std.testing.expect(shard.mailbox.prepareSleep());
+    shard.mailbox.wake.woke();
+}
+
 test "Shard: the inbox gauges follow the drain" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -5155,16 +5398,16 @@ test "Shard: the inbox gauges follow the drain" {
     var sm = ShardMetrics{ .shard_id = 0 };
     shard.shard_metrics = &sm;
     var i: usize = 0;
-    while (i < 3) : (i += 1) try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
+    while (i < 3) : (i += 1) try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
     try std.testing.expectEqual(@as(usize, 3), shard.drainInbox());
     try std.testing.expectEqual(@as(u64, 3), sm.inbox_processed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), sm.inbox_pending.load(.monotonic));
 
     // Read at scrape time from the inbox itself: what waits for a shard
     // that has stopped draining still shows.
-    sm.live_pending = .{ .ctx = &shard.inbox, .read = Shard.inboxPending };
-    try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
-    try std.testing.expect(shard.inbox.send(.{ .tag = .stream_event }));
+    sm.live_pending = .{ .ctx = shard.mailbox, .read = Shard.inboxPending };
+    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
+    try std.testing.expect(shard.mailbox.inbox.send(.{ .tag = .action_start }));
     try std.testing.expectEqual(@as(u64, 2), sm.snapshot().inbox_pending);
     _ = shard.drainInbox();
     try std.testing.expectEqual(@as(u64, 0), sm.snapshot().inbox_pending);
@@ -5264,7 +5507,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
     // never match one in its waiter pool.
-    try std.testing.expect(shard.forwards[0].fd == pair[0]);
+    try std.testing.expect(shard.forwards[0].reply_to.isSocket(0, pair[0], conn.id));
     try std.testing.expect(@as(i32, @bitCast(shard.forwards[0].id)) < 0);
 
     // A leader is known but there is no link to it: the write is not
@@ -6084,7 +6327,7 @@ test "Shard: a deferred answer too large to frame reaches its client as an error
     const big = try std.testing.allocator.alloc(u8, MAX_REQUEST_SIZE + 1);
     defer std.testing.allocator.free(big);
     @memset(big, 'x');
-    shard.deliverDeferredResponse(0, conn.fd, conn.id, 9, .ok, big);
+    shard.deliverDeferredResponse(conn.replyTo(), 9, .ok, big);
     var buf: [512]u8 = undefined;
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);

@@ -159,7 +159,7 @@ Client → Acceptor → Shard (correct one) → Dispatcher
 ```
 Client → Shard → Dispatcher → Handler
   → Query Projection directly (no Raft needed for reads)
-  → If cross-shard: Inbox message → remote Shard → Inbox response
+  → If cross-shard: request on the owner's inbox → answer on the asker's reply ring
   → Response to client
 ```
 
@@ -171,8 +171,7 @@ Client → Shard → Dispatcher → Handler
 | **Reactor** | Single unified event loop per shard (kqueue/io_uring). Handles all I/O, timers, and inbox draining |
 | **Dispatcher** | Table-driven opcode→handler routing (~300 lines). Handlers self-register |
 | **Router** | Hash-based routing: `hash(key) → partition → shard` |
-| **Inbox** | MPSC ring buffer with 32-byte envelopes for cross-shard communication |
-| **Slab** | Per-shard slab allocator for cross-shard payload lifetimes |
+| **Mailbox** | Per shard: an inbox for other shards' requests, a reply ring for answers to its own, and wake flags; MPSC rings of 32-byte envelopes |
 | **UAL** | Unified Append Log — hot ring buffer (mmap) + disk segments. The Raft log IS the UAL |
 | **Projections** | Derived views rebuilt from UAL on recovery: KV (hash+MVCC), Queue (heaps+leases), Stream (offsets+groups), TS (columnar blocks) |
 
@@ -490,7 +489,9 @@ src/
 │   ├── dispatcher.zig       #   Opcode → handler routing table
 │   ├── router.zig           #   hash → partition → shard
 │   ├── inbox.zig            #   MPSC ring for cross-shard messages
-│   ├── slab.zig             #   Slab allocator for payloads
+│   ├── mailbox.zig          #   Inbox, reply ring and wake flags per shard
+│   ├── reply_pool.zig       #   Room for answers to requests sent to other shards
+│   ├── slab.zig             #   Slab allocator (not yet used for cross-shard payloads)
 │   ├── connection.zig       #   Connection + protocol detection
 │   ├── shard_walker.zig     #   ShardWalker(T) for list/scan
 │   ├── runtime.zig          #   Boot sequence, thread spawning
@@ -532,8 +533,7 @@ src/
 │
 ├── cluster/                 # Clustering
 │   ├── coordinator.zig      #   Controller Raft on Shard 0
-│   ├── forwarder.zig        #   Cross-shard request forwarding
-│   └── partition_table.zig  #   Partition → Node mapping
+│   └── partition_table.zig  #   Partition → Node mapping (not yet used for routing)
 │
 ├── cli/                     # CLI client
 ├── config/                  # Configuration (flo.toml)
@@ -611,7 +611,7 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Stream Processing (operators, windows, checkpoints) | ✅ Complete |
 | Web Dashboard | ✅ Complete |
 | Cluster membership by the replicated log | ✅ Complete |
-| Cross-node request forwarding | ✅ Complete |
+| Writes forwarded to the leader | ✅ Complete |
 | Cold Storage (S3/GCS) | � Local backend complete, remote planned |
 
 ## Contributing
