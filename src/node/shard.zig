@@ -358,13 +358,31 @@ pub const Shard = struct {
     /// tick. Room for one entry per connection is reserved as each is
     /// added, so marking never fails.
     closing_fds: std.ArrayListUnmanaged(i32) = .empty,
-    /// Paused connections to read again (`flushToClient`, the stall check);
+    /// Paused or waiting connections to read again (`flushToClient`, the
+    /// stall check, `resumeWaiting`);
     /// their buffered requests run at the end of the tick. The end of the
     /// tick runs a swapped-out snapshot (`resume_running`), so what is
     /// queued while it runs waits for the next tick: one entry per
     /// connection at most, and both lists are reserved as above.
     resume_fds: std.ArrayListUnmanaged(i32) = .empty,
     resume_running: std.ArrayListUnmanaged(i32) = .empty,
+    /// The line of connections whose next request waits for room to go to
+    /// another shard (`waitForward`), in the order they began waiting,
+    /// checked at the end of every tick. An entry is live while its
+    /// connection's `wait_seq` matches; a connection has at most one live
+    /// and one stale entry, so two per connection are reserved as above.
+    waiting_fds: std.ArrayListUnmanaged(WaitEntry) = .empty,
+    /// Cancels of closed clients' blocking reads still to be sent
+    /// (`releaseForwardsFor`).
+    pending_cancels: std.ArrayListUnmanaged(struct { target: u16, seq: u64 }) = .empty,
+    /// The last `WaitEntry.seq` given out; never 0.
+    wait_seq: u32 = 0,
+    /// Connections waiting for each target's room, by class
+    /// (`Connection.in_queue`): a new request for that target queues behind
+    /// them.
+    queued: [2][@import("../config/server.zig").MAX_SHARDS]u32 = .{ @splat(0), @splat(0) },
+    /// When a refusal after waiting was last logged, per wait reason.
+    wait_warn_ms: [@typeInfo(Connection.WaitReason).@"enum".fields.len]u64 = @splat(0),
     /// Connections paused now, and when the stall check next runs.
     paused_count: u32 = 0,
     stall_check_ms: u64 = 0,
@@ -402,7 +420,11 @@ pub const Shard = struct {
         // timeout; a shard that cannot have one does not start.
         var reply_pool = try ReplyPool.init(allocator, ReplyPool.slotsFor(shard_count), shard_count);
         errdefer reply_pool.deinit(allocator);
-        const mailbox = try Mailbox.create(allocator, 1024, reply_pool.ringCapacity());
+        var waiter_pool = try WaiterPool.init(allocator);
+        errdefer waiter_pool.deinit(allocator);
+        waiter_pool.owner = shard_id;
+        waiter_pool.split = shard_count > 1;
+        const mailbox = try Mailbox.create(allocator, 1024, reply_pool.ringCapacity(), shard_count);
         errdefer mailbox.destroy(allocator);
         try reactor.addSource(.{ .fd = mailbox.wake.rd, .tag = .inbox_ready, .interests = .{ .readable = true } });
 
@@ -770,7 +792,7 @@ pub const Shard = struct {
             .raft_queue_registered = false,
             .shard_metrics = null,
             .cluster_node_id = node_id,
-            .waiter_pool = WaiterPool.init(),
+            .waiter_pool = waiter_pool,
             .task_scheduler = TaskScheduler.init(),
             .hot_flush_seconds = hot_flush_seconds,
             .peer_shards = null,
@@ -876,6 +898,8 @@ pub const Shard = struct {
     pub fn deinit(self: *Shard) void {
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
+        self.waiting_fds.deinit(self.allocator);
+        self.pending_cancels.deinit(self.allocator);
         self.resume_running.deinit(self.allocator);
         // Close all connections (close fds + free buffers)
         var it = self.connections.iterator();
@@ -955,6 +979,7 @@ pub const Shard = struct {
 
         self.mailbox.destroy(self.allocator);
         self.reply_pool.deinit(self.allocator);
+        self.waiter_pool.deinit(self.allocator);
         self.slab.deinit();
         self.reactor.deinit();
     }
@@ -1026,6 +1051,8 @@ pub const Shard = struct {
 
     // ─── Connection management ───────────────────────────────────────────
 
+    const WaitEntry = struct { fd: i32, seq: u32 };
+
     /// Add a new connection from an accepted fd.
     pub fn addConnection(self: *Shard, fd: i32) !*Connection {
         const conn = try self.allocator.create(Connection);
@@ -1043,6 +1070,7 @@ pub const Shard = struct {
         const resume_room = self.connections.count() + 1 + self.resume_fds.items.len;
         try self.resume_fds.ensureTotalCapacity(self.allocator, resume_room);
         try self.resume_running.ensureTotalCapacity(self.allocator, resume_room);
+        try self.waiting_fds.ensureTotalCapacity(self.allocator, 2 * (self.connections.count() + 1) + self.waiting_fds.items.len);
         try self.connections.put(self.allocator, fd, conn);
         if (self.metrics_registry) |m| m.server.connectionOpened();
         if (self.shard_metrics) |sm| sm.connectionOpened();
@@ -1055,6 +1083,7 @@ pub const Shard = struct {
             // Roll back any KV transactions still owned by this connection.
             _ = self.kv_handler.txn_table.dropByConnection(kv.value.id);
             if (kv.value.reads_paused) self.paused_count -= 1;
+            self.endWait(kv.value);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             if (self.metrics_registry) |m| m.server.connectionClosed();
@@ -1065,13 +1094,59 @@ pub const Shard = struct {
     /// Remove connection, unregister from reactor, and close the fd.
     pub fn closeConnection(self: *Shard, fd: i32) void {
         log.debug("Shard {d} closing connection: fd={d}", .{ self.id, fd });
-        if (self.connections.get(fd)) |conn| self.waiter_pool.removeByConnection(@intCast(self.id), fd, conn.id);
+        if (self.connections.get(fd)) |conn| self.waiter_pool.removeByConnection(@intCast(self.id), fd, conn.id, null, @ptrCast(self));
         if (self.forward_count > 0) {
             if (self.connections.get(fd)) |conn| self.dropForwardsFor(fd, conn.id);
+        }
+        if (self.connections.get(fd)) |conn| {
+            if (conn.blocking_in_flight > 0) self.releaseForwardsFor(conn);
         }
         self.reactor.removeSource(fd);
         self.removeConnection(fd);
         _ = std.c.close(fd);
+    }
+
+    /// A client closed with blocking reads out on other shards: each shard
+    /// holding some is asked, once, to drop them and answer each, empty, so
+    /// their slots come back within its next tick rather than at their
+    /// block time — a client cannot hold another shard's waiters, or this
+    /// shard's share of them, by connecting and leaving. The ask goes on
+    /// this shard's share of that inbox, like the reads it cancels, so it
+    /// never overtakes them; with none left it waits its turn
+    /// (`sendPendingCancels`). The slots stay held until answered, so they
+    /// never count for less than what is parked.
+    fn releaseForwardsFor(self: *Shard, conn: *Connection) void {
+        var told = std.StaticBitSet(@import("../config/server.zig").MAX_SHARDS).initEmpty();
+        const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
+        for (conn.blocking_slots[0..conn.blocking_in_flight]) |t| {
+            const target = self.reply_pool.orphan(t) orelse continue;
+            if (told.isSet(target)) continue;
+            told.set(target);
+            if (self.sendCancel(target, seq)) continue;
+            // At most one ask per slot that is still to be answered; past
+            // that, or without memory, the reads end at their block time.
+            if (self.pending_cancels.items.len < self.reply_pool.classes[@intFromEnum(reply_pool_mod.Class.blocking)].free.len) {
+                self.pending_cancels.append(self.allocator, .{ .target = target, .seq = seq }) catch {};
+            }
+        }
+        conn.blocking_in_flight = 0;
+    }
+
+    fn sendCancel(self: *Shard, target: u16, seq: u64) bool {
+        const mailboxes = self.peer_mailboxes orelse return true;
+        return mailboxes[target].sendOnShare(.{ .tag = .cancel_reads, .src_shard = @intCast(self.id), .sequence = seq });
+    }
+
+    /// Send the cancels that found no room in their target's inbox, now
+    /// that some may have drained.
+    fn sendPendingCancels(self: *Shard) void {
+        var kept: usize = 0;
+        for (self.pending_cancels.items) |c| {
+            if (self.sendCancel(c.target, c.seq)) continue;
+            self.pending_cancels.items[kept] = c;
+            kept += 1;
+        }
+        self.pending_cancels.shrinkRetainingCapacity(kept);
     }
 
     /// Get a connection by fd.
@@ -1100,7 +1175,8 @@ pub const Shard = struct {
         inline for (.{ proto.OptionTag.block_ms, proto.OptionTag.wait_ms }) |tag| {
             if (req.findOption(tag)) |opt| {
                 if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
-                    return self.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)");
+                    self.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)");
+                    return;
                 }
             }
         }
@@ -1124,6 +1200,105 @@ pub const Shard = struct {
         // implicit namespace create) and anything past the entry `park`
         // answered at. In a cluster these wait for a peer's ack.
         _ = self.applyCommitted();
+    }
+
+    /// Where a request goes when it goes to another shard, and whether it
+    /// is a read that may wait there on purpose.
+    const ForwardTo = struct { target: u16, blocking: bool };
+
+    /// The shard `req` would be sent to, if not this one: `dispatchRequest`'s
+    /// routing, decided before anything runs.
+    fn forwardTarget(self: *Shard, req: proto.Request) ?ForwardTo {
+        const op = req.header.op_code;
+        if (op >= proto.MAX_OPCODES) return null;
+        if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
+            const single = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
+            if (!single) return null;
+        }
+        return switch (self.resolveTarget(op, req)) {
+            .local => null,
+            .shard => |s| blk: {
+                const mailboxes = self.peer_mailboxes orelse break :blk null;
+                if (self.peer_shards == null or s.shard_id == self.id or s.shard_id >= mailboxes.len) break :blk null;
+                break :blk .{ .target = s.shard_id, .blocking = blockingWait(req) != null };
+            },
+        };
+    }
+
+    /// Requests whose answer carries what they took: a dequeued message, a
+    /// group read's records, a claimed or awaited task.
+    fn takesItems(op: u16) bool {
+        return switch (op) {
+            @intFromEnum(proto.OpCode.queue_dequeue),
+            @intFromEnum(proto.OpCode.stream_group_read),
+            @intFromEnum(proto.OpCode.stream_group_claim),
+            @intFromEnum(proto.OpCode.action_await),
+            => true,
+            else => false,
+        };
+    }
+
+    /// How long a read may wait on purpose for its data, or null for any
+    /// other request. Such a read holds a slot of its own class, and is not
+    /// a slow answer while it waits. A worker's await waits 30 s unless
+    /// told otherwise (`ActionsHandler`).
+    fn blockingWait(req: proto.Request) ?u64 {
+        if (req.getBlockMs() orelse req.getWaitMs()) |ms| return ms;
+        if (req.header.op_code != @intFromEnum(proto.OpCode.action_await)) return null;
+        const opt = req.findOption(.block_ms) orelse return 30_000;
+        const ms = opt.asU32() orelse 30_000;
+        return if (ms == 0) null else ms;
+    }
+
+    /// Why `conn`'s request cannot go to `to.target` now, or null when it
+    /// can.
+    fn forwardWait(self: *Shard, conn: *Connection, to: ForwardTo) ?Connection.WaitReason {
+        if (to.target == self.id) return if (self.blockingOut(conn) >= Connection.MAX_BLOCKING_IN_FLIGHT) .blocking_reads else null;
+        if (conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT) return .in_flight;
+        if (to.blocking and self.blockingOut(conn) >= Connection.MAX_BLOCKING_IN_FLIGHT) return .blocking_reads;
+        if (!self.reply_pool.canTake(if (to.blocking) .blocking else .ordinary, to.target)) return .slots;
+        if (!self.peer_mailboxes.?[to.target].hasShare(@intCast(self.id))) return .inbox;
+        return null;
+    }
+
+    /// The blocking reads `conn` has out: on other shards, and parked here.
+    /// `local_reads` only ever overcounts — raised as each parks, not
+    /// lowered as each returns — so the waiters are counted only when it
+    /// says the cap may be reached.
+    fn blockingOut(self: *Shard, conn: *Connection) u16 {
+        if (conn.blocking_in_flight + conn.local_reads >= Connection.MAX_BLOCKING_IN_FLIGHT) {
+            conn.local_reads = self.waiter_pool.countFor(@intCast(self.id), conn.fd, conn.id);
+        }
+        return conn.blocking_in_flight + conn.local_reads;
+    }
+
+    /// What a client's request must wait for before it can go — to another
+    /// shard, or, for a blocking read here, past this connection's cap — or
+    /// null when it can go now, or is refused by `dispatchRequest`. A
+    /// waiting request is left unread: nothing about it has run or been
+    /// counted.
+    fn holdForward(self: *Shard, conn: *Connection, req: proto.Request) ?Connection.Waiting {
+        if ((req.getBlockMs() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS or (req.getWaitMs() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) return null;
+        const to: ForwardTo = self.forwardTarget(req) orelse if (blockingWait(req) != null) .{ .target = @intCast(self.id), .blocking = true } else return null;
+        var why = self.stillWaits(conn, to, null);
+        // Behind connections already waiting for this target, unless this
+        // is the one request `resumeWaiting` let this connection send: room
+        // goes round, a request at a time.
+        if (why == null and !conn.has_turn and self.queued[@intFromBool(to.blocking)][to.target] > 0) why = .slots;
+        return .{ .target = to.target, .blocking = to.blocking, .reason = why orelse return null };
+    }
+
+    /// `forwardWait`; but when the answer is, or last was (`was`), the inbox
+    /// share, ask to be told of a drain before looking, so a drain in
+    /// between is not missed (`Mailbox.wantShare`).
+    fn stillWaits(self: *Shard, conn: *Connection, to: ForwardTo, was: ?Connection.WaitReason) ?Connection.WaitReason {
+        if (to.target == self.id) return self.forwardWait(conn, to);
+        const mailbox = self.peer_mailboxes.?[to.target];
+        if (was == .inbox) mailbox.wantShare(@intCast(self.id));
+        const why = self.forwardWait(conn, to);
+        if (why != .inbox or was == .inbox) return why;
+        mailbox.wantShare(@intCast(self.id));
+        return self.forwardWait(conn, to);
     }
 
     /// Run a request on this shard — unless it writes and this shard's
@@ -1206,9 +1381,9 @@ pub const Shard = struct {
     /// slot taken here first, and is written to the client. See
     /// `runForwardedRequest` and `deliverReply`.
     ///
-    /// When every reply slot is taken, or the target's inbox is full, the
-    /// client is answered `overloaded` — the request did not run — and
-    /// retries instead of hanging.
+    /// A client's request has already waited for room (`holdForward`); if
+    /// there is none even so, it is answered `overloaded` — it did not run —
+    /// and the client retries instead of hanging.
     fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request) void {
         const peers = self.peer_shards orelse {
             // No peer shards wired — fall back to local dispatch
@@ -1225,16 +1400,27 @@ pub const Shard = struct {
             return;
         }
         const target = (self.peer_mailboxes orelse return self.dispatchLocal(conn, req))[target_shard_id];
+        // A cluster member runs one shard (`Runtime` refuses more), so what
+        // goes to another shard never waits there for a leader first; the
+        // deadlines below count on it.
+        std.debug.assert(self.raft_network == null);
 
         // Room for the answer first: nothing is copied for a request that
         // cannot be sent.
-        // A read that may wait on purpose is not a slow answer while it waits.
-        const blocking = req.getBlockMs() != null or req.getWaitMs() != null or req.header.op_code == @intFromEnum(proto.OpCode.action_await);
-        const ticket = self.reply_pool.take(target_shard_id, conn.fd, conn.id, req.header.request_id, nowMs(), blocking) catch |err|
-            return self.refuseForward(conn, req, target_shard_id, switch (err) {
-                error.TargetBusy => .target_busy,
-                error.PoolFull => .pool_full,
-            });
+        const block = blockingWait(req);
+        const blocking = block != null;
+        const op = req.header.op_code;
+        const claims = takesItems(op);
+        const writes = claims or (op < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(op)));
+        // An answer carrying what its request took is not dropped for a
+        // deadline: it would reach no one until its lease ran out. Such a
+        // request waits for it as long as the slot is held.
+        const class: reply_pool_mod.Class = if (blocking) .blocking else .ordinary;
+        const now = nowMs();
+        const since = if (claims) now else conn.head_since_ms orelse now;
+        const allowance = if (claims) reply_pool_mod.SLOT_DEADLINE_MS else reply_pool_mod.DEADLINE_MS;
+        const ticket = self.reply_pool.take(class, target_shard_id, conn.fd, conn.id, req.header.request_id, writes, since, now, allowance, if (claims) 0 else block orelse 0) catch
+            return self.refuseForward(conn, req, target_shard_id, .target_busy);
 
         // Serialize request (header + recomposed payload) onto the heap so the
         // target shard can re-parse it after the source buffer is gone.
@@ -1256,10 +1442,17 @@ pub const Shard = struct {
             .payload_ptr = buf.ptr,
         };
         msg.setReplySlot(ticket.slot, ticket.gen);
-        if (!target.inbox.send(msg)) {
+        if (!target.sendOnShare(msg)) {
             self.allocator.free(buf);
             _ = self.reply_pool.release(ticket, target_shard_id);
             return self.refuseForward(conn, req, target_shard_id, .inbox_full);
+        }
+        conn.forwards_in_flight += 1;
+        if (blocking) {
+            // `holdForward` kept it under the cap, or it would have waited.
+            std.debug.assert(conn.blocking_in_flight < Connection.MAX_BLOCKING_IN_FLIGHT);
+            conn.blocking_slots[conn.blocking_in_flight] = ticket;
+            conn.blocking_in_flight += 1;
         }
         if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
 
@@ -1270,7 +1463,9 @@ pub const Shard = struct {
         conn.response_deferred = true;
     }
 
-    const ForwardRefusal = enum { target_busy, pool_full, inbox_full };
+    const ForwardRefusal = enum { target_busy, inbox_full };
+
+    const NOT_KEEPING_UP = "overloaded: shard {d} is not keeping up; this request was not run — back off and retry";
 
     /// A client's request refused before it was sent to `target`: answered
     /// `overloaded` (it did not run, so resending is safe), counted, and
@@ -1278,22 +1473,17 @@ pub const Shard = struct {
     fn refuseForward(self: *Shard, conn: *Connection, req: proto.Request, target: u16, why: ForwardRefusal) void {
         if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.client_forward);
         var msg_buf: [128]u8 = undefined;
-        const message = switch (why) {
-            .target_busy => std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} is not keeping up; this request was not run — back off and retry", .{target}),
-            .inbox_full => std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} is behind on taking requests; this request was not run — back off and retry", .{target}),
-            .pool_full => std.fmt.bufPrint(&msg_buf, "overloaded: too many requests in flight to other shards; this request was not run — back off and retry", .{}),
-        } catch "overloaded: this request was not run — back off and retry";
+        const message = std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{target}) catch "overloaded: this request was not run — back off and retry";
         self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
         self.forwards_refused += 1;
         const now = nowMs();
         if (now -| self.refuse_warn_ms < WARN_INTERVAL_MS) return;
         self.refuse_warn_ms = now;
         const reason = switch (why) {
-            .target_busy => "it holds its full share of this shard's reply slots",
-            .inbox_full => "its inbox is full",
-            .pool_full => "every reply slot is taken",
+            .target_busy => "it holds its full share of this shard's requests",
+            .inbox_full => "its inbox is full of messages sent on no share",
         };
-        log.warn("shard {d}: refusing client requests for shard {d}: {s} ({d} refused so far; {d} in flight to other shards, {d} of them to shard {d})", .{ self.id, target, reason, self.forwards_refused, self.reply_pool.taken(), self.reply_pool.heldBy(target), target });
+        log.warn("shard {d}: refusing client requests for shard {d}: {s} ({d} refused so far; {d} in flight to other shards, {d} ordinary and {d} blocking to shard {d})", .{ self.id, target, reason, self.forwards_refused, self.reply_pool.taken(), self.reply_pool.heldBy(.ordinary, target), self.reply_pool.heldBy(.blocking, target), target });
     }
 
     // ─── Cross-Shard Walk ────────────────────────────────────────────────
@@ -1414,6 +1604,9 @@ pub const Shard = struct {
             const count = inbox.drain(buf[0..@min(buf.len, inbox.capacity - total)]);
             if (count == 0) break;
             for (buf[0..count]) |msg| {
+                if (self.mailbox.returnShare(msg)) {
+                    if (self.peer_mailboxes) |peers| peers[msg.src_shard].wake.set(.share_returned);
+                }
                 self.handleInboxMessage(msg);
                 total += 1;
             }
@@ -1434,6 +1627,13 @@ pub const Shard = struct {
             .action_start => self.startActionRun(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
+            .cancel_reads => {
+                const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
+                const conn_id: u32 = @truncate(msg.sequence >> 32);
+                // Each dropped read is answered, empty: the asker holds its
+                // slot until an answer comes.
+                self.waiter_pool.removeByConnection(msg.src_shard, fd, conn_id, answerCancelled, @ptrCast(self));
+            },
         }
     }
 
@@ -1604,8 +1804,8 @@ pub const Shard = struct {
         const held = msg.replySlot();
         const slot = self.reply_pool.release(.{ .slot = held.slot, .gen = held.gen }, msg.src_shard) orelse return;
         if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
-        const conn = self.getConnection(slot.fd) orelse return; // connection gone
-        if (conn.id != slot.conn_id) return; // fd reused for a new connection
+        if (slot.answered) return; // its client was told at the deadline
+        const conn = self.forwardAnswered(slot) orelse return;
         if (bytes.len == 0) {
             var buf: [128]u8 = undefined;
             const message = std.fmt.bufPrint(&buf, "internal error: shard {d} lost its answer — the request may still apply", .{msg.src_shard}) catch "internal error: the answer was lost — the request may still apply";
@@ -1615,27 +1815,53 @@ pub const Shard = struct {
         self.flushToClient(slot.fd);
     }
 
+    /// A forwarded request's client is answered, by the other shard or at
+    /// its deadline: the client, if still connected, has one fewer request
+    /// in flight.
+    fn forwardAnswered(self: *Shard, slot: ReplyPool.Slot) ?*Connection {
+        const conn = self.getConnection(slot.fd) orelse return null; // connection gone
+        if (conn.id != slot.conn_id) return null; // fd reused for a new connection
+        conn.forwards_in_flight -|= 1;
+        if (slot.class == .blocking) {
+            const held = conn.blocking_slots[0..conn.blocking_in_flight];
+            for (held, 0..) |t, i| {
+                if (t.slot != slot.index) continue;
+                held[i] = held[held.len - 1];
+                conn.blocking_in_flight -= 1;
+                break;
+            }
+        }
+        return conn;
+    }
+
     /// Answer the clients whose requests another shard has not answered by
-    /// `reply_pool.SLOT_DEADLINE_MS`, and take their slots back: whatever
-    /// lost the answer, the slot is not lost with it.
+    /// their deadline, and take back slots held past `SLOT_DEADLINE_MS`:
+    /// whatever lost the answer, neither the client nor the slot waits for
+    /// ever. Swept every quarter second, so a client is told at most about
+    /// that long after its deadline.
     fn expireReplySlots(self: *Shard) void {
         const now = nowMs();
         if (now < self.reply_sweep_ms) return;
-        self.reply_sweep_ms = now + 1000;
+        self.reply_sweep_ms = now + 250;
         const Expired = struct {
             shard: *Shard,
             count: u64 = 0,
             /// Expired per target, to name the one with the most.
             per_target: [@import("../config/server.zig").MAX_SHARDS]u32 = @splat(0),
-            pub fn expired(ctx: *@This(), slot: ReplyPool.Slot) void {
+            pub fn late(ctx: *@This(), slot: ReplyPool.Slot) void {
                 ctx.count += 1;
                 ctx.per_target[slot.target] += 1;
                 if (ctx.shard.shard_metrics) |sm| sm.recordCrossShardTimeout();
-                const conn = ctx.shard.getConnection(slot.fd) orelse return;
-                if (conn.id != slot.conn_id) return;
+                const conn = ctx.shard.forwardAnswered(slot) orelse return;
+                const after = slot.answer_after_ms / 1000;
                 var buf: [128]u8 = undefined;
-                const message = std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — the request may still apply", .{ slot.target, reply_pool_mod.SLOT_DEADLINE_MS / 1000 }) catch "unavailable: no answer — the request may still apply";
+                const message = if (slot.writes)
+                    std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — the request may still apply", .{ slot.target, after }) catch "unavailable: no answer — the request may still apply"
+                else
+                    std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — retry", .{ slot.target, after }) catch "unavailable: no answer — retry";
                 ctx.shard.sendErrorResponse(conn, slot.request_id, .unavailable, message);
+                // Nothing else may touch an idle client's connection soon.
+                ctx.shard.flushToClient(slot.fd);
             }
         };
         var gone = Expired{ .shard = self };
@@ -1649,7 +1875,7 @@ pub const Shard = struct {
         if (now -| self.expire_warn_ms < WARN_INTERVAL_MS) return;
         self.expire_warn_ms = now;
         const worst = std.mem.indexOfMax(u32, &gone.per_target);
-        log.warn("shard {d}: since the last report, {d} client requests to other shards went unanswered for {d} s (most in this sweep: {d}, to shard {d}); clients still connected were told they may still apply", .{ self.id, self.slots_expired, reply_pool_mod.SLOT_DEADLINE_MS / 1000, gone.per_target[worst], worst });
+        log.warn("shard {d}: since the last report, {d} client requests to other shards went unanswered past their deadline (most in this sweep: {d}, to shard {d}); their clients were told", .{ self.id, self.slots_expired, gone.per_target[worst], worst });
         self.slots_expired = 0;
     }
 
@@ -2885,7 +3111,7 @@ pub const Shard = struct {
         // A readable event can still arrive after a pause (same poll batch,
         // or an interest change not yet submitted); what it would read
         // could not drain, and would look like one oversized request.
-        if (conn.reads_paused or conn.closing) return;
+        if (conn.reads_paused or conn.closing or conn.waiting != null) return;
 
         // Read no more than the read buffer has room for: bytes read and
         // not kept would be requests silently lost.
@@ -2942,7 +3168,22 @@ pub const Shard = struct {
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.
     fn processRequests(self: *Shard, fd: i32, conn: *Connection) void {
+        self.runRequests(fd, conn);
+        // Read again once the request it waited on has gone or been refused.
+        if (conn.reads_held and conn.waiting == null and !conn.reads_paused and !conn.closing) {
+            self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch |err| {
+                log.err("shard {d}: could not read connection fd={d} again: {s}; closing it", .{ self.id, fd, @errorName(err) });
+                return self.markClosing(fd);
+            };
+            conn.reads_held = false;
+        }
+    }
+
+    fn runRequests(self: *Shard, fd: i32, conn: *Connection) void {
         const header_size = @sizeOf(proto.RequestHeader);
+        // A waiting connection is not read (`readFromClient`) or resumed
+        // (`settleConnections`) until `resumeWaiting` lets it go.
+        std.debug.assert(conn.waiting == null);
 
         while (conn.read_buf.readable() >= header_size) {
             if (conn.closing) return;
@@ -2981,12 +3222,25 @@ pub const Shard = struct {
                 }
             };
 
+            const held = self.holdForward(conn, req);
+            if (held != null and conn.give_up_bytes == 0) return self.waitForward(fd, conn, held.?);
+            const waited: ?u64 = if (conn.head_since_ms) |t| nowMs() -| t else null;
+
             const consumed = header_size + req.header.payload_length;
             conn.read_buf.consume(consumed);
+            conn.give_up_bytes -|= consumed;
 
             // Dispatch request, detecting if the handler sent a response
             const pending_before = conn.write_buf.readable();
-            self.dispatchRequest(conn, req);
+            const forwards_before = conn.forwards_in_flight;
+            if (held) |w| self.refuseWaited(conn, req, w, waited) else self.dispatchRequest(conn, req);
+            // Parked here as a blocking read: one more toward its cap.
+            if (held == null and conn.response_deferred and conn.forwards_in_flight == forwards_before and blockingWait(req) != null) conn.local_reads +|= 1;
+            // Its wait is spent (counted into its deadline if it went to
+            // another shard); the next request, should it wait, starts its
+            // own clock at the back of the line.
+            conn.head_since_ms = null;
+            conn.has_turn = false;
 
             // If handler didn't queue any response, check if it was deferred
             if (conn.write_buf.readable() == pending_before) {
@@ -3023,6 +3277,7 @@ pub const Shard = struct {
     /// answers drain (`flushToClient` resumes it) or it stalls.
     fn pauseReads(self: *Shard, fd: i32, conn: *Connection) void {
         conn.reads_paused = true;
+        conn.reads_held = false; // interest is this pause's now
         conn.paused_progress_ms = @import("stdx").time.monotonicMs();
         self.paused_count += 1;
         self.reactor.modifyInterests(fd, .{ .readable = false, .writable = true }) catch {};
@@ -3030,6 +3285,7 @@ pub const Shard = struct {
 
     fn resumeReads(self: *Shard, fd: i32, conn: *Connection) void {
         conn.reads_paused = false;
+        conn.reads_held = false;
         self.paused_count -= 1;
         self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch {};
         // What it had already sent runs at the end of the tick, not inside
@@ -3058,6 +3314,225 @@ pub const Shard = struct {
         }
     }
 
+    /// How long a client's request may wait, unread, for room to go to
+    /// another shard before it is refused, counted from when it first
+    /// waited. Waiting holds its connection's later requests too, so this
+    /// bounds how long any caller waits for room, blocking reads included;
+    /// for a client with one request out, as the SDKs have, the refusal
+    /// arrives before their 5 s request timeout (a pipelined request's
+    /// clock starts when it reaches the head). A request that does go has
+    /// what is left of `reply_pool.DEADLINE_MS`, and at least
+    /// `reply_pool.MIN_DEADLINE_MS`.
+    pub const ASK_WAIT_MS: u64 = 3000;
+
+    comptime {
+        // PAUSE_REASONS: the wait reasons in order, then unsent_answers.
+        const reasons = @typeInfo(Connection.WaitReason).@"enum".fields;
+        std.debug.assert(reasons.len + 1 == ShardMetrics.PAUSE_REASONS.len);
+        for (reasons, ShardMetrics.PAUSE_REASONS[0..reasons.len]) |r, label| std.debug.assert(std.mem.eql(u8, r.name, label));
+    }
+
+    /// Stop reading `conn` until its next request has room to go where it is
+    /// bound, or has waited `ASK_WAIT_MS` (`resumeWaiting`).
+    fn waitForward(self: *Shard, fd: i32, conn: *Connection, w: Connection.Waiting) void {
+        // Paused for its unsent answers, it would not have got this far; the
+        // two pauses never overlap, so neither undoes the other.
+        std.debug.assert(!conn.reads_paused);
+        std.debug.assert(conn.waiting == null);
+        conn.waiting = w;
+        self.setReason(conn, w.reason);
+        // A request waiting for the first time joins the back of the line; one
+        // that lost the room it was resumed for keeps its place.
+        if (conn.head_since_ms == null) {
+            conn.head_since_ms = nowMs();
+            self.wait_seq +%= 1;
+            if (self.wait_seq == 0) self.wait_seq = 1;
+            conn.wait_seq = self.wait_seq;
+            self.waiting_fds.appendAssumeCapacity(.{ .fd = fd, .seq = conn.wait_seq });
+        }
+        if (conn.reads_held) return;
+        self.reactor.modifyInterests(fd, .{ .readable = false, .writable = conn.hasPendingWrites() }) catch |err| {
+            log.err("shard {d}: could not stop reading connection fd={d}: {s}; closing it", .{ self.id, fd, @errorName(err) });
+            return self.markClosing(fd);
+        };
+        conn.reads_held = true;
+    }
+
+    /// `conn` waits for `why` now. Only a wait for the target's room holds
+    /// others back (`queued`): one on the connection's own limits says
+    /// nothing about the target.
+    fn setReason(self: *Shard, conn: *Connection, why: Connection.WaitReason) void {
+        const w = &conn.waiting.?;
+        w.reason = why;
+        const in_line = why == .slots or why == .inbox;
+        if (in_line == conn.in_queue) return;
+        conn.in_queue = in_line;
+        const n = &self.queued[@intFromBool(w.blocking)][w.target];
+        if (in_line) n.* += 1 else n.* -= 1;
+    }
+
+    /// `conn` waits no longer.
+    fn endWait(self: *Shard, conn: *Connection) void {
+        const w = conn.waiting orelse return;
+        if (conn.in_queue) self.queued[@intFromBool(w.blocking)][w.target] -= 1;
+        conn.in_queue = false;
+        conn.waiting = null;
+    }
+
+    /// Answer a request that could not get room in time: it was not run.
+    fn refuseWaited(self: *Shard, conn: *Connection, req: proto.Request, w: Connection.Waiting, waited_ms: ?u64) void {
+        // Refused on the connection's own in-flight limit: the shard holding
+        // its oldest unanswered request, found once per give-up.
+        const blamed = if (w.reason != .in_flight) w.target else conn.give_up_blame orelse blk: {
+            const oldest = self.reply_pool.oldestFor(conn.fd, conn.id) orelse w.target;
+            conn.give_up_blame = oldest;
+            break :blk oldest;
+        };
+        conn.recordRequest();
+        if (self.metrics_registry) |m| m.server.recordCommand();
+        if (self.shard_metrics) |sm| sm.recordCommand();
+        var msg_buf: [160]u8 = undefined;
+        const message = switch (w.reason) {
+            .in_flight => std.fmt.bufPrint(&msg_buf, "overloaded: {d} requests on this connection are still waiting on other shards (the oldest on shard {d}); this request was not run — back off and retry", .{ Connection.MAX_FORWARDS_IN_FLIGHT, blamed }),
+            .blocking_reads => std.fmt.bufPrint(&msg_buf, "overloaded: this connection has {d} blocking reads waiting already; this request was not run — retry once one returns", .{Connection.MAX_BLOCKING_IN_FLIGHT}),
+            .slots => if (w.blocking)
+                std.fmt.bufPrint(&msg_buf, "overloaded: shard {d} has no room for more blocking reads from shard {d}; this read was not run — retry", .{ w.target, self.id })
+            else
+                std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{w.target}),
+            .inbox => std.fmt.bufPrint(&msg_buf, NOT_KEEPING_UP, .{w.target}),
+        } catch "overloaded: this request was not run — back off and retry";
+        self.sendErrorResponse(conn, req.header.request_id, .overloaded, message);
+        if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.client_forward);
+        self.forwards_refused += 1;
+        // Said for the request that waited, once per interval per reason;
+        // those refused behind it are counted.
+        const waited = waited_ms orelse return;
+        const now = nowMs();
+        const last = &self.wait_warn_ms[@intFromEnum(w.reason)];
+        if (now -| last.* < WARN_INTERVAL_MS) return;
+        last.* = now;
+        const why = switch (w.reason) {
+            .in_flight => std.fmt.comptimePrint("its connection had {d} requests unanswered, the oldest on that shard", .{Connection.MAX_FORWARDS_IN_FLIGHT}),
+            .blocking_reads => std.fmt.comptimePrint("its connection had {d} blocking reads out", .{Connection.MAX_BLOCKING_IN_FLIGHT}),
+            .slots => if (w.blocking) "that shard held its share of this shard's blocking reads" else "that shard held its share of this shard's requests",
+            .inbox => "that shard had not drained this shard's share of its inbox",
+        };
+        log.warn("shard {d}: refused a client request after {d} ms waiting on shard {d}: {s} ({d} refused so far; {d} ordinary and {d} blocking in flight to shard {d})", .{ self.id, waited, blamed, why, self.forwards_refused, self.reply_pool.heldBy(.ordinary, blamed), self.reply_pool.heldBy(.blocking, blamed), blamed });
+    }
+
+    /// Resume, in the order their requests began waiting, the connections
+    /// whose next request now has room — no more to one target than it has
+    /// room for, so the rest keep their place and their clock rather than
+    /// all waking to lose the race — and those that have waited
+    /// `ASK_WAIT_MS`, to be refused. A resumed connection sends that one
+    /// request ahead of the line (`Connection.has_turn`); its next waits at
+    /// the back.
+    fn resumeWaiting(self: *Shard) void {
+        if (self.waiting_fds.items.len == 0) return;
+        const now = nowMs();
+        const MAX = @import("../config/server.zig").MAX_SHARDS;
+        // Room per target this pass, worked out when first needed.
+        var slot_room: [2][MAX]i32 = .{ @splat(-1), @splat(-1) };
+        var inbox_room: [MAX]i32 = @splat(-1);
+        var kept: usize = 0;
+        for (self.waiting_fds.items) |entry| {
+            const conn = self.getConnection(entry.fd) orelse continue;
+            // Its head went and a later request waits under a newer entry,
+            // or the fd was reused.
+            if (conn.wait_seq != entry.seq) continue;
+            const w = conn.waiting orelse {
+                // Resumed last pass. Its head went: out of the line. Or it
+                // was paused for its unsent answers first: it keeps its
+                // place, should its head wait again.
+                if (conn.head_since_ms != null) {
+                    self.waiting_fds.items[kept] = entry;
+                    kept += 1;
+                } else conn.wait_seq = 0;
+                continue;
+            };
+            if (conn.closing) continue;
+            const class: reply_pool_mod.Class = if (w.blocking) .blocking else .ordinary;
+            var why = self.stillWaits(conn, .{ .target = w.target, .blocking = w.blocking }, w.reason);
+            const slots = &slot_room[@intFromEnum(class)][w.target];
+            const inbox = &inbox_room[w.target];
+            // A blocking read here waits on nothing shared.
+            const shared = w.target != self.id;
+            if (why == null and shared) {
+                const mailbox = self.peer_mailboxes.?[w.target];
+                if (slots.* < 0) slots.* = self.reply_pool.room(class, w.target);
+                if (inbox.* < 0) inbox.* = mailbox.shareRoom(@intCast(self.id));
+                if (slots.* <= 0) {
+                    why = .slots;
+                } else if (inbox.* <= 0) {
+                    // Those resumed ahead of it will fill the share: be told
+                    // when the target drains it.
+                    why = .inbox;
+                    mailbox.wantShare(@intCast(self.id));
+                }
+            }
+            if (why) |r| {
+                if (now -| conn.head_since_ms.? < ASK_WAIT_MS) {
+                    self.setReason(conn, r);
+                    self.waiting_fds.items[kept] = entry;
+                    kept += 1;
+                    continue;
+                }
+            }
+            self.endWait(conn);
+            // A client that has gone is not answered, and what it sent is
+            // not run.
+            if (peerClosed(entry.fd)) {
+                self.markClosing(entry.fd);
+                continue;
+            }
+            if (why == null) {
+                if (shared) {
+                    slots.* -= 1;
+                    inbox.* -= 1;
+                }
+                conn.has_turn = true;
+            } else {
+                conn.give_up_bytes = conn.read_buf.readable();
+                conn.give_up_blame = null;
+            }
+            if (!conn.resume_queued) {
+                conn.resume_queued = true;
+                self.resume_fds.appendAssumeCapacity(entry.fd);
+            }
+            // Should its head lose the room it was resumed for this tick, it
+            // waits again here, in its place.
+            self.waiting_fds.items[kept] = entry;
+            kept += 1;
+        }
+        self.waiting_fds.shrinkRetainingCapacity(kept);
+    }
+
+    /// Whether the client has gone: its end closed with nothing left to
+    /// read, or reset. A client that only stopped sending is gone too, as a
+    /// read of end-of-stream treats it (`readFromClient`).
+    fn peerClosed(fd: i32) bool {
+        var byte: [1]u8 = undefined;
+        const n = std.c.recv(fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT);
+        if (n == 0) return true;
+        if (n > 0) return false;
+        return std.posix.errno(n) != .AGAIN;
+    }
+
+    /// Set the paused-connections gauge: those waiting, by reason, and
+    /// those paused for their unsent answers.
+    fn countPaused(self: *Shard) void {
+        const sm = self.shard_metrics orelse return;
+        var counts: [ShardMetrics.PAUSE_REASONS.len]u64 = @splat(0);
+        for (self.waiting_fds.items) |entry| {
+            const conn = self.getConnection(entry.fd) orelse continue;
+            if (conn.wait_seq != entry.seq) continue;
+            const w = conn.waiting orelse continue;
+            counts[@intFromEnum(w.reason)] += 1;
+        }
+        counts[counts.len - 1] = self.paused_count;
+        sm.setConnectionsPaused(counts);
+    }
+
     /// Close `fd` once the tick's events are handled: code up the stack may
     /// still hold its connection.
     fn markClosing(self: *Shard, fd: i32) void {
@@ -3071,12 +3546,14 @@ pub const Shard = struct {
     /// connection had buffered once its answers drained or it stalled.
     fn settleConnections(self: *Shard) void {
         self.liftStalledPauses();
+        if (self.pending_cancels.items.len > 0) self.sendPendingCancels();
+        self.resumeWaiting();
         std.mem.swap(std.ArrayListUnmanaged(i32), &self.resume_fds, &self.resume_running);
         var ran = false;
         for (self.resume_running.items) |fd| {
             const conn = self.getConnection(fd) orelse continue;
             conn.resume_queued = false;
-            if (conn.closing or conn.reads_paused) continue;
+            if (conn.closing or conn.reads_paused or conn.waiting != null) continue;
             ran = true;
             switch (conn.protocol) {
                 .resp => self.processRespRequests(fd, conn),
@@ -3092,6 +3569,7 @@ pub const Shard = struct {
             if (conn.closing) self.closeConnection(fd);
         }
         self.closing_fds.clearRetainingCapacity();
+        self.countPaused();
     }
 
     // ─── RESP Protocol Handler ──────────────────────────────────────────
@@ -3922,6 +4400,13 @@ fn serializeWalkKeysAsScan(allocator: std.mem.Allocator, keys: []const []const u
 // ═══════════════════════════════════════════════════════════════════════════════
 // Waiter Callbacks — used by WaiterPool for timeout and resolution
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// A blocking read dropped because its client closed: an empty answer, so
+/// the asking shard's slot for it comes back; nobody reads it.
+fn answerCancelled(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    shard.deliverDeferred(waiter.reply_to, "");
+}
 
 /// Timeout callback: send an appropriate "no data" response based on waiter kind.
 ///
@@ -5127,7 +5612,7 @@ test "Shard: a request forwarded to another shard is answered on the asker's rep
     try std.testing.expect(std.c.read(c.pair[1], &out, out.len) < 0);
 }
 
-test "Shard: an answer the other shard could not send, a request no slot is left for, and one never answered each reach the client, and the slot comes back" {
+test "Shard: an answer the other shard could not send, a request no slot is left for, and one not answered by its deadline each reach the client once, and the slot comes back" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -5162,7 +5647,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     // at once, and told it did not run.
     const p2 = try testRequest(.ping, 52, "", "");
     defer std.testing.allocator.free(p2);
-    while (a.reply_pool.take(1, -1, 0, 0, Shard.nowMs(), false)) |_| {} else |err| try std.testing.expectEqual(error.TargetBusy, err);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |_| {} else |err| try std.testing.expectEqual(error.TargetBusy, err);
     a.forwardToShard(1, c.conn, try proto.Request.parse(p2));
     resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 52), resp.header.request_id);
@@ -5173,14 +5658,19 @@ test "Shard: an answer the other shard could not send, a request no slot is left
         if (s.active) _ = a.reply_pool.release(.{ .slot = @intCast(i), .gen = s.gen }, 1);
     }
 
-    // Never answered: past the deadline its client is told the request may
-    // still apply, the slot comes back, and the late answer is dropped.
+    // Unanswered by their deadlines, a read's client is told to retry and a
+    // write's that it may still apply; the slots stay held for the late
+    // answers, which are dropped when they come.
     const p3 = try testRequest(.ping, 53, "", "");
     defer std.testing.allocator.free(p3);
+    const put = try testRequest(.kv_put, 54, "k", "v");
+    defer std.testing.allocator.free(put);
     a.forwardToShard(1, c.conn, try proto.Request.parse(p3));
+    a.forwardToShard(1, c.conn, try proto.Request.parse(put));
+    try std.testing.expectEqual(@as(u16, 2), c.conn.forwards_in_flight);
     // Waiting since the clock's zero: shown as the oldest wait, not yet
-    // given up on. (Times are set, not subtracted: a monotonic clock can
-    // read less than any interval a test would take off it.)
+    // past a deadline. (Times are set, not subtracted: a monotonic clock
+    // can read less than any interval a test would take off it.)
     for (a.reply_pool.slots) |*s| {
         if (s.active) s.taken_ms = 0;
     }
@@ -5188,22 +5678,89 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     const before = Shard.nowMs() / 1000;
     a.expireReplySlots();
     const after = Shard.nowMs() / 1000;
-    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u16, 2), c.conn.forwards_in_flight);
     const oldest = sm.snapshot().oldest_cross_shard_wait_s;
     try std.testing.expect(oldest >= before and oldest <= after);
-    // The tick sweeps: once past its due time, the slot is taken back
-    // without anything else asking.
+    // The tick sweeps: past their deadlines, the clients are told without
+    // anything else asking.
     for (a.reply_pool.slots) |*s| {
-        if (s.active) s.due_ms = 0;
+        if (s.active) s.answer_due_ms = 0;
     }
     a.reply_sweep_ms = 0;
     _ = try a.tick(0);
-    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().oldest_cross_shard_wait_s);
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(usize, 2), a.reply_pool.taken());
+    // Sent by the sweep itself: nothing else may touch an idle client's
+    // connection, so read the socket without flushing.
+    var told: [2]proto.Response = undefined;
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < 2 * @sizeOf(proto.ResponseHeader) and tries < 1000) : (tries += 1) {
+        const n = std.c.read(c.pair[1], out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    var at: usize = 0;
+    for (&told) |*r| {
+        r.* = try proto.Response.parse(out[at..got]);
+        at += @sizeOf(proto.ResponseHeader) + r.header.data_len;
+    }
+    // In slot order, not send order.
+    const read_told = if (told[0].header.request_id == 53) told[0] else told[1];
+    const write_told = if (told[0].header.request_id == 54) told[0] else told[1];
+    try std.testing.expectEqual(@as(u64, 53), read_told.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), read_told.header.status);
+    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — retry", read_told.data);
+    try std.testing.expectEqual(@as(u64, 54), write_told.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), write_told.header.status);
+    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — the request may still apply", write_told.data);
+    try std.testing.expectEqual(@as(u64, 2), sm.snapshot().cross_shard_timeouts);
+    // The late answers free the slots and reach no one.
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
     try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    a.flushToClient(c.conn.fd);
+    try std.testing.expect(std.c.read(c.pair[1], &out, out.len) < 0);
+
+    // A request whose answer carries what it took waits for that answer as
+    // long as the slot is held.
+    const dq = try testRequest(.queue_dequeue, 56, "q", "");
+    defer std.testing.allocator.free(dq);
+    // Counted from when it is sent, however long it waited: the slot is
+    // not let go before its client is told.
+    c.conn.head_since_ms = 0;
+    a.forwardToShard(1, c.conn, try proto.Request.parse(dq));
+    c.conn.head_since_ms = null;
+    for (a.reply_pool.slots) |s| {
+        if (!s.active) continue;
+        try std.testing.expectEqual(reply_pool_mod.SLOT_DEADLINE_MS, s.answer_after_ms);
+        try std.testing.expectEqual(s.due_ms, s.answer_due_ms);
+        try std.testing.expect(s.writes);
+    }
+    for ([_]proto.OpCode{ .queue_dequeue, .stream_group_read, .stream_group_claim, .action_await }) |op| try std.testing.expect(Shard.takesItems(@intFromEnum(op)));
+    for ([_]proto.OpCode{ .kv_get, .stream_read, .kv_put, .queue_complete }) |op| try std.testing.expect(!Shard.takesItems(@intFromEnum(op)));
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    a.flushToClient(c.conn.fd);
+    while (std.c.read(c.pair[1], &out, out.len) > 0) {}
+
+    // Never answered at all: past the slot's own deadline it comes back.
+    const p4 = try testRequest(.ping, 55, "", "");
+    defer std.testing.allocator.free(p4);
+    a.forwardToShard(1, c.conn, try proto.Request.parse(p4));
+    for (a.reply_pool.slots) |*s| {
+        if (s.active) {
+            s.answer_due_ms = 0;
+            s.due_ms = 0;
+        }
+    }
+    a.reply_sweep_ms = 0;
+    _ = try a.tick(0);
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().oldest_cross_shard_wait_s);
     resp = try nextAnswer(c, a, &out);
-    try std.testing.expectEqual(@as(u64, 53), resp.header.request_id);
+    try std.testing.expectEqual(@as(u64, 55), resp.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
-    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_timeouts);
     _ = b.drainInbox();
     _ = a.drainInbox();
     a.flushToClient(c.conn.fd);
@@ -5223,6 +5780,785 @@ test "Shard: an answer for another shard's client that holds no reply slot is dr
     try std.testing.expectEqual(@as(usize, 0), two.shards[0].mailbox.replies.pending());
 }
 
+/// A key `a` sends to shard `target`, for requests that must go there.
+fn keyOwnedBy(a: *Shard, target: u16, buf: []u8) ![]const u8 {
+    for (0..1000) |i| {
+        const key = try std.fmt.bufPrint(buf, "k{d}", .{i});
+        const bytes = try testRequest(.kv_get, 0, key, "");
+        defer std.testing.allocator.free(bytes);
+        const to = a.forwardTarget(try proto.Request.parse(bytes)) orelse continue;
+        if (to.target == target) return key;
+    }
+    return error.NoKeyForShard;
+}
+
+/// The answers waiting on a test client's socket, parsed in order.
+fn answersOn(c: TestClient, shard: *Shard, out: []u8, into: []proto.Response) !void {
+    const got = try readAnswer(c.pair[1], shard, c.conn.fd, out, into.len * @sizeOf(proto.ResponseHeader));
+    var at: usize = 0;
+    for (into) |*r| {
+        r.* = try proto.Response.parse(out[at..got]);
+        at += @sizeOf(proto.ResponseHeader) + r.header.data_len;
+    }
+    try std.testing.expectEqual(got, at);
+}
+
+fn pausedFor(sm: *const ShardMetrics, why: Connection.WaitReason) u64 {
+    return sm.snapshot().connections_paused[@intFromEnum(why)];
+}
+
+test "Shard: a connection with 64 requests waiting on other shards is not read until one is answered; its next request then goes" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    try a.reactor.addSource(.{ .fd = c.conn.fd, .tag = .client_read, .interests = .{ .readable = true } });
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+
+    const n = Connection.MAX_FORWARDS_IN_FLIGHT + 1;
+    var reqs: [n][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 100 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const all = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(all.len, feedClient(c.pair[1], a, c.conn.fd, all));
+
+    // The last stays unread, and nothing about it has run.
+    try std.testing.expectEqual(@as(usize, n - 1), a.reply_pool.taken());
+    try std.testing.expectEqual(Connection.MAX_FORWARDS_IN_FLIGHT, c.conn.forwards_in_flight);
+    try std.testing.expectEqual(Connection.WaitReason.in_flight, c.conn.waiting.?.reason);
+    try std.testing.expectEqual(reqs[n - 1].len, c.conn.read_buf.readable());
+    try std.testing.expectEqual(@as(u64, n - 1), a.requests_dispatched);
+    // Waiting on its own limit, it holds no one else back from shard 1.
+    {
+        const other = try TestClient.open(a);
+        defer _ = std.c.close(other.pair[1]);
+        const one = try testRequest(.kv_get, 950, key, "");
+        defer std.testing.allocator.free(one);
+        try std.testing.expectEqual(one.len, feedClient(other.pair[1], a, other.conn.fd, one));
+        try std.testing.expect(other.conn.waiting == null);
+        try std.testing.expectEqual(@as(u16, 1), other.conn.forwards_in_flight);
+        a.closeConnection(other.conn.fd);
+    }
+    try std.testing.expect(!a.reactor.sources.get(c.conn.fd).?.interests.readable);
+    // What the client sends meanwhile stays in the kernel, not read.
+    const later = try testRequest(.ping, 999, "", "");
+    defer std.testing.allocator.free(later);
+    try std.testing.expectEqual(@as(isize, @intCast(later.len)), std.c.write(c.pair[1], later.ptr, later.len));
+    a.readFromClient(c.conn.fd);
+    try std.testing.expectEqual(reqs[n - 1].len, c.conn.read_buf.readable());
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting != null);
+    try std.testing.expectEqual(@as(u64, 1), pausedFor(&sm, .in_flight));
+
+    // Answered, the connection's count comes down, and at the end of the
+    // tick its next request goes.
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expect(a.reactor.sources.get(c.conn.fd).?.interests.readable);
+    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u16, 1), c.conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(usize, 0), c.conn.read_buf.readable());
+    try std.testing.expectEqual(@as(u64, 0), pausedFor(&sm, .in_flight));
+    a.readFromClient(c.conn.fd);
+    try std.testing.expectEqual(@as(u64, n + 2), a.requests_dispatched);
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+    var out: [64 * 1024]u8 = undefined;
+    var answers: [n + 1]proto.Response = undefined;
+    try answersOn(c, a, &out, &answers);
+    // The ping ran here while the last get was on its way.
+    for (answers[0 .. n - 1], 0..) |r, i| try std.testing.expectEqual(@as(u64, 100 + i), r.header.request_id);
+    try std.testing.expectEqual(@as(u64, 999), answers[n - 1].header.request_id);
+    try std.testing.expectEqual(@as(u64, 100 + n - 1), answers[n].header.request_id);
+}
+
+test "Shard: a connection has at most 8 blocking reads on other shards; the next waits, holding what is behind it, and once it has waited ASK_WAIT_MS is refused unrun, with the reads buffered behind it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, 5000);
+
+    // Ten blocking reads of a key nobody writes, then a request for this
+    // shard.
+    const reads = Connection.MAX_BLOCKING_IN_FLIGHT + 2;
+    var reqs: [reads + 1][]u8 = undefined;
+    for (reqs[0..reads], 0..) |*r, i| r.* = try testRequestWith(.kv_get, 200 + i, key, "", ob.getOptions());
+    reqs[reads] = try testRequest(.ping, 300, "", "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const all = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(all.len, feedClient(c.pair[1], a, c.conn.fd, all));
+    while (b.drainInbox() > 0) {}
+    try std.testing.expectEqual(@as(u16, Connection.MAX_BLOCKING_IN_FLIGHT), b.waiter_pool.countByKind(.kv_get));
+    try std.testing.expectEqual(Connection.MAX_BLOCKING_IN_FLIGHT, c.conn.blocking_in_flight);
+    try std.testing.expectEqual(Connection.MAX_BLOCKING_IN_FLIGHT, a.reply_pool.heldBy(.blocking, 1));
+    for (a.reply_pool.slots) |s| {
+        if (s.active) try std.testing.expectEqual(5000 + reply_pool_mod.DEADLINE_MS, s.answer_after_ms);
+    }
+    try std.testing.expectEqual(Connection.WaitReason.blocking_reads, c.conn.waiting.?.reason);
+    try std.testing.expectEqual(@as(u64, Connection.MAX_BLOCKING_IN_FLIGHT), a.requests_dispatched);
+
+    // Ordinary requests from another connection still go.
+    const other = try TestClient.open(a);
+    defer _ = std.c.close(other.pair[1]);
+    const get = try testRequest(.kv_get, 400, key, "");
+    defer std.testing.allocator.free(get);
+    try std.testing.expectEqual(get.len, feedClient(other.pair[1], a, other.conn.fd, get));
+    try std.testing.expect(other.conn.waiting == null);
+    try std.testing.expectEqual(@as(usize, Connection.MAX_BLOCKING_IN_FLIGHT + 1), a.reply_pool.taken());
+
+    // Still in time: nothing changes.
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting != null);
+
+    // Waited long enough (set, not subtracted: a monotonic clock can read
+    // less than an interval a test would take off it): both reads over the
+    // cap are refused together, told they did not run, and the request
+    // behind them runs.
+    c.conn.head_since_ms = 0;
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(u64, Connection.MAX_BLOCKING_IN_FLIGHT + 2), a.requests_dispatched);
+    try std.testing.expectEqual(@as(usize, 0), c.conn.read_buf.readable());
+    var out: [1024]u8 = undefined;
+    var answers: [3]proto.Response = undefined;
+    try answersOn(c, a, &out, &answers);
+    for (answers[0..2], 0..) |r, i| {
+        try std.testing.expectEqual(@as(u64, 200 + Connection.MAX_BLOCKING_IN_FLIGHT + i), r.header.request_id);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), r.header.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.data, "was not run") != null);
+    }
+    try std.testing.expectEqual(@as(u64, 300), answers[2].header.request_id);
+    try std.testing.expectEqualStrings("PONG", answers[2].data);
+    try std.testing.expectEqual(Connection.MAX_BLOCKING_IN_FLIGHT, c.conn.blocking_in_flight);
+    // Its reads' clients told at their deadline, the connection's counts
+    // come down with them.
+    for (a.reply_pool.slots) |*s| {
+        if (s.active) s.answer_due_ms = 0;
+    }
+    a.reply_sweep_ms = 0;
+    a.expireReplySlots();
+    try std.testing.expectEqual(@as(u16, 0), c.conn.blocking_in_flight);
+    try std.testing.expectEqual(@as(u16, 0), c.conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(u16, 0), other.conn.forwards_in_flight);
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
+test "Shard: a request waits while its target holds its share of ask slots or has no room in its inbox, and goes once there is" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    const get = try testRequest(.kv_get, 500, key, "");
+    defer std.testing.allocator.free(get);
+
+    // Shard 1 holds its full share of ordinary slots.
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+    // A wait over the cap is not held for room: dispatch refuses it.
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, waiter_pool_mod.MAX_BLOCK_MS + 1);
+    const too_long = try testRequestWith(.kv_get, 499, key, "", ob.getOptions());
+    defer std.testing.allocator.free(too_long);
+    // At its blocking cap, it would otherwise wait.
+    c.conn.blocking_in_flight = Connection.MAX_BLOCKING_IN_FLIGHT;
+    try std.testing.expect(a.holdForward(c.conn, try proto.Request.parse(too_long)) == null);
+    c.conn.blocking_in_flight = 0;
+
+    try std.testing.expectEqual(get.len, feedClient(c.pair[1], a, c.conn.fd, get));
+    try std.testing.expectEqual(Connection.WaitReason.slots, c.conn.waiting.?.reason);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u64, 1), pausedFor(&sm, .slots));
+
+    // A slot back, but this shard's share of shard 1's inbox unread.
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    while (b.mailbox.hasShare(0)) try std.testing.expect(b.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = 0 }));
+    a.settleConnections();
+    try std.testing.expectEqual(Connection.WaitReason.inbox, c.conn.waiting.?.reason);
+    try std.testing.expectEqual(@as(u64, 0), pausedFor(&sm, .slots));
+    try std.testing.expectEqual(@as(u64, 1), pausedFor(&sm, .inbox));
+    try std.testing.expectEqual(@as(usize, tickets.items.len), a.reply_pool.taken());
+
+    // Some drained, but taken again before this shard looks: it asks to be
+    // told again.
+    try std.testing.expect(b.mailbox.shares[0].wanted.load(.seq_cst));
+    var one: [1]InboxMessage = undefined;
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.drain(&one));
+    try std.testing.expect(b.mailbox.returnShare(one[0]));
+    try std.testing.expect(b.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = 0 }));
+    a.settleConnections();
+    try std.testing.expectEqual(Connection.WaitReason.inbox, c.conn.waiting.?.reason);
+    try std.testing.expect(b.mailbox.shares[0].wanted.load(.seq_cst));
+
+    // Shard 1 drains it and wakes this shard, and the request goes.
+    _ = a.mailbox.wake.take();
+    while (b.drainInbox() > 0) {}
+    try std.testing.expect(a.mailbox.wake.take() & mailbox_mod.Flag.share_returned.bit() != 0);
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(usize, tickets.items.len + 1), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u64, 0), pausedFor(&sm, .inbox));
+
+    // A connection closed while it waits leaves nothing behind.
+    for (tickets.items) |t| _ = a.reply_pool.release(t, 1);
+    while (b.mailbox.hasShare(0)) try std.testing.expect(b.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = 0 }));
+    const again = try testRequest(.kv_get, 501, key, "");
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqual(again.len, feedClient(c.pair[1], a, c.conn.fd, again));
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u64, 1), pausedFor(&sm, .inbox));
+    a.closeConnection(c.conn.fd);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(usize, 0), a.waiting_fds.items.len);
+    try std.testing.expectEqual(@as(u64, 0), pausedFor(&sm, .inbox));
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
+test "Shard: waiting connections go in the order they began waiting, no more than there is room for; the rest keep their place and their clock, and a client gone meanwhile is not run" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+
+    // Shard 1 holds its full share of ordinary slots.
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+
+    // Three clients wait for it; the first has a second request behind its
+    // first.
+    var clients: [3]TestClient = undefined;
+    for (&clients) |*cl| cl.* = try TestClient.open(a);
+    defer for (clients[0..2]) |cl| {
+        _ = std.c.close(cl.pair[1]);
+    };
+    var reqs: [4][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 600 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const first_two = try std.mem.concat(std.testing.allocator, u8, reqs[0..2]);
+    defer std.testing.allocator.free(first_two);
+    try std.testing.expectEqual(first_two.len, feedClient(clients[0].pair[1], a, clients[0].conn.fd, first_two));
+    for (clients[1..], reqs[2..]) |cl, r| try std.testing.expectEqual(r.len, feedClient(cl.pair[1], a, cl.conn.fd, r));
+    for (clients) |cl| try std.testing.expect(cl.conn.waiting != null);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u64, 3), pausedFor(&sm, .slots));
+    const since = clients[1].conn.head_since_ms.?;
+
+    // One slot back: only the first goes. Its second request, with no room
+    // either, waits rather than being refused; the others keep waiting on
+    // their first clock.
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u16, 1), clients[0].conn.forwards_in_flight);
+    try std.testing.expectEqual(Connection.WaitReason.slots, clients[0].conn.waiting.?.reason);
+    try std.testing.expectEqual(reqs[1].len, clients[0].conn.read_buf.readable());
+    for (clients[1..]) |cl| {
+        try std.testing.expect(cl.conn.waiting != null);
+        try std.testing.expectEqual(@as(u16, 0), cl.conn.forwards_in_flight);
+    }
+    try std.testing.expectEqual(since, clients[1].conn.head_since_ms.?);
+    try std.testing.expectEqual(@as(u64, 3), pausedFor(&sm, .slots));
+
+    // One slot back, and the third's client gone meanwhile: the line goes
+    // round a request at a time, so the second, ahead of the first's second
+    // request, takes it; the third is closed without running.
+    _ = std.c.close(clients[2].pair[1]);
+    clients[2].conn.head_since_ms = 0;
+    // The second has waited 2.5 s: a second is left it once sent.
+    const second_since = Shard.nowMs() -| 2500;
+    clients[1].conn.head_since_ms = second_since;
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    const dispatched = a.requests_dispatched;
+    const refused_before = a.forwards_refused;
+    const fd2 = clients[2].conn.fd;
+    a.settleConnections();
+    try std.testing.expectEqual(dispatched + 1, a.requests_dispatched);
+    try std.testing.expectEqual(refused_before, a.forwards_refused);
+    try std.testing.expectEqual(@as(u16, 1), clients[1].conn.forwards_in_flight);
+    try std.testing.expect(clients[1].conn.waiting == null);
+    // Its deadline counts from when it first waited, with a second at least
+    // once sent.
+    for (a.reply_pool.slots) |s| {
+        if (s.active and s.request_id == 602) try std.testing.expectEqual(@max(second_since + reply_pool_mod.DEADLINE_MS, s.taken_ms + reply_pool_mod.MIN_DEADLINE_MS), s.answer_due_ms);
+    }
+    try std.testing.expectEqual(@as(u16, 1), clients[0].conn.forwards_in_flight);
+    try std.testing.expect(clients[0].conn.waiting != null);
+    try std.testing.expect(a.getConnection(fd2) == null);
+    try std.testing.expectEqual(@as(u64, 1), pausedFor(&sm, .slots));
+
+    // The first's second request has waited ASK_WAIT_MS with no room: it is
+    // refused, unrun.
+    clients[0].conn.head_since_ms = 0;
+    a.settleConnections();
+    try std.testing.expect(clients[0].conn.waiting == null);
+    try std.testing.expectEqual(refused_before + 1, a.forwards_refused);
+    try std.testing.expectEqual(@as(u64, 0), pausedFor(&sm, .slots));
+    var out: [512]u8 = undefined;
+    var answers: [2]proto.Response = undefined;
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+    try answersOn(clients[0], a, &out, &answers);
+    const refused = if (answers[0].header.request_id == 601) answers[0] else answers[1];
+    try std.testing.expectEqual(@as(u64, 601), refused.header.request_id);
+    try std.testing.expectEqualStrings("overloaded: shard 1 is not keeping up; this request was not run — back off and retry", refused.data);
+}
+
+test "Shard: a give-up survives a pause for unsent answers: the requests behind it that would wait are refused when reading resumes" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    var sm = ShardMetrics{ .shard_id = 0 };
+    a.shard_metrics = &sm;
+    defer a.shard_metrics = null;
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+
+    var reqs: [2][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 700 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const both = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(both);
+    try std.testing.expectEqual(both.len, feedClient(c.pair[1], a, c.conn.fd, both));
+    try std.testing.expect(c.conn.waiting != null);
+
+    // Unsent answers past the pause mark, and a client not reading them.
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+    const filler = try std.testing.allocator.alloc(u8, 2 * Shard.PAUSE_READS_AT);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 0);
+    _ = c.conn.queueWrite(filler);
+    c.conn.head_since_ms = 0;
+    a.settleConnections();
+    // Given up on, but paused for its unsent answers before either request
+    // is refused.
+    try std.testing.expect(c.conn.reads_paused);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().connections_paused[ShardMetrics.PAUSE_REASONS.len - 1]);
+    try std.testing.expectEqual(both.len, c.conn.read_buf.readable());
+    try std.testing.expectEqual(both.len, c.conn.give_up_bytes);
+    try std.testing.expectEqual(@as(u64, 0), a.forwards_refused);
+
+    // Drained, it reads on: both are refused at once, not made to wait.
+    var sink: [16 * 1024]u8 = undefined;
+    while (c.conn.reads_paused) {
+        _ = std.c.read(c.pair[1], &sink, sink.len);
+        a.flushToClient(c.conn.fd);
+    }
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(usize, 0), c.conn.give_up_bytes);
+    try std.testing.expectEqual(@as(usize, 0), c.conn.read_buf.readable());
+    try std.testing.expectEqual(@as(u64, 2), a.forwards_refused);
+}
+
+test "Shard: a client that closes has its blocking reads on another shard dropped there, and their slots come back with the empty answers" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, 60_000);
+    var reqs: [2][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequestWith(.kv_get, 800 + i, key, "", ob.getOptions());
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const both = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(both);
+    try std.testing.expectEqual(both.len, feedClient(c.pair[1], a, c.conn.fd, both));
+    while (b.drainInbox() > 0) {}
+    try std.testing.expectEqual(@as(u16, 2), b.waiter_pool.countByKind(.kv_get));
+    try std.testing.expectEqual(@as(usize, 2), a.reply_pool.taken());
+
+    _ = std.c.close(c.pair[1]);
+    a.closeConnection(c.conn.fd);
+    // Held until answered, so the slots never count for less than what is
+    // parked there; one word to shard 1 for both reads.
+    try std.testing.expectEqual(@as(usize, 2), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.pending());
+    while (b.drainInbox() > 0) {}
+    try std.testing.expectEqual(@as(u16, 0), b.waiter_pool.countByKind(.kv_get));
+    try std.testing.expectEqual(@as(usize, 2), a.mailbox.replies.pending());
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+    try std.testing.expectEqual(@as(u64, 0), a.replies_dropped + b.replies_dropped);
+}
+
+test "Shard: a closing client's blocking read already answered is not cancelled, and the slot it had, now another's, is left alone" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var keys: [2][16]u8 = undefined;
+    var names: [2][]const u8 = undefined;
+    var found: usize = 0;
+    for (0..1000) |i| {
+        if (found == 2) break;
+        const k = try std.fmt.bufPrint(&keys[found], "k{d}", .{i});
+        const probe = try testRequest(.kv_get, 0, k, "");
+        defer std.testing.allocator.free(probe);
+        const to = a.forwardTarget(try proto.Request.parse(probe)) orelse continue;
+        if (to.target != 1) continue;
+        names[found] = k;
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found);
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, 60_000);
+
+    // A client reads both keys, blocking; the first is written and answered.
+    const c = try TestClient.open(a);
+    var reads: [2][]u8 = undefined;
+    for (&reads, names, 0..) |*r, k, i| r.* = try testRequestWith(.kv_get, 810 + i, k, "", ob.getOptions());
+    defer for (reads) |r| std.testing.allocator.free(r);
+    const both = try std.mem.concat(std.testing.allocator, u8, &reads);
+    defer std.testing.allocator.free(both);
+    try std.testing.expectEqual(both.len, feedClient(c.pair[1], a, c.conn.fd, both));
+    while (b.drainInbox() > 0) {}
+    const writer = try TestClient.open(b);
+    defer _ = std.c.close(writer.pair[1]);
+    const put = try testRequest(.kv_put, 820, names[0], "v");
+    defer std.testing.allocator.free(put);
+    try std.testing.expectEqual(put.len, feedClient(writer.pair[1], b, writer.conn.fd, put));
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(u16, 1), c.conn.blocking_in_flight);
+
+    // Another client's read takes the freed slot; then the first closes.
+    const d = try TestClient.open(a);
+    defer _ = std.c.close(d.pair[1]);
+    const again = try testRequestWith(.kv_get, 831, names[1], "", ob.getOptions());
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqual(again.len, feedClient(d.pair[1], a, d.conn.fd, again));
+    _ = std.c.close(c.pair[1]);
+    a.closeConnection(c.conn.fd);
+    // One cancel, on this shard's share of shard 1's inbox.
+    try std.testing.expectEqual(@as(u16, 2), b.mailbox.shares[0].unread.load(.seq_cst));
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+    // The other client's read still waits there, and is answered.
+    try std.testing.expectEqual(@as(u16, 1), b.waiter_pool.countByKind(.kv_get));
+    const put2 = try testRequest(.kv_put, 821, names[1], "w");
+    defer std.testing.allocator.free(put2);
+    try std.testing.expectEqual(put2.len, feedClient(writer.pair[1], b, writer.conn.fd, put2));
+    _ = a.drainInbox();
+    var out: [256]u8 = undefined;
+    const answer = try nextAnswer(d, a, &out);
+    try std.testing.expectEqual(@as(u64, 831), answer.header.request_id);
+    // A woken get answers the key's version, then its value.
+    try std.testing.expectEqual(@as(usize, 9), answer.data.len);
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, answer.data[0..8], .little));
+    try std.testing.expectEqualStrings("w", answer.data[8..]);
+}
+
+test "Shard: a closing client's cancel that finds no room in the target's inbox is sent once there is" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, 60_000);
+    const read = try testRequestWith(.kv_get, 840, key, "", ob.getOptions());
+    defer std.testing.allocator.free(read);
+    try std.testing.expectEqual(read.len, feedClient(c.pair[1], a, c.conn.fd, read));
+    while (b.drainInbox() > 0) {}
+    try std.testing.expectEqual(@as(u16, 1), b.waiter_pool.countByKind(.kv_get));
+
+    // This shard's share of shard 1's inbox is full when the client closes.
+    while (b.mailbox.hasShare(0)) try std.testing.expect(b.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = 0 }));
+    _ = std.c.close(c.pair[1]);
+    a.closeConnection(c.conn.fd);
+    try std.testing.expectEqual(@as(usize, 1), a.pending_cancels.items.len);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(usize, 1), a.pending_cancels.items.len);
+    // Drained, the cancel goes, and the read is dropped there.
+    while (b.drainInbox() > 0) {}
+    a.settleConnections();
+    try std.testing.expectEqual(@as(usize, 0), a.pending_cancels.items.len);
+    while (b.drainInbox() > 0) {}
+    try std.testing.expectEqual(@as(u16, 0), b.waiter_pool.countByKind(.kv_get));
+    _ = a.drainInbox();
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+}
+
+test "Shard: room that comes back goes one request to each waiter in turn: a resumed connection's next request waits behind the rest" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+    var clients: [3]TestClient = undefined;
+    for (&clients) |*cl| cl.* = try TestClient.open(a);
+    defer for (clients) |cl| {
+        _ = std.c.close(cl.pair[1]);
+    };
+    // The first pipelines two requests; the others send one each.
+    var reqs: [4][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 900 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const first_two = try std.mem.concat(std.testing.allocator, u8, reqs[0..2]);
+    defer std.testing.allocator.free(first_two);
+    try std.testing.expectEqual(first_two.len, feedClient(clients[0].pair[1], a, clients[0].conn.fd, first_two));
+    for (clients[1..], reqs[2..]) |cl, r| try std.testing.expectEqual(r.len, feedClient(cl.pair[1], a, cl.conn.fd, r));
+
+    // Room for two: the first and the second each send one; the first's
+    // next request and the third wait.
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u16, 1), clients[0].conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(u16, 1), clients[1].conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(u16, 0), clients[2].conn.forwards_in_flight);
+    try std.testing.expect(clients[0].conn.waiting != null);
+    try std.testing.expect(clients[2].conn.waiting != null);
+    try std.testing.expect(!clients[2].conn.has_turn);
+    while (two.shards[1].drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
+test "Shard: a waiter held back only because those ahead of it will fill the target's inbox share asks to be woken when it drains" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+    var clients: [2]TestClient = undefined;
+    for (&clients) |*cl| cl.* = try TestClient.open(a);
+    defer for (clients) |cl| {
+        _ = std.c.close(cl.pair[1]);
+    };
+    var reqs: [2][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 890 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    for (clients, reqs) |cl, r| try std.testing.expectEqual(r.len, feedClient(cl.pair[1], a, cl.conn.fd, r));
+    for (clients) |cl| try std.testing.expectEqual(Connection.WaitReason.slots, cl.conn.waiting.?.reason);
+
+    // Room in shard 1's inbox for one more; slots come back for both.
+    while (b.mailbox.shareRoom(0) > 1) try std.testing.expect(b.mailbox.sendOnShare(.{ .tag = .forward_request, .src_shard = 0 }));
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    a.settleConnections();
+    try std.testing.expect(clients[0].conn.waiting == null);
+    try std.testing.expectEqual(Connection.WaitReason.inbox, clients[1].conn.waiting.?.reason);
+    try std.testing.expect(b.mailbox.shares[0].wanted.load(.seq_cst));
+    while (b.drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
+test "Shard: a wait on a connection's own limit that becomes a wait for the target's room joins that target's line" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+    // At its own in-flight limit (set, as if 64 were out): not in the line.
+    c.conn.forwards_in_flight = Connection.MAX_FORWARDS_IN_FLIGHT;
+    const get = try testRequest(.kv_get, 860, key, "");
+    defer std.testing.allocator.free(get);
+    try std.testing.expectEqual(get.len, feedClient(c.pair[1], a, c.conn.fd, get));
+    try std.testing.expectEqual(Connection.WaitReason.in_flight, c.conn.waiting.?.reason);
+    try std.testing.expectEqual(@as(u32, 0), a.queued[0][1]);
+    // Its answers come back; now it waits for shard 1's room, in its line.
+    c.conn.forwards_in_flight = 0;
+    a.settleConnections();
+    try std.testing.expectEqual(Connection.WaitReason.slots, c.conn.waiting.?.reason);
+    try std.testing.expectEqual(@as(u32, 1), a.queued[0][1]);
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(u32, 0), a.queued[0][1]);
+    while (two.shards[1].drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
+test "Shard: a connection's blocking reads on its own shard count toward its 8: the ninth waits until one returns" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var opt_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opt_buf);
+    try ob.addU32(.block_ms, 60_000);
+    var reqs: [Connection.MAX_BLOCKING_IN_FLIGHT + 1][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequestWith(.kv_get, 870 + i, "absent", "", ob.getOptions());
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const all = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(all.len, feedClient(c.pair[1], &shard, c.conn.fd, all));
+    try std.testing.expectEqual(@as(u16, Connection.MAX_BLOCKING_IN_FLIGHT), shard.waiter_pool.countByKind(.kv_get));
+    try std.testing.expectEqual(Connection.WaitReason.blocking_reads, c.conn.waiting.?.reason);
+
+    // The key is written: the eight return, and the ninth goes.
+    const writer = try TestClient.open(&shard);
+    defer _ = std.c.close(writer.pair[1]);
+    const put = try testRequest(.kv_put, 880, "absent", "v");
+    defer std.testing.allocator.free(put);
+    try std.testing.expectEqual(put.len, feedClient(writer.pair[1], &shard, writer.conn.fd, put));
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.kv_get));
+    shard.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(usize, 0), c.conn.read_buf.readable());
+}
+
+test "Shard: a connection resumed but paused for its unsent answers before its request goes stays in line, and is refused in time if it waits again" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+    const get = try testRequest(.kv_get, 970, key, "");
+    defer std.testing.allocator.free(get);
+    try std.testing.expectEqual(get.len, feedClient(c.pair[1], a, c.conn.fd, get));
+    try std.testing.expect(c.conn.waiting != null);
+    // Began waiting a second ago, so a clock started again would show.
+    c.conn.head_since_ms = c.conn.head_since_ms.? -| 1000;
+    const since = c.conn.head_since_ms.?;
+
+    // Answers it is not reading, past the pause mark.
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
+    const filler = try std.testing.allocator.alloc(u8, 2 * Shard.PAUSE_READS_AT);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 0);
+    _ = c.conn.queueWrite(filler);
+
+    // Room comes back; resumed, it pauses before its request goes.
+    const freed = tickets.pop().?;
+    _ = a.reply_pool.release(freed, 1);
+    a.settleConnections();
+    try std.testing.expect(c.conn.reads_paused);
+    try std.testing.expect(c.conn.waiting == null);
+    a.settleConnections();
+    // The room is taken meanwhile; its answers drain and it reads on.
+    try tickets.append(std.testing.allocator, try a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0));
+    var sink: [16 * 1024]u8 = undefined;
+    while (c.conn.reads_paused) {
+        _ = std.c.read(c.pair[1], &sink, sink.len);
+        a.flushToClient(c.conn.fd);
+    }
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting != null);
+    // Its clock runs from its first wait.
+    try std.testing.expectEqual(since, c.conn.head_since_ms.?);
+    // In line still, and so refused once it has waited ASK_WAIT_MS.
+    c.conn.head_since_ms = 0;
+    a.settleConnections();
+    try std.testing.expect(c.conn.waiting == null);
+    try std.testing.expectEqual(@as(u64, 1), a.forwards_refused);
+    try std.testing.expectEqual(@as(u32, 0), a.queued[0][1]);
+}
+
+test "Shard: a new request for a target waits behind connections already waiting for it, even with room come back" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    var key_buf: [16]u8 = undefined;
+    const key = try keyOwnedBy(a, 1, &key_buf);
+    var tickets: std.ArrayListUnmanaged(ReplyPool.Ticket) = .empty;
+    defer tickets.deinit(std.testing.allocator);
+    while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |t| try tickets.append(std.testing.allocator, t) else |_| {}
+
+    const first = try TestClient.open(a);
+    defer _ = std.c.close(first.pair[1]);
+    const later = try TestClient.open(a);
+    defer _ = std.c.close(later.pair[1]);
+    var reqs: [2][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try testRequest(.kv_get, 900 + i, key, "");
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    try std.testing.expectEqual(reqs[0].len, feedClient(first.pair[1], a, first.conn.fd, reqs[0]));
+    try std.testing.expect(first.conn.waiting != null);
+
+    // A slot comes back before the tick ends; a request read now does not
+    // take it from the one already waiting.
+    _ = a.reply_pool.release(tickets.pop().?, 1);
+    try std.testing.expectEqual(reqs[1].len, feedClient(later.pair[1], a, later.conn.fd, reqs[1]));
+    try std.testing.expect(later.conn.waiting != null);
+    a.settleConnections();
+    try std.testing.expectEqual(@as(u16, 1), first.conn.forwards_in_flight);
+    try std.testing.expectEqual(@as(u16, 0), later.conn.forwards_in_flight);
+    try std.testing.expect(later.conn.waiting != null);
+    while (two.shards[1].drainInbox() > 0) {}
+    _ = a.drainInbox();
+}
+
 /// Feed `data` to the shard through the client's socket end, reading on the
 /// shard's side as the kernel buffer fills, then until the shard has taken
 /// everything written (a kernel may still hold the tail after the last
@@ -5237,7 +6573,7 @@ fn feedClient(client_fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, data: []co
         }
         shard.readFromClient(conn_fd);
         const conn = shard.getConnection(conn_fd) orelse break;
-        if (conn.closing or conn.reads_paused) break;
+        if (conn.closing or conn.reads_paused or conn.waiting != null) break;
         if (sent == data.len and unreadBytes(conn_fd) == 0) break;
     }
     return sent;
