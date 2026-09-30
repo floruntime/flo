@@ -94,9 +94,17 @@ pub const SystemManifest = struct {
         try w.print("  \"version\": \"{s}\"\n", .{CURRENT_VERSION});
         try w.writeAll("}\n");
 
-        const file = try @import("stdx").fs.createFile(path, .{});
-        defer @import("stdx").fs.closeFile(file);
-        try @import("stdx").fs.writeAll(file, aw.written());
+        // Written in place, a crash mid-write leaves a torn SYSTEM file that
+        // every later boot refuses; write aside, sync, then rename.
+        const tmp_path = try std.fs.path.join(allocator, &.{ data_path, FILENAME ++ ".tmp" });
+        defer allocator.free(tmp_path);
+        {
+            const file = try @import("stdx").fs.createFile(tmp_path, .{});
+            defer @import("stdx").fs.closeFile(file);
+            try @import("stdx").fs.writeAll(file, aw.written());
+            try @import("stdx").fs.sync(file);
+        }
+        try @import("stdx").fs.renameDurable(tmp_path, path);
     }
 
     /// Validate that the running configuration matches manifested topology.
@@ -157,7 +165,7 @@ pub fn ensureTopology(
     requested_partitions: u32,
 ) !void {
     // Ensure data directory exists
-    @import("stdx").fs.makePath(data_path) catch |err| {
+    @import("stdx").fs.makePathDurable(data_path) catch |err| {
         if (err != error.PathAlreadyExists) {
             log.err("failed to create data directory: {s} err={any}", .{ data_path, err });
             return err;
@@ -194,7 +202,9 @@ test "create and load manifest" {
     const path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", allocator);
     defer allocator.free(path);
 
+    const before = @import("stdx").fs.dir_syncs.load(.monotonic);
     try SystemManifest.create(allocator, path, 8, 256);
+    try std.testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
 
     const loaded = try SystemManifest.load(allocator, path);
     try std.testing.expect(loaded != null);

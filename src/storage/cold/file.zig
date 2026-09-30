@@ -7,7 +7,8 @@
 //! - Local backup strategies
 //!
 //! Features:
-//! - Atomic writes (write to .tmp, then rename)
+//! - Atomic writes (write to .tmp, then rename; with sync_on_write the file
+//!   and its directory are fsynced)
 //! - Automatic directory creation
 //! - Full round-trip support (upload/download)
 
@@ -180,6 +181,10 @@ pub const FileBackend = struct {
             @import("stdx").fs.deleteFile(tmp_path) catch {};
             return error.IoError;
         };
+        if (self.cfg.sync_on_write) {
+            const dir = std.fs.path.dirname(full_path) orelse ".";
+            @import("stdx").fs.syncDir(dir) catch return error.IoError;
+        }
     }
 
     /// Streaming download - reads file in chunks, writes to sink
@@ -250,6 +255,10 @@ pub const FileBackend = struct {
             @import("stdx").fs.deleteFile(tmp_path) catch {};
             return error.IoError;
         };
+        if (self.cfg.sync_on_write) {
+            const dir = std.fs.path.dirname(full_path) orelse ".";
+            @import("stdx").fs.syncDir(dir) catch return error.IoError;
+        }
     }
 
     fn downloadImpl(ptr: *anyopaque, key: []const u8, buffer: []u8) BackendError![]u8 {
@@ -448,7 +457,9 @@ test "FileBackend: upload and download round-trip" {
 
     // Upload
     const test_data = "hello world, this is test data!";
+    const before = @import("stdx").fs.dir_syncs.load(.monotonic);
     try cb.upload("test/key.dat", test_data, null);
+    try testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
 
     // Download
     var buffer: [1024]u8 = undefined;
@@ -554,7 +565,9 @@ test "FileBackend: streaming upload and download" {
     const test_data = "Streaming test data - larger payload for streaming test";
     var source = backend.SliceStreamSource.init(test_data);
     const ss = source.asStreamSource();
+    const before = @import("stdx").fs.dir_syncs.load(.monotonic);
     try cb.uploadStream("stream_test.dat", &ss, null);
+    try testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
 
     // Streaming download
     var sink = backend.BufferStreamSink.init(allocator);

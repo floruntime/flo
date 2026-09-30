@@ -36,6 +36,7 @@ test {
     // never collected.
     _ = prng;
     _ = @import("net.zig");
+    _ = @import("fs.zig");
 }
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.

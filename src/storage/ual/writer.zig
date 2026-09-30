@@ -237,8 +237,7 @@ pub const SegmentWriter = struct {
         // fsync the data before the rename makes it visible. Without this the
         // bytes may sit in the page cache and be lost on power failure, so
         // `sync` durability would silently fail to deliver its "fdatasync before
-        // ack" guarantee. Mirrors the snapshot write path (shard.zig). The
-        // rename itself is atomic; directory-entry durability is a follow-up.
+        // ack" guarantee.
         try @import("stdx").fs.sync(file);
 
         // Rename into place
@@ -247,6 +246,10 @@ pub const SegmentWriter = struct {
             @import("stdx").fs.deleteFile(tmp_path) catch {};
             return err;
         };
+
+        // Until the directory is synced a power loss can drop the new name,
+        // and with it every entry in the segment.
+        try @import("stdx").fs.syncDir(dir_path);
 
         log.debug("UAL Writer: segment written, path={s}, entries={d}, data_size={d}", .{ path, self.entry_count, sealed.len });
     }
@@ -354,4 +357,20 @@ test "writer: CRC in footer is non-zero" {
 
     try std.testing.expect(footer.crc32c != 0);
     try std.testing.expectEqualSlices(u8, &segment.FOOTER_MAGIC, &footer.magic);
+}
+
+test "writer: writeToFile syncs the segment directory after the rename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+
+    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer writer.deinit();
+    try writer.addEntry(&makeTestEntry(1, "data"));
+
+    const syncs = &@import("stdx").fs.dir_syncs;
+    const before = syncs.load(.monotonic);
+    try writer.writeToFile(dir_path);
+    try std.testing.expectEqual(before + 1, syncs.load(.monotonic));
 }

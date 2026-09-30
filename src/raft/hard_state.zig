@@ -2,9 +2,9 @@
 //!
 //! `HARDSTATE` in each shard directory holds the node's identity, its current
 //! term and the vote it cast in that term. It is rewritten (tmp → fsync →
-//! rename) before the node grants a vote, and whenever it adopts a term, so a
-//! restarted node can neither vote twice in one term nor re-enter a term it
-//! already left.
+//! rename → directory fsync) before the node grants a vote, and whenever it
+//! adopts a term, so a restarted node can neither vote twice in one term nor
+//! re-enter a term it already left.
 //! Terms change per election, not per write, so the fsync never sits on the
 //! write path.
 //!
@@ -95,7 +95,9 @@ pub fn save(dir: []const u8, hs: HardState) !void {
         try stdx.fs.writeAll(file, &bytes);
         try stdx.fs.sync(file);
     }
-    try stdx.fs.rename(tmp_path, path);
+    // Without the directory sync a power loss can bring back the old file,
+    // and with it a term or vote this node already acted on.
+    try stdx.fs.renameDurable(tmp_path, path);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -141,7 +143,9 @@ test "hard state: save then load survives, missing file is null" {
 
     try testing.expectEqual(@as(?HardState, null), try load(dir));
 
+    const before = stdx.fs.dir_syncs.load(.monotonic);
     try save(dir, .{ .node_id = 3, .term = 5, .voted_for = 3 });
+    try testing.expectEqual(before + 1, stdx.fs.dir_syncs.load(.monotonic));
     const a = (try load(dir)).?;
     try testing.expectEqual(@as(u64, 5), a.term);
     try testing.expectEqual(@as(u32, 3), a.voted_for);

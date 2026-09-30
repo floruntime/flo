@@ -565,14 +565,15 @@ pub const Shard = struct {
             const shard_dir = try std.fmt.allocPrint(allocator, "{s}/{d:0>5}", .{ dir, shard_id });
             errdefer allocator.free(shard_dir);
 
-            // Ensure shard dir and subdirectories exist
-            @import("stdx").fs.makePath(shard_dir) catch |err| {
+            // Each synced into its parent: a lost directory takes HARDSTATE
+            // and every segment inside it with it.
+            @import("stdx").fs.makePathDurable(shard_dir) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
             const segs_dir_path = try std.fmt.allocPrint(allocator, "{s}/segs", .{shard_dir});
             defer allocator.free(segs_dir_path);
-            @import("stdx").fs.makePath(segs_dir_path) catch |err| {
+            @import("stdx").fs.makePathDurable(segs_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
             const dl = try allocator.create(DurableLog);
@@ -584,7 +585,7 @@ pub const Shard = struct {
 
             const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
             defer allocator.free(snaps_dir_path);
-            @import("stdx").fs.makePath(snaps_dir_path) catch |err| {
+            @import("stdx").fs.makePathDurable(snaps_dir_path) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
@@ -998,55 +999,6 @@ pub const Shard = struct {
     pub fn getPartition(self: *Shard, partition_id: u32) *Partition {
         _ = partition_id;
         return self.partitions[0];
-    }
-
-    // ─── Snapshot ────────────────────────────────────────────────────────
-
-    /// Take a snapshot of all partitions and write to disk.
-    /// Creates `{shard_data_dir}/snaps/` if it doesn't exist.
-    /// Returns true if snapshot was written successfully.
-    pub fn takeSnapshot(self: *Shard) bool {
-        const dir_path = self.shard_data_dir orelse return false;
-
-        var snap_path_buf: [512]u8 = undefined;
-        const snap_dir_path = std.fmt.bufPrint(&snap_path_buf, "{s}/snaps", .{dir_path}) catch return false;
-
-        // Ensure snapshots directory exists
-        @import("stdx").fs.makePath(snap_dir_path) catch return false;
-
-        var snap_dir = @import("stdx").fs.openDir(snap_dir_path, .{}) catch return false;
-        defer snap_dir.close();
-
-        // Snapshot each partition
-        for (self.partitions) |partition| {
-            const snap_data = partition.snapshot() catch continue;
-            defer self.allocator.free(snap_data);
-
-            // Generate snapshot filename
-            var name_buf: [128]u8 = undefined;
-            const filename = snapshot_mod.snapshotFilename(
-                &name_buf,
-                partition.router.applied_index,
-                @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000,
-            );
-
-            // Write atomically: .tmp → sync → rename
-            var tmp_buf: [128]u8 = undefined;
-            const tmp_name = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{filename}) catch continue;
-
-            const file = snap_dir.createFile(tmp_name, .{}) catch continue;
-            file.writeAll(snap_data) catch {
-                file.close();
-                continue;
-            };
-            file.sync() catch {};
-            file.close();
-
-            snap_dir.rename(tmp_name, filename) catch continue;
-            ShardManifest.setLatestSnapshot(self.allocator, dir_path, filename) catch {};
-        }
-
-        return true;
     }
 
     // ─── Connection management ───────────────────────────────────────────
