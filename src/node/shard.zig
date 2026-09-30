@@ -423,7 +423,7 @@ pub const Shard = struct {
         var waiter_pool = try WaiterPool.init(allocator);
         errdefer waiter_pool.deinit(allocator);
         waiter_pool.owner = shard_id;
-        waiter_pool.split = shard_count > 1;
+        waiter_pool.split = shard_count > 1 or cluster_role != .single;
         const mailbox = try Mailbox.create(allocator, 1024, reply_pool.ringCapacity(), shard_count);
         errdefer mailbox.destroy(allocator);
         try reactor.addSource(.{ .fd = mailbox.wake.rd, .tag = .inbox_ready, .interests = .{ .readable = true } });
@@ -6437,6 +6437,18 @@ test "Shard: a wait on a connection's own limit that becomes a wait for the targ
     try std.testing.expectEqual(@as(u32, 0), a.queued[0][1]);
     while (two.shards[1].drainInbox() > 0) {}
     _ = a.drainInbox();
+}
+
+test "Shard: a shard keeps waiter room for reads from elsewhere — other shards, or other nodes on a cluster member — and a lone shard does not" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var lone = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer lone.deinit();
+    try std.testing.expect(!lone.waiter_pool.split);
+    var member = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+    defer member.deinit();
+    try std.testing.expect(member.waiter_pool.split);
 }
 
 test "Shard: a connection's blocking reads on its own shard count toward its 8: the ninth waits until one returns" {

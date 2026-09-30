@@ -71,8 +71,7 @@ const StreamID = @import("../stream/stream_id.zig").StreamID;
 pub const MAX_WAITERS: u16 = 4096;
 
 /// Waiters for this shard's own clients' blocking reads and its parked
-/// workers, on a shard of several; the rest are for requests from other
-/// shards. Each side is held to its part (`register`), so neither can fill
+/// workers; the rest are for requests from other shards or nodes. Each side is held to its part (`register`), so neither can fill
 /// the pool and leave the other's reads answered empty at once — a
 /// consumer would spin.
 pub const LOCAL_WAITERS: u16 = 1024;
@@ -167,8 +166,9 @@ pub const WaiterPool = struct {
     count: u16,
     /// The shard whose clients count as local.
     owner: u16 = 0,
-    /// Split between local and forwarded (`LOCAL_WAITERS`): only a shard
-    /// of several has other shards' reads to keep room for.
+    /// Split between local and forwarded (`LOCAL_WAITERS`): only a shard of
+    /// several, or a cluster member, has other shards' or nodes' reads to
+    /// keep room for.
     split: bool = true,
     /// Waiters answering another shard or node.
     forwarded: u16 = 0,
