@@ -579,17 +579,23 @@ pub const Reactor = struct {
                 _ = posix.read(fd, &buf) catch {};
             }
 
+            // A poll that fired just before it was removed or changed still
+            // completes: report only what is asked for now, as kqueue does,
+            // or a connection taken off reading would be read.
             const revents: u32 = @intCast(cqe.res);
-            self.result_cache[count] = .{
+            const event: Event = .{
                 .fd = fd,
                 .tag = source.tag,
                 .user_data = source.user_data,
-                .readable = (revents & linux.POLL.IN) != 0,
-                .writable = (revents & linux.POLL.OUT) != 0,
+                .readable = (revents & linux.POLL.IN) != 0 and source.interests.readable,
+                .writable = (revents & linux.POLL.OUT) != 0 and source.interests.writable,
                 .err = (revents & linux.POLL.ERR) != 0,
                 .hangup = (revents & linux.POLL.HUP) != 0,
             };
-            count += 1;
+            if (event.readable or event.writable or event.err or event.hangup) {
+                self.result_cache[count] = event;
+                count += 1;
+            }
 
             // If multi-shot poll was dropped (IORING_CQE_F_MORE not set),
             // re-arm the poll for this fd.
