@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const ReplyTo = @import("reply_to.zig").ReplyTo;
+const Ticket = @import("reply_pool.zig").ReplyPool.Ticket;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Ring Buffer
@@ -368,6 +369,70 @@ pub const Connection = struct {
     pacing_off: bool = false,
     /// Queued on the shard's resume list; keeps it to one entry.
     resume_queued: bool = false,
+
+    /// Requests this client sent that went to another shard and are not yet
+    /// answered, and how many of those are reads that may block.
+    forwards_in_flight: u16 = 0,
+    blocking_in_flight: u16 = 0,
+    /// Its blocking reads parked on this shard, at most: raised as each
+    /// parks, recounted near the cap (`Shard.blockingOut`).
+    local_reads: u16 = 0,
+    /// The slots of those blocking reads, first `blocking_in_flight`: on
+    /// close, the shards holding them are told to drop them
+    /// (`Shard.releaseForwardsFor`).
+    blocking_slots: [MAX_BLOCKING_IN_FLIGHT]Ticket = undefined,
+    /// Set while the request at the head of the read buffer waits for room
+    /// to go to another shard: no more of this client's requests are read
+    /// or run until it goes, or has waited `Shard.ASK_WAIT_MS` and is
+    /// refused (`Shard.waitForward`, `Shard.resumeWaiting`).
+    waiting: ?Waiting = null,
+    /// When the head request first waited; kept while it waits again after
+    /// losing the room it was resumed for, and counted into its deadline
+    /// once sent.
+    head_since_ms: ?u64 = null,
+    /// Its live entry in the shard's waiting line (`Shard.waiting_fds`); 0
+    /// for none.
+    wait_seq: u32 = 0,
+    /// Counted in the line for its target (`Shard.queued`): it waits for
+    /// the target's room, not its own limits.
+    in_queue: bool = false,
+    /// Resumed with room for its head: that one request goes ahead of the
+    /// line (`Shard.holdForward`), when it next can — after a pause for its
+    /// unsent answers, too, for it kept its place.
+    has_turn: bool = false,
+    /// Read interest is off for `waiting`; on again once the head goes or
+    /// is refused (`Shard.processRequests`).
+    reads_held: bool = false,
+    /// The head waited `Shard.ASK_WAIT_MS`: it, and every request buffered
+    /// behind it then (these bytes' worth) that would wait, is answered
+    /// `overloaded`, unrun, rather than each waiting its turn.
+    give_up_bytes: usize = 0,
+    /// The shard a refusal on the in-flight limit names, the one holding the
+    /// oldest unanswered request: found at the first such refusal after a
+    /// give-up (`Shard.refuseWaited`).
+    give_up_blame: ?u16 = null,
+
+    pub const Waiting = struct {
+        target: u16,
+        blocking: bool,
+        reason: WaitReason,
+    };
+
+    pub const WaitReason = enum(u2) {
+        /// `MAX_FORWARDS_IN_FLIGHT` of this client's requests are unanswered.
+        in_flight,
+        /// `MAX_BLOCKING_IN_FLIGHT` of its reads are blocked on other shards.
+        blocking_reads,
+        /// The target's share of this shard's ask slots is taken.
+        slots,
+        /// This shard's share of the target's inbox is unread.
+        inbox,
+    };
+
+    /// The most of one client's requests that may be unanswered on other
+    /// shards at once, and the most of those that may be blocking reads.
+    pub const MAX_FORWARDS_IN_FLIGHT: u16 = 64;
+    pub const MAX_BLOCKING_IN_FLIGHT: u16 = 8;
 
     /// Where an answer to the request this connection is running goes: the
     /// client itself, or, on a proxy, whoever the proxied request came from.

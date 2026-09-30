@@ -4057,7 +4057,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.raft_network = null;
     shard.router = router.Router.init(1, 1, 0);
     shard.run_id_gen = .{};
-    shard.waiter_pool = waiter_pool_mod.WaiterPool.init();
+    shard.waiter_pool = try waiter_pool_mod.WaiterPool.init(std.testing.allocator);
     // The one applier needs a partition to append to, the registry that
     // owns action entries, and the copy buffer it reads committed entries
     // through.
@@ -4082,6 +4082,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
 }
 
 fn destroyTestShard(shard: *Shard) void {
+    shard.waiter_pool.deinit(std.testing.allocator);
     shard.raft_node.deinit();
     std.testing.allocator.destroy(shard.raft_node);
     shard.partitions[0].deinit();

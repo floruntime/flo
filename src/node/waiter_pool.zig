@@ -65,8 +65,16 @@ const ReplyTo = @import("reply_to.zig").ReplyTo;
 const log = @import("stdx").log;
 const StreamID = @import("../stream/stream_id.zig").StreamID;
 
-/// Maximum concurrent waiters per shard across all subsystems.
-pub const MAX_WAITERS: u16 = 256;
+/// Maximum concurrent waiters per shard across all subsystems: room for
+/// every other shard's share of blocking reads (`ReplyPool`) beside
+/// `LOCAL_WAITERS`. About 1.5 MB a shard.
+pub const MAX_WAITERS: u16 = 4096;
+
+/// Waiters for this shard's own clients' blocking reads and its parked
+/// workers; the rest are for requests from other shards or nodes. Each side is held to its part (`register`), so neither can fill
+/// the pool and leave the other's reads answered empty at once — a
+/// consumer would spin.
+pub const LOCAL_WAITERS: u16 = 1024;
 
 /// The longest any blocking request waits: a wait with no end would leave
 /// its client unanswered. A longer wait is refused when it is dispatched.
@@ -149,19 +157,41 @@ pub const Waiter = struct {
     }
 };
 
-/// Per-shard waiter pool.  Fixed-capacity, no allocations.
+/// Per-shard waiter pool.  Fixed-capacity, allocated once.
 ///
 /// Waiters are stored in a flat array and managed with swap-remove.
 /// This gives O(1) insert, O(1) remove, and O(n) scan for notify/expire.
 pub const WaiterPool = struct {
-    waiters: [MAX_WAITERS]Waiter,
+    waiters: []Waiter,
     count: u16,
+    /// The shard whose clients count as local.
+    owner: u16 = 0,
+    /// Split between local and forwarded (`LOCAL_WAITERS`): only a shard of
+    /// several, or a cluster member, has other shards' or nodes' reads to
+    /// keep room for.
+    split: bool = true,
+    /// Waiters answering another shard or node.
+    forwarded: u16 = 0,
+    /// Waiters of each kind, so a change nobody waits on skips the scan.
+    of_kind: [@typeInfo(WaiterKind).@"enum".fields.len]u16 = @splat(0),
+    full_warn_ms: u64 = 0,
 
-    pub fn init() WaiterPool {
+    pub fn init(allocator: std.mem.Allocator) !WaiterPool {
         return .{
-            .waiters = undefined,
+            .waiters = try allocator.alloc(Waiter, MAX_WAITERS),
             .count = 0,
         };
+    }
+
+    fn isForwarded(self: *const WaiterPool, reply_to: ReplyTo) bool {
+        return switch (reply_to) {
+            .socket => |s| s.shard != self.owner,
+            .remote => true,
+        };
+    }
+
+    pub fn deinit(self: *WaiterPool, allocator: std.mem.Allocator) void {
+        allocator.free(self.waiters);
     }
 
     // ── Registration ────────────────────────────────────────────────────
@@ -179,15 +209,21 @@ pub const WaiterPool = struct {
         timeout_ms: u32,
     };
 
-    /// Register a new waiter.  Returns `true` on success, `false` if pool full or key too long.
+    /// Register a new waiter. False when its part of the pool is full
+    /// (`LOCAL_WAITERS`), or the key is empty or too long.
     pub fn register(self: *WaiterPool, opts: RegisterOpts) bool {
-        if (self.count >= MAX_WAITERS) {
-            log.warn("waiter pool full ({d}/{d}), blocking read dropped", .{ self.count, MAX_WAITERS });
+        const forwarded = self.isForwarded(opts.reply_to);
+        const room = if (!self.split) self.count < MAX_WAITERS else if (forwarded) self.forwarded < MAX_WAITERS - LOCAL_WAITERS else self.count - self.forwarded < LOCAL_WAITERS;
+        const now_ms = @import("stdx").time.monotonicMs();
+        if (!room) {
+            if (now_ms -| self.full_warn_ms >= 10_000) {
+                self.full_warn_ms = now_ms;
+                log.warn("waiter pool full ({d} waiting, {d} of them for other shards); blocking reads are answered at once until some return", .{ self.count, self.forwarded });
+            }
             return false;
         }
         if (opts.key.len == 0 or opts.key.len > 256) return false;
 
-        const now_ms = @import("stdx").time.monotonicMs();
         // Waits of 0 and over the cap never get here (see the fields' docs);
         // clamped rather than trusted all the same.
         const expires: u64 = now_ms + std.math.clamp(opts.timeout_ms, 1, MAX_BLOCK_MS);
@@ -204,6 +240,8 @@ pub const WaiterPool = struct {
         w.expires_at_ms = expires;
         w.active = true;
         self.count += 1;
+        if (forwarded) self.forwarded += 1;
+        self.of_kind[@intFromEnum(opts.kind)] += 1;
         return true;
     }
 
@@ -232,6 +270,7 @@ pub const WaiterPool = struct {
     /// shard.waiter_pool.notify(.kv_get, key, resolveKVWaiter, shard);
     /// ```
     pub fn notify(self: *WaiterPool, kind: WaiterKind, notify_key: []const u8, resolver: ResolverFn, ctx: *anyopaque) void {
+        if (self.of_kind[@intFromEnum(kind)] == 0) return;
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
@@ -255,6 +294,7 @@ pub const WaiterPool = struct {
     /// Wake ALL waiters of a given kind (no key filter).
     /// Used for action_await where any pending task should wake the first waiter.
     pub fn notifyAny(self: *WaiterPool, kind: WaiterKind, resolver: ResolverFn, ctx: *anyopaque) void {
+        if (self.of_kind[@intFromEnum(kind)] == 0) return;
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
@@ -301,12 +341,14 @@ pub const WaiterPool = struct {
 
     /// Remove the waiters of one closed connection, named by the shard that
     /// owns its socket, its fd and its generation: a waiter registered for
-    /// another shard's client can hold the same fd number.
-    pub fn removeByConnection(self: *WaiterPool, owner_shard: u16, fd: i32, conn_id: u32) void {
+    /// another shard's client can hold the same fd number. Each is handed to
+    /// `on_removed` first, when given.
+    pub fn removeByConnection(self: *WaiterPool, owner_shard: u16, fd: i32, conn_id: u32, on_removed: ?TimeoutFn, ctx: *anyopaque) void {
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
             if (w.reply_to.isSocket(owner_shard, fd, conn_id)) {
+                if (on_removed) |f| f(w, ctx);
                 self.swapRemove(i);
                 continue;
             }
@@ -315,6 +357,15 @@ pub const WaiterPool = struct {
     }
 
     // ── Query ───────────────────────────────────────────────────────────
+
+    /// Waiters for one connection, named as in `removeByConnection`.
+    pub fn countFor(self: *const WaiterPool, owner_shard: u16, fd: i32, conn_id: u32) u16 {
+        var n: u16 = 0;
+        for (self.waiters[0..self.count]) |w| {
+            if (w.reply_to.isSocket(owner_shard, fd, conn_id)) n += 1;
+        }
+        return n;
+    }
 
     /// Count active waiters of a specific kind.
     pub fn countByKind(self: *const WaiterPool, kind: WaiterKind) u16 {
@@ -334,6 +385,9 @@ pub const WaiterPool = struct {
 
     fn swapRemove(self: *WaiterPool, index: u16) void {
         if (self.count == 0) return;
+        const gone = &self.waiters[index];
+        if (self.isForwarded(gone.reply_to)) self.forwarded -= 1;
+        self.of_kind[@intFromEnum(gone.kind)] -= 1;
         if (index < self.count - 1) {
             self.waiters[index] = self.waiters[self.count - 1];
         }
@@ -346,7 +400,8 @@ pub const WaiterPool = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "WaiterPool: register and count" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 0), pool.totalActive());
 
     const ok = pool.register(.{
@@ -363,7 +418,8 @@ test "WaiterPool: register and count" {
 }
 
 test "WaiterPool: register rejects empty key" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     const ok = pool.register(.{
         .kind = .kv_get,
         .reply_to = ReplyTo.socketOf(0, 10, 1),
@@ -376,7 +432,8 @@ test "WaiterPool: register rejects empty key" {
 }
 
 test "WaiterPool: a closed connection removes its own waiters, not another shard's or an older one's on the same fd" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "a", .timeout_ms = 1_000 });
     _ = pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 2, .key = "b", .timeout_ms = 1_000 });
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 20, 2), .request_id = 3, .key = "c", .timeout_ms = 1_000 });
@@ -386,13 +443,14 @@ test "WaiterPool: a closed connection removes its own waiters, not another shard
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 9), .request_id = 5, .key = "e", .timeout_ms = 1_000 });
     try std.testing.expectEqual(@as(u16, 5), pool.totalActive());
 
-    pool.removeByConnection(0, 10, 1);
+    pool.removeByConnection(0, 10, 1, null, @ptrCast(&pool));
     try std.testing.expectEqual(@as(u16, 3), pool.totalActive());
     try std.testing.expectEqual(@as(u16, 3), pool.countByKind(.kv_get));
 }
 
 test "WaiterPool: a waiter's deadline is its wait from now, on the monotonic clock" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     const before = @import("stdx").time.monotonicMs();
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 1, 1), .request_id = 1, .key = "a", .timeout_ms = 2_000 });
     const after = @import("stdx").time.monotonicMs();
@@ -400,7 +458,8 @@ test "WaiterPool: a waiter's deadline is its wait from now, on the monotonic clo
 }
 
 test "WaiterPool: notify wakes matching waiters" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 20, 2), .request_id = 2, .key = "other", .min_version = 0, .timeout_ms = 1_000 });
     _ = pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(0, 30, 3), .request_id = 3, .key = "mykey", .min_version = 0, .timeout_ms = 1_000 });
@@ -422,7 +481,8 @@ test "WaiterPool: notify wakes matching waiters" {
 }
 
 test "WaiterPool: notify respects resolver returning false" {
-    var pool = WaiterPool.init();
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
     _ = pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = "mykey", .min_version = 5, .timeout_ms = 1_000 });
 
     // Resolver that never satisfies (version too low)
@@ -435,4 +495,51 @@ test "WaiterPool: notify respects resolver returning false" {
     var dummy: u8 = 0;
     pool.notify(.kv_get, "mykey", never_resolve, @ptrCast(&dummy));
     try std.testing.expectEqual(@as(u16, 1), pool.totalActive()); // still waiting
+}
+
+test "WaiterPool: this shard's clients and other shards' each have their part of the pool, and a change nobody waits on is not looked for" {
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    pool.owner = 2;
+    for (0..LOCAL_WAITERS) |i| try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(2, @intCast(i), 1), .request_id = i, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expect(!pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(2, 9999, 1), .request_id = 0, .key = "k", .timeout_ms = 1_000 }));
+    // Other shards' reads still have theirs.
+    for (0..MAX_WAITERS - LOCAL_WAITERS) |i| try std.testing.expect(pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(0, @intCast(i), 1), .request_id = i, .key = "s", .timeout_ms = 1_000 }));
+    try std.testing.expect(!pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(1, 1, 1), .request_id = 0, .key = "s", .timeout_ms = 1_000 }));
+    // One gone, one comes back in its place.
+    pool.removeByConnection(0, 0, 1, null, @ptrCast(&pool));
+    try std.testing.expect(pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(1, 1, 1), .request_id = 0, .key = "s", .timeout_ms = 1_000 }));
+    try std.testing.expectEqual(@as(u16, 0), pool.of_kind[@intFromEnum(WaiterKind.queue_dequeue)]);
+    try std.testing.expectEqual(LOCAL_WAITERS, pool.of_kind[@intFromEnum(WaiterKind.kv_get)]);
+    try std.testing.expectEqual(MAX_WAITERS - LOCAL_WAITERS, pool.of_kind[@intFromEnum(WaiterKind.stream_read)]);
+    const Never = struct {
+        fn resolve(_: *Waiter, _: *anyopaque) bool {
+            unreachable;
+        }
+    };
+    pool.notify(.queue_dequeue, "k", Never.resolve, @ptrCast(&pool));
+}
+
+test "WaiterPool: the split holds whichever side comes first, counts other nodes' reads as forwarded, and a shard of one does not split" {
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    pool.owner = 0;
+    // Forwarded first, from another shard and another node.
+    try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(1, 1, 1), .request_id = 1, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = .{ .remote = .{ .node = 7, .forward_id = 1 } }, .request_id = 2, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expectEqual(@as(u16, 2), pool.forwarded);
+    for (0..LOCAL_WAITERS) |i| try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, @intCast(i), 1), .request_id = i, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expect(!pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 9999, 1), .request_id = 0, .key = "k", .timeout_ms = 1_000 }));
+
+    // Other shards' part holds with no local waiters at all.
+    var remote = try WaiterPool.init(std.testing.allocator);
+    defer remote.deinit(std.testing.allocator);
+    for (0..MAX_WAITERS - LOCAL_WAITERS) |i| try std.testing.expect(remote.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(1, @intCast(i), 1), .request_id = i, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expect(!remote.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(1, 9999, 1), .request_id = 0, .key = "k", .timeout_ms = 1_000 }));
+
+    var one = try WaiterPool.init(std.testing.allocator);
+    defer one.deinit(std.testing.allocator);
+    one.split = false;
+    for (0..MAX_WAITERS) |i| try std.testing.expect(one.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, @intCast(i), 1), .request_id = i, .key = "k", .timeout_ms = 1_000 }));
+    try std.testing.expect(!one.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 9999, 1), .request_id = 0, .key = "k", .timeout_ms = 1_000 }));
 }

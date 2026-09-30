@@ -11,6 +11,10 @@
 //! - `wake`: the idle flag, the wake pipe and the dirty flags. A producer
 //!   that publishes a message or sets a flag writes the pipe only when the
 //!   consumer said it was about to sleep.
+//! - `shares`: each other shard's share of the inbox for the client requests
+//!   it forwards, and their cancels. A sender with its share unread waits (its client's
+//!   connection left unread) and is woken when the consumer drains some, so
+//!   no one shard's clients can fill another's inbox and crowd out the rest.
 //!
 //! The mailbox is heap-allocated so its address is stable: peers hold
 //! `*Mailbox`, and each ring points at the wake.
@@ -28,6 +32,10 @@ pub const Flag = enum(u5) {
     stream_appended,
     /// An action run became available: parked workers try to claim.
     action_invoked,
+    /// A shard this one waits on drained some of this one's share of its
+    /// inbox. It only wakes the shard: waiting connections are looked at
+    /// every tick.
+    share_returned,
 
     pub fn bit(self: Flag) u32 {
         return @as(u32, 1) << @intFromEnum(self);
@@ -99,22 +107,51 @@ pub const Wake = struct {
     }
 };
 
+/// Inbox room kept out before the shares are cut (`shareFor`).
+pub const UNSHARED_ROOM: usize = 64;
+
 pub const Mailbox = struct {
     inbox: Inbox,
     replies: Inbox,
     wake: Wake = .{},
+    /// Per sending shard: its client requests unread in `inbox`, and
+    /// whether it waits to hear that some were drained.
+    shares: []Share,
+    /// The most client requests one sender may have unread in `inbox`.
+    share: u16,
 
-    /// Heap-allocate a mailbox with its wake pipe, rings pointing at it.
-    pub fn create(allocator: std.mem.Allocator, inbox_capacity: usize, replies_capacity: usize) !*Mailbox {
+    /// Each sender writes its own, and the consumer every one: a line each.
+    pub const Share = struct {
+        unread: Atomic(u16) align(std.atomic.cache_line) = Atomic(u16).init(0),
+        wanted: Atomic(bool) = Atomic(bool).init(false),
+    };
+
+    /// Half the inbox beyond `UNSHARED_ROOM`, split among the shards that may
+    /// send to it. The rest is room for the messages that are not paced
+    /// (action starts, shutdown): an action start with no room fails its
+    /// workflow step.
+    fn shareFor(inbox_capacity: usize, shard_count: u16) u16 {
+        const room = (inbox_capacity -| UNSHARED_ROOM) / 2;
+        return @intCast(@max(1, room / @max(1, shard_count -| 1)));
+    }
+
+    /// Heap-allocate a mailbox with its wake pipe, rings pointing at it, for
+    /// a node of `shard_count` shards.
+    pub fn create(allocator: std.mem.Allocator, inbox_capacity: usize, replies_capacity: usize, shard_count: u16) !*Mailbox {
         const self = try allocator.create(Mailbox);
         errdefer allocator.destroy(self);
         self.* = .{
             .inbox = try Inbox.init(allocator, inbox_capacity),
             .replies = undefined,
+            .shares = &.{},
+            .share = shareFor(inbox_capacity, shard_count),
         };
         errdefer self.inbox.deinit();
         self.replies = try Inbox.init(allocator, replies_capacity);
         errdefer self.replies.deinit();
+        self.shares = try allocator.alloc(Share, @max(1, shard_count));
+        errdefer allocator.free(self.shares);
+        @memset(self.shares, .{});
         try self.wake.init();
         self.inbox.wake = &self.wake;
         self.replies.wake = &self.wake;
@@ -124,8 +161,50 @@ pub const Mailbox = struct {
     pub fn destroy(self: *Mailbox, allocator: std.mem.Allocator) void {
         self.inbox.deinit();
         self.replies.deinit();
+        allocator.free(self.shares);
         self.wake.deinit();
         allocator.destroy(self);
+    }
+
+    /// Sender `from`: how many more of its client requests fit its share.
+    pub fn shareRoom(self: *const Mailbox, from: u8) i32 {
+        return @as(i32, self.share) - @as(i32, self.shares[from].unread.load(.seq_cst));
+    }
+
+    /// Sender `from`: room for one more of its client requests.
+    pub fn hasShare(self: *const Mailbox, from: u8) bool {
+        return self.shares[from].unread.load(.seq_cst) < self.share;
+    }
+
+    /// Sender: put a client request in the inbox on its sender's share.
+    /// False when the share is spent or the ring is full: nothing was sent.
+    pub fn sendOnShare(self: *Mailbox, m: inbox_mod.Message) bool {
+        const s = &self.shares[m.src_shard];
+        // Only its sender raises a count, so none passes the share.
+        if (s.unread.load(.seq_cst) >= self.share) return false;
+        _ = s.unread.fetchAdd(1, .seq_cst);
+        var shared = m;
+        shared.setOnShare();
+        if (self.inbox.send(shared)) return true;
+        _ = s.unread.fetchSub(1, .seq_cst);
+        return false;
+    }
+
+    /// Sender `from`, its share spent: ask to be told when some is drained,
+    /// then look again (`hasShare`). Each side stores then loads, both
+    /// sequentially consistent, so either the sender sees the room or the
+    /// consumer sees the ask.
+    pub fn wantShare(self: *Mailbox, from: u8) void {
+        self.shares[from].wanted.store(true, .seq_cst);
+    }
+
+    /// Consumer, for each message it drains: give back its share. True when
+    /// its sender asked to be told (`wantShare`): the caller wakes it.
+    pub fn returnShare(self: *Mailbox, m: inbox_mod.Message) bool {
+        if (!m.onShare()) return false;
+        const s = &self.shares[m.src_shard];
+        _ = s.unread.fetchSub(1, .seq_cst);
+        return s.wanted.load(.seq_cst) and s.wanted.swap(false, .seq_cst);
     }
 
     /// Consumer, before blocking: announce the sleep, then look again at
@@ -156,7 +235,7 @@ fn readable(fd: std.posix.fd_t, timeout_ms: i32) bool {
 }
 
 test "Mailbox: a message, a reply or a flag wakes a consumer that said it would sleep, and only then" {
-    const mb = try Mailbox.create(std.testing.allocator, 16, 16);
+    const mb = try Mailbox.create(std.testing.allocator, 16, 16, 1);
     defer mb.destroy(std.testing.allocator);
     var batch: [16]inbox_mod.Message = undefined;
 
@@ -201,7 +280,7 @@ test "Mailbox: a message, a reply or a flag wakes a consumer that said it would 
 }
 
 test "Mailbox: nothing sent while the consumer goes to sleep is slept through" {
-    const mb = try Mailbox.create(std.testing.allocator, 1024, 1024);
+    const mb = try Mailbox.create(std.testing.allocator, 1024, 1024, 1);
     defer mb.destroy(std.testing.allocator);
 
     // One producer per way in: messages, replies and flags.
@@ -249,4 +328,43 @@ test "Mailbox: nothing sent while the consumer goes to sleep is slept through" {
     }
     for (&threads) |*t| t.join();
     try std.testing.expectEqual(3 * N, got);
+}
+
+test "Mailbox: a sender has only its share of the inbox, gets it back as the consumer drains, and is told when it asked" {
+    const mb = try Mailbox.create(std.testing.allocator, 1024, 16, 4);
+    defer mb.destroy(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, (1024 - UNSHARED_ROOM) / 2 / 3), mb.share);
+    var m = msg(1);
+    m.src_shard = 2;
+    for (0..mb.share) |_| try std.testing.expect(mb.sendOnShare(m));
+    try std.testing.expect(!mb.hasShare(2));
+    try std.testing.expect(!mb.sendOnShare(m));
+    // Another sender still has all of its own.
+    var other = msg(2);
+    other.src_shard = 3;
+    try std.testing.expect(mb.sendOnShare(other));
+    try std.testing.expectEqual(@as(usize, mb.share) + 1, mb.inbox.pending());
+
+    // Drained without being asked: the share comes back, nobody is told.
+    var batch: [1]inbox_mod.Message = undefined;
+    try std.testing.expectEqual(@as(usize, 1), mb.inbox.drain(&batch));
+    try std.testing.expect(!mb.returnShare(batch[0]));
+    try std.testing.expect(mb.hasShare(2));
+    try std.testing.expect(mb.sendOnShare(m));
+
+    // Asked: the next drain of its messages says so, once.
+    mb.wantShare(2);
+    try std.testing.expectEqual(@as(usize, 1), mb.inbox.drain(&batch));
+    try std.testing.expect(mb.returnShare(batch[0]));
+    try std.testing.expectEqual(@as(usize, 1), mb.inbox.drain(&batch));
+    try std.testing.expect(!mb.returnShare(batch[0]));
+    // A message not sent on a share gives nothing back.
+    try std.testing.expect(mb.inbox.send(msg(3)));
+    try std.testing.expectEqual(@as(u16, mb.share - 2), mb.shares[2].unread.load(.seq_cst));
+    var all: [1024]inbox_mod.Message = undefined;
+    const n = mb.inbox.drain(&all);
+    for (all[0..n]) |d| _ = mb.returnShare(d);
+    try std.testing.expectEqual(@as(u16, 0), mb.shares[2].unread.load(.seq_cst));
+    try std.testing.expectEqual(@as(u16, 0), mb.shares[3].unread.load(.seq_cst));
+    try std.testing.expectEqual(@as(u16, 0), mb.shares[0].unread.load(.seq_cst));
 }

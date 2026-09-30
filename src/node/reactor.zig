@@ -243,10 +243,7 @@ pub const Reactor = struct {
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.ENABLE, source.user_data);
                     _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
-                    const mask = linux.POLL.IN | linux.POLL.OUT;
-                    const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
-                    const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-                    _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
+                    try self.iouringSetInterests(fd, source.interests, .{ .readable = source.interests.readable, .writable = true });
                 }
                 source.interests.writable = true;
             }
@@ -262,16 +259,7 @@ pub const Reactor = struct {
                     changelist[0] = makeKevent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0);
                     _ = try keventCall(self.poll_fd, &changelist, &.{}, null);
                 } else if (comptime is_linux) {
-                    const mask = if (source.interests.readable) linux.POLL.IN else @as(u32, 0);
-                    if (mask == 0) {
-                        // No interests left — remove the poll entirely
-                        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-                        _ = try self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64);
-                    } else {
-                        const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-                        const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
-                        _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
-                    }
+                    try self.iouringSetInterests(fd, source.interests, .{ .readable = source.interests.readable, .writable = false });
                 }
                 source.interests.writable = false;
             }
@@ -318,8 +306,7 @@ pub const Reactor = struct {
 
             // Register timerfd with io_uring multi-shot poll
             const tfd_u64: u64 = @intCast(@as(u32, @bitCast(tfd)));
-            const sqe = try self.ring.poll_add(tfd_u64, tfd, linux.POLL.IN);
-            sqe.len = linux.IORING_POLL_ADD_MULTI;
+            try self.pollAdd(tfd_u64, tfd, linux.POLL.IN);
 
             // Track timerfd so we can close it in deinit
             try self.timer_fds.put(ident, tfd);
@@ -470,28 +457,70 @@ pub const Reactor = struct {
 
         if (mask != 0) {
             const fd_u64: u64 = @intCast(@as(u32, @bitCast(source.fd)));
-            const sqe = try self.ring.poll_add(fd_u64, source.fd, mask);
-            sqe.len = linux.IORING_POLL_ADD_MULTI;
+            try self.pollAdd(fd_u64, source.fd, mask);
         }
     }
 
     fn iouringRemoveSource(self: *Self, fd: i32) void {
         const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-        _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {};
+        self.pollRemove(fd_u64) catch |err| log.err("reactor: could not stop polling fd {d}: {s}", .{ fd, @errorName(err) });
     }
 
-    fn iouringModifyInterests(self: *Self, fd: i32, interests: Interests, _: *EventSource) !void {
+    // The submission queue is sent to the kernel only when the reactor
+    // polls, so a burst of interest changes in one tick (connections pausing
+    // and resuming together) can fill it. A change that did not fit would be
+    // lost: a connection never read again, or polled twice. Each of these
+    // sends what is queued and tries once more.
+
+    fn pollAdd(self: *Self, user_data: u64, fd: i32, mask: u32) !void {
+        const sqe = self.ring.poll_add(user_data, fd, mask) catch blk: {
+            _ = try self.ring.submit();
+            break :blk try self.ring.poll_add(user_data, fd, mask);
+        };
+        sqe.len = linux.IORING_POLL_ADD_MULTI;
+    }
+
+    fn pollUpdate(self: *Self, fd_u64: u64, mask: u32) !void {
+        const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
+        _ = self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags) catch {
+            _ = try self.ring.submit();
+            _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
+        };
+    }
+
+    fn pollRemove(self: *Self, fd_u64: u64) !void {
+        _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {
+            _ = try self.ring.submit();
+            _ = try self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64);
+        };
+    }
+
+    fn iouringModifyInterests(self: *Self, fd: i32, interests: Interests, source: *EventSource) !void {
+        try self.iouringSetInterests(fd, source.interests, interests);
+    }
+
+    fn pollMask(interests: Interests) u32 {
         var mask: u32 = 0;
         if (interests.readable) mask |= linux.POLL.IN;
         if (interests.writable) mask |= linux.POLL.OUT;
+        return mask;
+    }
 
+    /// Move `fd`'s poll from `old` interests to `new`. With none, the poll is
+    /// removed, and an update cannot bring a removed poll back: a paused
+    /// connection with nothing to send would never be read again. So going
+    /// from none to some adds a fresh poll.
+    fn iouringSetInterests(self: *Self, fd: i32, old: Interests, new: Interests) !void {
         const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-
-        if (mask == 0) {
-            _ = self.ring.poll_remove(fd_u64 | INTERNAL_FLAG, fd_u64) catch {};
+        const from = pollMask(old);
+        const to = pollMask(new);
+        if (from == to) return;
+        if (to == 0) {
+            try self.pollRemove(fd_u64);
+        } else if (from == 0) {
+            try self.pollAdd(fd_u64, fd, to);
         } else {
-            const flags = linux.IORING_POLL_UPDATE_EVENTS | linux.IORING_POLL_ADD_MULTI;
-            _ = try self.ring.poll_update(fd_u64 | INTERNAL_FLAG, fd_u64, fd_u64, mask, flags);
+            try self.pollUpdate(fd_u64, to);
         }
     }
 
@@ -550,17 +579,23 @@ pub const Reactor = struct {
                 _ = posix.read(fd, &buf) catch {};
             }
 
+            // A poll that fired just before it was removed or changed still
+            // completes: report only what is asked for now, as kqueue does,
+            // or a connection taken off reading would be read.
             const revents: u32 = @intCast(cqe.res);
-            self.result_cache[count] = .{
+            const event: Event = .{
                 .fd = fd,
                 .tag = source.tag,
                 .user_data = source.user_data,
-                .readable = (revents & linux.POLL.IN) != 0,
-                .writable = (revents & linux.POLL.OUT) != 0,
+                .readable = (revents & linux.POLL.IN) != 0 and source.interests.readable,
+                .writable = (revents & linux.POLL.OUT) != 0 and source.interests.writable,
                 .err = (revents & linux.POLL.ERR) != 0,
                 .hangup = (revents & linux.POLL.HUP) != 0,
             };
-            count += 1;
+            if (event.readable or event.writable or event.err or event.hangup) {
+                self.result_cache[count] = event;
+                count += 1;
+            }
 
             // If multi-shot poll was dropped (IORING_CQE_F_MORE not set),
             // re-arm the poll for this fd.
@@ -570,8 +605,7 @@ pub const Reactor = struct {
                 if (source.interests.writable) mask |= linux.POLL.OUT;
                 if (mask != 0) {
                     const fd_u64: u64 = @intCast(@as(u32, @bitCast(fd)));
-                    const sqe = self.ring.poll_add(fd_u64, fd, mask) catch continue;
-                    sqe.len = linux.IORING_POLL_ADD_MULTI;
+                    self.pollAdd(fd_u64, fd, mask) catch |err| log.err("reactor: could not poll fd {d} again: {s}", .{ fd, @errorName(err) });
                 }
             }
         }
@@ -720,4 +754,71 @@ test "Reactor: arm and disarm writable" {
         const source = reactor.sources.get(pipe[1]).?;
         try std.testing.expect(!source.interests.writable);
     }
+}
+
+test "Reactor: a connection not read for a while, with nothing to send, is read again once asked" {
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer for (pair) |fd| {
+        _ = std.c.close(fd);
+    };
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.addSource(.{ .fd = pair[0], .tag = .client_read, .interests = .{ .readable = true } });
+    _ = std.c.write(pair[1], "X", 1);
+
+    const Seen = struct {
+        fn of(events: []const Event, fd: i32) ?Event {
+            for (events) |ev| if (ev.fd == fd) return ev;
+            return null;
+        }
+    };
+    // Reads off, and something to send: only writable is reported, though
+    // a byte waits to be read.
+    try reactor.modifyInterests(pair[0], .{ .readable = false, .writable = false });
+    try reactor.armWritable(pair[0]);
+    const writable = Seen.of(try reactor.poll(100), pair[0]).?;
+    try std.testing.expect(writable.writable and !writable.readable);
+    // Sent: no interest left at all, and nothing is reported.
+    try reactor.disarmWritable(pair[0]);
+    try std.testing.expect(Seen.of(try reactor.poll(10), pair[0]) == null);
+    // Asked to read again: the waiting byte is reported.
+    try reactor.modifyInterests(pair[0], .{ .readable = true, .writable = false });
+    const readable = Seen.of(try reactor.poll(100), pair[0]).?;
+    try std.testing.expect(readable.readable);
+}
+
+test "Reactor: more interest changes in one tick than the submission queue holds all take effect" {
+    // Only io_uring queues changes; kqueue applies each at once.
+    if (comptime !is_linux) return error.SkipZigTest;
+    const n = 300; // each loop below makes 300 changes: more than the ring's 256 entries
+    var pairs: [n][2]std.posix.fd_t = undefined;
+    var opened: usize = 0;
+    defer for (pairs[0..opened]) |p| {
+        _ = std.c.close(p[0]);
+        _ = std.c.close(p[1]);
+    };
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    for (&pairs) |*p| {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, p));
+        opened += 1;
+        try reactor.addSource(.{ .fd = p[0], .tag = .client_read, .interests = .{ .readable = true } });
+    }
+    _ = try reactor.poll(0);
+    for (pairs) |p| try reactor.modifyInterests(p[0], .{ .readable = false, .writable = false });
+    for (pairs) |p| try reactor.modifyInterests(p[0], .{ .readable = true, .writable = false });
+    for (pairs) |p| try reactor.armWritable(p[0]);
+    for (pairs) |p| try reactor.disarmWritable(p[0]);
+    for (pairs) |p| _ = std.c.write(p[1], "X", 1);
+
+    var seen = std.AutoHashMap(i32, void).init(std.testing.allocator);
+    defer seen.deinit();
+    var polls: usize = 0;
+    while (seen.count() < n and polls < 50) : (polls += 1) {
+        for (try reactor.poll(100)) |ev| {
+            if (ev.readable) try seen.put(ev.fd, {});
+        }
+    }
+    try std.testing.expectEqual(@as(usize, n), seen.count());
 }

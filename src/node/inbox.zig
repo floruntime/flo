@@ -23,7 +23,7 @@
 //!  4      payload_len    u32            payload size for deallocation
 //!  8      sequence       u64            forward_request: (conn_id << 32) | fd of the client
 //! 16      payload_ptr    ?*anyopaque    heap-allocated payload (ownership transfers)
-//! 24      _padding       [8]u8          reply slot u16, generation u32; rest spare
+//! 24      _padding       [8]u8          reply slot u16, generation u32, on-share u8; one spare
 //! ```
 //!
 //! The receiver shard frees the payload after processing.
@@ -39,6 +39,7 @@ pub const Tag = enum(u8) {
     reply, // the answer to a request this shard sent, on its reply ring; names the slot
     shutdown, // Graceful shutdown signal
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
+    cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.
@@ -67,6 +68,17 @@ pub const Message = extern struct {
 
     pub fn replySlot(self: Message) struct { slot: u16, gen: u32 } {
         return .{ .slot = std.mem.readInt(u16, self._padding[0..2], .little), .gen = std.mem.readInt(u32, self._padding[2..6], .little) };
+    }
+
+    /// Marks a message sent on its sender's share (`Mailbox.sendOnShare`), so
+    /// the consumer gives the share back when it drains it. Byte 6 of
+    /// `_padding`.
+    pub fn setOnShare(self: *Message) void {
+        self._padding[6] = 1;
+    }
+
+    pub fn onShare(self: Message) bool {
+        return self._padding[6] != 0;
     }
 };
 
