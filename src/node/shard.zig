@@ -568,13 +568,15 @@ pub const Shard = struct {
             // Each synced into its parent: a lost directory takes HARDSTATE
             // and every segment inside it with it.
             @import("stdx").fs.makePathDurable(shard_dir) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
+                log.err("shard {d}: cannot create or sync {s}: {s}", .{ shard_id, shard_dir, @errorName(err) });
+                return err;
             };
 
             const segs_dir_path = try std.fmt.allocPrint(allocator, "{s}/segs", .{shard_dir});
             defer allocator.free(segs_dir_path);
             @import("stdx").fs.makePathDurable(segs_dir_path) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
+                log.err("shard {d}: cannot create or sync {s}: {s}", .{ shard_id, segs_dir_path, @errorName(err) });
+                return err;
             };
             const dl = try allocator.create(DurableLog);
             dl.* = DurableLog.init(allocator, seg_writer, segs_dir_path) catch |err| {
@@ -586,7 +588,8 @@ pub const Shard = struct {
             const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
             defer allocator.free(snaps_dir_path);
             @import("stdx").fs.makePathDurable(snaps_dir_path) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
+                log.err("shard {d}: cannot create or sync {s}: {s}", .{ shard_id, snaps_dir_path, @errorName(err) });
+                return err;
             };
 
             // ── Hard state ──────────────────────────────────────────────
