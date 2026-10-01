@@ -290,6 +290,7 @@ pub const Shard = struct {
     stranger_warn_ms: u64,
     frame_warn_ms: u64,
     late_apply_warn_ms: u64,
+    forward_reply_warn_ms: u64 = 0,
     election_warn_ms: u64,
     elections_unlogged: u64,
     /// One limiter per peer for each thing the leader loop says about it.
@@ -2010,25 +2011,35 @@ pub const Shard = struct {
         self.sendForward(slot);
     }
 
-    /// Sent only over a link that is up: what the network queues for a
-    /// peer it has no link to is dropped, and a write marked sent that
-    /// never left would wait until the term changed.
+    /// Sent only over a link that is up, and marked with that link's
+    /// session: an answer that has not come when the session changes went
+    /// over a link that is gone. A full forward queue to the leader answers
+    /// the client now: nothing was sent, so nothing ran.
     fn sendForward(self: *Shard, f: *Forward) void {
         const raft = self.raft_node;
         const leader = raft.leader_id;
         if (leader == 0 or leader == self.cluster_node_id) return;
         const rn = self.raft_network orelse return;
-        if (!rn.isLinked(leader)) return;
-        var buf: [4 + MAX_REQUEST_SIZE]u8 = undefined;
-        if (4 + f.bytes.len > buf.len) {
+        const session = rn.linkSession(leader) orelse return;
+        var buf: [FORWARD_PREFIX + MAX_REQUEST_SIZE]u8 = undefined;
+        if (FORWARD_PREFIX + f.bytes.len > buf.len) {
             self.finishForward(f, .internal_error, "request too large to forward");
             return;
         }
         std.mem.writeInt(u32, buf[0..4], f.id, .little);
-        @memcpy(buf[4 .. 4 + f.bytes.len], f.bytes);
-        if (!self.trySendRaft(leader, .forward_write, buf[0 .. 4 + f.bytes.len])) return;
+        // Fields carried beside the client's bytes, never inside them; none
+        // are sent yet.
+        std.mem.writeInt(u16, buf[4..6], 0, .little);
+        @memcpy(buf[FORWARD_PREFIX..][0..f.bytes.len], f.bytes);
+        switch (rn.sendForward(leader, .forward_write, self.id, buf[0 .. FORWARD_PREFIX + f.bytes.len], session)) {
+            .queued => {},
+            .full => return self.finishForward(f, .overloaded, "overloaded: the link to the leader is full; this request was not run — retry"),
+            .not_sent => return,
+        }
         f.sent_to = leader;
         f.sent_term = raft.current_term;
+        f.sent_session = session;
+        f.sent_ms = nowMs();
     }
 
     /// Writes waiting for a leader go out once one is known, or run here
@@ -2058,8 +2069,12 @@ pub const Shard = struct {
             if (f.sent_to != 0) {
                 if (raft.current_term != f.sent_term or (leader != 0 and leader != f.sent_to)) {
                     self.finishForward(f, .unavailable, "unavailable: lost leadership before commit — write may still apply");
-                } else if (self.raft_network) |rn| {
-                    if (!rn.isLinked(f.sent_to)) self.finishForward(f, .unavailable, "unavailable: lost the link to the leader — write may still apply");
+                } else if (self.raft_network != null and self.raft_network.?.linkSession(f.sent_to) != f.sent_session) {
+                    // Gone, or gone and back between two ticks: either way the
+                    // link it went over is not the one up now.
+                    self.finishForward(f, .unavailable, "unavailable: lost the link to the leader — write may still apply");
+                } else if (now -| f.sent_ms >= SENT_FORWARD_BACKSTOP_MS) {
+                    self.finishForward(f, .unavailable, "unavailable: no answer from the leader — write may still apply");
                 }
                 continue;
             }
@@ -2126,12 +2141,23 @@ pub const Shard = struct {
     /// A write a peer received while this node leads: run it here as if
     /// the client had connected here, answering over the link.
     fn runForwardedWrite(self: *Shard, frame: RaftFrame) void {
-        if (frame.payload.len < 4) return self.badFrame(frame);
+        if (frame.payload.len < FORWARD_PREFIX) return self.badFrame(frame);
         const id = std.mem.readInt(u32, frame.payload[0..4], .little);
-        const req = proto.Request.parse(frame.payload[4..]) catch {
+        const fields_len = std.mem.readInt(u16, frame.payload[4..6], .little);
+        // Fields this node does not know how to honour: running the request
+        // without them would ignore what the forwarder meant.
+        if (fields_len != 0) {
+            self.badFrame(frame);
+            const body = frame.payload[@min(frame.payload.len, FORWARD_PREFIX + @as(usize, fields_len))..];
+            const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
+            var err_buf: [256]u8 = undefined;
+            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: the leader cannot read this forwarded request — are all nodes on the same version?", &err_buf) catch return;
+            return self.sendForwardReply(frame.source_node, id, serialized);
+        }
+        const req = proto.Request.parse(frame.payload[FORWARD_PREFIX..]) catch {
             // The forwarder holds its client until this is answered.
             self.badFrame(frame);
-            const body = frame.payload[4..];
+            const body = frame.payload[FORWARD_PREFIX..];
             const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
             var err_buf: [256]u8 = undefined;
             // The forwarder parsed it first, so the likely cause is two
@@ -2174,7 +2200,19 @@ pub const Shard = struct {
         std.mem.writeInt(u32, buf[0..4], id, .little);
         std.mem.writeInt(u64, buf[4..12], self.raft_node.last_applied, .little);
         @memcpy(buf[12..], bytes);
-        self.sendRaft(peer, .forward_reply, buf);
+        const rn = self.raft_network orelse return;
+        // A reply that cannot be queued is lost; the forwarder's backstop
+        // answers its client.
+        switch (rn.sendForward(peer, .forward_reply, self.id, buf, 0)) {
+            .queued => {},
+            .full, .not_sent => {
+                const now = nowMs();
+                if (now -| self.forward_reply_warn_ms >= WARN_INTERVAL_MS) {
+                    self.forward_reply_warn_ms = now;
+                    log.warn("shard {d}: could not queue a forwarded write's answer for node {d} (its link is full or down); that client is answered by its node's backstop", .{ self.id, peer });
+                }
+            },
+        }
     }
 
     fn takeForwardReply(self: *Shard, frame: RaftFrame) void {
@@ -4417,9 +4455,12 @@ const Forward = struct {
     reply_to: ReplyTo = undefined,
     request_id: u64 = 0,
     bytes: []u8 = &.{},
-    /// The leader it went to and the term then; 0 until it has gone.
+    /// The leader it went to, the term then, and the link it went over; 0
+    /// until it has gone.
     sent_to: u32 = 0,
     sent_term: u64 = 0,
+    sent_session: u64 = 0,
+    sent_ms: u64 = 0,
     deadline_ms: u64 = 0,
     /// The leader's answer, held until `applied_by` is applied here.
     reply: ?[]u8 = null,
@@ -4429,6 +4470,13 @@ const FORWARD_SLOTS: usize = 1024;
 /// How long a write waits for a leader to be known, and how long an
 /// answer is held for this node to catch up to it.
 pub const FORWARD_TIMEOUT_MS: u64 = 5000;
+/// A write sent to a leader that stays linked and in office but never
+/// answers is answered after this: the last guard, for a leader that is
+/// wedged. Everything else that ends a sent write answers sooner.
+pub const SENT_FORWARD_BACKSTOP_MS: u64 = 60_000;
+/// A forwarded write's frame: its id, then the length of the fields carried
+/// beside the client's bytes (none yet), then those fields, then the bytes.
+const FORWARD_PREFIX: usize = 4 + 2;
 /// Forward ids stand in for an fd on the leader's proxy connection: ids
 /// from here up are negative as an fd, so a client closing on the leader
 /// can never match one in the waiter pool.
@@ -6536,10 +6584,11 @@ test "Shard: a forwarded write that cannot be parsed is answered, so its forward
         for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
         rn.outbound.clearRetainingCapacity();
     }
-    var payload: [4 + 40]u8 = undefined;
+    var payload: [FORWARD_PREFIX + 40]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], 91, .little);
-    @memset(payload[4..], 0xee);
-    std.mem.writeInt(u64, payload[4 + 8 ..][0..8], 5, .little);
+    std.mem.writeInt(u16, payload[4..6], 0, .little);
+    @memset(payload[FORWARD_PREFIX..], 0xee);
+    std.mem.writeInt(u64, payload[FORWARD_PREFIX + 8 ..][0..8], 5, .little);
     shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = &payload });
     try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
@@ -6547,6 +6596,49 @@ test "Shard: a forwarded write that cannot be parsed is answered, so its forward
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
+    // It waits in the forward queue, not Raft's.
+    try std.testing.expect(rn.outbound.items[0].forward);
+}
+
+test "Shard: a forwarded write carrying fields this node does not read is answered, not run without them" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    try std.testing.expect(shard.applyCommitted());
+    shard.raft_network = &rn;
+    defer {
+        for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        rn.outbound.clearRetainingCapacity();
+    }
+    // A well-formed write behind three bytes of fields.
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(proto.OpCode.kv_put);
+    header.request_id = 9;
+    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
+    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    defer std.testing.allocator.free(wire);
+    const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + 3 + wire.len);
+    defer std.testing.allocator.free(frame);
+    std.mem.writeInt(u32, frame[0..4], 92, .little);
+    std.mem.writeInt(u16, frame[4..6], 3, .little);
+    @memcpy(frame[FORWARD_PREFIX..][0..3], "abc");
+    @memcpy(frame[FORWARD_PREFIX + 3 ..], wire);
+    const writes_before = shard.requests_dispatched;
+    shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
+    try std.testing.expectEqual(writes_before, shard.requests_dispatched);
+    try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
+    const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
+    try std.testing.expectEqual(@as(u32, 92), std.mem.readInt(u32, reply[0..4], .little));
+    const resp = try proto.Response.parse(reply[12..]);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+    try std.testing.expectEqualStrings("internal error: the leader cannot read this forwarded request — are all nodes on the same version?", resp.data);
 }
 
 test "Shard: a diverged node refuses writes even if it led" {
@@ -6639,6 +6731,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
+    shard.forwards[0].sent_ms = now;
     shard.raft_network = null;
     shard.sweepForwards(now + 10 * FORWARD_TIMEOUT_MS);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
@@ -6662,6 +6755,40 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     n = std.c.read(pair[1], &out, out.len);
     resp = try proto.Response.parse(out[0..@intCast(n)]);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "lost the link") != null);
+
+    // The link went down and came back between two ticks: a new session,
+    // so the answer is not coming over it either.
+    rn.linked_ids[0].store(2, .release);
+    rn.linked_sessions[0].store(5, .release);
+    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
+    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.forwards[0].sent_to = 2;
+    shard.forwards[0].sent_term = raft.current_term;
+    shard.forwards[0].sent_session = 4;
+    shard.forwards[0].sent_ms = now;
+    shard.sweepForwards(now);
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    n = std.c.read(pair[1], &out, out.len);
+    resp = try proto.Response.parse(out[0..@intCast(n)]);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "lost the link") != null);
+
+    // Same link, same leader, same term, and no answer: waited on until
+    // the backstop, then answered.
+    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
+    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.forwards[0].sent_to = 2;
+    shard.forwards[0].sent_term = raft.current_term;
+    shard.forwards[0].sent_session = 5;
+    shard.forwards[0].sent_ms = now;
+    shard.sweepForwards(now + SENT_FORWARD_BACKSTOP_MS - 1);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    shard.sweepForwards(now + SENT_FORWARD_BACKSTOP_MS);
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    n = std.c.read(pair[1], &out, out.len);
+    resp = try proto.Response.parse(out[0..@intCast(n)]);
+    try std.testing.expectEqualStrings("unavailable: no answer from the leader — write may still apply", resp.data);
+    rn.linked_ids[0].store(0, .release);
+    rn.linked_sessions[0].store(0, .release);
 
     // A write held while no leader was known, then this node leads: it
     // runs here as the client's own request.

@@ -151,7 +151,11 @@ pub const ServerProcess = struct {
         /// Written to `[cluster] secret` whenever the peer listener will start.
         /// Every node of a test cluster shares the default; a test that wants a
         /// stranger sets its own.
-        cluster_secret: []const u8 = "e2e-cluster-secret",
+        /// In the form `flo server secret` prints; a cluster takes no other.
+        cluster_secret: []const u8 = "flo-secret-" ++ "e2e0" ** 16,
+        /// Written to `[cluster] secret_file` when set, beside `secret` if
+        /// that is set too.
+        cluster_secret_file: ?[]const u8 = null,
         /// `[server] bind` for this node; null = the server default (0.0.0.0),
         /// reached at 127.0.0.1 by the harness.
         bind: ?[]const u8 = null,
@@ -304,8 +308,10 @@ pub const ServerProcess = struct {
 
         // Same predicate as the raft port allocation below: the config is
         // written before the port is picked.
-        if ((self.config.raft_port > 0 or self.config.join_addresses != null or self.config.cluster_enabled) and self.config.cluster_secret.len > 0) {
-            try config_writer.print("\n[cluster]\nsecret = \"{s}\"\n", .{self.config.cluster_secret});
+        if (self.config.raft_port > 0 or self.config.join_addresses != null or self.config.cluster_enabled) {
+            if (self.config.cluster_secret.len > 0 or self.config.cluster_secret_file != null) try config_writer.print("\n[cluster]\n", .{});
+            if (self.config.cluster_secret.len > 0) try config_writer.print("secret = \"{s}\"\n", .{self.config.cluster_secret});
+            if (self.config.cluster_secret_file) |f| try config_writer.print("secret_file = \"{s}\"\n", .{f});
         }
 
         try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});

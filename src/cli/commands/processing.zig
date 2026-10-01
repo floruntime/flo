@@ -28,8 +28,6 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
     }.run;
 }
 
-
-
 /// Create the processing command tree
 pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
     return try commander.newBuilder(allocator)
