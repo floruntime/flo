@@ -22,7 +22,6 @@ test {
 // Protocol
 test {
     _ = @import("protocol/proto.zig");
-    _ = @import("protocol/resp.zig");
 }
 
 // Node layer

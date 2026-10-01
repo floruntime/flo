@@ -182,10 +182,6 @@ pub const Acceptor = struct {
                 self.routed_round_robin += 1;
                 return 0;
             },
-            .resp => {
-                // RESP → round-robin (we can't easily peek the key from RESP framing)
-                return self.roundRobin();
-            },
             .unknown => {
                 return self.roundRobin();
             },

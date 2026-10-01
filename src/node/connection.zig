@@ -9,9 +9,12 @@
 //! | First Bytes    | Protocol   |
 //! |---------------|------------|
 //! | `FLO\0`       | Binary     |
-//! | `*` (0x2A)    | RESP       |
 //! | `GET ` + ws   | WebSocket  |
 //! | HTTP method   | HTTP       |
+//!
+//! Anything else is read as binary, whose parser refuses it: once a
+//! request header's worth has arrived, the client gets an invalid-request
+//! answer and the connection is closed.
 //!
 //! ## Write Coalescing
 //!
@@ -168,12 +171,10 @@ pub const RingBuffer = struct {
 pub const Protocol = enum(u8) {
     /// Flo native binary protocol (magic `FLO\0`).
     binary = 0,
-    /// Redis RESP protocol (first byte `*`).
-    resp = 1,
     /// WebSocket (HTTP GET with Upgrade header).
-    websocket = 2,
+    websocket = 1,
     /// Plain HTTP (REST API / dashboard).
-    http = 3,
+    http = 2,
     /// Not yet determined (need more bytes).
     unknown = 0xFF,
 };
@@ -181,18 +182,12 @@ pub const Protocol = enum(u8) {
 /// Flo protocol magic: `FLO\0` = 0x004F4C46 little-endian.
 const FLO_MAGIC = [4]u8{ 0x46, 0x4C, 0x4F, 0x00 };
 
-/// RESP array prefix (Redis clients always send `*N\r\n...`).
-const RESP_ARRAY: u8 = '*';
-
 /// Detect protocol from peeked bytes (typically first 4+ bytes).
 ///
 /// The Acceptor uses `recv(fd, buf, MSG_PEEK)` to get these bytes
 /// without consuming them from the socket buffer.
 pub fn detectProtocol(peek_data: []const u8) Protocol {
     if (peek_data.len == 0) return .unknown;
-
-    // RESP: first byte is '*' (array command from redis-cli)
-    if (peek_data[0] == RESP_ARRAY) return .resp;
 
     // Flo binary: first 4 bytes are magic
     if (peek_data.len >= 4 and std.mem.eql(u8, peek_data[0..4], &FLO_MAGIC)) return .binary;
@@ -310,9 +305,6 @@ pub const Connection = struct {
 
     /// Outbound data buffer (write coalescing).
     write_buf: RingBuffer,
-
-    /// Pinned namespace (from auth or first request).
-    namespace: ?[]const u8,
 
     /// Authenticated user ID.
     user_id: ?[]const u8,
@@ -453,7 +445,6 @@ pub const Connection = struct {
             .state = .active,
             .read_buf = read_buf,
             .write_buf = write_buf,
-            .namespace = null,
             .user_id = null,
             .requests_total = 0,
             .forward_count = 0,
@@ -569,10 +560,10 @@ test "Connection: protocol detection — binary (Flo magic)" {
     try std.testing.expectEqual(Protocol.binary, detectProtocol(&data));
 }
 
-test "Connection: protocol detection — RESP" {
-    // Redis client sends: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n
-    const data = "*3\r\n$3\r\nSET\r\n";
-    try std.testing.expectEqual(Protocol.resp, detectProtocol(data));
+test "Connection: protocol detection — a Redis command is read as binary, which refuses it" {
+    const data = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n";
+    try std.testing.expectEqual(Protocol.binary, detectProtocol(data));
+    try std.testing.expectEqual(Protocol.binary, detectProtocolFull(data));
 }
 
 test "Connection: protocol detection — HTTP GET" {
@@ -691,15 +682,6 @@ test "Connection: detect protocol from read buffer" {
     _ = conn.read_buf.write(&[_]u8{ 0x46, 0x4C, 0x4F, 0x00 });
     conn.detectAndSetProtocol();
     try std.testing.expectEqual(Protocol.binary, conn.protocol);
-}
-
-test "Connection: detect RESP from read buffer" {
-    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
-    defer conn.deinit();
-
-    _ = conn.read_buf.write("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-    conn.detectAndSetProtocol();
-    try std.testing.expectEqual(Protocol.resp, conn.protocol);
 }
 
 test "Connection: an answer larger than the buffer is queued whole, in order, and the buffer shrinks back" {
