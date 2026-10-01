@@ -1,4 +1,5 @@
-//! RESP REPL - Interactive Redis-like shell for Flo using Commander framework
+//! REPL - Interactive shell for Flo using Commander framework. It talks to
+//! the server over the Flo binary protocol, through the CLI client.
 //!
 //! Usage:
 //!   flo repl [--endpoint <host:port>] [--namespace <ns>]

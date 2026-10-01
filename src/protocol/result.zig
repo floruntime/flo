@@ -25,9 +25,6 @@ pub const CommandResult = union(enum) {
     /// returned.
     parked: @import("../raft/types.zig").ProposeResult,
 
-    /// Pong response to ping
-    pong: void,
-
     /// Authentication successful response
     /// Returns user_id and locked namespace (if any) from validated token
     auth_ok: struct {
@@ -920,7 +917,6 @@ pub const CommandResult = union(enum) {
             // A responder answers a parked write once it applies. Sent as is,
             // it is a dispatcher that forgot to park: an error, not an empty ok.
             .parked => .error_response,
-            .pong => .pong,
             .auth_ok => .auth, // Auth success response
             .err => .error_response,
 
@@ -1011,7 +1007,7 @@ pub const CommandResult = union(enum) {
     /// Calculate serialized size for cross-core messaging
     pub fn serializedSize(self: CommandResult) usize {
         return switch (self) {
-            .ok, .pending, .parked, .pong, .kv_not_found, .kv_condition_not_met => 1,
+            .ok, .pending, .parked, .kv_not_found, .kv_condition_not_met => 1,
             .auth_ok => |a| 1 + 1 + (if (a.user_id) |u| 4 + u.len else @as(usize, 0)) + 1 + (if (a.namespace) |n| 4 + n.len else @as(usize, 0)),
             .err => |e| 1 + 2 + 4 + e.message.len,
 
@@ -1138,7 +1134,7 @@ pub const CommandResult = union(enum) {
         try writer.writeByte(@intFromEnum(std.meta.activeTag(self)));
 
         switch (self) {
-            .ok, .pending, .parked, .pong, .kv_not_found, .kv_condition_not_met => {},
+            .ok, .pending, .parked, .kv_not_found, .kv_condition_not_met => {},
             .auth_ok => |a| {
                 // Write has_user_id flag + optional user_id
                 if (a.user_id) |uid| {
@@ -1477,7 +1473,6 @@ pub const CommandResult = union(enum) {
             .pending => .{ .pending = {} },
             // A parked write never crosses shards; the tag alone survives.
             .parked => .{ .pending = {} },
-            .pong => .{ .pong = {} },
             .auth_ok => blk: {
                 const has_user_id = try reader.takeByte();
                 const user_id: ?[]const u8 = if (has_user_id == 1) try readSlice(reader, allocator) else null;
@@ -1903,7 +1898,6 @@ test "CommandResult.opcode mapping" {
     const flo = @import("proto.zig");
 
     try std.testing.expectEqual(flo.OpCode.ok, (CommandResult{ .ok = {} }).opcode());
-    try std.testing.expectEqual(flo.OpCode.pong, (CommandResult{ .pong = {} }).opcode());
     try std.testing.expectEqual(flo.OpCode.error_response, (CommandResult{ .err = .{ .code = .unknown, .message = "" } }).opcode());
     try std.testing.expectEqual(flo.OpCode.kv_get_response, (CommandResult{ .kv_value = .{ .value = "", .version = 0 } }).opcode());
 }

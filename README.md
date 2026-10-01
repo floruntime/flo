@@ -476,11 +476,10 @@ src/
 ├── stdx.zig                 # Standard library extensions
 ├── log.zig                  # Structured logging
 │
-├── protocol/                # Wire protocol (binary + RESP)
+├── protocol/                # Wire protocol (binary)
 │   ├── proto.zig            #   OpCode enum, headers, TLV encoding
 │   ├── request_builder.zig  #   Request construction helper
-│   ├── result.zig           #   CommandResult response types
-│   └── resp.zig             #   RESP Redis protocol parser
+│   └── result.zig           #   CommandResult response types
 │
 ├── node/                    # Node layer (shard-per-core)
 │   ├── acceptor.zig         #   TCP accept + routing hand-off

@@ -51,9 +51,7 @@ const Router = @import("router.zig").Router;
 const node_router = @import("router.zig");
 const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
-const resp_mod = @import("../protocol/resp.zig");
 const result_mod = @import("../protocol/result.zig");
-const CommandResult = result_mod.CommandResult;
 const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
@@ -1908,11 +1906,7 @@ pub const Shard = struct {
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
             if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
-                if (conn.protocol == .resp) {
-                    _ = conn.queueWrite("-ERR " ++ persistence_mod.COMMITTED_NOT_APPLIED ++ "\r\n");
-                } else {
-                    self.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
-                }
+                self.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
                 return;
             }
             self.answering_index = proposed.index;
@@ -2628,8 +2622,8 @@ pub const Shard = struct {
 
     /// Apply every committed entry not yet applied. Only the shard's own
     /// loop calls this: at boot, on a Raft frame, on an election won alone,
-    /// after each client request (binary, RESP, or forwarded from another
-    /// shard), and in the tick; `park` applies up to its own entry through
+    /// after each client request (its own client's or one forwarded from
+    /// another shard), and in the tick; `park` applies up to its own entry through
     /// `applyThrough`. Module code never does: applying in the middle of its own
     /// work would run other writers' appliers and responders under its
     /// locks and over its pointers into the maps they change. False when an
@@ -3119,15 +3113,13 @@ pub const Shard = struct {
         if (conn.read_buf.writable() == 0) {
             // A request may be larger than the buffer: grow it to hold one
             // whole request. Full at that size, the client sent more than a
-            // request can be (a binary request says so in its header first;
-            // a RESP command cannot).
+            // request can be. Every request says its size in its header and
+            // one that cannot fit is refused from it, so this should not be
+            // reached; if it is, one connection is closed rather than its
+            // buffer growing without bound.
             const cap = conn.read_buf.buf.len * 2;
             if (cap > MAX_READ_BUFFER) {
-                if (conn.protocol == .resp) {
-                    _ = conn.queueWrite("-ERR request over 256 KiB\r\n");
-                } else {
-                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
-                }
+                self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
                 self.flushToClient(fd);
                 return self.markClosing(fd);
             }
@@ -3157,11 +3149,7 @@ pub const Shard = struct {
             conn.detectAndSetProtocol();
         }
 
-        // Dispatch based on protocol
-        switch (conn.protocol) {
-            .resp => self.processRespRequests(fd, conn),
-            else => self.processRequests(fd, conn),
-        }
+        self.processRequests(fd, conn);
         // Closing is deferred, so the connection is still ours here.
         conn.shrinkReadBuffer();
     }
@@ -3555,10 +3543,7 @@ pub const Shard = struct {
             conn.resume_queued = false;
             if (conn.closing or conn.reads_paused or conn.waiting != null) continue;
             ran = true;
-            switch (conn.protocol) {
-                .resp => self.processRespRequests(fd, conn),
-                else => self.processRequests(fd, conn),
-            }
+            self.processRequests(fd, conn);
         }
         self.resume_running.clearRetainingCapacity();
         // What they proposed goes out at the next tick's pump; that tick
@@ -3570,207 +3555,6 @@ pub const Shard = struct {
         }
         self.closing_fds.clearRetainingCapacity();
         self.countPaused();
-    }
-
-    // ─── RESP Protocol Handler ──────────────────────────────────────────
-
-    /// Process RESP (Redis protocol) requests from a connection's read buffer.
-    /// Parses RESP commands, translates to Flo operations, executes directly
-    /// via the appropriate handler, and serializes responses back to RESP.
-    fn processRespRequests(self: *Shard, fd: i32, conn: *Connection) void {
-        var resp_parser = resp_mod.Parser.init(self.allocator);
-        defer resp_parser.deinit();
-
-        while (conn.read_buf.readable() > 0) {
-            if (conn.closing) return;
-            if (shouldPause(conn)) return self.pauseReads(fd, conn);
-            // Peek all available data without consuming
-            const available = conn.read_buf.readable();
-            var parse_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-            const to_copy = @min(available, MAX_REQUEST_SIZE);
-            const copied = conn.read_buf.copyOut(parse_buf[0..to_copy]);
-            if (copied == 0) break;
-
-            // Try to parse a complete RESP value
-            const parsed = resp_parser.parse(parse_buf[0..copied]) catch {
-                // Parse error — send RESP error and close
-                _ = conn.queueWrite("-ERR invalid RESP data\r\n");
-                self.flushToClient(fd);
-                self.markClosing(fd);
-                return;
-            };
-
-            // Incomplete — wait for more
-            if (parsed == null) break;
-
-            const result = parsed.?;
-            var resp_value = result.value;
-            conn.read_buf.consume(result.consumed);
-
-            defer resp_mod.freeValue(self.allocator, &resp_value);
-
-            // Get session namespace (default "default")
-            const namespace = conn.namespace orelse "default";
-
-            // Translate RESP command to Flo operation
-            const translate_result = resp_mod.translateCommand(self.allocator, resp_value, namespace) catch |err| {
-                switch (err) {
-                    error.UnknownCommand => {
-                        _ = conn.queueWrite("-ERR unknown command\r\n");
-                    },
-                    else => {
-                        _ = conn.queueWrite("-ERR invalid command\r\n");
-                    },
-                }
-                self.flushToClient(fd);
-                resp_parser.reset();
-                continue;
-            };
-
-            switch (translate_result) {
-                .use_namespace => |u| {
-                    conn.namespace = u.namespace;
-                    _ = conn.queueWrite("+OK\r\n");
-                },
-                .select_db => {
-                    // Redis SELECT — acknowledge silently
-                    _ = conn.queueWrite("+OK\r\n");
-                },
-                .command => |cmd| {
-                    self.executeRespCommand(conn, cmd);
-                    // As after a binary request: what it proposed applies now.
-                    _ = self.applyCommitted();
-                },
-            }
-
-            self.flushToClient(fd);
-            resp_parser.reset();
-        }
-    }
-
-    /// Execute a translated RESP command through the appropriate handler
-    /// and queue the RESP-formatted response.
-    fn executeRespCommand(self: *Shard, conn: *Connection, cmd: resp_mod.RespCommand) void {
-        // Build a proto.Request from the RESP command
-        const req = proto.Request{
-            .header = .{
-                .magic = proto.MAGIC,
-                .payload_length = 0,
-                .request_id = conn.requests_total,
-                .crc32 = 0,
-                .version = proto.VERSION,
-                .op_code = @intFromEnum(cmd.opcode),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-            },
-            .namespace = cmd.namespace,
-            .key = cmd.key,
-            .value = cmd.value,
-            .options = "",
-        };
-
-        conn.requests_total += 1;
-
-        // RESP has no request ids and no forwarding: a write parked for a
-        // peer's ack would be answered out of order behind a pipelined
-        // read, and a follower cannot take it. On a single node the answer
-        // is inline, so writes are served there only.
-        if (self.raft_node.peer_count > 0 and dispatcher_mod.opWrites(cmd.opcode)) {
-            _ = conn.queueWrite("-ERR RESP writes are served by a single-node server; use the Flo protocol on a cluster\r\n");
-            self.freeRespCommand(cmd);
-            return;
-        }
-        // An enqueue's applier labels the queue by resolving its namespace
-        // (a stream append's handler proposes this itself).
-        if (cmd.opcode == .queue_enqueue) self.namespace_handler.proposeImplicitCreate(cmd.namespace, self, false);
-
-        // Dispatch to the appropriate handler and get CommandResult
-        const cmd_result = self.handleRespOpcode(cmd.opcode, req);
-        defer self.kv_handler.freeResult(cmd_result);
-
-        // A stream append or queue enqueue is answered once its entry
-        // applies, like any client's: on a single node, inline. (Key-value
-        // writes over RESP still go straight to the projection.) A parked
-        // request is re-parsed from its bytes, so it carries its length
-        // and checksum.
-        if (cmd_result == .parked) {
-            defer self.freeRespCommand(cmd);
-            var parked = req;
-            parked.header.payload_length = @intCast(2 + req.namespace.len + 2 + req.key.len + 4 + req.value.len + 2 + req.options.len);
-            const wire = serializeRequest(self.allocator, parked) catch {
-                _ = conn.queueWrite("-ERR internal error: write proposed, its answer lost — do not resend\r\n");
-                return;
-            };
-            defer self.allocator.free(wire);
-            parked.header.crc32 = parked.header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
-            self.park(conn, parked, cmd_result.parked, respondResp);
-            return;
-        }
-
-        // Translate CommandResult → RESP and serialize
-        const resp_value = resp_mod.translateResult(cmd_result);
-        const response_bytes = resp_mod.serialize(self.allocator, resp_value) catch {
-            _ = conn.queueWrite("-ERR internal error\r\n");
-            self.freeRespCommand(cmd);
-            return;
-        };
-        defer self.allocator.free(response_bytes);
-
-        _ = conn.queueWrite(response_bytes);
-
-        // Free any heap-allocated fields from translateCommand
-        self.freeRespCommand(cmd);
-    }
-
-    /// A RESP write applied: the module's answer, in RESP.
-    fn respondResp(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
-        const self: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var id_buf: [20]u8 = undefined;
-        const result: CommandResult = switch (@as(proto.OpCode, @enumFromInt(req.header.op_code))) {
-            .stream_append => self.stream_handler.respondAppend(),
-            .queue_enqueue => self.queue_handler.respondEnqueue(&id_buf),
-            else => .ok,
-        };
-        if (result != .err) self.namespace_handler.markNamespaceHasData(req.namespace, self);
-        const bytes = resp_mod.serialize(self.allocator, resp_mod.translateResult(result)) catch {
-            _ = conn.queueWrite("-ERR internal error\r\n");
-            return;
-        };
-        defer self.allocator.free(bytes);
-        _ = conn.queueWrite(bytes);
-    }
-
-    /// Route a RESP opcode to the appropriate handler, returning a CommandResult.
-    fn handleRespOpcode(self: *Shard, opcode: proto.OpCode, req: proto.Request) CommandResult {
-        return switch (opcode) {
-            .ping => .pong,
-            .kv_get => self.kv_handler.handleCommand(req),
-            .kv_put => self.kv_handler.handleCommand(req),
-            .kv_delete => self.kv_handler.handleCommand(req),
-            .kv_incr => self.kv_handler.handleCommand(req),
-            .kv_touch => self.kv_handler.handleCommand(req),
-            .kv_persist => self.kv_handler.handleCommand(req),
-            .kv_exists => self.kv_handler.handleCommand(req),
-            .kv_json_get => self.kv_handler.handleCommand(req),
-            .kv_json_set => self.kv_handler.handleCommand(req),
-            .kv_json_del => self.kv_handler.handleCommand(req),
-            .stream_append => self.stream_handler.handleCommand(req),
-            .stream_read => self.stream_handler.handleCommand(req),
-            .queue_enqueue => self.queue_handler.handleCommand(req),
-            .queue_dequeue => self.queue_handler.handleCommand(req),
-            else => .{ .err = .{ .code = .invalid_request, .message = "unsupported RESP command" } },
-        };
-    }
-
-    /// Free heap-allocated fields from a translated RESP command.
-    /// Only frees key/value if they were heap-allocated (non-empty, since
-    /// translateCommand uses allocator.dupe for non-empty strings).
-    /// Free heap-allocated fields from a translated RESP command.
-    /// translateCommand uses allocator.dupe — non-empty slices are heap-owned.
-    fn freeRespCommand(self: *Shard, cmd: resp_mod.RespCommand) void {
-        if (cmd.key.len > 0) self.allocator.free(cmd.key);
-        if (cmd.value.len > 0) self.allocator.free(cmd.value);
     }
 
     /// Flush pending write data from a connection to the socket.
@@ -5362,30 +5146,6 @@ test "Shard: a client that sends without reading is paced: its requests wait unt
         try std.testing.expectEqual(@as(u64, 11 + i), resp.header.request_id);
     }
     try std.testing.expect(!c.conn.reads_paused);
-
-    // The same over RESP.
-    const r = try TestClient.open(&shard);
-    defer _ = std.c.close(r.pair[1]);
-    _ = std.c.setsockopt(r.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
-    const get = "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
-    const three = get ** 3;
-    try std.testing.expectEqual(@as(isize, three.len), std.c.write(r.pair[1], three, three.len));
-    shard.readFromClient(r.conn.fd);
-    try std.testing.expect(r.conn.reads_paused);
-    try std.testing.expectEqual(2 * get.len, r.conn.read_buf.readable());
-    const bulk_len = std.fmt.comptimePrint("${d}\r\n", .{2 * Shard.PAUSE_READS_AT}).len + value.len + 2;
-    const rout = try std.testing.allocator.alloc(u8, 3 * bulk_len);
-    defer std.testing.allocator.free(rout);
-    got = 0;
-    tries = 0;
-    while (got < rout.len and tries < 100_000) : (tries += 1) {
-        shard.flushToClient(r.conn.fd);
-        shard.settleConnections();
-        const n = std.c.read(r.pair[1], rout[got..].ptr, rout.len - got);
-        if (n > 0) got += @intCast(n);
-    }
-    try std.testing.expectEqual(rout.len, got);
-    try std.testing.expect(!r.conn.reads_paused);
 }
 
 test "Shard: a client that sends its whole pipeline before reading is unpaced once it stalls, and gets every answer; one that reads stays paced" {
@@ -5502,20 +5262,6 @@ test "Shard: a connection marked closing runs no more of its requests and is clo
     try std.testing.expect(shard.getConnection(fd) != null);
     shard.settleConnections();
     try std.testing.expect(shard.getConnection(fd) == null);
-
-    // The same over RESP: the second command stays unread.
-    const r = try TestClient.open(&shard);
-    defer _ = std.c.close(r.pair[1]);
-    const rfd = r.conn.fd;
-    const ping = "*1\r\n$4\r\nPING\r\n";
-    r.conn.write_overflow = true;
-    const two = ping ++ ping;
-    try std.testing.expectEqual(@as(isize, two.len), std.c.write(r.pair[1], two, two.len));
-    shard.readFromClient(rfd);
-    try std.testing.expectEqual(ping.len, r.conn.read_buf.readable());
-    try std.testing.expect(shard.getConnection(rfd) != null);
-    shard.settleConnections();
-    try std.testing.expect(shard.getConnection(rfd) == null);
 }
 
 /// Two shards of one node, wired to each other as the runtime wires them.
@@ -6643,21 +6389,6 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
     try std.testing.expectEqualStrings("bad request: request over 256 KiB", resp.data);
 
-    // A RESP command cannot say its size up front: refused in RESP once
-    // the buffer is full at its cap.
-    const r = try TestClient.open(&shard);
-    defer _ = std.c.close(r.pair[1]);
-    const big = try std.testing.allocator.alloc(u8, MAX_READ_BUFFER + 64);
-    defer std.testing.allocator.free(big);
-    @memset(big, 'x');
-    const head = "*2\r\n$3\r\nGET\r\n$600000\r\n";
-    @memcpy(big[0..head.len], head);
-    _ = feedClient(r.pair[1], &shard, r.conn.fd, big);
-    try std.testing.expect(r.conn.closing);
-    var rout: [64]u8 = undefined;
-    const rn = std.c.read(r.pair[1], &rout, rout.len);
-    try std.testing.expectEqualStrings("-ERR request over 256 KiB\r\n", rout[0..@intCast(rn)]);
-
     // Not a request at all, whatever its length field says: invalid, not
     // too large.
     const j = try TestClient.open(&shard);
@@ -6669,6 +6400,36 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     n = try readAnswer(j.pair[1], &shard, j.conn.fd, &out, @sizeOf(proto.ResponseHeader));
     resp = try proto.Response.parse(out[0..n]);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "256 KiB") == null);
+}
+
+test "Shard: a first frame in another protocol is answered as an invalid request and the connection closed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+
+    // A Redis command gets what stray HTTP gets: Flo does not speak it.
+    const frames = [_][]const u8{
+        "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n",
+        "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    for (frames) |frame| {
+        const c = try TestClient.open(&shard);
+        defer _ = std.c.close(c.pair[1]);
+        const fd = c.conn.fd;
+        try std.testing.expectEqual(@as(isize, @intCast(frame.len)), std.c.write(c.pair[1], frame.ptr, frame.len));
+        shard.readFromClient(fd);
+        try std.testing.expect(c.conn.closing);
+        var out: [256]u8 = undefined;
+        const n = try readAnswer(c.pair[1], &shard, fd, &out, @sizeOf(proto.ResponseHeader));
+        const resp = try proto.Response.parse(out[0..n]);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+        try std.testing.expectEqual(@as(u64, 0), resp.header.request_id);
+        try std.testing.expectEqualStrings("Invalid request", resp.data);
+        shard.settleConnections();
+        try std.testing.expect(shard.getConnection(fd) == null);
+    }
 }
 
 test "Shard: requests resumed at the end of a tick run, and keep the next poll from waiting on a leader only" {
@@ -7322,66 +7083,6 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
     try std.testing.expectEqualStrings("invalid namespace name", two[1].data);
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
-}
-
-test "Shard: a RESP stream append answers with its record's sequence once its entry applies" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
-    defer shard.deinit();
-    shard.wireHandlerShardPtrs();
-    try std.testing.expect(shard.applyCommitted());
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-    conn.protocol = .resp;
-
-    const a = std.testing.allocator;
-    shard.executeRespCommand(conn, .{ .opcode = .stream_append, .namespace = "", .key = try a.dupe(u8, "s"), .value = try a.dupe(u8, "a") });
-    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
-
-    // `XADD` answers once, with the record's sequence, not nil.
-    const id = shard.stream_handler.stream.streamLastId(node_router.nameHash(node_router.namespaceHash(""), "s"));
-    var want_buf: [32]u8 = undefined;
-    const want = try std.fmt.bufPrint(&want_buf, ":{d}\r\n", .{id.sequence});
-    shard.flushToClient(conn.fd);
-    var buf: [64]u8 = undefined;
-    const n = std.c.recv(pair[1], &buf, buf.len, std.c.MSG.DONTWAIT);
-    try std.testing.expect(n > 0);
-    try std.testing.expectEqualStrings(want, buf[0..@intCast(n)]);
-    // Counted against its namespace, as a Flo-protocol write is.
-    try std.testing.expect(shard.namespace_handler.namespaceHasData("default"));
-}
-
-test "Shard: a RESP write on a cluster is refused in RESP, not parked" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-    defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
-    defer shard.deinit();
-    shard.raft_network = &rn;
-    shard.wireHandlerShardPtrs();
-    try ParkTest.joinPeer(&shard);
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-    conn.protocol = .resp;
-
-    const a = std.testing.allocator;
-    const before = shard.raft_node.log.lastIndex();
-    shard.executeRespCommand(conn, .{ .opcode = .stream_append, .namespace = "", .key = try a.dupe(u8, "s"), .value = try a.dupe(u8, "a") });
-    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
-    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
-    shard.flushToClient(conn.fd);
-    var buf: [128]u8 = undefined;
-    const n = std.c.recv(pair[1], &buf, buf.len, std.c.MSG.DONTWAIT);
-    try std.testing.expect(n > 0);
-    try std.testing.expect(std.mem.startsWith(u8, buf[0..@intCast(n)], "-ERR "));
 }
 
 test "Shard: concurrent conditional writes are decided in log order: one run per idempotency key, one create per namespace, one version per register" {

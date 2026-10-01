@@ -31,7 +31,7 @@
 Dedicated thread running a TCP accept loop. On each new connection:
 
 1. Accept the socket
-2. Peek at the first bytes to detect the protocol (binary, RESP, HTTP, WebSocket)
+2. Peek at the first bytes to detect the protocol (binary, HTTP, WebSocket)
 3. Parse the routing key from the first request
 4. Hash the routing key → partition → shard
 5. Hand off the file descriptor to the target shard via a pipe
