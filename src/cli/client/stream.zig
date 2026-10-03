@@ -507,7 +507,7 @@ pub fn groupPendingForConsumer(
     return client.sendRequest(.stream_group_pending, namespace, stream, writer.bytes());
 }
 
-/// Claim pending entries (FLO-102) — cursor-based PEL scan.
+/// Claim pending entries — cursor-based PEL scan.
 ///
 /// Scans the group's PEL from `start_id` in StreamID order and claims up to
 /// `count` entries whose idle time ≥ `min_idle_ms` for `consumer`, returning
