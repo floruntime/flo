@@ -627,9 +627,11 @@ pub fn generateDefaultConfig() []const u8 {
     \\# seeds = ["192.168.1.10:9500", "192.168.1.11:9500"]
     \\
     \\# Shared secret every member must hold; required whenever the peer
-    \\# listener starts (--cluster, --join, or seeds here).
-    \\# Generate one: openssl rand -base64 32
-    \\# secret = "..."
+    \\# listener starts (--cluster, --join, or seeds here). Only one made by
+    \\# `flo server secret` is accepted. Or keep it in a file only its owner
+    \\# can read (chmod 600) and name the file instead.
+    \\# secret = "flo-secret-..."
+    \\# secret_file = "/etc/flo/cluster.secret"
     \\
     \\# Replacing a leader that has gone quiet begins after half of this and
     \\# is certain by all of it; heartbeats are a sixth of it. Minimum 100.

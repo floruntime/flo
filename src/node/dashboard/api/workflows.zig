@@ -420,78 +420,78 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     const end_idx = @min(start_idx + limit, all_runs.items.len);
     for (all_runs.items[start_idx..end_idx]) |item| {
         const run = item.run;
-                const run_status_str = run.status.toString();
-                // Derive trigger source from first history event
-                const triggered_by: []const u8 = if (run.history.items.len > 0) blk: {
-                    const first = run.history.items[0].event_type_owned;
-                    if (std.mem.eql(u8, first, "schedule_started")) break :blk "schedule";
-                    if (std.mem.eql(u8, first, "trigger_started")) break :blk "stream";
-                    break :blk "manual";
-                } else "manual";
-                try arr.next();
-                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try obj.begin();
-                try obj.stringField("run_id", run.run_id_owned);
-                try obj.stringField("workflow", run.workflow_name_owned);
-                // Resolve actual version from definitions ("latest" → real version)
-                const resolved_version = blk: {
-                    if (!std.mem.eql(u8, run.workflow_version_owned, "latest")) break :blk run.workflow_version_owned;
-                    // Search definitions for the real version
-                    for (0..n) |si| {
-                        if (getShard(ctx, si)) |s| {
-                            var dit = s.workflow_handler.definitions.iterator();
-                            while (dit.next()) |de| {
-                                if (std.mem.eql(u8, de.value_ptr.name_owned, run.workflow_name_owned)) {
-                                    break :blk de.value_ptr.version_owned;
-                                }
-                            }
+        const run_status_str = run.status.toString();
+        // Derive trigger source from first history event
+        const triggered_by: []const u8 = if (run.history.items.len > 0) blk: {
+            const first = run.history.items[0].event_type_owned;
+            if (std.mem.eql(u8, first, "schedule_started")) break :blk "schedule";
+            if (std.mem.eql(u8, first, "trigger_started")) break :blk "stream";
+            break :blk "manual";
+        } else "manual";
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("run_id", run.run_id_owned);
+        try obj.stringField("workflow", run.workflow_name_owned);
+        // Resolve actual version from definitions ("latest" → real version)
+        const resolved_version = blk: {
+            if (!std.mem.eql(u8, run.workflow_version_owned, "latest")) break :blk run.workflow_version_owned;
+            // Search definitions for the real version
+            for (0..n) |si| {
+                if (getShard(ctx, si)) |s| {
+                    var dit = s.workflow_handler.definitions.iterator();
+                    while (dit.next()) |de| {
+                        if (std.mem.eql(u8, de.value_ptr.name_owned, run.workflow_name_owned)) {
+                            break :blk de.value_ptr.version_owned;
                         }
                     }
-                    break :blk run.workflow_version_owned;
-                };
-                try obj.stringField("version", resolved_version);
-                try obj.stringField("status", run_status_str);
-                try obj.stringField("triggered_by", triggered_by);
-                if (run.current_step_name_owned) |step| {
-                    try obj.stringField("current_step", step);
-                } else {
-                    try obj.nullField("current_step");
                 }
-                try obj.intField("started_at", item.started_at);
-                if (run.completed_at_ms) |t| {
-                    try obj.intField("completed_at", t);
-                    try obj.intField("duration_ms", t - item.started_at);
-                } else {
-                    try obj.nullField("completed_at");
-                    try obj.nullField("duration_ms");
-                }
-                if (run.wait_signal_type_owned) |wt| {
-                    // Hide internal _action_done:* synthetic signals from the API
-                    if (std.mem.startsWith(u8, wt, "_action_done:")) {
-                        try obj.stringField("wait_type", "action");
-                    } else {
-                        try obj.stringField("wait_type", wt);
-                    }
-                } else {
-                    try obj.nullField("wait_type");
-                }
-                try obj.nullField("parent_run_id");
-                try obj.nullField("terminal_name");
-                if (run.history.items.len > 0) {
-                    // Check last event for error info
-                    const last = run.history.items[run.history.items.len - 1];
-                    if (std.mem.eql(u8, last.event_type_owned, "workflow_failed") or
-                        std.mem.eql(u8, last.event_type_owned, "step_failed"))
-                    {
-                        try obj.stringField("error", last.detail_owned);
-                    } else {
-                        try obj.nullField("error");
-                    }
-                } else {
-                    try obj.nullField("error");
-                }
-                try obj.intField("history_event_count", @as(i64, @intCast(run.history.items.len)));
-                try obj.end();
+            }
+            break :blk run.workflow_version_owned;
+        };
+        try obj.stringField("version", resolved_version);
+        try obj.stringField("status", run_status_str);
+        try obj.stringField("triggered_by", triggered_by);
+        if (run.current_step_name_owned) |step| {
+            try obj.stringField("current_step", step);
+        } else {
+            try obj.nullField("current_step");
+        }
+        try obj.intField("started_at", item.started_at);
+        if (run.completed_at_ms) |t| {
+            try obj.intField("completed_at", t);
+            try obj.intField("duration_ms", t - item.started_at);
+        } else {
+            try obj.nullField("completed_at");
+            try obj.nullField("duration_ms");
+        }
+        if (run.wait_signal_type_owned) |wt| {
+            // Hide internal _action_done:* synthetic signals from the API
+            if (std.mem.startsWith(u8, wt, "_action_done:")) {
+                try obj.stringField("wait_type", "action");
+            } else {
+                try obj.stringField("wait_type", wt);
+            }
+        } else {
+            try obj.nullField("wait_type");
+        }
+        try obj.nullField("parent_run_id");
+        try obj.nullField("terminal_name");
+        if (run.history.items.len > 0) {
+            // Check last event for error info
+            const last = run.history.items[run.history.items.len - 1];
+            if (std.mem.eql(u8, last.event_type_owned, "workflow_failed") or
+                std.mem.eql(u8, last.event_type_owned, "step_failed"))
+            {
+                try obj.stringField("error", last.detail_owned);
+            } else {
+                try obj.nullField("error");
+            }
+        } else {
+            try obj.nullField("error");
+        }
+        try obj.intField("history_event_count", @as(i64, @intCast(run.history.items.len)));
+        try obj.end();
     }
 
     try arr.end();

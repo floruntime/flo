@@ -606,8 +606,12 @@ pub const Runtime = struct {
             const node_id = cluster_node_id;
             const secret = self.config.cluster_secret orelse "";
             if (secret.len == 0) {
-                log.err("cluster: the peer listener needs [cluster] secret (the same value on every member); refusing to start it open", .{});
+                log.err("cluster: the peer listener needs [cluster] secret (the same value on every member, made by `flo server secret`); refusing to start it open", .{});
                 return error.ClusterSecretRequired;
+            }
+            if (!cluster_config.secretWellFormed(secret)) {
+                log.err("cluster: [cluster] secret is not one `flo server secret` made; run it once and give every member its output (in [cluster] secret, secret_file or FLO_CLUSTER_SECRET)", .{});
+                return error.ClusterSecretMalformed;
             }
 
             const q = try self.allocator.create(RaftQueue);

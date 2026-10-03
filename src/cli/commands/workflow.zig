@@ -173,8 +173,6 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
 // Command Handlers
 // =============================================================================
 
-
-
 fn runCreate(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
     if (file_path.len == 0) {

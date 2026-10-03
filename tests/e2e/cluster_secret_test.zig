@@ -9,13 +9,13 @@ const CliRunner = stdx.testing.CliRunner;
 
 test "e2e/cluster: a joiner with the wrong secret never links, and both sides log the refusal" {
     const allocator = testing.allocator;
-    const seed = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "the-right-one" });
+    const seed = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ "1" ** 64 });
     defer seed.deinit();
     try seed.start();
     const seed_raft = try seed.getRaftEndpoint(allocator);
     defer allocator.free(seed_raft);
 
-    const stranger = try ServerProcess.initWithConfig(allocator, .{ .join_addresses = seed_raft, .shards = 1, .cluster_secret = "another" });
+    const stranger = try ServerProcess.initWithConfig(allocator, .{ .join_addresses = seed_raft, .shards = 1, .cluster_secret = "flo-secret-" ++ "2" ** 64 });
     defer stranger.deinit();
     try stranger.start();
     errdefer {
@@ -60,6 +60,67 @@ test "e2e/cluster: the peer listener refuses to start without a secret" {
     defer bare.deinit();
     try testing.expectError(error.ServerNotReady, bare.startWithTimeout(3000));
     try testing.expect(try bare.logsContain("[cluster] secret"));
+}
+
+test "e2e/cluster: a secret not made by `flo server secret` is refused, and the refusal says how to make one" {
+    const allocator = testing.allocator;
+    const weak = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "password123" });
+    defer weak.deinit();
+    try testing.expectError(error.ServerNotReady, weak.startWithTimeout(3000));
+    try testing.expect(try weak.logsContain("`flo server secret`"));
+}
+
+test "e2e/cluster: `flo server secret` prints a secret a cluster starts with" {
+    const allocator = testing.allocator;
+    const probe = try ServerProcess.initWithConfig(allocator, .{ .shards = 1 });
+    defer probe.deinit();
+    const cli = try CliRunner.init(allocator, probe.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+    var out = try cli.runRaw(&.{ "server", "secret" });
+    defer out.deinit();
+    const secret = std.mem.trim(u8, out.stdout, " \n");
+    try testing.expectEqual(@as(usize, "flo-secret-".len + 64), secret.len);
+    try testing.expect(std.mem.startsWith(u8, secret, "flo-secret-"));
+
+    const node = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = secret });
+    defer node.deinit();
+    try node.start();
+}
+
+test "e2e/cluster: a secret file is used only when its owner alone can read it, and never beside a second secret" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fs.path.join(allocator, &.{ dir, "cluster.secret" });
+    defer allocator.free(path);
+    {
+        const f = try stdx.fs.createFileAbsolute(path, .{});
+        defer stdx.fs.closeFile(f);
+        try stdx.fs.writeAll(f, "flo-secret-" ++ "3" ** 64 ++ "\n");
+    }
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    // Readable by others: refused, and the log says how to fix it.
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o644));
+    const open_file = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "", .cluster_secret_file = path });
+    defer open_file.deinit();
+    try testing.expectError(error.ServerNotReady, open_file.startWithTimeout(3000));
+    try testing.expect(try open_file.logsContain("chmod 600"));
+
+    // A second source as well: refused rather than one silently ignored.
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o600));
+    const both = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret_file = path });
+    defer both.deinit();
+    try testing.expectError(error.ServerNotReady, both.startWithTimeout(3000));
+    try testing.expect(try both.logsContain("set more than once"));
+
+    // Owner-only: the node starts on it.
+    const ok = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "", .cluster_secret_file = path });
+    defer ok.deinit();
+    try ok.start();
 }
 
 test "e2e/cluster: a raft port already in use is a clean refusal, not a crash" {

@@ -1,11 +1,13 @@
 //! Peer handshake: each side proves it holds the cluster secret before the
 //! link carries anything else. Three frames — a hello from the dialer with
-//! its nonce, a hello back with the acceptor's nonce and its proof over
-//! both, a proof back from the dialer — then the acceptor's verdict. The
-//! proof is an HMAC over both nonces and both ids, prover's and verifier's,
-//! so a transcript replays to nothing, a proof made for one peer does not
-//! verify at another, and the id a frame carries is the id that was
-//! proved. The secret itself never crosses the wire.
+//! its nonce, a hello back with the acceptor's nonce and its proof, a proof
+//! back from the dialer — then the acceptor's verdict. Each proof is an
+//! HMAC over the handshake so far (`seal.Transcript`): both hellos, with
+//! the ids, addresses and nonces they carry, and the prover's and
+//! verifier's ids. So a transcript replays to nothing, a proof made for one
+//! peer does not verify at another, and nothing a hello says can be altered
+//! on the way. The secret itself never crosses the wire; once the verdict
+//! is in, the whole transcript keys the link (`seal.zig`).
 //!
 //! This file is the codec and the arithmetic; the per-socket state machine
 //! that drives it lives with the sockets, in the network.
@@ -13,7 +15,9 @@
 const std = @import("std");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-pub const VERSION: u16 = 1;
+/// Nodes speaking different versions cannot link; upgrading is stopping
+/// every node and starting them on the new version together.
+pub const VERSION: u16 = 2;
 pub const NONCE_LEN: usize = 32;
 pub const MAC_LEN: usize = HmacSha256.mac_length;
 
@@ -81,17 +85,16 @@ pub const Welcome = struct {
     }
 };
 
-/// The proof one side gives: bound to the other side's nonce first, then
-/// its own, then the id it claims, then the id it is proving itself to.
-/// Binding the verifier's id is what stops a node's own proof, relayed
-/// back to it by a stranger, from verifying. The domain string keeps this
-/// MAC from ever matching one computed for another purpose with the same
-/// secret.
-pub fn proof(secret: []const u8, their_nonce: *const [NONCE_LEN]u8, my_nonce: *const [NONCE_LEN]u8, my_node_id: u32, their_node_id: u32) [MAC_LEN]u8 {
+/// The proof one side gives: bound to the handshake so far (`transcript`,
+/// which holds both nonces), then the id it claims, then the id it is
+/// proving itself to. Binding the verifier's id is what stops a node's own
+/// proof, relayed back to it by a stranger, from verifying. The domain
+/// string keeps this MAC from ever matching one computed for another
+/// purpose with the same secret.
+pub fn proof(secret: []const u8, transcript: *const [32]u8, my_node_id: u32, their_node_id: u32) [MAC_LEN]u8 {
     var mac = HmacSha256.init(secret);
-    mac.update("flo-raft-hs-1");
-    mac.update(their_nonce);
-    mac.update(my_nonce);
+    mac.update("flo-raft-hs-2");
+    mac.update(transcript);
     var ids: [8]u8 = undefined;
     std.mem.writeInt(u32, ids[0..4], my_node_id, .little);
     std.mem.writeInt(u32, ids[4..8], their_node_id, .little);
@@ -132,21 +135,23 @@ test "handshake: hello and welcome round-trip" {
     try testing.expect(Welcome.decode(&wbuf) == null);
 }
 
-test "handshake: a proof verifies only with the same secret, nonces and ids, and each side's differs" {
-    const nd = [_]u8{1} ** NONCE_LEN;
-    const na = [_]u8{2} ** NONCE_LEN;
-    // The acceptor (id 2) proves to the dialer (id 1) over (dialer nonce,
-    // acceptor nonce, 2, 1); the dialer checks it with the same inputs.
-    const from_acceptor = proof("s3cret", &nd, &na, 2, 1);
-    try testing.expect(proofMatches(&proof("s3cret", &nd, &na, 2, 1), &from_acceptor));
-    try testing.expect(!proofMatches(&proof("other", &nd, &na, 2, 1), &from_acceptor));
-    try testing.expect(!proofMatches(&proof("s3cret", &nd, &na, 3, 1), &from_acceptor));
-    try testing.expect(!proofMatches(&proof("s3cret", &na, &nd, 2, 1), &from_acceptor));
+test "handshake: a proof verifies only with the same secret, transcript and ids, and each side's differs" {
+    const t1 = [_]u8{1} ** 32;
+    const t2 = [_]u8{2} ** 32;
+    // The acceptor (id 2) proves to the dialer (id 1); the dialer checks it
+    // with the same inputs.
+    const from_acceptor = proof("s3cret", &t1, 2, 1);
+    try testing.expect(proofMatches(&proof("s3cret", &t1, 2, 1), &from_acceptor));
+    try testing.expect(!proofMatches(&proof("other", &t1, 2, 1), &from_acceptor));
+    try testing.expect(!proofMatches(&proof("s3cret", &t1, 3, 1), &from_acceptor));
+    // Any change to the handshake so far — a hello's address, a nonce —
+    // changes the transcript, and the proof no longer matches.
+    try testing.expect(!proofMatches(&proof("s3cret", &t2, 2, 1), &from_acceptor));
     // Made for a different verifier, it does not pass at this one: a
     // stranger relaying node 2's proof for node 3 to node 1 fails.
-    try testing.expect(!proofMatches(&proof("s3cret", &nd, &na, 2, 3), &from_acceptor));
-    // The dialer's proof over the mirrored inputs is a different value, so
-    // an acceptor's proof echoed back does not pass as the dialer's.
-    const from_dialer = proof("s3cret", &na, &nd, 1, 2);
+    try testing.expect(!proofMatches(&proof("s3cret", &t1, 2, 3), &from_acceptor));
+    // The dialer's proof is a different value, so an acceptor's proof
+    // echoed back does not pass as the dialer's.
+    const from_dialer = proof("s3cret", &t1, 1, 2);
     try testing.expect(!proofMatches(&from_dialer, &from_acceptor));
 }
