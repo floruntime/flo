@@ -249,7 +249,12 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
                 log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer seconds", .{ spec.name, window_size_str });
                 return CreateError.MissingConfig;
             };
-            break :blk .{ .tumbling_time = seconds * 1000 }; // Convert seconds → ms
+            // The window size divides event times, so zero or negative is fatal.
+            const window_ms = if (seconds > 0) std.math.mul(i64, seconds, 1000) catch null else null;
+            break :blk .{ .tumbling_time = window_ms orelse {
+                log.err("Native operator '{s}' (type=aggregate) window_size '{s}' must be a positive number of seconds", .{ spec.name, window_size_str });
+                return CreateError.MissingConfig;
+            } };
         } else if (std.mem.eql(u8, window_type, "count")) {
             const count = std.fmt.parseInt(u64, window_size_str, 10) catch {
                 log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer count", .{ spec.name, window_size_str });
@@ -578,6 +583,27 @@ test "NativeOperatorRegistry — create aggregate with tumbling window" {
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("avg-latency", result.op.getName());
+}
+
+test "NativeOperatorRegistry — tumbling window size must be positive and fit in ms" {
+    const allocator = std.testing.allocator;
+
+    for ([_][]const u8{ "0", "-5", "9223372036854776" }) |size| {
+        const config_entries = [_]OperatorSpec.ConfigEntry{
+            .{ .key = "function", .value = "count" },
+            .{ .key = "window", .value = "tumbling" },
+            .{ .key = "window_size", .value = size },
+        };
+        const spec = OperatorSpec{
+            .type_name = "aggregate",
+            .name = "bad-window",
+            .config = &config_entries,
+        };
+        std.testing.expectError(CreateError.MissingConfig, create(allocator, &spec, null)) catch |err| {
+            std.debug.print("window_size: {s}\n", .{size});
+            return err;
+        };
+    }
 }
 
 test "NativeOperatorRegistry — aggregate missing function" {

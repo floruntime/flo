@@ -43,6 +43,11 @@ const Converter = struct {
     allocator: Allocator,
     output: std.ArrayList(u8),
     lines: std.ArrayList(Line),
+    depth: u32 = 0,
+
+    /// Nesting is recursion here, and a request is large enough to hold the
+    /// brackets for a stack overflow; no real definition nests this deep.
+    const max_depth = 64;
 
     fn init(allocator: Allocator) Converter {
         return .{
@@ -55,6 +60,11 @@ const Converter = struct {
     fn deinit(self: *Converter) void {
         self.output.deinit(self.allocator);
         self.lines.deinit(self.allocator);
+    }
+
+    fn enter(self: *Converter) ConvertError!void {
+        if (self.depth == max_depth) return ConvertError.InvalidFormat;
+        self.depth += 1;
     }
 
     fn convert(self: *Converter, yaml: []const u8) ConvertError![]const u8 {
@@ -93,6 +103,8 @@ const Converter = struct {
     }
 
     fn processObject(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -157,6 +169,8 @@ const Converter = struct {
     }
 
     fn processArray(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -222,6 +236,8 @@ const Converter = struct {
     /// Process an array item that starts an object on the same line
     /// e.g., "- name: value" followed by more properties
     fn processArrayItemObject(self: *Converter, start: usize, array_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         const line = self.lines.items[start];
@@ -384,6 +400,8 @@ const Converter = struct {
 
     /// Convert a YAML flow sequence `[item1, item2, ...]` to a JSON array.
     fn writeFlowSequence(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
@@ -415,6 +433,8 @@ const Converter = struct {
     /// Values are recursively converted, so nested flow maps/sequences and scalars
     /// all work (e.g. `{ name: events }`, `{ a: { b: c }, d: [1, 2] }`).
     fn writeFlowMapping(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
@@ -760,4 +780,22 @@ test "yaml_to_json: flow mapping with multiple keys and nesting" {
     try std.testing.expect(mem.indexOf(u8, json, "\"x\":1") != null);
     try std.testing.expect(mem.indexOf(u8, json, "\"y\":\"two\"") != null);
     try std.testing.expect(mem.indexOf(u8, json, "\"z\":{\"deep\":true}") != null);
+}
+
+test "yaml_to_json: nesting past the depth limit is rejected, not recursed" {
+    const allocator = std.testing.allocator;
+
+    // Deep enough to overflow the stack if each level recursed.
+    const levels = 200_000;
+    const yaml = try allocator.alloc(u8, 3 + 2 * levels);
+    defer allocator.free(yaml);
+    @memcpy(yaml[0..3], "x: ");
+    @memset(yaml[3 .. 3 + levels], '[');
+    @memset(yaml[3 + levels ..], ']');
+    try std.testing.expectError(ConvertError.InvalidFormat, convert(allocator, yaml));
+
+    const shallow = "x: [[[[[[[[1]]]]]]]]";
+    const json = try convert(allocator, shallow);
+    defer allocator.free(json);
+    try std.testing.expectEqualStrings("{\"x\":[[[[[[[[1]]]]]]]]}", json);
 }
