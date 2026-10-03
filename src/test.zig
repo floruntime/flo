@@ -75,6 +75,7 @@ test {
 // Raft consensus
 test {
     _ = @import("raft/log.zig");
+    _ = @import("raft/hard_state.zig");
     _ = @import("raft/node.zig");
     _ = @import("raft/transport.zig");
     _ = @import("raft/snapshot.zig");

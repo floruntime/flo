@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const io_mod = @import("io.zig");
+const log = @import("log.zig");
 
 pub const Dir = std.Io.Dir;
 pub const File = std.Io.File;
@@ -142,6 +143,71 @@ pub fn rename(old_path: []const u8, new_path: []const u8) Dir.RenameError!void {
     return c.rename(old_path, c, new_path, io());
 }
 
+/// Directory fsyncs performed by this process. A dir fsync has no effect a
+/// test can observe, so tests read this to prove a durable write made one.
+pub var dir_syncs: std.atomic.Value(u64) = .init(0);
+
+pub const SyncDirError = Dir.OpenError || File.SyncError || error{DirSyncUnsupported};
+
+/// fsync the directory at `dir_path`. A file's own fsync covers its bytes,
+/// not the directory entry that names it: after a create, rename or unlink
+/// the change is atomic but can still vanish on power loss until the
+/// directory itself is synced.
+pub fn syncDir(dir_path: []const u8) SyncDirError!void {
+    return syncDirAt(cwd(), if (dir_path.len == 0) "." else dir_path);
+}
+
+/// `syncDir` for a directory already open as `dir`.
+pub fn syncDirHandle(dir: Dir) SyncDirError!void {
+    return syncDirAt(dir, ".");
+}
+
+fn syncDirAt(base: Dir, sub_path: []const u8) SyncDirError!void {
+    // `.iterate` because without it Linux opens the directory O_PATH, and
+    // fsync on an O_PATH descriptor fails with EBADF.
+    const dir = try base.openDir(io(), sub_path, .{ .iterate = true });
+    defer closeDir(dir);
+    // Called directly rather than through `File.sync`: std treats EINVAL as a
+    // programmer bug and panics in debug builds, but some filesystems refuse
+    // to sync a directory, and that must surface as an error, not a crash.
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
+            .SUCCESS => {
+                _ = dir_syncs.fetchAdd(1, .monotonic);
+                return;
+            },
+            .INTR => continue,
+            .INVAL => {
+                log.err("cannot fsync directory {s}: its filesystem does not support it, so writes there cannot be made durable; put the data directory on a local filesystem such as ext4, XFS or APFS", .{sub_path});
+                return error.DirSyncUnsupported;
+            },
+            .BADF => unreachable, // opened above, and not O_PATH
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .DQUOT => return error.DiskQuota,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+    }
+}
+
+/// `makePath`, then, if the directory was created, fsync its parent so its
+/// entry survives power loss. A directory that already existed leaves the
+/// parent alone: syncing it needs read permission, which a parent such as
+/// an execute-only home directory does not give. Covers one level: create
+/// nested durable directories one call per level, outermost first.
+pub fn makePathDurable(sub_path: []const u8) (Dir.CreateDirPathError || SyncDirError)!void {
+    const status = try cwd().createDirPathStatus(io(), sub_path, .default_dir);
+    if (status == .created) try syncDir(path.dirname(sub_path) orelse ".");
+}
+
+/// Rename `old_path` to `new_path`, then fsync the directory holding
+/// `new_path` so the new name survives power loss, not just a crash.
+pub fn renameDurable(old_path: []const u8, new_path: []const u8) (Dir.RenameError || SyncDirError)!void {
+    try rename(old_path, new_path);
+    try syncDir(path.dirname(new_path) orelse ".");
+}
+
 /// Read all bytes from an opened file with allocator.
 /// Replacement for `std.fs.File.readToEndAlloc`.
 pub fn readToEndAlloc(file: File, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
@@ -197,4 +263,59 @@ pub fn statHandle(file: File) !File.Stat {
 /// Read up to `buf.len` bytes from current file position.
 pub fn readBytes(file: File, buf: []u8) !usize {
     return readAll(file, buf);
+}
+
+test "syncDir, renameDurable and makePathDurable sync a directory, and a missing one is an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPathFile(io(), ".", &buf);
+    const dir_path = buf[0..len];
+
+    const before = dir_syncs.load(.monotonic);
+    try syncDir(dir_path);
+    try std.testing.expectEqual(before + 1, dir_syncs.load(.monotonic));
+
+    var a_buf: [max_path_bytes]u8 = undefined;
+    var b_buf: [max_path_bytes]u8 = undefined;
+    const a = try std.fmt.bufPrint(&a_buf, "{s}/a", .{dir_path});
+    const b = try std.fmt.bufPrint(&b_buf, "{s}/b", .{dir_path});
+    closeFile(try createFile(a, .{}));
+    try renameDurable(a, b);
+    try std.testing.expectEqual(before + 2, dir_syncs.load(.monotonic));
+    try access(b, .{});
+
+    var d_buf: [max_path_bytes]u8 = undefined;
+    const d = try std.fmt.bufPrint(&d_buf, "{s}/d", .{dir_path});
+    try makePathDurable(d);
+    try std.testing.expectEqual(before + 3, dir_syncs.load(.monotonic));
+
+    var gone_buf: [max_path_bytes]u8 = undefined;
+    const gone = try std.fmt.bufPrint(&gone_buf, "{s}/missing", .{dir_path});
+    try std.testing.expectError(error.FileNotFound, syncDir(gone));
+    try std.testing.expectEqual(before + 3, dir_syncs.load(.monotonic));
+}
+
+test "makePathDurable syncs the parent only for a directory it created, so a parent it cannot read is fine on restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPathFile(io(), ".", &buf);
+    var p_buf: [max_path_bytes]u8 = undefined;
+    const parent = try std.fmt.bufPrint(&p_buf, "{s}/parent", .{buf[0..len]});
+    var c_buf: [max_path_bytes]u8 = undefined;
+    const child = try std.fmt.bufPrint(&c_buf, "{s}/data", .{parent});
+
+    const before = dir_syncs.load(.monotonic);
+    try makePath(parent);
+    try makePathDurable(child);
+    try std.testing.expectEqual(before + 1, dir_syncs.load(.monotonic));
+
+    // Write and search, but no read: opening it to sync would be refused.
+    const parent_z = try std.testing.allocator.dupeZ(u8, parent);
+    defer std.testing.allocator.free(parent_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(parent_z, 0o311));
+    defer _ = std.c.chmod(parent_z, 0o700);
+    try makePathDurable(child);
+    try std.testing.expectEqual(before + 1, dir_syncs.load(.monotonic));
 }
