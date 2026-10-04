@@ -251,8 +251,9 @@ pub const StreamIdGenerator = struct {
     /// - Clock skew safe (if clock goes backward, uses previous timestamp + seq)
     ///
     /// NOTE: durable apply paths must use `nextAt` with the originating UAL
-    /// entry's timestamp instead, so replay reproduces identical StreamIDs
-    /// (FLO-103). Reading the wall clock here would renumber records on restart.
+    /// entry's timestamp instead, so replay reproduces identical StreamIDs and
+    /// a persisted consumer-group cursor still matches. Reading the wall clock
+    /// here would renumber records on restart.
     pub fn next(self: *StreamIdGenerator) StreamID {
         return self.nextAt(@as(u64, @intCast(@import("stdx").time.milliTimestamp())));
     }
@@ -260,7 +261,7 @@ pub const StreamIdGenerator = struct {
     /// Generate the next StreamID anchored to an explicit timestamp (the UAL
     /// entry's `header.timestamp_ns`, in ms). Deterministic across replay:
     /// applying the same entries in index order reproduces identical IDs, so a
-    /// persisted consumer-group cursor still lines up after restart (FLO-103).
+    /// persisted consumer-group cursor still lines up after restart.
     pub fn nextAt(self: *StreamIdGenerator, now_ms: u64) StreamID {
         // Load current state
         const last_ts = self.last_timestamp_ms.load(.acquire);
@@ -305,7 +306,7 @@ pub const StreamIdGenerator = struct {
     }
 
     /// Batch variant of `nextAt` — anchors the batch to an explicit timestamp
-    /// for deterministic replay (FLO-103).
+    /// for deterministic replay.
     pub fn nextBatchAt(self: *StreamIdGenerator, now_ms: u64, count: usize) !Batch {
         if (count == 0) return error.EmptyBatch;
 
@@ -423,7 +424,7 @@ test "StreamIdGenerator monotonic" {
     try std.testing.expect(id2.lessThan(id3));
 }
 
-test "StreamIdGenerator nextAt is deterministic across replay (FLO-103)" {
+test "StreamIdGenerator nextAt is deterministic across replay" {
     // Two generators fed the SAME per-entry timestamps must produce identical
     // IDs, regardless of wall clock — this is what lets replay reproduce the
     // original StreamIDs so a persisted consumer-group cursor still lines up.

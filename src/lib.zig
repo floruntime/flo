@@ -7,13 +7,12 @@
 pub const log = @import("stdx").log;
 
 // =============================================================================
-// Protocol Layer: Wire protocol, RESP, request building
+// Protocol Layer: Wire protocol, request building
 // =============================================================================
 pub const protocol = struct {
     pub const proto = @import("protocol/proto.zig");
     pub const request_builder = @import("protocol/request_builder.zig");
     pub const result = @import("protocol/result.zig");
-    pub const resp = @import("protocol/resp.zig");
 };
 
 // =============================================================================

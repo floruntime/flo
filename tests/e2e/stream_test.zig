@@ -500,7 +500,7 @@ test "e2e/stream: trim with --dry-run" {
     try testing.expect(!result.contains("required"));
 }
 
-test "e2e/stream: delete removes a stream (FLO-105)" {
+test "e2e/stream: delete removes a stream" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -522,7 +522,7 @@ test "e2e/stream: delete removes a stream (FLO-105)" {
     try testing.expect(!r3.contains("del-test"));
 }
 
-test "e2e/stream: delete is idempotent and recreatable (FLO-105)" {
+test "e2e/stream: delete is idempotent and recreatable" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -688,10 +688,10 @@ test "e2e/stream: group pending" {
     try testing.expect(result.contains("Pending") or result.contains("pending") or result.succeeded());
 }
 
-test "e2e/stream: group claim redelivers unacked records, ack drains (FLO-102)" {
-    // The headline FLO-102 path over the full wire: deliver → (no ack) →
-    // claim re-returns the same records (crash-recovery redelivery) → ack →
-    // claim returns nothing. This is what GroupRead alone cannot do.
+test "e2e/stream: group claim redelivers unacked records, ack drains" {
+    // Crash-recovery redelivery over the full wire: deliver → (no ack) →
+    // claim re-returns the same records → ack → claim returns nothing.
+    // GroupRead alone cannot redeliver.
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2803,10 +2803,10 @@ test "e2e/stream: headers survive consumer group read" {
 }
 
 // =============================================================================
-// Per-Stream Consumer Groups (FLO-105)
+// Per-Stream Consumer Groups
 //
 // Consumer groups are strictly per-(stream, group): one group belongs to one
-// stream, with its own cursor and PEL. Cross-stream fan-in (`events.*`) is gone.
+// stream, with its own cursor and PEL. Wildcard keys (`events.*`) are rejected.
 // =============================================================================
 
 test "e2e/stream: wildcard group read is rejected" {

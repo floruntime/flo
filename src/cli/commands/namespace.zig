@@ -101,8 +101,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
-
-
 fn runCreate(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);

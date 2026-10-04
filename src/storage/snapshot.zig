@@ -8,7 +8,8 @@
 //! Each section: [SectionHeader 12B] [section data bytes]
 //!
 //! Crash safety:
-//! - Writes go to `.fsnap.tmp`, then fdatasync, then atomic rename
+//! - Writes go to `.fsnap.tmp`, then fsync, then atomic rename, then a
+//!   directory fsync
 //! - MANIFEST updated atomically the same way
 //! - If crash during write: `.tmp` is incomplete, previous `.fsnap` is valid
 //! - If crash after snapshot but before UAL compact: harmless extra entries
@@ -226,6 +227,7 @@ pub const SnapshotBuilder = struct {
 
         // Atomic rename
         try dir.rename(tmp_name, dir, filename, io);
+        try stdx.fs.syncDirHandle(dir);
 
         // Update MANIFEST
         try writeManifest(dir, filename);
@@ -356,6 +358,7 @@ pub fn writeManifest(dir: stdx.fs.Dir, filename: []const u8) !void {
         try stdx.fs.sync(file);
     }
     try dir.rename("MANIFEST.tmp", dir, "MANIFEST", io);
+    try stdx.fs.syncDirHandle(dir);
 }
 
 /// Read the current snapshot filename from MANIFEST. Returns null if no MANIFEST exists.
@@ -698,7 +701,10 @@ test "snapshot: writeToDir and loadLatestSnapshot" {
     try builder.addSection(.kv, "kv-state-750");
     try builder.addSection(.queue, "queue-state-750");
 
+    // The snapshot's rename and the MANIFEST's each sync the directory.
+    const before = stdx.fs.dir_syncs.load(.monotonic);
     try builder.writeToDir(tmp.dir);
+    try testing.expectEqual(before + 2, stdx.fs.dir_syncs.load(.monotonic));
 
     // Load it back
     const loaded = try loadLatestSnapshot(allocator, tmp.dir) orelse return error.NoSnapshot;

@@ -11,7 +11,7 @@
 //!
 //! The Controller Raft does NOT use data projections (KV, Queue, Stream, TS).
 //! Instead, committed entries update an in-memory PartitionTable and namespace
-//! registry, which are broadcast to other shards via inbox messages.
+//! registry.
 //!
 //! Architecture:
 //!   Shard 0 Reactor → tick() every 10ms → heartbeats/elections

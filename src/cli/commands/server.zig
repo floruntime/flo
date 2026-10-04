@@ -10,6 +10,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const server_config = @import("../../config/mod.zig").server;
+const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
 const RuntimeConfig = @import("../../node/runtime.zig").RuntimeConfig;
 const posix = std.posix;
@@ -53,7 +54,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\  --cluster:     the first member; it leads alone until others join
                     \\  --join host:port[,...]: joins the members it can reach and is added by the leader
                     \\  Every member proves the same shared secret at the peer port:
-                    \\  set [cluster] secret in flo.toml or FLO_CLUSTER_SECRET.
+                    \\  make one with `flo server secret`, then set it in [cluster] secret,
+                    \\  [cluster] secret_file (mode 600) or FLO_CLUSTER_SECRET.
                     \\  A cluster replicates one shard: leave --shards at its default, or set 1.
                     \\
                     \\Note: Shard count defines data topology and cannot be changed after
@@ -88,6 +90,22 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .boolFlag("no-metrics", 0, "Disable metrics server")
                 .boolFlag("no-dashboard", 0, "Disable web dashboard")
                 .action(wrapHandler(runStart)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("secret")
+                .about("Print a new cluster secret")
+                .longAbout(
+                    \\Print a new secret for the peer port, from 32 random bytes. Give
+                    \\every member the same one: in [cluster] secret, in a file named
+                    \\by [cluster] secret_file (mode 600), or in FLO_CLUSTER_SECRET.
+                    \\A cluster starts only with a secret in this form.
+                )
+                .examples(&.{
+                    "flo server secret",
+                    "flo server secret > /etc/flo/cluster.secret && chmod 600 /etc/flo/cluster.secret",
+                })
+                .action(wrapHandler(runSecret)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -276,6 +294,16 @@ fn isProcessRunning(pid: posix.pid_t) bool {
     return true; // No error means process exists
 }
 
+fn runSecret(ctx: *commander.Context) commander.Error!void {
+    var out: [cluster_config.SECRET_PREFIX.len + cluster_config.SECRET_HEX_LEN]u8 = undefined;
+    cluster_config.newSecret(&out) catch {
+        ctx.printErr("Error: no randomness available for a secret\n", .{});
+        return error.CommandFailed;
+    };
+    defer std.crypto.secureZero(u8, &out);
+    ctx.print("{s}\n", .{&out});
+}
+
 fn runStart(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
 
@@ -350,13 +378,27 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         config.dashboard.enabled = false;
     }
 
-    // The peer secret may come from the environment: a container often has
-    // no config file to keep it in.
-    if (config.cluster.secret == null) {
-        if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| {
-            if (s.len > 0) config.cluster.secret = try config.dupeString(s);
-        }
+    // The peer secret may come from a file, or the environment: a container
+    // often has no config file to keep it in.
+    // One source only: a second one would be silently ignored.
+    const env_secret: ?[]const u8 = if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| (if (s.len > 0) s else null) else null;
+    const sources = @as(u8, @intFromBool(config.cluster.secret != null)) + @intFromBool(config.cluster.secret_file != null) + @intFromBool(env_secret != null);
+    if (sources > 1) {
+        ctx.printErr("Error: the cluster secret is set more than once ([cluster] secret, [cluster] secret_file, FLO_CLUSTER_SECRET); keep one\n", .{});
+        return error.CommandFailed;
     }
+    if (config.cluster.secret_file) |path| {
+        const s = cluster_config.readSecretFile(allocator, path) catch {
+            ctx.printErr("Error: [cluster] secret_file {s} could not be used (see the log line above)\n", .{path});
+            return error.CommandFailed;
+        };
+        defer {
+            std.crypto.secureZero(u8, s);
+            allocator.free(s);
+        }
+        config.cluster.secret = try config.dupeString(s);
+    }
+    if (env_secret) |s| config.cluster.secret = try config.dupeString(s);
 
     // --join flag overrides seeds from config
     var join_seeds_list: std.ArrayList([]const u8) = .empty;

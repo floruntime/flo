@@ -103,7 +103,7 @@ pub const StreamRecord = struct {
 /// (`.partition` / `.partition_key`) and is not otherwise recoverable, so it
 /// must ride inside the durable entry to survive restart/replay. Without it,
 /// replay rebuilds every record as partition 0 and partition-filtered reads
-/// break after a restart (FLO-105). Encode at every persist site; decode at
+/// break after a restart. Encode at every persist site; decode at
 /// read/replay via `decodeAppendValue`.
 pub const APPEND_PARTITION_PREFIX: usize = 4;
 
@@ -125,7 +125,7 @@ pub fn encodeAppendValue(allocator: Allocator, partition_index: u32, payload: []
 
 /// Split a stored stream-append value into its partition index and inner
 /// payload. An empty append carries exactly the 4-byte prefix; a value shorter
-/// than the prefix (malformed/pre-FLO-105) decodes as partition 0 with the
+/// than the prefix (malformed) decodes as partition 0 with the
 /// bytes passed through unchanged.
 pub fn decodeAppendValue(value: []const u8) AppendValue {
     if (value.len < APPEND_PARTITION_PREFIX) return .{ .partition_index = 0, .payload = value };
@@ -190,7 +190,7 @@ pub const StreamState = struct {
     }
 
     /// Append anchored to an explicit timestamp (the originating UAL entry's
-    /// timestamp, in ms) so replay reproduces identical StreamIDs (FLO-103).
+    /// timestamp, in ms) so replay reproduces identical StreamIDs.
     pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         // Reserve one sequence per logical record: reads expand a batch into
         // `id.sequence + 0..n-1`, so reserving a single sequence for an
@@ -386,9 +386,8 @@ pub const ConsumerGroup = struct {
     last_committed_floor: StreamID = StreamID.MIN,
     /// Idle time (ms) after which the background sweeper re-nacks a pending
     /// entry (makes it claimable again). 0 = sweeper disabled for this group.
-    /// In-memory config — groups are not persisted (auto-created on read), so
-    /// this resets to the default on restart; see handleGroupCreate /
-    /// stream_group_configure_sweeper for runtime overrides. (FLO-102)
+    /// Durable via cg_commit; set at group create or by
+    /// stream_group_configure_sweeper.
     ack_timeout_ms: u32 = DEFAULT_ACK_TIMEOUT_MS,
     /// Max delivery attempts before the sweeper drops an entry from the PEL
     /// (poison-message guard). 0 = unlimited.
@@ -982,7 +981,7 @@ pub const StreamProjection = struct {
 
     /// Append anchored to the originating UAL entry's timestamp (ms) so replay
     /// reproduces identical StreamIDs — durable apply/replay paths must use this
-    /// instead of `appendToStream`, which reads the wall clock (FLO-103).
+    /// instead of `appendToStream`, which reads the wall clock.
     pub fn appendToStreamAt(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         const ss = try self.getOrCreateStream(name_hash);
         const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms, record_count, byte_len);
@@ -1350,7 +1349,7 @@ pub const StreamProjection = struct {
                     record_count = batchRecordCount(av.payload);
                     byte_len = @intCast(av.payload.len);
                 }
-                // Anchor to the entry timestamp for deterministic replay (FLO-103).
+                // Anchor to the entry timestamp for deterministic replay.
                 _ = try self.appendToStreamAt(name_hash, ual_entry.header.index, partition_index, ual_entry.header.timestamp_ns / 1_000_000, record_count, byte_len);
             },
             .stream_trim => {
@@ -1365,7 +1364,7 @@ pub const StreamProjection = struct {
                 }
             },
             .stream_delete => {
-                // key = raw stream name, value = namespace-qualified name (FLO-105).
+                // key = raw stream name, value = namespace-qualified name.
                 if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
                     if (cmd.key.len > 0) {
                         const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
@@ -1542,7 +1541,7 @@ pub const StreamProjection = struct {
             std.mem.writeInt(u64, buf[offset..][0..8], group.created_at_ns, .little);
             offset += 8;
 
-            // Recovery cursor + sweeper config (FLO-103). Persisting the
+            // Recovery cursor + sweeper config. Persisting the
             // ack-floor here keeps a future snapshot self-sufficient: entries
             // at/below the snapshot index are skipped on replay, so the cursor
             // must live in the snapshot, not only in cg_commit UAL entries.
@@ -1652,7 +1651,7 @@ pub const StreamProjection = struct {
             const created_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
 
-            // Recovery cursor + sweeper config (FLO-103).
+            // Recovery cursor + sweeper config.
             const last_delivered_ts = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
             const last_delivered_seq = std.mem.readInt(u64, data[offset..][0..8], .little);
@@ -1815,7 +1814,7 @@ test "stream: serialize/deserialize round-trip" {
     _ = try s.joinGroup("my-group", "consumer-1", 6000);
     _ = try s.joinGroup("my-group", "consumer-2", 7000);
 
-    // Set a recovery cursor + non-default config to verify they round-trip (FLO-103)
+    // Set a recovery cursor + non-default config to verify they round-trip
     {
         const g = s.getGroup("my-group").?;
         g.last_delivered_id = .{ .timestamp_ms = 1700, .sequence = 9 };
@@ -1848,14 +1847,14 @@ test "stream: serialize/deserialize round-trip" {
     const group = s2.getGroup("my-group").?;
     try testing.expectEqual(@as(usize, 2), group.memberCount());
 
-    // Recovery cursor + config restored (FLO-103)
+    // Recovery cursor + config restored
     try testing.expectEqual(@as(u64, 1700), group.last_delivered_id.timestamp_ms);
     try testing.expectEqual(@as(u64, 9), group.last_delivered_id.sequence);
     try testing.expectEqual(@as(u32, 45000), group.ack_timeout_ms);
     try testing.expectEqual(@as(u8, 7), group.max_deliver);
 }
 
-test "stream: ackFloor reflects lowest unacked (FLO-103)" {
+test "stream: ackFloor reflects lowest unacked" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -1887,7 +1886,7 @@ test "stream: ackFloor reflects lowest unacked (FLO-103)" {
     try testing.expectEqual(g.last_delivered_id.order(), g.ackFloor().order());
 }
 
-test "stream: applyCommit seeds cursor monotonically + restores config (FLO-103)" {
+test "stream: applyCommit seeds cursor monotonically + restores config" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -1910,8 +1909,8 @@ test "stream: applyCommit seeds cursor monotonically + restores config (FLO-103)
     try testing.expectEqual(@as(u64, 900), g.last_delivered_id.timestamp_ms);
 }
 
-test "stream: restart redelivers only the unacked tail (FLO-103)" {
-    // Simulates the FLO-103 acceptance criterion at the projection layer:
+test "stream: restart redelivers only the unacked tail" {
+    // Simulates consumer-group crash recovery at the projection layer:
     // append → deliver → ack some → restart → only the unacked remainder is
     // redelivered. "Restart" = a fresh projection that replays the same UAL
     // entries (same name_hash / ual_index / entry-timestamp) so StreamIDs are
@@ -1960,7 +1959,7 @@ test "stream: restart redelivers only the unacked tail (FLO-103)" {
     try testing.expectEqual(aid4.order(), buf2[1].id.order());
 }
 
-test "stream: GroupCommit encode/decode round-trip (FLO-103)" {
+test "stream: GroupCommit encode/decode round-trip" {
     const c = GroupCommit{ .floor = .{ .timestamp_ms = 0xDEAD, .sequence = 0xBEEF }, .ack_timeout_ms = 777, .max_deliver = 5 };
     var buf: [GroupCommit.WIRE_LEN]u8 = undefined;
     c.encode(&buf);
@@ -2248,7 +2247,7 @@ test "stream: groupClaim transfers ownership" {
     try testing.expectEqual(@as(usize, 1), n);
 }
 
-test "stream: sweeper re-nacks idle entries then drops poison (FLO-102)" {
+test "stream: sweeper re-nacks idle entries then drops poison" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2283,7 +2282,7 @@ test "stream: sweeper re-nacks idle entries then drops poison (FLO-102)" {
     try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
 }
 
-test "stream: sweeper disabled when ack_timeout_ms is 0 (FLO-102)" {
+test "stream: sweeper disabled when ack_timeout_ms is 0" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 

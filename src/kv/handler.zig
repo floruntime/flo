@@ -201,9 +201,7 @@ pub const KVHandler = struct {
             // Key absent — register waiter in unified pool; response sent when key is created.
             const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
-                .fd = conn.fd,
-                .owner_shard = conn.owner_shard,
-                .conn_id = conn.id,
+                .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = qkey,
                 .min_version = 0,
@@ -222,9 +220,7 @@ pub const KVHandler = struct {
             const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 0;
             const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
-                .fd = conn.fd,
-                .owner_shard = conn.owner_shard,
-                .conn_id = conn.id,
+                .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = qkey,
                 .min_version = current_version,
@@ -1280,23 +1276,16 @@ pub const KVHandler = struct {
     // ── Core Command Logic ─────────────────────────────────────────────
 
     /// Dispatch a KV command to the appropriate handler.
-    /// Used for read operations and direct/test writes (bypasses Raft).
-    /// Production write path goes through dispatchPut/dispatchDelete → proposeKVEntry.
+    /// Used for reads, and for the processing KV sink's put, which writes
+    /// the projection directly (bypasses Raft). Client writes go through
+    /// dispatchPut/dispatchDelete → proposeKVEntry.
     pub fn handleCommand(self: *KVHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .kv_get => self.handleGet(req),
             .kv_put => self.handlePutDirect(req),
-            .kv_delete => self.handleDeleteDirect(req),
             .kv_scan => self.handleScan(req),
             .kv_history => self.handleHistory(req),
-            .kv_incr => self.handleIncrDirect(req),
-            .kv_touch => self.handleTouchDirect(req, false),
-            .kv_persist => self.handleTouchDirect(req, true),
-            .kv_exists => self.handleExistsDirect(req),
-            .kv_json_get => self.handleJsonGetDirect(req),
-            .kv_json_set => self.handleJsonSetDirect(req),
-            .kv_json_del => self.handleJsonDelDirect(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown KV opcode" } },
         };
     }
@@ -1372,43 +1361,6 @@ pub const KVHandler = struct {
         };
         const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
         return .{ .kv_put_ok = .{ .version = version } };
-    }
-
-    // ── DELETE direct (used by handleCommand — test/internal path) ───────
-
-    /// Direct delete from the KV projection. Bypasses Raft.
-    fn handleDeleteDirect(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        }
-        if (isReservedKey(req.key)) {
-            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-        }
-
-        // Namespace-qualify key for projection operations
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        // CAS check — only the holder of the expected version may delete.
-        if (req.getCasVersion()) |expected_version| {
-            if (self.kv.get(qkey)) |entry| {
-                if (entry.version != expected_version) {
-                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
-                }
-            } else {
-                if (expected_version != 0) {
-                    return .{ .kv_cas_failed = .{ .current_version = 0 } };
-                }
-            }
-        }
-
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        self.kv.delete(qkey, lsn, 0, timestamp) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
-        };
-        return .ok;
     }
 
     // ── PUT validation (pre-checks only — no write to projection) ───────
@@ -1567,219 +1519,6 @@ pub const KVHandler = struct {
         }
 
         return .{ .kv_history_result = .{ .data = data } };
-    }
-
-    // ── Extended KV (Direct/RESP path — bypasses Raft) ─────────────────
-
-    /// Direct INCR — operates on local KV. Used by RESP path. Default delta = 1
-    /// when the value field is empty. Returns kv_value with 8-byte i64 LE.
-    fn handleIncrDirect(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-
-        var delta: i64 = 1;
-        if (req.value.len == 8) {
-            delta = std.mem.readInt(i64, req.value[0..8], .little);
-        } else if (req.value.len != 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "incr: value must be empty or 8-byte i64 LE" } };
-        }
-
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        if (self.kv.getRaw(qkey)) |existing| {
-            if (!existing.tombstone and existing.value.len != 8) {
-                return .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } };
-            }
-        }
-
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        _ = self.kv.applyIncr(qkey, delta, lsn, 0, timestamp) catch |err| {
-            return switch (err) {
-                error.Overflow => .{ .err = .{ .code = .invalid_request, .message = "counter overflow" } },
-                error.NotACounter => .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } },
-                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
-            };
-        };
-
-        const entry = self.kv.get(qkey) orelse
-            return .{ .err = .{ .code = .internal_error, .message = "incr: post-apply lookup failed" } };
-        return .{ .kv_value = .{ .value = entry.value, .version = entry.version } };
-    }
-
-    /// Direct TOUCH/PERSIST — operates on local KV.
-    fn handleTouchDirect(self: *KVHandler, req: Request, force_persist: bool) CommandResult {
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        const existing = self.kv.get(qkey) orelse return .kv_not_found;
-
-        // CAS check — only the holder of the expected version may touch/persist.
-        if (req.getCasVersion()) |expected_version| {
-            if (existing.version != expected_version) {
-                return .{ .kv_cas_failed = .{ .current_version = existing.version } };
-            }
-        }
-
-        var expiry_ns: u64 = 0;
-        if (!force_persist) {
-            var ttl_seconds: u64 = 0;
-            if (req.value.len == 8) {
-                ttl_seconds = std.mem.readInt(u64, req.value[0..8], .little);
-            } else if (req.value.len != 0) {
-                return .{ .err = .{ .code = .invalid_request, .message = "touch: value must be empty or 8-byte u64 LE" } };
-            }
-            if (ttl_seconds > 0) {
-                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                expiry_ns = now_ns + ttl_seconds * 1_000_000_000;
-            }
-        }
-
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        self.kv.applyTouch(qkey, expiry_ns, lsn, 0, timestamp) catch |err| switch (err) {
-            error.NotFound => return .kv_not_found,
-        };
-        return .ok;
-    }
-
-    /// Direct EXISTS — returns kv_value with single byte 0/1.
-    fn handleExistsDirect(self: *KVHandler, req: Request) CommandResult {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        const S = struct {
-            threadlocal var byte: [1]u8 = undefined;
-        };
-        if (self.kv.get(qkey)) |entry| {
-            S.byte[0] = 1;
-            return .{ .kv_value = .{ .value = S.byte[0..1], .version = entry.version } };
-        }
-        S.byte[0] = 0;
-        return .{ .kv_value = .{ .value = S.byte[0..1], .version = 0 } };
-    }
-
-    /// Direct JSON.GET — owned bytes are returned via kv_value.value but the
-    /// allocation lives until the next handler call. Caller (RESP path)
-    /// serializes the response synchronously before this can be reused.
-    fn handleJsonGetDirect(self: *KVHandler, req: Request) CommandResult {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        const entry = self.kv.get(qkey) orelse return .kv_not_found;
-
-        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
-        const json_path = @import("../util/json_path.zig");
-        const result_bytes = json_path.jsonPathGet(self.allocator, entry.value, path) catch |err| {
-            return switch (err) {
-                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
-                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
-                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
-            };
-        };
-
-        // Stash the allocation so freeResult() can free it.
-        // Wire format: [version:u64 LE][result_bytes] — gives clients the
-        // document version for CAS/causality, same shape as the RESP-style
-        // version-prefixed envelope used by GET.
-        const out = self.allocator.alloc(u8, 8 + result_bytes.len) catch {
-            self.allocator.free(result_bytes);
-            return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
-        };
-        std.mem.writeInt(u64, out[0..8], entry.version, .little);
-        if (result_bytes.len > 0) @memcpy(out[8..], result_bytes);
-        self.allocator.free(result_bytes);
-        return .{ .kv_scan_result = .{ .data = out } };
-    }
-
-    /// Direct JSON.SET — value layout: [path_len:u16][path][json].
-    fn handleJsonSetDirect(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-
-        if (req.value.len < 2) return .{ .err = .{ .code = .invalid_request, .message = "json_set: missing path_len" } };
-        const path_len = std.mem.readInt(u16, req.value[0..2], .little);
-        if (req.value.len < 2 + path_len) return .{ .err = .{ .code = .invalid_request, .message = "json_set: truncated path" } };
-        const path = req.value[2 .. 2 + path_len];
-        const new_json = req.value[2 + path_len ..];
-
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        const json_path = @import("../util/json_path.zig");
-
-        const merged: []u8 = blk: {
-            if (self.kv.get(qkey)) |entry| {
-                break :blk json_path.jsonPathSet(self.allocator, entry.value, path, new_json) catch |err| {
-                    return switch (err) {
-                        error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
-                        error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
-                        error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
-                    };
-                };
-            }
-            if (path.len != 1 or path[0] != '$') return .kv_not_found;
-            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, new_json, .{}) catch
-                return .{ .err = .{ .code = .invalid_request, .message = "invalid json document" } };
-            parsed.deinit();
-            break :blk self.allocator.dupe(u8, new_json) catch
-                return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
-        };
-        defer self.allocator.free(merged);
-
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        self.kv.put(qkey, merged, lsn, 0, timestamp, 0) catch
-            return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
-        const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
-        return .{ .kv_put_ok = .{ .version = version } };
-    }
-
-    /// Direct JSON.DEL.
-    fn handleJsonDelDirect(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        if (isReservedKey(req.key)) return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
-
-        const path: []const u8 = if (req.value.len == 0) "$" else req.value;
-        const entry = self.kv.get(qkey) orelse return .kv_not_found;
-
-        if (path.len == 1 and path[0] == '$') {
-            const lsn = self.nextLsn();
-            const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-            self.kv.delete(qkey, lsn, 0, timestamp) catch
-                return .{ .err = .{ .code = .internal_error, .message = "delete failed" } };
-            return .ok;
-        }
-
-        const json_path = @import("../util/json_path.zig");
-        const merged = json_path.jsonPathDel(self.allocator, entry.value, path) catch |err| {
-            return switch (err) {
-                error.InvalidPath, error.InvalidJson => .{ .err = .{ .code = .invalid_request, .message = "invalid json path or document" } },
-                error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .kv_not_found,
-                error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "out of memory" } },
-            };
-        };
-        defer self.allocator.free(merged);
-
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        self.kv.put(qkey, merged, lsn, 0, timestamp, 0) catch
-            return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
-        const new_version = if (self.kv.get(qkey)) |new_entry| new_entry.version else 1;
-        return .{ .kv_put_ok = .{ .version = new_version } };
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -2216,36 +1955,13 @@ test "kv handler: put if_exists failure" {
     }
 }
 
-test "kv handler: delete" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Put then delete
-    _ = handler.handleCommand(makeRequest(.kv_put, "k", "v", ""));
-    const del_result = handler.handleCommand(makeRequest(.kv_delete, "k", "", ""));
-    switch (del_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Get should return not_found
-    const get_result = handler.handleCommand(makeRequest(.kv_get, "k", "", ""));
-    switch (get_result) {
-        .kv_not_found => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
 test "kv handler: delete reserved key blocked" {
     const allocator = testing.allocator;
     var kv = KVProjection.init(allocator, 0);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
-    const result = handler.handleCommand(makeRequest(.kv_delete, "_flo:metadata", "", ""));
+    const result = handler.validateDelete(makeRequest(.kv_delete, "_flo:metadata", "", "")) orelse return error.TestUnexpectedResult;
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.unauthorized, e.code),
         else => return error.TestUnexpectedResult,

@@ -2,6 +2,7 @@
 // See: NODE_NETWORK_DESIGN.md
 
 pub const inbox = @import("inbox.zig");
+pub const mailbox = @import("mailbox.zig");
 pub const manifest = @import("manifest.zig");
 pub const shard_manifest = @import("shard_manifest.zig");
 pub const reactor = @import("reactor.zig");

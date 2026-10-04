@@ -11,7 +11,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-const log = @import("stdx").log;
+const stdx = @import("stdx");
+const log = stdx.log;
 
 /// Cluster configuration loaded from [cluster] section in flo.toml
 pub const ClusterConfig = struct {
@@ -40,8 +41,11 @@ pub const ClusterConfig = struct {
 
     /// Shared secret every member proves it holds before it is a peer. The
     /// raft port moves terms, membership and log contents, so it is never
-    /// open: required whenever the peer listener starts.
+    /// open: required whenever the peer listener starts, and only in the
+    /// form `flo server secret` prints (`secretWellFormed`).
     secret: ?[]const u8 = null,
+    /// A file holding the secret instead, readable by its owner alone.
+    secret_file: ?[]const u8 = null,
 
     /// A leader unheard for this long is replaced; election timeouts are
     /// [½, 1] × this and heartbeats a sixth of it.
@@ -101,7 +105,60 @@ pub const MIN_FAILOVER_TIMEOUT_MS: i64 = 100;
 /// Every key `[cluster]` reads. A key not on the list is refused at start,
 /// not ignored: a line that parses clean and changes nothing is the bug
 /// an operator finds at 2am.
-const known_keys = [_][]const u8{ "enabled", "secret", "node_id", "raft_port", "seeds", "failover_timeout_ms" };
+const known_keys = [_][]const u8{ "enabled", "secret", "secret_file", "node_id", "raft_port", "seeds", "failover_timeout_ms" };
+
+/// What `flo server secret` prints: this prefix, then 32 random bytes in
+/// lowercase hex.
+pub const SECRET_PREFIX = "flo-secret-";
+pub const SECRET_HEX_LEN: usize = 64;
+
+/// Whether `s` has the form `flo server secret` prints. A node cannot tell
+/// how a secret was made, so this checks the form: a value typed by hand,
+/// or a placeholder, is refused rather than trusted to be strong.
+pub fn secretWellFormed(s: []const u8) bool {
+    if (s.len != SECRET_PREFIX.len + SECRET_HEX_LEN) return false;
+    if (!std.mem.startsWith(u8, s, SECRET_PREFIX)) return false;
+    for (s[SECRET_PREFIX.len..]) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return true;
+}
+
+/// A new secret, as `flo server secret` prints it.
+pub fn newSecret(out: *[SECRET_PREFIX.len + SECRET_HEX_LEN]u8) !void {
+    var bytes: [SECRET_HEX_LEN / 2]u8 = undefined;
+    try stdx.io.instance().randomSecure(&bytes);
+    defer std.crypto.secureZero(u8, &bytes);
+    @memcpy(out[0..SECRET_PREFIX.len], SECRET_PREFIX);
+    _ = std.fmt.bufPrint(out[SECRET_PREFIX.len..], "{x}", .{&bytes}) catch unreachable;
+}
+
+/// Read the secret from `path`: a file only its owner can read or write,
+/// holding the secret and at most surrounding whitespace. The mode is
+/// checked on the file that is read, not on the path before it is opened.
+pub fn readSecretFile(allocator: Allocator, path: []const u8) ![]u8 {
+    const file = stdx.fs.openFile(path, .{}) catch |err| {
+        log.err("[cluster] secret_file {s} cannot be opened: {s}", .{ path, @errorName(err) });
+        return error.InvalidSetting;
+    };
+    defer stdx.fs.closeFile(file);
+    const st = stdx.fs.statHandle(file) catch |err| {
+        log.err("[cluster] secret_file {s} cannot be read: {s}", .{ path, @errorName(err) });
+        return error.InvalidSetting;
+    };
+    const mode: u32 = @intCast(@intFromEnum(st.permissions));
+    if (mode & 0o077 != 0) {
+        log.err("[cluster] secret_file {s} can be read or written by others (mode {o}); chmod 600 it", .{ path, mode & 0o777 });
+        return error.InvalidSetting;
+    }
+    var buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const got = stdx.fs.readAll(file, &buf) catch |err| {
+        log.err("[cluster] secret_file {s} cannot be read: {s}", .{ path, @errorName(err) });
+        return error.InvalidSetting;
+    };
+    return allocator.dupe(u8, std.mem.trim(u8, buf[0..got], " \t\r\n"));
+}
 
 /// Parse cluster configuration from TOML table
 pub fn parseClusterConfig(
@@ -132,6 +189,11 @@ pub fn parseClusterConfig(
         try owned_strings.append(allocator, owned);
         config.secret = owned;
     }
+    if (table.getString("secret_file")) |s| {
+        const owned = try allocator.dupe(u8, s);
+        try owned_strings.append(allocator, owned);
+        config.secret_file = owned;
+    }
     if (table.getInt("failover_timeout_ms")) |t| {
         if (t > std.math.maxInt(u32)) {
             log.err("[cluster] failover_timeout_ms = {d} is above the maximum {d}", .{ t, std.math.maxInt(u32) });
@@ -148,7 +210,7 @@ pub fn parseClusterConfig(
         var known = false;
         for (known_keys) |k| known = known or std.mem.eql(u8, k, key.*);
         if (!known) {
-            log.err("[cluster] {s} is not a setting; the keys are enabled, secret, node_id, raft_port, seeds and failover_timeout_ms. Remove the line.", .{key.*});
+            log.err("[cluster] {s} is not a setting; the keys are enabled, secret, secret_file, node_id, raft_port, seeds and failover_timeout_ms. Remove the line.", .{key.*});
             return error.UnknownSetting;
         }
     }
@@ -273,4 +335,46 @@ test "cluster config refuses a key it does not know and a failover below the flo
     var fine = try toml.parse(allocator, "failover_timeout_ms = 3000\n");
     defer fine.deinit();
     try std.testing.expectEqual(@as(u32, 3000), (try parseClusterConfig(allocator, &fine, &owned)).failover_timeout_ms);
+}
+
+const testing = std.testing;
+
+test "cluster: only the form `flo server secret` prints is a secret, and it prints that form" {
+    var out: [SECRET_PREFIX.len + SECRET_HEX_LEN]u8 = undefined;
+    try newSecret(&out);
+    try testing.expect(secretWellFormed(&out));
+    var again: [SECRET_PREFIX.len + SECRET_HEX_LEN]u8 = undefined;
+    try newSecret(&again);
+    try testing.expect(!std.mem.eql(u8, &out, &again));
+    try testing.expect(!secretWellFormed("s3cret"));
+    try testing.expect(!secretWellFormed(""));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ "0" ** 63));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ "0" ** 65));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ "A" ** 64));
+    try testing.expect(!secretWellFormed("xyz-secret-" ++ "0" ** 64));
+    try testing.expect(secretWellFormed("flo-secret-" ++ "0123456789abcdef" ** 4));
+}
+
+test "cluster: a secret file is read only when its owner alone can read it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const secret = "flo-secret-" ++ "ab" ** 32;
+    const dir_path = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "s" });
+    {
+        const f = try stdx.fs.createFileAbsolute(path, .{});
+        defer stdx.fs.closeFile(f);
+        try stdx.fs.writeAll(f, secret ++ "\n");
+    }
+    defer testing.allocator.free(path);
+    const path_z = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(path_z);
+
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o644));
+    try testing.expectError(error.InvalidSetting, readSecretFile(testing.allocator, path));
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o600));
+    const got = try readSecretFile(testing.allocator, path);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(secret, got);
 }

@@ -76,6 +76,9 @@ pub const DurableLog = struct {
             self.recoverTruncation() catch return error.TruncationIncomplete;
         }
         self.writer.commit_index_at_seal = commit_index;
+        // A failed write may still leave the file in place (only the
+        // directory sync failed), so drop the cached listing.
+        errdefer self.invalidate();
         try self.writer.writeToFile(self.segs_path);
         self.writer.reset();
         self.invalidate();
@@ -183,6 +186,12 @@ pub const DurableLog = struct {
                 deleted += 1;
             }
         }
+        // The intent is cleared next; if these unlinks were still only in
+        // memory, a power loss would bring the deleted segments back with no
+        // intent left to delete them again. Synced even when this pass
+        // deleted nothing: a retry finds the files already gone after an
+        // earlier pass unlinked them and then failed to sync.
+        try stdx.fs.syncDir(self.segs_path);
         log.info("durable log: truncated after index {d}: {d} segment(s) rewritten, {d} deleted", .{ after_index, rewritten, deleted });
     }
 
@@ -305,7 +314,7 @@ pub const DurableLog = struct {
         defer stdx.fs.closeFile(file);
         try stdx.fs.writeAll(file, line);
         try stdx.fs.sync(file);
-        try stdx.fs.rename(tmp_path, path);
+        try stdx.fs.renameDurable(tmp_path, path);
     }
 
     fn clearIntent(self: *DurableLog) !void {
@@ -491,7 +500,11 @@ test "durable log: truncateAfter rewrites the sealed tail under its own name and
     try writer.addEntry(&testEntry(9, 1, "i"));
     try writer.addEntry(&testEntry(10, 1, "j"));
 
+    // Three directory syncs: the intent, the rewrite of 4-6, and the
+    // deletion of 7-8.
+    const before = stdx.fs.dir_syncs.load(.monotonic);
     try dl.truncateAfter(5);
+    try testing.expectEqual(before + 3, stdx.fs.dir_syncs.load(.monotonic));
 
     try testing.expectEqual(@as(u32, 0), writer.entry_count);
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -756,4 +769,26 @@ test "durable log: a cut that cannot even list the files is remembered" {
     const files = try dl.listSegments(true);
     defer dl.freeSegments(files);
     try testing.expectEqual(@as(u64, 2), files[0].last_index);
+}
+
+test "durable log: a cut retried after its deletes already happened still syncs the directory before clearing the intent" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+
+    // A cut after 3 whose only work was deleting 4-5: that delete happened,
+    // the directory sync after it failed, and the intent is still on disk.
+    try writer.addEntry(&testEntry(1, 1, "a"));
+    try writer.addEntry(&testEntry(2, 1, "b"));
+    try writer.addEntry(&testEntry(3, 1, "c"));
+    try dl.flush(3);
+    try dl.writeIntent(3);
+
+    const before = stdx.fs.dir_syncs.load(.monotonic);
+    try dl.recoverTruncation();
+    try testing.expectEqual(before + 1, stdx.fs.dir_syncs.load(.monotonic));
+    try testing.expect((try dl.readIntent()) == null);
 }

@@ -38,6 +38,7 @@ const run_id_mod = @import("../node/run_id.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
+const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
 const WorkerRecord = @import("../worker/handler.zig").WorkerRecord;
 
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -221,19 +222,16 @@ pub const ActionsHandler = struct {
     }
 
     /// A run exists for workers to take: wake this shard's action_await
-    /// waiters and tell the other shards, whose workers may take it. Run
-    /// once after an apply pass in which an invoke applied on the leader,
-    /// whoever proposed it.
+    /// waiters and set the other shards' `action_invoked` flag, whose
+    /// workers may take it. Run once after an apply pass in which an invoke
+    /// applied on the leader, whoever proposed it.
     pub fn wakeWorkers(shard: *Shard) void {
         // Use notifyAny because waiter keys are compound (action_name + worker_id).
         shard.waiter_pool.notifyAny(.action_await, resolveActionAwait, @ptrCast(shard));
-        if (shard.peer_inboxes) |inboxes| {
-            for (inboxes, 0..) |inbox, i| {
+        if (shard.peer_mailboxes) |mailboxes| {
+            for (mailboxes, 0..) |mb, i| {
                 if (i == shard.id) continue;
-                _ = inbox.send(.{
-                    .tag = .action_invoke,
-                    .src_shard = @intCast(shard.id),
-                });
+                mb.wake.set(.action_invoked);
             }
         }
     }
@@ -323,7 +321,6 @@ pub const ActionsHandler = struct {
             const ws: *Shard = switch (wt) {
                 .local => shard,
                 .shard => |t| if (shard.peer_shards) |peers| (if (t.shard_id < peers.len) peers[t.shard_id] else shard) else shard,
-                .remote => shard,
             };
             break :blk if (ws.worker_handler.workers.get(worker_id)) |w| w.metadata_owned else null;
         } else null;
@@ -353,9 +350,7 @@ pub const ActionsHandler = struct {
         const total_len = ns_len + 1 + action_len + wid_len;
         const registered = shard.waiter_pool.register(.{
             .kind = .action_await,
-            .fd = conn.fd,
-            .owner_shard = conn.owner_shard,
-            .conn_id = conn.id,
+            .reply_to = conn.replyTo(),
             .request_id = req.header.request_id,
             .key = compound_key_buf[0..total_len],
             .min_version = (@as(u64, ns_len) << 16) | @as(u64, action_len),
@@ -380,7 +375,7 @@ pub const ActionsHandler = struct {
             const target = resolveActionShard(shard, namespace, name);
             if (target.actions_handler.claimPendingRun(name, worker_labels, worker_id)) |task| {
                 shard.worker_handler.recordTaskAssigned(worker_id);
-                sendTaskAssignment(shard, conn.owner_shard, conn.fd, conn.id, req.header.request_id, task);
+                sendTaskAssignment(shard, conn.replyTo(), req.header.request_id, task);
                 return true;
             }
         }
@@ -400,7 +395,6 @@ pub const ActionsHandler = struct {
                 }
                 return shard;
             },
-            .remote => shard,
         };
     }
 
@@ -420,7 +414,6 @@ pub const ActionsHandler = struct {
                 }
                 return shard;
             },
-            .remote => shard,
         };
     }
 
@@ -1616,7 +1609,6 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
                 }
                 break :blk shard;
             },
-            .remote => shard,
         };
         if (worker_shard.worker_handler.workers.getPtr(worker_id)) |w| {
             worker_labels = w.metadata_owned;
@@ -1626,7 +1618,7 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
 
     // Try to claim a pending run for the primary action name — hash-routed O(1)
     if (claimFromTargetShard(shard, namespace, action_name, worker_labels, worker_id)) |task| {
-        sendTaskAssignment(shard, waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, task);
+        sendTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
         return true;
     }
 
@@ -1637,7 +1629,7 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
             // Skip the primary name we already tried
             if (std.mem.eql(u8, process.name_owned, action_name)) continue;
             if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
-                sendTaskAssignment(shard, waiter.owner_shard, waiter.fd, waiter.conn_id, waiter.request_id, task);
+                sendTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
                 return true;
             }
         }
@@ -1655,7 +1647,7 @@ fn claimFromTargetShard(shard: *Shard, namespace: []const u8, action_name: []con
 
 /// Send a task assignment response in the full wire format:
 ///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
-fn sendTaskAssignment(shard: *Shard, owner_shard: u16, fd: i32, conn_id: u32, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+fn sendTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: ActionsHandler.ClaimedTask) void {
     const payload = task.input orelse "";
     const caller_run_id = task.caller_run_id orelse "";
     const caller_wf_name = task.caller_workflow_name orelse "";
@@ -1664,7 +1656,7 @@ fn sendTaskAssignment(shard: *Shard, owner_shard: u16, fd: i32, conn_id: u32, re
     var buf: [8192]u8 = undefined;
     const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len;
     if (total > buf.len) {
-        shard.deliverDeferredResponse(owner_shard, fd, conn_id, request_id, .ok, task.run_id);
+        shard.deliverDeferredResponse(reply_to, request_id, .ok, task.run_id);
         return;
     }
     var pos: usize = 0;
@@ -1701,7 +1693,7 @@ fn sendTaskAssignment(shard: *Shard, owner_shard: u16, fd: i32, conn_id: u32, re
     if (payload.len > 0) {
         @memcpy(buf[pos .. pos + payload.len], payload);
     }
-    shard.deliverDeferredResponse(owner_shard, fd, conn_id, request_id, .ok, buf[0..total]);
+    shard.deliverDeferredResponse(reply_to, request_id, .ok, buf[0..total]);
 }
 
 /// Extract the first task type (action name) from the action_await value.

@@ -234,10 +234,13 @@ pub const ColdTierManager = struct {
             @import("stdx").fs.closeFile(file);
             return error.InvalidManifest;
         };
-        @import("stdx").fs.sync(file) catch {};
+        @import("stdx").fs.sync(file) catch |err| {
+            @import("stdx").fs.closeFile(file);
+            return err;
+        };
         @import("stdx").fs.closeFile(file);
 
-        @import("stdx").fs.rename(tmp_path, manifest_path) catch return error.InvalidManifest;
+        try @import("stdx").fs.renameDurable(tmp_path, manifest_path);
     }
 
     /// Load the manifest from a local directory.
@@ -440,7 +443,9 @@ test "ColdTierManager: manifest save and load persistence" {
         try testing.expectEqual(@as(usize, 1), manager.segmentCount());
 
         // Persist the manifest
+        const before = @import("stdx").fs.dir_syncs.load(.monotonic);
         try manager.saveManifest(test_dir);
+        try testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
     }
 
     // Create a NEW manager and load the manifest

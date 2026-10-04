@@ -180,7 +180,7 @@ pub const ShardManifest = struct {
         try @import("stdx").fs.writeAll(file, aw.written());
         try @import("stdx").fs.sync(file);
 
-        try @import("stdx").fs.rename(tmp_path, manifest_path);
+        try @import("stdx").fs.renameDurable(tmp_path, manifest_path);
     }
 
     // ─── Convenience: update only latest_snapshot ────────────────────
@@ -236,7 +236,9 @@ test "shard manifest: save and load round-trip" {
         .crc = 12345678,
     });
 
+    const before = @import("stdx").fs.dir_syncs.load(.monotonic);
     try sm.save(allocator, path);
+    try std.testing.expectEqual(before + 1, @import("stdx").fs.dir_syncs.load(.monotonic));
 
     // Load it back
     var loaded = (try ShardManifest.load(allocator, path)).?;

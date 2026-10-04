@@ -22,13 +22,15 @@ test {
 // Protocol
 test {
     _ = @import("protocol/proto.zig");
-    _ = @import("protocol/resp.zig");
 }
 
 // Node layer
 test {
     _ = @import("node/reactor.zig");
     _ = @import("node/inbox.zig");
+    _ = @import("node/mailbox.zig");
+    _ = @import("node/reply_to.zig");
+    _ = @import("node/reply_pool.zig");
     _ = @import("node/slab.zig");
     _ = @import("node/router.zig");
     _ = @import("node/dispatcher.zig");
@@ -73,6 +75,7 @@ test {
 // Raft consensus
 test {
     _ = @import("raft/log.zig");
+    _ = @import("raft/hard_state.zig");
     _ = @import("raft/node.zig");
     _ = @import("raft/transport.zig");
     _ = @import("raft/snapshot.zig");
@@ -169,7 +172,6 @@ test {
 test {
     _ = @import("cluster/coordinator.zig");
     _ = @import("cluster/partition_table.zig");
-    _ = @import("cluster/forwarder.zig");
 }
 
 // Auth

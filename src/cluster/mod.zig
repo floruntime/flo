@@ -1,5 +1,4 @@
-// Cluster — Controller Raft, Partition Table, Forwarding
+// Cluster — Controller Raft, Partition Table
 
 pub const coordinator = @import("coordinator.zig");
 pub const partition_table = @import("partition_table.zig");
-pub const forwarder = @import("forwarder.zig");
