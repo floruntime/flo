@@ -65,6 +65,17 @@ test "e2e/cluster: peers are reached at the address they advertise" {
     defer set1.deinit();
     try stdx.testing.assertSucceeded(set1);
     try pollUntilContains(cli2, &.{ "kv", "get", "from-seed" }, "v1");
+    // Node 3 is a member everywhere before the seed goes: it holds the
+    // log, and a write after its admission has reached node 2 too, so the
+    // entry that admitted it is applied on both. Stopped any earlier, the
+    // seed leaves node 2 in a group of two that has lost one, which can
+    // rightly elect no one.
+    try pollUntilContains(cli3, &.{ "kv", "get", "from-seed" }, "v1");
+    var set2 = try cli_seed.run(&.{ "kv", "set", "after-join", "v1" });
+    defer set2.deinit();
+    try stdx.testing.assertSucceeded(set2);
+    try pollUntilContains(cli2, &.{ "kv", "get", "after-join" }, "v1");
+    try pollUntilContains(cli3, &.{ "kv", "get", "after-join" }, "v1");
 
     // The mesh: node 3 learned node 2's address from the seed's peer info.
     // With the seed gone, the only path from 2 to 3 is that link.

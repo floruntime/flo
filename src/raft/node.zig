@@ -222,8 +222,12 @@ pub const RaftNode = struct {
     vote_granted_by: [MAX_PEERS]bool,
     /// A pre-vote round is a poll before the term is spent: the term is
     /// not incremented, nothing is persisted, and only a majority of
-    /// "I would vote for you" turns into a real election.
-    pre_vote_in_progress: bool,
+    /// "I would vote for you" turns into a real election. This is the term
+    /// the poll asked about, 0 for none; the poll is open only while that is
+    /// the term after ours (`pollOpen`), so any move of the term — a step
+    /// down, an election, a stored term loaded — closes it with no clearing
+    /// to forget.
+    pre_vote_term: u64,
     /// Last tick a current-term leader spoke to us. A vote request within
     /// one election timeout of that is a disrupted node's, not a real
     /// failover, and is ignored.
@@ -289,7 +293,7 @@ pub const RaftNode = struct {
             .votes_received = 0,
             .votes_needed = 0,
             .vote_granted_by = std.mem.zeroes([MAX_PEERS]bool),
-            .pre_vote_in_progress = false,
+            .pre_vote_term = 0,
             .last_leader_contact_ms = 0,
             .leader_since_ms = 0,
             .timer_enabled = true,
@@ -467,7 +471,7 @@ pub const RaftNode = struct {
                     log.warn("Raft: no contact with a majority for {d} ms; stepping down from term {d}", .{ now_ms - self.quorumContactMs(), self.current_term });
                     self.role = .follower;
                     self.leader_id = NO_VOTE;
-                    self.pre_vote_in_progress = false;
+                    self.pre_vote_term = 0;
                     self.rearmElectionTimer();
                     result.step_down = true;
                 } else {
@@ -532,7 +536,7 @@ pub const RaftNode = struct {
         // reconnect. A poll that gets no majority before the timer fires
         // again is simply asked again; only a passed poll spends the term.
         if (self.config.enable_pre_vote and self.peer_count > 0) {
-            self.pre_vote_in_progress = true;
+            self.pre_vote_term = self.current_term + 1;
             self.votes_received = 1;
             self.votes_needed = self.quorum();
             self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
@@ -548,10 +552,15 @@ pub const RaftNode = struct {
         return self.startElectionNow();
     }
 
+    /// A poll is still asking about the term after ours.
+    fn pollOpen(self: *const RaftNode) bool {
+        return self.pre_vote_term != 0 and self.pre_vote_term == self.current_term + 1;
+    }
+
     /// Spend the term: what a passed poll leads to, and what a node with no
     /// peers or no pre-vote does at once.
     pub fn startElectionNow(self: *RaftNode) ?VoteRequest {
-        self.pre_vote_in_progress = false;
+        self.pre_vote_term = 0;
         const prior_term = self.current_term;
         const prior_vote = self.voted_for;
         self.current_term += 1;
@@ -635,6 +644,11 @@ pub const RaftNode = struct {
             self.voted_for = NO_VOTE;
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id };
         }
+        // Our vote is that candidate's now: a poll of our own still open
+        // would, on late answers, stand against the leader we just helped
+        // elect. (A vote in a newer term needs no help: moving the term
+        // closed the poll.)
+        self.pre_vote_term = 0;
         self.rearmElectionTimer();
         log.debug("Raft: vote granted to node={d}, term={d}", .{ req.candidate_id, self.current_term });
         return .{ .term = self.current_term, .vote_granted = true, .from = self.id };
@@ -645,12 +659,12 @@ pub const RaftNode = struct {
     pub fn handleVoteResponse(self: *RaftNode, resp: VoteResponse) VoteOutcome {
         if (!self.termPlausible(resp.term)) return .none;
         if (resp.is_pre_vote) {
-            if (!self.pre_vote_in_progress or self.role == .leader) return .none;
+            if (!self.pollOpen() or self.role == .leader) return .none;
             // The poll asked about our term + 1; an answer naming a higher
-            // term means the cluster has moved on and the poll is void.
+            // term means the cluster has moved on, and stepping down to it
+            // closes the poll.
             if (resp.term > self.current_term) {
                 self.stepDown(resp.term);
-                self.pre_vote_in_progress = false;
                 return .none;
             }
             if (!resp.vote_granted) return .none;
@@ -716,7 +730,8 @@ pub const RaftNode = struct {
         if (self.role == .candidate) {
             self.role = .follower;
         }
-        self.pre_vote_in_progress = false;
+        // A leader of our term is alive: a poll for the next one is moot.
+        self.pre_vote_term = 0;
         self.last_leader_contact_ms = self.current_time_ms;
         self.rearmElectionTimer();
 
@@ -897,7 +912,7 @@ pub const RaftNode = struct {
         log.debug("Raft: becoming leader, node_id={d}, term={d}", .{ self.id, self.current_term });
         self.role = .leader;
         self.leader_id = self.id;
-        self.pre_vote_in_progress = false;
+        self.pre_vote_term = 0;
         self.leader_since_ms = self.current_time_ms;
         self.elections_won += 1;
         // Initialize peer tracking
@@ -1972,6 +1987,100 @@ test "raft node: a term more than 2^32 ahead is refused, not adopted" {
     // A term merely ahead is an election we missed, and is adopted.
     _ = try node.handleAppendEntries(.{ .term = before + 5, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
     try testing.expectEqual(before + 5, node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
+}
+
+test "raft node: a node that votes for another candidate drops its own poll, so late answers to it cannot depose the winner" {
+    var node = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    node.addPeer(2);
+
+    // Both survivors time out together: we poll for term 1, and node 2
+    // stands for term 1 first. We vote for it.
+    const poll = node.startElection().?;
+    try testing.expect(poll.is_pre_vote);
+    const vote = node.handleVoteRequest(.{ .term = 1, .candidate_id = 2, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(vote.vote_granted);
+    try testing.expectEqual(@as(u64, 1), node.current_term);
+
+    // Node 2's answer to our poll, sent before it stood, arrives now. It
+    // must not start an election for term 2 against the leader of term 1.
+    try testing.expect(node.handleVoteResponse(.{ .term = 0, .vote_granted = true, .from = 2, .is_pre_vote = true }) == .none);
+    try testing.expectEqual(@as(u64, 1), node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(u32, 2), node.voted_for);
+}
+
+test "raft node: a vote for a candidate in a term we already knew also drops our poll" {
+    var node = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    node.addPeer(2);
+    // We know term 1 but have voted in it for nobody; we poll for term 2.
+    node.current_term = 1;
+    _ = node.startElection().?;
+    // Node 2 stands in term 1, the term we are in: no step-down, just a vote.
+    const vote = node.handleVoteRequest(.{ .term = 1, .candidate_id = 2, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(vote.vote_granted);
+    try testing.expect(node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 1, .is_pre_vote = true }) == .none);
+    try testing.expectEqual(@as(u64, 1), node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
+}
+
+test "raft node: a poll's answers never count as votes, nor votes as poll answers" {
+    var node = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    node.addPeer(2);
+    // Polling: a granted real vote is not a "would vote". (One naming our
+    // own term; a newer term would rightly move us to it.)
+    _ = node.startElection().?;
+    try testing.expect(node.handleVoteResponse(.{ .term = 0, .vote_granted = true, .from = 1 }) == .none);
+    try testing.expectEqual(@as(u64, 0), node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
+    // A candidate for term 1: a late "would vote", from a node that has
+    // reached term 1 meanwhile, is not a vote.
+    _ = node.startElectionNow().?;
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expect(node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 1, .is_pre_vote = true }) == .none);
+    try testing.expectEqual(Role.candidate, node.role);
+    // A real vote still wins it.
+    try testing.expect(node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 }) == .won);
+}
+
+test "raft node: a poll is dropped when a leader of our term speaks" {
+    var node = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    node.addPeer(2);
+    node.current_term = 1;
+    _ = node.startElection().?;
+    // Node 1 leads term 1 and is heard: our poll for term 2 is moot.
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2, .is_pre_vote = true }) == .none);
+    try testing.expectEqual(@as(u64, 1), node.current_term);
+    try testing.expectEqual(Role.follower, node.role);
+}
+
+test "raft node: a poll open when a newer term arrives is dropped" {
+    var node = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    node.addPeer(2);
+
+    _ = node.startElection().?;
+    // A newer term, here from a vote we refuse (node 2's log is behind
+    // ours), moves us on without granting anything.
+    var entry = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    entry.header.crc32c = entry.computeCrc();
+    _ = try node.log.append(&entry);
+    const vote = node.handleVoteRequest(.{ .term = 5, .candidate_id = 2, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(!vote.vote_granted);
+    try testing.expectEqual(@as(u64, 5), node.current_term);
+    // The poll asked about term 1; a "yes" to it says nothing about term 6.
+    try testing.expect(node.handleVoteResponse(.{ .term = 0, .vote_granted = true, .from = 1, .is_pre_vote = true }) == .none);
+    try testing.expectEqual(@as(u64, 5), node.current_term);
     try testing.expectEqual(Role.follower, node.role);
 }
 
