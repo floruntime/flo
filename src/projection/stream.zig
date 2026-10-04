@@ -882,7 +882,7 @@ pub const StreamProjection = struct {
     }
 
     /// Reset the stream projection to empty state.
-    /// Used during namespace force-delete to clear all stream data.
+    /// Clears every stream on this shard; used before restoring a snapshot.
     pub fn reset(self: *StreamProjection) void {
         // Free consumer groups
         var git = self.groups.iterator();

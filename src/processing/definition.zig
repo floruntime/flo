@@ -397,6 +397,22 @@ pub const JobDefinition = struct {
     // Cleanup
     // =========================================================================
 
+    /// The reason the first invalid namespace this job names (at the top,
+    /// on a source or sink, or in an operator's `namespace` setting) is
+    /// refused, or null if all are valid. A job reads and writes without
+    /// passing a client's request check, so its definition is checked
+    /// whole, at submit.
+    pub fn namespaceRefusal(self: *const JobDefinition) ?[]const u8 {
+        const nameRefusal = @import("../namespace/handler.zig").nameRefusal;
+        if (self.namespace.len > 0) if (nameRefusal(self.namespace)) |why| return why;
+        for (self.sources.items) |src| if (src.namespace.len > 0) if (nameRefusal(src.namespace)) |why| return why;
+        for (self.sinks.items) |snk| if (snk.namespace.len > 0) if (nameRefusal(snk.namespace)) |why| return why;
+        for (self.operators.items) |*op| {
+            if (op.getConfig("namespace")) |ns| if (ns.len > 0) if (nameRefusal(ns)) |why| return why;
+        }
+        return null;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);

@@ -105,7 +105,7 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
 
         // Build namespace prefix for filtering (same logic as KV handler)
         var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
+        const ns_prefix = try ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
 
         // Scan keys from shard projections
         const n = shardCount(ctx);
@@ -258,7 +258,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
 /// Connect a short-lived loopback client to the node's own protocol port.
 /// Mutations can't be proposed from the dashboard thread, so we issue them over
 /// the wire to ourselves — the same thread-safe path the CLI uses.
-fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+pub fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
     var ep_buf: [32]u8 = undefined;
     const endpoint = try ctx.clientEndpoint(&ep_buf);
     var client = client_mod.Client.init(allocator, endpoint);

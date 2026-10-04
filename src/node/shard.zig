@@ -469,7 +469,8 @@ pub const Shard = struct {
         // Create Namespace handler (no projection needed)
         const namespace_handler = try allocator.create(NamespaceHandler);
         errdefer allocator.destroy(namespace_handler);
-        namespace_handler.* = NamespaceHandler.init(allocator);
+        namespace_handler.* = try NamespaceHandler.init(allocator);
+        errdefer namespace_handler.deinit();
 
         // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
         // namespace handler. Done HERE — before replaySegments runs below — so that
@@ -1135,6 +1136,15 @@ pub const Shard = struct {
             }
         }
 
+        // Every namespace a request names meets the one rule here, before
+        // anything runs: a write to an unknown namespace creates it.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
@@ -1272,6 +1282,29 @@ pub const Shard = struct {
             }
             self.forwardToLeader(conn, req);
             return;
+        }
+        // Requests forwarded from another node arrive here without passing
+        // `dispatchRequest`'s check.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+        // A write that brings data into a namespace this shard has not seen
+        // creates it. Checked after forwarding because only the leader knows
+        // the creates in flight; the create is proposed here, ahead of the
+        // write, so it holds the room before the next request is admitted.
+        // Other writes (a delete, an ack, a wait for what is not there yet)
+        // create nothing, wherever they are sent, and nor does a request
+        // that names nothing to write to. A job submit names its targets in
+        // its definition: its handler reserves once the definition passes.
+        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@enumFromInt(req.header.op_code))) {
+            if (self.namespace_handler.admission(req.namespace)) |r| {
+                self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
+                return;
+            }
+            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
         }
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
     }
@@ -6855,6 +6888,56 @@ const ParkTest = struct {
     }
 };
 
+test "Shard: a write to a new namespace holds its room before it commits, so writes in flight cannot overshoot the limit" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // An explicit create in flight holds its name and id as a write's does.
+    shard.dispatchRequest(conn, try ParkTest.request(.namespace_create, 42, "", "explicit", "", ""));
+    try std.testing.expect(shard.namespace_handler.pending_creates.contains("explicit"));
+    try ParkTest.ack(&shard);
+    try std.testing.expect(!shard.namespace_handler.pending_creates.contains("explicit"));
+    var created: [1]proto.Response = undefined;
+    var created_buf: [256]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &created_buf, &created);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created[0].header.status);
+
+    // One namespace short of the limit.
+    var name_buf: [16]u8 = undefined;
+    const room = 1024 - shard.namespace_handler.namespaces.count() - 1;
+    for (0..room) |i| _ = shard.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
+
+    // Two writes to new namespaces, neither committed: the first holds
+    // the last room, the second is refused at once.
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 40, "first", "k", "v", ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 41, "second", "k", "v", ""));
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 41), one[0].header.request_id);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, one[0].data);
+
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 40), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(shard.namespace_handler.namespaces.contains("first"));
+    try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
+}
+
 test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -7082,12 +7165,12 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     try ParkTest.ack(&shard);
     shard.namespace_handler.markNamespaceHasData("other", &shard);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.pending_creates.count());
 
     // What this leader had in flight may be gone with its log's tail.
     shard.leadershipLost("test");
     try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.pending_creates.count());
 }
 
 test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {
@@ -7155,15 +7238,16 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
     try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
 
-    // A namespace a run key cannot carry is refused, for a definition and
-    // for a start, before anything is proposed.
+    // A namespace a run key cannot carry (the key is read back up to its
+    // first ':') is refused, for a definition and for a start, before
+    // anything is proposed.
     const before = shard.raft_node.log.lastIndex();
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""));
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""));
     try ParkTest.responses(&shard, conn, pair[1], &big, &two);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
-    try std.testing.expectEqualStrings("invalid namespace name", two[1].data);
+    try std.testing.expect(std.mem.startsWith(u8, two[1].data, "invalid namespace name"));
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 

@@ -524,20 +524,8 @@ pub const WorkflowHandler = struct {
 
     // ── CREATE ──────────────────────────────────────────────────────────
 
-    /// Runs and definitions are keyed "namespace:name", and every node
-    /// reads the namespace back up to the first ':'. Checked where a
-    /// definition is created and a client starts a run: every producer's
-    /// start comes from a definition.
-    fn keyableNamespace(namespace: []const u8) bool {
-        return std.mem.indexOfAny(u8, namespace, ":\x00") == null;
-    }
-
     fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const yaml = req.value;
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
-            return null;
-        }
 
         if (yaml.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow definition is required");
@@ -550,6 +538,13 @@ pub const WorkflowHandler = struct {
             return null;
         };
         defer def.deinit(self.allocator);
+
+        // A trigger reads from its stream without passing a client's
+        // request check, so the namespace it names is checked here.
+        if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return null;
+        };
 
         // Validate the definition
         var validation = validator.validateWorkflow(self.allocator, &def) catch {
@@ -610,10 +605,6 @@ pub const WorkflowHandler = struct {
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return null;
-        }
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
             return null;
         }
 

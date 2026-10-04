@@ -128,8 +128,22 @@ pub const Client = struct {
     endpoint: []const u8,
     stream: ?@import("stdx").net.Stream = null,
     builder: RequestBuilder,
+    /// The server's message for the last request that failed with
+    /// `error.ServerError`, which a caller has no response to read it from.
+    server_error_buf: [256]u8 = undefined,
+    server_error_len: usize = 0,
 
     const Self = @This();
+
+    pub fn keepError(self: *Self, response: Response) void {
+        const msg = response.errorMessage();
+        self.server_error_len = @min(msg.len, self.server_error_buf.len);
+        @memcpy(self.server_error_buf[0..self.server_error_len], msg[0..self.server_error_len]);
+    }
+
+    pub fn serverError(self: *const Self) []const u8 {
+        return self.server_error_buf[0..self.server_error_len];
+    }
 
     pub fn init(allocator: Allocator, endpoint: []const u8) Self {
         return .{

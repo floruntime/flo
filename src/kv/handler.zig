@@ -764,7 +764,7 @@ pub const KVHandler = struct {
         };
 
         // Build scan prefix: namespace prefix + optional filter
-        const ns_prefix = nsPrefix(&S.ns_buf, namespace);
+        const ns_prefix = nsPrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
         var scan_prefix = ns_prefix;
         if (filter.len > 0 and ns_prefix.len + filter.len <= S.ns_buf.len) {
             @memcpy(S.ns_buf[ns_prefix.len..][0..filter.len], filter);
@@ -1439,7 +1439,8 @@ pub const KVHandler = struct {
             qualifyKey(&qbuf, ns, req.key) catch
                 return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } }
         else
-            nsPrefix(&qbuf, ns);
+            nsPrefix(&qbuf, ns) catch
+                return .{ .err = .{ .code = .invalid_request, .message = "namespace name too long" } };
 
         // Allocate scan buffer on stack
         var scan_buf: [MAX_SCAN_LIMIT]ScanEntry = undefined;
