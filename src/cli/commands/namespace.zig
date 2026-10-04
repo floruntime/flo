@@ -106,25 +106,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
 
-    // Validate namespace name
-    if (name.len == 0) {
-        ctx.printErr("Error: Namespace name cannot be empty\n", .{});
-        return error.CommandFailed;
-    }
-
-    if (name.len > 64) {
-        ctx.printErr("Error: Namespace name cannot exceed 64 characters\n", .{});
-        return error.CommandFailed;
-    }
-
-    // Check for invalid characters
-    for (name) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') {
-            ctx.printErr("Error: Namespace name can only contain alphanumeric characters, underscores, and hyphens\n", .{});
-            return error.CommandFailed;
-        }
-    }
-
+    // The server checks the name: its rule is the only one.
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 

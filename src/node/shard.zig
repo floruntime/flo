@@ -1135,6 +1135,15 @@ pub const Shard = struct {
             }
         }
 
+        // Every namespace a request names meets the one rule here, before
+        // anything runs: a write to an unknown namespace creates it.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
@@ -1273,7 +1282,22 @@ pub const Shard = struct {
             self.forwardToLeader(conn, req);
             return;
         }
+        // A write to a namespace this shard has not seen creates it, so it
+        // needs room in the registry, checked where the registry lives.
+        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and
+            !isNamespaceOp(req.header.op_code) and !self.namespace_handler.admits(req.namespace))
+        {
+            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace limit reached");
+            return;
+        }
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+    }
+
+    fn isNamespaceOp(op: u16) bool {
+        return switch (op) {
+            @intFromEnum(proto.OpCode.namespace_create), @intFromEnum(proto.OpCode.namespace_delete), @intFromEnum(proto.OpCode.namespace_config_set) => true,
+            else => false,
+        };
     }
 
     /// Pure routing decision: pre-route → the shard that owns the key. No
@@ -7155,15 +7179,16 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
     try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
 
-    // A namespace a run key cannot carry is refused, for a definition and
-    // for a start, before anything is proposed.
+    // A namespace a run key cannot carry (the key is read back up to its
+    // first ':') is refused, for a definition and for a start, before
+    // anything is proposed.
     const before = shard.raft_node.log.lastIndex();
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""));
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""));
     try ParkTest.responses(&shard, conn, pair[1], &big, &two);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
-    try std.testing.expectEqualStrings("invalid namespace name", two[1].data);
+    try std.testing.expect(std.mem.startsWith(u8, two[1].data, "invalid namespace name"));
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 

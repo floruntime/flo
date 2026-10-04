@@ -524,20 +524,8 @@ pub const WorkflowHandler = struct {
 
     // ── CREATE ──────────────────────────────────────────────────────────
 
-    /// Runs and definitions are keyed "namespace:name", and every node
-    /// reads the namespace back up to the first ':'. Checked where a
-    /// definition is created and a client starts a run: every producer's
-    /// start comes from a definition.
-    fn keyableNamespace(namespace: []const u8) bool {
-        return std.mem.indexOfAny(u8, namespace, ":\x00") == null;
-    }
-
     fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const yaml = req.value;
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
-            return null;
-        }
 
         if (yaml.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow definition is required");
@@ -610,10 +598,6 @@ pub const WorkflowHandler = struct {
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return null;
-        }
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
             return null;
         }
 

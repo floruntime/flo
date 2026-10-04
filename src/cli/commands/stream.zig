@@ -408,7 +408,11 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         partition_key,
         if (partition_opt) |p| @intCast(p) else null,
     ) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
+        if (err == error.ServerError) {
+            ctx.printErr("Error: {s}\n", .{client.serverError()});
+        } else {
+            ctx.printErr("Request failed: {}\n", .{err});
+        }
         return error.CommandFailed;
     };
 

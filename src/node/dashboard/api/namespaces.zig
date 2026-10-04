@@ -136,11 +136,7 @@ pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardCo
         return h.jsonError(allocator, "missing or invalid \"name\" field");
     };
 
-    // Validate
-    if (name.len == 0) return h.jsonError(allocator, "namespace name is required");
-    if (name.len > 128) return h.jsonError(allocator, "namespace name too long (max 128)");
-    if (!isValidNamespaceName(name)) return h.jsonError(allocator, "invalid namespace name: must start with letter/underscore, contain only [a-zA-Z0-9_.-]");
-    if (isReservedNamespace(name)) return h.jsonError(allocator, "reserved namespace name");
+    if (ns_keys.nameRefusal(name)) |why| return h.jsonError(allocator, why);
 
     // Access shard 0 (namespace commands are controller-only)
     const ptrs = ctx.shard_ptrs orelse return h.jsonError(allocator, "shards not initialized");
@@ -152,7 +148,12 @@ pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardCo
     if (shard.namespace_handler.namespaces.contains(name)) return h.jsonError(allocator, "namespace already exists");
 
     // Apply creation to shard 0's namespace handler (in-memory registration)
-    shard.namespace_handler.applyCreate(name);
+    switch (shard.namespace_handler.applyCreate(name)) {
+        .created => {},
+        .existed => return h.jsonError(allocator, "namespace already exists"),
+        .invalid => return h.jsonError(allocator, "invalid namespace name"),
+        .full => return h.jsonError(allocator, "namespace limit reached"),
+    }
 
     // Return success
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -180,31 +181,6 @@ fn extractName(body: []const u8) ?[]const u8 {
     while (i < after.len and after[i] != '"') : (i += 1) {}
     if (i >= after.len) return null;
     return after[start..i];
-}
-
-fn isValidNamespaceName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
-            else => return false,
-        }
-    }
-    return switch (name[0]) {
-        'a'...'z', 'A'...'Z', '_' => true,
-        else => false,
-    };
-}
-
-fn isReservedNamespace(name: []const u8) bool {
-    const reserved = [_][]const u8{ "__system", "__internal", "__meta", "_flo" };
-    for (reserved) |prefix| {
-        if (name.len >= prefix.len and std.mem.eql(u8, name[0..prefix.len], prefix)) {
-            if (name.len == prefix.len) return true;
-            if (name[prefix.len] == ':' or name[prefix.len] == '.') return true;
-        }
-    }
-    return false;
 }
 
 /// GET /namespaces/:name - Namespace detail with resource arrays

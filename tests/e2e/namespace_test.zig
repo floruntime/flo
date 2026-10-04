@@ -316,76 +316,26 @@ test "e2e/namespace: delete fails when namespace has streams" {
     try stdx.testing.assertFailed(result);
 }
 
-test "e2e/namespace: force delete removes streams" {
+test "e2e/namespace: force delete is refused while the shard holds streams, and keeps them" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     const ns = "stream_cleanup_test";
-
-    // Create namespace with streams
     try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "stream", "create", "orders", "-n", ns });
-    try ctx.exec(&.{ "stream", "create", "events", "-n", ns });
-
-    // Add some data to streams
     try ctx.exec(&.{ "stream", "append", "orders", "order:1", "-n", ns });
-    try ctx.exec(&.{ "stream", "append", "events", "event:1", "-n", ns });
+    try ctx.exec(&.{ "stream", "group", "create", "orders", "--group", "g", "-n", ns });
 
-    // Force delete namespace
+    var refused = try ctx.cli.run(&.{ "ns", "delete", ns, "--force" });
+    defer refused.deinit();
+    try stdx.testing.assertContains(refused, "cannot remove streams or queues yet");
+    const info = try ctx.execCapture(&.{ "stream", "info", "orders", "-n", ns });
+    try testing.expect(std.mem.indexOf(u8, info, "Records: 1") != null);
+
+    // With its streams deleted, the namespace goes.
+    try ctx.exec(&.{ "stream", "delete", "orders", "--force", "-n", ns });
     try ctx.exec(&.{ "ns", "delete", ns, "--force" });
-
-    // Wait for async deletion
-    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
-
-    // Namespace should be gone
     const list = try ctx.execCapture(&.{ "ns", "ls" });
     try testing.expect(std.mem.indexOf(u8, list, ns) == null);
-
-    // Recreate namespace - streams should not exist
-    try ctx.exec(&.{ "ns", "create", ns });
-
-    // Try to create stream (should work since namespace is fresh)
-    try ctx.exec(&.{ "stream", "create", "orders", "-n", ns });
-    
-    // Stream info should show 0 records (fresh stream, data was deleted)
-    const result = try ctx.execCapture(&.{ "stream", "info", "orders", "-n", ns });
-    try testing.expect(std.mem.indexOf(u8, result, "Records: 0") != null);
-}
-
-test "e2e/namespace: force delete removes stream consumer groups" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    const ns = "stream_cg_cleanup";
-
-    // Create namespace with stream and consumer group
-    try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "stream", "create", "mystream", "-n", ns });
-    try ctx.exec(&.{ "stream", "append", "mystream", "data1", "-n", ns });
-    try ctx.exec(&.{ "stream", "group", "create", "mystream", "--group", "mygroup", "-n", ns });
-
-    // Verify consumer group exists and has data
-    const before = try ctx.execCapture(&.{ "stream", "group", "info", "mystream", "--group", "mygroup", "-n", ns });
-    // Note: Pending should be empty since we didn't consume anything yet
-    _ = before;
-
-    // Force delete namespace
-    try ctx.exec(&.{ "ns", "delete", ns, "--force" });
-
-    // Wait for async deletion
-    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
-
-    // Namespace should be gone
-    const list = try ctx.execCapture(&.{ "ns", "ls" });
-    try testing.expect(std.mem.indexOf(u8, list, ns) == null);
-
-    // Recreate namespace and stream
-    try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "stream", "create", "mystream", "-n", ns });
-
-    // Stream should be fresh with 0 records (data was deleted)
-    const stream_info = try ctx.execCapture(&.{ "stream", "info", "mystream", "-n", ns });
-    try testing.expect(std.mem.indexOf(u8, stream_info, "Records: 0") != null);
 }
 
 // =============================================================================
@@ -410,122 +360,19 @@ test "e2e/namespace: delete fails when namespace has queues" {
     try stdx.testing.assertFailed(result);
 }
 
-test "e2e/namespace: force delete removes queues" {
+test "e2e/namespace: force delete is refused while the shard holds queues, and keeps them" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     const ns = "queue_cleanup_test";
-
-    // Create namespace with queues
     try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "queue", "create", "tasks", "-n", ns });
-    try ctx.exec(&.{ "queue", "create", "notifications", "-n", ns });
-
-    // Add messages to queues
     try ctx.exec(&.{ "queue", "enqueue", "tasks", "task:1", "-n", ns });
-    try ctx.exec(&.{ "queue", "enqueue", "notifications", "notify:1", "-n", ns });
 
-    // Force delete namespace
-    try ctx.exec(&.{ "ns", "delete", ns, "--force" });
-
-    // Wait for async deletion
-    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
-
-    // Namespace should be gone
-    const list = try ctx.execCapture(&.{ "ns", "ls" });
-    try testing.expect(std.mem.indexOf(u8, list, ns) == null);
-
-    // Recreate namespace - queues should not exist
-    try ctx.exec(&.{ "ns", "create", ns });
-
-    // Try to recreate queue (should work since namespace is fresh)
-    try ctx.exec(&.{ "queue", "create", "tasks", "-n", ns });
-    
-    // Dequeue should return nothing (queue is empty, messages were deleted)
-    const result = try ctx.execCapture(&.{ "queue", "dequeue", "tasks", "-n", ns, "--timeout", "100" });
-    try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
-}
-
-test "e2e/namespace: force delete removes queue messages" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    const ns = "queue_msg_cleanup";
-
-    // Create namespace with queue and messages
-    try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "queue", "create", "work", "-n", ns });
-    try ctx.exec(&.{ "queue", "enqueue", "work", "job1", "-n", ns });
-    try ctx.exec(&.{ "queue", "enqueue", "work", "job2", "-n", ns });
-    try ctx.exec(&.{ "queue", "enqueue", "work", "job3", "-n", ns });
-
-    // Force delete namespace
-    try ctx.exec(&.{ "ns", "delete", ns, "--force" });
-
-    // Wait for async deletion
-    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
-
-    // Recreate namespace and queue
-    try ctx.exec(&.{ "ns", "create", ns });
-    try ctx.exec(&.{ "queue", "create", "work", "-n", ns });
-
-    // Queue should be empty (no messages from before, messages were deleted)
-    const result = try ctx.execCapture(&.{ "queue", "dequeue", "work", "-n", ns, "--timeout", "100" });
-    try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
-}
-
-// =============================================================================
-// Force Delete - Combined Resources
-// =============================================================================
-
-test "e2e/namespace: force delete removes all resource types" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    const ns = "combined_cleanup";
-
-    // Create namespace with KV, Stream, and Queue resources
-    try ctx.exec(&.{ "ns", "create", ns });
-
-    // KV resources
-    try ctx.exec(&.{ "kv", "set", "config:app", "myapp", "-n", ns });
-    try ctx.exec(&.{ "kv", "set", "config:version", "1.0", "-n", ns });
-
-    // Stream resources
-    try ctx.exec(&.{ "stream", "create", "audit", "-n", ns });
-    try ctx.exec(&.{ "stream", "append", "audit", "login:user1", "-n", ns });
-
-    // Queue resources
-    try ctx.exec(&.{ "queue", "create", "emails", "-n", ns });
-    try ctx.exec(&.{ "queue", "enqueue", "emails", "welcome@test.com", "-n", ns });
-
-    // Force delete namespace
-    try ctx.exec(&.{ "ns", "delete", ns, "--force" });
-
-    // Wait for async deletion to complete all phases
-    @import("stdx").time.sleep(700 * std.time.ns_per_ms);
-
-    // Namespace should be gone
-    const list = try ctx.execCapture(&.{ "ns", "ls" });
-    try testing.expect(std.mem.indexOf(u8, list, ns) == null);
-
-    // Recreate namespace - should be completely empty
-    try ctx.exec(&.{ "ns", "create", ns });
-
-    // Verify KV is empty (key should not exist - command will fail)
-    var kv_result = try ctx.cli.run(&.{ "kv", "get", "config:app", "-n", ns });
-    defer kv_result.deinit();
-    try stdx.testing.assertFailed(kv_result); // Key doesn't exist
-
-    // Verify stream is fresh (can create, should have 0 records)
-    try ctx.exec(&.{ "stream", "create", "audit", "-n", ns });
-    const stream_result = try ctx.execCapture(&.{ "stream", "info", "audit", "-n", ns });
-    try testing.expect(std.mem.indexOf(u8, stream_result, "Records: 0") != null);
-
-    // Verify queue is fresh (can create, should be empty)
-    try ctx.exec(&.{ "queue", "create", "emails", "-n", ns });
-    const queue_result = try ctx.execCapture(&.{ "queue", "dequeue", "emails", "-n", ns, "--timeout", "100" });
-    try testing.expect(std.mem.indexOf(u8, queue_result, "(no messages)") != null);
+    var refused = try ctx.cli.run(&.{ "ns", "delete", ns, "--force" });
+    defer refused.deinit();
+    try stdx.testing.assertContains(refused, "cannot remove streams or queues yet");
+    const msg = try ctx.execCapture(&.{ "queue", "dequeue", "tasks", "-n", ns, "--timeout", "100" });
+    try testing.expect(std.mem.indexOf(u8, msg, "task:1") != null);
 }
 
 test "e2e/namespace: force delete is idempotent" {
