@@ -525,6 +525,8 @@ pub const ProcessingHandler = struct {
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
         const now = @import("stdx").time.milliTimestamp();
+        // Admitted at dispatch; the definition has now passed, so reserve.
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
         const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "job not persisted"));
             return;

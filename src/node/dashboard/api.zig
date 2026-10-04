@@ -33,9 +33,9 @@ pub fn only(method: Method, allowed: []const Method) error{MethodNotAllowed}!voi
     return error.MethodNotAllowed;
 }
 
-/// Why a namespace this request names, in `?namespace=` or the path, can
-/// name none, or null. Checked before any route: a name that no namespace
-/// can have is never looked up.
+/// The reason a namespace this request names (in `?namespace=` or the path)
+/// is invalid, or null. Checked before any route, so an invalid name is
+/// never looked up.
 fn namespaceRefusal(path: []const u8, query_string: ?[]const u8) ?[]const u8 {
     if (h.parseQueryParam([]const u8, query_string, "namespace")) |ns| {
         if (ns.len > 0) if (ns_keys.nameRefusal(ns)) |why| return why;

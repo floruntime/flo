@@ -469,7 +469,8 @@ pub const Shard = struct {
         // Create Namespace handler (no projection needed)
         const namespace_handler = try allocator.create(NamespaceHandler);
         errdefer allocator.destroy(namespace_handler);
-        namespace_handler.* = NamespaceHandler.init(allocator);
+        namespace_handler.* = try NamespaceHandler.init(allocator);
+        errdefer namespace_handler.deinit();
 
         // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
         // namespace handler. Done HERE — before replaySegments runs below — so that
@@ -1290,27 +1291,22 @@ pub const Shard = struct {
                 return;
             }
         }
-        // A write to a namespace this shard has not seen creates it. Checked
-        // after forwarding because only the leader knows the creates in
-        // flight; the create is proposed here, ahead of the write, so it
-        // holds the room before the next request is admitted.
-        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and
-            !isNamespaceOp(req.header.op_code))
-        {
+        // A write that brings data into a namespace this shard has not seen
+        // creates it. Checked after forwarding because only the leader knows
+        // the creates in flight; the create is proposed here, ahead of the
+        // write, so it holds the room before the next request is admitted.
+        // Other writes (a delete, an ack, a wait for what is not there yet)
+        // create nothing, wherever they are sent, and nor does a request
+        // that names nothing to write to. A job submit names its targets in
+        // its definition: its handler reserves once the definition passes.
+        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@enumFromInt(req.header.op_code))) {
             if (self.namespace_handler.admission(req.namespace)) |r| {
                 self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
                 return;
             }
-            self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
+            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
         }
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
-    }
-
-    fn isNamespaceOp(op: u16) bool {
-        return switch (op) {
-            @intFromEnum(proto.OpCode.namespace_create), @intFromEnum(proto.OpCode.namespace_delete), @intFromEnum(proto.OpCode.namespace_config_set) => true,
-            else => false,
-        };
     }
 
     /// Pure routing decision: pre-route → the shard that owns the key. No
@@ -6909,6 +6905,16 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
 
+    // An explicit create in flight holds its name and id as a write's does.
+    shard.dispatchRequest(conn, try ParkTest.request(.namespace_create, 42, "", "explicit", "", ""));
+    try std.testing.expect(shard.namespace_handler.pending_creates.contains("explicit"));
+    try ParkTest.ack(&shard);
+    try std.testing.expect(!shard.namespace_handler.pending_creates.contains("explicit"));
+    var created: [1]proto.Response = undefined;
+    var created_buf: [256]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &created_buf, &created);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created[0].header.status);
+
     // One namespace short of the limit.
     var name_buf: [16]u8 = undefined;
     const room = 1024 - shard.namespace_handler.namespaces.count() - 1;
@@ -7159,12 +7165,12 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     try ParkTest.ack(&shard);
     shard.namespace_handler.markNamespaceHasData("other", &shard);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.pending_creates.count());
 
     // What this leader had in flight may be gone with its log's tail.
     shard.leadershipLost("test");
     try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.pending_creates.count());
 }
 
 test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {

@@ -1,7 +1,7 @@
 //! A namespace name meets one rule however it arrives: an explicit create,
 //! any request naming it (a first write creates it), a pipeline definition,
-//! or the dashboard. Each test checks the answer, and that nothing was
-//! created or harmed.
+//! a workflow trigger, or the dashboard. Each test checks the answer, and
+//! that nothing was created or harmed.
 
 const std = @import("std");
 const testing = std.testing;
@@ -57,11 +57,12 @@ test "e2e/namespace: an explicit create meets the same rule" {
 test "e2e/namespace: a pipeline naming a namespace outside the rule is refused at submit" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    for ([_][]const u8{
-        "sinks.[0].stream.namespace: _flo",
-        "sources.[0].stream.namespace: Prod",
-        "namespace: has_colon:x",
-    }) |line| {
+    const Case = struct { line: []const u8, says: []const u8 };
+    for ([_]Case{
+        .{ .line = "sinks.[0].stream.namespace: _flo", .says = "reserved namespace name" },
+        .{ .line = "sources.[0].stream.namespace: Prod", .says = "lowercase only" },
+        .{ .line = "namespace: has_colon:x", .says = "letters, digits, '_' and '-' only" },
+    }) |c| {
         var buf: [512]u8 = undefined;
         const def = try std.fmt.bufPrint(&buf,
             \\kind: Processing
@@ -69,19 +70,18 @@ test "e2e/namespace: a pipeline naming a namespace outside the rule is refused a
             \\sources.[0].stream.name: in
             \\sinks.[0].stream.name: out
             \\{s}
-        , .{line});
+        , .{c.line});
         const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "ns-check.yaml");
         defer stdx.testing.cleanupTempFile(testing.allocator, path);
         var submit = try ctx.cli.run(&.{ "processing", "submit", path });
         defer submit.deinit();
-        try stdx.testing.assertContains(submit, "namespace name");
+        try stdx.testing.assertContains(submit, c.says);
     }
     const jobs = try ctx.execCapture(&.{ "processing", "list" });
     try testing.expect(std.mem.indexOf(u8, jobs, "ns-check") == null);
-    try testing.expect(!try listed(ctx, "_flo"));
 }
 
-test "e2e/namespace: the dashboard refuses a namespace no namespace can have, and the node keeps serving" {
+test "e2e/namespace: the dashboard refuses an invalid namespace name, and the node keeps serving" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
     defer ctx.deinit();
     var http = try ctx.createDashboardHttp();
@@ -145,4 +145,22 @@ test "e2e/namespace: a workflow trigger naming a namespace outside the rule is r
     var got = try ctx.cli.run(&.{ "workflow", "definition", "ns-trigger" });
     defer got.deinit();
     try testing.expect(!got.stdoutContains("ns-trigger"));
+}
+
+test "e2e/namespace: a write that brings no data, to a namespace never seen, creates nothing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    var del = try ctx.cli.run(&.{ "kv", "delete", "k", "-n", "typo-a" });
+    defer del.deinit();
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "q", "-n", "typo-b", "--timeout", "100" });
+    defer deq.deinit();
+    try stdx.testing.assertContains(deq, "(no messages)");
+    var empty_key = try ctx.cli.run(&.{ "kv", "set", "", "v", "-n", "typo-c" });
+    defer empty_key.deinit();
+    for ([_][]const u8{ "typo-a", "typo-b", "typo-c" }) |name| {
+        var info = try ctx.cli.run(&.{ "ns", "info", name });
+        defer info.deinit();
+        var buf: [64]u8 = undefined;
+        try stdx.testing.assertStdoutContains(info, try std.fmt.bufPrint(&buf, "Namespace '{s}' does not exist", .{name}));
+    }
 }

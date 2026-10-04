@@ -541,7 +541,7 @@ pub const WorkflowHandler = struct {
 
         // A trigger reads from its stream without passing a client's
         // request check, so the namespace it names is checked here.
-        if (def.trigger) |t| if (t.namespace) |ns| if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
+        if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return null;
         };

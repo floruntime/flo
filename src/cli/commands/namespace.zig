@@ -60,7 +60,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo ns rm staging",
                 })
                 .arg("name", "Name of the namespace to delete")
-                .boolFlag("force", 'f', "Delete even if not empty, once delete is supported")
+                .boolFlag("force", 'f', "No effect while delete is refused")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(

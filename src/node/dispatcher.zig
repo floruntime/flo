@@ -88,6 +88,23 @@ pub fn opWrites(op: proto.OpCode) bool {
     };
 }
 
+/// Whether a write can bring a namespace's first data into being, and so
+/// may create the namespace. The other writes act on data that must
+/// already exist, and create no namespace.
+pub fn opCreates(op: proto.OpCode) bool {
+    return switch (op) {
+        .kv_put, .kv_incr, .kv_json_set, .kv_begin_txn => true,
+        .stream_append, .stream_create, .stream_group_create => true,
+        .queue_enqueue, .queue_batch_enqueue => true,
+        .ts_write => true,
+        .action_register, .action_invoke => true,
+        .worker_register => true,
+        .workflow_create, .workflow_start => true,
+        .processing_submit => true,
+        else => false,
+    };
+}
+
 pub const Dispatcher = struct {
     /// Handler lookup table — indexed by OpCode (u16, capped at MAX_OPCODES).
     handlers: [proto.MAX_OPCODES]?HandlerFn,
