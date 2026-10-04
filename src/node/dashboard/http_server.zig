@@ -127,7 +127,7 @@ pub const DashboardServer = struct {
 
     fn serverLoop(self: *Self) void {
         const listener = self.listener orelse return;
-        http.serve.serve(self.allocator, listener, &self.running, self);
+        http.serve.serve(self.allocator, listener, &self.running, self, http.serve.MAX_REQUEST);
     }
 
     /// A request from the accept loop, cut to its Content-Length, so the
@@ -263,9 +263,8 @@ pub const DashboardServer = struct {
         self.sendResponseRaw(client, status, content_type.toString(), body_data, cors_headers, false);
     }
 
-    /// Sent on every response: no other site may frame the dashboard (a
-    /// click there would be a click here) or have a response read as
-    /// another type than it says.
+    /// On every response the dashboard writes: no framing by another site,
+    /// no MIME sniffing.
     const security_headers = "X-Frame-Options: DENY\r\n" ++
         "Content-Security-Policy: frame-ancestors 'none'\r\n" ++
         "X-Content-Type-Options: nosniff\r\n";
@@ -306,7 +305,6 @@ pub const DashboardServer = struct {
     /// hand one origin's answer to another.
     fn getCorsHeaders(self: *Self, request: []const u8, buf: []u8) ?[]const u8 {
         const origin = headerValue(request, "origin") orelse return null;
-        // "null" is every sandboxed frame and local file: never a grant.
         if (std.mem.eql(u8, origin, "null") or !listed(self.config.cors_origins, origin)) return null;
         return std.fmt.bufPrint(buf, "Access-Control-Allow-Origin: {s}\r\n" ++
             "Vary: Origin\r\n" ++
@@ -317,7 +315,7 @@ pub const DashboardServer = struct {
     const Refusal = struct { status: http.StatusCode, message: []const u8 };
 
     /// Why a request is not served, or null. Any request needs a Host this
-    /// dashboard answers to. A change (any method but GET, HEAD or OPTIONS)
+    /// dashboard answers to (DNS rebinding). A change (any method but GET, HEAD or OPTIONS)
     /// must also come from this dashboard's own pages or an allowed origin,
     /// and carry a content type a page elsewhere cannot send without a
     /// preflight.

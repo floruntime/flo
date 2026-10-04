@@ -47,6 +47,8 @@ pub fn originsRefusal(list: []const u8) ?[]const u8 {
         else
             return "an origin starts with http:// or https://";
         if (hostPortRefusal(rest)) |why| return why;
+        // A browser leaves the scheme's own port out of Origin.
+        if (std.mem.endsWith(u8, o, if (o[4] == 's') ":443" else ":80")) return "leave out the default port (:443 for https, :80 for http); browsers do";
     }
     return null;
 }
@@ -82,6 +84,8 @@ pub fn hostsRefusal(list: []const u8) ?[]const u8 {
         const h = std.mem.trim(u8, raw, " \t");
         if (h.len == 0) continue;
         if (std.mem.indexOfAny(u8, h, "/?#@ ") != null) return "a host is a name or address alone, no scheme or path";
+        if (std.mem.indexOfScalar(u8, h, '*') != null) return "hosts are exact; no wildcards";
+        if (std.mem.endsWith(u8, h, ".")) return "write the name without its trailing '.'";
         if (std.mem.startsWith(u8, h, "[")) {
             if (!std.mem.endsWith(u8, h, "]")) return "a host is a name or address alone, no port";
         } else if (std.mem.indexOfScalar(u8, h, ':') != null) {
@@ -92,10 +96,10 @@ pub fn hostsRefusal(list: []const u8) ?[]const u8 {
 }
 
 test "dashboard config: origins and hosts that could never match are refused" {
-    for ([_][]const u8{ "", "https://ops.example.com:8443", "http://localhost:5173, https://a.b", "http://[::1]:9002", "https://x.y" }) |ok| {
+    for ([_][]const u8{ "", "https://ops.example.com:8443", "http://localhost:5173, https://a.b", "http://[::1]:9002", "https://x.y", "http://a.b:8080", "https://a.b:4430" }) |ok| {
         try std.testing.expectEqual(@as(?[]const u8, null), originsRefusal(ok));
     }
-    for ([_][]const u8{ "*", "null", "https://ops.example.com/", "https://a.b/console", "HTTPS://a.b", "https://A.b", "a.b", "ftp://a.b", "https://a.b:port", "https://:80" }) |bad| {
+    for ([_][]const u8{ "*", "null", "https://ops.example.com/", "https://a.b/console", "HTTPS://a.b", "https://A.b", "a.b", "ftp://a.b", "https://a.b:port", "https://:80", "https://a.b:443", "http://a.b:80" }) |bad| {
         if (originsRefusal(bad) == null) {
             std.debug.print("accepted origin: {s}\n", .{bad});
             return error.TestUnexpectedResult;
@@ -104,7 +108,7 @@ test "dashboard config: origins and hosts that could never match are refused" {
     for ([_][]const u8{ "", "flo.internal", "Flo.Internal, 10.0.1.5", "[fd00::5]" }) |ok| {
         try std.testing.expectEqual(@as(?[]const u8, null), hostsRefusal(ok));
     }
-    for ([_][]const u8{ "flo.internal:9002", "http://flo.internal", "[fd00::5]:9002", "fd00::5", "a/b" }) |bad| {
+    for ([_][]const u8{ "flo.internal:9002", "http://flo.internal", "[fd00::5]:9002", "fd00::5", "a/b", "*", "*.example.com", "localhost." }) |bad| {
         if (hostsRefusal(bad) == null) {
             std.debug.print("accepted host: {s}\n", .{bad});
             return error.TestUnexpectedResult;

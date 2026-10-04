@@ -102,7 +102,7 @@ pub const HttpMetricsServer = struct {
 
     fn serverLoop(self: *Self) void {
         const listener = self.listener orelse return;
-        http.serve.serve(self.allocator, listener, &self.running, self);
+        http.serve.serve(self.allocator, listener, &self.running, self, http.serve.MAX_HEAD);
     }
 
     /// A request from the accept loop, read whole.

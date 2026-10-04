@@ -265,21 +265,62 @@ pub fn isHttpRequest(data: []const u8) bool {
     return false;
 }
 
-/// Calculate total request size (headers + body) for buffering: null until
-/// the headers are whole, or when Content-Length is not a number.
-pub fn getExpectedSize(data: []const u8) ?usize {
+/// How a request with whole headers says where its body ends.
+pub const Framing = union(enum) {
+    /// The whole request, headers and body, is this many bytes.
+    size: usize,
+    /// Transfer-Encoding, which these servers do not decode.
+    transfer_encoding,
+    /// A Content-Length that is not plain digits, or two that disagree.
+    bad_length,
+};
+
+/// The framing of `data`, or null until its headers are whole. A body is
+/// only ever delimited by Content-Length; anything else is refused rather
+/// than read as a body of some other length.
+pub fn framing(data: []const u8) ?Framing {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
     const body_start = header_end + 4;
+    var length: ?usize = null;
     var lines = std.mem.splitSequence(u8, data[0..header_end], "\r\n");
     _ = lines.next(); // request line
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return .transfer_encoding;
+        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const content_length = std.fmt.parseInt(usize, value, 10) catch return null;
-        return std.math.add(usize, body_start, content_length) catch null;
+        // parseInt alone takes "+1_0" as 10.
+        if (value.len == 0) return .bad_length;
+        for (value) |c| if (!std.ascii.isDigit(c)) return .bad_length;
+        const n = std.fmt.parseInt(usize, value, 10) catch return .bad_length;
+        if (length) |seen| if (seen != n) return .bad_length;
+        length = n;
     }
-    return body_start; // No body
+    return .{ .size = std.math.add(usize, body_start, length orelse 0) catch return .bad_length };
+}
+
+/// The whole request's size, or null until the headers are whole or when
+/// its body is not delimited by one plain Content-Length.
+pub fn getExpectedSize(data: []const u8) ?usize {
+    return switch (framing(data) orelse return null) {
+        .size => |n| n,
+        else => null,
+    };
+}
+
+test "framing: one plain Content-Length, or none; anything else is refused" {
+    try std.testing.expectEqual(Framing{ .size = 18 }, framing("GET / HTTP/1.1\r\n\r\n").?);
+    try std.testing.expectEqual(Framing{ .size = 41 }, framing("POST / HTTP/1.1\r\ncontent-LENGTH: 3\r\n\r\nabc").?);
+    try std.testing.expectEqual(Framing{ .size = 60 }, framing("POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n").?);
+    try std.testing.expectEqual(Framing.bad_length, framing("POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nhello").?);
+    for ([_][]const u8{ "+1_0", "1_0", "-1", "0x10", "", "1 0" }) |v| {
+        var buf: [96]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "POST / HTTP/1.1\r\nContent-Length: {s}\r\n\r\n", .{v});
+        try std.testing.expectEqual(Framing.bad_length, framing(req).?);
+    }
+    try std.testing.expectEqual(Framing.transfer_encoding, framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").?);
+    try std.testing.expectEqual(@as(?Framing, null), framing("POST / HTTP/1.1\r\nContent-Len"));
 }
 
 test "parse simple GET request" {

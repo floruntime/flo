@@ -1,6 +1,6 @@
 //! The dashboard serves the hosts it is told about and takes changes only
-//! from its own pages or allowed origins. The change tests drive a queue
-//! purge and check the queue after; the rest check what comes back.
+//! from its own pages or allowed origins. Changes are checked by their
+//! effect on a seeded queue; the rest check what comes back.
 
 const std = @import("std");
 const testing = std.testing;
@@ -63,7 +63,7 @@ test "e2e/dashboard: a change from another site's page is refused" {
     });
     defer opaque_origin.deinit();
     try testing.expectEqual(@as(u16, 403), opaque_origin.status);
-    // Nor is no origin at all: a bare cross-site request may send none.
+    // Nor is no origin at all: a change must show it came from an allowed page.
     var no_origin = try http.requestExact(.POST, "/api/v1/queues/x/purge", "", &.{.{ "Content-Type", "application/json" }});
     defer no_origin.deinit();
     try testing.expectEqual(@as(u16, 403), no_origin.status);
@@ -76,7 +76,7 @@ test "e2e/dashboard: a change from another site's page is refused" {
     try testing.expect(read.getHeader("Access-Control-Allow-Origin") == null);
 }
 
-test "e2e/dashboard: a change whose content type any page could send is refused" {
+test "e2e/dashboard: a change whose content type any page could send, or none, is refused" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
     defer ctx.deinit();
     try seeded(ctx, "t");
@@ -93,8 +93,8 @@ test "e2e/dashboard: a change whose content type any page could send is refused"
     var none = try http.requestExact(.POST, "/api/v1/queues/t/purge", "", &.{.{ "Origin", origin }});
     defer none.deinit();
     try testing.expectEqual(@as(u16, 415), none.status);
-    // The dashboard's own page, by origin or by the browser's own word,
-    // with a JSON body: done, and nothing before it had been.
+    // Same-origin by Sec-Fetch-Site with JSON is accepted; the refused
+    // purges above removed nothing.
     try testing.expect(try untouched(http, ctx.getDashboardPort(), "t"));
     try ctx.exec(&.{ "queue", "enqueue", "t", "again" });
     var same_site = try http.requestExact(.POST, "/api/v1/queues/t/purge", "", &.{ .{ "Sec-Fetch-Site", "same-origin" }, .{ "Content-Type", "application/json" } });
@@ -114,7 +114,6 @@ test "e2e/dashboard: a host it does not answer to is not served, but health answ
     defer local.deinit();
     try testing.expectEqual(@as(u16, 200), local.status);
 
-    // A Host it does not answer to.
     const port = ctx.getDashboardPort();
     const evil = try rawRequest(port, "GET /api/v1/queues HTTP/1.1\r\nHost: evil.example\r\n\r\n");
     defer testing.allocator.free(evil);
@@ -242,4 +241,17 @@ test "e2e/dashboard: hosts and cors_origins from flo.toml are the ones served an
     defer testing.allocator.free(read);
     try testing.expect(std.mem.indexOf(u8, read, "Access-Control-Allow-Origin") == null);
     try testing.expect(std.mem.indexOf(u8, read, "Vary: Origin\r\n") != null);
+}
+
+test "e2e/dashboard: a body framed other than by Content-Length is refused, never stored" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    const port = ctx.getDashboardPort();
+    var buf: [384]u8 = undefined;
+    const chunked = try std.fmt.bufPrint(&buf, "POST /api/v1/queues/tq HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: http://127.0.0.1:{d}\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", .{ port, port });
+    const answer = try rawRequest(port, chunked);
+    defer testing.allocator.free(answer);
+    try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 501"));
+    const result = try ctx.execCapture(&.{ "queue", "dequeue", "tq", "--timeout", "100" });
+    try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
 }

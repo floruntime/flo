@@ -1,14 +1,15 @@
 //! Accept loop for the small HTTP listeners (dashboard, metrics).
 //!
 //! Requests are read without blocking, many connections at once, each with a
-//! deadline, so a client that connects and sends nothing slowly holds up no
-//! one: `/health` answers while it waits. A request read whole is handed to
-//! the handler, one at a time, on the loop's thread; one larger than the
-//! limits is answered 413/431 and never handed on. When every slot is
-//! taken, the connection that has waited longest for its request is dropped
-//! to make room: a newcomer always gets in. A response is written within
-//! one deadline, so a client that reads slowly holds the loop at most that
-//! long.
+//! deadline, so a client that sends slowly or not at all holds up no one:
+//! `/health` answers while it waits. A request read whole is handed to the
+//! handler, one at a time, on the loop's thread; one past the limits, or
+//! whose body is not delimited by one plain Content-Length, is refused and
+//! never handed on. When every slot is taken, the connection that has
+//! waited longest for its request is dropped to make room: a newcomer
+//! always gets in. Each response is written within one deadline; responses
+//! are written one after another, so clients that read slowly each hold
+//! the loop up to that long.
 
 const std = @import("std");
 const posix = std.posix;
@@ -24,7 +25,8 @@ pub const WRITE_TIMEOUT_MS: i64 = 5_000;
 pub const MAX_CONNECTIONS: usize = 64;
 /// The largest request line and headers; past it, 431.
 pub const MAX_HEAD: usize = 8192;
-/// The largest request, headers and body; past it, 413.
+/// The largest request, headers and body, a listener that takes bodies
+/// should accept; past its limit, 413.
 pub const MAX_REQUEST: usize = 1 << 20;
 
 const Conn = struct {
@@ -35,16 +37,17 @@ const Conn = struct {
 
 /// Serve `listener` until `running` is cleared, handing each request, read
 /// whole and cut to its Content-Length, to `handler.handle(fd, bytes)`.
-/// The handler writes with `writeAll`; the connection is closed after it
-/// returns.
-pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *const std.atomic.Value(bool), handler: anytype) void {
+/// Requests are at most `max_request` bytes (`MAX_HEAD` for a listener
+/// that takes no body). The handler writes with `writeAll`; the connection
+/// is closed after it returns.
+pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *const std.atomic.Value(bool), handler: anytype, max_request: usize) void {
     const conns = allocator.alloc(Conn, MAX_CONNECTIONS) catch {
         std.log.err("http: no memory for connection slots; listener not served", .{});
         return;
     };
     defer allocator.free(conns);
     for (conns) |*c| c.* = .{};
-    defer for (conns) |*c| if (c.fd >= 0) close(allocator, c, true);
+    defer for (conns) |*c| if (c.fd >= 0) close(allocator, c);
     stdx.net.sysFcntlSetNonblocking(listener) catch {};
 
     var fds: [1 + MAX_CONNECTIONS]posix.pollfd = undefined;
@@ -68,7 +71,7 @@ pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *c
 
         for (fds[1..n], slot_of[1..n]) |pf, i| {
             if (pf.revents == 0) continue;
-            readInto(allocator, &conns[i], handler);
+            readInto(allocator, &conns[i], handler, max_request);
         }
         if (fds[0].revents != 0 and !acceptAll(allocator, listener, conns)) {
             // Out of descriptors (or another accept error): the connection
@@ -79,7 +82,7 @@ pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *c
 
         const now = stdx.time.milliTimestamp();
         for (conns) |*c| {
-            if (c.fd >= 0 and now > c.deadline_ms) close(allocator, c, true);
+            if (c.fd >= 0 and now > c.deadline_ms) close(allocator, c);
         }
     }
 }
@@ -99,7 +102,7 @@ fn acceptAll(allocator: std.mem.Allocator, listener: posix.socket_t, conns: []Co
             continue;
         };
         const slot = freeSlot(conns) orelse oldest(conns);
-        if (slot.fd >= 0) close(allocator, slot, true);
+        if (slot.fd >= 0) close(allocator, slot);
         slot.* = .{ .fd = fd, .deadline_ms = stdx.time.milliTimestamp() + READ_TIMEOUT_MS };
     }
 }
@@ -117,18 +120,18 @@ fn oldest(conns: []Conn) *Conn {
     return o;
 }
 
-fn readInto(allocator: std.mem.Allocator, c: *Conn, handler: anytype) void {
+fn readInto(allocator: std.mem.Allocator, c: *Conn, handler: anytype, max_request: usize) void {
     var chunk: [8192]u8 = undefined;
     while (true) {
         const rc = std.c.read(c.fd, &chunk, chunk.len);
         if (rc < 0) switch (posix.errno(rc)) {
             .AGAIN => return,
             .INTR => continue,
-            else => return close(allocator, c, true),
+            else => return close(allocator, c),
         };
         // The client stopped sending before its request was whole.
-        if (rc == 0) return close(allocator, c, true);
-        c.buf.appendSlice(allocator, chunk[0..@intCast(rc)]) catch return close(allocator, c, true);
+        if (rc == 0) return close(allocator, c);
+        c.buf.appendSlice(allocator, chunk[0..@intCast(rc)]) catch return close(allocator, c);
 
         const data = c.buf.items;
         const head_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
@@ -136,11 +139,18 @@ fn readInto(allocator: std.mem.Allocator, c: *Conn, handler: anytype) void {
             continue;
         };
         if (head_end + 4 > MAX_HEAD) return refuse(allocator, c, "431 Request Header Fields Too Large");
-        const expected = request.getExpectedSize(data) orelse return refuse(allocator, c, "400 Bad Request");
+        const expected = switch (request.framing(data).?) {
+            .size => |n| n,
+            // A body delimited any other way would be read as one of some
+            // other length.
+            .transfer_encoding => return refuse(allocator, c, "501 Not Implemented"),
+            .bad_length => return refuse(allocator, c, "400 Bad Request"),
+        };
         // Never handed on cut short: a truncated body would be stored or
         // applied as if whole.
-        if (expected > MAX_REQUEST) return refuse(allocator, c, "413 Content Too Large");
+        if (expected > max_request) return refuse(allocator, c, "413 Content Too Large");
         if (data.len >= expected) return dispatch(allocator, c, handler, data[0..expected]);
+        c.buf.ensureTotalCapacity(allocator, expected) catch return close(allocator, c);
     }
 }
 
@@ -151,20 +161,18 @@ fn refuse(allocator: std.mem.Allocator, c: *Conn, status: []const u8) void {
     write_deadline_ms = stdx.time.milliTimestamp() + WRITE_TIMEOUT_MS;
     defer write_deadline_ms = 0;
     writeAll(c.fd, resp) catch {};
-    close(allocator, c, true);
+    close(allocator, c);
 }
 
 /// The deadline `writeAll` keeps while a handler runs: one for the whole
 /// response, however many writes it takes.
 threadlocal var write_deadline_ms: i64 = 0;
-threadlocal var write_timed_out: bool = false;
 
 fn dispatch(allocator: std.mem.Allocator, c: *Conn, handler: anytype, bytes: []const u8) void {
     write_deadline_ms = stdx.time.milliTimestamp() + WRITE_TIMEOUT_MS;
-    write_timed_out = false;
     defer write_deadline_ms = 0;
     handler.handle(c.fd, bytes);
-    close(allocator, c, !write_timed_out);
+    close(allocator, c);
 }
 
 /// Write all of `bytes` to a non-blocking socket, waiting for room until
@@ -183,10 +191,7 @@ pub fn writeAll(fd: posix.socket_t, bytes: []const u8) error{WriteFailed}!void {
             .INTR => continue,
             .AGAIN => {
                 const left = deadline - stdx.time.milliTimestamp();
-                if (left <= 0) {
-                    write_timed_out = true;
-                    return error.WriteFailed;
-                }
+                if (left <= 0) return error.WriteFailed;
                 var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
                 _ = posix.poll(&pfd, @intCast(@min(left, 1000))) catch {};
             },
@@ -195,15 +200,10 @@ pub fn writeAll(fd: posix.socket_t, bytes: []const u8) error{WriteFailed}!void {
     }
 }
 
-/// `linger`: hold the close until what was written is sent, so the client
-/// reads the response rather than a reset. Not after a write timed out:
-/// that client is not reading.
-fn close(allocator: std.mem.Allocator, c: *Conn, linger: bool) void {
+/// A plain close: what was written is still sent, then FIN. The request was
+/// read whole first, so no unread input turns the close into a reset.
+fn close(allocator: std.mem.Allocator, c: *Conn) void {
     // Raw std.c because the std wrapper panics on an fd the peer already reset.
-    if (linger) {
-        const opt = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
-        _ = std.c.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.LINGER, &opt, @sizeOf(@TypeOf(opt)));
-    }
     _ = std.c.close(c.fd);
     c.buf.deinit(allocator);
     c.* = .{};
@@ -272,7 +272,7 @@ test "serve: clients that connect and send nothing hold up no one, even past the
     const l = try listenLocal();
     var running = std.atomic.Value(bool).init(true);
     var echo = Echo{};
-    const t = try std.Thread.spawn(.{}, serve, .{ testing.allocator, l.fd, &running, &echo });
+    const t = try std.Thread.spawn(.{}, serve, .{ testing.allocator, l.fd, &running, &echo, MAX_REQUEST });
     defer {
         running.store(false, .release);
         t.join();
@@ -296,7 +296,7 @@ test "serve: a connection that has not sent its whole request in time is closed"
     const l = try listenLocal();
     var running = std.atomic.Value(bool).init(true);
     var echo = Echo{};
-    const t = try std.Thread.spawn(.{}, serve, .{ testing.allocator, l.fd, &running, &echo });
+    const t = try std.Thread.spawn(.{}, serve, .{ testing.allocator, l.fd, &running, &echo, MAX_REQUEST });
     defer {
         running.store(false, .release);
         t.join();
@@ -315,11 +315,12 @@ const Served = struct {
     l: Listening,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     echo: Echo = .{},
+    max: usize = MAX_REQUEST,
     thread: std.Thread = undefined,
 
     fn start(self: *Served) !void {
         self.l = try listenLocal();
-        self.thread = try std.Thread.spawn(.{}, serve, .{ testing.allocator, self.l.fd, &self.running, &self.echo });
+        self.thread = try std.Thread.spawn(.{}, serve, .{ testing.allocator, self.l.fd, &self.running, &self.echo, self.max });
     }
     fn stop(self: *Served) void {
         self.running.store(false, .release);
@@ -366,6 +367,10 @@ test "serve: a request past the limits is answered 413 or 431 and never handled,
 
     const bad_length = "POST / HTTP/1.1\r\nContent-Length: lots\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, bad_length, &out), "HTTP/1.1 400"));
+    const disagreeing = "POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nhello";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, disagreeing, &out), "HTTP/1.1 400"));
+    const chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, chunked, &out), "HTTP/1.1 501"));
     try testing.expectEqual(@as(u32, 0), srv.echo.served.load(.monotonic));
 
     // Any spelling of the header; what follows the body is not part of it.
@@ -400,4 +405,14 @@ test "serve: a client that reads slowly is cut off at the response deadline, not
     try testing.expect(done != 0);
     try testing.expect(done - start < WRITE_TIMEOUT_MS + 1_500);
     try testing.expect(got > 0);
+}
+
+test "serve: a listener that takes no body is limited to its head" {
+    var srv = Served{ .l = undefined, .max = MAX_HEAD };
+    try srv.start();
+    defer srv.stop();
+    var out: [256]u8 = undefined;
+    const body = "POST / HTTP/1.1\r\nContent-Length: 8192\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, body, &out), "HTTP/1.1 413"));
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, "GET / HTTP/1.1\r\n\r\n", &out), "HTTP/1.1 200"));
 }
