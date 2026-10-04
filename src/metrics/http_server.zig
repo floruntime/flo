@@ -101,90 +101,28 @@ pub const HttpMetricsServer = struct {
     }
 
     fn serverLoop(self: *Self) void {
-        while (self.running.load(.acquire)) {
-            const listener = self.listener orelse break;
-
-            var client_addr: std.posix.sockaddr = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-
-            const client = stdx.net.sysAccept(listener, &client_addr, &addr_len, 0) catch |err| {
-                // stdx.net.sysAccept only ever returns AcceptFailed, so testing
-                // for ConnectionAborted/SocketNotListening was dead code and
-                // every failure fell through to `continue` — a silent 100%-CPU
-                // spin under fd exhaustion. Re-check the running flag (which
-                // stop() clears before closing the listener) and back off.
-                if (!self.running.load(.acquire)) break;
-                std.log.debug("Metrics HTTP: accept failed: {s}", .{@errorName(err)});
-                @import("stdx").time.sleep(10 * std.time.ns_per_ms);
-                continue;
-            };
-            defer {
-                // Graceful close: SO_LINGER so the send buffer is flushed before
-                // FIN. Raw std.c rather than std.posix.setsockopt, which maps
-                // EBADF/ENOTSOCK/EINVAL to `unreachable` — a panic that
-                // `catch {}` cannot catch and that would abort the whole node
-                // when a scraper disconnects mid-response and the fd is already
-                // invalid. Same reason the dashboard server uses std.c here.
-                const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
-                _ = std.c.setsockopt(client, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &linger, @sizeOf(@TypeOf(linger)));
-                _ = std.c.close(client);
-            }
-
-            self.handleRequest(client) catch |err| {
-                std.log.debug("Metrics HTTP: request error: {}", .{err});
-            };
-        }
+        const listener = self.listener orelse return;
+        http.serve.serve(self.allocator, listener, &self.running, self, http.serve.MAX_HEAD);
     }
 
-    /// Write the whole buffer. `sysWrite` does not retry a short write or
-    /// EINTR, and SIGINT/SIGTERM are installed without SA_RESTART — a signal
-    /// landing mid-write of a large /metrics body would otherwise truncate it
-    /// under a Content-Length promising more, hanging the scraper until close.
-    fn writeAll(client: std.posix.socket_t, bytes: []const u8) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = try stdx.net.sysWrite(client, bytes[off..]);
-            if (n == 0) return error.WriteFailed;
-            off += n;
-        }
+    /// A request from the accept loop, read whole.
+    pub fn handle(self: *Self, client: std.posix.socket_t, request: []const u8) void {
+        self.handleRequest(client, request) catch |err| {
+            std.log.debug("Metrics HTTP: request error: {}", .{err});
+        };
     }
 
-    fn handleRequest(self: *Self, client: std.posix.socket_t) !void {
-        // Read until the request is complete. A single read could route on a
-        // partial request line (a split inside "GET /metrics" matches neither
-        // prefix and 404s a scraper). Same fix the dashboard server needed.
-        var buf: [4096]u8 = undefined;
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = stdx.net.sysRead(client, buf[total..]) catch break;
-            if (n == 0) break;
-            total += n;
-            if (http.getExpectedSize(buf[0..total])) |expected| {
-                if (total >= expected) break;
-            }
-        }
-        if (total == 0) return;
+    const writeAll = http.serve.writeAll;
 
-        const request = buf[0..total];
-
-        // Parse request using shared HTTP primitives
-        if (http.parseRequest(request)) |parsed| {
-            if (parsed.pathStartsWith("/metrics")) {
-                try self.sendMetrics(client);
-            } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
-                try self.sendHealth(client);
-            } else {
-                try http.writeResponse(client, .not_found, .text, "Not Found\n");
-            }
+    fn handleRequest(self: *Self, client: std.posix.socket_t, request: []const u8) !void {
+        const parsed = http.parseRequest(request) orelse
+            return http.writeResponse(client, .bad_request, .text, "Bad Request\n");
+        if (parsed.pathStartsWith("/metrics")) {
+            try self.sendMetrics(client);
+        } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
+            try self.sendHealth(client);
         } else {
-            // Fallback: simple string match for incomplete parses
-            if (std.mem.startsWith(u8, request, "GET /metrics")) {
-                try self.sendMetrics(client);
-            } else if (std.mem.startsWith(u8, request, "GET /health") or std.mem.startsWith(u8, request, "GET /")) {
-                try self.sendHealth(client);
-            } else {
-                try http.writeResponse(client, .not_found, .text, "Not Found\n");
-            }
+            try http.writeResponse(client, .not_found, .text, "Not Found\n");
         }
     }
 

@@ -181,6 +181,7 @@ pub const ServerConfig = struct {
             .dashboard_port = self.dashboard.port,
             .dashboard_bind = self.dashboard.bind,
             .dashboard_cors_origins = self.dashboard.cors_origins,
+            .dashboard_hosts = self.dashboard.hosts,
             .cluster_enabled = self.cluster.enabled,
             .cluster_node_id = self.cluster.node_id,
             .cluster_raft_port = self.cluster.raft_port,
@@ -344,7 +345,18 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             config.dashboard.bind = try config.dupeString(b);
         }
         if (d.getString("cors_origins")) |c| {
+            if (dashboard_config.originsRefusal(c)) |why| {
+                log.err("[dashboard] cors_origins: {s} (e.g. \"https://ops.example.com:8443\")", .{why});
+                return error.InvalidSetting;
+            }
             config.dashboard.cors_origins = try config.dupeString(c);
+        }
+        if (d.getString("hosts")) |hs| {
+            if (dashboard_config.hostsRefusal(hs)) |why| {
+                log.err("[dashboard] hosts: {s} (e.g. \"flo.internal, 10.0.1.5\")", .{why});
+                return error.InvalidSetting;
+            }
+            config.dashboard.hosts = try config.dupeString(hs);
         }
     }
 
@@ -607,8 +619,11 @@ pub fn generateDefaultConfig() []const u8 {
     \\# port = 9002
     \\# Bind address for dashboard server
     \\# bind = "0.0.0.0"
-    \\# CORS origins for development (comma-separated)
+    \\# Other origins whose pages may call the API, exact, comma-separated
     \\# cors_origins = "http://localhost:5173"
+    \\# Host names the dashboard answers to besides localhost, 127.0.0.1 and
+    \\# [::1], comma-separated: needed to reach it by any other name
+    \\# hosts = "flo.internal"
     \\
     \\[cluster]
     \\# true starts this node as the first member of a cluster (same as
@@ -731,4 +746,25 @@ test "a shard or partition count out of range is refused, not cast, from the fil
     var most = try loadWithOverrides(allocator, path, null, null, null, MAX_PARTITIONS, null, null, null);
     defer most.deinit();
     try std.testing.expectEqual(MAX_PARTITIONS, most.partition_count);
+}
+
+test "dashboard origins and hosts that could never match are refused at load" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+    for ([_][]const u8{
+        "[dashboard]\ncors_origins = \"*\"\n",
+        "[dashboard]\ncors_origins = \"null\"\n",
+        "[dashboard]\ncors_origins = \"https://ops.example.com/\"\n",
+        "[dashboard]\nhosts = \"flo.internal:9002\"\n",
+    }) |body| {
+        const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+        try @import("stdx").fs.writeAll(f, body);
+        @import("stdx").fs.closeFile(f);
+        try std.testing.expectError(error.InvalidSetting, load(allocator, path));
+    }
 }

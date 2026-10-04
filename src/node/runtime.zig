@@ -102,6 +102,7 @@ pub const RuntimeConfig = struct {
     dashboard_port: u16 = 0,
     dashboard_bind: []const u8 = "0.0.0.0",
     dashboard_cors_origins: ?[]const u8 = null,
+    dashboard_hosts: ?[]const u8 = null,
 
     /// Start the peer-facing Raft listener even without seeds. See
     /// `ClusterConfig.enabled`.
@@ -760,7 +761,8 @@ pub const Runtime = struct {
             server.* = DashboardServer.init(self.allocator, .{
                 .port = self.config.effectiveDashboardPort(),
                 .bind = self.config.dashboard_bind,
-                .cors_origins = self.config.dashboard_cors_origins orelse "*",
+                .cors_origins = self.config.dashboard_cors_origins orelse "",
+                .hosts = self.config.dashboard_hosts orelse "",
             }, ctx);
             self.dashboard_server = server;
             try server.start();

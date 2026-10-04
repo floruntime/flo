@@ -8,6 +8,7 @@
 
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
+pub const serve = @import("serve.zig");
 
 // Re-export common types at top level for convenience
 pub const Method = request.Method;
@@ -62,7 +63,8 @@ pub fn parseRequest(data: []const u8) ?ParsedRequest {
         .method = Method.fromString(method_str),
         .path = path,
         .query_string = query_string,
-        .headers_raw = data[line_end + 2 .. headers_end],
+        // No headers at all: the request line's CRLF is the blank line's.
+        .headers_raw = data[@min(line_end + 2, headers_end)..headers_end],
     };
 }
 
@@ -89,3 +91,9 @@ pub const ParsedRequest = struct {
 };
 
 const std = @import("std");
+
+test "parseRequest: a request with no headers parses, with none" {
+    const req = parseRequest("GET / HTTP/1.0\r\n\r\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/", req.path);
+    try std.testing.expectEqualStrings("", req.headers_raw);
+}

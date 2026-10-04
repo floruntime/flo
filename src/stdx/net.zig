@@ -351,6 +351,15 @@ pub fn sysFcntlSetNonblocking(fd: posix.socket_t) SocketError!void {
     if (std.c.fcntl(fd, F_SETFL, flags | nonblock) < 0) return error.FcntlFailed;
 }
 
+pub fn sysFcntlSetBlocking(fd: posix.socket_t) SocketError!void {
+    const F_GETFL: c_int = 3;
+    const F_SETFL: c_int = 4;
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    const flags = std.c.fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (flags < 0) return error.FcntlFailed;
+    if (std.c.fcntl(fd, F_SETFL, flags & ~nonblock) < 0) return error.FcntlFailed;
+}
+
 // ── Addresses for listeners and peers ────────────────────────────────
 
 /// A dotted quad or "localhost".
