@@ -37,7 +37,10 @@ async function request<T>(method: string, path: string, body?: unknown, rawText 
   const headers: Record<string, string> = {}
   const token = getToken()
   if (token) headers['Authorization'] = `Bearer ${token}`
-  if (body !== undefined) headers['Content-Type'] = rawText ? 'text/plain' : 'application/json'
+  // Every change names a content type another site's page cannot send
+  // without the browser asking the server first; the server refuses a
+  // change without one. Raw text (a YAML pipeline) is sent as opaque bytes.
+  if (method !== 'GET') headers['Content-Type'] = rawText ? 'application/octet-stream' : 'application/json'
 
   const res = await fetch(`${API_BASE}/${path.replace(/^\//, '')}`, {
     method,

@@ -17,6 +17,11 @@ pub const DashboardConfig = struct {
     /// Default: "127.0.0.1" (localhost only - safe by default)
     /// Set to "0.0.0.0" to expose externally (use with firewall/VPN)
     bind: []const u8 = "127.0.0.1",
-    /// CORS origins (comma-separated, or "*" for all)
-    cors_origins: []const u8 = "*",
+    /// Other origins whose pages may call the API, exactly as a browser
+    /// names them (`https://ops.example.com:8443`), comma-separated. Empty:
+    /// only the dashboard's own pages. There is no wildcard.
+    cors_origins: []const u8 = "",
+    /// Host names the dashboard answers to besides localhost, 127.0.0.1 and
+    /// [::1], comma-separated (`flo.internal,10.0.1.5`).
+    hosts: []const u8 = "",
 };

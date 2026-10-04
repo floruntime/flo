@@ -131,7 +131,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         return switch (method) {
             .GET => listJobs(allocator, query_string, ctx),
             .POST => submitJob(allocator, body, query_string, ctx),
-            else => h.jsonError(allocator, "Method not allowed"),
+            else => error.MethodNotAllowed,
         };
     }
 
@@ -139,18 +139,22 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
     if (std.mem.startsWith(u8, path, "/jobs/")) {
         const rest = path["/jobs/".len..];
         if (std.mem.endsWith(u8, rest, "/stop")) {
+            if (method != .PUT) return error.MethodNotAllowed;
             const job_id = rest[0 .. rest.len - "/stop".len];
             return stopJob(allocator, job_id, query_string, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/savepoint")) {
+            if (method != .POST) return error.MethodNotAllowed;
             const job_id = rest[0 .. rest.len - "/savepoint".len];
             return createSavepoint(allocator, job_id, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/restore")) {
+            if (method != .POST) return error.MethodNotAllowed;
             const job_id = rest[0 .. rest.len - "/restore".len];
             return restoreJob(allocator, job_id, body, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/rescale")) {
+            if (method != .POST) return error.MethodNotAllowed;
             const job_id = rest[0 .. rest.len - "/rescale".len];
             return rescaleJob(allocator, job_id, body, ctx);
         }
@@ -158,7 +162,7 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         return switch (method) {
             .DELETE => cancelJob(allocator, rest, query_string, ctx),
             .GET => getJobDetail(allocator, rest, query_string, ctx),
-            else => h.jsonError(allocator, "Method not allowed"),
+            else => error.MethodNotAllowed,
         };
     }
 

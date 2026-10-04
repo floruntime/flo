@@ -139,7 +139,7 @@ pub const HttpRunner = struct {
         const body = try std.fmt.allocPrint(self.allocator, "{{\"api_key\":\"{s}\"}}", .{key});
         defer self.allocator.free(body);
 
-        var resp = try self.doRequest(.POST, "/api/v1/auth/session", body, auth_headers);
+        var resp = try self.doRequest(.POST, "/api/v1/auth/session", body, auth_headers, true);
         defer resp.deinit();
 
         if (resp.status != 200 and resp.status != 201) return error.LoginFailed;
@@ -224,7 +224,20 @@ pub const HttpRunner = struct {
         body: ?[]const u8,
         extra_headers: ?[]const [2][]const u8,
     ) !HttpResponse {
-        return self.doRequest(method, path, body, extra_headers);
+        return self.doRequest(method, path, body, extra_headers, true);
+    }
+
+    /// A request carrying only `Host` and the headers given: what a page on
+    /// another site, or a bare client, sends. `request` adds what the
+    /// dashboard's own pages send on a change.
+    pub fn requestExact(
+        self: *Self,
+        method: Method,
+        path: []const u8,
+        body: ?[]const u8,
+        headers: []const [2][]const u8,
+    ) !HttpResponse {
+        return self.doRequest(method, path, body, headers, false);
     }
 
     /// Full request with stream access (internal)
@@ -234,6 +247,7 @@ pub const HttpRunner = struct {
         path: []const u8,
         body: ?[]const u8,
         extra_headers: ?[]const [2][]const u8,
+        as_console: bool,
     ) !HttpResponse {
         // Connect to server
         const addr = @import("../../net.zig").Address.initIp4(parseIp4(self.host) catch .{ 127, 0, 0, 1 }, self.port);
@@ -261,6 +275,13 @@ pub const HttpRunner = struct {
             for (headers) |hdr| {
                 try writer.print("{s}: {s}\r\n", .{ hdr[0], hdr[1] });
             }
+        }
+        // A change from the dashboard's own pages: the browser names their
+        // origin, and the console names a JSON body.
+        const change = method != .GET and method != .HEAD and method != .OPTIONS;
+        if (as_console and change) {
+            if (!hasHeader(extra_headers, "origin")) try writer.print("Origin: http://{s}:{d}\r\n", .{ self.host, self.port });
+            if (!hasHeader(extra_headers, "content-type")) try writer.writeAll("Content-Type: application/json\r\n");
         }
 
         if (body) |b| {
@@ -295,6 +316,13 @@ pub const HttpRunner = struct {
 
         // Parse response
         return self.parseResponse(response_data);
+    }
+
+    fn hasHeader(headers: ?[]const [2][]const u8, name: []const u8) bool {
+        for (headers orelse return false) |h| {
+            if (std.ascii.eqlIgnoreCase(h[0], name)) return true;
+        }
+        return false;
     }
 
     fn parseResponse(self: *Self, data: []const u8) !HttpResponse {

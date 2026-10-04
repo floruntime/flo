@@ -54,7 +54,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         return switch (method) {
             .GET => listDefinitions(allocator, query_string, ctx),
             .POST => createDefinition(allocator, query_string, body, ctx),
-            else => h.jsonError(allocator, "Method not allowed"),
+            else => error.MethodNotAllowed,
         };
     }
 
@@ -63,7 +63,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         return switch (method) {
             .GET => listRuns(allocator, query_string, ctx),
             .POST => startRun(allocator, query_string, body, ctx),
-            else => h.jsonError(allocator, "Method not allowed"),
+            else => error.MethodNotAllowed,
         };
     }
 
@@ -71,14 +71,17 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
     if (std.mem.startsWith(u8, path, "/definitions/")) {
         const rest = path["/definitions/".len..];
         if (std.mem.endsWith(u8, rest, "/enable")) {
+            if (method != .PUT) return error.MethodNotAllowed;
             const name = rest[0 .. rest.len - "/enable".len];
             return enableWorkflow(allocator, name, query_string, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/disable")) {
+            if (method != .PUT) return error.MethodNotAllowed;
             const name = rest[0 .. rest.len - "/disable".len];
             return disableWorkflow(allocator, name, query_string, ctx);
         }
         // /workflow/definitions/:name
+        if (method != .GET) return error.MethodNotAllowed;
         return getDefinition(allocator, rest, ctx);
     }
 
@@ -86,10 +89,12 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
     if (std.mem.startsWith(u8, path, "/runs/")) {
         const rest = path["/runs/".len..];
         if (std.mem.endsWith(u8, rest, "/history")) {
+            if (method != .GET) return error.MethodNotAllowed;
             const run_id = rest[0 .. rest.len - "/history".len];
             return getRunHistory(allocator, run_id, ctx);
         }
         if (std.mem.endsWith(u8, rest, "/signal")) {
+            if (method != .POST) return error.MethodNotAllowed;
             const run_id = rest[0 .. rest.len - "/signal".len];
             return signalRun(allocator, run_id, query_string, body, ctx);
         }
@@ -97,7 +102,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         return switch (method) {
             .DELETE => cancelRun(allocator, rest, query_string, ctx),
             .GET => getRunStatus(allocator, rest, ctx),
-            else => h.jsonError(allocator, "Method not allowed"),
+            else => error.MethodNotAllowed,
         };
     }
 

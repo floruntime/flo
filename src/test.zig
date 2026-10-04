@@ -166,6 +166,8 @@ test {
     _ = @import("node/dashboard/api/processing.zig");
     _ = @import("node/dashboard/api.zig");
     _ = @import("node/dashboard/http_server.zig");
+    _ = @import("util/http/serve.zig");
+    _ = @import("metrics/http_server.zig");
 }
 
 // Cluster

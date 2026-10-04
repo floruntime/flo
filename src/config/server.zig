@@ -181,6 +181,7 @@ pub const ServerConfig = struct {
             .dashboard_port = self.dashboard.port,
             .dashboard_bind = self.dashboard.bind,
             .dashboard_cors_origins = self.dashboard.cors_origins,
+            .dashboard_hosts = self.dashboard.hosts,
             .cluster_enabled = self.cluster.enabled,
             .cluster_node_id = self.cluster.node_id,
             .cluster_raft_port = self.cluster.raft_port,
@@ -344,7 +345,14 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             config.dashboard.bind = try config.dupeString(b);
         }
         if (d.getString("cors_origins")) |c| {
+            if (std.mem.indexOf(u8, c, "*") != null) {
+                log.err("[dashboard] cors_origins takes exact origins (https://ops.example.com:8443), comma-separated; \"*\" is not accepted", .{});
+                return error.InvalidSetting;
+            }
             config.dashboard.cors_origins = try config.dupeString(c);
+        }
+        if (d.getString("hosts")) |hs| {
+            config.dashboard.hosts = try config.dupeString(hs);
         }
     }
 
@@ -607,8 +615,11 @@ pub fn generateDefaultConfig() []const u8 {
     \\# port = 9002
     \\# Bind address for dashboard server
     \\# bind = "0.0.0.0"
-    \\# CORS origins for development (comma-separated)
+    \\# Other origins whose pages may call the API, exact, comma-separated
     \\# cors_origins = "http://localhost:5173"
+    \\# Host names the dashboard answers to besides localhost, 127.0.0.1 and
+    \\# [::1], comma-separated: needed to reach it by any other name
+    \\# hosts = "flo.internal"
     \\
     \\[cluster]
     \\# true starts this node as the first member of a cluster (same as

@@ -8,6 +8,7 @@
 
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
+pub const serve = @import("serve.zig");
 
 // Re-export common types at top level for convenience
 pub const Method = request.Method;
