@@ -227,9 +227,10 @@ pub const HttpRunner = struct {
         return self.doRequest(method, path, body, extra_headers, true);
     }
 
-    /// A request carrying only `Host` and the headers given: what a page on
-    /// another site, or a bare client, sends. `request` adds what the
-    /// dashboard's own pages send on a change.
+    /// A request with the headers given and without the Origin and
+    /// Content-Type the dashboard's own pages add to a change, which
+    /// `request` adds. Host, Connection, Content-Length and any auth
+    /// header are sent as usual.
     pub fn requestExact(
         self: *Self,
         method: Method,

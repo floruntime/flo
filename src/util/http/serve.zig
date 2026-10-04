@@ -3,9 +3,12 @@
 //! Requests are read without blocking, many connections at once, each with a
 //! deadline, so a client that connects and sends nothing slowly holds up no
 //! one: `/health` answers while it waits. A request read whole is handed to
-//! the handler, one at a time, on the loop's thread. When every slot is
+//! the handler, one at a time, on the loop's thread; one larger than the
+//! limits is answered 413/431 and never handed on. When every slot is
 //! taken, the connection that has waited longest for its request is dropped
-//! to make room: a newcomer always gets in.
+//! to make room: a newcomer always gets in. A response is written within
+//! one deadline, so a client that reads slowly holds the loop at most that
+//! long.
 
 const std = @import("std");
 const posix = std.posix;
@@ -14,28 +17,34 @@ const request = @import("request.zig");
 
 /// How long a client has to send its whole request.
 pub const READ_TIMEOUT_MS: i64 = 5_000;
-/// How long a response write may stall before the connection is dropped.
-pub const WRITE_TIMEOUT_S: i64 = 5;
+/// How long writing one response may take, all of it, before the connection
+/// is dropped.
+pub const WRITE_TIMEOUT_MS: i64 = 5_000;
 /// Connections being read at once.
 pub const MAX_CONNECTIONS: usize = 64;
-/// The largest request read; a longer one is handed on cut at this size.
-pub const MAX_REQUEST: usize = 8192;
+/// The largest request line and headers; past it, 431.
+pub const MAX_HEAD: usize = 8192;
+/// The largest request, headers and body; past it, 413.
+pub const MAX_REQUEST: usize = 1 << 20;
 
 const Conn = struct {
     fd: posix.socket_t = -1,
     deadline_ms: i64 = 0,
-    len: usize = 0,
-    buf: [MAX_REQUEST]u8 = undefined,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
 };
 
-/// Serve `listener` until `running` is cleared, handing each whole request
-/// to `handler.handle(fd, bytes)`. The socket is blocking with a write
-/// timeout while the handler runs, and closed after it returns.
+/// Serve `listener` until `running` is cleared, handing each request, read
+/// whole and cut to its Content-Length, to `handler.handle(fd, bytes)`.
+/// The handler writes with `writeAll`; the connection is closed after it
+/// returns.
 pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *const std.atomic.Value(bool), handler: anytype) void {
-    const conns = allocator.alloc(Conn, MAX_CONNECTIONS) catch return;
+    const conns = allocator.alloc(Conn, MAX_CONNECTIONS) catch {
+        std.log.err("http: no memory for connection slots; listener not served", .{});
+        return;
+    };
     defer allocator.free(conns);
     for (conns) |*c| c.* = .{};
-    defer for (conns) |*c| if (c.fd >= 0) close(c);
+    defer for (conns) |*c| if (c.fd >= 0) close(allocator, c, true);
     stdx.net.sysFcntlSetNonblocking(listener) catch {};
 
     var fds: [1 + MAX_CONNECTIONS]posix.pollfd = undefined;
@@ -50,31 +59,47 @@ pub fn serve(allocator: std.mem.Allocator, listener: posix.socket_t, running: *c
             slot_of[n] = i;
             n += 1;
         }
-        _ = posix.poll(fds[0..n], 100) catch 0;
+        _ = posix.poll(fds[0..n], 100) catch {
+            // A poll that keeps failing would otherwise spin the thread.
+            stdx.time.sleep(10 * std.time.ns_per_ms);
+            continue;
+        };
         if (!running.load(.acquire)) break;
 
         for (fds[1..n], slot_of[1..n]) |pf, i| {
             if (pf.revents == 0) continue;
-            readInto(&conns[i], handler);
+            readInto(allocator, &conns[i], handler);
         }
-        if (fds[0].revents != 0) acceptAll(listener, conns);
+        if (fds[0].revents != 0 and !acceptAll(allocator, listener, conns)) {
+            // Out of descriptors (or another accept error): the connection
+            // stays queued and the listener stays readable, so without a
+            // pause every poll returns at once and the thread spins.
+            stdx.time.sleep(10 * std.time.ns_per_ms);
+        }
 
         const now = stdx.time.milliTimestamp();
         for (conns) |*c| {
-            if (c.fd >= 0 and now > c.deadline_ms) close(c);
+            if (c.fd >= 0 and now > c.deadline_ms) close(allocator, c, true);
         }
     }
 }
 
-fn acceptAll(listener: posix.socket_t, conns: []Conn) void {
+/// Accept everything queued; false on an error other than "none left".
+fn acceptAll(allocator: std.mem.Allocator, listener: posix.socket_t, conns: []Conn) bool {
     while (true) {
-        const fd = stdx.net.sysAccept(listener, null, null, 0) catch return;
+        const rc = std.c.accept(listener, null, null);
+        if (rc < 0) switch (posix.errno(rc)) {
+            .AGAIN => return true,
+            .INTR, .CONNABORTED => continue,
+            else => return false,
+        };
+        const fd: posix.socket_t = @intCast(rc);
         stdx.net.sysFcntlSetNonblocking(fd) catch {
             _ = std.c.close(fd);
             continue;
         };
         const slot = freeSlot(conns) orelse oldest(conns);
-        if (slot.fd >= 0) close(slot);
+        if (slot.fd >= 0) close(allocator, slot, true);
         slot.* = .{ .fd = fd, .deadline_ms = stdx.time.milliTimestamp() + READ_TIMEOUT_MS };
     }
 }
@@ -92,37 +117,95 @@ fn oldest(conns: []Conn) *Conn {
     return o;
 }
 
-fn readInto(c: *Conn, handler: anytype) void {
-    const rc = std.c.read(c.fd, c.buf[c.len..].ptr, c.buf.len - c.len);
-    if (rc < 0) {
-        if (posix.errno(rc) == .AGAIN) return;
-        return close(c);
+fn readInto(allocator: std.mem.Allocator, c: *Conn, handler: anytype) void {
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const rc = std.c.read(c.fd, &chunk, chunk.len);
+        if (rc < 0) switch (posix.errno(rc)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return close(allocator, c, true),
+        };
+        // The client stopped sending before its request was whole.
+        if (rc == 0) return close(allocator, c, true);
+        c.buf.appendSlice(allocator, chunk[0..@intCast(rc)]) catch return close(allocator, c, true);
+
+        const data = c.buf.items;
+        const head_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
+            if (data.len > MAX_HEAD) return refuse(allocator, c, "431 Request Header Fields Too Large");
+            continue;
+        };
+        if (head_end + 4 > MAX_HEAD) return refuse(allocator, c, "431 Request Header Fields Too Large");
+        const expected = request.getExpectedSize(data) orelse return refuse(allocator, c, "400 Bad Request");
+        // Never handed on cut short: a truncated body would be stored or
+        // applied as if whole.
+        if (expected > MAX_REQUEST) return refuse(allocator, c, "413 Content Too Large");
+        if (data.len >= expected) return dispatch(allocator, c, handler, data[0..expected]);
     }
-    if (rc == 0) {
-        // The client finished sending: what came is the request.
-        if (c.len == 0) return close(c);
-        return dispatch(c, handler);
-    }
-    c.len += @intCast(rc);
-    const whole = if (request.getExpectedSize(c.buf[0..c.len])) |expected| c.len >= expected else false;
-    if (whole or c.len == c.buf.len) dispatch(c, handler);
 }
 
-fn dispatch(c: *Conn, handler: anytype) void {
-    defer close(c);
-    // The handler writes as before: blocking, but never for long.
-    stdx.net.sysFcntlSetBlocking(c.fd) catch return;
-    const tv = std.posix.timeval{ .sec = @intCast(WRITE_TIMEOUT_S), .usec = 0 };
-    _ = std.c.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(std.posix.timeval));
-    handler.handle(c.fd, c.buf[0..c.len]);
+/// Answer `status` without the handler, and close.
+fn refuse(allocator: std.mem.Allocator, c: *Conn, status: []const u8) void {
+    var buf: [128]u8 = undefined;
+    const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch unreachable;
+    write_deadline_ms = stdx.time.milliTimestamp() + WRITE_TIMEOUT_MS;
+    defer write_deadline_ms = 0;
+    writeAll(c.fd, resp) catch {};
+    close(allocator, c, true);
 }
 
-fn close(c: *Conn) void {
-    // SO_LINGER so a response's last bytes are sent before FIN; raw std.c
-    // because the std wrapper panics on an fd the peer already reset.
-    const linger = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
-    _ = std.c.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.LINGER, &linger, @sizeOf(@TypeOf(linger)));
+/// The deadline `writeAll` keeps while a handler runs: one for the whole
+/// response, however many writes it takes.
+threadlocal var write_deadline_ms: i64 = 0;
+threadlocal var write_timed_out: bool = false;
+
+fn dispatch(allocator: std.mem.Allocator, c: *Conn, handler: anytype, bytes: []const u8) void {
+    write_deadline_ms = stdx.time.milliTimestamp() + WRITE_TIMEOUT_MS;
+    write_timed_out = false;
+    defer write_deadline_ms = 0;
+    handler.handle(c.fd, bytes);
+    close(allocator, c, !write_timed_out);
+}
+
+/// Write all of `bytes` to a non-blocking socket, waiting for room until
+/// the response's deadline (or `WRITE_TIMEOUT_MS` outside a handler).
+pub fn writeAll(fd: posix.socket_t, bytes: []const u8) error{WriteFailed}!void {
+    const deadline = if (write_deadline_ms != 0) write_deadline_ms else stdx.time.milliTimestamp() + WRITE_TIMEOUT_MS;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = std.c.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (rc > 0) {
+            off += @intCast(rc);
+            continue;
+        }
+        if (rc == 0) return error.WriteFailed;
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => {
+                const left = deadline - stdx.time.milliTimestamp();
+                if (left <= 0) {
+                    write_timed_out = true;
+                    return error.WriteFailed;
+                }
+                var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                _ = posix.poll(&pfd, @intCast(@min(left, 1000))) catch {};
+            },
+            else => return error.WriteFailed,
+        }
+    }
+}
+
+/// `linger`: hold the close until what was written is sent, so the client
+/// reads the response rather than a reset. Not after a write timed out:
+/// that client is not reading.
+fn close(allocator: std.mem.Allocator, c: *Conn, linger: bool) void {
+    // Raw std.c because the std wrapper panics on an fd the peer already reset.
+    if (linger) {
+        const opt = extern struct { l_onoff: c_int, l_linger: c_int }{ .l_onoff = 1, .l_linger = 2 };
+        _ = std.c.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.LINGER, &opt, @sizeOf(@TypeOf(opt)));
+    }
     _ = std.c.close(c.fd);
+    c.buf.deinit(allocator);
     c.* = .{};
 }
 
@@ -134,18 +217,35 @@ const testing = std.testing;
 
 const Echo = struct {
     served: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    last: [64]u8 = undefined,
+    last_len: usize = 0,
+    /// Bytes of body to answer with.
+    body_len: usize = 2,
+    /// When the last answer was given up or finished.
+    done_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     fn handle(self: *Echo, fd: posix.socket_t, bytes: []const u8) void {
         _ = self.served.fetchAdd(1, .monotonic);
-        const body = "ok";
+        defer self.done_ms.store(stdx.time.milliTimestamp(), .release);
+        const tail = bytes[bytes.len - @min(bytes.len, self.last.len) ..];
+        @memcpy(self.last[0..tail.len], tail);
+        self.last_len = tail.len;
         var hdr: [128]u8 = undefined;
-        const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch return;
-        _ = std.c.write(fd, h.ptr, h.len);
-        _ = std.c.write(fd, body.ptr, body.len);
-        _ = bytes;
+        const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len}) catch return;
+        writeAll(fd, h) catch return;
+        var chunk: [4096]u8 = undefined;
+        @memset(&chunk, 'o');
+        var left = self.body_len;
+        while (left > 0) {
+            const n = @min(left, chunk.len);
+            writeAll(fd, chunk[0..n]) catch return;
+            left -= n;
+        }
     }
 };
 
-fn listenLocal() !struct { fd: posix.socket_t, port: u16 } {
+const Listening = struct { fd: posix.socket_t, port: u16 };
+
+fn listenLocal() !Listening {
     const fd = try stdx.net.sysSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     const addr = stdx.net.SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, 0);
     try stdx.net.sysBind(fd, addr.anyPtr(), addr.anyLen());
@@ -209,4 +309,95 @@ test "serve: a connection that has not sent its whole request in time is closed"
     var b: [16]u8 = undefined;
     try testing.expectEqual(@as(isize, 0), std.c.read(fd, &b, b.len));
     try testing.expectEqual(@as(u32, 0), echo.served.load(.monotonic));
+}
+
+const Served = struct {
+    l: Listening,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    echo: Echo = .{},
+    thread: std.Thread = undefined,
+
+    fn start(self: *Served) !void {
+        self.l = try listenLocal();
+        self.thread = try std.Thread.spawn(.{}, serve, .{ testing.allocator, self.l.fd, &self.running, &self.echo });
+    }
+    fn stop(self: *Served) void {
+        self.running.store(false, .release);
+        self.thread.join();
+        _ = std.c.close(self.l.fd);
+    }
+};
+
+/// Send `req` and return the first bytes of the answer, waiting up to 3 s.
+fn exchange(port: u16, req: []const u8, out: []u8) ![]const u8 {
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
+    defer _ = std.c.close(fd);
+    var off: usize = 0;
+    while (off < req.len) {
+        const rc = std.c.write(fd, req[off..].ptr, req.len - off);
+        if (rc <= 0) break;
+        off += @intCast(rc);
+    }
+    try stdx.net.sysFcntlSetNonblocking(fd);
+    var got: usize = 0;
+    var waited: u64 = 0;
+    while (waited < 3000 and got < out.len) : (waited += 10) {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break else stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return out[0..got];
+}
+
+test "serve: a request past the limits is answered 413 or 431 and never handled, and a body is cut to its length" {
+    var srv = Served{ .l = undefined };
+    try srv.start();
+    defer srv.stop();
+    var out: [256]u8 = undefined;
+
+    const big = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, big, &out), "HTTP/1.1 413"));
+
+    const huge_head = "GET / HTTP/1.1\r\nX: " ++ "h" ** (MAX_HEAD + 10) ++ "\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, huge_head, &out), "HTTP/1.1 431"));
+
+    // A head that never ends is not buffered past the limit either.
+    const endless_head = "GET / HTTP/1.1\r\nX: " ++ "h" ** (MAX_HEAD + 10);
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, endless_head, &out), "HTTP/1.1 431"));
+
+    const bad_length = "POST / HTTP/1.1\r\nContent-Length: lots\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, bad_length, &out), "HTTP/1.1 400"));
+    try testing.expectEqual(@as(u32, 0), srv.echo.served.load(.monotonic));
+
+    // Any spelling of the header; what follows the body is not part of it.
+    const cut = "POST / HTTP/1.1\r\nCONTENT-length: 3\r\n\r\nabcEXTRA";
+    try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, cut, &out), "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 1), srv.echo.served.load(.monotonic));
+    try testing.expect(std.mem.endsWith(u8, srv.echo.last[0..srv.echo.last_len], "\r\n\r\nabc"));
+}
+
+test "serve: a client that reads slowly is cut off at the response deadline, not held to it write by write" {
+    var srv = Served{ .l = undefined };
+    srv.echo.body_len = 16 << 20;
+    try srv.start();
+    defer srv.stop();
+
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, srv.l.port, 1000);
+    defer _ = std.c.close(fd);
+    const req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    _ = std.c.write(fd, req, req.len);
+    // Read a trickle, so every single write makes some progress, until the
+    // server gives the answer up. At this pace the whole body would take
+    // over a minute; what the kernel buffered may still arrive after.
+    const start = stdx.time.milliTimestamp();
+    var got: usize = 0;
+    var buf: [4096]u8 = undefined;
+    while (srv.echo.done_ms.load(.acquire) == 0 and stdx.time.milliTimestamp() - start < 15_000) {
+        const rc = std.c.read(fd, &buf, buf.len);
+        if (rc > 0) got += @intCast(rc);
+        stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    const done = srv.echo.done_ms.load(.acquire);
+    try testing.expect(done != 0);
+    try testing.expect(done - start < WRITE_TIMEOUT_MS + 1_500);
+    try testing.expect(got > 0);
 }

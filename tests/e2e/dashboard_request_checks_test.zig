@@ -1,7 +1,6 @@
-//! The dashboard serves its own pages and the hosts it is told about, and
-//! takes changes only from them: a page on another site, or a name rebound
-//! to this address, gets nothing done. Each test drives a queue purge, the
-//! change a stray link could most easily make, and checks the queue after.
+//! The dashboard serves the hosts it is told about and takes changes only
+//! from its own pages or allowed origins. The change tests drive a queue
+//! purge and check the queue after; the rest check what comes back.
 
 const std = @import("std");
 const testing = std.testing;
@@ -69,8 +68,12 @@ test "e2e/dashboard: a change from another site's page is refused" {
     defer no_origin.deinit();
     try testing.expectEqual(@as(u16, 403), no_origin.status);
     try testing.expect(try untouched(http, ctx.getDashboardPort(), "x"));
-    // No CORS grant goes back to a site that is not allowed.
-    try testing.expect(cross.getHeader("Access-Control-Allow-Origin") == null);
+    // A read from a site that is not allowed is answered without a CORS
+    // grant, so its page cannot see the answer.
+    var read = try http.requestExact(.GET, "/api/v1/queues", null, &.{.{ "Origin", "http://evil.example" }});
+    defer read.deinit();
+    try testing.expectEqual(@as(u16, 200), read.status);
+    try testing.expect(read.getHeader("Access-Control-Allow-Origin") == null);
 }
 
 test "e2e/dashboard: a change whose content type any page could send is refused" {
@@ -100,7 +103,7 @@ test "e2e/dashboard: a change whose content type any page could send is refused"
     try testing.expect(same_site.bodyContains("\"purged\":1"));
 }
 
-test "e2e/dashboard: a name rebound to this address is not served, but health answers anyone" {
+test "e2e/dashboard: a host it does not answer to is not served, but health answers anyone" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
     defer ctx.deinit();
     var http = try ctx.createDashboardHttp();
@@ -111,7 +114,7 @@ test "e2e/dashboard: a name rebound to this address is not served, but health an
     defer local.deinit();
     try testing.expectEqual(@as(u16, 200), local.status);
 
-    // A page on evil.example whose name now points here asks for data.
+    // A Host it does not answer to.
     const port = ctx.getDashboardPort();
     const evil = try rawRequest(port, "GET /api/v1/queues HTTP/1.1\r\nHost: evil.example\r\n\r\n");
     defer testing.allocator.free(evil);
@@ -159,4 +162,84 @@ fn rawRequest(port: u16, req: []const u8) ![]u8 {
         }
     }
     return testing.allocator.dupe(u8, buf[0..got]);
+}
+
+test "e2e/dashboard: a request with no headers is answered, on both listeners, and the node keeps serving" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true, .metrics_enabled = true } });
+    defer ctx.deinit();
+    const dash = try rawRequest(ctx.getDashboardPort(), "GET /api/v1/queues HTTP/1.0\r\n\r\n");
+    defer testing.allocator.free(dash);
+    try testing.expect(std.mem.startsWith(u8, dash, "HTTP/1.1 400"));
+    const metrics = try rawRequest(ctx.getMetricsPort(), "GET /metrics HTTP/1.0\r\n\r\n");
+    defer testing.allocator.free(metrics);
+    try testing.expect(std.mem.startsWith(u8, metrics, "HTTP/1.1 200"));
+    for ([_]u16{ ctx.getDashboardPort(), ctx.getMetricsPort() }) |port| {
+        const health = try rawRequest(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        defer testing.allocator.free(health);
+        try testing.expect(std.mem.startsWith(u8, health, "HTTP/1.1 200"));
+    }
+    try ctx.exec(&.{ "kv", "set", "alive", "yes" });
+}
+
+test "e2e/dashboard: a body past the limit is refused whole, never stored cut short" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    const port = ctx.getDashboardPort();
+    var buf: [256]u8 = undefined;
+    const head = try std.fmt.bufPrint(&buf, "POST /api/v1/queues/big HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: http://127.0.0.1:{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: 2000000\r\n\r\n", .{ port, port });
+    const answer = try rawRequest(port, head);
+    defer testing.allocator.free(answer);
+    try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 413"));
+    const result = try ctx.execCapture(&.{ "queue", "dequeue", "big", "--timeout", "100" });
+    try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
+}
+
+test "e2e/dashboard: no other site may frame it, and nothing is read as another type" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    for ([_][]const u8{ "/", "/queues/some/deep/link", "/api/v1/queues" }) |path| {
+        var r = try http.get(path);
+        defer r.deinit();
+        try testing.expectEqualStrings("DENY", r.getHeader("X-Frame-Options") orelse "");
+        try testing.expectEqualStrings("frame-ancestors 'none'", r.getHeader("Content-Security-Policy") orelse "");
+        try testing.expectEqualStrings("nosniff", r.getHeader("X-Content-Type-Options") orelse "");
+    }
+    // HEAD is GET without the body.
+    var head = try http.requestExact(.HEAD, "/api/v1/queues", null, &.{});
+    defer head.deinit();
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqual(@as(usize, 0), head.body.len);
+}
+
+test "e2e/dashboard: hosts and cors_origins from flo.toml are the ones served and granted" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
+        .dashboard_enabled = true,
+        .dashboard_hosts = "flo.test",
+        .dashboard_cors_origins = "https://ops.example.com",
+    } });
+    defer ctx.deinit();
+    try seeded(ctx, "c");
+    const port = ctx.getDashboardPort();
+    var buf: [512]u8 = undefined;
+
+    const named = try std.fmt.bufPrint(&buf, "GET /api/v1/queues HTTP/1.1\r\nHost: flo.test:{d}\r\n\r\n", .{port});
+    const by_name = try rawRequest(port, named);
+    defer testing.allocator.free(by_name);
+    try testing.expect(std.mem.startsWith(u8, by_name, "HTTP/1.1 200"));
+
+    const granted = try std.fmt.bufPrint(&buf, "POST /api/v1/queues/c/purge HTTP/1.1\r\nHost: flo.test:{d}\r\nOrigin: https://ops.example.com\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n", .{port});
+    const purge = try rawRequest(port, granted);
+    defer testing.allocator.free(purge);
+    try testing.expect(std.mem.startsWith(u8, purge, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, purge, "Access-Control-Allow-Origin: https://ops.example.com\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, purge, "\"purged\":2") != null);
+
+    // Any other origin gets no grant, and the answer says it varies.
+    const other = try std.fmt.bufPrint(&buf, "GET /api/v1/queues HTTP/1.1\r\nHost: localhost:{d}\r\nOrigin: https://other.example.com\r\n\r\n", .{port});
+    const read = try rawRequest(port, other);
+    defer testing.allocator.free(read);
+    try testing.expect(std.mem.indexOf(u8, read, "Access-Control-Allow-Origin") == null);
+    try testing.expect(std.mem.indexOf(u8, read, "Vary: Origin\r\n") != null);
 }

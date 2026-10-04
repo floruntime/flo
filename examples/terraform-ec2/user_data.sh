@@ -73,6 +73,7 @@ enabled = true
 [dashboard]
 enabled = true
 bind = "0.0.0.0"
+# hosts = "flo.example.internal, 10.0.1.5"   # names/addresses you browse to it by (besides localhost)
 TOML
 
 # --- 5. Create systemd service ---

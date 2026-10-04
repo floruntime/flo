@@ -350,15 +350,7 @@ pub fn writeResponse(client: std.posix.socket_t, status: StatusCode, content_typ
     try writeAllTo(client, body);
 }
 
-/// Write the whole buffer — `sysWrite` retries neither a short write nor EINTR.
-fn writeAllTo(client: std.posix.socket_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = try @import("stdx").net.sysWrite(client, bytes[off..]);
-        if (n == 0) return error.WriteFailed;
-        off += n;
-    }
-}
+const writeAllTo = @import("serve.zig").writeAll;
 
 test "build JSON response" {
     const resp = json(std.testing.allocator, "{\"key\":\"value\"}");

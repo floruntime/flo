@@ -265,22 +265,21 @@ pub fn isHttpRequest(data: []const u8) bool {
     return false;
 }
 
-/// Calculate total request size (headers + body) for buffering
+/// Calculate total request size (headers + body) for buffering: null until
+/// the headers are whole, or when Content-Length is not a number.
 pub fn getExpectedSize(data: []const u8) ?usize {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
     const body_start = header_end + 4;
-
-    // Find Content-Length header
-    const cl_pos = std.mem.indexOf(u8, data[0..header_end], "Content-Length:") orelse
-        std.mem.indexOf(u8, data[0..header_end], "content-length:") orelse
-        return body_start; // No body
-
-    const cl_start = cl_pos + "Content-Length:".len;
-    const cl_line_end = std.mem.indexOfScalarPos(u8, data, cl_start, '\r') orelse return null;
-    const cl_value = std.mem.trim(u8, data[cl_start..cl_line_end], " ");
-
-    const content_length = std.fmt.parseInt(usize, cl_value, 10) catch return null;
-    return body_start + content_length;
+    var lines = std.mem.splitSequence(u8, data[0..header_end], "\r\n");
+    _ = lines.next(); // request line
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const content_length = std.fmt.parseInt(usize, value, 10) catch return null;
+        return std.math.add(usize, body_start, content_length) catch null;
+    }
+    return body_start; // No body
 }
 
 test "parse simple GET request" {

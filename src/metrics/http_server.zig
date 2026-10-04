@@ -105,46 +105,24 @@ pub const HttpMetricsServer = struct {
         http.serve.serve(self.allocator, listener, &self.running, self);
     }
 
-    /// One whole request, from the accept loop.
+    /// A request from the accept loop, read whole.
     pub fn handle(self: *Self, client: std.posix.socket_t, request: []const u8) void {
         self.handleRequest(client, request) catch |err| {
             std.log.debug("Metrics HTTP: request error: {}", .{err});
         };
     }
 
-    /// Write the whole buffer. `sysWrite` does not retry a short write or
-    /// EINTR, and SIGINT/SIGTERM are installed without SA_RESTART — a signal
-    /// landing mid-write of a large /metrics body would otherwise truncate it
-    /// under a Content-Length promising more, hanging the scraper until close.
-    fn writeAll(client: std.posix.socket_t, bytes: []const u8) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = try stdx.net.sysWrite(client, bytes[off..]);
-            if (n == 0) return error.WriteFailed;
-            off += n;
-        }
-    }
+    const writeAll = http.serve.writeAll;
 
     fn handleRequest(self: *Self, client: std.posix.socket_t, request: []const u8) !void {
-
-        // Parse request using shared HTTP primitives
-        if (http.parseRequest(request)) |parsed| {
-            if (parsed.pathStartsWith("/metrics")) {
-                try self.sendMetrics(client);
-            } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
-                try self.sendHealth(client);
-            } else {
-                try http.writeResponse(client, .not_found, .text, "Not Found\n");
-            }
+        const parsed = http.parseRequest(request) orelse
+            return http.writeResponse(client, .bad_request, .text, "Bad Request\n");
+        if (parsed.pathStartsWith("/metrics")) {
+            try self.sendMetrics(client);
+        } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
+            try self.sendHealth(client);
         } else {
-            // Fallback: simple string match for incomplete parses
-            if (std.mem.startsWith(u8, request, "GET /metrics")) {
-                try self.sendMetrics(client);
-            } else if (std.mem.startsWith(u8, request, "GET /health") or std.mem.startsWith(u8, request, "GET /")) {
-                try self.sendHealth(client);
-            } else {
-                try http.writeResponse(client, .not_found, .text, "Not Found\n");
-            }
+            try http.writeResponse(client, .not_found, .text, "Not Found\n");
         }
     }
 

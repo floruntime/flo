@@ -119,6 +119,9 @@ pub const ServerProcess = struct {
     pub const ServerConfig = struct {
         /// Enable dashboard HTTP server
         dashboard_enabled: bool = false,
+        /// `[dashboard] hosts` and `cors_origins`, written as given.
+        dashboard_hosts: ?[]const u8 = null,
+        dashboard_cors_origins: ?[]const u8 = null,
         /// Enable metrics HTTP server (Prometheus)
         metrics_enabled: bool = false,
         /// Number of shards (1 = faster startup)
@@ -294,6 +297,8 @@ pub const ServerProcess = struct {
         if (self.config.dashboard_enabled) {
             try config_writer.print("port = {d}\n", .{self.dashboard_port});
         }
+        if (self.config.dashboard_hosts) |h| try config_writer.print("hosts = \"{s}\"\n", .{h});
+        if (self.config.dashboard_cors_origins) |o| try config_writer.print("cors_origins = \"{s}\"\n", .{o});
 
         // Cold storage section (for tiered storage tests)
         if (self.config.cold_storage.provider != .none) {
