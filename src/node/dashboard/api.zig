@@ -5,11 +5,13 @@
 //! Handler bodies use DashboardContext instead of old Core/Dispatcher.
 
 const std = @import("std");
+const ns_keys = @import("../../namespace/handler.zig");
 const Allocator = std.mem.Allocator;
 const Method = @import("../../util/http/mod.zig").Method;
 
 // Sub-modules
 pub const helpers = @import("api/helpers.zig");
+const h = helpers;
 pub const namespaces = @import("api/namespaces.zig");
 pub const streams = @import("api/streams.zig");
 pub const queues = @import("api/queues.zig");
@@ -31,6 +33,22 @@ pub fn only(method: Method, allowed: []const Method) error{MethodNotAllowed}!voi
     return error.MethodNotAllowed;
 }
 
+/// Why a namespace this request names, in `?namespace=` or the path, can
+/// name none, or null. Checked before any route: a name that no namespace
+/// can have is never looked up.
+fn namespaceRefusal(path: []const u8, query_string: ?[]const u8) ?[]const u8 {
+    if (h.parseQueryParam([]const u8, query_string, "namespace")) |ns| {
+        if (ns.len > 0) if (ns_keys.nameRefusal(ns)) |why| return why;
+    }
+    for ([_][]const u8{ "namespaces/", "kv/namespaces/" }) |prefix| {
+        if (!std.mem.startsWith(u8, path, prefix)) continue;
+        const rest = path[prefix.len..];
+        const ns = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+        if (ns_keys.nameRefusal(ns)) |why| return why;
+    }
+    return null;
+}
+
 /// Main API request router.
 /// `path` is the portion after `/api/v1/` — e.g. "streams", "kv/namespaces/default/keys".
 pub fn handleRequest(
@@ -41,6 +59,8 @@ pub fn handleRequest(
     body: []const u8,
     ctx: *DashboardContext,
 ) ![]const u8 {
+    if (namespaceRefusal(path, query_string)) |why| return h.jsonError(allocator, why);
+
     // ── namespaces ──────────────────────────────────────────
     if (std.mem.eql(u8, path, "namespaces")) {
         try only(method, &.{ .GET, .POST });

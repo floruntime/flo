@@ -135,7 +135,6 @@ pub const Client = struct {
 
     const Self = @This();
 
-    /// Keep `response`'s error message for `serverError`.
     pub fn keepError(self: *Self, response: Response) void {
         const msg = response.errorMessage();
         self.server_error_len = @min(msg.len, self.server_error_buf.len);

@@ -164,7 +164,7 @@ pub const StreamHandler = struct {
         };
 
         // Build namespace prefix for filtering
-        const ns_prefix = ns_keys.namespacePrefix(&S.ns_buf, namespace);
+        const ns_prefix = ns_keys.namespacePrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
 
         // Scan all qualified names
         const raw_count = stream.scanStreamNames(&S.name_buf);
@@ -744,7 +744,8 @@ pub const StreamHandler = struct {
 
         // Filter by namespace prefix and strip
         var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_prefix = ns_keys.namespacePrefix(&ns_buf, req.namespace);
+        const ns_prefix = ns_keys.namespacePrefix(&ns_buf, req.namespace) catch
+            return .{ .err = .{ .code = .invalid_request, .message = "namespace name too long" } };
 
         var filtered: [1024][]const u8 = undefined;
         var filtered_count: usize = 0;

@@ -53,14 +53,14 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("delete")
-                .about("Delete an existing namespace")
+                .about("Delete a namespace (not supported yet: the server refuses it)")
                 .aliases(&.{ "rm", "remove" })
                 .examples(&.{
                     "flo namespace delete myapp",
                     "flo ns rm staging",
                 })
                 .arg("name", "Name of the namespace to delete")
-                .boolFlag("force", 'f', "Force delete even if not empty (deletes all resources)")
+                .boolFlag("force", 'f', "Delete even if not empty, once delete is supported")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -106,7 +106,6 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
 
-    // The server checks the name: its rule is the only one.
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
@@ -134,12 +133,6 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
     const force = ctx.getBool("force");
-
-    // Prevent deletion of reserved namespaces
-    if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "_system")) {
-        ctx.printErr("Error: Cannot delete system namespace '{s}'\n", .{name});
-        return error.CommandFailed;
-    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

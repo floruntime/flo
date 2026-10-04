@@ -231,7 +231,7 @@ pub const QueueProjection = struct {
     }
 
     /// Reset the queue projection to empty state.
-    /// Used during namespace force-delete to clear all queue data.
+    /// Clears every queue on this shard; used before restoring a snapshot.
     pub fn reset(self: *QueueProjection) void {
         // Free owned payload copies
         var msg_it = self.messages.iterator();

@@ -153,7 +153,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
     // Build namespace prefix for filtering (same logic as stream handler)
     var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const ns_prefix = if (ns_filter) |ns| ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
+    const ns_prefix = if (ns_filter) |ns| try ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
     const effective_ns = ns_filter orelse "default";
 
     // Scan StreamProjection on each shard for registered stream names

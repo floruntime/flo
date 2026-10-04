@@ -1282,13 +1282,26 @@ pub const Shard = struct {
             self.forwardToLeader(conn, req);
             return;
         }
-        // A write to a namespace this shard has not seen creates it, so it
-        // needs room in the registry, checked where the registry lives.
+        // Requests forwarded from another node arrive here without passing
+        // `dispatchRequest`'s check.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+        // A write to a namespace this shard has not seen creates it. Checked
+        // after forwarding because only the leader knows the creates in
+        // flight; the create is proposed here, ahead of the write, so it
+        // holds the room before the next request is admitted.
         if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and
-            !isNamespaceOp(req.header.op_code) and !self.namespace_handler.admits(req.namespace))
+            !isNamespaceOp(req.header.op_code))
         {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace limit reached");
-            return;
+            if (self.namespace_handler.admission(req.namespace)) |r| {
+                self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
+                return;
+            }
+            self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
         }
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
     }
@@ -6878,6 +6891,46 @@ const ParkTest = struct {
         try std.testing.expectEqual(total, off);
     }
 };
+
+test "Shard: a write to a new namespace holds its room before it commits, so writes in flight cannot overshoot the limit" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // One namespace short of the limit.
+    var name_buf: [16]u8 = undefined;
+    const room = 1024 - shard.namespace_handler.namespaces.count() - 1;
+    for (0..room) |i| _ = shard.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
+
+    // Two writes to new namespaces, neither committed: the first holds
+    // the last room, the second is refused at once.
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 40, "first", "k", "v", ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 41, "second", "k", "v", ""));
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 41), one[0].header.request_id);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, one[0].data);
+
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 40), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(shard.namespace_handler.namespaces.contains("first"));
+    try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
+}
 
 test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {
     const pipe_fds = try @import("stdx").io.pipe();

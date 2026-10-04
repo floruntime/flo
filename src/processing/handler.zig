@@ -494,6 +494,10 @@ pub const ProcessingHandler = struct {
             return;
         };
         defer def.deinit(self.allocator);
+        if (def.namespaceRefusal()) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
 
         // Generate a unique job ID with embedded partition bits.
         //
@@ -1547,6 +1551,12 @@ pub const ProcessingHandler = struct {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            // A sink writes without passing a client's request gate: a
+            // namespace this shard may not create takes no write.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| {
+                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                continue;
+            }
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
@@ -1589,6 +1599,12 @@ pub const ProcessingHandler = struct {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            // A sink writes without passing a client's request gate: a
+            // namespace this shard may not create takes no write.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| {
+                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                continue;
+            }
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);

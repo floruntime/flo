@@ -539,6 +539,13 @@ pub const WorkflowHandler = struct {
         };
         defer def.deinit(self.allocator);
 
+        // A trigger reads from its stream without passing a client's
+        // request check, so the namespace it names is checked here.
+        if (def.trigger) |t| if (t.namespace) |ns| if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return null;
+        };
+
         // Validate the definition
         var validation = validator.validateWorkflow(self.allocator, &def) catch {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "validation failed");

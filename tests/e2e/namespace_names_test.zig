@@ -1,6 +1,7 @@
-//! A namespace name meets one rule, however it arrives: an explicit create,
-//! or any request naming it, which creates it on a first write. Each test
-//! checks the server's answer, and that nothing was created.
+//! A namespace name meets one rule however it arrives: an explicit create,
+//! any request naming it (a first write creates it), a pipeline definition,
+//! or the dashboard. Each test checks the answer, and that nothing was
+//! created or harmed.
 
 const std = @import("std");
 const testing = std.testing;
@@ -11,72 +12,95 @@ fn listed(ctx: *stdx.testing.TestContext, name: []const u8) !bool {
     return std.mem.indexOf(u8, list, name) != null;
 }
 
-test "e2e/namespace: a write naming a namespace outside the rule is refused and creates nothing" {
+const Bad = struct { name: []const u8, says: []const u8 };
+const bad_names = [_]Bad{
+    .{ .name = "n" ** 300, .says = "namespace name too long" },
+    .{ .name = "_flo", .says = "reserved namespace name" },
+    .{ .name = "Prod", .says = "lowercase only" },
+    .{ .name = "v1.0", .says = "letters, digits, '_' and '-' only" },
+    .{ .name = "a:b", .says = "letters, digits, '_' and '-' only" },
+    .{ .name = "trailing-", .says = "must not end with '-'" },
+};
+
+test "e2e/namespace: a write naming a namespace outside the rule is refused, says why, and creates nothing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const long = "n" ** 300;
-    for ([_][]const u8{ long, "_flo", "_mine", "a:b", "trailing-", "9lives" }) |name| {
-        var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "-n", name });
+    for (bad_names) |b| {
+        var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "-n", b.name });
         defer put.deinit();
-        try stdx.testing.assertContains(put, "namespace name");
-        var append = try ctx.cli.run(&.{ "stream", "append", "s", "x", "-n", name });
+        try stdx.testing.assertStderrContains(put, b.says);
+        var append = try ctx.cli.run(&.{ "stream", "append", "s", "x", "-n", b.name });
         defer append.deinit();
-        try stdx.testing.assertContains(append, "namespace name");
-        try testing.expect(!try listed(ctx, name));
+        try stdx.testing.assertStderrContains(append, b.says);
+        try testing.expect(!try listed(ctx, b.name));
     }
-    // The longest name, and the old rule's dots, still work.
+    // The longest name, and one starting with a digit, are names.
     const longest = "n" ** 63;
     try ctx.exec(&.{ "kv", "set", "k", "v", "-n", longest });
-    try ctx.exec(&.{ "kv", "set", "k", "v", "-n", "v1.0" });
+    try ctx.exec(&.{ "kv", "set", "k", "v", "-n", "9lives" });
     try testing.expect(try listed(ctx, longest));
-    try testing.expect(try listed(ctx, "v1.0"));
+    try testing.expect(try listed(ctx, "9lives"));
 }
 
 test "e2e/namespace: an explicit create meets the same rule" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    for ([_][]const u8{ "n" ** 64, "_flo", "trailing-" }) |name| {
-        var create = try ctx.cli.run(&.{ "ns", "create", name });
+    for (bad_names) |b| {
+        var create = try ctx.cli.run(&.{ "ns", "create", b.name });
         defer create.deinit();
-        try stdx.testing.assertContains(create, "namespace name");
-        try testing.expect(!try listed(ctx, name));
+        try stdx.testing.assertStderrContains(create, b.says);
+        try testing.expect(!try listed(ctx, b.name));
     }
 }
 
-test "e2e/namespace: force delete of a long-named namespace leaves the server serving" {
+test "e2e/namespace: a pipeline naming a namespace outside the rule is refused at submit" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    const long = "n" ** 300;
-    var append = try ctx.cli.run(&.{ "stream", "append", "s", "x", "-n", long });
-    defer append.deinit();
-    var delete = try ctx.cli.run(&.{ "ns", "delete", long, "--force" });
-    defer delete.deinit();
-    try stdx.testing.assertContains(delete, "namespace name");
+    for ([_][]const u8{
+        "sinks.[0].stream.namespace: _flo",
+        "sources.[0].stream.namespace: Prod",
+        "namespace: has_colon:x",
+    }) |line| {
+        var buf: [512]u8 = undefined;
+        const def = try std.fmt.bufPrint(&buf,
+            \\kind: Processing
+            \\name: ns-check
+            \\sources.[0].stream.name: in
+            \\sinks.[0].stream.name: out
+            \\{s}
+        , .{line});
+        const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "ns-check.yaml");
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        var submit = try ctx.cli.run(&.{ "processing", "submit", path });
+        defer submit.deinit();
+        try stdx.testing.assertContains(submit, "namespace name");
+    }
+    const jobs = try ctx.execCapture(&.{ "processing", "list" });
+    try testing.expect(std.mem.indexOf(u8, jobs, "ns-check") == null);
+    try testing.expect(!try listed(ctx, "_flo"));
+}
+
+test "e2e/namespace: the dashboard refuses a namespace no namespace can have, and the node keeps serving" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    const long = "n" ** 5000;
+    for ([_][]const u8{
+        "/api/v1/streams?namespace=" ++ long,
+        "/api/v1/kv/namespaces/" ++ long ++ "/keys",
+        "/api/v1/namespaces/" ++ long,
+    }) |path| {
+        var r = try http.get(path);
+        defer r.deinit();
+        try testing.expect(r.bodyContains("namespace name too long"));
+    }
     try ctx.exec(&.{ "kv", "set", "alive", "yes" });
-    const got = try ctx.execCapture(&.{ "kv", "get", "alive" });
-    try testing.expect(std.mem.indexOf(u8, got, "yes") != null);
+    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "kv", "get", "alive" }), "yes") != null);
 }
 
-test "e2e/namespace: force delete does not take other namespaces' streams and queues with it" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-    try ctx.exec(&.{ "stream", "append", "orders", "keep-1", "-n", "keep" });
-    try ctx.exec(&.{ "queue", "enqueue", "jobs", "keep-2", "-n", "keep" });
-    try ctx.exec(&.{ "kv", "set", "k", "v", "-n", "gone" });
-
-    var delete = try ctx.cli.run(&.{ "ns", "delete", "gone", "--force" });
-    defer delete.deinit();
-    try stdx.testing.assertContains(delete, "cannot remove streams or queues yet");
-    try testing.expect(try listed(ctx, "gone"));
-
-    const info = try ctx.execCapture(&.{ "stream", "info", "orders", "-n", "keep" });
-    try testing.expect(std.mem.indexOf(u8, info, "Records: 1") != null);
-    const msg = try ctx.execCapture(&.{ "queue", "dequeue", "jobs", "-n", "keep", "--timeout", "100" });
-    try testing.expect(std.mem.indexOf(u8, msg, "keep-2") != null);
-}
-
-test "e2e/namespace: writes cannot create namespaces past the limit" {
+test "e2e/namespace: writes cannot create namespaces past the limit, and the refusal says so" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     // "default" is one of the 1024.
@@ -87,12 +111,38 @@ test "e2e/namespace: writes cannot create namespaces past the limit" {
     }
     var over = try ctx.cli.run(&.{ "kv", "set", "k", "v", "-n", "one-more" });
     defer over.deinit();
-    try stdx.testing.assertContains(over, "namespace limit reached");
-    try testing.expect(!try listed(ctx, "one-more"));
+    try stdx.testing.assertStderrContains(over, "namespace limit reached (1024 per shard)");
     var create = try ctx.cli.run(&.{ "ns", "create", "one-more" });
     defer create.deinit();
-    try stdx.testing.assertContains(create, "namespace limit reached");
-    try testing.expect(!try listed(ctx, "one-more"));
+    try stdx.testing.assertStderrContains(create, "namespace limit reached (1024 per shard)");
+    // The listing shows at most 256 per shard, so ask for it by name.
+    var info = try ctx.cli.run(&.{ "ns", "info", "one-more" });
+    defer info.deinit();
+    try stdx.testing.assertStdoutContains(info, "Namespace 'one-more' does not exist");
     // A namespace that exists still takes writes.
     try ctx.exec(&.{ "kv", "set", "k2", "v", "-n", "ns7" });
+}
+
+test "e2e/namespace: a workflow trigger naming a namespace outside the rule is refused at create" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "ns-echo" });
+    const def =
+        \\kind: Workflow
+        \\name: ns-trigger
+        \\version: 1.0.0
+        \\trigger.stream: events
+        \\trigger.namespace: _flo
+        \\start.run: @actions/ns-echo
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "ns-trigger.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    var create = try ctx.cli.run(&.{ "workflow", "create", "-f", path });
+    defer create.deinit();
+    try stdx.testing.assertContains(create, "reserved namespace name");
+    var got = try ctx.cli.run(&.{ "workflow", "definition", "ns-trigger" });
+    defer got.deinit();
+    try testing.expect(!got.stdoutContains("ns-trigger"));
 }
