@@ -3061,3 +3061,43 @@ test "e2e/workflow: a stream trigger survives restart and resumes at its cursor"
     // (cursor lost: the consumed events run again).
     try testing.expectEqual(@as(usize, 4), list_result.stdoutCount("st-restart-trig"));
 }
+
+fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !struct { status: u8, data: []const u8 } {
+    const proto = @import("src").protocol.proto;
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(op);
+    header.request_id = 7;
+    const req: proto.Request = .{ .header = header, .namespace = namespace, .key = key, .value = value, .options = "" };
+    var buf: [1024]u8 = undefined;
+    const bytes = try req.serialize(&buf);
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, bytes.ptr, bytes.len);
+    var got: usize = 0;
+    var waited: u32 = 0;
+    while (waited < 300) : (waited += 1) {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
+        if (proto.Response.parse(out[0..got])) |resp| return .{ .status = resp.header.status, .data = resp.data } else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.NoResponse;
+}
+
+test "e2e/workflow: a list-runs request whose lengths overrun it is refused and the server stays up" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+
+    // The status length claims one byte, which pushes the search length past the end.
+    var out: [512]u8 = undefined;
+    const r = try rawCall(ctx, proto.OpCode.workflow_list_runs, "", "", &[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }, &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+    try testing.expectEqualStrings("invalid list-runs request", r.data);
+
+    const ok = try rawCall(ctx, proto.OpCode.workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), ok.status);
+}

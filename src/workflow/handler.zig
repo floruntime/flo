@@ -1190,44 +1190,46 @@ pub const WorkflowHandler = struct {
         }
     }
 
+    const ListRunsQuery = struct {
+        limit: u32,
+        status: ?[]const u8,
+        cursor: ?[]const u8,
+        search: ?[]const u8,
+    };
+
+    /// Value: [limit:u32]([len:u16][bytes]) for status, cursor and search; an
+    /// empty field is no filter. Null when any field runs past the value.
+    fn parseListRunsQuery(value: []const u8) ?ListRunsQuery {
+        if (value.len < 4) return null;
+        var offset: usize = 4;
+        var fields: [3]?[]const u8 = undefined;
+        for (&fields) |*field| {
+            if (value.len - offset < 2) return null;
+            const len = std.mem.readInt(u16, value[offset..][0..2], .little);
+            offset += 2;
+            if (value.len - offset < len) return null;
+            field.* = if (len > 0) value[offset .. offset + len] else null;
+            offset += len;
+        }
+        return .{
+            .limit = std.mem.readInt(u32, value[0..4], .little),
+            .status = fields[0],
+            .cursor = fields[1],
+            .search = fields[2],
+        };
+    }
+
     fn handleListRuns(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const workflow_name = req.key;
 
-        // Parse value: [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]
-        if (req.value.len < 10) { // 4 + 2 + 2 + 2 minimum
+        const query = parseListRunsQuery(req.value) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid list-runs request");
             return;
-        }
-
-        const limit = std.mem.readInt(u32, req.value[0..4], .little);
-        var offset: usize = 4;
-
-        // Status filter
-        const sf_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const status_filter: ?[]const u8 = if (sf_len > 0 and offset + sf_len <= req.value.len) blk: {
-            const s = req.value[offset .. offset + sf_len];
-            offset += sf_len;
-            break :blk s;
-        } else null;
-
-        // Cursor
-        const c_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const cursor_filter: ?[]const u8 = if (c_len > 0 and offset + c_len <= req.value.len) blk: {
-            const c = req.value[offset .. offset + c_len];
-            offset += c_len;
-            break :blk c;
-        } else null;
-
-        // Search query
-        const sq_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const search_query: ?[]const u8 = if (sq_len > 0 and offset + sq_len <= req.value.len) blk: {
-            const s = req.value[offset .. offset + sq_len];
-            offset += sq_len;
-            break :blk s;
-        } else null;
+        };
+        const limit = query.limit;
+        const status_filter = query.status;
+        const cursor_filter = query.cursor;
+        const search_query = query.search;
 
         // Lowercase the search query once for case-insensitive matching
         var search_lower_buf: [256]u8 = undefined;
@@ -3588,7 +3590,7 @@ pub const WorkflowHandler = struct {
         off += ver_len;
 
         if (off + 1 > value.len) return;
-        const status: RunStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(RunStatus, value[off]) orelse return;
         off += 1;
 
         if (off + 8 > value.len) return;
@@ -3701,8 +3703,8 @@ pub const WorkflowHandler = struct {
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
     fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
-        if (value.len < 9) return;
-        const status: RunStatus = @enumFromInt(value[0]);
+        if (value.len < 10) return;
+        const status = std.enums.fromInt(RunStatus, value[0]) orelse return;
         const completed_at_ms = std.mem.readInt(i64, value[1..9], .little);
 
         // Look up existing run (must have been replayed via workflow_start first)
@@ -4766,4 +4768,49 @@ test "step executor: checkPendingActions handles completed async action" {
     const run = handler.runs.get("default:run-8").?;
     // After resuming start → step_b (success) → flo.Completed
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+}
+
+test "list-runs query: every truncation of a valid value is refused, not read past" {
+    // limit 7, status "running", cursor "c1", search "abc"
+    const valid = [_]u8{ 7, 0, 0, 0, 7, 0 } ++ "running".* ++ [_]u8{ 2, 0 } ++ "c1".* ++ [_]u8{ 3, 0 } ++ "abc".*;
+    for (0..valid.len) |n| {
+        try testing.expect(WorkflowHandler.parseListRunsQuery(valid[0..n]) == null);
+    }
+    const q = WorkflowHandler.parseListRunsQuery(&valid).?;
+    try testing.expectEqual(@as(u32, 7), q.limit);
+    try testing.expectEqualStrings("running", q.status.?);
+    try testing.expectEqualStrings("c1", q.cursor.?);
+    try testing.expectEqualStrings("abc", q.search.?);
+
+    const empty = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const e = WorkflowHandler.parseListRunsQuery(&empty).?;
+    try testing.expect(e.status == null and e.cursor == null and e.search == null);
+}
+
+test "list-runs query: a length that overruns the value is refused" {
+    // Ten bytes, but status claims one byte, which shifts the search length past the end.
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }) == null);
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 }) == null);
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 'a', 'b' }) == null);
+}
+
+test "workflow replay: truncated and unknown-status entries are skipped" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    // [wf_len][wf][ver_len][ver][status][created_at][evt_len][idem_len]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
+    var bad_status = start;
+    bad_status[7] = 0xee;
+    handler.replayStart("default:r0", &bad_status);
+    try testing.expectEqual(@as(usize, 0), handler.runCount());
+
+    handler.replayStart("default:r1", &start);
+    try testing.expectEqual(@as(usize, 1), handler.runCount());
+
+    // Status and timestamp but no has_output byte.
+    handler.replayComplete("default:r1", &([_]u8{3} ++ [_]u8{0} ** 8));
+    handler.replayComplete("default:r1", &([_]u8{0xee} ++ [_]u8{0} ** 9));
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
 }
