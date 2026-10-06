@@ -1066,8 +1066,6 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        // Transaction ids are small per-shard counters: one begun in
-        // another namespace is not found from this one.
         const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_unknown,
@@ -1123,7 +1121,9 @@ pub const KVHandler = struct {
         } });
     }
 
-    /// Transaction `txn_id`, if it was begun in `namespace`.
+    /// Transaction `txn_id`, if it was begun in `namespace`. Ids are small
+    /// per-shard counters, so one begun in another namespace is not found
+    /// from this one.
     fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
         const t = txn_table.get(txn_id) orelse return null;
         return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
@@ -1189,7 +1189,6 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        // One begun in another namespace is not found from this one.
         const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
             return true;

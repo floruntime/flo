@@ -366,17 +366,15 @@ pub const StreamHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    /// Dispatch a stream command to the appropriate handler.
     /// Why a request's stream or group name cannot be used, or null. Keys
-    /// are qualified by namespace with NUL separators ("ns\x00stream",
-    /// "ns\x00stream\x00group"; the stream alone in "default"), so a name
-    /// holding a NUL could spell another namespace's key, and one too long
-    /// to qualify could only be used unqualified. Both are refused here, for
-    /// every stream request, before any key is built.
+    /// join namespace, stream and group with NUL ("ns\x00stream\x00group";
+    /// no prefix in "default"), so a name holding a NUL could spell another
+    /// namespace's key. Names too long to qualify are refused too. Checked
+    /// here for every request but list, before any key is built.
     fn nameRefusal(op: OpCode, req: Request) ?[]const u8 {
         if (op == .stream_list) return null; // key is a filter, never a name
         if (std.mem.indexOfScalar(u8, req.key, 0) != null) return "stream name must not contain NUL";
-        if (ns_keys.validateKeySize(req.namespace, req.key)) |why| return why;
+        if (ns_keys.validateKeySize(req.namespace, req.key) != null) return "stream name too long for its namespace";
         if (!isGroupOp(op)) return null;
         const group = (decodeGroupName(req.value) orelse return null).name;
         if (std.mem.indexOfScalar(u8, group, 0) != null) return "group name must not contain NUL";
@@ -394,6 +392,7 @@ pub const StreamHandler = struct {
 
     const NAME_TOO_LONG: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream name too long" } };
 
+    /// Dispatch a stream command to the appropriate handler.
     pub fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
@@ -1778,8 +1777,11 @@ pub const StreamHandler = struct {
                 // is unaffected.
                 var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
                 const ns = self.stream.resolveNamespace(cmd.namespace_hash);
-                const ns_name = ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key) catch cmd.key;
-                self.stream.registerStream(ns_name) catch {};
+                // A name that cannot be qualified is not listed rather than
+                // listed bare, where it could pass for another namespace's.
+                if (ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key)) |ns_name| {
+                    self.stream.registerStream(ns_name) catch {};
+                } else |_| {}
             }
         }
 

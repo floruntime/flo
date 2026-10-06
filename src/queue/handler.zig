@@ -416,8 +416,9 @@ pub const QueueHandler = struct {
     /// message must be in that queue, in that namespace: seqs are numbered
     /// across the partition, so the batch is refused whole if any is in
     /// another queue. A message already gone is no error (it may have been
-    /// taken and acked). Each seq is logged with its queue, and the applier
-    /// checks the same.
+    /// taken and acked) and, like a repeated seq, is not logged. Each seq
+    /// logged gets its own entry naming the queue, and the applier checks
+    /// the same.
     fn handleAckBatch(self: *QueueHandler, req: Request, kind: entry_mod.EntryType, not_persisted: []const u8) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
@@ -426,18 +427,26 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequences are required: [count:u32][seq:u64]*" } };
         };
         const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        var held: [MAX_ACK_BATCH]u64 = undefined;
+        var held_count: usize = 0;
         for (0..seqs.count) |i| {
-            if (self.queue.messages.get(seqs.at(i))) |msg| if (msg.queue_name_hash != queue_hash) {
+            const seq = seqs.at(i);
+            const msg = self.queue.messages.get(seq) orelse continue;
+            if (msg.queue_name_hash != queue_hash) {
                 return .{ .err = .{ .code = .not_found, .message = "message not found in this queue" } };
-            };
+            }
+            if (std.mem.indexOfScalar(u64, held[0..held_count], seq) == null) {
+                held[held_count] = seq;
+                held_count += 1;
+            }
         }
 
         var queue_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &queue_key, queue_hash, .little);
         var last: ?persistence_mod.ProposeResult = null;
-        for (0..seqs.count) |i| {
+        for (held[0..held_count]) |seq| {
             var seq_key: [8]u8 = undefined;
-            std.mem.writeInt(u64, &seq_key, seqs.at(i), .little);
+            std.mem.writeInt(u64, &seq_key, seq, .little);
             if (self.shard_ptr) |sptr| {
                 const shard: *Shard = @ptrCast(@alignCast(sptr));
                 last = persistence_mod.proposeEntry(shard, kind, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
@@ -1299,4 +1308,25 @@ test "queue handler: stats and the dead-letter count are one queue's, in its nam
     // [enqueued][dequeued][acked][nacked][dlq][expired][ready][leased][dead]
     try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[48..56], .little));
     try testing.expect(handler.handleCommand(makeRequest(.queue_stats, "", "", "")) == .err);
+}
+
+test "queue handler: an ack batch logs each held message once, and nothing for one already gone" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    var handler = QueueHandler.init(allocator, partition);
+
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
+    var it = handler.queue.messages.keyIterator();
+    const seq = it.next().?.*;
+    const before = handler.partition.ual.max_index;
+
+    var batch: [4 + 24]u8 = undefined;
+    std.mem.writeInt(u32, batch[0..4], 3, .little);
+    std.mem.writeInt(u64, batch[4..12], seq, .little);
+    std.mem.writeInt(u64, batch[12..20], seq, .little);
+    std.mem.writeInt(u64, batch[20..28], 99_999, .little);
+    try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, "")) != .err);
+    try testing.expectEqual(before + 1, handler.partition.ual.max_index);
+    try testing.expectEqual(@as(usize, 0), handler.queue.messages.count());
 }

@@ -119,8 +119,10 @@ pub const WorkerHandler = struct {
     }
 
     /// The registry key of worker `id` in `namespace`: "ns\x00id", or the
-    /// id alone in "default". Null if too long to be one.
+    /// id alone in "default". Null if too long to be one, or if the id
+    /// holds a NUL and so could spell another namespace's worker.
     pub fn workerKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, id: []const u8) ?[]const u8 {
+        if (std.mem.indexOfScalar(u8, id, 0) != null) return null;
         return ns_keys.qualifyKey(buf, namespace, id) catch null;
     }
 
@@ -164,8 +166,11 @@ pub const WorkerHandler = struct {
 
         switch (op) {
             .worker_register => {
-                shard.worker_handler.handleRegister(req);
-                shard.sendOkResponse(conn, req.header.request_id, "");
+                if (shard.worker_handler.handleRegister(req)) |why| {
+                    shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                } else {
+                    shard.sendOkResponse(conn, req.header.request_id, "");
+                }
             },
             .worker_heartbeat => {
                 if (shard.worker_handler.handleHeartbeat(req)) |status| {
@@ -220,11 +225,12 @@ pub const WorkerHandler = struct {
     /// value = [type:u8][max_concurrency:u32][process_count:u16]
     ///   ([name_len:u16][name][kind:u8])*
     ///   [has_metadata:u8][metadata_len:u16][metadata]?
-    fn handleRegister(self: *WorkerHandler, req: Request) void {
-        if (req.key.len == 0) return;
+    /// Why the worker was not registered, or null.
+    fn handleRegister(self: *WorkerHandler, req: Request) ?[]const u8 {
+        if (req.key.len == 0) return "worker id is required";
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = workerKey(&kbuf, req.namespace, req.key) orelse return;
-        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return;
+        const key = workerKey(&kbuf, req.namespace, req.key) orelse return "worker id too long, or holds a NUL";
+        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return "worker limit reached";
 
         const value = req.value;
         var offset: usize = 0;
@@ -309,20 +315,20 @@ pub const WorkerHandler = struct {
         const owned_key = self.allocator.dupe(u8, key) catch {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
-            return;
+            return "worker not registered: out of memory";
         };
         const owned_id = self.allocator.dupe(u8, req.key) catch {
             self.allocator.free(owned_key);
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
-            return;
+            return "worker not registered: out of memory";
         };
         const owned_namespace = self.allocator.dupe(u8, homeOf(req.namespace)) catch {
             self.allocator.free(owned_key);
             self.allocator.free(owned_id);
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
-            return;
+            return "worker not registered: out of memory";
         };
         const owned_metadata: ?[]const u8 = if (metadata) |m|
             self.allocator.dupe(u8, m) catch null
@@ -353,7 +359,9 @@ pub const WorkerHandler = struct {
             self.allocator.free(owned_namespace);
             if (owned_metadata) |m| self.allocator.free(m);
             if (owned_machine_id) |mid| self.allocator.free(mid);
+            return "worker not registered: out of memory";
         };
+        return null;
     }
 
     /// Heartbeat from a worker — lightweight keep-alive.
@@ -630,3 +638,22 @@ pub const WorkerHandler = struct {
         return .{ .items = S.name_buf[0..count], .next_cursor = null };
     }
 };
+
+fn testRequest(namespace: []const u8, id: []const u8) Request {
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.op_code = @intFromEnum(OpCode.worker_register);
+    return .{ .header = header, .namespace = namespace, .key = id, .value = "", .options = "" };
+}
+
+test "workers: one id in two namespaces is two workers, and an id holding a NUL names none" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try std.testing.expect(h.handleRegister(testRequest("b", "w")) == null);
+    try std.testing.expect(h.find("b", "w") != null);
+    try std.testing.expect(h.find("a", "w") == null);
+    // In "default" keys are bare, so "b\x00w" would be b's worker w.
+    try std.testing.expect(h.find("", "b\x00w") == null);
+    try std.testing.expect(h.handleRegister(testRequest("", "b\x00w")) != null);
+    try std.testing.expectEqual(@as(usize, 1), h.workers.count());
+}

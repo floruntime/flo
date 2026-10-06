@@ -105,6 +105,14 @@ test {
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");
+    _ = @import("worker/handler.zig");
+    _ = @import("workflow/validator.zig");
+    _ = @import("workflow/parser.zig");
+    _ = @import("workflow/definition.zig");
+    _ = @import("workflow/cron.zig");
+    _ = @import("workflow/jsonpath.zig");
+    _ = @import("workflow/plan_types.zig");
+    _ = @import("workflow/types.zig");
     _ = @import("processing/handler.zig");
     _ = @import("processing/operator.zig");
     _ = @import("processing/collector.zig");

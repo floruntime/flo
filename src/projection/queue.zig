@@ -178,7 +178,7 @@ pub const QueueProjection = struct {
         namespace: []const u8,
         enqueued: u64,
         dequeued: u64,
-        // This queue's share of `Stats`: a queue's numbers are not another's.
+        // This queue's share of `Stats`.
         acked: u64 = 0,
         nacked: u64 = 0,
         dead_lettered: u64 = 0,
@@ -453,8 +453,12 @@ pub const QueueProjection = struct {
     }
 
     /// Negative-acknowledge: return message to ready heap or move to DLQ.
+    /// Only a leased message is nacked: one already back in the ready heap
+    /// (a nack applied twice, a retried batch) is left alone, so it is not
+    /// queued twice or counted against its attempts again.
     pub fn nack(self: *QueueProjection, seq: u64, now_ns: u64) !void {
         if (self.messages.getPtr(seq)) |msg| {
+            if (msg.state != .leased) return;
             if (self.max_attempts > 0 and msg.attempts >= self.max_attempts) {
                 // Move to DLQ
                 try self.moveToDLQ(msg, now_ns);
@@ -1158,9 +1162,11 @@ test "queue: serialize/deserialize round-trip" {
     try q.registerQueue(42, "tasks", "default");
     try q.registerQueue(99, "orders", "production");
 
-    // One dead letter, from queue 99.
+    // One dead letter, from queue 99: leased at its last attempt, then nacked.
     const dead = try q.enqueue(103, 0, 3500, 99, "dead");
-    q.messages.getPtr(dead).?.attempts = q.max_attempts;
+    const msg = q.messages.getPtr(dead).?;
+    msg.state = .leased;
+    msg.attempts = q.max_attempts;
     try q.nack(dead, 3600);
     try testing.expectEqual(@as(usize, 1), q.dlq.items.len);
 
@@ -1180,7 +1186,7 @@ test "queue: serialize/deserialize round-trip" {
     try testing.expectEqual(@as(u64, 99), q2.dlq.items[0].queue_name_hash);
     try testing.expectEqual(dead, q2.dlq.items[0].seq);
 
-    // Verify next_seq was preserved (should be 4 after 3 enqueues)
+    // Verify next_seq was preserved
     try testing.expectEqual(q.next_seq, q2.next_seq);
 
     // Verify known queues restored
@@ -1228,4 +1234,18 @@ test "queue: an ack or nack entry touches a message only in the queue it names" 
     try q.applyEntry(&entry);
     try testing.expect(!q.inQueue(theirs, 42));
     try testing.expectEqual(@as(u64, 1), q.stats.acked);
+}
+
+test "queue: a nack applied twice queues the message once and counts one attempt" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000, .max_attempts = 5 });
+    defer q.deinit();
+    const seq = try q.enqueue(100, 0, 1000, 42, "msg");
+    _ = try q.dequeue(2000, 42);
+    try q.nack(seq, 3000);
+    try q.nack(seq, 3001);
+    try testing.expectEqual(@as(usize, 1), q.ready_heap.count());
+    try testing.expectEqual(@as(u64, 1), q.stats.nacked);
+    const d = (try q.dequeue(4000, 42)).?;
+    try testing.expectEqual(@as(u32, 2), d.attempts);
+    try testing.expect(try q.dequeue(4001, 42) == null);
 }

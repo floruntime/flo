@@ -410,6 +410,18 @@ pub const JobDefinition = struct {
         for (self.operators.items) |*op| {
             if (op.getConfig("namespace")) |ns| if (ns.len > 0) if (nameRefusal(ns)) |why| return why;
         }
+        // Stream and queue names are keyed under their namespace with NUL
+        // separators: one holding a NUL, or too long to qualify, could be
+        // read or listed as another namespace's.
+        for (self.sources.items) |src| if (resourceRefusal(src.namespace, src.stream)) |why| return why;
+        for (self.sinks.items) |snk| if (resourceRefusal(snk.namespace, snk.target)) |why| return why;
+        return null;
+    }
+
+    fn resourceRefusal(namespace: []const u8, name: []const u8) ?[]const u8 {
+        if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return "stream or queue name must not contain NUL";
+        if (@import("../namespace/handler.zig").validateKeySize(namespace, name) != null) return "stream or queue name too long for its namespace";
         return null;
     }
 

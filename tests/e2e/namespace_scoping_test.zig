@@ -231,6 +231,16 @@ test "e2e/scoping: a job reads other namespaces but writes only its own" {
     try testing.expect(try readsBack(ctx, "copied", "acme", "shared-record"));
 }
 
+/// Whether a table printed by the CLI has a row whose first column is `name`.
+fn hasRow(table: []const u8, name: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        var cols = std.mem.tokenizeAny(u8, line, " \t");
+        if (cols.next()) |first| if (std.mem.eql(u8, first, name)) return true;
+    }
+    return false;
+}
+
 /// Send one request over the client protocol and return its status and
 /// message: names holding a NUL cannot be passed as command-line arguments.
 fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !struct { status: u8, data: []const u8 } {
@@ -271,8 +281,9 @@ test "e2e/scoping: a name holding a NUL, which could spell another namespace's k
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "must not contain NUL") != null);
     }
+    // b's action x is still there, as it was registered.
     const list = try ctx.execCapture(&.{ "action", "list", "-n", "b" });
-    try testing.expect(std.mem.indexOf(u8, list, "x") != null);
+    try testing.expect(hasRow(list, "x"));
 
     // A stream "b" with group "orders\x00g" would be b's group g on "orders".
     var group: [2 + 8]u8 = undefined;

@@ -136,8 +136,11 @@ pub const ActionsHandler = struct {
 
     /// The registry key of action `name` in `namespace` (empty is
     /// "default"): "ns\x00name", or the bare name in "default", as the
-    /// register entry carries it. Null if too long to be one.
+    /// register entry carries it. Null if too long to be one, or if the
+    /// name holds a NUL.
     pub fn defKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, name: []const u8) ?[]const u8 {
+        // A name holding a NUL could spell another namespace's key.
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return null;
         return ns_keys.qualifyKey(buf, namespace, name) catch null;
     }
 
@@ -2352,4 +2355,10 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     try std.testing.expectEqualStrings("{\"ok\":true}", done.result_owned.?);
     try std.testing.expectEqualStrings("w-2", done.worker_id_owned.?);
     try std.testing.expect(done.error_owned == null);
+}
+
+test "actions: an action name holding a NUL has no registry key" {
+    var buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    try std.testing.expectEqualStrings("x", ActionsHandler.defKey(&buf, "default", "x").?);
+    try std.testing.expect(ActionsHandler.defKey(&buf, "", "b\x00x") == null);
 }

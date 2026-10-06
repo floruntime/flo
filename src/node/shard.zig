@@ -4150,7 +4150,7 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         pos += n.len;
         // partition_count from stream metadata, keyed by the qualified name
         var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-        const pc = stream.getPartitionCount(handler_mod.qualifyKey(&qbuf, ns, n) catch n);
+        const pc = if (handler_mod.qualifyKey(&qbuf, ns, n)) |q| stream.getPartitionCount(q) else |_| 1;
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
