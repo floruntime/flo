@@ -222,7 +222,7 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
 }
 
 /// GET /queues/:name/dlq - Dead-letter queue entries
-/// Query params: ?limit=
+/// Query params: ?limit=&namespace=
 pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
     const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);

@@ -1189,7 +1189,8 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        // One begun in another namespace is not found from this one.
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
             return true;
         };
@@ -1200,16 +1201,6 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_cross_shard,
                 .message = "key hashes to a different partition than the transaction",
-            } });
-            return true;
-        }
-
-        // Single-namespace guard.
-        const req_ns_hash = router.namespaceHash(req.namespace);
-        if (txn_state.namespace_hash != req_ns_hash) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
-                .code = .kv_txn_unsupported_op,
-                .message = "transaction is bound to a different namespace",
             } });
             return true;
         }
@@ -1258,18 +1249,13 @@ pub const KVHandler = struct {
             return .err;
         };
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
             return .err;
         };
         const expected_hash = preRouteByKey(req) orelse 0;
         if (txn_state.pinned_hash != expected_hash) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_cross_shard, .message = "key hashes to a different partition than the transaction" } });
-            return .err;
-        }
-        const req_ns_hash = router.namespaceHash(req.namespace);
-        if (txn_state.namespace_hash != req_ns_hash) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unsupported_op, .message = "transaction is bound to a different namespace" } });
             return .err;
         }
         const last = txn_table.lastOpForKey(txn_id, qkey) orelse return .miss;

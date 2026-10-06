@@ -27,6 +27,7 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
+const ns_keys = @import("../namespace/handler.zig");
 
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -61,6 +62,8 @@ pub const ProcessInfo = struct {
 };
 
 pub const WorkerRecord = struct {
+    /// The registry key (`WorkerHandler.workerKey`), owned.
+    key_owned: []const u8,
     id_owned: []const u8,
     worker_type: WorkerType,
     status: WorkerStatus,
@@ -82,6 +85,7 @@ pub const WorkerRecord = struct {
 
 pub const WorkerHandler = struct {
     allocator: Allocator,
+    /// Keyed by `workerKey`: one worker id in two namespaces is two workers.
     workers: std.StringHashMap(WorkerRecord),
 
     const MAX_WORKERS: usize = 10_000;
@@ -107,10 +111,27 @@ pub const WorkerHandler = struct {
             self.allocator.free(p.name_owned);
         }
         w.processes.deinit(self.allocator);
+        self.allocator.free(w.key_owned);
         self.allocator.free(w.id_owned);
         self.allocator.free(w.namespace_owned);
         if (w.metadata_owned) |m| self.allocator.free(m);
         if (w.machine_id_owned) |mid| self.allocator.free(mid);
+    }
+
+    /// The registry key of worker `id` in `namespace`: "ns\x00id", or the
+    /// id alone in "default". Null if too long to be one.
+    pub fn workerKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, id: []const u8) ?[]const u8 {
+        return ns_keys.qualifyKey(buf, namespace, id) catch null;
+    }
+
+    /// Worker `id` as registered in `namespace`.
+    pub fn find(self: *WorkerHandler, namespace: []const u8, id: []const u8) ?*WorkerRecord {
+        var buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        return self.workers.getPtr(workerKey(&buf, namespace, id) orelse return null);
+    }
+
+    fn homeOf(namespace: []const u8) []const u8 {
+        return if (namespace.len == 0) "default" else namespace;
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -133,6 +154,13 @@ pub const WorkerHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @enumFromInt(req.header.op_code);
+
+        // A worker id is part of the registry key ("ns\x00id"), so one
+        // holding a NUL could spell another namespace's worker.
+        if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker id must not contain NUL");
+            return;
+        }
 
         switch (op) {
             .worker_register => {
@@ -159,7 +187,7 @@ pub const WorkerHandler = struct {
                 }
             },
             .worker_list => {
-                const data = shard.worker_handler.serializeWorkerList() catch {
+                const data = shard.worker_handler.serializeWorkerList(req.namespace) catch {
                     shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
                     return;
                 };
@@ -167,7 +195,7 @@ pub const WorkerHandler = struct {
                 shard.sendOkResponse(conn, req.header.request_id, data);
             },
             .worker_info => {
-                const data = shard.worker_handler.serializeWorkerInfo(req.key) catch |err| switch (err) {
+                const data = shard.worker_handler.serializeWorkerInfo(req.namespace, req.key) catch |err| switch (err) {
                     error.NotFound => {
                         shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
                         return;
@@ -194,7 +222,9 @@ pub const WorkerHandler = struct {
     ///   [has_metadata:u8][metadata_len:u16][metadata]?
     fn handleRegister(self: *WorkerHandler, req: Request) void {
         if (req.key.len == 0) return;
-        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(req.key)) return;
+        var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const key = workerKey(&kbuf, req.namespace, req.key) orelse return;
+        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return;
 
         const value = req.value;
         var offset: usize = 0;
@@ -270,18 +300,25 @@ pub const WorkerHandler = struct {
         }
 
         // Remove old registration if exists
-        if (self.workers.fetchRemove(req.key)) |old| {
+        if (self.workers.fetchRemove(key)) |old| {
             var old_val = old.value;
             self.freeWorkerRecord(&old_val);
         }
 
         const now_ms = @import("stdx").time.milliTimestamp();
-        const owned_id = self.allocator.dupe(u8, req.key) catch {
+        const owned_key = self.allocator.dupe(u8, key) catch {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
             return;
         };
-        const owned_namespace = self.allocator.dupe(u8, req.namespace) catch {
+        const owned_id = self.allocator.dupe(u8, req.key) catch {
+            self.allocator.free(owned_key);
+            for (processes.items) |p| self.allocator.free(p.name_owned);
+            processes.deinit(self.allocator);
+            return;
+        };
+        const owned_namespace = self.allocator.dupe(u8, homeOf(req.namespace)) catch {
+            self.allocator.free(owned_key);
             self.allocator.free(owned_id);
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
@@ -296,7 +333,8 @@ pub const WorkerHandler = struct {
         else
             null;
 
-        self.workers.put(owned_id, .{
+        self.workers.put(owned_key, .{
+            .key_owned = owned_key,
             .id_owned = owned_id,
             .worker_type = worker_type,
             .status = .active,
@@ -310,6 +348,7 @@ pub const WorkerHandler = struct {
         }) catch {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
+            self.allocator.free(owned_key);
             self.allocator.free(owned_id);
             self.allocator.free(owned_namespace);
             if (owned_metadata) |m| self.allocator.free(m);
@@ -321,7 +360,7 @@ pub const WorkerHandler = struct {
     /// value = [current_load:u32]
     /// Returns the worker's current status (so the SDK can detect draining).
     fn handleHeartbeat(self: *WorkerHandler, req: Request) ?WorkerStatus {
-        const worker = self.workers.getPtr(req.key) orelse return null;
+        const worker = self.find(req.namespace, req.key) orelse return null;
         worker.last_heartbeat_ms = @import("stdx").time.milliTimestamp();
 
         // Don't reset draining→active — drain is sticky until deregister
@@ -339,14 +378,16 @@ pub const WorkerHandler = struct {
     /// Drain a worker — marks it as draining so no new tasks are assigned.
     /// key = worker_id. Returns true if the worker was found.
     fn handleDrain(self: *WorkerHandler, req: Request) bool {
-        const worker = self.workers.getPtr(req.key) orelse return false;
+        const worker = self.find(req.namespace, req.key) orelse return false;
         worker.status = .draining;
         return true;
     }
 
     /// Deregister a worker. key = worker_id.
     fn handleDeregister(self: *WorkerHandler, req: Request) void {
-        if (self.workers.fetchRemove(req.key)) |old| {
+        var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const key = workerKey(&kbuf, req.namespace, req.key) orelse return;
+        if (self.workers.fetchRemove(key)) |old| {
             var old_val = old.value;
             self.freeWorkerRecord(&old_val);
         }
@@ -365,8 +406,8 @@ pub const WorkerHandler = struct {
     }
 
     /// Increment completed count for a worker + specific process (called by actions handler).
-    pub fn recordCompletion(self: *WorkerHandler, worker_id: []const u8, process_name: ?[]const u8) void {
-        if (self.workers.getPtr(worker_id)) |w| {
+    pub fn recordCompletion(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
+        if (self.find(namespace, worker_id)) |w| {
             w.tasks_completed += 1;
             if (w.current_load > 0) w.current_load -= 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, false);
@@ -374,8 +415,8 @@ pub const WorkerHandler = struct {
     }
 
     /// Increment failed count for a worker + specific process (called by actions handler).
-    pub fn recordFailure(self: *WorkerHandler, worker_id: []const u8, process_name: ?[]const u8) void {
-        if (self.workers.getPtr(worker_id)) |w| {
+    pub fn recordFailure(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
+        if (self.find(namespace, worker_id)) |w| {
             w.tasks_failed += 1;
             if (w.current_load > 0) w.current_load -= 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, true);
@@ -383,15 +424,15 @@ pub const WorkerHandler = struct {
     }
 
     /// Increment current load for a worker (when task assigned).
-    pub fn recordTaskAssigned(self: *WorkerHandler, worker_id: []const u8) void {
-        if (self.workers.getPtr(worker_id)) |w| {
+    pub fn recordTaskAssigned(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) void {
+        if (self.find(namespace, worker_id)) |w| {
             w.current_load += 1;
         }
     }
 
     /// Check if a worker is draining (used by action_await to reject new tasks).
-    pub fn isDraining(self: *WorkerHandler, worker_id: []const u8) bool {
-        if (self.workers.get(worker_id)) |w| {
+    pub fn isDraining(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) bool {
+        if (self.find(namespace, worker_id)) |w| {
             return w.status == .draining;
         }
         return false;
@@ -520,11 +561,12 @@ pub const WorkerHandler = struct {
     ///   [registered_at:i64][last_heartbeat:i64]
     ///   [process_count:u16]([name_len:u16][name][kind:u8][run_count:u64][fail_count:u64][last_run_at:i64])*
     ///   [has_metadata:u8][metadata_len:u16][metadata]?
-    fn serializeWorkerList(self: *WorkerHandler) ![]u8 {
+    fn serializeWorkerList(self: *WorkerHandler, namespace: []const u8) ![]u8 {
         var total_size: usize = 4; // count
         var entry_count: u32 = 0;
         var it = self.workers.iterator();
         while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
             total_size += workerWireSize(entry.value_ptr);
             entry_count += 1;
         }
@@ -539,6 +581,7 @@ pub const WorkerHandler = struct {
 
         var it2 = self.workers.iterator();
         while (it2.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
             offset = writeWorkerRecord(buf, offset, entry.value_ptr);
         }
 
@@ -551,8 +594,8 @@ pub const WorkerHandler = struct {
     }
 
     /// Serialize a single worker's info.
-    fn serializeWorkerInfo(self: *WorkerHandler, worker_id: []const u8) ![]u8 {
-        const w = self.workers.getPtr(worker_id) orelse return error.NotFound;
+    fn serializeWorkerInfo(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) ![]u8 {
+        const w = self.find(namespace, worker_id) orelse return error.NotFound;
 
         const total_size = workerWireSize(w);
         const buf = try self.allocator.alloc(u8, total_size);
@@ -565,7 +608,7 @@ pub const WorkerHandler = struct {
     /// ShardWalker LocalScanFn for worker_list.
     fn localScanWorkers(
         ctx: *anyopaque,
-        _: []const u8,
+        namespace: []const u8,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
@@ -578,6 +621,7 @@ pub const WorkerHandler = struct {
         var count: usize = 0;
         var it = handler.workers.iterator();
         while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
             if (count >= S.name_buf.len) break;
             S.name_buf[count] = entry.value_ptr.id_owned;
             count += 1;

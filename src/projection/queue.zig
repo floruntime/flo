@@ -71,8 +71,8 @@ pub const DLQEntry = struct {
     ual_index: u64,
     attempts: u32,
     moved_at_ns: u64,
-    /// The queue the message died in (its `queue_name_hash`), so a queue's
-    /// dead letters are listed without another queue's, or namespace's.
+    /// The queue the message died in, so one queue's dead letters can be
+    /// told from another's.
     queue_name_hash: u64,
 };
 
@@ -178,6 +178,11 @@ pub const QueueProjection = struct {
         namespace: []const u8,
         enqueued: u64,
         dequeued: u64,
+        // This queue's share of `Stats`: a queue's numbers are not another's.
+        acked: u64 = 0,
+        nacked: u64 = 0,
+        dead_lettered: u64 = 0,
+        leases_expired: u64 = 0,
     };
 
     pub const Stats = struct {
@@ -443,6 +448,7 @@ pub const QueueProjection = struct {
                 self.allocator.free(kv.value.payload);
             }
             self.stats.acked += 1;
+            if (self.known_queues.getPtr(kv.value.queue_name_hash)) |meta| meta.acked += 1;
         }
     }
 
@@ -459,6 +465,7 @@ pub const QueueProjection = struct {
                 try self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority });
             }
             self.stats.nacked += 1;
+            if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.nacked += 1;
         }
     }
 
@@ -487,6 +494,26 @@ pub const QueueProjection = struct {
         return self.dlq.items.len;
     }
 
+    /// One queue's message counts by state: ready, leased, dead letters.
+    pub fn queueCounts(self: *const QueueProjection, queue_name_hash: u64) struct { ready: usize, leased: usize, dead: usize } {
+        var ready: usize = 0;
+        var leased: usize = 0;
+        var it = self.messages.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.queue_name_hash != queue_name_hash) continue;
+            switch (kv.value_ptr.state) {
+                .ready => ready += 1,
+                .leased => leased += 1,
+                else => {},
+            }
+        }
+        var dead: usize = 0;
+        for (self.dlq.items) |d| {
+            if (d.queue_name_hash == queue_name_hash) dead += 1;
+        }
+        return .{ .ready = ready, .leased = leased, .dead = dead };
+    }
+
     /// Total messages tracked (ready + leased, not DLQ).
     pub fn totalMessages(self: *const QueueProjection) usize {
         return self.messages.count();
@@ -511,6 +538,7 @@ pub const QueueProjection = struct {
                 self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority }) catch {};
 
                 self.stats.leases_expired += 1;
+                if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.leases_expired += 1;
             }
         }
     }
@@ -535,6 +563,7 @@ pub const QueueProjection = struct {
 
         msg.state = .dlq;
         self.stats.dlq_count += 1;
+        if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.dead_lettered += 1;
     }
 
     // ─── UAL Entry application ─────────────────────────────────────────────
@@ -647,10 +676,11 @@ pub const QueueProjection = struct {
     ///   [lease_expiry_ns: u64][enqueued_at_ns: u64][queue_name_hash: u64]
     ///   [payload_len: u32][payload bytes]
     /// Then: [dlq_count: u32] then per DLQ entry:
-    ///   [seq: u64][ual_index: u64][attempts: u32][moved_at_ns: u64]
+    ///   [seq: u64][ual_index: u64][attempts: u32][moved_at_ns: u64][queue_name_hash: u64]
     /// Then: [known_queue_count: u32] then per known queue:
     ///   [name_hash: u64][name_len: u16][name bytes][ns_len: u16][ns bytes]
-    ///   [enqueued: u64][dequeued: u64]
+    ///   [enqueued: u64][dequeued: u64][acked: u64][nacked: u64]
+    ///   [dead_lettered: u64][leases_expired: u64]
     /// Caller owns returned slice.
     pub fn serialize(self: *QueueProjection, allocator: Allocator) ![]u8 {
         // Calculate total size
@@ -666,8 +696,8 @@ pub const QueueProjection = struct {
         total_size += 4; // count
         var kq_it = self.known_queues.iterator();
         while (kq_it.next()) |kv| {
-            // hash(8) + name_len(2) + name + ns_len(2) + ns + enqueued(8) + dequeued(8)
-            total_size += 28 + kv.value_ptr.name.len + kv.value_ptr.namespace.len;
+            // hash(8) + name_len(2) + name + ns_len(2) + ns + 6 counters(48)
+            total_size += 60 + kv.value_ptr.name.len + kv.value_ptr.namespace.len;
         }
 
         const buf = try allocator.alloc(u8, total_size);
@@ -746,6 +776,10 @@ pub const QueueProjection = struct {
             offset += 8;
             std.mem.writeInt(u64, buf[offset..][0..8], meta.dequeued, .little);
             offset += 8;
+            for ([_]u64{ meta.acked, meta.nacked, meta.dead_lettered, meta.leases_expired }) |n| {
+                std.mem.writeInt(u64, buf[offset..][0..8], n, .little);
+                offset += 8;
+            }
         }
 
         return buf;
@@ -858,7 +892,7 @@ pub const QueueProjection = struct {
             }
             const ns_len = std.mem.readInt(u16, data[offset..][0..2], .little);
             offset += 2;
-            if (offset + ns_len + 16 > data.len) {
+            if (offset + ns_len + 48 > data.len) {
                 self.allocator.free(name);
                 return;
             }
@@ -868,12 +902,21 @@ pub const QueueProjection = struct {
             offset += 8;
             const dequeued = std.mem.readInt(u64, data[offset..][0..8], .little);
             offset += 8;
+            var counters: [4]u64 = undefined;
+            for (&counters) |*n| {
+                n.* = std.mem.readInt(u64, data[offset..][0..8], .little);
+                offset += 8;
+            }
 
             try self.known_queues.put(hash, .{
                 .name = name,
                 .namespace = namespace,
                 .enqueued = enqueued,
                 .dequeued = dequeued,
+                .acked = counters[0],
+                .nacked = counters[1],
+                .dead_lettered = counters[2],
+                .leases_expired = counters[3],
             });
         }
     }
@@ -1115,6 +1158,12 @@ test "queue: serialize/deserialize round-trip" {
     try q.registerQueue(42, "tasks", "default");
     try q.registerQueue(99, "orders", "production");
 
+    // One dead letter, from queue 99.
+    const dead = try q.enqueue(103, 0, 3500, 99, "dead");
+    q.messages.getPtr(dead).?.attempts = q.max_attempts;
+    try q.nack(dead, 3600);
+    try testing.expectEqual(@as(usize, 1), q.dlq.items.len);
+
     // Serialize
     const data = try q.serialize(testing.allocator);
     defer testing.allocator.free(data);
@@ -1125,8 +1174,11 @@ test "queue: serialize/deserialize round-trip" {
 
     try q2.deserialize(data);
 
-    // Verify messages restored
-    try testing.expectEqual(@as(usize, 3), q2.messages.count());
+    // Verify messages restored (the dead letter's message stays held)
+    try testing.expectEqual(@as(usize, 4), q2.messages.count());
+    try testing.expectEqual(@as(usize, 1), q2.dlq.items.len);
+    try testing.expectEqual(@as(u64, 99), q2.dlq.items[0].queue_name_hash);
+    try testing.expectEqual(dead, q2.dlq.items[0].seq);
 
     // Verify next_seq was preserved (should be 4 after 3 enqueues)
     try testing.expectEqual(q.next_seq, q2.next_seq);

@@ -65,8 +65,8 @@ pub const ActionsHandler = struct {
 
     allocator: Allocator,
 
-    /// In-memory action registry, keyed by `defKey`: the name qualified by
-    /// its namespace, so one name in two namespaces is two actions.
+    /// In-memory action registry, keyed by `defKey`: "ns\x00name", or the
+    /// bare name in "default", so one name in two namespaces is two actions.
     actions: std.StringHashMap(ActionRecord),
 
     /// In-memory run store. run_id → RunRecord.
@@ -106,8 +106,8 @@ pub const ActionsHandler = struct {
     pub const RunRecord = struct {
         run_id_owned: []const u8,
         action_name_owned: []const u8,
-        /// The namespace the run was invoked in ("default" for none); every
-        /// lookup by run id must name it.
+        /// The namespace the run was invoked in ("default" for none); a client
+        /// reaches the run only from there.
         namespace_owned: []const u8,
         input_owned: ?[]const u8,
         labels_owned: ?[]const u8 = null,
@@ -135,8 +135,8 @@ pub const ActionsHandler = struct {
     }
 
     /// The registry key of action `name` in `namespace` (empty is
-    /// "default"): the name qualified by its namespace, as the register
-    /// entry carries it. Null if too long to be one.
+    /// "default"): "ns\x00name", or the bare name in "default", as the
+    /// register entry carries it. Null if too long to be one.
     pub fn defKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, name: []const u8) ?[]const u8 {
         return ns_keys.qualifyKey(buf, namespace, name) catch null;
     }
@@ -301,7 +301,7 @@ pub const ActionsHandler = struct {
         const op: OpCode = @enumFromInt(req.header.op_code);
         const action_name = parseLeadingName(req.value);
         const ws = resolveWorkerShard(shard, req.namespace, req.key);
-        if (op == .action_complete) ws.worker_handler.recordCompletion(req.key, action_name) else ws.worker_handler.recordFailure(req.key, action_name);
+        if (op == .action_complete) ws.worker_handler.recordCompletion(req.namespace, req.key, action_name) else ws.worker_handler.recordFailure(req.namespace, req.key, action_name);
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -329,7 +329,7 @@ pub const ActionsHandler = struct {
         const worker_id = req.key;
 
         // Reject if worker is draining (no new task assignments)
-        if (worker_id.len > 0 and shard.worker_handler.isDraining(worker_id)) {
+        if (worker_id.len > 0 and shard.worker_handler.isDraining(req.namespace, worker_id)) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker is draining");
             return;
         }
@@ -345,7 +345,7 @@ pub const ActionsHandler = struct {
                 .local => shard,
                 .shard => |t| if (shard.peer_shards) |peers| (if (t.shard_id < peers.len) peers[t.shard_id] else shard) else shard,
             };
-            break :blk if (ws.worker_handler.workers.get(worker_id)) |w| w.metadata_owned else null;
+            break :blk if (ws.worker_handler.find(namespace, worker_id)) |w| w.metadata_owned else null;
         } else null;
 
         // Try to claim a pending run for ANY registered action, not just the first.
@@ -397,7 +397,7 @@ pub const ActionsHandler = struct {
         while (it.next()) |name| {
             const target = resolveActionShard(shard, namespace, name);
             if (target.actions_handler.claimPendingRun(namespace, name, worker_labels, worker_id)) |task| {
-                shard.worker_handler.recordTaskAssigned(worker_id);
+                shard.worker_handler.recordTaskAssigned(namespace, worker_id);
                 sendTaskAssignment(shard, conn.replyTo(), req.header.request_id, task);
                 return true;
             }
@@ -490,6 +490,14 @@ pub const ActionsHandler = struct {
 
     pub fn handleCommand(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
+        // The registry key is "ns\x00name" ("name" in "default"), so a name
+        // holding a NUL could spell another namespace's key.
+        switch (op) {
+            .action_register, .action_invoke, .action_delete => if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
+                return .{ .err = .{ .code = .invalid_request, .message = "action name must not contain NUL" } };
+            },
+            else => {},
+        }
         return switch (op) {
             .action_register => self.handleRegister(shard, req),
             .action_invoke => self.handleInvoke(shard, req),
@@ -575,7 +583,9 @@ pub const ActionsHandler = struct {
     /// is the caller's, since the result points into it.
     fn registerOutcome(self: *ActionsHandler, namespace: []const u8, name: []const u8, ver_buf: *[12]u8) CommandResult {
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = defKey(&kbuf, namespace, name) orelse name;
+        const key = defKey(&kbuf, namespace, name) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
+        };
         const stored = self.actions.get(key) orelse {
             return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
         };
@@ -602,7 +612,9 @@ pub const ActionsHandler = struct {
 
         // Check action exists, in this namespace
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = defKey(&kbuf, req.namespace, action_name) orelse action_name;
+        const key = defKey(&kbuf, req.namespace, action_name) orelse {
+            return .{ .err = .{ .code = .not_found, .message = "action not found" } };
+        };
         if (!self.actions.contains(key)) {
             return .{ .err = .{ .code = .not_found, .message = "action not found" } };
         }
@@ -1327,8 +1339,6 @@ pub const ActionsHandler = struct {
             name = key[sep + 1 ..];
         }
 
-        // The entry's key is the registry key: one name in two namespaces
-        // is two actions.
         const version: u32 = if (self.actions.get(key)) |old| old.version + 1 else 1;
         const created_at_ns = std.mem.readInt(u64, value[0..8], .little);
         // The client's register value follows, so owner, timeout and
@@ -1461,7 +1471,8 @@ pub const ActionsHandler = struct {
         const namespace = invokeNamespace(value);
 
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const max_retries: u32 = if (self.actions.get(defKey(&kbuf, namespace, action_name) orelse action_name)) |arec| arec.max_retries else 3;
+        const arec = if (defKey(&kbuf, namespace, action_name)) |k| self.actions.get(k) else null;
+        const max_retries: u32 = if (arec) |a| a.max_retries else 3;
         const owned_run_id = self.allocator.dupe(u8, run_id) catch return;
         const owned_action_name = self.allocator.dupe(u8, action_name) catch {
             self.allocator.free(owned_run_id);
@@ -1688,7 +1699,7 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
                 break :blk shard;
             },
         };
-        if (worker_shard.worker_handler.workers.getPtr(worker_id)) |w| {
+        if (worker_shard.worker_handler.find(namespace, worker_id)) |w| {
             worker_labels = w.metadata_owned;
             worker_ptr = w;
         }
@@ -2301,7 +2312,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
 
     var reg_buf: [256]u8 = undefined;
     const reg = ActionsHandler.encodeRegisterValue(&reg_buf, 1, "") orelse return error.EncodeFailed;
-    h.replayRegister("default\x00echo", reg);
+    h.replayRegister("echo", reg);
 
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", 1000, "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;

@@ -1987,7 +1987,7 @@ pub const WorkflowHandler = struct {
         now_ms: i64,
     ) ?[]const u8 {
         var kbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = ActionsHandler.defKey(&kbuf, namespace, action_name) orelse action_name;
+        const key = ActionsHandler.defKey(&kbuf, namespace, action_name) orelse "";
         const action = shard.actions_handler.actions.get(key) orelse {
             self.addHistoryEvent(run, "action_not_found", action_name, now_ms);
             return definition.StepOutcome.target_not_found;

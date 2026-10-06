@@ -4335,14 +4335,15 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     defer shard.queue_handler.allocator.free(data);
 
     // Auto-ack: persist a queue_ack entry so the message doesn't reappear
-    // after restart, stamped with the queue's namespace and naming the
-    // queue, as any ack does.
+    // after restart; it names the queue, as any ack does.
     {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
         var queue_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &queue_key, queue_name_hash, .little);
-        const namespace = if (partition.queue.known_queues.get(queue_name_hash)) |meta| meta.namespace else "";
+        // The waiter holds only the queue's hash; its namespace comes from
+        // the queue's registration.
+        const namespace = if (partition.queue.known_queues.get(queue_name_hash)) |meta| meta.namespace else "default";
 
         // Same contract as the queue handler's dequeue-ack: log, never fail
         // the dequeue. The ack applies when it commits.

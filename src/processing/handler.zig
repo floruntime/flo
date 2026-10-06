@@ -933,11 +933,10 @@ pub const ProcessingHandler = struct {
 
         const yaml = value[off..];
 
-        // Re-parse with the job's namespace as the fallback, exactly as the
-        // submit did, so endpoints and lookups that name none resolve to it
-        // here too, on every replica and every restart. Keep `def` alive so
-        // we can also rebuild the execution pipeline below — createPipeline
-        // deep-copies what it retains, so freeing `def` at function end is safe.
+        // Re-parse with the job's namespace as fallback, as the submit did, so
+        // endpoints and lookups that name none resolve alike on every replica
+        // and restart. `def` stays alive for createPipeline, which deep-copies
+        // what it keeps.
         var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw) catch return;
         defer def.deinit(self.allocator);
         // The submit checked these; the applier holds every replica to them.

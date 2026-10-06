@@ -329,7 +329,15 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
                     idx += 1;
                 }
 
-                break :blk entries[0..idx];
+                // Values of other kinds were skipped: keep the slice exactly
+                // as long as its allocation, since later growth frees it.
+                if (idx < entries.len) {
+                    const exact = allocator.alloc(OperatorSpec.ConfigEntry, idx) catch return error.OutOfMemory;
+                    @memcpy(exact, entries[0..idx]);
+                    allocator.free(entries);
+                    break :blk exact;
+                }
+                break :blk entries;
             };
 
             // For classify operators, expand `rules:` array into indexed condition_N/tag_N pairs
