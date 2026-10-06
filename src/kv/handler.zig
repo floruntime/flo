@@ -1066,7 +1066,9 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        // Transaction ids are small per-shard counters: one begun in
+        // another namespace is not found from this one.
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_unknown,
                 .message = "transaction not found",
@@ -1121,6 +1123,12 @@ pub const KVHandler = struct {
         } });
     }
 
+    /// Transaction `txn_id`, if it was begun in `namespace`.
+    fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
+        const t = txn_table.get(txn_id) orelse return null;
+        return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
+    }
+
     fn dispatchRollbackTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -1134,7 +1142,7 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        if (txn_table.get(txn_id) == null) {
+        if (txnIn(txn_table, txn_id, req.namespace) == null) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_unknown,
                 .message = "transaction not found",

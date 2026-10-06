@@ -498,6 +498,12 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
+        const home = if (req.namespace.len > 0) req.namespace else "default";
+        var why_buf: [256]u8 = undefined;
+        if (def.homeRefusal(home, &why_buf)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
 
         // Generate a unique job ID with embedded partition bits.
         //
@@ -527,7 +533,7 @@ pub const ProcessingHandler = struct {
         const now = @import("stdx").time.milliTimestamp();
         // Admitted at dispatch; the definition has now passed, so reserve.
         shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
-        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch |err| {
+        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, home, yaml) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "job not persisted"));
             return;
         };
@@ -536,6 +542,15 @@ pub const ProcessingHandler = struct {
 
     // ── Stop ─────────────────────────────────────────────────────────────
 
+    /// The job `job_id`, if it lives in `namespace` (empty is "default"):
+    /// a job is seen, stopped and changed only from its own namespace, so
+    /// from any other it is not found.
+    fn ownedJob(self: *ProcessingHandler, job_id: []const u8, namespace: []const u8) ?*JobRecord {
+        const job = self.jobs.getPtr(job_id) orelse return null;
+        const home = if (namespace.len > 0) namespace else "default";
+        return if (std.mem.eql(u8, job.namespace_owned, home)) job else null;
+    }
+
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const job_id = req.key;
         if (job_id.len == 0) {
@@ -543,7 +558,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .stopped) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "stop not persisted"));
                 return;
@@ -563,7 +578,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .cancelled) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "cancel not persisted"));
                 return;
@@ -583,7 +598,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.get(job_id)) |job| {
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Binary wire format:
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
@@ -694,7 +709,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.get(job_id)) |job| {
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Generate savepoint ID with partition from parent job
             const partition_id = run_id_mod.extractPartition(job_id) orelse 0;
             var id_buf: [32]u8 = undefined;
@@ -728,8 +743,8 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        // Check job exists
-        if (self.jobs.getPtr(job_id)) |job| {
+        // Check job exists, in this namespace
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Check savepoint exists
             if (self.savepoints.get(savepoint_id)) |sp| {
                 // Verify the savepoint belongs to this job
@@ -772,7 +787,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeRescale(shard, req.namespace, job_id, parallelism) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "rescale not persisted"));
                 return;
@@ -918,11 +933,19 @@ pub const ProcessingHandler = struct {
 
         const yaml = value[off..];
 
-        // Extract name from YAML by re-parsing. Keep `def` alive so we can also
-        // rebuild the execution pipeline below — createPipeline
+        // Re-parse with the job's namespace as the fallback, exactly as the
+        // submit did, so endpoints and lookups that name none resolve to it
+        // here too, on every replica and every restart. Keep `def` alive so
+        // we can also rebuild the execution pipeline below — createPipeline
         // deep-copies what it retains, so freeing `def` at function end is safe.
-        var def = parser.parseJobDefinition(self.allocator, yaml) catch return;
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw) catch return;
         defer def.deinit(self.allocator);
+        // The submit checked these; the applier holds every replica to them.
+        var why_buf: [256]u8 = undefined;
+        if (def.namespaceRefusal() orelse def.homeRefusal(ns_raw, &why_buf)) |why| {
+            log.err("processing job {s} not started: {s}", .{ job_id, why });
+            return;
+        }
         const name = self.allocator.dupe(u8, def.name) catch return;
 
         // Use the embedded namespace (authoritative from original submit)

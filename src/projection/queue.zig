@@ -71,6 +71,9 @@ pub const DLQEntry = struct {
     ual_index: u64,
     attempts: u32,
     moved_at_ns: u64,
+    /// The queue the message died in (its `queue_name_hash`), so a queue's
+    /// dead letters are listed without another queue's, or namespace's.
+    queue_name_hash: u64,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -269,8 +272,7 @@ pub const QueueProjection = struct {
     /// Purge all live (ready + leased) messages for one queue, returning the
     /// count removed. The ready/lease heaps are left untouched — they self-clean
     /// lazily on pop (a popped seq missing from `messages` is skipped), so only
-    /// the message store needs mutating. DLQ entries are not per-queue
-    /// addressable (no queue hash on DLQEntry) and are left intact.
+    /// the message store needs mutating. Dead letters are left intact.
     pub fn purgeQueue(self: *QueueProjection, queue_name_hash: u64) u64 {
         // Collect matching seqs first; removing during iteration is unsafe.
         var seqs: std.ArrayList(u64) = .empty;
@@ -421,6 +423,19 @@ pub const QueueProjection = struct {
         return found;
     }
 
+    const AckTarget = struct { seq: u64, queue: u64 };
+
+    fn ackTarget(cmd: CommandPayload) ?AckTarget {
+        if (cmd.key.len != 8 or cmd.value.len != 8) return null;
+        return .{ .seq = std.mem.readInt(u64, cmd.key[0..8], .little), .queue = std.mem.readInt(u64, cmd.value[0..8], .little) };
+    }
+
+    /// Whether message `seq` is held and belongs to `queue_name_hash`.
+    pub fn inQueue(self: *const QueueProjection, seq: u64, queue_name_hash: u64) bool {
+        const msg = self.messages.get(seq) orelse return false;
+        return msg.queue_name_hash == queue_name_hash;
+    }
+
     /// Acknowledge a leased message (mark as complete, remove).
     pub fn ack(self: *QueueProjection, seq: u64) !void {
         if (self.messages.fetchRemove(seq)) |kv| {
@@ -515,6 +530,7 @@ pub const QueueProjection = struct {
             .ual_index = msg.ual_index,
             .attempts = msg.attempts,
             .moved_at_ns = now_ns,
+            .queue_name_hash = msg.queue_name_hash,
         });
 
         msg.state = .dlq;
@@ -558,21 +574,17 @@ pub const QueueProjection = struct {
                     self.registerQueue(q_name_hash, q_name, self.resolveNamespace(q_ns_hash)) catch {};
                 }
             },
+            // Key: the message's seq. Value: the queue it must be in. Seqs
+            // are numbered across the partition, so without the queue an
+            // ack could take another queue's message, another namespace's.
             .queue_ack => {
-                // Seq is encoded in the command payload key as a u64
                 if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    if (cmd.key.len >= 8) {
-                        const seq = std.mem.readInt(u64, cmd.key[0..8], .little);
-                        try self.ack(seq);
-                    }
+                    if (ackTarget(cmd)) |t| if (self.inQueue(t.seq, t.queue)) try self.ack(t.seq);
                 }
             },
             .queue_nack => {
                 if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    if (cmd.key.len >= 8) {
-                        const seq = std.mem.readInt(u64, cmd.key[0..8], .little);
-                        try self.nack(seq, entry.header.timestamp_ns);
-                    }
+                    if (ackTarget(cmd)) |t| if (self.inQueue(t.seq, t.queue)) try self.nack(t.seq, entry.header.timestamp_ns);
                 }
             },
             .queue_lease => {
@@ -648,8 +660,8 @@ pub const QueueProjection = struct {
             // Fixed fields: 8+8+4+1+4+8+8+8+4 = 53 bytes + payload
             total_size += 53 + kv.value_ptr.payload.len;
         }
-        // DLQ: count(4) + entries(8+8+4+8=28 each)
-        total_size += 4 + self.dlq.items.len * 28;
+        // DLQ: count(4) + entries(8+8+4+8+8=36 each)
+        total_size += 4 + self.dlq.items.len * 36;
         // Known queues
         total_size += 4; // count
         var kq_it = self.known_queues.iterator();
@@ -708,6 +720,8 @@ pub const QueueProjection = struct {
             std.mem.writeInt(u32, buf[offset..][0..4], dlq_entry.attempts, .little);
             offset += 4;
             std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.moved_at_ns, .little);
+            offset += 8;
+            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.queue_name_hash, .little);
             offset += 8;
         }
 
@@ -810,14 +824,15 @@ pub const QueueProjection = struct {
 
         var d: u32 = 0;
         while (d < dlq_count) : (d += 1) {
-            if (offset + 28 > data.len) return;
+            if (offset + 36 > data.len) return;
             const dlq_entry = DLQEntry{
                 .seq = std.mem.readInt(u64, data[offset..][0..8], .little),
                 .ual_index = std.mem.readInt(u64, data[offset + 8 ..][0..8], .little),
                 .attempts = std.mem.readInt(u32, data[offset + 16 ..][0..4], .little),
                 .moved_at_ns = std.mem.readInt(u64, data[offset + 20 ..][0..8], .little),
+                .queue_name_hash = std.mem.readInt(u64, data[offset + 28 ..][0..8], .little),
             };
-            offset += 28;
+            offset += 36;
             try self.dlq.append(self.allocator, dlq_entry);
         }
 
@@ -1137,4 +1152,28 @@ test "queue: serialize empty projection" {
     try q2.deserialize(data);
     try testing.expectEqual(@as(usize, 0), q2.messages.count());
     try testing.expectEqual(@as(u64, 1), q2.next_seq);
+}
+
+test "queue: an ack or nack entry touches a message only in the queue it names" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
+    defer q.deinit();
+    const theirs = try q.enqueue(100, 0, 1000, 42, "theirs");
+
+    var key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &key, theirs, .little);
+    var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
+    for ([_]EntryType{ .queue_ack, .queue_nack }) |kind| {
+        // Another queue's id, then no queue at all: nothing happens.
+        for ([_][]const u8{ &std.mem.toBytes(@as(u64, 7)), "" }) |queue| {
+            const entry = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, queue, &payload_buf).?;
+            try q.applyEntry(&entry);
+            try testing.expect(q.inQueue(theirs, 42));
+            try testing.expectEqual(@as(u64, 0), q.stats.acked + q.stats.nacked);
+        }
+    }
+    // Its own queue's id: acked.
+    const entry = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 3, 3000, 0, &key, &std.mem.toBytes(@as(u64, 42)), &payload_buf).?;
+    try q.applyEntry(&entry);
+    try testing.expect(!q.inQueue(theirs, 42));
+    try testing.expectEqual(@as(u64, 1), q.stats.acked);
 }

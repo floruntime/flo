@@ -879,26 +879,13 @@ pub const StreamHandler = struct {
 
     fn handleGroupCreate(self: *StreamHandler, req: Request) CommandResult {
         // Wire format: [group_len:u16][group] (binary length-prefixed)
-        // Fallback: raw value as group name (for unit tests)
-        var wire_format = false;
-        const raw_group = blk: {
-            if (req.value.len >= 2) {
-                var reader = WireReader.init(req.value);
-                if (reader.readLengthPrefixed(u16)) |name| {
-                    if (name.len > 0) {
-                        wire_format = true;
-                        break :blk name;
-                    }
-                }
-            }
-            // Fallback: treat raw value as group name
-            if (req.value.len > 0) break :blk req.value;
+        const raw_group = (decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
+        }).name;
 
-        // Namespace-qualify for isolation (wire format only)
+        // Namespace-qualify for isolation
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, wire_format);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group);
 
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -930,7 +917,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name);
 
         const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
         const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
@@ -958,7 +945,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name);
 
         if (self.stream.getGroup(group_name) == null) {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
@@ -981,7 +968,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group);
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -1015,7 +1002,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group);
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         _ = self.stream.leaveGroup(group_name, member_id) catch |err| {
@@ -1042,7 +1029,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group, pair.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group);
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         // Auto-create group and join consumer if not exists
@@ -1087,7 +1074,7 @@ pub const StreamHandler = struct {
         _ = reader.readLengthPrefixed(u16); // consumer
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group);
 
         // Read StreamID array
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1134,7 +1121,7 @@ pub const StreamHandler = struct {
         _ = reader.readLengthPrefixed(u16); // consumer
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group);
 
         // Read StreamIDs to NACK
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1178,7 +1165,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name);
 
         const group = self.stream.getGroup(group_name) orelse {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
@@ -1205,15 +1192,13 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name, decoded.wire);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name);
 
-        // Optional consumer filter (only valid for wire-format requests).
+        // Optional consumer filter.
         var consumer_filter: ?[]const u8 = null;
-        if (decoded.wire) {
-            _ = reader.readLengthPrefixed(u16); // skip group (already decoded)
-            if (reader.readLengthPrefixed(u16)) |c| {
-                if (c.len > 0) consumer_filter = c;
-            }
+        _ = reader.readLengthPrefixed(u16); // skip group (already decoded)
+        if (reader.readLengthPrefixed(u16)) |c| {
+            if (c.len > 0) consumer_filter = c;
         }
 
         // Get actual PEL entries
@@ -1269,7 +1254,7 @@ pub const StreamHandler = struct {
         const count: u32 = reader.readU32() orelse DEFAULT_READ_BATCH;
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group);
         const consumer_id = if (consumer_raw.len > 0) consumer_raw else "default";
 
         const start_id = StreamID{ .timestamp_ms = start_ts, .sequence = start_seq };
@@ -1317,7 +1302,7 @@ pub const StreamHandler = struct {
         };
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group, true);
+        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group);
         _ = reader.readLengthPrefixed(u16); // consumer
 
         // Read StreamIDs to touch
@@ -1895,48 +1880,31 @@ pub const StreamHandler = struct {
 /// so callers can decide whether to namespace-qualify.
 const GroupDecode = struct {
     name: []const u8,
-    wire: bool,
 };
 
 /// Result from group+consumer pair decoding.
 const GroupConsumerDecode = struct {
     group: []const u8,
     consumer: []const u8,
-    wire: bool,
 };
 
 /// Decode a group name from wire format: [group_len:u16][group]
 /// Falls back to treating the entire value as the group name (unit test compat).
 fn decodeGroupName(value: []const u8) ?GroupDecode {
-    if (value.len >= 2) {
-        var reader = WireReader.init(value);
-        if (reader.readLengthPrefixed(u16)) |name| {
-            if (name.len > 0) return .{ .name = name, .wire = true };
-        }
-    }
-    // Fallback: raw value
-    if (value.len > 0) return .{ .name = value, .wire = false };
-    return null;
+    var reader = WireReader.init(value);
+    const name = reader.readLengthPrefixed(u16) orelse return null;
+    return if (name.len > 0) .{ .name = name } else null;
 }
 
 /// Decode group + consumer pair from wire format.
-/// Wire: [group_len:u16][group][consumer_len:u16][consumer]
-/// Falls back to raw value = group name, namespace = consumer (unit test compat).
+/// Wire: [group_len:u16][group][consumer_len:u16][consumer], or the group alone.
 fn decodeGroupConsumer(req: Request) ?GroupConsumerDecode {
-    if (req.value.len >= 2) {
-        var reader = WireReader.init(req.value);
-        if (reader.readPair(u16, u16)) |pair| {
-            if (pair.key.len > 0) return .{ .group = pair.key, .consumer = pair.value, .wire = true };
-        }
-        // Try single length-prefixed (for group-only wire format used as pair)
-        var reader2 = WireReader.init(req.value);
-        if (reader2.readLengthPrefixed(u16)) |name| {
-            if (name.len > 0) return .{ .group = name, .consumer = "", .wire = true };
-        }
+    var reader = WireReader.init(req.value);
+    if (reader.readPair(u16, u16)) |pair| {
+        if (pair.key.len > 0) return .{ .group = pair.key, .consumer = pair.value };
     }
-    // Fallback: raw value = group, namespace = consumer
-    if (req.value.len > 0) return .{ .group = req.value, .consumer = if (req.namespace.len > 0) req.namespace else "", .wire = false };
-    return null;
+    const name = (decodeGroupName(req.value) orelse return null).name;
+    return .{ .group = name, .consumer = "" };
 }
 
 /// Apply ack_timeout_ms / max_deliver TLV options (if present) to a group's
@@ -1949,16 +1917,12 @@ fn applyGroupConfig(self: *StreamHandler, group_name: []const u8, req: Request) 
     self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch {};
 }
 
-/// Resolve a wire group name to its durable, per-(stream, group) key:
-/// `qualifyKey(ns, stream) ++ "\x00" ++ group`. A consumer group is scoped to a
-/// single stream, so the cursor/PEL never span streams.
-///
-/// Wire-format requests carry the real namespace; fallback (unit-test) requests
-/// abuse the namespace field, so for those we qualify under the default
-/// namespace (stream-only) — `stream` (req.key) is always meaningful.
-fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, raw_name: []const u8, is_wire: bool) []const u8 {
-    const ns = if (is_wire) namespace else "default";
-    return ns_keys.qualifyGroupKey(buf, ns, stream, raw_name) catch raw_name;
+/// Resolve a group name to its durable, per-(stream, group) key in the
+/// request's namespace: `qualifyKey(ns, stream) ++ "\x00" ++ group`. A
+/// consumer group is scoped to a single stream, so the cursor/PEL never span
+/// streams.
+fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, raw_name: []const u8) []const u8 {
+    return ns_keys.qualifyGroupKey(buf, namespace, stream, raw_name) catch raw_name;
 }
 
 /// Serialize a list of names in the standard walk wire format.
@@ -2151,6 +2115,16 @@ fn serializePendingEntries(allocator: Allocator, entries: []const PendingEntry) 
 const testing = std.testing;
 
 /// Helper to build a test request.
+/// A group name as the wire carries it: [len:u16][name].
+fn groupWire(comptime name: []const u8) []const u8 {
+    return comptime &([2]u8{ name.len, 0 } ++ name[0..name.len].*);
+}
+
+/// A group and a member as the wire carries them.
+fn groupMemberWire(comptime group: []const u8, comptime member: []const u8) []const u8 {
+    return comptime &([2]u8{ group.len, 0 } ++ group[0..group.len].* ++ [2]u8{ member.len, 0 } ++ member[0..member.len].*);
+}
+
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
     return .{
         .header = .{
@@ -2612,22 +2586,21 @@ test "stream handler: group lifecycle" {
     defer handler.deinit();
 
     // Create group (stream=key, group_name=value)
-    const create_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", "my-group", ""));
+    const create_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("my-group"), ""));
     switch (create_result) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
 
     // Create duplicate → error
-    const dup_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", "my-group", ""));
+    const dup_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("my-group"), ""));
     switch (dup_result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.already_exists, e.code),
         else => return error.TestUnexpectedResult,
     }
 
     // Join group (namespace=member_id)
-    var join_req = makeRequest(.stream_group_join, "s1", "my-group", "");
-    join_req.namespace = "member-1";
+    const join_req = makeRequest(.stream_group_join, "s1", groupMemberWire("my-group", "member-1"), "");
     const join_result = handler.handleCommand(join_req);
     switch (join_result) {
         .group_joined => {},
@@ -2635,8 +2608,7 @@ test "stream handler: group lifecycle" {
     }
 
     // Leave group
-    var leave_req = makeRequest(.stream_group_leave, "s1", "my-group", "");
-    leave_req.namespace = "member-1";
+    const leave_req = makeRequest(.stream_group_leave, "s1", groupMemberWire("my-group", "member-1"), "");
     const leave_result = handler.handleCommand(leave_req);
     switch (leave_result) {
         .ok => {},
@@ -2644,14 +2616,14 @@ test "stream handler: group lifecycle" {
     }
 
     // Delete group
-    const del_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", "my-group", ""));
+    const del_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", groupWire("my-group"), ""));
     switch (del_result) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
 
     // Delete again → not found
-    const del2_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", "my-group", ""));
+    const del2_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", groupWire("my-group"), ""));
     switch (del2_result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
         else => return error.TestUnexpectedResult,
@@ -2676,12 +2648,12 @@ test "stream handler: group read and ack" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm3, "msg3"), ""));
 
     // Create group
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", "cg1", ""));
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
 
     // First read — PEL delivers all 3 records, adds to PEL
     var first_id_ts: u64 = 0;
     var first_id_seq: u64 = 0;
-    const read_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
+    const read_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
     switch (read_result) {
         .group_messages => |m| {
             defer handler.freeResult(read_result);
@@ -2695,7 +2667,7 @@ test "stream handler: group read and ack" {
     }
 
     // Second read with no new appends — no NEW records after last_delivered_id
-    const read2_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
+    const read2_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
     switch (read2_result) {
         .group_messages => |m| {
             defer handler.freeResult(read2_result);
@@ -2710,7 +2682,7 @@ test "stream handler: group read and ack" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm4, "msg4"), ""));
 
     // Third read — delivers only the new msg4
-    const read3_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", "cg1", ""));
+    const read3_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
     switch (read3_result) {
         .group_messages => |m| {
             defer handler.freeResult(read3_result);
@@ -2860,12 +2832,11 @@ test "stream handler: group info" {
     defer handler.deinit();
 
     // Create group and join
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", "cg1", ""));
-    var join_req = makeRequest(.stream_group_join, "s1", "cg1", "");
-    join_req.namespace = "m1";
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
+    const join_req = makeRequest(.stream_group_join, "s1", groupMemberWire("cg1", "m1"), "");
     _ = handler.handleCommand(join_req);
 
-    const result = handler.handleCommand(makeRequest(.stream_group_info, "s1", "cg1", ""));
+    const result = handler.handleCommand(makeRequest(.stream_group_info, "s1", groupWire("cg1"), ""));
     switch (result) {
         .group_pending => |p| {
             defer handler.freeResult(result);
@@ -2887,7 +2858,7 @@ test "stream handler: group not found errors" {
     defer handler.deinit();
 
     // Join non-existent group — auto-creates the group
-    const join_result = handler.handleCommand(makeRequest(.stream_group_join, "s1", "nope", ""));
+    const join_result = handler.handleCommand(makeRequest(.stream_group_join, "s1", groupWire("nope"), ""));
     switch (join_result) {
         .group_joined => {},
         else => return error.TestUnexpectedResult,
@@ -2929,4 +2900,22 @@ test "stream handler: pre-route by stream" {
     var req_ns = makeRequest(.stream_append, "stream-a", "", "");
     req_ns.namespace = "other";
     try testing.expect(StreamHandler.preRouteByStream(req1) != StreamHandler.preRouteByStream(req_ns));
+}
+
+test "stream handler: a group name must come in the wire format, and is always in the request's namespace" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // A bare name is refused, not filed under another namespace.
+    const raw = handler.handleCommand(makeRequest(.stream_group_create, "s1", "my-group", ""));
+    try std.testing.expect(raw == .err);
+    // The same group name in two namespaces is two groups.
+    try std.testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("g"), "")) != .err);
+    var other = makeRequest(.stream_group_create, "s1", groupWire("g"), "");
+    other.namespace = "other";
+    try std.testing.expect(handler.handleCommand(other) != .err);
 }

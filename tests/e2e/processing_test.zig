@@ -834,29 +834,22 @@ test "e2e/processing: multi-source pipeline merges two input streams" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msrc" });
 }
 
-test "e2e/processing: multi-sink declaration uses primary sink" {
-    // Multi-sink fan-out is wired — all sinks receive records.
-    // This test verifies data flows through the primary (stream) sink;
-    // the secondary KV sink is a no-op (KV write not yet implemented in sink dispatch).
+test "e2e/processing: a record reaches every sink a job declares" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Scope to dedicated namespace for isolation
     try ctx.exec(&.{ "ns", "create", "proc_msink" });
-
-    // Seed source stream
     try ctx.exec(&.{ "stream", "append", "msink-input", "multi-sink-record", "-n", "proc_msink" });
 
-    // Submit job with two sinks declared; only the first (stream) is wired
+    // Two sinks, both in the job's own namespace: a job writes nowhere else.
     const job_def =
         \\kind: Processing
         \\name: e2e-multi-sink
-        \\namespace: proc_msink
         \\sources.[0].stream.name: msink-input
         \\sinks.[0].name: primary-out
         \\sinks.[0].stream.name: msink-stream-out
         \\sinks.[1].name: secondary-kv
-        \\sinks.[1].kv.namespace: msink-kv
+        \\sinks.[1].kv.key_prefix: msink
         \\parallelism: 1
         \\batch_size: 100
     ;
@@ -866,17 +859,9 @@ test "e2e/processing: multi-sink declaration uses primary sink" {
     const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_msink" });
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
-    // Wait for data to appear in the primary (stream) sink
-    const found = try readStreamBlocking(ctx, "msink-stream-out", "proc_msink", "multi-sink-record", "5000");
-
-    if (!found) {
-        std.debug.print("\n[TIMEOUT] Multi-sink data did not flow to primary stream sink\n", .{});
-        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_msink" });
-        defer status.deinit();
-        std.debug.print("Job status: {s}\n", .{status.stdout});
-        ctx.dumpServerLogs();
-        return error.PipelineTimeout;
-    }
+    try testing.expect(try readStreamBlocking(ctx, "msink-stream-out", "proc_msink", "multi-sink-record", "5000"));
+    // With no keyby the record key is empty: the KV sink writes `msink:`.
+    try testing.expect(try kvGetBlocking(ctx, "msink:", "proc_msink", "multi-sink-record", 6000));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msink" });
 }

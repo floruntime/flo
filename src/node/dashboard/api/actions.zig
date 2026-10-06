@@ -199,14 +199,14 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 
     // Search shards for this action (matching namespace)
     var found_rec: ?*const ActionsHandler.ActionRecord = null;
+    var kbuf: [@import("../../../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+    const key = ActionsHandler.defKey(&kbuf, ns_filter, name) orelse name;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
-            if (shard.actions_handler.actions.getPtr(name)) |rec| {
-                if (std.mem.eql(u8, rec.namespace_owned, ns_filter)) {
-                    found_rec = rec;
-                    break;
-                }
+            if (shard.actions_handler.actions.getPtr(key)) |rec| {
+                found_rec = rec;
+                break;
             }
         }
     }

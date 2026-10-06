@@ -371,6 +371,28 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
                 }
             }
 
+            // A lookup that names no namespace reads the job's own, as an
+            // endpoint does; resolved here so the running job and every
+            // replay of it read the same one.
+            if (std.mem.eql(u8, op_type, "kv_lookup")) {
+                const has_ns = if (config) |c| for (c) |e| {
+                    if (std.mem.eql(u8, e.key, "namespace")) break true;
+                } else false else false;
+                if (!has_ns) {
+                    const existing_count = if (config) |c| c.len else 0;
+                    const grown = allocator.alloc(OperatorSpec.ConfigEntry, existing_count + 1) catch return error.OutOfMemory;
+                    if (config) |c| {
+                        @memcpy(grown[0..c.len], c);
+                        allocator.free(c);
+                    }
+                    grown[existing_count] = .{
+                        .key = allocator.dupe(u8, "namespace") catch return error.OutOfMemory,
+                        .value = allocator.dupe(u8, effective_namespace) catch return error.OutOfMemory,
+                    };
+                    config = grown;
+                }
+            }
+
             operators.append(allocator, .{
                 .type_name = type_dup,
                 .name = name_dup,
@@ -2051,14 +2073,14 @@ test "parser: kv_lookup operator minimal config" {
         \\    lookup_key: "${$.id}"
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinitionWithNamespace(allocator, text, "acme");
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
     try std.testing.expectEqualStrings("kv_lookup", op.type_name);
     try std.testing.expectEqualStrings("${$.id}", op.getConfig("lookup_key").?);
-    // namespace and mode not specified — registry will use defaults
-    try std.testing.expect(op.getConfig("namespace") == null);
+    // No namespace named: the lookup reads the job's own, as endpoints do.
+    try std.testing.expectEqualStrings("acme", op.getConfig("namespace").?);
     try std.testing.expect(op.getConfig("mode") == null);
 }
 

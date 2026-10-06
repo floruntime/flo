@@ -385,7 +385,7 @@ pub const QueueHandler = struct {
         var dequeued_bytes: usize = 0;
         for (results[0..actual]) |r| {
             dequeued_bytes += r.payload.len;
-            self.persistAck(ns_hash, r.seq);
+            self.persistAck(req.namespace, queue_name_hash, r.seq);
         }
 
         if (self.metrics_registry) |mr| {
@@ -409,12 +409,23 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
+        // The message must be in this queue, in this namespace: seqs are
+        // numbered across the partition. A message already gone is no
+        // error (it may have been taken and acked); another queue's is not
+        // this queue's to touch. The applier checks the same.
+        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        if (self.queue.messages.get(seq)) |msg| if (msg.queue_name_hash != queue_hash) {
+            return .{ .err = .{ .code = .not_found, .message = "message not found in this queue" } };
+        };
+
         // Persist through Raft
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ack not persisted") } };
             };
             return .{ .parked = proposed };
@@ -425,8 +436,8 @@ pub const QueueHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8; // 8-byte seq key, no value
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 16; // seq key, queue value
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
 
         const entry = entry_mod.buildCommandEntry(
             .queue_ack,
@@ -436,7 +447,7 @@ pub const QueueHandler = struct {
             timestamp_ns,
             ns_hash,
             &seq_key,
-            &[_]u8{},
+            &queue_key,
             payload_buf[0..payload_size],
         ) orelse {
             return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
@@ -460,12 +471,20 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
         };
 
+        // As for an ack: only this queue's message.
+        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        if (self.queue.messages.get(seq)) |msg| if (msg.queue_name_hash != queue_hash) {
+            return .{ .err = .{ .code = .not_found, .message = "message not found in this queue" } };
+        };
+
         // Persist through Raft
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
+            const proposed = persistence_mod.proposeEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "nack not persisted") } };
             };
             return .{ .parked = proposed };
@@ -476,8 +495,8 @@ pub const QueueHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const next_index = self.partition.ual.max_index + 1;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 16;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
 
         const entry = entry_mod.buildCommandEntry(
             .queue_nack,
@@ -487,7 +506,7 @@ pub const QueueHandler = struct {
             timestamp_ns,
             ns_hash,
             &seq_key,
-            &[_]u8{},
+            &queue_key,
             payload_buf[0..payload_size],
         ) orelse {
             return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
@@ -710,18 +729,21 @@ pub const QueueHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Persist a queue_ack UAL entry for a dequeued message.
+    /// Persist a queue_ack UAL entry for a dequeued message, stamped with
+    /// its namespace and naming its queue as any ack does.
     /// Called automatically after dequeue so consumed messages don't reappear after restart.
-    fn persistAck(self: *QueueHandler, ns_hash: u32, seq: u64) void {
+    fn persistAck(self: *QueueHandler, namespace: []const u8, queue_hash: u64, seq: u64) void {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
 
         // Persist through Raft; the applier acks the projection. A failed
         // persist means the message can reappear after a restart, which
         // the operator must hear about.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
                 log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
             };
             return;
@@ -731,8 +753,8 @@ pub const QueueHandler = struct {
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 16;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
 
         const entry = entry_mod.buildCommandEntry(
             .queue_ack,
@@ -740,9 +762,9 @@ pub const QueueHandler = struct {
             self.partition.current_term,
             next_index,
             timestamp_ns,
-            ns_hash,
+            router.namespaceHash(namespace),
             &seq_key,
-            &[_]u8{},
+            &queue_key,
             payload_buf[0..payload_size],
         ) orelse return;
 

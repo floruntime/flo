@@ -65,27 +65,24 @@ pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count:
     return client.sendRequestWithOptions(.queue_dequeue, namespace, queue, "", builder.getOptions());
 }
 
-/// Acknowledge message processing (complete)
-pub fn ack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64) !Response {
-    // Format: [count:u32][seq:u64]*
-    var writer = FixedWireWriter(4096).init();
-    try writer.writeU64ArrayWithCount(seqs);
-
-    return client.sendRequest(.queue_complete, namespace, queue, writer.bytes());
+/// Acknowledge message processing (complete). The message's seq goes as
+/// decimal text, which is what the server reads.
+pub fn ack(client: *Client, namespace: []const u8, queue: []const u8, seq: u64) !Response {
+    var buf: [20]u8 = undefined;
+    const value = std.fmt.bufPrint(&buf, "{d}", .{seq}) catch unreachable;
+    return client.sendRequest(.queue_complete, namespace, queue, value);
 }
 
 /// Negative acknowledge (return to queue or send to DLQ)
-pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64, to_dlq: bool) !Response {
+pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seq: u64, to_dlq: bool) !Response {
     var options_buf: [8]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
     try builder.addU8(.send_to_dlq, if (to_dlq) 1 else 0);
 
-    // Format: [count:u32][seq:u64]*
-    var writer = FixedWireWriter(4096).init();
-    try writer.writeU64ArrayWithCount(seqs);
-
-    return client.sendRequestWithOptions(.queue_fail, namespace, queue, writer.bytes(), builder.getOptions());
+    var buf: [20]u8 = undefined;
+    const value = std.fmt.bufPrint(&buf, "{d}", .{seq}) catch unreachable;
+    return client.sendRequestWithOptions(.queue_fail, namespace, queue, value, builder.getOptions());
 }
 
 /// List DLQ messages

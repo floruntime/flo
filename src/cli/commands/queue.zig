@@ -385,7 +385,7 @@ fn runAck(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.queue.ack(&client, namespace, queue, &[_]u64{seq}) catch |err| {
+    var result = client_mod.queue.ack(&client, namespace, queue, seq) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -420,7 +420,7 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.queue.nack(&client, namespace, queue, &[_]u64{seq}, to_dlq) catch |err| {
+    var result = client_mod.queue.nack(&client, namespace, queue, seq, to_dlq) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };

@@ -413,6 +413,22 @@ pub const JobDefinition = struct {
         return null;
     }
 
+    /// Why this job cannot live in `home` (the namespace it is submitted
+    /// to), or null: a job lives where it is submitted and writes only
+    /// there. It may read other namespaces (sources, `kv_lookup`); a sink
+    /// elsewhere would write into a namespace whose owner never chose it.
+    /// The message is written into `buf`.
+    pub fn homeRefusal(self: *const JobDefinition, home: []const u8, buf: []u8) ?[]const u8 {
+        if (!std.mem.eql(u8, self.namespace, home)) {
+            return std.fmt.bufPrint(buf, "the definition's namespace '{s}' is not the one it is submitted to ('{s}'); submit it with -n {s}", .{ self.namespace, home, self.namespace }) catch "the definition's namespace is not the one it is submitted to";
+        }
+        for (self.sinks.items) |snk| {
+            if (std.mem.eql(u8, snk.namespace, home)) continue;
+            return std.fmt.bufPrint(buf, "{s} sink '{s}' writes namespace '{s}', but a job writes only into its own ('{s}'); submit a job in '{s}' that reads from '{s}' instead", .{ @tagName(snk.kind), if (snk.target.len > 0) snk.target else snk.name, snk.namespace, home, snk.namespace, home }) catch "a sink writes outside the job's namespace";
+        }
+        return null;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);

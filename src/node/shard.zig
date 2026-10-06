@@ -4334,14 +4334,19 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
     defer shard.queue_handler.allocator.free(data);
 
-    // Auto-ack: persist a queue_ack entry so the message doesn't reappear after restart
+    // Auto-ack: persist a queue_ack entry so the message doesn't reappear
+    // after restart, stamped with the queue's namespace and naming the
+    // queue, as any ack does.
     {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_name_hash, .little);
+        const namespace = if (partition.queue.known_queues.get(queue_name_hash)) |meta| meta.namespace else "";
 
         // Same contract as the queue handler's dequeue-ack: log, never fail
         // the dequeue. The ack applies when it commits.
-        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
             log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
         };
     }
