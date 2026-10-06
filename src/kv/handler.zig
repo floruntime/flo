@@ -763,7 +763,9 @@ pub const KVHandler = struct {
             threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
         };
 
-        // Build scan prefix: namespace prefix + optional filter
+        // Build scan prefix: namespace prefix + optional filter. A filter
+        // holding a NUL could reach into another namespace's keys.
+        if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
         const ns_prefix = nsPrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
         var scan_prefix = ns_prefix;
         if (filter.len > 0 and ns_prefix.len + filter.len <= S.ns_buf.len) {
@@ -780,6 +782,9 @@ pub const KVHandler = struct {
         for (S.key_buf[0..raw_count]) |key| {
             if (count >= cap) break;
             const stripped = stripNsPrefix(key, namespace);
+            // "default" scans with no prefix: a key holding a NUL there is
+            // another namespace's "ns\x00key".
+            if (std.mem.indexOfScalar(u8, stripped, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
             if (!isReservedKey(stripped)) {
                 S.key_buf[count] = stripped;
                 count += 1;
@@ -1273,6 +1278,11 @@ pub const KVHandler = struct {
     /// the projection directly (bypasses Raft). Client writes go through
     /// dispatchPut/dispatchDelete → proposeKVEntry.
     pub fn handleCommand(self: *KVHandler, req: Request) CommandResult {
+        // Every key path below qualifies the key; one holding a NUL is
+        // refused here with the reason (processing sinks come this way).
+        if (std.mem.indexOfScalar(u8, req.key, ns_keys.NAMESPACE_SEPARATOR) != null) {
+            return .{ .err = .{ .code = .invalid_request, .message = "key must not contain NUL" } };
+        }
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .kv_get => self.handleGet(req),
@@ -1429,8 +1439,10 @@ pub const KVHandler = struct {
         //   - If no namespace + user prefix: "prefix"
         //   - If no namespace + no prefix: full scan
         const scan_prefix: []const u8 = if (req.key.len > 0)
-            qualifyKey(&qbuf, ns, req.key) catch
-                return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } }
+            qualifyKey(&qbuf, ns, req.key) catch |err| return switch (err) {
+                error.KeyHasNul => .{ .err = .{ .code = .invalid_request, .message = "key must not contain NUL" } },
+                error.KeyTooLarge => .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } },
+            }
         else
             nsPrefix(&qbuf, ns) catch
                 return .{ .err = .{ .code = .invalid_request, .message = "namespace name too long" } };
@@ -1448,9 +1460,13 @@ pub const KVHandler = struct {
         // Filter out reserved keys and strip namespace prefix from results
         var filtered_count: usize = 0;
         for (out[0..found_count]) |entry| {
+            const key = stripNsPrefix(entry.key, ns);
+            // "default" scans with no prefix: a key holding a NUL there is
+            // another namespace's "ns\x00key", value and all.
+            if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
             if (!isReservedKey(entry.key)) {
                 var stripped = entry;
-                stripped.key = stripNsPrefix(entry.key, ns);
+                stripped.key = key;
                 scan_buf[filtered_count] = stripped;
                 filtered_count += 1;
             }
@@ -2175,4 +2191,36 @@ test "kv handler: reserved key prefixes" {
     try testing.expect(!isReservedKey("normal_key"));
     try testing.expect(!isReservedKey("_other:prefix")); // not a reserved prefix
     try testing.expect(!isReservedKey("")); // empty key
+}
+
+test "kv handler: a key holding a NUL is refused, and a default scan lists only default's keys" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    // b's own key, as b writes it.
+    var b_put = makeRequest(.kv_put, "secret", "b-value", "");
+    b_put.namespace = "b";
+    _ = handler.handleCommand(b_put);
+    _ = handler.handleCommand(makeRequest(.kv_put, "mine", "default-value", ""));
+
+    // In "default" keys are bare: "b\x00secret" would be b's.
+    for ([_]OpCode{ .kv_put, .kv_get, .kv_delete }) |op| {
+        switch (handler.handleCommand(makeRequest(op, "b\x00secret", "stolen", ""))) {
+            .err => |e| try testing.expectEqualStrings("key must not contain NUL", e.message),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqualStrings("b-value", kv.get("b\x00secret").?.value);
+
+    const scan = handler.handleCommand(makeRequest(.kv_scan, "", "", ""));
+    defer handler.freeResult(scan);
+    const data = switch (scan) {
+        .kv_scan_result => |r| r.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, data, "mine") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, data, "b-value") == null);
 }

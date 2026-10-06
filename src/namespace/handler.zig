@@ -122,7 +122,10 @@ pub const NAMESPACE_SEPARATOR: u8 = 0;
 /// `raw_key` (when no prefix). Safe for synchronous operations, waiter
 /// registration (pool copies to inline buffer), and Raft propose (serializes
 /// immediately).
-pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) error{KeyTooLarge}![]const u8 {
+pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) error{ KeyTooLarge, KeyHasNul }![]const u8 {
+    // In "default" a key is used bare, so one holding a NUL could spell
+    // another namespace's "ns\x00key"; refused in every namespace alike.
+    if (std.mem.indexOfScalar(u8, raw_key, NAMESPACE_SEPARATOR) != null) return error.KeyHasNul;
     if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
     const total = ns.len + 1 + raw_key.len;
     if (total > MAX_QUALIFIED_KEY) return error.KeyTooLarge;
@@ -202,6 +205,7 @@ pub fn namespacePrefix(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8) error{Namesp
 /// Returns an error message string if invalid, or `null` if the key is valid.
 pub fn validateKeySize(ns: []const u8, key: []const u8) ?[]const u8 {
     if (key.len == 0) return "key is required";
+    if (std.mem.indexOfScalar(u8, key, NAMESPACE_SEPARATOR) != null) return "key must not contain NUL";
     const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
     if (has_ns) {
         if (ns.len + 1 + key.len > MAX_QUALIFIED_KEY)
@@ -1441,4 +1445,11 @@ test "namespace: a committed entry's hash resolves to the name until it is delet
     handler.applyDelete("prod");
     try std.testing.expect(handler.nameForHash(hash) == null);
     try std.testing.expect(handler.nameForHash(router.namespaceHash("never")) == null);
+}
+
+test "namespace handler: a key holding a NUL is never qualified" {
+    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "", "b\x00secret"));
+    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "a", "b\x00secret"));
+    try testing.expectEqualStrings("key must not contain NUL", validateKeySize("default", "b\x00x").?);
 }
