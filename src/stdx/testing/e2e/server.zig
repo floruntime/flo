@@ -107,6 +107,9 @@ pub const ServerProcess = struct {
         log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
         durability: Durability = .async_flush,
+        /// Serve from this data dir rather than the node's own, e.g. another
+        /// node's. Config and log stay in the node's own.
+        data_dir_of: ?[]const u8 = null,
         /// Tiered log configuration (for controlling hot→warm transitions)
         tiered_log: TieredLogConfig = .{},
 
@@ -310,7 +313,7 @@ pub const ServerProcess = struct {
             "--port",
             port_str,
             "--data-dir",
-            self.data_dir,
+            self.config.data_dir_of orelse self.data_dir,
             "--config",
             self.config_file,
             "--shards",

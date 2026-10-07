@@ -151,6 +151,23 @@ pub const RuntimeConfig = struct {
 };
 
 /// Node runtime — manages shard threads, acceptor thread, and lifecycle.
+pub const LOCK_FILENAME = "flo.lock";
+
+/// Take the data dir's lock, or refuse if another server holds it. The lock
+/// is the OS's (flock), so it goes when the holder exits, however it exits.
+pub fn lockDataDir(data_dir: []const u8) !stdx.fs.File {
+    try stdx.fs.makePath(data_dir);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME });
+    return stdx.fs.createFile(path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => {
+            log.err("data dir {s} is in use by another flo server ({s} is locked); stop that server, or give this one another --data-dir", .{ data_dir, LOCK_FILENAME });
+            return error.DataDirInUse;
+        },
+        else => return err,
+    };
+}
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     config: RuntimeConfig,
@@ -217,6 +234,10 @@ pub const Runtime = struct {
     /// Cross-shard shard pointer array — allocated during wirePeerShards, freed on deinit.
     peer_shards_slice: ?[]*Shard,
 
+    /// Held for the runtime's life: a second server on the same data dir
+    /// would interleave writes to the same segments and manifest.
+    data_dir_lock: ?stdx.fs.File,
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         if (config.num_shards > server_config.MAX_SHARDS) {
             log.err("shards = {d}: at most {d} per node", .{ config.num_shards, server_config.MAX_SHARDS });
@@ -245,6 +266,7 @@ pub const Runtime = struct {
             .metrics_registry = null,
             .metrics_server = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
+            .data_dir_lock = null,
             .peer_stream_handlers_slice = null,
             .peer_kv_handlers_slice = null,
             .peer_ts_handlers_slice = null,
@@ -362,6 +384,12 @@ pub const Runtime = struct {
         if (self.pipe_write_ends) |ends| {
             self.allocator.free(ends);
         }
+
+        // Last: everything that writes to the data dir has stopped.
+        if (self.data_dir_lock) |f| {
+            stdx.fs.closeFile(f);
+            self.data_dir_lock = null;
+        }
     }
 
     const NodeIdentity = struct {
@@ -413,6 +441,8 @@ pub const Runtime = struct {
             log.err("invalid [server] bind '{s}': expected a dotted IPv4 address or \"localhost\"", .{self.config.listen_addr});
             return error.InvalidBindAddress;
         };
+
+        self.data_dir_lock = try lockDataDir(data_dir);
 
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
             self.shard_count,
@@ -1209,4 +1239,16 @@ test "RuntimeConfig: an ephemeral listen_port derives ephemeral ports, not privi
     // An explicit port always wins, even off an ephemeral base.
     const explicit = RuntimeConfig{ .listen_port = 0, .dashboard_port = 8080 };
     try std.testing.expectEqual(@as(u16, 8080), explicit.effectiveDashboardPort());
+}
+
+test "runtime: a data dir is locked by one holder at a time, and freed when it lets go" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+
+    const first = try lockDataDir(dir);
+    try std.testing.expectError(error.DataDirInUse, lockDataDir(dir));
+    stdx.fs.closeFile(first);
+    stdx.fs.closeFile(try lockDataDir(dir));
 }
