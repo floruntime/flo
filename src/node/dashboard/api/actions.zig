@@ -39,12 +39,26 @@ fn shardCount(ctx: *DashboardContext) usize {
     return if (ctx.shard_ptrs) |p| p.len else 0;
 }
 
+/// Whether `run` is a run of action `name` in `namespace`: one name in two
+/// namespaces is two actions, with runs of their own.
+fn runOf(run: *const ActionsHandler.RunRecord, namespace: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, run.action_name_owned, name) and std.mem.eql(u8, run.namespace_owned, namespace);
+}
+
+fn workerOf(w: *const @import("../../../worker/handler.zig").WorkerRecord, namespace: []const u8, name: []const u8) bool {
+    if (!std.mem.eql(u8, w.namespace_owned, namespace)) return false;
+    for (w.processes.items) |p| {
+        if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) return true;
+    }
+    return false;
+}
+
 const LatencyStats = struct { count: u64 = 0, avg_ms: i64 = 0, p99_ms: i64 = 0 };
 
 /// Real invocation latency for an action, derived from completed run records
 /// (`completed_at_ms - started_at_ms`). avg is over all completed runs; p99 is
 /// over a bounded sample (the first `LAT_CAP` completed runs found).
-fn computeLatency(allocator: Allocator, ctx: *DashboardContext, name: []const u8) LatencyStats {
+fn computeLatency(allocator: Allocator, ctx: *DashboardContext, namespace: []const u8, name: []const u8) LatencyStats {
     const LAT_CAP: usize = 4096;
     const buf = allocator.alloc(i64, LAT_CAP) catch return .{};
     defer allocator.free(buf);
@@ -58,7 +72,7 @@ fn computeLatency(allocator: Allocator, ctx: *DashboardContext, name: []const u8
             var rit = shard.actions_handler.runs.iterator();
             while (rit.next()) |re| {
                 const run = re.value_ptr;
-                if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                if (!runOf(run, namespace, name)) continue;
                 const started = run.started_at_ms orelse continue;
                 const completed = run.completed_at_ms orelse continue;
                 if (completed < started) continue;
@@ -126,7 +140,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                         if (getShard(ctx, si)) |s| {
                             var rit = s.actions_handler.runs.iterator();
                             while (rit.next()) |re| {
-                                if (std.mem.eql(u8, re.value_ptr.action_name_owned, rec.name_owned)) {
+                                if (runOf(re.value_ptr, rec.namespace_owned, rec.name_owned)) {
                                     counts.total += 1;
                                     switch (re.value_ptr.status) {
                                         .pending => counts.pending += 1,
@@ -141,12 +155,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                             // Count workers that handle this action
                             var wit = s.worker_handler.workers.iterator();
                             while (wit.next()) |we| {
-                                for (we.value_ptr.processes.items) |p| {
-                                    if (p.kind == .action and std.mem.eql(u8, p.name_owned, rec.name_owned)) {
-                                        worker_count += 1;
-                                        break;
-                                    }
-                                }
+                                if (workerOf(we.value_ptr, rec.namespace_owned, rec.name_owned)) worker_count += 1;
                             }
                         }
                     }
@@ -166,7 +175,7 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
-                    try writeLatency(&obj, computeLatency(allocator, ctx, rec.name_owned));
+                    try writeLatency(&obj, computeLatency(allocator, ctx, rec.namespace_owned, rec.name_owned));
                     {
                         var runs_obj = try obj.objectField("runs");
                         try runs_obj.begin();
@@ -199,14 +208,14 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 
     // Search shards for this action (matching namespace)
     var found_rec: ?*const ActionsHandler.ActionRecord = null;
+    var kbuf: [@import("../../../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+    const key = ActionsHandler.defKey(&kbuf, ns_filter, name) orelse "";
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
-            if (shard.actions_handler.actions.getPtr(name)) |rec| {
-                if (std.mem.eql(u8, rec.namespace_owned, ns_filter)) {
-                    found_rec = rec;
-                    break;
-                }
+            if (shard.actions_handler.actions.getPtr(key)) |rec| {
+                found_rec = rec;
+                break;
             }
         }
     }
@@ -227,7 +236,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         try obj.intField("retry_delay_ms", 1000); // not persisted — see gap log
         try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
         try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-        try writeLatency(&obj, computeLatency(allocator, ctx, name));
+        try writeLatency(&obj, computeLatency(allocator, ctx, ns_filter, name));
 
         // Count runs for this action across all shards
         var counts = h.RunCounts{};
@@ -235,7 +244,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
             if (getShard(ctx, i)) |shard| {
                 var rit = shard.actions_handler.runs.iterator();
                 while (rit.next()) |re| {
-                    if (std.mem.eql(u8, re.value_ptr.action_name_owned, name)) {
+                    if (runOf(re.value_ptr, ns_filter, name)) {
                         counts.total += 1;
                         switch (re.value_ptr.status) {
                             .pending => counts.pending += 1,
@@ -276,7 +285,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
                     while (rit.next()) |re| {
                         if (rcount >= 20) break;
                         const run = re.value_ptr;
-                        if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                        if (!runOf(run, ns_filter, name)) continue;
                         try recent_arr.next();
                         var robj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                         try robj.begin();
@@ -355,6 +364,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
                     var wit = shard.worker_handler.workers.iterator();
                     while (wit.next()) |we| {
                         const w = we.value_ptr;
+                        if (!std.mem.eql(u8, w.namespace_owned, ns_filter)) continue;
                         for (w.processes.items) |p| {
                             if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) {
                                 try workers_arr.next();
@@ -413,8 +423,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = h.parseQueryParam(u64, query_string, "limit") orelse 100;
     const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
-    _ = ns_filter; // runs are already filtered by action name
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -433,7 +442,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
             while (it.next()) |entry| {
                 if (count >= limit) break;
                 const run = entry.value_ptr;
-                if (!std.mem.eql(u8, run.action_name_owned, name)) continue;
+                if (!runOf(run, ns_filter, name)) continue;
                 seen += 1;
                 if (seen <= offset) continue;
                 try arr.next();

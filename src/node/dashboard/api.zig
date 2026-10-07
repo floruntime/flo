@@ -164,7 +164,7 @@ pub fn handleRequest(
     if (std.mem.startsWith(u8, path, "workers/")) {
         try only(method, &.{.GET});
         const worker_id = path["workers/".len..];
-        return workers.getWorkerDetail(allocator, worker_id, ctx);
+        return workers.getWorkerDetail(allocator, worker_id, query_string, ctx);
     }
 
     // ── cluster / metrics ────────────────────────────────────

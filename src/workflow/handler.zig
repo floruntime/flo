@@ -1943,7 +1943,7 @@ pub const WorkflowHandler = struct {
 
         if (is_local) {
             // Local shard: use invokeByName directly (same thread, no threading concerns)
-            return self.invokeActionLocal(shard, run, action_name, input, step_label, target_shard_id, now_ms);
+            return self.invokeActionLocal(shard, run, namespace, action_name, input, step_label, target_shard_id, now_ms);
         }
 
         // Cross-shard: the target shard creates the run on its own thread,
@@ -1953,7 +1953,7 @@ pub const WorkflowHandler = struct {
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
         const peer_mailboxes = shard.peer_mailboxes orelse return definition.StepOutcome.execution_failure;
         if (target_shard_id >= peer_mailboxes.len) return definition.StepOutcome.execution_failure;
-        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
+        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, namespace, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
             return definition.StepOutcome.execution_failure;
         };
         if (!peer_mailboxes[target_shard_id].inbox.send(.{
@@ -1973,18 +1973,22 @@ pub const WorkflowHandler = struct {
         return null; // signals: parked
     }
 
-    /// Same-shard action invocation (no threading concerns).
+    /// Same-shard action invocation (no threading concerns). The action is
+    /// the one in the workflow's namespace.
     fn invokeActionLocal(
         self: *WorkflowHandler,
         shard: *Shard,
         run: *RunRecord,
+        namespace: []const u8,
         action_name: []const u8,
         input: []const u8,
         step_label: []const u8,
         target_shard_id: u16,
         now_ms: i64,
     ) ?[]const u8 {
-        const action = shard.actions_handler.actions.get(action_name) orelse {
+        var kbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+        const key = ActionsHandler.defKey(&kbuf, namespace, action_name) orelse "";
+        const action = shard.actions_handler.actions.get(key) orelse {
             self.addHistoryEvent(run, "action_not_found", action_name, now_ms);
             return definition.StepOutcome.target_not_found;
         };
@@ -1995,7 +1999,7 @@ pub const WorkflowHandler = struct {
         }
 
         var action_id_buf: [32]u8 = undefined;
-        const invoked = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
+        const invoked = shard.actions_handler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
             return definition.StepOutcome.execution_failure;
         };
         // The run exists once the invoke applies; `checkPendingActions`
@@ -3984,7 +3988,9 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_ns);
         return;
     };
-    actions.actions.put(owned_name, .{
+    const owned_key = alloc.dupe(u8, name) catch unreachable;
+    actions.actions.put(owned_key, .{
+        .key_owned = owned_key,
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
         .owner_owned = owned_owner,
@@ -4012,7 +4018,9 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_ns);
         return;
     };
-    actions.actions.put(owned_name, .{
+    const owned_key = alloc.dupe(u8, name) catch unreachable;
+    actions.actions.put(owned_key, .{
+        .key_owned = owned_key,
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
         .owner_owned = owned_owner,
@@ -4731,6 +4739,7 @@ test "step executor: checkPendingActions handles completed async action" {
         actions.runs.put(arid, .{
             .run_id_owned = arid,
             .action_name_owned = aname,
+            .namespace_owned = actions.allocator.dupe(u8, "default") catch unreachable,
             .input_owned = null,
             .status = .completed,
             .created_at_ms = 0,

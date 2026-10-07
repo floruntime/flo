@@ -25,7 +25,9 @@ const checksum_mod = @import("../util/checksum.zig");
 
 pub const HEADER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'S', 'N', 'P', 0 };
 pub const FOOTER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'S', 'N', 'E', 0 };
-pub const SNAPSHOT_VERSION: u16 = 1;
+/// 2: queue dead letters record their queue; known queues carry per-queue
+/// ack, nack, dead-letter and lease-expiry counts.
+pub const SNAPSHOT_VERSION: u16 = 2;
 pub const HEADER_SIZE: usize = @sizeOf(SnapshotHeader);
 pub const FOOTER_SIZE: usize = @sizeOf(SnapshotFooter);
 pub const SECTION_HEADER_SIZE: usize = @sizeOf(SectionHeader);

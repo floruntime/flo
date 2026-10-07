@@ -25,8 +25,8 @@ function metaHl(meta: string | null): { __html: string } | null {
 }
 
 /* ======================= detail ======================= */
-function WorkerDetail({ id, onBack }: { id: string; onBack: () => void }) {
-  const q = useWorkerDetail(id)
+function WorkerDetail({ ns, id, onBack }: { ns: string; id: string; onBack: () => void }) {
+  const q = useWorkerDetail(ns, id)
   const w = q.data
   const hb = w ? secsAgo(w.last_seen) : 0
   const mh = w ? metaHl(w.metadata) : null
@@ -278,7 +278,7 @@ export function Workers() {
   const { ns } = useNamespace()
   const [open, setOpen] = useState<string | null>(null)
   return open ? (
-    <WorkerDetail id={open} onBack={() => setOpen(null)} />
+    <WorkerDetail ns={ns} id={open} onBack={() => setOpen(null)} />
   ) : (
     <WorkersList ns={ns} onOpen={setOpen} />
   )

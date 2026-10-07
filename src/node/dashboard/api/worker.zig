@@ -63,11 +63,12 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 }
 
 /// GET /workers/:id — Single worker detail
-pub fn getWorkerDetail(allocator: Allocator, worker_id: []const u8, ctx: *DashboardContext) ![]const u8 {
+pub fn getWorkerDetail(allocator: Allocator, worker_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getShard(ctx, i)) |shard| {
-            if (shard.worker_handler.workers.getPtr(worker_id)) |w| {
+            if (shard.worker_handler.find(ns_filter, worker_id)) |w| {
                 var json_aw: std.Io.Writer.Allocating = .init(allocator);
                 errdefer json_aw.deinit();
                 const writer = &json_aw.writer;

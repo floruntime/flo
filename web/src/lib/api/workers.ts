@@ -14,10 +14,11 @@ export function useWorkers(ns: string) {
   })
 }
 
-export function useWorkerDetail(id: string | null) {
+/** One worker, in the namespace it registered in: a worker id is per namespace. */
+export function useWorkerDetail(ns: string, id: string | null) {
   return useQuery({
-    queryKey: ['workers', 'detail', id],
-    queryFn: () => api.get<WorkerInfo>(`workers/${enc(id!)}`),
+    queryKey: ['workers', 'detail', ns, id],
+    queryFn: () => api.get<WorkerInfo>(`workers/${enc(id!)}?namespace=${enc(ns)}`),
     enabled: !!id,
     refetchInterval: 10_000,
   })
