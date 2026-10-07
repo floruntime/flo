@@ -3128,56 +3128,63 @@ pub const Shard = struct {
     /// Read data from a client socket, parse request(s), and dispatch.
     fn readFromClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
-        // A readable event can still arrive after a pause (same poll batch,
-        // or an interest change not yet submitted); what it would read
-        // could not drain, and would look like one oversized request.
-        if (conn.reads_paused or conn.closing or conn.waiting != null) return;
+        // A readable event comes when data arrives, not while it waits
+        // (io_uring polls are multishot). A read that filled the room it
+        // had may have left the rest of a request in the socket with
+        // nothing to announce it, so read again until a read comes back short.
+        while (true) {
+            // A readable event can still arrive after a pause (same poll batch,
+            // or an interest change not yet submitted); what it would read
+            // could not drain, and would look like one oversized request.
+            if (conn.reads_paused or conn.closing or conn.waiting != null) return;
 
-        // Read no more than the read buffer has room for: bytes read and
-        // not kept would be requests silently lost.
-        var tmp_buf: [65536]u8 = undefined;
-        if (conn.read_buf.writable() == 0) {
-            // A request may be larger than the buffer: grow it to hold one
-            // whole request. Full at that size, the client sent more than a
-            // request can be. Every request says its size in its header and
-            // one that cannot fit is refused from it, so this should not be
-            // reached; if it is, one connection is closed rather than its
-            // buffer growing without bound.
-            const cap = conn.read_buf.buf.len * 2;
-            if (cap > MAX_READ_BUFFER) {
-                self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
-                self.flushToClient(fd);
-                return self.markClosing(fd);
+            // Read no more than the read buffer has room for: bytes read and
+            // not kept would be requests silently lost.
+            var tmp_buf: [65536]u8 = undefined;
+            if (conn.read_buf.writable() == 0) {
+                // A request may be larger than the buffer: grow it to hold one
+                // whole request. Full at that size, the client sent more than a
+                // request can be. Every request says its size in its header and
+                // one that cannot fit is refused from it, so this should not be
+                // reached; if it is, one connection is closed rather than its
+                // buffer growing without bound.
+                const cap = conn.read_buf.buf.len * 2;
+                if (cap > MAX_READ_BUFFER) {
+                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
+                    self.flushToClient(fd);
+                    return self.markClosing(fd);
+                }
+                conn.read_buf.resize(cap) catch return self.markClosing(fd);
             }
-            conn.read_buf.resize(cap) catch return self.markClosing(fd);
+            const room = @min(tmp_buf.len, conn.read_buf.writable());
+
+            const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeConnection(fd);
+                return;
+            };
+            if (n == 0) {
+                // EOF — peer closed
+                self.closeConnection(fd);
+                return;
+            }
+
+            if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+            if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
+
+            // Accumulate data in the read buffer
+            _ = conn.read_buf.write(tmp_buf[0..n]);
+
+            // Detect protocol on first data if not yet determined
+            if (conn.protocol == .unknown) {
+                conn.detectAndSetProtocol();
+            }
+
+            self.processRequests(fd, conn);
+            // Closing is deferred, so the connection is still ours here.
+            conn.shrinkReadBuffer();
+            if (n < room) return;
         }
-        const room = @min(tmp_buf.len, conn.read_buf.writable());
-
-        const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
-            if (err == error.WouldBlock) return;
-            self.closeConnection(fd);
-            return;
-        };
-        if (n == 0) {
-            // EOF — peer closed
-            self.closeConnection(fd);
-            return;
-        }
-
-        if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
-        if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
-
-        // Accumulate data in the read buffer
-        _ = conn.read_buf.write(tmp_buf[0..n]);
-
-        // Detect protocol on first data if not yet determined
-        if (conn.protocol == .unknown) {
-            conn.detectAndSetProtocol();
-        }
-
-        self.processRequests(fd, conn);
-        // Closing is deferred, so the connection is still ours here.
-        conn.shrinkReadBuffer();
     }
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.

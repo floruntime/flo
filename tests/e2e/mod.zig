@@ -21,6 +21,7 @@ pub const namespace_scoping_test = @import("namespace_scoping_test.zig");
 pub const action_test = @import("action_test.zig");
 pub const worker_test = @import("worker_test.zig");
 pub const workflow_test = @import("workflow_test.zig");
+pub const large_request_test = @import("large_request_test.zig");
 pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");
