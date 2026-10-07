@@ -1,8 +1,6 @@
-//! In "default" a key is used bare, so a key holding a NUL could spell
-//! another namespace's "ns\x00key". Such keys are refused on every path that
-//! takes one: a client's request, a pipeline's KV sink keyed from record
-//! data, and a kv_lookup built from record data. Namespace "b" holds the key
-//! each test reaches for, and keeps it.
+//! A KV key is stored bare in "default", so one holding a NUL could name
+//! another namespace's "ns\x00key". Such keys are refused by client requests
+//! and pipeline KV sinks, and a kv_lookup built from one finds nothing.
 
 const std = @import("std");
 const testing = std.testing;
@@ -35,9 +33,9 @@ fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, k
     return error.NoResponse;
 }
 
-fn bSecretIntact(ctx: *stdx.testing.TestContext) !bool {
-    const got = try ctx.execCapture(&.{ "kv", "get", "secret", "-n", "b" });
-    return std.mem.indexOf(u8, got, "b-value") != null and std.mem.indexOf(u8, got, "stolen") == null;
+fn bKeyUnchanged(ctx: *stdx.testing.TestContext) !bool {
+    const got = try ctx.execCapture(&.{ "kv", "get", "k", "-n", "b" });
+    return std.mem.indexOf(u8, got, "b-value") != null and std.mem.indexOf(u8, got, "overwrite") == null and std.mem.indexOf(u8, got, "nul-key") == null;
 }
 
 fn waitFor(ctx: *stdx.testing.TestContext, args: []const []const u8, expected: []const u8) !bool {
@@ -54,26 +52,26 @@ test "e2e/kv: a key holding a NUL is refused, and a default listing shows only d
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     const proto = @import("src").protocol.proto;
-    try ctx.exec(&.{ "kv", "set", "secret", "b-value", "-n", "b" });
+    try ctx.exec(&.{ "kv", "set", "k", "b-value", "-n", "b" });
     try ctx.exec(&.{ "kv", "set", "mine", "default-value" });
 
     var out: [512]u8 = undefined;
     for ([_]proto.OpCode{ .kv_put, .kv_get, .kv_delete }) |op| {
-        const r = try rawCall(ctx, op, "", "b\x00secret", "stolen", &out);
+        const r = try rawCall(ctx, op, "", "b\x00k", "overwrite", &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "key must not contain NUL") != null);
     }
-    try testing.expect(try bSecretIntact(ctx));
+    try testing.expect(try bKeyUnchanged(ctx));
 
     const listed = try ctx.execCapture(&.{ "kv", "list" });
     try testing.expect(std.mem.indexOf(u8, listed, "mine") != null);
-    try testing.expect(std.mem.indexOf(u8, listed, "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, listed, "b-value") == null);
 }
 
-test "e2e/kv: a default pipeline's KV sink keyed from record data cannot write another namespace's key" {
+test "e2e/kv: a pipeline's KV sink drops a record whose key holds a NUL" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    try ctx.exec(&.{ "kv", "set", "secret", "b-value", "-n", "b" });
+    try ctx.exec(&.{ "kv", "set", "k", "b-value", "-n", "b" });
     const def =
         \\kind: Processing
         \\name: nul-sink
@@ -86,17 +84,17 @@ test "e2e/kv: a default pipeline's KV sink keyed from record data cannot write a
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "nul-sink.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
     try ctx.exec(&.{ "processing", "submit", path });
-    try ctx.exec(&.{ "stream", "append", "nul-in", "{\"id\":\"b\\u0000secret\",\"v\":\"stolen\"}" });
+    try ctx.exec(&.{ "stream", "append", "nul-in", "{\"id\":\"b\\u0000k\",\"v\":\"nul-key\"}" });
     try ctx.exec(&.{ "stream", "append", "nul-in", "{\"id\":\"control\",\"v\":\"ran\"}" });
-    // The control record shows the pipeline ran past the other.
+    // Appended after the NUL record: once it lands, that record was processed.
     try testing.expect(try waitFor(ctx, &.{ "kv", "get", "control" }, "ran"));
-    try testing.expect(try bSecretIntact(ctx));
+    try testing.expect(try bKeyUnchanged(ctx));
 }
 
-test "e2e/kv: a default pipeline's kv_lookup keyed from record data cannot read another namespace's key" {
+test "e2e/kv: a kv_lookup whose key holds a NUL finds nothing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    try ctx.exec(&.{ "kv", "set", "secret", "b-value", "-n", "b" });
+    try ctx.exec(&.{ "kv", "set", "k", "b-value", "-n", "b" });
     try ctx.exec(&.{ "kv", "set", "known", "yes" });
     const def =
         \\kind: Processing
@@ -111,10 +109,30 @@ test "e2e/kv: a default pipeline's kv_lookup keyed from record data cannot read 
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "nul-lookup.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
     try ctx.exec(&.{ "processing", "submit", path });
-    try ctx.exec(&.{ "stream", "append", "look-in", "{\"id\":\"b\\u0000secret\",\"tag\":\"crossed\"}" });
+    try ctx.exec(&.{ "stream", "append", "look-in", "{\"id\":\"b\\u0000k\",\"tag\":\"nul-key\"}" });
     try ctx.exec(&.{ "stream", "append", "look-in", "{\"id\":\"known\",\"tag\":\"control\"}" });
     try testing.expect(try waitFor(ctx, &.{ "stream", "read", "look-out", "--start", "0-0", "--limit", "100" }, "control"));
     var r = try ctx.cli.run(&.{ "stream", "read", "look-out", "--start", "0-0", "--limit", "100" });
     defer r.deinit();
-    try testing.expect(!r.stdoutContains("crossed"));
+    try testing.expect(!r.stdoutContains("nul-key"));
+}
+
+test "e2e/kv: the dashboard finds no key holding a NUL" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "kv", "set", "k", "b-value", "-n", "b" });
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    var own = try http.get("/api/v1/kv/namespaces/b/keys/k");
+    defer own.deinit();
+    try testing.expectEqual(@as(u16, 200), own.status);
+    try testing.expect(own.bodyContains("b-value"));
+
+    for ([_][]const u8{ "/api/v1/kv/namespaces/default/keys/b%00k", "/api/v1/kv/namespaces/default/keys/b%00k/history" }) |path| {
+        var r = try http.get(path);
+        defer r.deinit();
+        try testing.expectEqual(@as(u16, 404), r.status);
+        try testing.expect(!r.bodyContains("b-value"));
+    }
 }

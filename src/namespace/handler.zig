@@ -116,6 +116,10 @@ pub const NAMESPACE_SEPARATOR: u8 = 0;
 /// This is the canonical function — all subsystems should use this for
 /// namespace isolation rather than implementing their own qualification.
 ///
+/// Returns `error.KeyHasNul` if raw_key contains the separator: a "default"
+/// key is stored bare, so it could otherwise name another namespace's entry
+/// (refused in every namespace so the rule is one rule). Callers must fail
+/// closed; falling back to raw_key reopens that reach.
 /// Returns `error.KeyTooLarge` if the combined length exceeds the buffer.
 ///
 /// Lifetime: the returned slice borrows from `buf` (when prefixed) or from
@@ -123,8 +127,6 @@ pub const NAMESPACE_SEPARATOR: u8 = 0;
 /// registration (pool copies to inline buffer), and Raft propose (serializes
 /// immediately).
 pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) error{ KeyTooLarge, KeyHasNul }![]const u8 {
-    // In "default" a key is used bare, so one holding a NUL could spell
-    // another namespace's "ns\x00key"; refused in every namespace alike.
     if (std.mem.indexOfScalar(u8, raw_key, NAMESPACE_SEPARATOR) != null) return error.KeyHasNul;
     if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
     const total = ns.len + 1 + raw_key.len;
@@ -196,7 +198,7 @@ pub fn namespacePrefix(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8) error{Namesp
     return buf[0 .. ns.len + 1];
 }
 
-/// Validate that a key + namespace combination will fit within limits.
+/// Validate a key for namespace ns: non-empty, no NUL, and fits once qualified.
 ///
 /// Call this at the dispatch layer (before any business logic) to give users
 /// a clear error message upfront rather than a confusing qualification failure
@@ -1449,7 +1451,7 @@ test "namespace: a committed entry's hash resolves to the name until it is delet
 
 test "namespace handler: a key holding a NUL is never qualified" {
     var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "", "b\x00secret"));
-    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "a", "b\x00secret"));
+    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "", "b\x00k"));
+    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "a", "b\x00k"));
     try testing.expectEqualStrings("key must not contain NUL", validateKeySize("default", "b\x00x").?);
 }
