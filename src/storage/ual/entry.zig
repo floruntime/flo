@@ -194,8 +194,8 @@ pub const CommandPayload = struct {
     value: []const u8,
 
     /// Total serialized size of this payload.
-    pub fn serializedSize(self: *const CommandPayload) u32 {
-        return @intCast(COMMAND_PREFIX_SIZE + self.key.len + self.value.len);
+    pub fn serializedSize(self: *const CommandPayload) usize {
+        return COMMAND_PREFIX_SIZE + self.key.len + self.value.len;
     }
 
     /// Serialize into a buffer. Returns the number of bytes written.
@@ -215,7 +215,7 @@ pub const CommandPayload = struct {
             @memcpy(buf[value_start .. value_start + self.value.len], self.value);
         }
 
-        return @intCast(total);
+        return total;
     }
 
     /// Deserialize from a byte slice.
@@ -223,16 +223,17 @@ pub const CommandPayload = struct {
         if (data.len < COMMAND_PREFIX_SIZE) return null;
 
         const ns_hash = std.mem.readInt(u32, data[0..4], .little);
-        const key_len = std.mem.readInt(u16, data[4..6], .little);
-        const val_len = std.mem.readInt(u32, data[6..10], .little);
+        // Widened so the offsets below can't overflow the wire widths.
+        const key_len: usize = std.mem.readInt(u16, data[4..6], .little);
+        const val_len: usize = std.mem.readInt(u32, data[6..10], .little);
 
         const total: usize = COMMAND_PREFIX_SIZE + key_len + val_len;
         if (data.len < total) return null;
 
         return .{
             .namespace_hash = ns_hash,
-            .key_length = key_len,
-            .value_length = val_len,
+            .key_length = @intCast(key_len),
+            .value_length = @intCast(val_len),
             .key = data[10 .. 10 + key_len],
             .value = data[10 + key_len .. 10 + key_len + val_len],
         };
@@ -277,7 +278,7 @@ pub const Entry = struct {
 
     /// Parse the payload as a command (key-value) payload.
     pub fn commandPayload(self: *const Entry) ?CommandPayload {
-        const et: EntryType = @enumFromInt(self.header.entry_type);
+        const et = std.enums.fromInt(EntryType, self.header.entry_type) orelse return null;
         if (!et.hasKeyValue()) return null;
         return CommandPayload.deserialize(self.payload);
     }
@@ -533,4 +534,32 @@ test "entry: CRC changes when header fields change" {
     const entry1 = buildEntry(.kv_put, Flags.NONE, 1, 1, 0, payload);
     const entry2 = buildEntry(.kv_put, Flags.NONE, 2, 1, 0, payload); // different term
     try std.testing.expect(entry1.header.crc32c != entry2.header.crc32c);
+}
+
+test "entry: a command payload whose lengths overrun the data is refused" {
+    // key_len 0xFFFF on a short buffer.
+    try std.testing.expect(CommandPayload.deserialize(&[_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 'k' }) == null);
+    // value_len 0xFFFFFFFF.
+    try std.testing.expect(CommandPayload.deserialize(&[_]u8{ 0, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 'k' }) == null);
+}
+
+test "entry: a command payload with a key near the u16 limit decodes" {
+    const key_len: usize = 65530;
+    const data = try std.testing.allocator.alloc(u8, COMMAND_PREFIX_SIZE + key_len + 1);
+    defer std.testing.allocator.free(data);
+    @memset(data, 'k');
+    std.mem.writeInt(u32, data[0..4], 0, .little);
+    std.mem.writeInt(u16, data[4..6], @intCast(key_len), .little);
+    std.mem.writeInt(u32, data[6..10], 1, .little);
+    const cmd = CommandPayload.deserialize(data).?;
+    try std.testing.expectEqual(key_len, cmd.key.len);
+    try std.testing.expectEqual(@as(usize, 1), cmd.value.len);
+}
+
+test "entry: an unknown entry type has no command payload" {
+    var buf: [64]u8 = undefined;
+    var e = buildCommandEntry(.kv_put, Flags.NONE, 1, 1, 0, 0, "k", "v", &buf).?;
+    try std.testing.expect(e.commandPayload() != null);
+    e.header.entry_type = 0xfe;
+    try std.testing.expect(e.commandPayload() == null);
 }

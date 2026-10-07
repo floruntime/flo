@@ -1394,38 +1394,12 @@ pub const Shard = struct {
     /// `[ns_len:u16][ns][key_len:u16][key][value_len:u32][value][opts_len:u16][opts]`.
     /// CRC is preserved from the original header so the receiver re-validates.
     fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
-        const header_size = @sizeOf(proto.RequestHeader);
-        const total = header_size + req.header.payload_length;
-        const buf = try allocator.alloc(u8, total);
+        // Sized from the parts, not header.payload_length: a client may omit
+        // the options trailer, which serialize always writes.
+        const size = @sizeOf(proto.RequestHeader) + 2 + req.namespace.len + 2 + req.key.len + 4 + req.value.len + 2 + req.options.len;
+        const buf = try allocator.alloc(u8, size);
         errdefer allocator.free(buf);
-
-        @memcpy(buf[0..header_size], std.mem.asBytes(&req.header));
-
-        var off: usize = header_size;
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.namespace.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.namespace.len], req.namespace);
-        off += req.namespace.len;
-
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.key.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.key.len], req.key);
-        off += req.key.len;
-
-        std.mem.writeInt(u32, buf[off..][0..4], @intCast(req.value.len), .little);
-        off += 4;
-        @memcpy(buf[off..][0..req.value.len], req.value);
-        off += req.value.len;
-
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.options.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.options.len], req.options);
-        off += req.options.len;
-
-        // Header.payload_length must match the recomposed payload exactly,
-        // otherwise the receiver's parse() will reject the message.
-        if (off != total) return error.RequestSerializationMismatch;
-
+        _ = try req.serialize(buf);
         return buf;
     }
 
@@ -8310,4 +8284,28 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
     try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
     try std.testing.expectEqual(second.index, writer.first_index);
     try shard.flushSegmentToDisk();
+}
+
+test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
+    // A client may stop after the value; serializeRequest always writes the trailer.
+    const payload = [_]u8{ 0, 0, 2, 0, 'k', '0', 0, 0, 0, 0 };
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(proto.OpCode.kv_get);
+    header.request_id = 5;
+    header.payload_length = payload.len;
+    header.crc32 = header.computeCRC32(&payload);
+    var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;
+    @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
+    @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
+    const req = try proto.Request.parse(&frame);
+
+    const wire = try Shard.serializeRequest(std.testing.allocator, req);
+    defer std.testing.allocator.free(wire);
+    const again = try proto.Request.parse(wire);
+    try std.testing.expectEqualStrings("k0", again.key);
+    try std.testing.expectEqual(@as(u64, 5), again.header.request_id);
+    try std.testing.expectEqual(@as(usize, 0), again.options.len);
 }

@@ -301,7 +301,7 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     const query_text = if (body.len > 0)
         body
     else if (h.parseQueryParam([]const u8, query_string, "q")) |raw|
-        (if (raw.len <= q_decode_buf.len) h.percentDecode(&q_decode_buf, raw) else raw)
+        (h.percentDecode(&q_decode_buf, raw) orelse raw)
     else
         "";
     if (query_text.len == 0) return try h.jsonError(allocator, "Empty query");

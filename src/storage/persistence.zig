@@ -31,6 +31,11 @@ const Flags = entry_mod.Flags;
 
 pub const MAX_PERSIST_PAYLOAD: usize = 65536;
 
+/// Longest key an entry carries. Every client-named write (KV key, stream,
+/// series, queue, run id) is proposed here, so the cap holds for all of them,
+/// including subsystems that don't check their own.
+pub const MAX_ENTRY_KEY: usize = 4096;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ReplayRegistry
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -103,6 +108,7 @@ pub fn proposeEntryAt(
     value: []const u8,
     timestamp_ns: u64,
 ) !ProposeResult {
+    if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
     const ns_hash = router.namespaceHash(namespace);
 
     var payload_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
@@ -130,7 +136,7 @@ pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
         error.NotLeader, error.WritesStopped => .unavailable,
         error.Overloaded => .overloaded,
-        error.PayloadTooLarge => .invalid_request,
+        error.PayloadTooLarge, error.KeyTooLarge => .invalid_request,
         else => .internal_error,
     };
 }
@@ -147,6 +153,7 @@ pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
         error.WritesStopped => "unavailable: this shard stopped taking writes — a write left memory before it reached disk; retry once the node restarts",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
+        error.KeyTooLarge => "bad request: key or name too long — at most 4096 bytes",
         else => fallback,
     };
 }
@@ -161,4 +168,17 @@ test "persistence: a write too large to encode is the request's fault, not a ret
     try std.testing.expectEqual(proto.StatusCode.unavailable, failureStatus(error.NotLeader));
     try std.testing.expectEqual(proto.StatusCode.unavailable, failureStatus(error.WritesStopped));
     try std.testing.expectEqual(result_mod.CommandResult.ErrorCode.internal_error, failureCode(error.IndexGap));
+}
+
+test "persistence: a key longer than an entry carries is refused before it is proposed" {
+    const FakeRaft = struct {
+        pub fn propose(_: *const @This(), _: EntryType, _: u16, _: u64, _: []const u8) !ProposeResult {
+            return error.NotLeader;
+        }
+    };
+    const shard = struct { raft_node: FakeRaft }{ .raft_node = .{} };
+    const long = [_]u8{'k'} ** (MAX_ENTRY_KEY + 1);
+    try std.testing.expectError(error.KeyTooLarge, proposeEntryAt(&shard, .stream_append, 0, "", &long, "v", 0));
+    try std.testing.expectError(error.NotLeader, proposeEntryAt(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v", 0));
+    try std.testing.expectEqual(proto.StatusCode.bad_request, failureStatus(error.KeyTooLarge));
 }

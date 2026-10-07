@@ -309,7 +309,7 @@ fn routeKV(allocator: Allocator, method: Method, rest: []const u8, query_string:
         const key_rest_raw = sub["keys/".len..];
         // Percent-decode the key (frontend sends encodeURIComponent)
         var decode_buf: [4096]u8 = undefined;
-        const key_rest = helpers.percentDecode(&decode_buf, key_rest_raw);
+        const key_rest = helpers.percentDecode(&decode_buf, key_rest_raw) orelse return error.NotFound;
         // Check for /history suffix
         if (std.mem.endsWith(u8, key_rest, "/history")) {
             try only(method, &.{.GET});
