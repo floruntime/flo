@@ -3062,7 +3062,8 @@ test "e2e/workflow: a stream trigger survives restart and resumes at its cursor"
     try testing.expectEqual(@as(usize, 4), list_result.stdoutCount("st-restart-trig"));
 }
 
-fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !struct { status: u8, data: []const u8 } {
+/// Sends a hand-built request; the CLI client can't encode a malformed value.
+fn rawCall(ctx: *stdx.testing.TestContext, op: @import("src").protocol.proto.OpCode, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !struct { status: u8, data: []const u8 } {
     const proto = @import("src").protocol.proto;
     var header: proto.RequestHeader = undefined;
     @memset(std.mem.asBytes(&header), 0);
@@ -3075,7 +3076,7 @@ fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, k
     const bytes = try req.serialize(&buf);
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
-    _ = std.c.write(fd, bytes.ptr, bytes.len);
+    if (std.c.write(fd, bytes.ptr, bytes.len) != @as(isize, @intCast(bytes.len))) return error.ShortWrite;
     var got: usize = 0;
     var waited: u32 = 0;
     while (waited < 300) : (waited += 1) {
@@ -3087,17 +3088,38 @@ fn rawCall(ctx: *stdx.testing.TestContext, op: anytype, namespace: []const u8, k
     return error.NoResponse;
 }
 
-test "e2e/workflow: a list-runs request whose lengths overrun it is refused and the server stays up" {
+test "e2e/workflow: list-runs and signal requests whose lengths overrun them are refused and the server stays up" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     const proto = @import("src").protocol.proto;
 
-    // The status length claims one byte, which pushes the search length past the end.
-    var out: [512]u8 = undefined;
-    const r = try rawCall(ctx, proto.OpCode.workflow_list_runs, "", "", &[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
-    try testing.expectEqualStrings("invalid list-runs request", r.data);
+    try ctx.exec(&.{ "action", "register", "overrun-action" });
+    const def =
+        \\kind: Workflow
+        \\name: overrun-wf
+        \\version: 1.0.0
+        \\start.run: @actions/overrun-action
+        \\start.transition.success: flo.Completed
+        \\start.transition.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, def, "overrun-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    var start = try ctx.cli.run(&.{ "workflow", "start", "overrun-wf", "{}", "--run-id", "overrun-run" });
+    defer start.deinit();
+    try testing.expect(start.contains("overrun-run"));
 
-    const ok = try rawCall(ctx, proto.OpCode.workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
+    var out: [512]u8 = undefined;
+    // The status length claims one byte, which pushes the search length past the end.
+    const list = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }, &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), list.status);
+    try testing.expectEqualStrings("invalid list-runs request", list.data);
+
+    // A signal type length of 0xFFFF on a two-byte value.
+    const sig = try rawCall(ctx, .workflow_signal, "default", "overrun-run", &[_]u8{ 0xff, 0xff }, &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), sig.status);
+    try testing.expectEqualStrings("malformed signal", sig.data);
+
+    const ok = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), ok.status);
 }

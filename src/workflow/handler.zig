@@ -903,8 +903,8 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const sig_len = std.mem.readInt(u16, req.value[0..2], .little);
-        if (2 + sig_len > req.value.len) {
+        const sig_len: usize = std.mem.readInt(u16, req.value[0..2], .little);
+        if (req.value.len - 2 < sig_len) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed signal");
             return;
         }
@@ -4771,7 +4771,6 @@ test "step executor: checkPendingActions handles completed async action" {
 }
 
 test "list-runs query: every truncation of a valid value is refused, not read past" {
-    // limit 7, status "running", cursor "c1", search "abc"
     const valid = [_]u8{ 7, 0, 0, 0, 7, 0 } ++ "running".* ++ [_]u8{ 2, 0 } ++ "c1".* ++ [_]u8{ 3, 0 } ++ "abc".*;
     for (0..valid.len) |n| {
         try testing.expect(WorkflowHandler.parseListRunsQuery(valid[0..n]) == null);
@@ -4788,13 +4787,13 @@ test "list-runs query: every truncation of a valid value is refused, not read pa
 }
 
 test "list-runs query: a length that overruns the value is refused" {
-    // Ten bytes, but status claims one byte, which shifts the search length past the end.
+    // Each value's last length prefix, or the bytes it claims, runs past the end.
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }) == null);
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 }) == null);
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 'a', 'b' }) == null);
 }
 
-test "workflow replay: truncated and unknown-status entries are skipped" {
+test "workflow replay: an unknown status, or a complete entry without its output flag, is skipped" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -4809,7 +4808,7 @@ test "workflow replay: truncated and unknown-status entries are skipped" {
     handler.replayStart("default:r1", &start);
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 
-    // Status and timestamp but no has_output byte.
+    // Missing has_output byte; then an unknown status. Neither may change the run.
     handler.replayComplete("default:r1", &([_]u8{3} ++ [_]u8{0} ** 8));
     handler.replayComplete("default:r1", &([_]u8{0xee} ++ [_]u8{0} ** 9));
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
