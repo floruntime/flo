@@ -64,7 +64,7 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
         .{ .name = "invoke", .op = .action_invoke, .key = "act", .value = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff }, .status = .ok },
         .{ .name = "json_set", .op = .kv_json_set, .key = "k", .value = &.{ 0xfe, 0xff }, .status = .bad_request },
         // An unknown worker type.
-        .{ .name = "worker", .op = .worker_register, .key = "w", .value = &.{2}, .status = .ok },
+        .{ .name = "worker", .op = .worker_register, .key = "w", .value = &.{2}, .status = .bad_request },
         // One setting with an unknown tag.
         .{ .name = "config", .op = .namespace_config_set, .key = "default", .value = &.{ 1, 8 }, .status = .bad_request },
         .{ .name = "info", .op = .namespace_info, .key = "a" ** 129, .value = "", .status = .bad_request },

@@ -237,7 +237,7 @@ pub const WorkerHandler = struct {
 
         // Parse worker type
         const worker_type: WorkerType = if (value.len > 0)
-            std.enums.fromInt(WorkerType, value[0]) orelse return
+            std.enums.fromInt(WorkerType, value[0]) orelse return "unknown worker type"
         else
             .action;
         offset += 1;
@@ -262,7 +262,11 @@ pub const WorkerHandler = struct {
                 if (offset + name_len + 1 > value.len) break;
                 const name = value[offset .. offset + name_len];
                 offset += name_len;
-                const kind = std.enums.fromInt(ProcessKind, value[offset]) orelse break;
+                const kind = std.enums.fromInt(ProcessKind, value[offset]) orelse {
+                    for (processes.items) |p| self.allocator.free(p.name_owned);
+                    processes.deinit(self.allocator);
+                    return "unknown process kind";
+                };
                 offset += 1;
 
                 const owned_name = self.allocator.dupe(u8, name) catch continue;
@@ -656,4 +660,19 @@ test "workers: one id in two namespaces is two workers, and an id holding a NUL 
     try std.testing.expect(h.find("", "b\x00w") == null);
     try std.testing.expect(h.handleRegister(testRequest("", "b\x00w")) != null);
     try std.testing.expectEqual(@as(usize, 1), h.workers.count());
+}
+
+test "workers: an unknown worker type or process kind is refused, and nothing is kept" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+
+    var bad_type = testRequest("", "w1");
+    bad_type.value = &.{2};
+    try std.testing.expectEqualStrings("unknown worker type", h.handleRegister(bad_type).?);
+
+    // [type][max_concurrency:u32][count:u16]([len:u16][name][kind])* — the second kind is unknown.
+    var bad_kind = testRequest("", "w2");
+    bad_kind.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 'b', 0xee };
+    try std.testing.expectEqualStrings("unknown process kind", h.handleRegister(bad_kind).?);
+    try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 }
