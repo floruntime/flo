@@ -295,6 +295,8 @@ pub const Shard = struct {
     elections_unlogged: u64,
     /// One limiter per peer for each thing the leader loop says about it.
     peer_silent_warn_ms: [raft_node_mod.MAX_PEERS]u64,
+    /// When a failed sync flush was last logged; it repeats on every request.
+    flush_fail_warn_ms: u64,
     peer_batch_warn_ms: [raft_node_mod.MAX_PEERS]u64,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
@@ -786,6 +788,7 @@ pub const Shard = struct {
             .election_warn_ms = 0,
             .elections_unlogged = 0,
             .peer_silent_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .flush_fail_warn_ms = 0,
             .peer_batch_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
@@ -846,7 +849,28 @@ pub const Shard = struct {
     /// sealed under the current commit index.
     pub fn flushSegmentToDisk(self: *Shard) !void {
         const dl = self.durable_log orelse return;
+        try self.rebufferGap(dl.writer);
         try dl.flush(self.raft_node.commit_index);
+    }
+
+    /// Buffer again what the append hook could not, from the log, so the
+    /// flush writes a run without a gap. The log holds every entry above
+    /// the last flush; one it can't produce is named, and the flush fails.
+    fn rebufferGap(self: *Shard, writer: *SegmentWriter) !void {
+        const from = writer.first_unbuffered orelse return;
+        const raft = self.raft_node;
+        var idx = from;
+        while (idx <= raft.log.lastIndex()) : (idx += 1) {
+            const e = raft.log.getEntryCopy(idx, self.apply_buf) orelse {
+                log.err("shard {d}: entry index={d} is neither buffered for disk nor readable from the log; nothing after it can be flushed", .{ self.id, idx });
+                return error.EntryUnavailable;
+            };
+            writer.addEntry(&e) catch |err| {
+                writer.first_unbuffered = idx;
+                return err;
+            };
+        }
+        writer.first_unbuffered = null;
     }
 
     /// Apply what replay loaded into the log above the commit watermark.
@@ -866,15 +890,39 @@ pub const Shard = struct {
         }
     }
 
-    /// Flush segments when `durability == .sync` (after projections are applied).
+    /// With sync durability, flush what the log holds and tell the Raft
+    /// node it's on disk: a leader's own copy counts toward commit only then.
     pub fn syncFlushIfNeeded(self: *Shard) void {
-        if (self.durability == .sync) {
-            self.flushSegmentToDisk() catch |err| {
-                // In sync mode a flush failure breaks the durability contract —
-                // surface it loudly instead of acking a write that isn't on disk.
-                self.persist_failures += 1;
-                log.err("shard {d}: sync flush failed: {s} (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
-            };
+        if (self.durability != .sync) return;
+        const raft = self.raft_node;
+        const through = raft.log.lastIndex();
+        self.flushSegmentToDisk() catch |err| {
+            self.persist_failures += 1;
+            const now = nowMs();
+            if (now -| self.flush_fail_warn_ms >= WARN_INTERVAL_MS) {
+                self.flush_fail_warn_ms = now;
+                log.err("shard {d}: sync flush failed: {s}; writes not on disk are not acked (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+            }
+            // Alone, nothing else can make these writes durable: tell their
+            // clients now rather than leave them waiting on the disk.
+            if (raft.role == .leader and raft.peer_count == 0) self.failPendingAbove(raft.durable_index, NOT_ON_DISK);
+            return;
+        };
+        raft.markDurable(through);
+    }
+
+    /// What a client is told when its write is in the log but its flush
+    /// failed: it may still commit once the disk recovers.
+    pub const NOT_ON_DISK = "unavailable: write not on disk (flush failed); it may still apply once the disk recovers — check before resending";
+
+    fn failPendingAbove(self: *Shard, index: u64, message: []const u8) void {
+        if (self.pending_count == 0) return;
+        for (self.pending) |*slot| {
+            if (!slot.active or slot.index <= index) continue;
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, message);
+            self.allocator.free(slot.bytes);
+            slot.active = false;
+            self.pending_count -= 1;
         }
     }
 
@@ -2315,6 +2363,7 @@ pub const Shard = struct {
                         log.err("shard {d}: sync flush failed: {s}; not acking the batch (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
                         return;
                     };
+                    raft.markDurable(raft.log.lastIndex());
                 }
                 var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
                 const n = transport.serializeAppendResponse(resp, &buf) orelse return;
@@ -2672,43 +2721,47 @@ pub const Shard = struct {
     /// `applyCommitted`, stopping after index `limit`.
     fn applyThrough(self: *Shard, limit: u64) bool {
         if (self.applying) return true;
+        // With sync durability a leader's writes commit only once on disk:
+        // flushing first lets what that commits apply now.
+        self.syncFlushIfNeeded();
         // Called after every request: nothing to apply is the common case.
-        // A `sync` flush still happens, as it did before this shortcut.
-        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) {
-            self.syncFlushIfNeeded();
-            return true;
-        }
+        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) return true;
         self.applying = true;
         defer self.applying = false;
 
         const raft = self.raft_node;
         var all_applied = true;
-        while (raft.last_applied < @min(raft.commit_index, limit)) {
-            const next_idx = raft.last_applied + 1;
-            // Advanced before the apply: whatever a notification does, this
-            // entry is never taken twice, and the loop cannot stall.
-            raft.last_applied = next_idx;
-            if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
-                const applied = self.applyEntry(&e);
-                if (!applied) all_applied = false;
-                self.last_entry_applied = applied;
-                self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
-            } else {
-                self.last_entry_applied = false;
-                self.answerPending(next_idx, 0, 0, false);
-                // A committed index is always within the log, in the ring
-                // or below it in the durable log, and the buffer fits every
-                // entry; an unreadable one is a bug or a damaged segment.
-                // Said out loud, because the write was already acked.
-                log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
-                all_applied = false;
+        while (true) {
+            while (raft.last_applied < @min(raft.commit_index, limit)) {
+                const next_idx = raft.last_applied + 1;
+                // Advanced before the apply: whatever a notification does, this
+                // entry is never taken twice, and the loop cannot stall.
+                raft.last_applied = next_idx;
+                if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                    const applied = self.applyEntry(&e);
+                    if (!applied) all_applied = false;
+                    self.last_entry_applied = applied;
+                    self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
+                } else {
+                    self.last_entry_applied = false;
+                    self.answerPending(next_idx, 0, 0, false);
+                    // A committed index is always within the log, in the ring
+                    // or below it in the durable log, and the buffer fits every
+                    // entry; an unreadable one is a bug or a damaged segment.
+                    // Said out loud, because the write was already acked.
+                    log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
+                    all_applied = false;
+                }
             }
+            // Applying can propose (a workflow's next step); flushing that
+            // can commit it, so apply again until a flush commits nothing new.
+            self.syncFlushIfNeeded();
+            if (raft.last_applied >= @min(raft.commit_index, limit)) break;
         }
         if (self.wake_workers) {
             self.wake_workers = false;
             ActionsHandler.wakeWorkers(self);
         }
-        self.syncFlushIfNeeded();
         if (self.replies_held > 0) self.releaseReplies();
         return all_applied;
     }
@@ -4393,11 +4446,12 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// by value from init), so the hook is valid before bootstrap.
 fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
+    // Behind a gap nothing is buffered: the flush re-buffers from the gap.
+    if (writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
-        // Do not swallow: a failed persist means this committed entry is not
-        // queued for disk and would be lost on restart. Surface it.
         writer.buffer_failures += 1;
-        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s} (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        writer.first_unbuffered = entry.header.index;
+        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
     };
 }
 
@@ -4525,6 +4579,8 @@ const JOIN_ASK_INTERVAL_MS: u64 = 1000;
 /// Membership at boot comes from the log's latest config entry; a single
 /// node and a first member with nothing in the log lead at once.
 fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32) !void {
+    // Everything replay put in the log came from disk.
+    raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
     if (role == .single) {
         // A data directory that belonged to a group must not lead alone:
@@ -8055,4 +8111,88 @@ test "Shard: what a client sent while its reads were paused is read when they re
     try std.testing.expectEqual(@as(usize, 0), t.conn.read_buf.readable());
     t.shard.resumeReads(t.conn.fd, t.conn);
     try std.testing.expectEqual(@as(usize, 1), try t.answers(1));
+}
+
+/// A lone node with sync durability, its data dir under `tmp`, answering a
+/// client over a socket pair.
+const SyncAlone = struct {
+    data_dir: []const u8,
+    segs_z: [:0]u8,
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *SyncAlone, tmp: *std.testing.TmpDir) !void {
+        self.data_dir = try testDataDir(tmp);
+        self.segs_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/00000/segs", .{self.data_dir}, 0);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{ .self_counts_when_durable = true });
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *SyncAlone) void {
+        _ = std.c.chmod(self.segs_z, 0o700);
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.segs_z);
+        std.testing.allocator.free(self.data_dir);
+    }
+
+    /// The answer borrows from `buf`.
+    fn put(self: *SyncAlone, id: u64, key: []const u8, buf: []u8) !proto.Response {
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+};
+
+test "Shard: alone with sync durability, a write whose flush fails is not acked, and applies once the disk recovers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+
+    // The segments directory refuses new files: the flush fails.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o500));
+    var buf: [1024]u8 = undefined;
+    const refused = try s.put(1, "k1", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "not on disk") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.get("k1") == null);
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o700));
+    const acked = try s.put(2, "k2", &buf);
+    try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
+    // The refused write was in the log; it reached disk with this one.
+    try std.testing.expect(s.shard.kv_handler.kv.get("k1") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.get("k2") != null);
+}
+
+test "Shard: an entry the writer could not buffer is buffered again from the log before the flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+
+    // As if the append hook had failed on the next entry: nothing from it
+    // on is buffered, and the flush must buffer it from the log.
+    const writer = s.shard.durable_log.?.writer;
+    writer.first_unbuffered = s.shard.raft_node.log.lastIndex() + 1;
+    var buf: [1024]u8 = undefined;
+    const acked = try s.put(1, "k1", &buf);
+    try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
+    try std.testing.expect(writer.first_unbuffered == null);
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena) == 1);
 }

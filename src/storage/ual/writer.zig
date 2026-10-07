@@ -45,6 +45,10 @@ pub const SegmentWriter = struct {
     /// one is an entry that would be missing from disk after a restart, so
     /// it is counted and logged rather than dropped silently.
     buffer_failures: u64,
+    /// The first index that could not be buffered. Nothing after it is
+    /// buffered either, so a flush never writes past a gap; the owner
+    /// re-buffers from here before flushing.
+    first_unbuffered: ?u64 = null,
 
     allocator: std.mem.Allocator,
 
@@ -62,6 +66,7 @@ pub const SegmentWriter = struct {
             .compression = compression,
             .commit_index_at_seal = 0,
             .buffer_failures = 0,
+            .first_unbuffered = null,
             .allocator = allocator,
         };
     }
@@ -83,8 +88,11 @@ pub const SegmentWriter = struct {
         self.entry_type_bitmap = 0;
     }
 
-    /// Add an entry to the segment.
+    /// Add an entry to the segment: all or nothing, so on error the buffer
+    /// is as it was.
     pub fn addEntry(self: *SegmentWriter, entry: *const Entry) !void {
+        try self.data.ensureUnusedCapacity(self.allocator, entry_mod.HEADER_SIZE + entry.payload.len);
+        try self.sparse_index.ensureUnusedCapacity(self.allocator, 1);
         // Track sparse index (every Nth entry)
         if (self.entry_count % segment.SPARSE_INDEX_INTERVAL == 0) {
             try self.sparse_index.append(self.allocator, .{
@@ -117,6 +125,10 @@ pub const SegmentWriter = struct {
     /// self-delimiting in `data`, so the kept prefix ends at the first
     /// dropped header; the sparse index and metadata follow it.
     pub fn truncateAfter(self: *SegmentWriter, after_index: u64) void {
+        // Missing entries the cut discards are no longer owed to disk.
+        if (self.first_unbuffered) |f| {
+            if (f > after_index) self.first_unbuffered = null;
+        }
         if (self.entry_count == 0 or self.last_index <= after_index) return;
         if (self.first_index > after_index) {
             self.reset();

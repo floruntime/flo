@@ -76,6 +76,11 @@ pub const Config = struct {
     /// leader without them, and the survivor's log rewinds to match
     /// (`committed_conflicts`).
     durable_commits: bool = true,
+    /// A leader counts its own copy of an entry toward commit only once the
+    /// owner reports it on disk (`markDurable`). Set with sync durability;
+    /// otherwise a leader whose flush failed would ack a write that isn't
+    /// on any disk. Off by default: the simulator has no flush to report.
+    self_counts_when_durable: bool = false,
     /// Seed for election-timeout jitter. 0 draws one from OS entropy; a
     /// simulation passes a per-node seed so a run replays exactly.
     rng_seed: u64 = 0,
@@ -198,6 +203,9 @@ pub const RaftNode = struct {
     role: Role,
     leader_id: NodeId,
     commit_index: u64,
+    /// The highest index this node has on disk, as its owner reports it.
+    /// Read only when `config.self_counts_when_durable`.
+    durable_index: u64,
     last_applied: u64,
 
     // ── Election timer ─────────────────────────────────────────────────
@@ -279,6 +287,7 @@ pub const RaftNode = struct {
             .role = .follower,
             .leader_id = NO_VOTE,
             .commit_index = 0,
+            .durable_index = 0,
             .last_applied = 0,
             .election_deadline_ms = 0,
             .current_time_ms = 0,
@@ -446,7 +455,7 @@ pub const RaftNode = struct {
         const idx = try self.log.append(&noop);
         // `last_applied` stays where replay left it; the owner drains what
         // this bootstrap just committed.
-        self.commit_index = idx;
+        self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         log.debug("Raft: bootstrap complete, leader at term={d}, commit_index={d}", .{ self.current_term, idx });
     }
 
@@ -777,6 +786,7 @@ pub const RaftNode = struct {
                         self.last_applied = @min(self.last_applied, cut);
                     }
                     self.log.truncateAfter(e.header.index - 1);
+                    self.durable_index = @min(self.durable_index, e.header.index - 1);
                     self.truncatedBelowMembership(e.header.index - 1);
                     _ = try self.log.append(e);
                     self.noteAppended(e);
@@ -876,9 +886,10 @@ pub const RaftNode = struct {
         const idx = try self.log.append(&e);
         self.noteAppended(&e);
 
-        // In single-node mode, commit immediately
+        // In single-node mode, commit immediately: the node is the
+        // majority, once its copy counts.
         if (self.peer_count == 0) {
-            self.commit_index = idx;
+            self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         }
 
         log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @intFromEnum(entry_type), payload.len });
@@ -934,7 +945,7 @@ pub const RaftNode = struct {
         var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, self.current_term, next, 0, "");
         noop.header.crc32c = noop.computeCrc();
         if (self.log.append(&noop)) |idx| {
-            if (self.peer_count == 0) self.commit_index = idx;
+            if (self.peer_count == 0) self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         } else |err| {
             log.err("Raft: cannot append the leadership noop at index {d}: {s}; earlier terms' entries commit only after the next client write", .{ next, @errorName(err) });
         }
@@ -953,6 +964,28 @@ pub const RaftNode = struct {
         return last_index >= self.log.lastIndex();
     }
 
+    /// How far up to `idx` this node's own copy counts: all of it, unless
+    /// copies count only once on disk.
+    fn selfCountedThrough(self: *const RaftNode, idx: u64) u64 {
+        return if (self.config.self_counts_when_durable) @min(idx, self.durable_index) else idx;
+    }
+
+    /// The owner has everything through `idx` on disk. A leader's own copy
+    /// now counts toward commit up to there.
+    pub fn markDurable(self: *RaftNode, idx: u64) void {
+        const through = @min(idx, self.log.lastIndex());
+        if (through <= self.durable_index) return;
+        self.durable_index = through;
+        if (self.role != .leader) return;
+        if (self.peer_count == 0) {
+            // A single node's disk is the whole quorum, whatever term the
+            // entries are from.
+            self.commit_index = @max(self.commit_index, self.durable_index);
+        } else {
+            self.advanceCommitIndex();
+        }
+    }
+
     fn advanceCommitIndex(self: *RaftNode) void {
         // Find the highest index replicated to a majority
         const last = self.log.lastIndex();
@@ -964,7 +997,7 @@ pub const RaftNode = struct {
             // Only commit entries from current term (Raft safety)
             if (term != self.current_term) continue;
 
-            var replicas: u8 = 1; // count self
+            var replicas: u8 = if (self.selfCountedThrough(idx) >= idx) 1 else 0;
             for (0..self.peer_count) |i| {
                 if (self.peers[i].match_index >= idx) {
                     replicas += 1;
@@ -2473,4 +2506,54 @@ test "raft node: a membership naming nobody leaves the timer off, and a bootstra
     // ...but a member that never answers still costs it the lead.
     const later = leader.tick(joined_at + 2 * max + 1);
     try testing.expect(later.step_down);
+}
+
+test "raft node: counting its own copy only once durable, a lone leader commits what is on disk" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 16384, .{ .self_counts_when_durable = true });
+    defer node.deinit();
+    try node.bootstrap();
+    try testing.expectEqual(@as(u64, 0), node.commit_index);
+    node.markDurable(node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 1), node.commit_index);
+
+    const p = try node.propose(.kv_put, entry_mod.Flags.NONE, 0, "v");
+    try testing.expectEqual(@as(u64, 1), node.commit_index);
+    // Nothing past the log counts, however far the owner says it flushed.
+    node.markDurable(p.index + 5);
+    try testing.expectEqual(p.index, node.commit_index);
+    try testing.expectEqual(p.index, node.durable_index);
+}
+
+test "raft node: a leader's own copy counts toward a majority only once durable" {
+    var leader = try RaftNode.init(testing.allocator, 1, 1, 16384, .{ .self_counts_when_durable = true });
+    defer leader.deinit();
+    leader.addPeer(2);
+    leader.addPeer(3);
+    _ = candidacy(&leader).?;
+    _ = leader.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 3 });
+    try testing.expectEqual(Role.leader, leader.role);
+    const p = try leader.propose(.kv_put, entry_mod.Flags.NONE, 0, "v");
+    sentAll(&leader);
+
+    // One follower has it; the leader's copy isn't on disk: one of three.
+    leader.handleAppendResponse(.{ .term = 1, .success = true, .match_index = p.index, .from = 2 });
+    try testing.expectEqual(@as(u64, 0), leader.commit_index);
+    leader.markDurable(p.index);
+    try testing.expectEqual(p.index, leader.commit_index);
+}
+
+test "raft node: a durable index past a truncation is cut back to it" {
+    var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{ .self_counts_when_durable = true, .durable_commits = false });
+    defer follower.deinit();
+    for (1..4) |i| {
+        var e = testEntry(1, i, "f");
+        _ = try follower.log.append(&e);
+    }
+    follower.markDurable(3);
+    try testing.expectEqual(@as(u64, 3), follower.durable_index);
+    follower.current_term = 2;
+    const replacement = [_]Entry{testEntry(2, 2, "l")};
+    const resp = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 1, .prev_log_term = 1, .entries = &replacement, .leader_commit = 0 });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 1), follower.durable_index);
 }
