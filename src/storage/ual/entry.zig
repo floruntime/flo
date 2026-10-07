@@ -266,10 +266,12 @@ pub const Entry = struct {
         return stream.checksum();
     }
 
-    /// Validate the entry: check magic, version, CRC, lengths.
-    pub fn validate(self: *const Entry) error{ InvalidMagic, InvalidVersion, InvalidCrc, InvalidLength }!void {
+    /// Validate the entry: check magic, version, type, CRC, lengths. Every
+    /// later `@enumFromInt` of the type relies on the type check.
+    pub fn validate(self: *const Entry) error{ InvalidMagic, InvalidVersion, InvalidType, InvalidCrc, InvalidLength }!void {
         if (self.header.magic != ENTRY_MAGIC) return error.InvalidMagic;
         if (self.header.version != ENTRY_VERSION) return error.InvalidVersion;
+        if (std.enums.fromInt(EntryType, self.header.entry_type) == null) return error.InvalidType;
         if (self.header.payload_len != @as(u32, @intCast(self.payload.len))) return error.InvalidLength;
 
         const expected_crc = self.computeCrc();
@@ -562,4 +564,11 @@ test "entry: an unknown entry type has no command payload" {
     try std.testing.expect(e.commandPayload() != null);
     e.header.entry_type = 0xfe;
     try std.testing.expect(e.commandPayload() == null);
+}
+
+test "entry: validate refuses an unknown entry type" {
+    var e = buildEntry(.kv_put, Flags.NONE, 1, 1, 0, "v");
+    e.header.entry_type = 0xfe;
+    e.header.crc32c = e.computeCrc();
+    try std.testing.expectError(error.InvalidType, e.validate());
 }

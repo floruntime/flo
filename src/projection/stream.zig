@@ -1691,7 +1691,10 @@ pub const StreamProjection = struct {
                 offset += id_len;
                 const joined_at_ns = std.mem.readInt(u64, data[offset..][0..8], .little);
                 offset += 8;
-                const state: MemberState = @enumFromInt(data[offset]);
+                const state = std.enums.fromInt(MemberState, data[offset]) orelse {
+                    self.allocator.free(member_id);
+                    return error.InvalidPayload;
+                };
                 offset += 1;
 
                 try group.members.put(member_id, .{
@@ -2498,4 +2501,28 @@ test "stream: count retention resolves by records, not batches" {
 
     // A budget smaller than the first batch trims nothing at all.
     try testing.expect(s.resolveNthRecordId(hash, 1).eql(StreamID.MIN));
+}
+
+test "stream: a snapshot with any one byte corrupted is refused or loaded, never trapped on" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+    try s.registerStream("events");
+    try s.registerStreamMetadata("events", .{ .partition_count = 4, .name_hash = 42, .retention_age_s = 0, .retention_count = 0, .retention_bytes = 0 });
+    _ = try s.appendToStream(42, 100, 0);
+    try s.createGroup("g", 5000);
+    _ = try s.joinGroup("g", "c1", 6000);
+    const data = try s.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    const bad = try testing.allocator.dupe(u8, data);
+    defer testing.allocator.free(bad);
+    for (0..bad.len) |i| {
+        @memcpy(bad, data);
+        bad[i] = 0xee;
+        // An arena: error paths may leave partial state behind.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var s2 = StreamProjection.init(arena.allocator());
+        s2.deserialize(bad) catch {};
+    }
 }

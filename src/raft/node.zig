@@ -854,7 +854,8 @@ pub const RaftNode = struct {
                     // agreeing, never forward. Below the recorded match it
                     // is a follower that crashed before flushing what it
                     // acked: trust it, or probe above its log forever.
-                    const hinted = resp.hint_index + 1;
+                    // Saturating: the hint is a peer's word, not a bound.
+                    const hinted = resp.hint_index +| 1;
                     const back_one = self.peers[i].next_index -| 1;
                     self.peers[i].next_index = @max(1, @min(hinted, back_one));
                     self.peers[i].match_index = @min(self.peers[i].match_index, resp.hint_index);
@@ -2343,6 +2344,11 @@ test "raft node: a rejection carries where the follower's log stops agreeing, an
     leader.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2, .hint_index = 1 });
     try testing.expectEqual(@as(u64, 2), leader.peers[0].next_index);
     try testing.expectEqual(@as(u64, 1), leader.peers[0].match_index);
+
+    // A hint at the top of the range is taken as "no earlier", not overflowed.
+    leader.peers[0].next_index = 9;
+    leader.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2, .hint_index = std.math.maxInt(u64) });
+    try testing.expectEqual(@as(u64, 8), leader.peers[0].next_index);
 }
 
 test "raft node: a conflict below the commit index is refused when commits are durable, and rewinds when they are not" {

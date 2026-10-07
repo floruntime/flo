@@ -915,7 +915,7 @@ pub const ProcessingHandler = struct {
         const job_id = key;
 
         var off: usize = 0;
-        const status: JobStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(JobStatus, value[off]) orelse return;
         off += 1;
         const parallelism = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
@@ -2031,4 +2031,16 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
     defer allocator.free(records);
     // key_not_empty filter rejects records with empty key
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+
+    // [status=0xee][parallelism][batch_size][created_at_ms][ns_len=0]
+    var val = [_]u8{0} ** 21;
+    val[0] = 0xee;
+    handler.replaySubmit("job-bad", &val);
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }

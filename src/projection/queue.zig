@@ -815,7 +815,7 @@ pub const QueueProjection = struct {
             offset += 8;
             const priority = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
-            const state: MessageState = @enumFromInt(data[offset]);
+            const state = std.enums.fromInt(MessageState, data[offset]) orelse return error.InvalidPayload;
             offset += 1;
             const attempts = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
@@ -1248,4 +1248,25 @@ test "queue: a nack applied twice queues the message once and counts one attempt
     const d = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 2), d.attempts);
     try testing.expect(try q.dequeue(4001, 42) == null);
+}
+
+test "queue: a snapshot with any one byte corrupted is refused or loaded, never trapped on" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
+    defer q.deinit();
+    _ = try q.enqueue(100, 1, 1000, 42, "hello");
+    try q.registerQueue(42, "tasks", "default");
+    const data = try q.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    const bad = try testing.allocator.dupe(u8, data);
+    defer testing.allocator.free(bad);
+    for (0..bad.len) |i| {
+        @memcpy(bad, data);
+        bad[i] = 0xee;
+        // An arena: error paths may leave partial state behind.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var q2 = QueueProjection.init(arena.allocator(), .{ .default_lease_ns = 1000 });
+        q2.deserialize(bad) catch {};
+    }
 }
