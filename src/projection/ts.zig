@@ -982,6 +982,20 @@ pub const TSProjection = struct {
                     }
                 }
             },
+            .ts_delete => {
+                if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
+                    _ = self.deleteMeasurement(cmd.namespace_hash, cmd.key);
+                }
+            },
+            // The cutoff was taken once, where the entry was proposed, so
+            // every replica trims the same points.
+            .ts_retention => {
+                if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
+                    if (cmd.value.len == 8) {
+                        _ = self.applyRetention(cmd.namespace_hash, cmd.key, std.mem.readInt(u64, cmd.value[0..8], .little));
+                    }
+                }
+            },
             else => {},
         }
 
