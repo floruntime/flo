@@ -27,6 +27,7 @@ pub const time_bounds_test = @import("time_bounds_test.zig");
 pub const config_test = @import("config_test.zig");
 pub const data_dir_lock_test = @import("data_dir_lock_test.zig");
 pub const request_bounds_test = @import("request_bounds_test.zig");
+pub const request_decode_test = @import("request_decode_test.zig");
 pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");

@@ -237,7 +237,7 @@ pub const WorkerHandler = struct {
 
         // Parse worker type
         const worker_type: WorkerType = if (value.len > 0)
-            @enumFromInt(value[0])
+            std.enums.fromInt(WorkerType, value[0]) orelse return
         else
             .action;
         offset += 1;
@@ -262,7 +262,7 @@ pub const WorkerHandler = struct {
                 if (offset + name_len + 1 > value.len) break;
                 const name = value[offset .. offset + name_len];
                 offset += name_len;
-                const kind: ProcessKind = @enumFromInt(value[offset]);
+                const kind = std.enums.fromInt(ProcessKind, value[offset]) orelse break;
                 offset += 1;
 
                 const owned_name = self.allocator.dupe(u8, name) catch continue;

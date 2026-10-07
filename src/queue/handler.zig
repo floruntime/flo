@@ -860,7 +860,8 @@ pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const Dequeue
         offset += 8;
         std.mem.writeInt(u32, buf[offset..][0..4], r.attempts, .little);
         offset += 4;
-        buf[offset] = @intCast(r.priority);
+        // The wire carries a u8; a client can't set more, but a stored u32 can hold it.
+        buf[offset] = @intCast(@min(r.priority, std.math.maxInt(u8)));
         offset += 1;
     }
 
