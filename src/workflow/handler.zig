@@ -3707,119 +3707,122 @@ pub const WorkflowHandler = struct {
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
     fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
-        if (value.len < 10) return;
-        const status = std.enums.fromInt(RunStatus, value[0]) orelse return;
-        const completed_at_ms = std.mem.readInt(i64, value[1..9], .little);
-
-        // Look up existing run (must have been replayed via workflow_start first)
+        // Checked whole before the run is touched: an entry cut short or
+        // with a bad field is skipped, not half applied.
+        const entry = CompleteEntry.parse(value) orelse return;
         const run = self.runs.getPtr(ns_key_raw) orelse return;
-        run.status = status;
-        run.completed_at_ms = completed_at_ms;
+        const built = self.buildComplete(&entry) catch return;
+
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
-        if (run.output_owned) |o| {
-            self.allocator.free(o);
-            run.output_owned = null;
-        }
+        run.status = entry.status;
+        run.completed_at_ms = entry.completed_at_ms;
+        if (run.output_owned) |o| self.allocator.free(o);
+        run.output_owned = built.output;
         if (run.step_outputs) |*so| {
             var mutable = so.*;
             mutable.deinit(self.allocator);
-            run.step_outputs = null;
         }
+        run.step_outputs = built.steps;
         for (run.history.items) |evt| {
             self.allocator.free(evt.event_type_owned);
             self.allocator.free(evt.detail_owned);
         }
-        run.history.clearRetainingCapacity();
-
-        var off: usize = 9;
-
-        // [has_output:u8][output_len:u32][output]?
-        const has_output = value[off];
-        off += 1;
-        if (has_output == 1) {
-            if (off + 4 > value.len) return;
-            const out_len = std.mem.readInt(u32, value[off..][0..4], .little);
-            off += 4;
-            if (off + out_len > value.len) return;
-            run.output_owned = self.allocator.dupe(u8, value[off .. off + out_len]) catch return;
-            off += out_len;
+        run.history.deinit(self.allocator);
+        run.history = built.history;
+        if (built.tags) |t| {
+            if (run.search_tags_owned) |old| self.allocator.free(old);
+            run.search_tags_owned = t;
         }
+    }
 
-        // [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-        if (off + 2 > value.len) return;
-        const step_count = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (step_count > 0) {
-            var so = StepOutputMap.init();
-            var i: u16 = 0;
-            while (i < step_count) : (i += 1) {
-                if (off + 2 > value.len) return;
-                const name_len = std.mem.readInt(u16, value[off..][0..2], .little);
-                off += 2;
-                if (off + name_len > value.len) return;
-                const name = value[off .. off + name_len];
-                off += name_len;
+    /// A workflow_complete value, checked against its length:
+    ///   [status:u8][completed_at_ms:i64]
+    ///   [has_output:u8]([output_len:u32][output])?
+    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
+    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
+    ///   ([tags_len:u16][search_tags])?
+    const CompleteEntry = struct {
+        status: RunStatus,
+        completed_at_ms: i64,
+        output: ?[]const u8,
+        step_count: u16,
+        steps: Cursor,
+        history_count: u16,
+        history: Cursor,
+        tags: ?[]const u8,
 
-                if (off + 2 > value.len) return;
-                const outcome_len = std.mem.readInt(u16, value[off..][0..2], .little);
-                off += 2;
-                if (off + outcome_len > value.len) return;
-                const outcome = value[off .. off + outcome_len];
-                off += outcome_len;
-
-                if (off + 4 > value.len) return;
-                const output_len = std.mem.readInt(u32, value[off..][0..4], .little);
-                off += 4;
-                if (off + output_len > value.len) return;
-                const output = value[off .. off + output_len];
-                off += output_len;
-
-                so.put(self.allocator, name, output, outcome) catch return;
+        fn parse(value: []const u8) ?CompleteEntry {
+            var c = Cursor{ .bytes = value };
+            const status = std.enums.fromInt(RunStatus, (c.take(1) orelse return null)[0]) orelse return null;
+            const completed_at_ms = c.int(i64) orelse return null;
+            const has_output = (c.take(1) orelse return null)[0];
+            const output: ?[]const u8 = if (has_output == 1) c.take(c.int(u32) orelse return null) orelse return null else null;
+            const step_count = c.int(u16) orelse return null;
+            const steps = c;
+            for (0..step_count) |_| {
+                _ = c.take(c.int(u16) orelse return null) orelse return null;
+                _ = c.take(c.int(u16) orelse return null) orelse return null;
+                _ = c.take(c.int(u32) orelse return null) orelse return null;
             }
-            run.step_outputs = so;
+            const history_count = c.int(u16) orelse return null;
+            const history = c;
+            for (0..history_count) |_| {
+                _ = c.take(c.int(u16) orelse return null) orelse return null;
+                _ = c.take(c.int(u16) orelse return null) orelse return null;
+                _ = c.int(i64) orelse return null;
+            }
+            // Optional; older entries end before it.
+            const tags: ?[]const u8 = if (c.int(u16)) |n| (if (n > 0) c.take(n) else null) else null;
+            return .{ .status = status, .completed_at_ms = completed_at_ms, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags };
         }
+    };
 
-        // [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-        if (off + 2 > value.len) return;
-        const hist_count = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        var h: u16 = 0;
-        while (h < hist_count) : (h += 1) {
-            if (off + 2 > value.len) return;
-            const type_len = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (off + type_len > value.len) return;
-            const event_type = self.allocator.dupe(u8, value[off .. off + type_len]) catch return;
-            off += type_len;
+    const BuiltComplete = struct {
+        output: ?[]const u8,
+        steps: ?StepOutputMap,
+        history: std.ArrayList(HistoryEvent),
+        tags: ?[]const u8,
+    };
 
-            if (off + 2 > value.len) return;
-            const detail_len = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (off + detail_len > value.len) return;
-            const detail = self.allocator.dupe(u8, value[off .. off + detail_len]) catch return;
-            off += detail_len;
+    /// The run's new terminal state, owned. A failed allocation frees what
+    /// was built and leaves the run as it was.
+    fn buildComplete(self: *WorkflowHandler, entry: *const CompleteEntry) !BuiltComplete {
+        const output: ?[]const u8 = if (entry.output) |o| try self.allocator.dupe(u8, o) else null;
+        errdefer if (output) |o| self.allocator.free(o);
 
-            if (off + 8 > value.len) return;
-            const timestamp_ms = std.mem.readInt(i64, value[off..][0..8], .little);
-            off += 8;
-
-            run.history.append(self.allocator, .{
-                .event_type_owned = event_type,
-                .detail_owned = detail,
-                .timestamp_ms = timestamp_ms,
-            }) catch return;
-        }
-
-        // [tags_len:u16][search_tags]? — optional, may be absent in old entries
-        if (off + 2 <= value.len) {
-            const tags_len = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (tags_len > 0 and off + tags_len <= value.len) {
-                if (run.search_tags_owned) |old| self.allocator.free(old);
-                run.search_tags_owned = self.allocator.dupe(u8, value[off .. off + tags_len]) catch null;
+        var steps: ?StepOutputMap = null;
+        errdefer if (steps) |*so| so.deinit(self.allocator);
+        if (entry.step_count > 0) {
+            steps = StepOutputMap.init();
+            var c = entry.steps;
+            for (0..entry.step_count) |_| {
+                const name = c.take(c.int(u16).?).?;
+                const outcome = c.take(c.int(u16).?).?;
+                const out = c.take(c.int(u32).?).?;
+                try steps.?.put(self.allocator, name, out, outcome);
             }
         }
+
+        var history: std.ArrayList(HistoryEvent) = .empty;
+        errdefer {
+            for (history.items) |evt| {
+                self.allocator.free(evt.event_type_owned);
+                self.allocator.free(evt.detail_owned);
+            }
+            history.deinit(self.allocator);
+        }
+        try history.ensureTotalCapacity(self.allocator, entry.history_count);
+        var c = entry.history;
+        for (0..entry.history_count) |_| {
+            const event_type = try self.allocator.dupe(u8, c.take(c.int(u16).?).?);
+            errdefer self.allocator.free(event_type);
+            const detail = try self.allocator.dupe(u8, c.take(c.int(u16).?).?);
+            history.appendAssumeCapacity(.{ .event_type_owned = event_type, .detail_owned = detail, .timestamp_ms = c.int(i64).? });
+        }
+
+        const tags: ?[]const u8 = if (entry.tags) |t| try self.allocator.dupe(u8, t) else null;
+        return .{ .output = output, .steps = steps, .history = history, .tags = tags };
     }
 
     pub fn definitionCount(self: *const WorkflowHandler) usize {
@@ -3828,6 +3831,23 @@ pub const WorkflowHandler = struct {
 
     pub fn runCount(self: *const WorkflowHandler) usize {
         return self.runs.count();
+    }
+};
+
+/// Reads a value front to back; every read is null rather than past the end.
+const Cursor = struct {
+    bytes: []const u8,
+    off: usize = 0,
+
+    fn take(self: *Cursor, n: usize) ?[]const u8 {
+        if (self.bytes.len - self.off < n) return null;
+        defer self.off += n;
+        return self.bytes[self.off..][0..n];
+    }
+
+    fn int(self: *Cursor, comptime T: type) ?T {
+        const b = self.take(@sizeOf(T)) orelse return null;
+        return std.mem.readInt(T, b[0..@sizeOf(T)], .little);
     }
 };
 
@@ -4821,4 +4841,43 @@ test "workflow replay: an unknown status, or a complete entry without its output
     handler.replayComplete("default:r1", &([_]u8{3} ++ [_]u8{0} ** 8));
     handler.replayComplete("default:r1", &([_]u8{0xee} ++ [_]u8{0} ** 9));
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
+}
+
+test "workflow replay: a complete entry cut short leaves the run as it was, and a whole one replaces it" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
+    handler.replayStart("default:r1", &start);
+
+    // completed, ts 0, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
+    const whole = [_]u8{3} ++ [_]u8{0} ** 8 ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
+        [_]u8{ 1, 0, 1, 0, 's', 4, 0, 'd', 'o', 'n', 'e', 1, 0, 0, 0, 'x' } ++
+        [_]u8{ 1, 0, 1, 0, 'e', 1, 0, 'd', 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 't' };
+
+    // The run already holds an event, which a skipped entry must keep.
+    try handler.runs.getPtr("default:r1").?.history.append(allocator, .{
+        .event_type_owned = try allocator.dupe(u8, "started"),
+        .detail_owned = try allocator.dupe(u8, ""),
+        .timestamp_ms = 1,
+    });
+
+    // Every cut through the history or the steps is skipped whole.
+    const history_before = handler.runs.get("default:r1").?.history.items.len;
+    try testing.expectEqual(@as(usize, 1), history_before);
+    for (1..whole.len - 3) |n| {
+        handler.replayComplete("default:r1", whole[0..n]);
+        const run = handler.runs.get("default:r1").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
+        try testing.expect(run.output_owned == null);
+        try testing.expectEqual(history_before, run.history.items.len);
+    }
+
+    handler.replayComplete("default:r1", &whole);
+    const run = handler.runs.get("default:r1").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try testing.expectEqualStrings("ok", run.output_owned.?);
+    try testing.expectEqual(@as(usize, 1), run.history.items.len);
+    try testing.expectEqualStrings("t", run.search_tags_owned.?);
 }
