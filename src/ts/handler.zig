@@ -549,6 +549,9 @@ pub const TSHandler = struct {
     // ── RETENTION ───────────────────────────────────────────────────────
 
     fn handleRetention(self: *TSHandler, req: Request) CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
+        }
         // Retention policy: key = measurement, duration from TLV option or value
         // Client sends raw_ttl via OptionTag.ts_raw_ttl; fallback to req.value
         const duration_str: []const u8 = if (req.findOption(.ts_raw_ttl)) |opt|
@@ -570,7 +573,7 @@ pub const TSHandler = struct {
         else
             0;
 
-        const evicted = self.ts.applyRetention(cutoff_ns);
+        const evicted = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, cutoff_ns);
         _ = evicted;
         return .ok;
     }

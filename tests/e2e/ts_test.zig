@@ -1488,3 +1488,27 @@ test "e2e/ts: points survive restart exactly once" {
     try stdx.testing.assertSucceeded(after);
     for (values) |v| try testing.expectEqual(@as(usize, 1), after.stdoutCount(v));
 }
+
+test "e2e/ts: retention trims only its own measurement in its own namespace" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // A day's retention leaves nothing from 2024.
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "111", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "444" });
+    try ctx.exec(&.{ "ts", "write", "ret_b", "--value", "222", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "333", "--timestamp", "1708700400000", "-n", "other" });
+    try ctx.exec(&.{ "ts", "retention", "ret_a", "--raw-ttl", "1d" });
+
+    var a = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer a.deinit();
+    // Values as the raw output prints them, so a timestamp can't match.
+    try testing.expect(a.contains(" 444.000000"));
+    try testing.expect(!a.contains(" 111.000000"));
+    var b = try ctx.cli.run(&.{ "ts", "read", "ret_b", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer b.deinit();
+    try testing.expect(b.contains(" 222.000000"));
+    var other = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100", "-n", "other" });
+    defer other.deinit();
+    try testing.expect(other.contains(" 333.000000"));
+}
