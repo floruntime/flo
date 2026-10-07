@@ -44,11 +44,17 @@ fn request(op: proto.OpCode, namespace: []const u8, key: []const u8, value: []co
 }
 
 fn kvAlive(ctx: *stdx.testing.TestContext) !bool {
-    try ctx.exec(&.{ "kv", "set", "alive", "yes" });
-    return std.mem.indexOf(u8, try ctx.execCapture(&.{ "kv", "get", "alive" }), "yes") != null;
+    const put = try request(.kv_put, "", "alive", "yes");
+    defer testing.allocator.free(put);
+    const get = try request(.kv_get, "", "alive", "");
+    defer testing.allocator.free(get);
+    var out: [4096]u8 = undefined;
+    if ((try send(ctx, put, &out)).status != @intFromEnum(proto.StatusCode.ok)) return false;
+    const r = try send(ctx, get, &out);
+    return r.status == @intFromEnum(proto.StatusCode.ok) and std.mem.endsWith(u8, r.data, "yes");
 }
 
-test "e2e/bounds: a name too long for a log entry is refused, and the log still replays" {
+test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and the log still replays" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -87,7 +93,8 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
 
-    // [ns_len=0][key_len=2]"kN"[value_len=0], and no options_len.
+    // [ns_len=0][key_len=2]"kN"[value_len=0], and no options_len; 16 keys so
+    // some route to another of the 4 shards.
     for (0..16) |i| {
         var h = header(.kv_get);
         const payload = [_]u8{ 0, 0, 2, 0, 'k', 'a' + @as(u8, @intCast(i)), 0, 0, 0, 0 };
@@ -102,7 +109,7 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
     try testing.expect(try kvAlive(ctx));
 }
 
-test "e2e/bounds: a dashboard key path longer than a key is not found, and the dashboard still answers" {
+test "e2e/bounds: a percent-encoded dashboard key path longer than any key is not found, and the dashboard still answers" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
     defer ctx.deinit();
     var http = try ctx.createDashboardHttp();

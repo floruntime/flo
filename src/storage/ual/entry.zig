@@ -223,7 +223,7 @@ pub const CommandPayload = struct {
         if (data.len < COMMAND_PREFIX_SIZE) return null;
 
         const ns_hash = std.mem.readInt(u32, data[0..4], .little);
-        // Widened so the offsets below can't overflow the wire widths.
+        // usize: `10 + key_len` overflows u16 for keys near the limit.
         const key_len: usize = std.mem.readInt(u16, data[4..6], .little);
         const val_len: usize = std.mem.readInt(u32, data[6..10], .little);
 

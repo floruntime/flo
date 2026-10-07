@@ -1388,11 +1388,9 @@ pub const Shard = struct {
         return self.router.route(hash);
     }
 
-    /// Allocate and re-serialize a parsed Request back to wire bytes so it
-    /// can be passed to another shard via the inbox. Mirrors the layout
-    /// `proto.Request.parse` consumes: header (32 B) + payload
-    /// `[ns_len:u16][ns][key_len:u16][key][value_len:u32][value][opts_len:u16][opts]`.
-    /// CRC is preserved from the original header so the receiver re-validates.
+    /// The request as wire bytes on the heap, for a copy that outlives the
+    /// connection's buffer: a forward to another shard or to the leader, or a
+    /// write held until commit. Length and CRC are recomputed.
     fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
         // Sized from the parts, not header.payload_length: a client may omit
         // the options trailer, which serialize always writes.
@@ -2022,7 +2020,7 @@ pub const Shard = struct {
 
     // ─── Writes on a node that does not lead ─────────────────────────────
 
-    /// Send a client's write to the leader as the bytes it arrived in, and
+    /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
     fn forwardToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
@@ -4949,9 +4947,6 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     @memset(std.mem.asBytes(&header), 0);
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 5;
-    // Namespace, key, value and options, each length-prefixed, as the
-    // wire carries them: the held copy is rebuilt from this length.
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     // Held for the leader, not answered.
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
@@ -5047,10 +5042,8 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 1;
-    header.payload_length = @intCast(2 + 2 + 3 + 4 + value.len + 2);
     const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
     defer std.testing.allocator.free(put);
-    std.mem.bytesAsValue(proto.RequestHeader, put[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(put[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, try proto.Request.parse(put));
     _ = shard.applyCommitted();
     var drain_buf: [4096]u8 = undefined;
@@ -5058,9 +5051,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
 
     header.op_code = @intFromEnum(proto.OpCode.kv_get);
     header.request_id = 2;
-    header.payload_length = 2 + 2 + 3 + 4 + 2;
     const get = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = "" });
-    std.mem.bytesAsValue(proto.RequestHeader, get[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(get[@sizeOf(proto.RequestHeader)..]);
     shard.runForwardedRequest(.{ .tag = .forward_request, .src_shard = 0, .payload_len = @intCast(get.len), .sequence = seq, .payload_ptr = get.ptr });
     const big_out = try std.testing.allocator.alloc(u8, 300 * 1024);
     defer std.testing.allocator.free(big_out);
@@ -5196,10 +5187,7 @@ fn testRequestWith(op: proto.OpCode, request_id: u64, key: []const u8, value: []
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(op);
     header.request_id = request_id;
-    header.payload_length = @intCast(2 + 2 + key.len + 4 + value.len + 2 + options.len);
-    const bytes = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
-    std.mem.bytesAsValue(proto.RequestHeader, bytes[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(bytes[@sizeOf(proto.RequestHeader)..]);
-    return bytes;
+    return Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
 }
 
 /// A shard alone and a connected client socket pair, both ends non-blocking
@@ -6696,7 +6684,6 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 9;
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     defer std.testing.allocator.free(wire);
     const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + 3 + wire.len);
@@ -6774,11 +6761,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 5;
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
-    // The held copy is re-parsed as the wire would be: the CRC must hold.
-    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
-    defer std.testing.allocator.free(wire);
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
@@ -6802,7 +6784,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // Sent to a leader: it waits past any deadline for that leader's
     // answer, until the term moves on. (No network here, so the link is
     // not consulted.)
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6821,7 +6802,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Sent over a link that then went down, with the term unchanged: the
     // answer will never come either.
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6835,7 +6815,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // so the answer is not coming over it either.
     rn.linked_ids[0].store(2, .release);
     rn.linked_sessions[0].store(5, .release);
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6849,7 +6828,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Same link, same leader, same term, and no answer: waited on until
     // the backstop, then answered.
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6869,7 +6847,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // runs here as the client's own request.
     raft.leader_id = 0;
     header.request_id = 6;
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     raft.role = .leader;
@@ -6934,8 +6911,6 @@ const ParkTest = struct {
         try std.testing.expect(sh.applyCommitted());
     }
 
-    /// A request as the wire carries it: a parked request is re-parsed
-    /// from its bytes, so its length and checksum must hold.
     fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
         var header: proto.RequestHeader = undefined;
         @memset(std.mem.asBytes(&header), 0);
@@ -6943,12 +6918,7 @@ const ParkTest = struct {
         header.version = proto.VERSION;
         header.op_code = @intFromEnum(op);
         header.request_id = id;
-        header.payload_length = @intCast(2 + ns.len + 2 + key.len + 4 + value.len + 2 + options.len);
-        var req: proto.Request = .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
-        const wire = try Shard.serializeRequest(std.testing.allocator, req);
-        defer std.testing.allocator.free(wire);
-        req.header.crc32 = req.header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
-        return req;
+        return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
     }
 
     fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
@@ -8287,7 +8257,6 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
 }
 
 test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
-    // A client may stop after the value; serializeRequest always writes the trailer.
     const payload = [_]u8{ 0, 0, 2, 0, 'k', '0', 0, 0, 0, 0 };
     var header: proto.RequestHeader = undefined;
     @memset(std.mem.asBytes(&header), 0);

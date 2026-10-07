@@ -23,6 +23,7 @@ const entry_mod = @import("ual/entry.zig");
 const router = @import("../node/router.zig");
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
+const ns_keys = @import("../namespace/handler.zig");
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -31,10 +32,10 @@ const Flags = entry_mod.Flags;
 
 pub const MAX_PERSIST_PAYLOAD: usize = 65536;
 
-/// Longest key an entry carries. Every client-named write (KV key, stream,
-/// series, queue, run id) is proposed here, so the cap holds for all of them,
-/// including subsystems that don't check their own.
-pub const MAX_ENTRY_KEY: usize = 4096;
+/// Longest key proposeEntry accepts, the same bound KV puts on its qualified
+/// keys. Streams, series, queues, groups, actions and workflows propose
+/// through here, so they get it even where they don't check their own.
+pub const MAX_ENTRY_KEY: usize = ns_keys.MAX_QUALIFIED_KEY;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ReplayRegistry
@@ -153,7 +154,7 @@ pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
         error.WritesStopped => "unavailable: this shard stopped taking writes — a write left memory before it reached disk; retry once the node restarts",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
-        error.KeyTooLarge => "bad request: key or name too long — at most 4096 bytes",
+        error.KeyTooLarge => std.fmt.comptimePrint("bad request: key or name too long — at most {d} bytes, namespace included", .{MAX_ENTRY_KEY}),
         else => fallback,
     };
 }
@@ -170,7 +171,7 @@ test "persistence: a write too large to encode is the request's fault, not a ret
     try std.testing.expectEqual(result_mod.CommandResult.ErrorCode.internal_error, failureCode(error.IndexGap));
 }
 
-test "persistence: a key longer than an entry carries is refused before it is proposed" {
+test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
     const FakeRaft = struct {
         pub fn propose(_: *const @This(), _: EntryType, _: u16, _: u64, _: []const u8) !ProposeResult {
             return error.NotLeader;
