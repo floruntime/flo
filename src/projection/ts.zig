@@ -428,7 +428,8 @@ pub fn keyTagHash(key: []const u8) u64 {
 pub const TSProjection = struct {
     allocator: Allocator,
 
-    /// Write buffers keyed by "measurement\x00field_name".
+    /// Write buffers keyed by series key: namespace hash, measurement, field
+    /// and tag hash (`seriesKeyToString`).
     buffers: std.StringHashMap(WriteBuffer),
 
     /// Flushed blocks (per series key).
@@ -892,7 +893,7 @@ pub const TSProjection = struct {
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) == namespace_hash and std.mem.eql(u8, keyMeasurement(key), measurement)) {
+            if (inMeasurement(key, namespace_hash, measurement)) {
                 kv.value_ptr.deinit();
                 self.allocator.free(@constCast(key));
                 self.buffers.removeByPtr(kv.key_ptr);
@@ -904,7 +905,7 @@ pub const TSProjection = struct {
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) == namespace_hash and std.mem.eql(u8, keyMeasurement(key), measurement)) {
+            if (inMeasurement(key, namespace_hash, measurement)) {
                 kv.value_ptr.deinit(self.allocator);
                 self.allocator.free(@constCast(key));
                 self.blocks.removeByPtr(kv.key_ptr);
@@ -1836,4 +1837,23 @@ test "ts: retention evicts only its own measurement in its own namespace" {
     try testing.expectEqual(@as(f64, 2.0), buf[0].field_value);
     try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).points_in_buffer);
     try testing.expectEqual(@as(usize, 1), (try ts.queryRange(2, "a", "value", null, 0, 10000, &buf)).points_in_buffer);
+}
+
+test "ts: retention spares other measurements' flushed blocks" {
+    // A one-point buffer flushes each point to a block.
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1 });
+    defer ts.deinit();
+
+    try ts.insert(1, "a", "value", 1.0, 1000, 1, "");
+    try ts.insert(1, "a", "value", 2.0, 1500, 2, "");
+    try ts.insert(1, "b", "value", 3.0, 1000, 3, "");
+    try ts.insert(1, "b", "value", 4.0, 1500, 4, "");
+    try testing.expect(ts.blocks.count() > 0);
+
+    var buf: [10]StoredPoint = undefined;
+    // Flushed points are counted as matching blocks, not buffered points.
+    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).blocks_matched);
+    _ = ts.applyRetention(1, "a", 2000);
+    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).blocks_matched);
+    try testing.expectEqual(@as(usize, 0), (try ts.queryRange(1, "a", "value", null, 0, 10000, &buf)).blocks_matched);
 }

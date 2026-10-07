@@ -1502,12 +1502,13 @@ test "e2e/ts: retention trims only its own measurement in its own namespace" {
 
     var a = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
     defer a.deinit();
-    try testing.expect(a.contains("444"));
-    try testing.expect(!a.contains("111"));
+    // Values as the raw output prints them, so a timestamp can't match.
+    try testing.expect(a.contains(" 444.000000"));
+    try testing.expect(!a.contains(" 111.000000"));
     var b = try ctx.cli.run(&.{ "ts", "read", "ret_b", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
     defer b.deinit();
-    try testing.expect(b.contains("222"));
+    try testing.expect(b.contains(" 222.000000"));
     var other = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100", "-n", "other" });
     defer other.deinit();
-    try testing.expect(other.contains("333"));
+    try testing.expect(other.contains(" 333.000000"));
 }
