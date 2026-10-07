@@ -18,12 +18,6 @@ pub const Durability = enum(u8) {
     /// No persistence (for caching use cases)
     ephemeral = 2,
 
-    /// Parse durability from string (for CLI/config parsing).
-    /// Unknown values fall back to `async_flush` for backward-compatible TOML.
-    pub fn fromString(s: []const u8) Durability {
-        return parseDurability(s) catch .async_flush;
-    }
-
     /// Parse durability from CLI input; rejects unknown values.
     pub fn parseDurability(s: []const u8) error{InvalidDurability}!Durability {
         if (std.mem.eql(u8, s, "sync")) return .sync;
@@ -39,12 +33,6 @@ pub const ColdStorageProvider = cold_storage_config.ColdStorageProvider;
 pub const ColdStorageConfig = cold_storage_config.ColdStorageConfig;
 pub const FileConfig = cold_storage_config.FileConfig;
 pub const S3Config = cold_storage_config.S3Config;
-
-const auth_config = @import("auth.zig");
-pub const AuthServerConfig = auth_config.AuthServerConfig;
-
-const websocket_config = @import("websocket.zig");
-pub const WebSocketConfig = websocket_config.WebSocketConfig;
 
 const metrics_config = @import("metrics.zig");
 pub const MetricsConfig = metrics_config.MetricsConfig;
@@ -78,22 +66,8 @@ pub const ServerConfig = struct {
     // NOTE: memtable_size_mb removed - no SpilloverEngine in "Log is Data" architecture
     durability: Durability = .async_flush, // sync, async_flush, or ephemeral
 
-    // [background_tasks] section
-    /// Namespace deletion task interval in milliseconds
-    /// Default: 5000ms (5s) for production, set lower in tests for faster cleanup
-    namespace_deletion_interval_ms: i64 = 5000,
-
-    // [cold_storage] section
-    cold_storage: ColdStorageConfig = .{},
-
     // Tier settings (parsed from [storage] section)
     tiered_log: TieredLogConfig = .{},
-
-    // [auth] section
-    auth: AuthServerConfig = .{},
-
-    // [websocket] section
-    websocket: WebSocketConfig = .{},
 
     // [metrics] section
     metrics: MetricsConfig = .{},
@@ -103,11 +77,6 @@ pub const ServerConfig = struct {
 
     // [cluster] section
     cluster: ClusterConfig = .{},
-
-    // [kv] section
-    /// When true, external connections can see internal keys (prefixed with '_')
-    /// Used for testing to verify internal state
-    expose_internal_keys: bool = false,
 
     // [logging] section
     log_level: LogLevel = .info,
@@ -123,12 +92,12 @@ pub const ServerConfig = struct {
         warn,
         err,
 
-        pub fn fromString(s: []const u8) LogLevel {
+        pub fn fromString(s: []const u8) ?LogLevel {
             if (std.mem.eql(u8, s, "debug")) return .debug;
             if (std.mem.eql(u8, s, "info")) return .info;
             if (std.mem.eql(u8, s, "warn") or std.mem.eql(u8, s, "warning")) return .warn;
             if (std.mem.eql(u8, s, "error") or std.mem.eql(u8, s, "err")) return .err;
-            return .info; // default
+            return null;
         }
     };
 
@@ -136,9 +105,10 @@ pub const ServerConfig = struct {
         text,
         json,
 
-        pub fn fromString(s: []const u8) LogFormat {
+        pub fn fromString(s: []const u8) ?LogFormat {
             if (std.mem.eql(u8, s, "json")) return .json;
-            return .text;
+            if (std.mem.eql(u8, s, "text")) return .text;
+            return null;
         }
     };
 
@@ -165,15 +135,7 @@ pub const ServerConfig = struct {
             .listen_port = self.port,
             .listen_addr = self.bind,
             .durability = self.durability,
-            .cold_storage = if (self.cold_storage.provider != .none) self.cold_storage else null,
             .tiered_log = self.tiered_log,
-            .auth_enabled = self.auth.enabled,
-            .jwt_secret = self.auth.jwt_secret,
-            .jwks_url = self.auth.jwks_url,
-            .ws_rate_limit_requests = self.websocket.rate_limit_requests,
-            .ws_rate_limit_window_ms = self.websocket.rate_limit_window_ms,
-            .ws_ping_interval_ms = self.websocket.ping_interval_ms,
-            .ws_pong_timeout_ms = self.websocket.pong_timeout_ms,
             .metrics_enabled = self.metrics.enabled,
             .metrics_port = self.metrics.port,
             .metrics_bind = self.metrics.bind,
@@ -188,10 +150,6 @@ pub const ServerConfig = struct {
             .cluster_seeds = self.cluster.seeds,
             .cluster_secret = self.cluster.secret,
             .cluster_failover_timeout_ms = self.cluster.failover_timeout_ms,
-            // Background task intervals
-            .namespace_deletion_interval_ms = self.namespace_deletion_interval_ms,
-            // KV configuration
-            .expose_internal_keys = self.expose_internal_keys,
         };
     }
 
@@ -202,19 +160,182 @@ pub const ServerConfig = struct {
     }
 };
 
+const Kind = enum { string, integer, boolean, string_or_array };
+const Key = struct {
+    name: []const u8,
+    kind: Kind,
+    /// Integer bounds, from the field the value is stored in.
+    min: i64 = 0,
+    max: i64 = std.math.maxInt(i64),
+};
+const Section = struct { name: []const u8, keys: []const Key };
+
+const PORT_MAX: i64 = std.math.maxInt(u16);
+
+/// Every section and key flo.toml may hold. Anything else is refused at
+/// start, not ignored: a line that parses clean and changes nothing is the
+/// bug an operator finds at 2am. A value of the wrong type or out of range is
+/// refused for the same reason.
+const sections = [_]Section{
+    .{
+        .name = "server",
+        .keys = &.{
+            .{ .name = "port", .kind = .integer, .max = PORT_MAX },
+            .{ .name = "bind", .kind = .string },
+            .{ .name = "data_dir", .kind = .string },
+            // Range-checked by load, which names the automatic value.
+            .{ .name = "shards", .kind = .integer, .min = std.math.minInt(i64) },
+            .{ .name = "partition_count", .kind = .integer, .min = std.math.minInt(i64) },
+        },
+    },
+    .{ .name = "storage", .keys = &.{
+        .{ .name = "durability", .kind = .string },
+        .{ .name = "hot_buffer_capacity", .kind = .integer, .min = 1 },
+        .{ .name = "max_hot_entries", .kind = .integer },
+        .{ .name = "hot_flush_seconds", .kind = .integer },
+    } },
+    .{ .name = "logging", .keys = &.{
+        .{ .name = "level", .kind = .string },
+        .{ .name = "format", .kind = .string },
+    } },
+    .{ .name = "metrics", .keys = &.{
+        .{ .name = "enabled", .kind = .boolean },
+        .{ .name = "port", .kind = .integer, .max = PORT_MAX },
+        .{ .name = "bind", .kind = .string },
+    } },
+    .{ .name = "dashboard", .keys = &.{
+        .{ .name = "enabled", .kind = .boolean },
+        .{ .name = "port", .kind = .integer, .max = PORT_MAX },
+        .{ .name = "bind", .kind = .string },
+        .{ .name = "cors_origins", .kind = .string },
+        .{ .name = "hosts", .kind = .string },
+    } },
+    .{ .name = "cluster", .keys = &.{
+        .{ .name = "enabled", .kind = .boolean },
+        .{ .name = "secret", .kind = .string },
+        .{ .name = "secret_file", .kind = .string },
+        .{ .name = "node_id", .kind = .integer, .max = std.math.maxInt(u32) },
+        .{ .name = "raft_port", .kind = .integer, .max = PORT_MAX },
+        .{ .name = "seeds", .kind = .string_or_array },
+        .{ .name = "failover_timeout_ms", .kind = .integer },
+    } },
+};
+
+/// Sections and keys that are refused with a reason rather than the list of
+/// what is valid: they were removed, or nothing reads them yet.
+const removed = [_]struct { name: []const u8, why: []const u8 }{
+    .{ .name = "auth", .why = "[auth] was removed: clients aren't authenticated yet. Remove the section, and keep the client port on a private interface." },
+    .{ .name = "websocket", .why = "[websocket] was removed along with the WebSocket endpoint. Remove the section." },
+    .{ .name = "cold_storage", .why = "[cold_storage] isn't wired up: nothing reads it, so no data would move to cold storage. Remove the section." },
+    .{ .name = "background_tasks", .why = "[background_tasks] was removed: namespace delete is refused, so there is no deletion task to tune. Remove the section." },
+    .{ .name = "kv", .why = "[kv] expose_internal_keys was never read: internal keys stay hidden. Remove the section." },
+    .{ .name = "storage.max_local_segments", .why = "[storage] max_local_segments isn't wired up: nothing reads it. Remove the line." },
+    .{ .name = "storage.enable_wal_truncation", .why = "[storage] enable_wal_truncation isn't wired up: nothing reads it. Remove the line." },
+};
+
+fn removedWhy(name: []const u8) ?[]const u8 {
+    for (removed) |r| if (std.mem.eql(u8, r.name, name)) return r.why;
+    return null;
+}
+
+fn kindOf(v: toml.Value) ?Kind {
+    return switch (v) {
+        .string => .string,
+        .integer => .integer,
+        .boolean => .boolean,
+        .table => null,
+        .array => .string_or_array,
+    };
+}
+
+fn kindName(k: Kind) []const u8 {
+    return switch (k) {
+        .string => "a string",
+        .integer => "an integer",
+        .boolean => "true or false",
+        .string_or_array => "a string or a list of strings",
+    };
+}
+
+fn findSection(name: []const u8) ?*const Section {
+    for (&sections) |*sec| if (std.mem.eql(u8, sec.name, name)) return sec;
+    return null;
+}
+
+/// Refuse anything in `root` that `sections` doesn't name, or names with
+/// another type or out of range.
+fn checkSchema(root: *const toml.Table) error{ UnknownSetting, InvalidSetting }!void {
+    var it = root.entries.iterator();
+    while (it.next()) |e| {
+        const name = e.key_ptr.*;
+        if (removedWhy(name)) |why| {
+            log.err("{s}", .{why});
+            return error.UnknownSetting;
+        }
+        if (e.value_ptr.* != .table) {
+            log.err("{s} is outside any section; settings go under [server], [storage] and the like. Move or remove the line.", .{name});
+            return error.UnknownSetting;
+        }
+        const sec = findSection(name) orelse {
+            log.err("[{s}] is not a section; the sections are server, storage, logging, metrics, dashboard and cluster. Remove it.", .{name});
+            return error.UnknownSetting;
+        };
+        try checkSection(sec, &e.value_ptr.table);
+    }
+}
+
+fn checkSection(sec: *const Section, table: *const toml.Table) error{ UnknownSetting, InvalidSetting }!void {
+    var it = table.entries.iterator();
+    while (it.next()) |e| {
+        var buf: [128]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}.{s}", .{ sec.name, e.key_ptr.* }) catch "";
+        if (removedWhy(path)) |why| {
+            log.err("{s}", .{why});
+            return error.UnknownSetting;
+        }
+        const key = for (sec.keys) |k| {
+            if (std.mem.eql(u8, k.name, e.key_ptr.*)) break k;
+        } else {
+            log.err("[{s}] {s} is not a setting; the keys are {s}. Remove the line.", .{ sec.name, e.key_ptr.*, keyList(sec) });
+            return error.UnknownSetting;
+        };
+        const got = kindOf(e.value_ptr.*);
+        const fits = got == key.kind or (key.kind == .string_or_array and got == .string);
+        if (!fits) {
+            log.err("[{s}] {s} must be {s}", .{ sec.name, key.name, kindName(key.kind) });
+            return error.InvalidSetting;
+        }
+        if (key.kind == .integer) {
+            const v = e.value_ptr.integer;
+            if (v < key.min or v > key.max) {
+                log.err("[{s}] {s} = {d}: must be {d} to {d}", .{ sec.name, key.name, v, key.min, key.max });
+                return error.InvalidSetting;
+            }
+        }
+    }
+}
+
+/// "a, b and c", for messages. Sections are short enough for a fixed buffer.
+fn keyList(sec: *const Section) []const u8 {
+    const S = struct {
+        threadlocal var buf: [512]u8 = undefined;
+    };
+    var w: std.Io.Writer = .fixed(&S.buf);
+    for (sec.keys, 0..) |k, i| {
+        const sep = if (i == 0) "" else if (i + 1 == sec.keys.len) " and " else ", ";
+        w.print("{s}{s}", .{ sep, k.name }) catch break;
+    }
+    return w.buffered();
+}
+
 /// Load server configuration from flo.toml file
 pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
     var config = ServerConfig.init(allocator);
     errdefer config.deinit();
 
-    var table = toml.parseFile(allocator, path) catch |err| {
-        if (err == error.FileNotFound) {
-            // Return defaults if config file doesn't exist
-            return config;
-        }
-        return err;
-    };
+    var table = try toml.parseFile(allocator, path);
     defer table.deinit();
+    try checkSchema(&table);
 
     // Parse [server] section
     if (table.getTable("server")) |server| {
@@ -247,7 +368,10 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
     if (table.getTable("storage")) |storage| {
         // NOTE: memtable_size_mb parsing removed - no SpilloverEngine
         if (storage.getString("durability")) |d| {
-            config.durability = Durability.fromString(d);
+            config.durability = Durability.parseDurability(d) catch {
+                log.err("[storage] durability = \"{s}\": use sync, async_flush or ephemeral", .{d});
+                return error.InvalidSetting;
+            };
         }
         // Tier settings (all under [storage])
         if (storage.getInt("hot_buffer_capacity")) |b| {
@@ -259,64 +383,21 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         if (storage.getInt("hot_flush_seconds")) |h| {
             config.tiered_log.hot_flush_seconds = @intCast(h);
         }
-        if (storage.getInt("max_local_segments")) |s| {
-            config.tiered_log.max_local_segments = @intCast(s);
-        }
-        if (storage.getBool("enable_wal_truncation")) |e| {
-            config.tiered_log.enable_wal_truncation = e;
-        }
-    }
-
-    // Parse [background_tasks] section
-    if (table.getTable("background_tasks")) |bt| {
-        if (bt.getInt("namespace_deletion_interval_ms")) |n| {
-            config.namespace_deletion_interval_ms = @intCast(n);
-        }
-    }
-
-    // Parse [kv] section
-    if (table.getTable("kv")) |kv| {
-        if (kv.getBool("expose_internal_keys")) |e| {
-            config.expose_internal_keys = e;
-        }
     }
 
     // Parse [logging] section
     if (table.getTable("logging")) |logging| {
         if (logging.getString("level")) |level| {
-            config.log_level = ServerConfig.LogLevel.fromString(level);
+            config.log_level = ServerConfig.LogLevel.fromString(level) orelse {
+                log.err("[logging] level = \"{s}\": use debug, info, warn or error", .{level});
+                return error.InvalidSetting;
+            };
         }
         if (logging.getString("format")) |format| {
-            config.log_format = ServerConfig.LogFormat.fromString(format);
-        }
-    }
-
-    // Parse [auth] section
-    if (table.getTable("auth")) |auth| {
-        if (auth.getBool("enabled")) |e| {
-            config.auth.enabled = e;
-        }
-        if (auth.getString("jwt_secret")) |s| {
-            config.auth.jwt_secret = try config.dupeString(s);
-        }
-        if (auth.getString("jwks_url")) |u| {
-            config.auth.jwks_url = try config.dupeString(u);
-        }
-    }
-
-    // Parse [websocket] section
-    if (table.getTable("websocket")) |ws| {
-        if (ws.getInt("rate_limit_requests")) |r| {
-            config.websocket.rate_limit_requests = @intCast(r);
-        }
-        if (ws.getInt("rate_limit_window_ms")) |w| {
-            config.websocket.rate_limit_window_ms = @intCast(w);
-        }
-        if (ws.getInt("ping_interval_ms")) |p| {
-            config.websocket.ping_interval_ms = @intCast(p);
-        }
-        if (ws.getInt("pong_timeout_ms")) |t| {
-            config.websocket.pong_timeout_ms = @intCast(t);
+            config.log_format = ServerConfig.LogFormat.fromString(format) orelse {
+                log.err("[logging] format = \"{s}\": use text or json", .{format});
+                return error.InvalidSetting;
+            };
         }
     }
 
@@ -364,74 +445,6 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         config.cluster = try cluster_config.parseClusterConfig(allocator, c, &config._owned_strings);
     }
 
-    // Parse [cold_storage] section
-    if (table.getTable("cold_storage")) |cold| {
-        if (cold.getString("provider")) |p| {
-            config.cold_storage.provider = ColdStorageProvider.fromString(p);
-        }
-        if (cold.getInt("upload_workers")) |w| {
-            config.cold_storage.upload_workers = @intCast(w);
-        }
-        if (cold.getInt("restore_workers")) |w| {
-            config.cold_storage.restore_workers = @intCast(w);
-        }
-        if (cold.getBool("verify_checksums")) |v| {
-            config.cold_storage.verify_checksums = v;
-        }
-        if (cold.getBool("compression_enabled")) |v| {
-            config.cold_storage.compression_enabled = v;
-        }
-        if (cold.getInt("hot_retention_days")) |d| {
-            config.cold_storage.hot_retention_days = @intCast(d);
-        }
-        // Watermarks are specified as percentages (0-100), converted to 0.0-1.0
-        if (cold.getInt("disk_high_watermark_percent")) |w| {
-            config.cold_storage.disk_high_watermark = @as(f32, @floatFromInt(w)) / 100.0;
-        }
-        if (cold.getInt("disk_critical_watermark_percent")) |w| {
-            config.cold_storage.disk_critical_watermark = @as(f32, @floatFromInt(w)) / 100.0;
-        }
-        if (cold.getInt("min_upload_batch_size")) |s| {
-            config.cold_storage.min_upload_batch_size = @intCast(s);
-        }
-        if (cold.getInt("max_upload_batch_age_seconds")) |s| {
-            config.cold_storage.max_upload_batch_age_seconds = @intCast(s);
-        }
-
-        // Parse [cold_storage.file] section
-        if (cold.getTable("file")) |file_cfg| {
-            if (file_cfg.getString("base_path")) |p| {
-                config.cold_storage.file.base_path = try config.dupeString(p);
-            }
-            if (file_cfg.getBool("sync_on_write")) |v| {
-                config.cold_storage.file.sync_on_write = v;
-            }
-            if (file_cfg.getBool("create_dirs")) |v| {
-                config.cold_storage.file.create_dirs = v;
-            }
-        }
-
-        // Parse [cold_storage.s3] section
-        if (cold.getTable("s3")) |s3_cfg| {
-            if (s3_cfg.getString("bucket")) |b| {
-                config.cold_storage.s3.bucket = try config.dupeString(b);
-            }
-            if (s3_cfg.getString("region")) |r| {
-                config.cold_storage.s3.region = try config.dupeString(r);
-            }
-            if (s3_cfg.getString("endpoint")) |e| {
-                config.cold_storage.s3.endpoint = try config.dupeString(e);
-            }
-            if (s3_cfg.getBool("use_path_style")) |v| {
-                config.cold_storage.s3.use_path_style = v;
-            }
-            if (s3_cfg.getBool("use_tls")) |v| {
-                config.cold_storage.s3.use_tls = v;
-            }
-            // Note: credentials should come from env vars or IAM role, not config file
-        }
-    }
-
     return config;
 }
 
@@ -449,7 +462,12 @@ pub fn loadWithOverrides(
 ) !ServerConfig {
     // Load base config
     var config = if (config_path) |path|
-        try load(allocator, path)
+        load(allocator, path) catch |err| {
+            // A file named on the command line is meant to be read; starting
+            // on defaults instead would hide the typo.
+            if (err == error.FileNotFound) log.err("config file {s} not found", .{path});
+            return err;
+        }
     else blk: {
         // Try default paths
         const cfg = load(allocator, "flo.toml") catch |err| {
@@ -484,10 +502,16 @@ pub fn loadWithOverrides(
         config.partition_count = pc;
     }
     if (log_level_override) |level| {
-        config.log_level = ServerConfig.LogLevel.fromString(level);
+        config.log_level = ServerConfig.LogLevel.fromString(level) orelse {
+            log.err("--log-level {s}: use debug, info, warn or error", .{level});
+            return error.InvalidSetting;
+        };
     }
     if (log_format_override) |format| {
-        config.log_format = ServerConfig.LogFormat.fromString(format);
+        config.log_format = ServerConfig.LogFormat.fromString(format) orelse {
+            log.err("--log-format {s}: use text or json", .{format});
+            return error.InvalidSetting;
+        };
     }
     // Durability override via CLI is permitted but warned on downgrade.
     // Historical note: durability was originally TOML-only to prevent an
@@ -518,7 +542,7 @@ pub fn generateDefaultConfig() []const u8 {
     \\# See documentation at https://github.com/floruntime/flo
     \\
     \\[server]
-    \\# TCP port for client connections (supports both binary protocol and WebSocket)
+    \\# TCP port for client connections (binary protocol)
     \\port = 9000
     \\
     \\# Bind address (0.0.0.0 for all interfaces)
@@ -559,49 +583,9 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Non-zero values useful for testing deterministic spill behavior
     \\# max_hot_entries = 0
     \\
-    \\# --- Warm Tier (Disk Segments) ---
-    \\# Max local segments before archival to cold tier
-    \\# max_local_segments = 100
-    \\
-    \\# Truncate WAL entries after safe segment flush
-    \\# enable_wal_truncation = true
-    \\
-    \\[background_tasks]
-    \\# Namespace deletion task interval in milliseconds
-    \\# How often to check for namespaces pending deletion (force delete cleanup)
-    \\# Default: 5000ms (5s) for production workloads
-    \\# namespace_deletion_interval_ms = 5000
-    \\
     \\[logging]
     \\# Log level: debug, info, warn, error
     \\level = "info"
-    \\
-    \\[auth]
-    \\# Enable JWT authentication for client connections
-    \\# When disabled, all connections are anonymous (no auth required)
-    \\enabled = false
-    \\
-    \\# JWT secret for HS256 signature verification
-    \\# Generate a secure secret: openssl rand -base64 32
-    \\# jwt_secret = "your-256-bit-secret-key-here"
-    \\
-    \\# JWKS URL for RS256/ES256 signature verification (supports RSA and ECC P-256 keys)
-    \\# Keys are fetched and cached with 1-hour TTL, supporting key rotation
-    \\# Works with Supabase, Auth0, Okta, Azure AD, Keycloak, etc.
-    \\# jwks_url = "https://your-project.supabase.co/.well-known/jwks.json"
-    \\
-    \\[websocket]
-    \\# Rate limiting for WebSocket connections (browser clients)
-    \\# Max requests per window (0 = unlimited)
-    \\rate_limit_requests = 1000
-    \\# Rate limit window size in milliseconds
-    \\rate_limit_window_ms = 1000
-    \\
-    \\# Heartbeat settings
-    \\# Ping interval in milliseconds (0 = disabled)
-    \\ping_interval_ms = 30000
-    \\# Pong timeout - connection closed if no pong received within this time
-    \\pong_timeout_ms = 10000
     \\
     \\[metrics]
     \\# Enable HTTP metrics endpoint for Prometheus scraping
@@ -651,27 +635,6 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Replacing a leader that has gone quiet begins after half of this and
     \\# is certain by all of it; heartbeats are a sixth of it. Minimum 100.
     \\# failover_timeout_ms = 1500
-    \\
-    \\[cold_storage]
-    \\# Cold tier backend: none, file, s3
-    \\# provider = "none"
-    \\
-    \\# Number of upload/restore workers
-    \\# upload_workers = 2
-    \\# restore_workers = 4
-    \\
-    \\# File backend configuration (local filesystem or NFS)
-    \\# [cold_storage.file]
-    \\# base_path = "/var/lib/flo/archive"
-    \\# sync_on_write = true
-    \\
-    \\# S3 backend configuration (AWS S3 or S3-compatible like MinIO, R2)
-    \\# [cold_storage.s3]
-    \\# bucket = "my-flo-cold-storage"
-    \\# region = "us-east-1"
-    \\# endpoint = ""           # Optional: for S3-compatible services
-    \\# use_path_style = false  # Set true for MinIO
-    \\# use_tls = true
     \\
     ;
 }
@@ -767,4 +730,60 @@ test "dashboard origins and hosts that could never match are refused at load" {
         @import("stdx").fs.closeFile(f);
         try std.testing.expectError(error.InvalidSetting, load(allocator, path));
     }
+}
+
+test "config: what flo.toml can't hold is refused, not ignored" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+    const Case = struct { body: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .body = "[server]\nprot = 9000\n", .err = error.UnknownSetting },
+        .{ .body = "[servr]\nport = 9000\n", .err = error.UnknownSetting },
+        .{ .body = "port = 9000\n", .err = error.UnknownSetting },
+        .{ .body = "[auth]\nenabled = true\n", .err = error.UnknownSetting },
+        .{ .body = "[websocket]\nping_interval_ms = 1\n", .err = error.UnknownSetting },
+        .{ .body = "[cold_storage]\nprovider = \"file\"\n", .err = error.UnknownSetting },
+        .{ .body = "[background_tasks]\nnamespace_deletion_interval_ms = 5\n", .err = error.UnknownSetting },
+        .{ .body = "[kv]\nexpose_internal_keys = true\n", .err = error.UnknownSetting },
+        .{ .body = "[storage]\nmax_local_segments = 5\n", .err = error.UnknownSetting },
+        .{ .body = "[cluster]\nelection_timeout_min_ms = 150\n", .err = error.UnknownSetting },
+        .{ .body = "[server]\nport = \"9000\"\n", .err = error.InvalidSetting },
+        .{ .body = "[server]\nport = 70000\n", .err = error.InvalidSetting },
+        .{ .body = "[metrics]\nport = -1\n", .err = error.InvalidSetting },
+        .{ .body = "[storage]\nhot_buffer_capacity = 0\n", .err = error.InvalidSetting },
+        .{ .body = "[storage]\ndurability = \"fast\"\n", .err = error.InvalidSetting },
+        .{ .body = "[logging]\nlevel = \"loud\"\n", .err = error.InvalidSetting },
+        .{ .body = "[logging]\nformat = \"xml\"\n", .err = error.InvalidSetting },
+        .{ .body = "[dashboard]\nenabled = \"yes\"\n", .err = error.InvalidSetting },
+    }) |c| {
+        const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+        try @import("stdx").fs.writeAll(f, c.body);
+        @import("stdx").fs.closeFile(f);
+        std.testing.expectError(c.err, load(allocator, path)) catch |e| {
+            std.debug.print("case: {s}", .{c.body});
+            return e;
+        };
+    }
+    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, "loud", null, null));
+}
+
+test "config: the file config init writes loads, and a named file that is missing is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+    try std.testing.expectError(error.FileNotFound, loadWithOverrides(allocator, path, null, null, null, null, null, null, null));
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, generateDefaultConfig());
+    @import("stdx").fs.closeFile(f);
+    var config = try load(allocator, path);
+    defer config.deinit();
 }

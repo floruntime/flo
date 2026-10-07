@@ -9,7 +9,6 @@
 //! | First Bytes    | Protocol   |
 //! |---------------|------------|
 //! | `FLO\0`       | Binary     |
-//! | `GET ` + ws   | WebSocket  |
 //! | HTTP method   | HTTP       |
 //!
 //! Anything else is read as binary, whose parser refuses it: once a
@@ -171,8 +170,6 @@ pub const RingBuffer = struct {
 pub const Protocol = enum(u8) {
     /// Flo native binary protocol (magic `FLO\0`).
     binary = 0,
-    /// WebSocket (HTTP GET with Upgrade header).
-    websocket = 1,
     /// Plain HTTP (REST API / dashboard).
     http = 2,
     /// Not yet determined (need more bytes).
@@ -195,9 +192,6 @@ pub fn detectProtocol(peek_data: []const u8) Protocol {
     // HTTP methods: GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH
     if (peek_data.len >= 4) {
         if (std.mem.eql(u8, peek_data[0..4], "GET ")) {
-            // Could be WebSocket upgrade or plain HTTP
-            // Full detection requires seeing headers; for now mark as HTTP.
-            // The upgrade handshake handler will promote to WebSocket.
             return .http;
         }
         if (std.mem.eql(u8, peek_data[0..4], "POST") or
@@ -216,60 +210,6 @@ pub fn detectProtocol(peek_data: []const u8) Protocol {
 
     // Default: assume binary (could be a partial FLO header)
     return .binary;
-}
-
-/// Extended protocol detection that can distinguish WebSocket from HTTP
-/// by checking for `Upgrade: websocket` header in the peek buffer.
-pub fn detectProtocolFull(peek_data: []const u8) Protocol {
-    const basic = detectProtocol(peek_data);
-    if (basic != .http) return basic;
-
-    // For GET requests, check if it's a WebSocket upgrade
-    if (peek_data.len >= 4 and std.mem.eql(u8, peek_data[0..4], "GET ")) {
-        // Look for "Upgrade:" header (case-insensitive search)
-        if (containsUpgradeWebsocket(peek_data)) return .websocket;
-    }
-
-    return .http;
-}
-
-/// Check if HTTP headers contain `Upgrade: websocket` (case-insensitive).
-fn containsUpgradeWebsocket(data: []const u8) bool {
-    // Simple scan for "upgrade:" followed by "websocket"
-    const needle_lower = "upgrade:";
-    var i: usize = 0;
-    while (i + needle_lower.len <= data.len) : (i += 1) {
-        var match = true;
-        for (0..needle_lower.len) |j| {
-            const c = data[i + j];
-            const lower_c = if (c >= 'A' and c <= 'Z') c + 32 else c;
-            if (lower_c != needle_lower[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            // Found "Upgrade:" — now look for "websocket" after it
-            const after = i + needle_lower.len;
-            var k = after;
-            // Skip whitespace
-            while (k < data.len and (data[k] == ' ' or data[k] == '\t')) : (k += 1) {}
-            const ws_needle = "websocket";
-            if (k + ws_needle.len <= data.len) {
-                var ws_match = true;
-                for (0..ws_needle.len) |j| {
-                    const c = data[k + j];
-                    const lower_c = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                    if (lower_c != ws_needle[j]) {
-                        ws_match = false;
-                        break;
-                    }
-                }
-                if (ws_match) return true;
-            }
-        }
-    }
-    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -465,7 +405,7 @@ pub const Connection = struct {
     /// Detect protocol from the read buffer contents.
     pub fn detectAndSetProtocol(self: *Connection) void {
         const data = self.read_buf.peek();
-        self.protocol = detectProtocolFull(data);
+        self.protocol = detectProtocol(data);
     }
 
     /// The most a connection holds unsent; a client that lets more pile up
@@ -563,7 +503,7 @@ test "Connection: protocol detection — binary (Flo magic)" {
 test "Connection: protocol detection — a Redis command is read as binary, which refuses it" {
     const data = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n";
     try std.testing.expectEqual(Protocol.binary, detectProtocol(data));
-    try std.testing.expectEqual(Protocol.binary, detectProtocolFull(data));
+    try std.testing.expectEqual(Protocol.binary, detectProtocol(data));
 }
 
 test "Connection: protocol detection — HTTP GET" {
@@ -584,16 +524,6 @@ test "Connection: protocol detection — HTTP PUT" {
 test "Connection: protocol detection — HTTP DELETE" {
     const data = "DELETE /api/v1/kv/key HTTP/1.1\r\n";
     try std.testing.expectEqual(Protocol.http, detectProtocol(data));
-}
-
-test "Connection: protocol detection — WebSocket upgrade" {
-    const data = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-    try std.testing.expectEqual(Protocol.websocket, detectProtocolFull(data));
-}
-
-test "Connection: protocol detection — WebSocket case insensitive" {
-    const data = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUPGRADE: WebSocket\r\nConnection: Upgrade\r\n\r\n";
-    try std.testing.expectEqual(Protocol.websocket, detectProtocolFull(data));
 }
 
 test "Connection: protocol detection — unknown (too few bytes)" {

@@ -29,7 +29,6 @@ const InboxMessage = @import("inbox.zig").Message;
 const proto = @import("../protocol/proto.zig");
 const server_config = @import("../config/server.zig");
 const Durability = server_config.Durability;
-const ColdStorageConfig = @import("../config/cold_storage.zig").ColdStorageConfig;
 const TieredLogConfig = @import("../config/tiered_log.zig").TieredLogConfig;
 const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const RaftNodeConfig = @import("../raft/node.zig").Config;
@@ -79,15 +78,7 @@ pub const RuntimeConfig = struct {
     listen_addr: []const u8 = "0.0.0.0",
 
     durability: Durability = .async_flush,
-    cold_storage: ?ColdStorageConfig = null,
     tiered_log: TieredLogConfig = .{},
-    auth_enabled: bool = false,
-    jwt_secret: ?[]const u8 = null,
-    jwks_url: ?[]const u8 = null,
-    ws_rate_limit_requests: u32 = 100,
-    ws_rate_limit_window_ms: i64 = 60000,
-    ws_ping_interval_ms: i64 = 30000,
-    ws_pong_timeout_ms: i64 = 10000,
 
     metrics_enabled: bool = true,
     /// Port for HTTP metrics server (0 = derive from listen_port + 1)
@@ -116,8 +107,6 @@ pub const RuntimeConfig = struct {
     /// The one timing knob: a leader unheard for this long is replaced.
     /// Election timeouts are [½, 1] × this, heartbeats a sixth of it.
     cluster_failover_timeout_ms: u32 = 1500,
-    namespace_deletion_interval_ms: i64 = 5000,
-    expose_internal_keys: bool = false,
 
     // =========================================================================
     // Port Derivation Methods

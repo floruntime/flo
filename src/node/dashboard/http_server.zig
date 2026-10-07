@@ -3,13 +3,12 @@
 //! Lightweight HTTP server for the Flo web dashboard.
 //! Serves the REST API and embedded static assets (React SPA).
 //!
-//! Security Model: API key + session token
-//! - Default bind to localhost for safe out-of-box experience
-//! - Requires `flo server bootstrap` to generate root API key
+//! Security: no authentication yet. It binds to localhost by default; keep it
+//! on a private interface.
 //!
 //! Endpoints:
 //! - GET /health         - Health check (always public)
-//! - GET /api/v1/*       - REST API for dashboard data (requires auth)
+//! - GET /api/v1/*       - REST API for dashboard data
 //! - GET /api/v1/kv/keys/:key/watch?namespace=:ns — SSE live updates (stub)
 //! - GET /api/v1/workflow/runs/:run_id/watch?namespace=:ns — SSE workflow run updates (stub)
 //! - GET /*              - Embedded static files (requires auth)
@@ -99,7 +98,7 @@ pub const DashboardServer = struct {
         // Start server thread
         self.thread = try std.Thread.spawn(.{}, serverLoop, .{self});
 
-        const auth_status = if (self.config.key_store != null) " (auth enabled)" else " (no auth — run flo server bootstrap)";
+        const auth_status = if (self.config.key_store != null) " (auth enabled)" else " (no authentication)";
         std.log.info("Dashboard server listening on {s}:{d}{s}", .{ self.config.bind, self.config.port, auth_status });
     }
 

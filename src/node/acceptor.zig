@@ -177,8 +177,8 @@ pub const Acceptor = struct {
                 }
                 return self.roundRobin();
             },
-            .http, .websocket => {
-                // HTTP/WS → dashboard shard (shard 0)
+            .http => {
+                // HTTP → dashboard shard (shard 0)
                 self.routed_round_robin += 1;
                 return 0;
             },

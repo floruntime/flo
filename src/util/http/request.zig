@@ -110,23 +110,6 @@ pub const HttpRequest = struct {
         }
         return null;
     }
-
-    /// Check if this is a WebSocket upgrade request
-    pub fn isWebSocketUpgrade(self: *const HttpRequest) bool {
-        if (self.method != .GET) return false;
-
-        const upgrade = self.getHeader("Upgrade") orelse return false;
-        if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return false;
-
-        const connection = self.connection orelse return false;
-        // Connection header may contain multiple values
-        var iter = std.mem.splitScalar(u8, connection, ',');
-        while (iter.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " ");
-            if (std.ascii.eqlIgnoreCase(trimmed, "upgrade")) return true;
-        }
-        return false;
-    }
 };
 
 pub const ParseError = error{

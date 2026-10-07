@@ -1,9 +1,7 @@
-//! Auth Module — API keys, session tokens, and key store
+//! Auth Module — API keys, session tokens, and key store.
 //!
-//! Three-layer auth model:
-//! - Layer 1: CLI & Dashboard → API keys + roles + session tokens
-//! - Layer 2: WebSocket → JWT from external IdP (handled in node/network/jwt.zig)
-//! - Layer 3: Binary protocol → Open (trust-the-network)
+//! Not wired into any listener yet: the client port and the dashboard
+//! authenticate no one.
 
 pub const keys = @import("keys.zig");
 pub const session = @import("session.zig");

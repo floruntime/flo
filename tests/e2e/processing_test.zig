@@ -866,11 +866,8 @@ test "e2e/processing: a record reaches every sink a job declares" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msink" });
 }
 
-test "e2e/processing: checkpoint persists to internal KV namespace" {
-    // Use expose_internal_keys so kv scan shows _proc: keys
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .expose_internal_keys = true },
-    });
+test "e2e/processing: a savepoint on a running job is accepted" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // Scope to dedicated namespace for isolation
@@ -900,22 +897,6 @@ test "e2e/processing: checkpoint persists to internal KV namespace" {
     var sp_result = try ctx.cli.run(&.{ "processing", "savepoint", job_id, "-n", "proc_ckpt" });
     defer sp_result.deinit();
     try stdx.testing.assertSucceeded(sp_result);
-
-    // With expose_internal_keys=true, _proc: checkpoint keys should be visible
-    var scan_result = try ctx.cli.run(&.{ "kv", "list", "-n", "proc_ckpt" });
-    defer scan_result.deinit();
-    if (scan_result.succeeded()) {
-        // Verify checkpoint keys are present under _proc: namespace
-        const has_proc_keys = scan_result.stdoutContains("_proc:");
-        if (!has_proc_keys) {
-            std.debug.print("WARN: kv list did not contain _proc: keys (checkpoint may not have flushed yet)\n", .{});
-            std.debug.print("kv list output:\n{s}\n", .{scan_result.stdout});
-        }
-    }
-
-    // Also verify that a server WITHOUT expose_internal_keys hides these keys.
-    // We've already verified the mechanism in the KVHandler unit: the filter
-    // uses `!is_internal and !self.expose_internal_keys and entry.key[0] == '_'`.
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_ckpt" });
 }
