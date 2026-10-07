@@ -24,8 +24,8 @@ test "e2e/dashboard: workflow create defines a workflow" {
         \\name: dash-wf
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const yaml = try dottedToYaml(testing.allocator, def);
     defer testing.allocator.free(yaml);
@@ -65,8 +65,8 @@ test "e2e/dashboard: workflow signal reaches a running run" {
         \\name: sig-wf
         \\version: 1.0.0
         \\start.run: @actions/approval-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try writeDottedToTempYaml(testing.allocator, def, "sig-wf.yaml");
     defer cleanupTempFile(testing.allocator, path);

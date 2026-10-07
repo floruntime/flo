@@ -18,8 +18,8 @@
 //!     \\name: my-workflow
 //!     \\version: 1.0.0
 //!     \\start.run: @actions/validate
-//!     \\start.transition.success: flo.Completed
-//!     \\start.transition.failure: flo.Failed
+//!     \\start.transitions.success: flo.Completed
+//!     \\start.transitions.failure: flo.Failed
 //! ;
 //!
 //! const path = try writeDottedToTempYaml(allocator, workflow_def, "my-workflow.yaml");
@@ -52,8 +52,8 @@ test "e2e/workflow: create simple workflow" {
         \\name: simple-test
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "simple-workflow.yaml");
@@ -181,8 +181,8 @@ test "e2e/workflow: list returns created workflows" {
         \\name: list-wf-alpha
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const wf2 =
@@ -190,8 +190,8 @@ test "e2e/workflow: list returns created workflows" {
         \\name: list-wf-beta
         \\version: 2.0.0
         \\start.run: @actions/process
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path1 = try writeDottedToTempYaml(testing.allocator, wf1, "list-wf-alpha.yaml");
@@ -227,8 +227,8 @@ test "e2e/workflow: list is namespace-scoped" {
         \\name: list-ns-wf
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "list-ns-wf.yaml");
@@ -374,15 +374,15 @@ test "e2e/workflow: multi-step workflow with custom terminals" {
         \\terminals.Approved.status: approval_success
         \\terminals.Rejected.status: approval_denied
         \\start.run: @actions/validate
-        \\start.transition.success: process
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: process
+        \\start.transitions.failure: flo.Failed
         \\steps.process.run: @actions/process-data
-        \\steps.process.transition.success: review
-        \\steps.process.transition.failure: flo.Failed
+        \\steps.process.transitions.success: review
+        \\steps.process.transitions.failure: flo.Failed
         \\steps.review.waitForSignal.type: approval
         \\steps.review.waitForSignal.timeoutMs: 3600000
-        \\steps.review.transition.success: Approved
-        \\steps.review.transition.timeout: Rejected
+        \\steps.review.transitions.success: Approved
+        \\steps.review.transitions.timeout: Rejected
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "multi-step.yaml");
@@ -405,8 +405,8 @@ test "e2e/workflow: dotted key format produces valid YAML" {
         \\name: import-test
         \\version: 1.0.0
         \\start.run: @actions/test
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "import-test.yaml");
@@ -455,8 +455,8 @@ test "e2e/workflow: create and start simple workflow" {
         \\name: echo-test
         \\version: 1.0.0
         \\start.run: @actions/echo
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "echo-test.yaml");
@@ -491,8 +491,8 @@ test "e2e/workflow: start workflow with idempotency key" {
         \\version: 1.0.0
         \\idempotency: required
         \\start.run: @actions/idem-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "idem-workflow.yaml");
@@ -523,8 +523,8 @@ test "e2e/workflow: start and check status" {
         \\name: status-workflow
         \\version: 1.0.0
         \\start.run: @actions/status-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "status-workflow.yaml");
@@ -565,12 +565,12 @@ test "e2e/workflow: workflow with signal wait" {
         \\terminals.Approved.status: approved
         \\terminals.Rejected.status: rejected
         \\start.run: @actions/approval-action
-        \\start.transition.success: wait-approval
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: wait-approval
+        \\start.transitions.failure: flo.Failed
         \\steps.wait-approval.waitForSignal.type: approval
         \\steps.wait-approval.waitForSignal.timeoutMs: 60000
-        \\steps.wait-approval.transition.success: Approved
-        \\steps.wait-approval.transition.timeout: Rejected
+        \\steps.wait-approval.transitions.success: Approved
+        \\steps.wait-approval.transitions.timeout: Rejected
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "approval-workflow.yaml");
@@ -605,14 +605,14 @@ test "e2e/workflow: multi-step workflow execution" {
         \\terminals.OrderComplete.status: success
         \\terminals.OrderFailed.status: failure
         \\start.run: @actions/validate-order
-        \\start.transition.success: payment
-        \\start.transition.failure: OrderFailed
+        \\start.transitions.success: payment
+        \\start.transitions.failure: OrderFailed
         \\steps.payment.run: @actions/charge-payment
-        \\steps.payment.transition.success: shipping
-        \\steps.payment.transition.failure: OrderFailed
+        \\steps.payment.transitions.success: shipping
+        \\steps.payment.transitions.failure: OrderFailed
         \\steps.shipping.run: @actions/ship-order
-        \\steps.shipping.transition.success: OrderComplete
-        \\steps.shipping.transition.failure: OrderFailed
+        \\steps.shipping.transitions.success: OrderComplete
+        \\steps.shipping.transitions.failure: OrderFailed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "order-flow.yaml");
@@ -689,8 +689,8 @@ test "e2e/workflow: list runs after starting workflows" {
         \\name: list-test-wf
         \\version: 1.0.0
         \\start.run: @actions/list-test-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "list-test.yaml");
@@ -724,8 +724,8 @@ test "e2e/workflow: get definition after create" {
         \\name: def-test-wf
         \\version: 1.0.0
         \\start.run: @actions/test
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "def-test.yaml");
@@ -756,12 +756,12 @@ test "e2e/workflow: cancel running workflow" {
         \\name: cancel-test-wf
         \\version: 1.0.0
         \\start.run: @actions/cancel-action
-        \\start.transition.success: wait-step
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: wait-step
+        \\start.transitions.failure: flo.Failed
         \\steps.wait-step.waitForSignal.type: proceed
         \\steps.wait-step.waitForSignal.timeoutMs: 300000
-        \\steps.wait-step.transition.success: flo.Completed
-        \\steps.wait-step.transition.timeout: flo.Failed
+        \\steps.wait-step.transitions.success: flo.Completed
+        \\steps.wait-step.transitions.timeout: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "cancel-test.yaml");
@@ -939,8 +939,8 @@ test "e2e/workflow: create workflow with child workflow step" {
         \\name: child-process
         \\version: 1.0.0
         \\start.run: @actions/child-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "child-workflow.yaml");
@@ -954,8 +954,8 @@ test "e2e/workflow: create workflow with child workflow step" {
         \\name: parent-process
         \\version: 1.0.0
         \\start.run: @workflow/child-process
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "parent-workflow.yaml");
@@ -981,8 +981,8 @@ test "e2e/workflow: start parent workflow invokes child" {
         \\name: simple-child
         \\version: 1.0.0
         \\start.run: @actions/simple-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "simple-child.yaml");
@@ -996,8 +996,8 @@ test "e2e/workflow: start parent workflow invokes child" {
         \\name: simple-parent
         \\version: 1.0.0
         \\start.run: @workflow/simple-child
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "simple-parent.yaml");
@@ -1034,7 +1034,7 @@ test "e2e/workflow: child workflow with explicit version" {
         \\name: versioned-child
         \\version: 2.0.0
         \\start.run: @actions/v2-action
-        \\start.transition.success: flo.Completed
+        \\start.transitions.success: flo.Completed
     ;
 
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "versioned-child.yaml");
@@ -1048,7 +1048,7 @@ test "e2e/workflow: child workflow with explicit version" {
         \\name: versioned-parent
         \\version: 1.0.0
         \\start.run: @workflow/versioned-child:2.0.0
-        \\start.transition.success: flo.Completed
+        \\start.transitions.success: flo.Completed
     ;
 
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "versioned-parent.yaml");
@@ -1077,8 +1077,8 @@ test "e2e/workflow: disable workflow blocks start" {
         \\name: disable-test
         \\version: 1.0.0
         \\start.run: @actions/sample-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "disable.yaml");
@@ -1119,8 +1119,8 @@ test "e2e/workflow: E2E-1b enable workflow allows start again" {
         \\name: e2e1b-enable-test
         \\version: 1.0.0
         \\start.run: @actions/e2e1b-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e1b-enable.yaml");
@@ -1161,8 +1161,8 @@ test "e2e/workflow: E2E-1c disable is per-workflow not global" {
         \\name: e2e1c-wf-a
         \\version: 1.0.0
         \\start.run: @actions/e2e1c-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path_a = try writeDottedToTempYaml(testing.allocator, def_a, "e2e1c-a.yaml");
@@ -1175,8 +1175,8 @@ test "e2e/workflow: E2E-1c disable is per-workflow not global" {
         \\name: e2e1c-wf-b
         \\version: 1.0.0
         \\start.run: @actions/e2e1c-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path_b = try writeDottedToTempYaml(testing.allocator, def_b, "e2e1c-b.yaml");
@@ -1224,11 +1224,11 @@ test "e2e/workflow: E2E-2 scheduled workflow creation" {
         \\schedule.max_concurrent: 1
         \\schedule.input: '{"mode":"full"}'
         \\start.run: @actions/e2e2-reconcile
-        \\start.transition.success: generate-report
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: generate-report
+        \\start.transitions.failure: flo.Failed
         \\steps.generate-report.run: @actions/e2e2-report
-        \\steps.generate-report.transition.success: flo.Completed
-        \\steps.generate-report.transition.failure: flo.Failed
+        \\steps.generate-report.transitions.success: flo.Completed
+        \\steps.generate-report.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e2-sched.yaml");
@@ -1268,12 +1268,12 @@ test "e2e/workflow: timeout enforcement" {
         \\name: e2e3-timeout
         \\version: 1.0.0
         \\start.run: @actions/e2e3-slow-action
-        \\start.transition.success: wait-forever
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: wait-forever
+        \\start.transitions.failure: flo.Failed
         \\steps.wait-forever.waitForSignal.type: never-comes
         \\steps.wait-forever.waitForSignal.timeoutMs: 2000
-        \\steps.wait-forever.transition.success: flo.Completed
-        \\steps.wait-forever.transition.timeout: flo.Failed
+        \\steps.wait-forever.transitions.success: flo.Completed
+        \\steps.wait-forever.transitions.timeout: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e3-timeout.yaml");
@@ -1334,12 +1334,12 @@ test "e2e/workflow: E2E-4 signal delivery resumes waiting workflow" {
         \\terminals.Approved.status: approved
         \\terminals.Rejected.status: rejected
         \\start.run: @actions/e2e4-init-action
-        \\start.transition.success: await-approval
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: await-approval
+        \\start.transitions.failure: flo.Failed
         \\steps.await-approval.waitForSignal.type: approval
         \\steps.await-approval.waitForSignal.timeoutMs: 30000
-        \\steps.await-approval.transition.success: Approved
-        \\steps.await-approval.transition.timeout: Rejected
+        \\steps.await-approval.transitions.success: Approved
+        \\steps.await-approval.transitions.timeout: Rejected
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e4-signal.yaml");
@@ -1399,8 +1399,8 @@ test "e2e/workflow: E2E-5 history retrieval after workflow execution" {
         \\name: e2e5-history-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e5-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e5-history.yaml");
@@ -1439,8 +1439,8 @@ test "e2e/workflow: E2E-5b history with limit parameter" {
         \\name: e2e5b-hist-limit
         \\version: 1.0.0
         \\start.run: @actions/e2e5b-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e5b-hist.yaml");
@@ -1482,8 +1482,8 @@ test "e2e/workflow: E2E-6 search attributes stored on start" {
         \\name: e2e6-search-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e6-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e6-search.yaml");
@@ -1595,8 +1595,8 @@ test "e2e/workflow: E2E-8 child completion resumes parent" {
         \\name: e2e8-child
         \\version: 1.0.0
         \\start.run: @actions/e2e8-child-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "e2e8-child.yaml");
@@ -1609,11 +1609,11 @@ test "e2e/workflow: E2E-8 child completion resumes parent" {
         \\name: e2e8-parent
         \\version: 1.0.0
         \\start.run: @workflow/e2e8-child
-        \\start.transition.success: post-child
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: post-child
+        \\start.transitions.failure: flo.Failed
         \\steps.post-child.run: @actions/e2e8-child-action
-        \\steps.post-child.transition.success: flo.Completed
-        \\steps.post-child.transition.failure: flo.Failed
+        \\steps.post-child.transitions.success: flo.Completed
+        \\steps.post-child.transitions.failure: flo.Failed
     ;
 
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "e2e8-parent.yaml");
@@ -1653,12 +1653,12 @@ test "e2e/workflow: E2E-9 cascading cancellation parent cancels child" {
         \\name: e2e9-child
         \\version: 1.0.0
         \\start.run: @actions/e2e9-action
-        \\start.transition.success: child-wait
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: child-wait
+        \\start.transitions.failure: flo.Failed
         \\steps.child-wait.waitForSignal.type: never-arrives
         \\steps.child-wait.waitForSignal.timeoutMs: 300000
-        \\steps.child-wait.transition.success: flo.Completed
-        \\steps.child-wait.transition.timeout: flo.Failed
+        \\steps.child-wait.transitions.success: flo.Completed
+        \\steps.child-wait.transitions.timeout: flo.Failed
     ;
 
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "e2e9-child.yaml");
@@ -1671,8 +1671,8 @@ test "e2e/workflow: E2E-9 cascading cancellation parent cancels child" {
         \\name: e2e9-parent
         \\version: 1.0.0
         \\start.run: @workflow/e2e9-child
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "e2e9-parent.yaml");
@@ -1788,8 +1788,8 @@ test "e2e/workflow: E2E-11 idempotency returns same run_id" {
         \\version: 1.0.0
         \\idempotency: required
         \\start.run: @actions/e2e11-idem-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e11-idem.yaml");
@@ -1837,8 +1837,8 @@ test "e2e/workflow: E2E-12 disabled workflow returns error and creates no run" {
         \\name: e2e12-disabled-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e12-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e12-disabled.yaml");
@@ -1880,8 +1880,8 @@ test "e2e/workflow: E2E-13 max child depth enforcement" {
         \\name: e2e13-leaf
         \\version: 1.0.0
         \\start.run: @actions/e2e13-leaf-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const leaf_path = try writeDottedToTempYaml(testing.allocator, leaf_def, "e2e13-leaf.yaml");
@@ -1894,8 +1894,8 @@ test "e2e/workflow: E2E-13 max child depth enforcement" {
         \\name: e2e13-c
         \\version: 1.0.0
         \\start.run: @workflow/e2e13-leaf
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const c_path = try writeDottedToTempYaml(testing.allocator, c_def, "e2e13-c.yaml");
@@ -1908,8 +1908,8 @@ test "e2e/workflow: E2E-13 max child depth enforcement" {
         \\name: e2e13-b
         \\version: 1.0.0
         \\start.run: @workflow/e2e13-c
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const b_path = try writeDottedToTempYaml(testing.allocator, b_def, "e2e13-b.yaml");
@@ -1922,8 +1922,8 @@ test "e2e/workflow: E2E-13 max child depth enforcement" {
         \\name: e2e13-a
         \\version: 1.0.0
         \\start.run: @workflow/e2e13-b
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const a_path = try writeDottedToTempYaml(testing.allocator, a_def, "e2e13-a.yaml");
@@ -1964,11 +1964,11 @@ test "e2e/workflow: E2E-14 jsonpath input resolution between steps" {
         \\name: e2e14-jsonpath-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e14-step1-action
-        \\start.transition.success: step2
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: step2
+        \\start.transitions.failure: flo.Failed
         \\steps.step2.run: @actions/e2e14-step2-action
-        \\steps.step2.transition.success: flo.Completed
-        \\steps.step2.transition.failure: flo.Failed
+        \\steps.step2.transitions.success: flo.Completed
+        \\steps.step2.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e14-jsonpath.yaml");
@@ -2007,12 +2007,12 @@ test "e2e/workflow: E2E-15 persistence survives server restart" {
         \\name: e2e15-persist-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e15-action
-        \\start.transition.success: wait-step
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: wait-step
+        \\start.transitions.failure: flo.Failed
         \\steps.wait-step.waitForSignal.type: resume
         \\steps.wait-step.waitForSignal.timeoutMs: 300000
-        \\steps.wait-step.transition.success: flo.Completed
-        \\steps.wait-step.transition.timeout: flo.Failed
+        \\steps.wait-step.transitions.success: flo.Completed
+        \\steps.wait-step.transitions.timeout: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e15-persist.yaml");
@@ -2066,8 +2066,8 @@ test "e2e/workflow: E2E-16a GET /api/workflows returns data" {
         \\name: e2e16-dash-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e16-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e16-dash.yaml");
@@ -2105,8 +2105,8 @@ test "e2e/workflow: E2E-16b GET /api/workflows/:run_id returns status" {
         \\name: e2e16b-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e16b-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e16b.yaml");
@@ -2142,8 +2142,8 @@ test "e2e/workflow: E2E-16c GET /api/workflows/:run_id/history returns events" {
         \\name: e2e16c-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e16c-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "e2e16c.yaml");
@@ -2186,12 +2186,12 @@ test "e2e/workflow: E2E-17 definition overwrite safety" {
         \\name: e2e17-overwrite-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e17-v1-action
-        \\start.transition.success: wait-step
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: wait-step
+        \\start.transitions.failure: flo.Failed
         \\steps.wait-step.waitForSignal.type: proceed
         \\steps.wait-step.waitForSignal.timeoutMs: 60000
-        \\steps.wait-step.transition.success: flo.Completed
-        \\steps.wait-step.transition.timeout: flo.Failed
+        \\steps.wait-step.transitions.success: flo.Completed
+        \\steps.wait-step.transitions.timeout: flo.Failed
     ;
 
     const v1_path = try writeDottedToTempYaml(testing.allocator, v1_def, "e2e17-v1.yaml");
@@ -2218,8 +2218,8 @@ test "e2e/workflow: E2E-17 definition overwrite safety" {
         \\name: e2e17-overwrite-wf
         \\version: 1.0.0
         \\start.run: @actions/e2e17-v2-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const v2_path = try writeDottedToTempYaml(testing.allocator, v2_def, "e2e17-v2.yaml");
@@ -2257,8 +2257,8 @@ test "e2e/workflow: create workflow with trigger definition" {
         \\trigger.stream: order-events
         \\trigger.mode: shared
         \\start.run: @actions/st-echo
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-def-test.yaml");
@@ -2293,8 +2293,8 @@ test "e2e/workflow: append to stream triggers workflow run" {
         \\trigger.stream: trigger-events
         \\trigger.mode: shared
         \\start.run: @actions/st-process
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-auto-start.yaml");
@@ -2330,8 +2330,8 @@ test "e2e/workflow: multiple appends trigger multiple runs" {
         \\trigger.stream: multi-trigger-events
         \\trigger.mode: shared
         \\start.run: @actions/st-multi
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-multi-run.yaml");
@@ -2370,8 +2370,8 @@ test "e2e/workflow: trigger with custom consumer group" {
         \\trigger.consumer_group: my-custom-cg
         \\trigger.mode: exclusive
         \\start.run: @actions/st-cg-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-cg-test.yaml");
@@ -2406,8 +2406,8 @@ test "e2e/workflow: no trigger on unrelated stream" {
         \\version: 1.0.0
         \\trigger.stream: specific-stream
         \\start.run: @actions/st-nomatch
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-nomatch.yaml");
@@ -2444,11 +2444,11 @@ test "e2e/workflow: triggered workflow with multi-step pipeline" {
         \\trigger.stream: pipeline-events
         \\trigger.mode: shared
         \\start.run: @actions/st-validate
-        \\start.transition.success: process-step
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: process-step
+        \\start.transitions.failure: flo.Failed
         \\steps.process-step.run: @actions/st-process-order
-        \\steps.process-step.transition.success: flo.Completed
-        \\steps.process-step.transition.failure: flo.Failed
+        \\steps.process-step.transitions.success: flo.Completed
+        \\steps.process-step.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-pipeline.yaml");
@@ -2486,8 +2486,8 @@ test "e2e/workflow: batch_size accumulates events and fires on full batch" {
         \\trigger.batch_timeout_ms: 60000
         \\trigger.mode: shared
         \\start.run: @actions/st-batch-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-batch.yaml");
@@ -2533,16 +2533,16 @@ test "e2e/workflow: same workflow name in different namespaces are independent" 
         \\name: shared-wf
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const def_b =
         \\kind: Workflow
         \\name: shared-wf
         \\version: 2.0.0
         \\start.run: @actions/process
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path_a = try writeDottedToTempYaml(testing.allocator, def_a, "ns-a-wf.yaml");
@@ -2577,8 +2577,8 @@ test "e2e/workflow: start and status are namespace-scoped" {
         \\name: run-scoped
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "run-scoped-wf.yaml");
@@ -2618,8 +2618,8 @@ test "e2e/workflow: disable in one namespace does not affect another" {
         \\name: dis-test
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "dis-wf.yaml");
@@ -2653,8 +2653,8 @@ test "e2e/workflow: default namespace is isolated from named namespaces" {
         \\name: ns-default
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ns-default-wf.yaml");
@@ -2710,8 +2710,8 @@ test "e2e/workflow: multi-shard create and definition retrieval" {
         \\name: ms-basic
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-basic-wf.yaml");
@@ -2735,8 +2735,8 @@ test "e2e/workflow: multi-shard create + start + status round-trip" {
         \\name: ms-roundtrip
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-roundtrip-wf.yaml");
@@ -2757,8 +2757,8 @@ test "e2e/workflow: multi-shard namespace isolation across shards" {
         \\name: ms-ns-test
         \\version: 1.0.0
         \\start.run: @actions/validate
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
 
     const path = try writeDottedToTempYaml(testing.allocator, wf_def, "ms-ns-test-wf.yaml");
@@ -2798,8 +2798,8 @@ test "e2e/workflow: child workflow step creates a child run" {
         \\name: audit-child-1
         \\version: 1.0.0
         \\start.run: @actions/audit-child-act
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const child_path = try writeDottedToTempYaml(testing.allocator, child_def, "audit-child-1.yaml");
     defer cleanupTempFile(testing.allocator, child_path);
@@ -2810,8 +2810,8 @@ test "e2e/workflow: child workflow step creates a child run" {
         \\name: audit-parent-1
         \\version: 1.0.0
         \\start.run: @workflow/audit-child-1
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const parent_path = try writeDottedToTempYaml(testing.allocator, parent_def, "audit-parent-1.yaml");
     defer cleanupTempFile(testing.allocator, parent_path);
@@ -2856,8 +2856,8 @@ test "e2e/workflow: stream trigger fires runs under multi-shard topology" {
             "trigger.batchTimeoutMs: 500\n" ++
             "trigger.batchSize: 1\n" ++
             "start.run: @actions/audit-trig-act\n" ++
-            "start.transition.success: flo.Completed\n" ++
-            "start.transition.failure: flo.Failed";
+            "start.transitions.success: flo.Completed\n" ++
+            "start.transitions.failure: flo.Failed";
         const path = try writeDottedToTempYaml(testing.allocator, def, p.file);
         defer cleanupTempFile(testing.allocator, path);
         try ctx.exec(&.{ "workflow", "create", "-f", path });
@@ -2889,8 +2889,8 @@ test "e2e/workflow: idempotency required rejects start without key" {
         \\version: 1.0.0
         \\idempotency: required
         \\start.run: @actions/audit-idem-act
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try writeDottedToTempYaml(testing.allocator, def, "audit-idem.yaml");
     defer cleanupTempFile(testing.allocator, path);
@@ -2981,8 +2981,8 @@ test "e2e/workflow: stream trigger fires promptly via push-wake" {
             "trigger.batchTimeoutMs: 60000\n" ++ // 60s timer — must NOT be what fires the run
             "trigger.batchSize: 1\n" ++
             "start.run: @actions/push-act\n" ++
-            "start.transition.success: flo.Completed\n" ++
-            "start.transition.failure: flo.Failed";
+            "start.transitions.success: flo.Completed\n" ++
+            "start.transitions.failure: flo.Failed";
         const path = try writeDottedToTempYaml(testing.allocator, def, p.file);
         defer cleanupTempFile(testing.allocator, path);
         try ctx.exec(&.{ "workflow", "create", "-f", path });
@@ -3034,8 +3034,8 @@ test "e2e/workflow: a stream trigger survives restart and resumes at its cursor"
         \\trigger.stream: restart-trigger-events
         \\trigger.mode: shared
         \\start.run: @actions/st-restart-act
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-restart-trig.yaml");
     defer cleanupTempFile(testing.allocator, path);

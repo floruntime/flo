@@ -134,8 +134,8 @@ test "e2e/namespace: a workflow trigger naming a namespace outside the rule is r
         \\trigger.stream: events
         \\trigger.namespace: _flo
         \\start.run: @actions/ns-echo
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "ns-trigger.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
