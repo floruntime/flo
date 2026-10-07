@@ -668,7 +668,7 @@ pub const RetryPolicy = struct {
     pub fn calculateDelay(self: RetryPolicy, attempt: u32) u32 {
         const delay: u32 = switch (self.backoff) {
             .constant => self.initial_delay_ms,
-            .linear => self.initial_delay_ms * (attempt + 1),
+            .linear => self.initial_delay_ms *| (attempt +| 1),
             .exponential => blk: {
                 const multiplier = std.math.powi(u32, 2, attempt) catch std.math.maxInt(u32);
                 break :blk self.initial_delay_ms *| multiplier;
