@@ -227,13 +227,14 @@ pub fn parseDuration(s: []const u8) ?i64 {
     const unit = s[s.len - 1];
     const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
     if (num <= 0) return null;
-    return switch (unit) {
-        's' => num * 1000,
-        'm' => num * 60 * 1000,
-        'h' => num * 3600 * 1000,
-        'd' => num * 86400 * 1000,
-        else => null,
+    const ms_per: i64 = switch (unit) {
+        's' => 1000,
+        'm' => 60 * 1000,
+        'h' => 3600 * 1000,
+        'd' => 86400 * 1000,
+        else => return null,
     };
+    return std.math.mul(i64, num, ms_per) catch null;
 }
 
 // ============================================================================
@@ -260,4 +261,10 @@ test "ast_agg_function_from_string" {
     try std.testing.expectEqual(AggFunction.min, AggFunction.fromString("min").?);
     try std.testing.expectEqual(AggFunction.max, AggFunction.fromString("max").?);
     try std.testing.expect(AggFunction.fromString("median") == null);
+}
+
+test "ast_duration_parse: a duration too large to represent is invalid" {
+    try std.testing.expect(parseDuration("106751991168d") == null);
+    try std.testing.expect(parseDuration("9223372036854775807s") == null);
+    try std.testing.expectEqual(@as(i64, 106751991167 * 86400 * 1000), parseDuration("106751991167d").?);
 }

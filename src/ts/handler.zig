@@ -18,6 +18,7 @@
 //! - FloQL provides a pipeline query language (KEEP — parser + executor).
 
 const std = @import("std");
+const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -308,12 +309,12 @@ pub const TSHandler = struct {
 
         const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else 0;
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
         } else 0;
 
         const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else std.math.maxInt(u64);
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
         } else std.math.maxInt(u64);
 
         // Query raw points
@@ -348,12 +349,12 @@ pub const TSHandler = struct {
 
         const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else 0;
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
         } else 0;
 
         const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else std.math.maxInt(u64);
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
         } else std.math.maxInt(u64);
 
         const agg_name = if (req.findOption(.ts_aggregation)) |opt|
@@ -441,12 +442,12 @@ pub const TSHandler = struct {
         var to_ns: u64 = std.math.maxInt(u64);
         if (query.source.range.duration_ms > 0) {
             const from_ms = now_ms - query.source.range.duration_ms;
-            from_ns = if (from_ms > 0) @intCast(@as(u64, @bitCast(from_ms)) * 1_000_000) else 0;
-            to_ns = @intCast(@as(u64, @bitCast(now_ms)) * 1_000_000);
+            from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0;
+            to_ns = time_units.msToNsSat(@intCast(now_ms));
         } else if (query.source.range.from_ms > 0) {
-            from_ns = @intCast(@as(u64, @bitCast(query.source.range.from_ms)) * 1_000_000);
+            from_ns = time_units.msToNsSat(@intCast(query.source.range.from_ms));
             if (query.source.range.to_ms > 0) {
-                to_ns = @intCast(@as(u64, @bitCast(query.source.range.to_ms)) * 1_000_000);
+                to_ns = time_units.msToNsSat(@intCast(query.source.range.to_ms));
             }
         }
 
@@ -569,7 +570,7 @@ pub const TSHandler = struct {
         const now_ms = @import("stdx").time.milliTimestamp();
         const cutoff_ms = now_ms - duration_ms;
         const cutoff_ns: u64 = if (cutoff_ms > 0)
-            @intCast(@as(u64, @bitCast(cutoff_ms)) * 1_000_000)
+            time_units.msToNsSat(@intCast(cutoff_ms))
         else
             0;
 
