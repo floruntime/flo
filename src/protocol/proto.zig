@@ -367,7 +367,7 @@ pub const OptionTag = enum(u8) {
     ts_precision = 0x66, // u8: Timestamp precision (0=ns, 1=us, 2=ms, 3=s)
     ts_timestamp = 0x67, // i64: Explicit timestamp for write (0 = server-assigned)
     ts_raw_ttl = 0x68, // string: Raw data TTL (e.g., "7d")
-    ts_downsample = 0x69, // string: Downsample rule (e.g., "1m:avg:30d")
+    ts_downsample = 0x69, // string: refused — downsampling isn't supported
     ts_batch = 0x6A, // void: Flag indicating batch/line-protocol mode
 
     _,
