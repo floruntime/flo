@@ -319,6 +319,7 @@ pub const KVHandler = struct {
     }
 
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
+        if (err == error.TtlTooLarge) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
         shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
     }
 
@@ -974,8 +975,8 @@ pub const KVHandler = struct {
             if (req.getTtlSeconds()) |ttl_secs| {
                 if (ttl_secs > 0) {
                     flags |= entry_mod.Flags.HAS_TTL;
-                    // dispatchPut refused a TTL that doesn't fit; this clock read is later.
-                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_secs) orelse std.math.maxInt(u64);
+                    // JSON set/delete reach here without dispatchPut's check.
+                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_secs) orelse return error.TtlTooLarge;
                     std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
                     payload_len += 8;
                 }

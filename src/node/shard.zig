@@ -2997,7 +2997,7 @@ pub const Shard = struct {
     fn hotFlushTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const now_ns: u64 = @intCast(@import("stdx").time.nanoTimestamp());
-        const cutoff_ns = now_ns -| (self.hot_flush_seconds * std.time.ns_per_s);
+        const cutoff_ns = now_ns -| (self.hot_flush_seconds *| std.time.ns_per_s);
 
         var total_evicted: u64 = 0;
         for (self.partitions) |partition| {
@@ -3026,7 +3026,7 @@ pub const Shard = struct {
 
             // Age-based retention: compute cutoff StreamID, persist trim through Raft
             if (meta.retention_age_s > 0) {
-                const cutoff_ms = now_ms -| (meta.retention_age_s * 1000);
+                const cutoff_ms = now_ms -| (meta.retention_age_s *| 1000);
                 if (cutoff_ms > 0) {
                     const cutoff_id = StreamID{ .timestamp_ms = cutoff_ms, .sequence = std.math.maxInt(u64) };
                     // Only trim if there are records to remove
