@@ -498,8 +498,9 @@ pub const TSHandler = struct {
         // 5. Execute the pipeline stages
         // Note: execute() returns the input unchanged (same pointer) when pipeline is empty.
         // When pipeline has stages, it returns a new SeriesSet and does NOT free initial.
-        var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch {
+        var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch |err| {
             initial.deinit();
+            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series)" } };
             return .{ .err = .{ .code = .internal_error, .message = "floql: execution failed" } };
         };
         defer result_set.deinit();

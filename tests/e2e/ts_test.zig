@@ -1512,3 +1512,31 @@ test "e2e/ts: retention trims only its own measurement in its own namespace" {
     defer other.deinit();
     try testing.expect(other.contains(" 333.000000"));
 }
+
+test "e2e/ts: a FloQL percentile outside 0..100 or a window with too many buckets is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "1" });
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "2" });
+    // Three in one bucket: 150% of the way through them is past the last.
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "3" });
+    // Two points far enough apart that one-second buckets number in the millions.
+    try ctx.exec(&.{ "ts", "write", "span", "--value", "1", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "span", "--value", "2" });
+
+    for ([_][]const u8{
+        "pct[1h] | window(1m) | percentile(150)",
+        "span[1708700000000..4102444800000] | window(1s) | sum()",
+    }) |q| {
+        var r = try ctx.cli.run(&.{ "ts", "floql", q });
+        defer r.deinit();
+        try testing.expect(r.contains("out of range"));
+    }
+
+    var ok = try ctx.cli.run(&.{ "ts", "floql", "pct[1h] | window(1m) | percentile(50)" });
+    defer ok.deinit();
+    try testing.expect(!ok.contains("out of range") and !ok.contains("rror"));
+
+    try ctx.exec(&.{ "kv", "set", "alive", "yes" });
+    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "kv", "get", "alive" }), "yes") != null);
+}

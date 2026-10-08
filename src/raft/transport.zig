@@ -368,6 +368,9 @@ pub fn parseEntries(entries_data: []const u8, entry_count: u32, out: []Entry) us
 
     while (count < limit and count < out.len and off < entries_data.len) {
         if (Entry.deserialize(entries_data[off..])) |e| {
+            // A peer's entry is applied by casts that assume a known type
+            // and an intact payload; one that fails stops the batch short.
+            e.validate() catch break;
             out[count] = e;
             off += e.totalSize();
             count += 1;
@@ -747,4 +750,22 @@ test "transport: 2-shard message exchange simulation" {
     try testing.expect(ar.success);
     try testing.expectEqual(@as(u64, 10), ar.match_index);
     try testing.expectEqual(@as(u32, 2), ar.from);
+}
+
+test "transport: a batch stops at an entry of unknown type or with a bad CRC" {
+    const good = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, "hello");
+    var unknown = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 2, 0, "world");
+    unknown.header.entry_type = 0xfe;
+    unknown.header.crc32c = unknown.computeCrc();
+    var corrupt = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 2, 0, "world");
+    corrupt.header.crc32c +%= 1;
+
+    for ([_]Entry{ unknown, corrupt }) |second| {
+        const entries = [_]Entry{ good, second };
+        var buf: [4096]u8 = undefined;
+        const written = serializeAppendRequest(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &entries, .leader_commit = 0 }, &buf).?;
+        const header = deserializeAppendRequestHeader(buf[0..written]).?;
+        var out: [8]Entry = undefined;
+        try testing.expectEqual(@as(usize, 1), parseEntries(header.entries_data, header.entry_count, &out));
+    }
 }
