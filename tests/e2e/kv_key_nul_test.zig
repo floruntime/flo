@@ -136,3 +136,35 @@ test "e2e/kv: the dashboard finds no key holding a NUL" {
         try testing.expect(!r.bodyContains("b-value"));
     }
 }
+
+test "e2e/stream: a stream name holding a NUL is refused, so one namespace can't name another's stream" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+    try ctx.exec(&.{ "stream", "create", "orders", "--partitions", "4", "-n", "b" });
+    try ctx.exec(&.{ "stream", "append", "orders", "o1", "-n", "b" });
+    try ctx.exec(&.{ "stream", "group", "create", "orders", "--group", "audit", "-n", "b" });
+
+    // "default" names are bare elsewhere; in any namespace this spells b's.
+    var out: [512]u8 = undefined;
+    var one: [4]u8 = undefined;
+    std.mem.writeInt(u32, &one, 1, .little);
+    for ([_]struct { op: proto.OpCode, value: []const u8 }{
+        .{ .op = .stream_create, .value = &one },
+        .{ .op = .stream_delete, .value = "" },
+    }) |c| {
+        const r = try rawCall(ctx, c.op, "a", "b\x00orders", c.value, &out);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.data, "stream name must not contain NUL") != null);
+    }
+
+    var info = try ctx.cli.run(&.{ "stream", "info", "orders", "-n", "b" });
+    defer info.deinit();
+    try testing.expect(info.contains("Partitions: 4"));
+    var group = try ctx.cli.run(&.{ "stream", "group", "info", "orders", "--group", "audit", "-n", "b" });
+    defer group.deinit();
+    try testing.expect(group.contains("audit") and !group.contains("not found"));
+    var listed = try ctx.cli.run(&.{ "stream", "list", "-n", "b" });
+    defer listed.deinit();
+    try testing.expect(listed.contains("orders"));
+}
