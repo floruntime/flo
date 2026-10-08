@@ -385,7 +385,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
         var groups_arr = try obj.arrayField("consumer_groups");
         try groups_arr.begin();
         var sp_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch stream_name;
+        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch return error.NotFound;
         const n = shardCount(ctx);
         for (0..n) |i| {
             if (getStreamProjection(ctx, i)) |sp| {
