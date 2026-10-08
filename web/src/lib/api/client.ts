@@ -1,8 +1,8 @@
 /* Typed fetch wrapper over the Flo dashboard REST API (`/api/v1`).
    Dev: Vite proxies `/api` → the dashboard server (:9002). Prod: same origin.
    Auth: when the server has auth enabled, a session token is stored in localStorage
-   and sent as `Authorization: Bearer`; when disabled (no `flo server bootstrap`),
-   requests go through unauthenticated. */
+   and sent as `Authorization: Bearer`; when it doesn't, requests go
+   through unauthenticated. */
 
 export const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
 

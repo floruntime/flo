@@ -19,10 +19,4 @@ pub const TieredLogConfig = struct {
     /// 0 = disable time-based flush (default — timer not yet implemented).
     /// Recommended production value: 300 (5 minutes).
     hot_flush_seconds: u64 = 0,
-
-    /// Maximum local disk segments before archival to cold tier (default: 100).
-    max_local_segments: usize = 100,
-
-    /// Enable WAL truncation after segment flush (default: true).
-    enable_wal_truncation: bool = true,
 };

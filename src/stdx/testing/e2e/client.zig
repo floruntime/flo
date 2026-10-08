@@ -154,8 +154,6 @@ pub const CliRunner = struct {
     flo_binary: []const u8,
     endpoint: []const u8,
     /// API key injected as --api-key flag on every command (set when auth is enabled)
-    api_key: ?[]const u8 = null,
-
     /// Initialize CLI runner
     pub fn init(allocator: Allocator, flo_binary: []const u8, endpoint: []const u8) !*Self {
         const self = try allocator.create(Self);
@@ -169,23 +167,16 @@ pub const CliRunner = struct {
 
     /// Clean up resources
     pub fn deinit(self: *Self) void {
-        if (self.api_key) |k| self.allocator.free(k);
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.endpoint);
         self.allocator.destroy(self);
     }
 
-    /// Set the API key to inject into every command (takes ownership of a duped copy)
-    pub fn setApiKey(self: *Self, key: []const u8) !void {
-        if (self.api_key) |old| self.allocator.free(old);
-        self.api_key = try self.allocator.dupe(u8, key);
-    }
-
     /// Run a CLI command asynchronously (returns handle to wait on)
     /// Useful for testing blocking operations like `kv get --block`
     pub fn runAsync(self: *Self, args: []const []const u8) !*AsyncCommand {
-        // Build full argument list, inserting --endpoint (and --api-key if set) before any "--" separator
-        const extra_flags: usize = 2 + if (self.api_key != null) @as(usize, 2) else @as(usize, 0);
+        // Build full argument list, inserting --endpoint before any "--" separator
+        const extra_flags: usize = 2;
         const total_args = 1 + args.len + extra_flags;
 
         var argv = try self.allocator.alloc([]const u8, total_args);
@@ -212,11 +203,6 @@ pub const CliRunner = struct {
             argv[inject_at] = "--endpoint";
             argv[inject_at + 1] = self.endpoint;
             inject_at += 2;
-            if (self.api_key) |key| {
-                argv[inject_at] = "--api-key";
-                argv[inject_at + 1] = key;
-                inject_at += 2;
-            }
             for (dd..args.len) |i| argv[inject_at + (i - dd)] = owned_argv[i];
         } else {
             for (args, 0..) |_, i| argv[1 + i] = owned_argv[i];
@@ -224,10 +210,6 @@ pub const CliRunner = struct {
             argv[inject_at] = "--endpoint";
             argv[inject_at + 1] = self.endpoint;
             inject_at += 2;
-            if (self.api_key) |key| {
-                argv[inject_at] = "--api-key";
-                argv[inject_at + 1] = key;
-            }
         }
 
         const async_cmd = try self.allocator.create(AsyncCommand);
@@ -297,7 +279,7 @@ pub const CliRunner = struct {
         // Build full argument list: [flo_binary] + args_before_-- + [--endpoint, endpoint, (--api-key, key)] + args_from_--
         // We must insert flags BEFORE "--" because commander treats everything
         // after "--" as positional (no flag parsing).
-        const extra_flags: usize = 2 + if (self.api_key != null) @as(usize, 2) else @as(usize, 0);
+        const extra_flags: usize = 2;
         const total_args = 1 + args.len + extra_flags;
 
         var argv = try self.allocator.alloc([]const u8, total_args);
@@ -320,11 +302,6 @@ pub const CliRunner = struct {
             argv[inject_at] = "--endpoint";
             argv[inject_at + 1] = self.endpoint;
             inject_at += 2;
-            if (self.api_key) |key| {
-                argv[inject_at] = "--api-key";
-                argv[inject_at + 1] = key;
-                inject_at += 2;
-            }
             for (args[dd..], 0..) |arg, i| argv[inject_at + i] = arg;
         } else {
             // No -- separator, append at end
@@ -333,10 +310,6 @@ pub const CliRunner = struct {
             argv[inject_at] = "--endpoint";
             argv[inject_at + 1] = self.endpoint;
             inject_at += 2;
-            if (self.api_key) |key| {
-                argv[inject_at] = "--api-key";
-                argv[inject_at + 1] = key;
-            }
         }
 
         // Execute command

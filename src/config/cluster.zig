@@ -102,11 +102,6 @@ pub const ClusterConfig = struct {
 
 pub const MIN_FAILOVER_TIMEOUT_MS: i64 = 100;
 
-/// Every key `[cluster]` reads. A key not on the list is refused at start,
-/// not ignored: a line that parses clean and changes nothing is the bug
-/// an operator finds at 2am.
-const known_keys = [_][]const u8{ "enabled", "secret", "secret_file", "node_id", "raft_port", "seeds", "failover_timeout_ms" };
-
 /// What `flo server secret` prints: this prefix, then 32 random bytes in
 /// lowercase hex.
 pub const SECRET_PREFIX = "flo-secret-";
@@ -204,15 +199,6 @@ pub fn parseClusterConfig(
             return error.InvalidSetting;
         }
         config.failover_timeout_ms = @intCast(t);
-    }
-    var keys = table.entries.keyIterator();
-    while (keys.next()) |key| {
-        var known = false;
-        for (known_keys) |k| known = known or std.mem.eql(u8, k, key.*);
-        if (!known) {
-            log.err("[cluster] {s} is not a setting; the keys are enabled, secret, secret_file, node_id, raft_port, seeds and failover_timeout_ms. Remove the line.", .{key.*});
-            return error.UnknownSetting;
-        }
     }
 
     // Seeds: an array of "host:port", or one comma-separated string.
@@ -312,7 +298,7 @@ test "formatNodeId with explicit name" {
     try std.testing.expectEqualStrings("flo-345678", name1);
 }
 
-test "cluster config refuses a key it does not know and a failover below the floor" {
+test "cluster config refuses a failover below the floor" {
     const toml = @import("toml.zig");
     const allocator = std.testing.allocator;
     var owned: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -320,9 +306,6 @@ test "cluster config refuses a key it does not know and a failover below the flo
         for (owned.items) |o| allocator.free(o);
         owned.deinit(allocator);
     }
-    var stale = try toml.parse(allocator, "election_timeout_min_ms = 150\n");
-    defer stale.deinit();
-    try std.testing.expectError(error.UnknownSetting, parseClusterConfig(allocator, &stale, &owned));
     var low = try toml.parse(allocator, "failover_timeout_ms = 50\n");
     defer low.deinit();
     try std.testing.expectError(error.InvalidSetting, parseClusterConfig(allocator, &low, &owned));

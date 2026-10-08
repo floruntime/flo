@@ -2,10 +2,9 @@
 //!
 //! Configuration types for the web dashboard.
 //!
-//! Security Model: API key + session token (M.8 auth)
-//! - Default bind to localhost for safe out-of-box experience
-//! - Requires `flo server bootstrap` to generate root API key
-//! - Operators firewall/VPN to secure access
+//! Security: the dashboard authenticates no one yet. It binds to localhost by
+//! default and checks Origin, Host and content type on what it accepts; keep
+//! it on a private interface.
 
 /// Dashboard configuration
 pub const DashboardConfig = struct {

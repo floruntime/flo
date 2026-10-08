@@ -90,10 +90,6 @@ pub const HttpRunner = struct {
     allocator: Allocator,
     host: []const u8,
     port: u16,
-    /// API key injected as X-Api-Key header on every request (set when auth is enabled)
-    api_key: ?[]const u8 = null,
-    /// Session JWT injected as Authorization: Bearer header (set after loginWithApiKey())
-    token: ?[]const u8 = null,
 
     /// Default request timeout (ms)
     pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -111,48 +107,8 @@ pub const HttpRunner = struct {
 
     /// Clean up resources
     pub fn deinit(self: *Self) void {
-        if (self.api_key) |k| self.allocator.free(k);
-        if (self.token) |t| self.allocator.free(t);
         self.allocator.free(self.host);
         self.allocator.destroy(self);
-    }
-
-    /// Set the API key for all subsequent requests (injects X-Api-Key header).
-    /// Clears any stored session token.
-    pub fn setApiKey(self: *Self, key: []const u8) !void {
-        if (self.api_key) |old| self.allocator.free(old);
-        self.api_key = try self.allocator.dupe(u8, key);
-    }
-
-    /// Set a pre-existing session JWT for all subsequent requests (Authorization: Bearer).
-    pub fn setToken(self: *Self, jwt: []const u8) !void {
-        if (self.token) |old| self.allocator.free(old);
-        self.token = try self.allocator.dupe(u8, jwt);
-    }
-
-    /// POST /api/v1/auth/session with the provided API key and store the returned JWT.
-    /// After this call, all requests will carry Authorization: Bearer <token>.
-    pub fn loginWithApiKey(self: *Self, key: []const u8) !void {
-        const auth_headers = &[_][2][]const u8{
-            .{ "X-Api-Key", key },
-        };
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"api_key\":\"{s}\"}}", .{key});
-        defer self.allocator.free(body);
-
-        var resp = try self.doRequest(.POST, "/api/v1/auth/session", body, auth_headers, true);
-        defer resp.deinit();
-
-        if (resp.status != 200 and resp.status != 201) return error.LoginFailed;
-
-        // Parse token from JSON body: {"token":"<jwt>",...}
-        const token_key = "\"token\":\"";
-        const start_pos = std.mem.indexOf(u8, resp.body, token_key) orelse return error.TokenNotFound;
-        const token_start = start_pos + token_key.len;
-        const token_end = std.mem.indexOfScalarPos(u8, resp.body, token_start, '"') orelse return error.TokenNotFound;
-
-        const jwt = resp.body[token_start..token_end];
-        if (self.token) |old| self.allocator.free(old);
-        self.token = try self.allocator.dupe(u8, jwt);
     }
 
     /// Make a GET request
@@ -264,13 +220,6 @@ pub const HttpRunner = struct {
         try writer.print("{s} {s} HTTP/1.1\r\n", .{ method.toString(), path });
         try writer.print("Host: {s}:{d}\r\n", .{ self.host, self.port });
         try writer.writeAll("Connection: close\r\n");
-
-        // Inject auth header: prefer Bearer token, fall back to X-Api-Key
-        if (self.token) |tok| {
-            try writer.print("Authorization: Bearer {s}\r\n", .{tok});
-        } else if (self.api_key) |key| {
-            try writer.print("X-Api-Key: {s}\r\n", .{key});
-        }
 
         if (extra_headers) |headers| {
             for (headers) |hdr| {

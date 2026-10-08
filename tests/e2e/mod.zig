@@ -24,6 +24,7 @@ pub const worker_test = @import("worker_test.zig");
 pub const workflow_test = @import("workflow_test.zig");
 pub const large_request_test = @import("large_request_test.zig");
 pub const time_bounds_test = @import("time_bounds_test.zig");
+pub const config_test = @import("config_test.zig");
 pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");

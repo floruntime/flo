@@ -8,7 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 
-/// Roles for API keys. Maps directly to `matchScope()` patterns in jwt.zig.
+/// Roles for API keys.
 pub const Role = enum {
     admin,
     operator,
