@@ -364,6 +364,9 @@ pub const Shard = struct {
     /// queued while it runs waits for the next tick: one entry per
     /// connection at most, and both lists are reserved as above.
     resume_fds: std.ArrayListUnmanaged(i32) = .empty,
+    /// Reads one connection gets per event before the others' turn; the
+    /// rest is read at the end of the tick. A field so tests can shrink it.
+    reads_per_event: u32 = 8,
     resume_running: std.ArrayListUnmanaged(i32) = .empty,
     /// The line of connections whose next request waits for room to go to
     /// another shard (`waitForward`), in the order they began waiting,
@@ -3128,56 +3131,79 @@ pub const Shard = struct {
     /// Read data from a client socket, parse request(s), and dispatch.
     fn readFromClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
-        // A readable event can still arrive after a pause (same poll batch,
-        // or an interest change not yet submitted); what it would read
-        // could not drain, and would look like one oversized request.
-        if (conn.reads_paused or conn.closing or conn.waiting != null) return;
+        // A readable event comes when data arrives, not while it waits
+        // (io_uring polls are multishot). A read that filled the room it
+        // had may have left the rest of a request in the socket with
+        // nothing to announce it, so read again until a read comes back short.
+        var reads: u32 = 0;
+        while (true) {
+            // A readable event can still arrive after a pause (same poll batch,
+            // or an interest change not yet submitted); what it would read
+            // could not drain, and would look like one oversized request.
+            if (conn.reads_paused or conn.closing or conn.waiting != null) return;
 
-        // Read no more than the read buffer has room for: bytes read and
-        // not kept would be requests silently lost.
-        var tmp_buf: [65536]u8 = undefined;
-        if (conn.read_buf.writable() == 0) {
-            // A request may be larger than the buffer: grow it to hold one
-            // whole request. Full at that size, the client sent more than a
-            // request can be. Every request says its size in its header and
-            // one that cannot fit is refused from it, so this should not be
-            // reached; if it is, one connection is closed rather than its
-            // buffer growing without bound.
-            const cap = conn.read_buf.buf.len * 2;
-            if (cap > MAX_READ_BUFFER) {
-                self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
-                self.flushToClient(fd);
-                return self.markClosing(fd);
+            // Read no more than the read buffer has room for: bytes read and
+            // not kept would be requests silently lost.
+            var tmp_buf: [65536]u8 = undefined;
+            if (conn.read_buf.writable() == 0) {
+                // A request may be larger than the buffer: grow it to hold one
+                // whole request. Full at that size, the client sent more than a
+                // request can be. Every request says its size in its header and
+                // one that cannot fit is refused from it, so this should not be
+                // reached; if it is, one connection is closed rather than its
+                // buffer growing without bound.
+                const cap = conn.read_buf.buf.len * 2;
+                if (cap > MAX_READ_BUFFER) {
+                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
+                    self.flushToClient(fd);
+                    return self.markClosing(fd);
+                }
+                conn.read_buf.resize(cap) catch return self.markClosing(fd);
             }
-            conn.read_buf.resize(cap) catch return self.markClosing(fd);
+            const room = @min(tmp_buf.len, conn.read_buf.writable());
+
+            const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeConnection(fd);
+                return;
+            };
+            if (n == 0) {
+                // EOF — peer closed
+                self.closeConnection(fd);
+                return;
+            }
+
+            if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+            if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
+
+            // Accumulate data in the read buffer
+            _ = conn.read_buf.write(tmp_buf[0..n]);
+
+            // Detect protocol on first data if not yet determined
+            if (conn.protocol == .unknown) {
+                conn.detectAndSetProtocol();
+            }
+
+            self.processRequests(fd, conn);
+            // Closing is deferred, so the connection is still ours here.
+            conn.shrinkReadBuffer();
+            if (n < room) return;
+            reads += 1;
+            if (reads == self.reads_per_event) {
+                // More may wait. It is read at the end of the tick, so one
+                // busy client doesn't hold the shard's others back.
+                self.queueResume(fd, conn);
+                return;
+            }
         }
-        const room = @min(tmp_buf.len, conn.read_buf.writable());
+    }
 
-        const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
-            if (err == error.WouldBlock) return;
-            self.closeConnection(fd);
-            return;
-        };
-        if (n == 0) {
-            // EOF — peer closed
-            self.closeConnection(fd);
-            return;
-        }
-
-        if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
-        if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
-
-        // Accumulate data in the read buffer
-        _ = conn.read_buf.write(tmp_buf[0..n]);
-
-        // Detect protocol on first data if not yet determined
-        if (conn.protocol == .unknown) {
-            conn.detectAndSetProtocol();
-        }
-
-        self.processRequests(fd, conn);
-        // Closing is deferred, so the connection is still ours here.
-        conn.shrinkReadBuffer();
+    /// Run `conn` again at the end of the tick: what it buffered, and
+    /// what its socket still holds.
+    fn queueResume(self: *Shard, fd: i32, conn: *Connection) void {
+        if (conn.resume_queued) return;
+        conn.resume_queued = true;
+        self.resume_fds.appendAssumeCapacity(fd);
     }
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.
@@ -3303,11 +3329,9 @@ pub const Shard = struct {
         self.paused_count -= 1;
         self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch {};
         // What it had already sent runs at the end of the tick, not inside
-        // whoever resumed it.
-        if (conn.read_buf.readable() > 0 and !conn.resume_queued) {
-            conn.resume_queued = true;
-            self.resume_fds.appendAssumeCapacity(fd);
-        }
+        // whoever resumed it; its socket may hold more that announces
+        // nothing, so it is queued even with nothing buffered.
+        self.queueResume(fd, conn);
     }
 
     /// Lift pacing from paused clients that have read nothing for
@@ -3570,6 +3594,9 @@ pub const Shard = struct {
             if (conn.closing or conn.reads_paused or conn.waiting != null) continue;
             ran = true;
             self.processRequests(fd, conn);
+            // Bytes left in the socket while it waited or was paused get no
+            // event of their own on Linux: read them now.
+            self.readFromClient(fd);
         }
         self.resume_running.clearRetainingCapacity();
         // What they proposed goes out at the next tick's pump; that tick
@@ -7942,4 +7969,90 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
     try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
     // Nothing the snapshot covers was offered to the projections again.
     try std.testing.expectEqual(@as(u64, 0), shard.partitions[0].router.stats.entries_skipped);
+}
+
+/// A lone shard answering one client over a socket pair; `client` is the
+/// client's end.
+const ReadTest = struct {
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *ReadTest) !void {
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        const flags = std.c.fcntl(self.pair[0], std.c.F.GETFL, @as(c_int, 0));
+        _ = std.c.fcntl(self.pair[0], std.c.F.SETFL, flags | @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *ReadTest) void {
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+    }
+
+    /// A kv_get as the client sends it.
+    fn sendGet(self: *ReadTest, id: u64) !void {
+        const wire = try Shard.serializeRequest(std.testing.allocator, try ParkTest.request(.kv_get, id, "", "some-key-for-the-test", "", ""));
+        defer std.testing.allocator.free(wire);
+        try std.testing.expectEqual(@as(isize, @intCast(wire.len)), std.c.write(self.pair[1], wire.ptr, wire.len));
+    }
+
+    /// End-of-tick passes until `want` answers arrived, or none came in a pass.
+    fn answers(self: *ReadTest, want: usize) !usize {
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        var got: usize = 0;
+        for (0..64) |_| {
+            self.shard.settleConnections();
+            self.shard.flushToClient(self.conn.fd);
+            while (true) {
+                const n = std.c.recv(self.pair[1], buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+                if (n <= 0) break;
+                total += @intCast(n);
+            }
+            var off: usize = 0;
+            got = 0;
+            while (proto.Response.parse(buf[off..total])) |r| : (got += 1) {
+                off += @sizeOf(proto.ResponseHeader) + r.data.len;
+            } else |_| {}
+            if (got >= want) break;
+        }
+        return got;
+    }
+};
+
+test "Shard: a request read a little per event is still answered, the rest read at the end of the tick" {
+    var t: ReadTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // One read per event, into a buffer smaller than the request: every
+    // read fills its room, so each event stops with more in the socket.
+    t.shard.reads_per_event = 1;
+    t.conn.read_buf.deinit();
+    t.conn.read_buf = try RingBuffer.initWithCapacity(std.testing.allocator, 16);
+
+    try t.sendGet(1);
+    t.shard.readFromClient(t.conn.fd);
+    try std.testing.expect(t.conn.resume_queued);
+    try std.testing.expectEqual(@as(usize, 1), try t.answers(1));
+}
+
+test "Shard: what a client sent while its reads were paused is read when they resume" {
+    var t: ReadTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    t.shard.pauseReads(t.conn.fd, t.conn);
+    try t.sendGet(1);
+    t.shard.readFromClient(t.conn.fd);
+    try std.testing.expectEqual(@as(usize, 0), t.conn.read_buf.readable());
+    t.shard.resumeReads(t.conn.fd, t.conn);
+    try std.testing.expectEqual(@as(usize, 1), try t.answers(1));
 }
