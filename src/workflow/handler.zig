@@ -1664,7 +1664,8 @@ pub const WorkflowHandler = struct {
 
                     // Record timeout deadline if configured
                     if (wait_step.timeout_ms) |timeout_ms| {
-                        run.wait_timeout_at_ms = now_ms + timeout_ms;
+                        // Saturating: a timeout past the clock never fires.
+                        run.wait_timeout_at_ms = now_ms +| timeout_ms;
                         if (wait_step.on_timeout) |target| {
                             if (run.wait_timeout_target_owned) |old| self.allocator.free(old);
                             run.wait_timeout_target_owned = self.allocator.dupe(u8, target) catch null;
@@ -2121,7 +2122,7 @@ pub const WorkflowHandler = struct {
             else
                 @intCast(poll_cfg.calculateDelay(run.poll_attempt - 1));
             run.poll_attempt += 1;
-            run.poll_next_at_ms = now_ms + delay;
+            run.poll_next_at_ms = now_ms +| delay;
             run.status = .waiting;
             self.addHistoryEvent(run, "poll_scheduled", step_label, now_ms);
             return .parked;

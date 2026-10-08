@@ -249,12 +249,20 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
                 log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer seconds", .{ spec.name, window_size_str });
                 return CreateError.MissingConfig;
             };
-            break :blk .{ .tumbling_time = seconds * 1000 }; // Convert seconds → ms
+            const ms = if (seconds > 0) std.math.mul(i64, seconds, 1000) catch null else null;
+            break :blk .{ .tumbling_time = ms orelse {
+                log.err("Native operator '{s}' (type=aggregate) window_size '{s}' — expected a positive number of seconds", .{ spec.name, window_size_str });
+                return CreateError.MissingConfig;
+            } };
         } else if (std.mem.eql(u8, window_type, "count")) {
             const count = std.fmt.parseInt(u64, window_size_str, 10) catch {
                 log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer count", .{ spec.name, window_size_str });
                 return CreateError.MissingConfig;
             };
+            if (count == 0) {
+                log.err("Native operator '{s}' (type=aggregate) window_size 0 — expected a positive count", .{spec.name});
+                return CreateError.MissingConfig;
+            }
             break :blk .{ .tumbling_count = count };
         } else {
             log.err("Native operator '{s}' (type=aggregate) unknown window type '{s}' — expected tumbling|count", .{ spec.name, window_type });

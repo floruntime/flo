@@ -106,6 +106,9 @@ test {
     _ = @import("ts/floql/stages.zig");
     _ = @import("ts/floql/executor.zig");
     _ = @import("ts/floql/series_set.zig");
+    _ = @import("workflow/parser.zig");
+    _ = @import("workflow/definition.zig");
+    _ = @import("workflow/plan_types.zig");
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");

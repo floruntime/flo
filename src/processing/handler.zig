@@ -504,6 +504,12 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
+        if (self.operatorRefusal(&def)) |name| {
+            var buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "operator '{s}' has a missing or invalid setting", .{name}) catch "an operator has a missing or invalid setting";
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, msg);
+            return;
+        }
 
         // Generate a unique job ID with embedded partition bits.
         //
@@ -1096,26 +1102,7 @@ pub const ProcessingHandler = struct {
         };
         tag_registry_ptr.* = definition.TagRegistry{};
         const tag_registry = tag_registry_ptr;
-        for (def.sinks.items) |snk| {
-            if (snk.match) |tag_list| {
-                for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
-            }
-        }
-        for (def.operators.items) |op_spec| {
-            if (std.mem.eql(u8, op_spec.type_name, "classify")) {
-                if (op_spec.config) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.startsWith(u8, entry.key, "tag_")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                        // Also register default_tag so it can be resolved
-                        if (std.mem.eql(u8, entry.key, "default_tag")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                    }
-                }
-            }
-        }
+        fillTagRegistry(tag_registry, def);
 
         // Resolve required_tags bitmask for each sink.
         for (def.sinks.items) |*snk| {
@@ -1135,6 +1122,38 @@ pub const ProcessingHandler = struct {
                 const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, idx }) catch continue;
                 const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
                 self.createPipeline(ms_owned, src, def.sinks.items, def, tag_registry);
+            }
+        }
+    }
+
+    /// The first native operator that can't be built, by name. Building
+    /// happens again when the job applies, where a failure skips the
+    /// operator and the job runs without it; refusing here is what stops that.
+    fn operatorRefusal(self: *ProcessingHandler, def: *const definition.JobDefinition) ?[]const u8 {
+        var tags = definition.TagRegistry{};
+        fillTagRegistry(&tags, def);
+        for (def.operators.items) |*spec| {
+            if (!native_registry.isNativeType(spec.type_name)) continue;
+            const built = native_registry.create(self.allocator, spec, &tags) catch return spec.name;
+            built.deinit(self.allocator);
+        }
+        return null;
+    }
+
+    /// Every tag the job's sinks match on and its classify operators assign.
+    fn fillTagRegistry(tags: *definition.TagRegistry, def: *const definition.JobDefinition) void {
+        for (def.sinks.items) |snk| {
+            if (snk.match) |tag_list| {
+                for (tag_list) |tag| _ = tags.getOrCreate(tag);
+            }
+        }
+        for (def.operators.items) |op_spec| {
+            if (!std.mem.eql(u8, op_spec.type_name, "classify")) continue;
+            const entries = op_spec.config orelse continue;
+            for (entries) |entry| {
+                if (std.mem.startsWith(u8, entry.key, "tag_") or std.mem.eql(u8, entry.key, "default_tag")) {
+                    _ = tags.getOrCreate(entry.value);
+                }
             }
         }
     }

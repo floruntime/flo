@@ -228,7 +228,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidParallelism,
         };
         if (v <= 0) return error.InvalidParallelism;
-        parallelism = @intCast(v);
+        parallelism = std.math.cast(u32, v) orelse return error.InvalidParallelism;
     }
 
     // --- batch_size (top-level integer default for all sources) ---
@@ -239,7 +239,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidFormat,
         };
         if (v <= 0) return error.InvalidFormat;
-        batch_size = @intCast(v);
+        batch_size = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // --- sources (required array) ---
@@ -537,12 +537,12 @@ fn appendTsSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(ts_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     var poll_interval_ms: u32 = 1000;
     if (getInt(ts_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_interval_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_interval_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -614,13 +614,13 @@ fn appendStreamSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(stream_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // Poll interval (default 1000ms) — how often the pipeline reads from the source.
     var poll_ms: u32 = 1000;
     if (getInt(stream_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // `partitions:` as string → range/list/all expansion
@@ -632,7 +632,7 @@ fn appendStreamSource(
     // `partitions:` as integer → single partition; default → all
     var partition: u32 = job_definition.PARTITION_ALL;
     if (getInt(stream_obj, "partitions")) |v| {
-        partition = @intCast(@as(i64, v));
+        partition = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     const name_dup = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -865,7 +865,9 @@ fn appendKvSink(
 
     var ttl: ?u64 = null;
     if (getInt(kv_obj, "ttl_ms")) |v| {
-        if (v > 0) ttl = @intCast(@as(i64, v));
+        // A TTL is applied in nanoseconds; one that can't be is refused here.
+        if (v > std.math.maxInt(u64) / std.time.ns_per_ms) return error.InvalidFormat;
+        if (v > 0) ttl = @intCast(v);
     }
 
     sinks.append(allocator, .{
