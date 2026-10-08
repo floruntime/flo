@@ -8,7 +8,6 @@
 //!   const config = @import("config/mod.zig");
 //!   const ColdStorageConfig = config.ColdStorageConfig;
 
-pub const cold_storage = @import("cold_storage.zig");
 pub const metrics = @import("metrics.zig");
 pub const dashboard = @import("dashboard.zig");
 pub const server = @import("server.zig");
@@ -16,10 +15,6 @@ pub const cluster = @import("cluster.zig");
 pub const tiered_log = @import("tiered_log.zig");
 
 // Re-export commonly used types at top level
-pub const ColdStorageConfig = cold_storage.ColdStorageConfig;
-pub const ColdStorageProvider = cold_storage.ColdStorageProvider;
-pub const FileConfig = cold_storage.FileConfig;
-pub const S3Config = cold_storage.S3Config;
 
 pub const TieredLogConfig = tiered_log.TieredLogConfig;
 

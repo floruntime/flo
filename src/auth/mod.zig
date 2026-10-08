@@ -1,7 +1,7 @@
 //! Auth Module — API keys, session tokens, and key store.
 //!
-//! Not wired into any listener yet: the client port and the dashboard
-//! authenticate no one.
+//! Nothing gives the dashboard a key store yet, so no listener authenticates
+//! anyone.
 
 pub const keys = @import("keys.zig");
 pub const session = @import("session.zig");

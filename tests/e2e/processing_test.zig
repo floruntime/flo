@@ -893,10 +893,9 @@ test "e2e/processing: a savepoint on a running job is accepted" {
     // Wait for data to flow through
     _ = try readStreamBlocking(ctx, "ckpt-output", "proc_ckpt", "checkpoint-test-data", "5000");
 
-    // Take a savepoint — this triggers a checkpoint that persists to KV
     var sp_result = try ctx.cli.run(&.{ "processing", "savepoint", job_id, "-n", "proc_ckpt" });
     defer sp_result.deinit();
-    try stdx.testing.assertSucceeded(sp_result);
+    try std.testing.expect(sp_result.stdoutContains("Savepoint created"));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_ckpt" });
 }

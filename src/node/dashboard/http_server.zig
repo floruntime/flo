@@ -11,7 +11,7 @@
 //! - GET /api/v1/*       - REST API for dashboard data
 //! - GET /api/v1/kv/keys/:key/watch?namespace=:ns — SSE live updates (stub)
 //! - GET /api/v1/workflow/runs/:run_id/watch?namespace=:ns — SSE workflow run updates (stub)
-//! - GET /*              - Embedded static files (requires auth)
+//! - GET /*              - Embedded static files
 //!
 //! The dashboard assets are embedded at compile time from web/dist/
 

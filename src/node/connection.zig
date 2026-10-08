@@ -503,7 +503,6 @@ test "Connection: protocol detection — binary (Flo magic)" {
 test "Connection: protocol detection — a Redis command is read as binary, which refuses it" {
     const data = "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n";
     try std.testing.expectEqual(Protocol.binary, detectProtocol(data));
-    try std.testing.expectEqual(Protocol.binary, detectProtocol(data));
 }
 
 test "Connection: protocol detection — HTTP GET" {

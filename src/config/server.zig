@@ -27,13 +27,6 @@ pub const Durability = enum(u8) {
     }
 };
 
-// Import from central config module - single source of truth
-const cold_storage_config = @import("cold_storage.zig");
-pub const ColdStorageProvider = cold_storage_config.ColdStorageProvider;
-pub const ColdStorageConfig = cold_storage_config.ColdStorageConfig;
-pub const FileConfig = cold_storage_config.FileConfig;
-pub const S3Config = cold_storage_config.S3Config;
-
 const metrics_config = @import("metrics.zig");
 pub const MetricsConfig = metrics_config.MetricsConfig;
 
@@ -127,7 +120,6 @@ pub const ServerConfig = struct {
 
     /// Convert to RuntimeConfig for use with Runtime.init()
     pub fn toRuntimeConfig(self: *const ServerConfig) RuntimeConfig {
-        // Now both use the same ColdStorageConfig from central config module
         return RuntimeConfig{
             .num_shards = self.shards,
             .partition_count = self.partition_count,
@@ -164,7 +156,7 @@ const Kind = enum { string, integer, boolean, string_or_array };
 const Key = struct {
     name: []const u8,
     kind: Kind,
-    /// Integer bounds, from the field the value is stored in.
+    /// Integer bounds checked before load reads the value.
     min: i64 = 0,
     max: i64 = std.math.maxInt(i64),
 };
@@ -277,7 +269,7 @@ fn checkSchema(root: *const toml.Table) error{ UnknownSetting, InvalidSetting }!
             return error.UnknownSetting;
         }
         const sec = findSection(name) orelse {
-            log.err("[{s}] is not a section; the sections are server, storage, logging, metrics, dashboard and cluster. Remove it.", .{name});
+            log.err("[{s}] is not a section; the sections are {s}. Remove it.", .{ name, sectionList() });
             return error.UnknownSetting;
         };
         try checkSection(sec, &e.value_ptr.table);
@@ -300,7 +292,13 @@ fn checkSection(sec: *const Section, table: *const toml.Table) error{ UnknownSet
             return error.UnknownSetting;
         };
         const got = kindOf(e.value_ptr.*);
-        const fits = got == key.kind or (key.kind == .string_or_array and got == .string);
+        var fits = got == key.kind or (key.kind == .string_or_array and got == .string);
+        // A list must hold strings only: anything else would be skipped.
+        if (fits and e.value_ptr.* == .array) {
+            for (e.value_ptr.array) |item| {
+                if (item != .string) fits = false;
+            }
+        }
         if (!fits) {
             log.err("[{s}] {s} must be {s}", .{ sec.name, key.name, kindName(key.kind) });
             return error.InvalidSetting;
@@ -313,6 +311,19 @@ fn checkSection(sec: *const Section, table: *const toml.Table) error{ UnknownSet
             }
         }
     }
+}
+
+/// The sections' names as "a, b and c", for messages.
+fn sectionList() []const u8 {
+    const S = struct {
+        threadlocal var buf: [256]u8 = undefined;
+    };
+    var w: std.Io.Writer = .fixed(&S.buf);
+    for (sections, 0..) |sec, i| {
+        const sep = if (i == 0) "" else if (i + 1 == sections.len) " and " else ", ";
+        w.print("{s}{s}", .{ sep, sec.name }) catch break;
+    }
+    return w.buffered();
 }
 
 /// "a, b and c", for messages. Sections are short enough for a fixed buffer.
@@ -465,7 +476,7 @@ pub fn loadWithOverrides(
         load(allocator, path) catch |err| {
             // A file named on the command line is meant to be read; starting
             // on defaults instead would hide the typo.
-            if (err == error.FileNotFound) log.err("config file {s} not found", .{path});
+            if (err == error.FileNotFound) log.err("config file {s} not found; check the path, or omit --config to use ./flo.toml or the defaults", .{path});
             return err;
         }
     else blk: {
@@ -760,6 +771,7 @@ test "config: what flo.toml can't hold is refused, not ignored" {
         .{ .body = "[logging]\nlevel = \"loud\"\n", .err = error.InvalidSetting },
         .{ .body = "[logging]\nformat = \"xml\"\n", .err = error.InvalidSetting },
         .{ .body = "[dashboard]\nenabled = \"yes\"\n", .err = error.InvalidSetting },
+        .{ .body = "[cluster]\nseeds = [9500]\n", .err = error.InvalidSetting },
     }) |c| {
         const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
         try @import("stdx").fs.writeAll(f, c.body);
@@ -769,7 +781,12 @@ test "config: what flo.toml can't hold is refused, not ignored" {
             return e;
         };
     }
+    // A valid file, so the refusal is the flag's.
+    const ok = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(ok, "[server]\nport = 9000\n");
+    @import("stdx").fs.closeFile(ok);
     try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, "loud", null, null));
+    try std.testing.expectError(error.InvalidSetting, loadWithOverrides(allocator, path, null, null, null, null, null, "xml", null));
 }
 
 test "config: the file config init writes loads, and a named file that is missing is refused" {
