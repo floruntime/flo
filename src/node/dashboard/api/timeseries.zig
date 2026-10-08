@@ -6,6 +6,7 @@
 //! - POST /timeseries/floql                 — Execute FloQL query
 
 const std = @import("std");
+const time_units = @import("../../../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
@@ -237,7 +238,7 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     try obj.stringField("measurement", measurement);
     try obj.stringField("field", field);
     try obj.stringField("aggregation", aggregation);
-    try obj.intField("window_ms", @as(i64, @intCast(window)));
+    try obj.intField("window_ms", @as(i64, @intCast(@min(window, std.math.maxInt(i64)))));
 
     const from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
     const to_val: i64 = if (to_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
@@ -250,8 +251,8 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         try series_arr.begin();
 
         // Convert ms → ns for projection query
-        const from_ns: u64 = if (from_val > 0) @intCast(from_val * std.time.ns_per_ms) else 0;
-        const to_ns: u64 = if (to_val > 0) @intCast(to_val * std.time.ns_per_ms) else std.math.maxInt(u64);
+        const from_ns: u64 = if (from_val > 0) time_units.msToNsSat(@intCast(from_val)) else 0;
+        const to_ns: u64 = if (to_val > 0) time_units.msToNsSat(@intCast(to_val)) else std.math.maxInt(u64);
 
         const StoredPoint = @import("../../../projection/ts.zig").StoredPoint;
         const n = shardCount(ctx);
@@ -320,11 +321,11 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     var to_ns: u64 = std.math.maxInt(u64);
     if (query.source.range.duration_ms > 0) {
         const from_ms = now_ms - query.source.range.duration_ms;
-        from_ns = if (from_ms > 0) @intCast(from_ms * std.time.ns_per_ms) else 0;
-        to_ns = @intCast(now_ms * std.time.ns_per_ms);
+        from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0;
+        to_ns = time_units.msToNsSat(@intCast(now_ms));
     } else if (query.source.range.from_ms > 0) {
-        from_ns = @intCast(query.source.range.from_ms * std.time.ns_per_ms);
-        if (query.source.range.to_ms > 0) to_ns = @intCast(query.source.range.to_ms * std.time.ns_per_ms);
+        from_ns = time_units.msToNsSat(@intCast(query.source.range.from_ms));
+        if (query.source.range.to_ms > 0) to_ns = time_units.msToNsSat(@intCast(query.source.range.to_ms));
     }
 
     // 3. Field — from a `field()` stage when present, else the default.

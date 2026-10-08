@@ -45,6 +45,7 @@ test {
     _ = @import("node/manifest.zig");
     _ = @import("node/shard_manifest.zig");
     _ = @import("storage/persistence.zig");
+    _ = @import("util/time_units.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");
@@ -102,6 +103,11 @@ test {
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
     _ = @import("ts/handler.zig");
+    _ = @import("ts/floql/ast.zig");
+    _ = @import("ts/floql/parser.zig");
+    _ = @import("ts/floql/stages.zig");
+    _ = @import("ts/floql/executor.zig");
+    _ = @import("ts/floql/series_set.zig");
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");

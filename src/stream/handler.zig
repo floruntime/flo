@@ -649,7 +649,9 @@ pub const StreamHandler = struct {
                 if (opt.asU64()) |age_s| {
                     if (age_s > 0) {
                         const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-                        const cutoff_ms = if (now_ms > age_s * 1000) now_ms - age_s * 1000 else 0;
+                        // Saturates: an age older than the clock trims nothing.
+                        const age_ms = age_s *| 1000;
+                        const cutoff_ms = if (now_ms > age_ms) now_ms - age_ms else 0;
                         if (cutoff_ms == 0) return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
                         trim_id = StreamID.fromTimestamp(cutoff_ms);
                     }

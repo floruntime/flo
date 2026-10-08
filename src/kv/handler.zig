@@ -27,6 +27,7 @@
 //! are system-owned and blocked from user operations.
 
 const std = @import("std");
+const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -284,7 +285,10 @@ pub const KVHandler = struct {
         if (req.getTtlSeconds()) |ttl_secs| {
             if (ttl_secs > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                put_expiry_ns = now_ns + ttl_secs * 1_000_000_000;
+                put_expiry_ns = time_units.expiryNs(now_ns, ttl_secs) orelse {
+                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+                    return;
+                };
             }
         }
 
@@ -315,6 +319,7 @@ pub const KVHandler = struct {
     }
 
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
+        if (err == error.TtlTooLarge) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
         shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
     }
 
@@ -496,7 +501,10 @@ pub const KVHandler = struct {
             }
             if (ttl_seconds > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                expiry_ns = now_ns + ttl_seconds * 1_000_000_000;
+                expiry_ns = time_units.expiryNs(now_ns, ttl_seconds) orelse {
+                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+                    return;
+                };
             }
         }
 
@@ -967,7 +975,8 @@ pub const KVHandler = struct {
             if (req.getTtlSeconds()) |ttl_secs| {
                 if (ttl_secs > 0) {
                     flags |= entry_mod.Flags.HAS_TTL;
-                    const expiry_ns = timestamp_ns + ttl_secs * 1_000_000_000;
+                    // JSON set/delete reach here without dispatchPut's check.
+                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_secs) orelse return error.TtlTooLarge;
                     std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
                     payload_len += 8;
                 }
@@ -1323,7 +1332,8 @@ pub const KVHandler = struct {
         const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
             if (ttl_secs == 0) break :blk 0;
-            break :blk timestamp + ttl_secs * 1_000_000_000;
+            break :blk time_units.expiryNs(timestamp, ttl_secs) orelse
+                return .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } };
         } else 0;
 
         self.kv.put(qkey, req.value, lsn, 0, timestamp, expiry_ns) catch {
@@ -2223,4 +2233,20 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
     const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 0).items;
     try testing.expectEqual(@as(usize, 1), b_keys.len);
     try testing.expectEqualStrings("k", b_keys[0]);
+}
+
+test "kv handler: a TTL too large to represent is refused" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    var obuf: [32]u8 = undefined;
+    var b = proto.OptionsBuilder.init(&obuf);
+    try b.addU64(.ttl_seconds, std.math.maxInt(u64));
+    switch (handler.handleCommand(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("ttl too large", e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(kv.get("k") == null);
 }
