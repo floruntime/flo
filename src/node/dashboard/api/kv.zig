@@ -170,7 +170,7 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 
     // Namespace-qualify the key for projection lookup
     var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch key;
+    const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch return error.NotFound;
 
     // Search across shard projections for the key
     var found = false;
@@ -227,7 +227,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
         if (getKVProjection(ctx, i)) |kv| {
             // Namespace-qualify the key for projection lookup
             var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-            const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch key;
+            const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch return error.NotFound;
             var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
             const hist_n = kv.getHistory(qkey, &hist_buf);
             if (hist_n > 0) {

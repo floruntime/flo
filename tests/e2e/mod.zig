@@ -7,6 +7,7 @@ const std = @import("std");
 
 // Feature tests
 pub const kv_test = @import("kv_test.zig");
+pub const kv_key_nul_test = @import("kv_key_nul_test.zig");
 pub const http_test = @import("http_test.zig");
 pub const cluster_test = @import("cluster_test.zig");
 pub const cluster_peering_test = @import("cluster_peering_test.zig");
