@@ -128,7 +128,7 @@ pub fn failureStatus(err: anyerror) proto.StatusCode {
 /// The same, for handlers that answer with a `CommandResult`.
 pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
-        error.NotLeader => .unavailable,
+        error.NotLeader, error.WritesStopped => .unavailable,
         error.Overloaded => .overloaded,
         error.PayloadTooLarge => .invalid_request,
         else => .internal_error,
@@ -144,6 +144,7 @@ pub const ANSWER_LOST = "internal error: write committed but its answer was lost
 pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
     return switch (err) {
         error.NotLeader => "unavailable: electing a leader — retry",
+        error.WritesStopped => "unavailable: this shard stopped taking writes — a write left memory before it reached disk; retry once the node restarts",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
         else => fallback,
@@ -158,5 +159,6 @@ test "persistence: a write too large to encode is the request's fault, not a ret
     try std.testing.expectEqualStrings("bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB", failureMessage(error.PayloadTooLarge, "x"));
     // The Raft outcomes are retryable; anything else is the server's.
     try std.testing.expectEqual(proto.StatusCode.unavailable, failureStatus(error.NotLeader));
+    try std.testing.expectEqual(proto.StatusCode.unavailable, failureStatus(error.WritesStopped));
     try std.testing.expectEqual(result_mod.CommandResult.ErrorCode.internal_error, failureCode(error.IndexGap));
 }

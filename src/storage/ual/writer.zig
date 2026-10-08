@@ -45,10 +45,14 @@ pub const SegmentWriter = struct {
     /// one is an entry that would be missing from disk after a restart, so
     /// it is counted and logged rather than dropped silently.
     buffer_failures: u64,
-    /// The first index that could not be buffered. Nothing after it is
-    /// buffered either, so a flush never writes past a gap; the owner
-    /// re-buffers from here before flushing.
+    /// The first index that could not be buffered, when `stop_at_gap`.
+    /// Nothing after it is buffered either, so a flush never writes past a
+    /// gap; the owner re-buffers from here before flushing.
     first_unbuffered: ?u64 = null,
+    /// Set when a write is acked only once on disk: a hole in a flush would
+    /// break that promise. Otherwise an entry that can't be buffered is a
+    /// counted hole and buffering goes on.
+    stop_at_gap: bool = false,
 
     allocator: std.mem.Allocator,
 

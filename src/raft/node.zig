@@ -206,6 +206,9 @@ pub const RaftNode = struct {
     /// The highest index this node has on disk, as its owner reports it.
     /// Read only when `config.self_counts_when_durable`.
     durable_index: u64,
+    /// Set by the owner when an entry it owed the disk is gone: nothing
+    /// after it can be made durable, so proposals are refused.
+    writes_stopped: bool = false,
     last_applied: u64,
 
     // ── Election timer ─────────────────────────────────────────────────
@@ -870,6 +873,7 @@ pub const RaftNode = struct {
     /// Flags and timestamp are written into the entry header (e.g. HAS_TTL, TOMBSTONE).
     pub fn propose(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
+        if (self.writes_stopped) return error.WritesStopped;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
         if (self.peer_count > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
@@ -886,8 +890,8 @@ pub const RaftNode = struct {
         const idx = try self.log.append(&e);
         self.noteAppended(&e);
 
-        // In single-node mode, commit immediately: the node is the
-        // majority, once its copy counts.
+        // Alone, the node is the majority: its copy commits the entry, at
+        // once unless it must be on disk first.
         if (self.peer_count == 0) {
             self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         }

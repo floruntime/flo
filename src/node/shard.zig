@@ -705,6 +705,7 @@ pub const Shard = struct {
         // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
+        seg_writer.stop_at_gap = durability == .sync;
         if (durable_log) |dl| {
             raft_node.log.catch_up = .{ .ctx = @ptrCast(dl), .read_range = catchUpReadRange };
             raft_node.log.on_truncate_ctx = @ptrCast(dl);
@@ -854,15 +855,26 @@ pub const Shard = struct {
     }
 
     /// Buffer again what the append hook could not, from the log, so the
-    /// flush writes a run without a gap. The log holds every entry above
-    /// the last flush; one it can't produce is named, and the flush fails.
+    /// flush writes a run without a gap. The log evicts by size, so the
+    /// entry may be gone; then nothing after it can reach disk, and the
+    /// shard takes no more writes until a restart.
     fn rebufferGap(self: *Shard, writer: *SegmentWriter) !void {
-        const from = writer.first_unbuffered orelse return;
         const raft = self.raft_node;
+        const from = writer.first_unbuffered orelse {
+            // A truncation cut the missing entry away: nothing is owed.
+            if (raft.writes_stopped) {
+                raft.writes_stopped = false;
+                log.info("shard {d}: the entry that never reached disk was cut from the log; taking writes again", .{self.id});
+            }
+            return;
+        };
         var idx = from;
         while (idx <= raft.log.lastIndex()) : (idx += 1) {
             const e = raft.log.getEntryCopy(idx, self.apply_buf) orelse {
-                log.err("shard {d}: entry index={d} is neither buffered for disk nor readable from the log; nothing after it can be flushed", .{ self.id, idx });
+                if (!raft.writes_stopped) {
+                    raft.writes_stopped = true;
+                    log.err("shard {d}: entry index={d} left memory before it reached disk, so nothing after it can be flushed; this shard takes no more writes until it restarts", .{ self.id, idx });
+                }
                 return error.EntryUnavailable;
             };
             writer.addEntry(&e) catch |err| {
@@ -881,8 +893,10 @@ pub const Shard = struct {
     pub fn applyDeferredTail(self: *Shard) void {
         const raft = self.raft_node;
         const pending = raft.commit_index -| raft.last_applied;
-        // A bootstrapped shard's noop is always one of them.
-        if (pending > 1) {
+        // Bootstrapping commits the term's noop with the tail, unless
+        // commits wait for the disk: then it isn't committed yet.
+        const noop: u64 = if (self.durability == .sync) 0 else 1;
+        if (pending > noop) {
             log.info("shard {d}: applying {d} durable entries above the commit watermark (indices {d}..{d})", .{ self.id, pending, raft.last_applied + 1, raft.commit_index });
         }
         if (!self.applyCommitted()) {
@@ -905,7 +919,9 @@ pub const Shard = struct {
             }
             // Alone, nothing else can make these writes durable: tell their
             // clients now rather than leave them waiting on the disk.
-            if (raft.role == .leader and raft.peer_count == 0) self.failPendingAbove(raft.durable_index, NOT_ON_DISK);
+            if (raft.role == .leader and raft.peer_count == 0) {
+                self.failPendingAbove(raft.durable_index, if (raft.writes_stopped) LOST_AT_RESTART else NOT_ON_DISK);
+            }
             return;
         };
         raft.markDurable(through);
@@ -914,6 +930,10 @@ pub const Shard = struct {
     /// What a client is told when its write is in the log but its flush
     /// failed: it may still commit once the disk recovers.
     pub const NOT_ON_DISK = "unavailable: write not on disk (flush failed); it may still apply once the disk recovers — check before resending";
+
+    /// The same, once the shard has stopped taking writes: nothing more
+    /// reaches disk, so the write is gone when the node restarts.
+    pub const LOST_AT_RESTART = "unavailable: write not on disk, and this shard stopped taking writes; it is lost when the node restarts — resend after the restart";
 
     fn failPendingAbove(self: *Shard, index: u64, message: []const u8) void {
         if (self.pending_count == 0) return;
@@ -2508,7 +2528,7 @@ pub const Shard = struct {
                 self.broadcastVote(req);
                 if (raft.role == .leader) {
                     log.info("shard {d}: elected leader for term {d} as the only member", .{ self.id, raft.current_term });
-                    // Alone, the win committed the whole log.
+                    // Alone, the win commits the whole log.
                     if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                 }
             }
@@ -4447,11 +4467,15 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
     // Behind a gap nothing is buffered: the flush re-buffers from the gap.
-    if (writer.first_unbuffered != null) return;
+    if (writer.stop_at_gap and writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
         writer.buffer_failures += 1;
-        writer.first_unbuffered = entry.header.index;
-        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        if (writer.stop_at_gap) {
+            writer.first_unbuffered = entry.header.index;
+            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        } else {
+            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        }
     };
 }
 
@@ -8195,4 +8219,95 @@ test "Shard: an entry the writer could not buffer is buffered again from the log
     var got: [4]entry_mod.Entry = undefined;
     var arena: [256]u8 = undefined;
     try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena) == 1);
+}
+
+test "Shard: with sync durability, entries after one the writer could not buffer reach disk once each, in order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+
+    // An empty buffer with no room: buffering the next entry allocates,
+    // and that allocation fails. The one after it is appended before any
+    // flush, as a follower appends a batch.
+    const writer = s.shard.durable_log.?.writer;
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_count);
+    writer.data.clearAndFree(writer.allocator);
+    writer.sparse_index.clearAndFree(writer.allocator);
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    const first = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    writer.allocator = real;
+    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+
+    s.shard.syncFlushIfNeeded();
+    try std.testing.expectEqual(first.index + 1, s.shard.raft_node.durable_index);
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena));
+    try std.testing.expectEqual(first.index, got[0].header.index);
+    try std.testing.expectEqual(first.index + 1, got[1].header.index);
+}
+
+test "Shard: with sync durability, an entry that left memory before reaching disk stops the shard's writes, by name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k1", &buf)).getStatus());
+
+    // The hook could not buffer k2, and the ring evicted it before the
+    // flush: it is nowhere.
+    const writer = s.shard.durable_log.?.writer;
+    writer.first_unbuffered = s.shard.raft_node.log.lastIndex() + 1;
+    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+
+    const lost = try s.put(3, "k3", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, lost.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, lost.data, "lost when the node restarts") != null);
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+
+    // The next write is refused before it reaches the log.
+    const last = s.shard.raft_node.log.lastIndex();
+    const refused = try s.put(4, "k4", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
+    try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+}
+
+test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try shard.flushSegmentToDisk();
+
+    const writer = shard.durable_log.?.writer;
+    writer.data.clearAndFree(writer.allocator);
+    writer.sparse_index.clearAndFree(writer.allocator);
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    writer.allocator = real;
+    const second = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
+    try std.testing.expectEqual(second.index, writer.first_index);
+    try shard.flushSegmentToDisk();
 }
