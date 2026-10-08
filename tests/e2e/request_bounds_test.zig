@@ -64,25 +64,24 @@ test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and
     var point: [8]u8 = undefined;
     std.mem.writeInt(u64, &point, @bitCast(@as(f64, 1.5)), .little);
 
-    // A group name that is a group-create's whole value: an empty
-    // length-prefixed name falls back to the raw value.
-    const group = try testing.allocator.alloc(u8, 65542);
+    // A group-create's value is the length-prefixed group name; one this
+    // long is refused before it is proposed.
+    const group = try testing.allocator.alloc(u8, 2 + 5000);
     defer testing.allocator.free(group);
-    @memset(group, 'g');
-    group[0] = 0;
-    group[1] = 0;
+    std.mem.writeInt(u16, group[0..2], 5000, .little);
+    @memset(group[2..], 'g');
 
     var out: [4096]u8 = undefined;
-    for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8 }{
-        .{ .op = .stream_group_create, .key = "s", .value = group },
-        .{ .op = .stream_append, .key = key, .value = "x" },
+    for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8, why: []const u8 = "key or name too long" }{
+        .{ .op = .stream_group_create, .key = "s", .value = group, .why = "stream + group name too long" },
+        .{ .op = .stream_append, .key = key, .value = "x", .why = "stream name too long" },
         .{ .op = .ts_write, .key = key, .value = &point },
     }) |c| {
         const frame = try request(c.op, "", c.key, c.value);
         defer testing.allocator.free(frame);
         const r = try send(ctx, frame, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
-        try testing.expect(std.mem.indexOf(u8, r.data, "key or name too long") != null);
+        try testing.expect(std.mem.indexOf(u8, r.data, c.why) != null);
     }
     try testing.expect(try kvAlive(ctx));
     try ctx.restartServer();
