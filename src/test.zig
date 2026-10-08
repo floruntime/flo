@@ -27,6 +27,7 @@ test {
 // Node layer
 test {
     _ = @import("node/reactor.zig");
+    _ = @import("node/runtime.zig");
     _ = @import("node/inbox.zig");
     _ = @import("node/mailbox.zig");
     _ = @import("node/reply_to.zig");
