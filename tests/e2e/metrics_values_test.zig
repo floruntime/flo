@@ -130,8 +130,8 @@ test "e2e/metrics: workflow lifecycle counters carry real values" {
         \\name: metrics-wf
         \\version: 1.0.0
         \\start.run: @actions/echo
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, workflow_def, "metrics-wf.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
