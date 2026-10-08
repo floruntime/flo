@@ -623,7 +623,7 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: missing path_len" } });
             return;
         }
-        const path_len = std.mem.readInt(u16, req.value[0..2], .little);
+        const path_len: usize = std.mem.readInt(u16, req.value[0..2], .little);
         if (req.value.len < 2 + path_len) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: truncated path" } });
             return;

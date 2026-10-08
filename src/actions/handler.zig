@@ -312,7 +312,7 @@ pub const ActionsHandler = struct {
     /// Used to get the action_name from action_complete/fail value wire format.
     fn parseLeadingName(value: []const u8) ?[]const u8 {
         if (value.len < 2) return null;
-        const name_len = std.mem.readInt(u16, value[0..2], .little);
+        const name_len: usize = std.mem.readInt(u16, value[0..2], .little);
         if (2 + name_len > value.len) return null;
         return value[2 .. 2 + name_len];
     }
@@ -531,7 +531,7 @@ pub const ActionsHandler = struct {
         if (value.len >= 5) m.timeout_ms = std.mem.readInt(u32, value[1..5], .little);
         if (value.len >= 9) m.max_retries = std.mem.readInt(u32, value[5..9], .little);
         if (value.len >= 11) {
-            const owner_len = std.mem.readInt(u16, value[9..11], .little);
+            const owner_len: usize = std.mem.readInt(u16, value[9..11], .little);
             if (value.len >= 11 + @as(usize, owner_len)) m.owner = value[11 .. 11 + owner_len];
         }
         return m;
@@ -905,12 +905,12 @@ pub const ActionsHandler = struct {
 
         // Parse action_name (skip it — we use task_id to find the run)
         if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
-        const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const aname_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
         if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
-        const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const tid_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
         if (offset + tid_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const task_id = value[offset .. offset + tid_len];
@@ -918,7 +918,7 @@ pub const ActionsHandler = struct {
 
         // Parse outcome
         if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
-        const outcome_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const outcome_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
         if (offset + outcome_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const outcome_str = value[offset .. offset + outcome_len];
@@ -927,7 +927,7 @@ pub const ActionsHandler = struct {
         // Parse result
         var result_data: []const u8 = "";
         if (offset + 2 <= value.len) {
-            const rlen = std.mem.readInt(u16, value[offset..][0..2], .little);
+            const rlen: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
             offset += 2;
             if (offset + rlen <= value.len) {
                 result_data = value[offset .. offset + rlen];
@@ -960,12 +960,12 @@ pub const ActionsHandler = struct {
 
         // Parse action_name (skip)
         if (offset + 2 > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
-        const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const aname_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
         if (offset + 2 > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
-        const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const tid_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
         if (offset + tid_len > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
         const task_id = value[offset .. offset + tid_len];
@@ -993,12 +993,12 @@ pub const ActionsHandler = struct {
 
         // Parse action_name (skip)
         if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
-        const aname_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const aname_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + aname_len;
 
         // Parse task_id
         if (offset + 2 > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
-        const tid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const tid_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
         if (offset + tid_len > value.len) return .{ .refused = .{ .status = .bad_request, .message = "invalid value format" } };
         const task_id = value[offset .. offset + tid_len];
@@ -1153,7 +1153,7 @@ pub const ActionsHandler = struct {
     /// the owning thread; the run exists once the invoke applies.
     pub fn startRunFromInbox(_: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
         if (bytes.len < 2) return;
-        const rid_len = std.mem.readInt(u16, bytes[0..2], .little);
+        const rid_len: usize = std.mem.readInt(u16, bytes[0..2], .little);
         if (2 + rid_len > bytes.len) return;
         const run_id = bytes[2 .. 2 + rid_len];
         const value = bytes[2 + rid_len ..];
@@ -1413,7 +1413,7 @@ pub const ActionsHandler = struct {
 
         // action_name
         if (off + 2 > value.len) return;
-        const aname_len = std.mem.readInt(u16, value[off..][0..2], .little);
+        const aname_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
         if (off + aname_len > value.len) return;
         const action_name = value[off .. off + aname_len];
@@ -1421,7 +1421,7 @@ pub const ActionsHandler = struct {
 
         // status
         if (off >= value.len) return;
-        const status: ActionRunStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return;
         off += 1;
 
         // created_at_ms
@@ -1431,7 +1431,7 @@ pub const ActionsHandler = struct {
 
         // input
         if (off + 4 > value.len) return;
-        const input_len = std.mem.readInt(u32, value[off..][0..4], .little);
+        const input_len: usize = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
         var input: ?[]const u8 = null;
         if (input_len > 0) {
@@ -1442,7 +1442,7 @@ pub const ActionsHandler = struct {
 
         // labels
         if (off + 4 > value.len) return;
-        const labels_len = std.mem.readInt(u32, value[off..][0..4], .little);
+        const labels_len: usize = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
         var labels: ?[]const u8 = null;
         if (labels_len > 0) {
@@ -1456,7 +1456,7 @@ pub const ActionsHandler = struct {
         var caller_run_id: ?[]const u8 = null;
         var caller_workflow_name: ?[]const u8 = null;
         if (off + 2 <= value.len) {
-            const crid_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            const crid_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
             if (crid_len > 0 and off + crid_len <= value.len) {
                 caller_run_id = self.allocator.dupe(u8, value[off .. off + crid_len]) catch null;
@@ -1464,7 +1464,7 @@ pub const ActionsHandler = struct {
             off += crid_len;
         }
         if (off + 2 <= value.len) {
-            const cwn_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            const cwn_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
             if (cwn_len > 0 and off + cwn_len <= value.len) {
                 caller_workflow_name = self.allocator.dupe(u8, value[off .. off + cwn_len]) catch null;
@@ -1556,7 +1556,7 @@ pub const ActionsHandler = struct {
 
         // status
         if (off >= value.len) return;
-        const status: ActionRunStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return;
         off += 1;
 
         // started_at_ms
@@ -1583,7 +1583,7 @@ pub const ActionsHandler = struct {
 
         // result data
         if (off + 4 > value.len) return;
-        const rlen = std.mem.readInt(u32, value[off..][0..4], .little);
+        const rlen: usize = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
         var result_data: ?[]const u8 = null;
         if (rlen > 0 and off + rlen <= value.len) {
@@ -1594,7 +1594,7 @@ pub const ActionsHandler = struct {
         // worker_id
         var worker_id_data: ?[]const u8 = null;
         if (off + 2 <= value.len) {
-            const wid_len = std.mem.readInt(u16, value[off..][0..2], .little);
+            const wid_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
             if (wid_len > 0 and off + wid_len <= value.len) {
                 worker_id_data = self.allocator.dupe(u8, value[off .. off + wid_len]) catch null;
@@ -1606,7 +1606,7 @@ pub const ActionsHandler = struct {
         var outcome_data: ?[]const u8 = null;
         var error_data: ?[]const u8 = null;
         if (off + 2 <= value.len) {
-            const olen = std.mem.readInt(u16, value[off..][0..2], .little);
+            const olen: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
             if (olen > 0 and off + olen <= value.len) {
                 outcome_data = self.allocator.dupe(u8, value[off .. off + olen]) catch null;
@@ -1614,7 +1614,7 @@ pub const ActionsHandler = struct {
             off += olen;
         }
         if (off + 2 <= value.len) {
-            const elen = std.mem.readInt(u16, value[off..][0..2], .little);
+            const elen: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
             if (elen > 0 and off + elen <= value.len) {
                 error_data = self.allocator.dupe(u8, value[off .. off + elen]) catch null;
@@ -1794,7 +1794,7 @@ fn extractFirstTaskType(value: []const u8) ?[]const u8 {
     if (value.len < 6) return null; // need at least count(4) + len(2)
     const count = std.mem.readInt(u32, value[0..4], .little);
     if (count == 0) return null;
-    const type_len = std.mem.readInt(u16, value[4..6], .little);
+    const type_len: usize = std.mem.readInt(u16, value[4..6], .little);
     if (value.len < 6 + type_len) return null;
     const name = value[6 .. 6 + type_len];
     if (name.len == 0) return null;
@@ -1814,17 +1814,20 @@ const TaskTypeIterator = struct {
         return .{ .data = value, .offset = 4, .remaining = count };
     }
 
+    /// The next non-empty type name. A loop, not recursion: a request can
+    /// carry tens of thousands of empty names.
     fn next(self: *TaskTypeIterator) ?[]const u8 {
-        if (self.remaining == 0) return null;
-        if (self.offset + 2 > self.data.len) return null;
-        const type_len = std.mem.readInt(u16, self.data[self.offset..][0..2], .little);
-        self.offset += 2;
-        if (self.offset + type_len > self.data.len) return null;
-        const name = self.data[self.offset .. self.offset + type_len];
-        self.offset += type_len;
-        self.remaining -= 1;
-        if (name.len == 0) return self.next();
-        return name;
+        while (self.remaining > 0) {
+            if (self.offset + 2 > self.data.len) return null;
+            const type_len: usize = std.mem.readInt(u16, self.data[self.offset..][0..2], .little);
+            self.offset += 2;
+            if (self.offset + type_len > self.data.len) return null;
+            const name = self.data[self.offset .. self.offset + type_len];
+            self.offset += type_len;
+            self.remaining -= 1;
+            if (name.len > 0) return name;
+        }
+        return null;
     }
 };
 
@@ -1850,7 +1853,7 @@ fn parseInvokeValue(value: []const u8) struct { labels: ?[]const u8, input: []co
     offset += 1;
     if (has_idem == 1) {
         if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
-        const idem_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const idem_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2 + idem_len;
     }
     if (offset >= value.len) return .{ .labels = null, .input = "" };
@@ -1861,7 +1864,7 @@ fn parseInvokeValue(value: []const u8) struct { labels: ?[]const u8, input: []co
     offset += 1;
     if (has_labels == 1) {
         if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
-        const labels_len = std.mem.readInt(u16, value[offset..][0..2], .little);
+        const labels_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
         offset += 2;
         if (offset + labels_len <= value.len) {
             labels = value[offset .. offset + labels_len];

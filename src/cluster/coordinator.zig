@@ -215,7 +215,7 @@ pub const NamespaceConfig = struct {
 
         for (0..count) |_| {
             if (pos >= data.len) break;
-            const tag: SettingsTag = @enumFromInt(data[pos]);
+            const tag = std.enums.fromInt(SettingsTag, data[pos]) orelse break;
             pos += 1;
             switch (tag) {
                 .kv_max_hot_versions => {

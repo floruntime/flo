@@ -732,6 +732,8 @@ pub const NamespaceHandler = struct {
         if (name.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
         }
+        // The answer is built in a fixed buffer sized for a valid name.
+        if (nameRefusal(name)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
 
         const exists = self.namespaces.contains(name);
 
