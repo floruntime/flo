@@ -535,6 +535,7 @@ pub const Runtime = struct {
         }
         var raft_config = RaftNodeConfig.fromFailover(self.config.cluster_failover_timeout_ms);
         raft_config.durable_commits = self.config.durability == .sync;
+        raft_config.self_counts_when_durable = self.config.durability == .sync;
 
         // 2. Create shards
         const shards = try self.allocator.alloc(Shard, self.shard_count);
