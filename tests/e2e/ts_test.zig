@@ -1556,3 +1556,23 @@ test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsampl
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.?.header.status);
     try testing.expect(std.mem.indexOf(u8, resp.?.data, "downsampling isn't supported") != null);
 }
+
+test "e2e/ts: a delete and a retention trim stay done across a restart" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ts", "write", "gone", "--value", "11" });
+    try ctx.exec(&.{ "ts", "write", "aged", "--value", "22", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "aged", "--value", "33" });
+    try ctx.exec(&.{ "ts", "delete", "gone", "--confirm" });
+    try ctx.exec(&.{ "ts", "retention", "aged", "--raw-ttl", "1d" });
+    try ctx.restartServer();
+
+    var gone = try ctx.cli.run(&.{ "ts", "read", "gone", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer gone.deinit();
+    try testing.expect(!gone.contains(" 11.000000"));
+    var aged = try ctx.cli.run(&.{ "ts", "read", "aged", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer aged.deinit();
+    try testing.expect(aged.contains(" 33.000000"));
+    try testing.expect(!aged.contains(" 22.000000"));
+}
