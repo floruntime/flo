@@ -49,6 +49,9 @@ pub const ServerProcess = struct {
     started: bool,
     config: ServerConfig,
     log_thread: ?std.Thread = null,
+    /// Set once the server is reaped; the log thread exits at the next quiet
+    /// poll, so joining it never waits on a pipe something else still holds.
+    log_stop: std.atomic.Value(bool) = .init(false),
 
     /// Default timeout for server readiness (ms)
     pub const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
@@ -185,6 +188,8 @@ pub const ServerProcess = struct {
         // `start()`, and a server torn down without starting would then join a
         // garbage thread handle.
         self.log_thread = null;
+        self.log_stop = .init(false);
+        self.reaped = false;
         self.dump_log_on_failure = true;
 
         return self;
@@ -363,7 +368,9 @@ pub const ServerProcess = struct {
         // pointers when stop() sets self.process = null
         const stdout_fd = self.process.?.stdout.?.handle;
         const stderr_fd = self.process.?.stderr.?.handle;
-        self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd });
+        self.reaped = false;
+        self.log_stop.store(false, .release);
+        self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd, &self.log_stop });
         log_file_handed_off = true; // Thread now owns the fd
 
         // Wait for server to be ready
@@ -371,7 +378,10 @@ pub const ServerProcess = struct {
             // The server's own output goes to a log file, so without this a
             // startup failure surfaces only as this harness's timeout and the
             // real bind error or panic never reaches the test output.
-            if (self.dump_log_on_failure) self.dumpLogTail();
+            if (self.dump_log_on_failure) {
+                std.debug.print("[server] port {d}: not ready within {d} ms\n", .{ self.port, timeout_ms });
+                self.dumpLogTail();
+            }
             self.forceKill();
             return err;
         };
@@ -406,8 +416,8 @@ pub const ServerProcess = struct {
 
             // Force kill if not gracefully exited
             if (!gracefully_exited) {
-                // Server didn't respond to SIGTERM, force kill
-                _ = std.c.kill(pid, .KILL);
+                // Server didn't respond to SIGTERM, force kill its group
+                if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
 
                 // Wait for process to die (blocking wait with timeout)
                 const kill_start = stdx.time.milliTimestamp();
@@ -427,16 +437,21 @@ pub const ServerProcess = struct {
                 stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
             }
 
-            // Join the log thread — process kill closes pipes, unblocking reads
-            if (self.log_thread) |thread| {
-                thread.join();
-                self.log_thread = null;
-            }
-
+            self.joinLogThread();
             self.process = null;
         }
 
         self.started = false;
+    }
+
+    /// Never through `Child.wait`: it closes the pipes the log thread is
+    /// polling, and a close under another thread's poll doesn't wake it.
+    fn joinLogThread(self: *Self) void {
+        self.log_stop.store(true, .release);
+        if (self.log_thread) |thread| {
+            thread.join();
+            self.log_thread = null;
+        }
     }
 
     // =========================================================================
@@ -539,24 +554,28 @@ pub const ServerProcess = struct {
         std.debug.print("\n=== SERVER LOGS ({s}) ===\n{s}\n=== END SERVER LOGS ===\n", .{ self.log_file_path, logs });
     }
 
-    /// Force kill the server process
+    /// Force kill the server process and everything in its group.
     fn forceKill(self: *Self) void {
         if (self.process) |*proc| {
+            const pid = proc.id;
             if (!self.reaped) {
-                _ = std.c.kill(proc.id, .KILL);
-                _ = proc.wait() catch {};
-                self.reaped = true;
+                // The child leads its own group (spawned with pgid 0), so
+                // this reaches anything it started; fall back to the pid.
+                if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
+                const kill_start = stdx.time.milliTimestamp();
+                while (stdx.time.milliTimestamp() - kill_start < 2000) {
+                    var status: c_int = 0;
+                    if (std.c.waitpid(pid, &status, std.posix.W.NOHANG) == pid) {
+                        self.reaped = true;
+                        break;
+                    }
+                    stdx.time.sleep(10 * std.time.ns_per_ms);
+                }
+                // A zombie is better than a hung run.
+                if (!self.reaped) std.debug.print("[server] pid {d} not reaped after SIGKILL; moving on\n", .{pid});
             }
-
-            // Wait for OS to release resources
             stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
-
-            // Join log thread after process is dead
-            if (self.log_thread) |thread| {
-                thread.join();
-                self.log_thread = null;
-            }
-
+            self.joinLogThread();
             self.process = null;
         }
         self.started = false;
@@ -751,8 +770,11 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 /// Uses poll() to read both stdout and stderr concurrently, preventing
 /// the classic pipe deadlock where the server blocks writing to one pipe
 /// while we're blocked reading the other.
-fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: std.posix.fd_t) void {
+fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: std.posix.fd_t, stop: *const std.atomic.Value(bool)) void {
     defer stdx.fs.closeFile(log_file);
+    // This thread owns the read ends: nothing else may close them while it polls.
+    defer _ = std.c.close(stdout_fd);
+    defer _ = std.c.close(stderr_fd);
 
     var fds = [_]std.posix.pollfd{
         .{ .fd = stdout_fd, .events = std.posix.POLL.IN, .revents = 0 },
@@ -763,8 +785,13 @@ fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: 
     var open_count: usize = 2;
 
     while (open_count > 0) {
-        const ready = std.posix.poll(&fds, -1) catch break;
-        if (ready == 0) continue;
+        const ready = std.posix.poll(&fds, 100) catch break;
+        if (ready == 0) {
+            // Quiet after the server was reaped: whatever still holds the
+            // pipe (a grandchild) must not keep the harness waiting.
+            if (stop.load(.acquire)) break;
+            continue;
+        }
 
         for (&fds) |*pfd| {
             if (pfd.fd < 0) continue;
