@@ -13,7 +13,9 @@
 //! ```
 //! magic:      u32   0x0A10_4853
 //! version:    u8    1
-//! reserved:   [3]u8 zero
+//! flags:      u8    bit 0: lost-log (the node has not yet re-established
+//!                   what it lost; see `raft.node.LostLog`)
+//! reserved:   [2]u8 zero
 //! node_id:    u32
 //! term:       u64
 //! voted_for:  u32
@@ -35,11 +37,13 @@ pub const HardState = struct {
     node_id: u32 = 0,
     term: u64 = 0,
     voted_for: u32 = 0,
+    lost_log: bool = false,
 
     pub fn encode(self: HardState, buf: *[SIZE]u8) void {
         std.mem.writeInt(u32, buf[0..4], MAGIC, .little);
         buf[4] = VERSION;
-        @memset(buf[5..8], 0);
+        buf[5] = @intFromBool(self.lost_log);
+        @memset(buf[6..8], 0);
         std.mem.writeInt(u32, buf[8..12], self.node_id, .little);
         std.mem.writeInt(u64, buf[12..20], self.term, .little);
         std.mem.writeInt(u32, buf[20..24], self.voted_for, .little);
@@ -54,6 +58,7 @@ pub const HardState = struct {
             .node_id = std.mem.readInt(u32, buf[8..12], .little),
             .term = std.mem.readInt(u64, buf[12..20], .little),
             .voted_for = std.mem.readInt(u32, buf[20..24], .little),
+            .lost_log = buf[5] & 1 != 0,
         };
     }
 };

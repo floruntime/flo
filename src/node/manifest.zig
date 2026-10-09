@@ -145,7 +145,8 @@ pub const SystemManifest = struct {
                 "║                                                              ║\n" ++
                 "║  Changing " ++ what ++ " count silently corrupts routing.    ║\n" ++
                 "║                                                              ║\n" ++
-                "║  Fix: delete the data directory and start fresh.             ║\n" ++
+                "║  Fix: start with the count the data was written with, or     ║\n" ++
+                "║  move the data directory aside and start with an empty one.  ║\n" ++
                 "║                                                              ║\n" ++
                 "╚═══════════════════════════════════════════════════════════════╝\n" ++
                 "\n",

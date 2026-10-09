@@ -110,7 +110,38 @@ pub const Config = struct {
 /// higher term is kept in memory anyway and counted in `persist_failures`.
 pub const HardStateSink = struct {
     ctx: *anyopaque,
-    persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId) bool,
+    persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool,
+};
+
+/// Where a node that has no log, or lost it, stands. Before it lost its
+/// disk it may have voted in a term, or held entries a quorum counted, so
+/// until it has both caught up with a leader and had a quorum confirm the
+/// term it grants no vote and never campaigns; after, it votes only in
+/// later terms. Persisted with the hard state until it is `none`.
+pub const LostLog = enum {
+    none,
+    /// Following a leader until this log reaches the leader's last index
+    /// and the leader has committed an entry of its own term.
+    catching_up,
+    /// Asking the members of the latest config it knows for their terms.
+    confirming,
+};
+
+/// A lost-log node asking a member for its term and its latest config.
+pub const TermPollRequest = struct {
+    term: u64,
+    from: NodeId,
+};
+
+pub const TermPollResponse = struct {
+    term: u64,
+    from: NodeId,
+    /// The responder's latest config: what the poller polls instead when
+    /// it is newer than its own.
+    config_index: u64,
+    config_term: u64,
+    member_count: u8,
+    members: [membership.MAX_MEMBERS]NodeId,
 };
 
 /// Result of processing a tick (timer advancement).
@@ -118,6 +149,9 @@ pub const TickResult = struct {
     /// Actions the caller must take after the tick.
     send_heartbeats: bool = false,
     start_election: bool = false,
+    /// A lost-log node is confirming the term: send `termPollRequest` to
+    /// every node in `termPollTargets`.
+    send_term_poll: bool = false,
     /// The leader has not heard from a majority within an election timeout
     /// and stepped down; the caller resolves what it was holding for commit.
     step_down: bool = false,
@@ -159,6 +193,9 @@ pub const AppendRequest = struct {
     prev_log_term: u64,
     entries: []const Entry,
     leader_commit: u64,
+    /// The leader's last index when it sent this, so a lost-log follower
+    /// knows when it has caught up. Unset, it never has.
+    leader_last_index: u64 = std.math.maxInt(u64),
 };
 
 /// AppendEntries response.
@@ -189,6 +226,18 @@ fn entropySeed() u64 {
     @import("stdx").io.instance().random(&buf);
     return std.mem.readInt(u64, &buf, .little);
 }
+
+/// The confirmation poll of a lost-log node: the members of the newest
+/// config it has heard of, and which of them have answered.
+const TermPoll = struct {
+    members: [MAX_PEERS + 1]NodeId = undefined,
+    member_count: u8 = 0,
+    config_index: u64 = 0,
+    config_term: u64 = 0,
+    answered: [MAX_PEERS + 1]bool = @splat(false),
+    answers: u8 = 0,
+    sent_ms: u64 = 0,
+};
 
 pub const RaftNode = struct {
     // ── Identity ────────────────────────────────────────────────────────
@@ -257,6 +306,12 @@ pub const RaftNode = struct {
     committed_conflicts: u64,
     committed_member_ids: [MAX_PEERS + 1]NodeId,
     committed_member_count: u8,
+    /// Term of the config entry at `membership_index`, 0 when unknown.
+    membership_term: u64 = 0,
+
+    // ── Lost-log guard ─────────────────────────────────────────────────
+    lost_log: LostLog = .none,
+    poll: TermPoll = .{},
 
     // ── Log ────────────────────────────────────────────────────────────
     log: RaftLog,
@@ -407,6 +462,7 @@ pub const RaftNode = struct {
             return;
         };
         self.setMembership(members, e.header.index);
+        self.membership_term = e.header.term;
     }
 
     fn truncatedBelowMembership(self: *RaftNode, after_index: u64) void {
@@ -415,6 +471,7 @@ pub const RaftNode = struct {
         const n = self.committed_member_count;
         @memcpy(ids[0..n], self.committed_member_ids[0..n]);
         self.setMembership(ids[0..n], 0);
+        self.membership_term = 0;
     }
 
     /// Total cluster size (self + peers).
@@ -489,6 +546,13 @@ pub const RaftNode = struct {
                 }
             },
             .follower, .candidate => {
+                if (self.lost_log != .none) {
+                    if (self.lost_log == .confirming and now_ms -| self.poll.sent_ms >= self.config.heartbeat_interval_ms) {
+                        self.poll.sent_ms = now_ms;
+                        result.send_term_poll = true;
+                    }
+                    return result;
+                }
                 if (!self.timer_enabled) return result;
                 // First tick: arm here rather than in init, which has no
                 // clock, so a node whose leader never speaks still elects.
@@ -612,6 +676,11 @@ pub const RaftNode = struct {
     pub fn handleVoteRequest(self: *RaftNode, req: VoteRequest) VoteResponse {
         if (!self.termPlausible(req.term)) {
             log.warn("Raft: vote request for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
+            return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
+        }
+        // What this node voted for before it lost its log is gone; it
+        // answers no poll and grants no vote until the guard completes.
+        if (self.lost_log != .none) {
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
         }
         // A leader spoke to us within an election timeout: whoever is
@@ -809,6 +878,15 @@ pub const RaftNode = struct {
         const last_new = req.prev_log_index + req.entries.len;
         self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
 
+        // Caught up: everything the leader had when it sent this, and the
+        // leader has committed an entry of its own term, so no earlier
+        // leader's suffix is still pending.
+        if (self.lost_log == .catching_up and last_new >= req.leader_last_index and
+            self.commit_index > 0 and self.log.entryTerm(self.commit_index) == self.current_term)
+        {
+            self.startTermPoll();
+        }
+
         // Only the prefix this RPC verified counts as matched. lastIndex()
         // may include a stale suffix from an old term that the leader would
         // otherwise wrongly count toward its commit quorum.
@@ -901,6 +979,112 @@ pub const RaftNode = struct {
         return .{ .index = idx, .term = self.current_term, .timestamp_ns = timestamp_ns };
     }
 
+    // ── Lost-log guard ──────────────────────────────────────────────────
+
+    /// This node has no log: guard it, durably, before it answers anyone.
+    pub fn enterLostLog(self: *RaftNode) !void {
+        self.lost_log = .catching_up;
+        if (!self.persistHardState()) return error.HardStateNotDurable;
+    }
+
+    /// Caught up: poll the members of the latest config this log holds.
+    fn startTermPoll(self: *RaftNode) void {
+        var ids: [MAX_PEERS + 1]NodeId = undefined;
+        // The node's own seat counts in the quorum's size, not as an answer.
+        const members = self.memberIds(&ids);
+        self.lost_log = .confirming;
+        self.poll = .{ .config_index = self.membership_index, .config_term = self.membership_term };
+        self.setPollMembers(members);
+        log.info("Raft: lost-log node {d} caught up at index {d} (term {d}); confirming the term with members {any}", .{ self.id, self.log.lastIndex(), self.current_term, members });
+    }
+
+    fn setPollMembers(self: *RaftNode, members: []const NodeId) void {
+        const n = @min(members.len, self.poll.members.len);
+        @memcpy(self.poll.members[0..n], members[0..n]);
+        self.poll.member_count = @intCast(n);
+        self.poll.answered = @splat(false);
+        self.poll.answers = 0;
+        // Ask the new set at the next tick.
+        self.poll.sent_ms = 0;
+    }
+
+    /// Whom a confirming node polls: the poll's members other than itself.
+    pub fn termPollTargets(self: *const RaftNode, out: *[MAX_PEERS + 1]NodeId) []NodeId {
+        var n: usize = 0;
+        for (self.poll.members[0..self.poll.member_count], 0..) |id, i| {
+            if (id == self.id or self.poll.answered[i]) continue;
+            out[n] = id;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    pub fn termPollRequest(self: *const RaftNode) TermPollRequest {
+        return .{ .term = self.current_term, .from = self.id };
+    }
+
+    /// Answer a lost-log node's poll with our term and latest config.
+    /// Nothing is adopted: the poller's term is a leader's it followed,
+    /// and may be stale.
+    pub fn handleTermPoll(self: *const RaftNode, req: TermPollRequest) TermPollResponse {
+        _ = req;
+        var resp: TermPollResponse = .{
+            .term = self.current_term,
+            .from = self.id,
+            .config_index = self.membership_index,
+            .config_term = self.membership_term,
+            .member_count = 0,
+            .members = undefined,
+        };
+        var ids: [MAX_PEERS + 1]NodeId = undefined;
+        const members = self.memberIds(&ids);
+        const n = @min(members.len, resp.members.len);
+        @memcpy(resp.members[0..n], members[0..n]);
+        resp.member_count = @intCast(n);
+        return resp;
+    }
+
+    /// One member's answer. A newer term sends the node back to catch up
+    /// with that term's leader; a newer config replaces the polled set;
+    /// a quorum of the set, this node excluded, confirms the term. Every
+    /// term a vote of this node could have counted in was reached by a
+    /// quorum overlapping that one, so none is above ours.
+    pub fn handleTermPollResponse(self: *RaftNode, resp: TermPollResponse) void {
+        if (self.lost_log != .confirming or !self.termPlausible(resp.term)) return;
+        if (resp.term > self.current_term) {
+            self.stepDown(resp.term);
+            return;
+        }
+        const newer = resp.config_term > self.poll.config_term or
+            (resp.config_term == self.poll.config_term and resp.config_index > self.poll.config_index);
+        if (newer and resp.member_count > 0) {
+            self.poll.config_index = resp.config_index;
+            self.poll.config_term = resp.config_term;
+            self.setPollMembers(resp.members[0..@min(resp.member_count, resp.members.len)]);
+            log.info("Raft: lost-log node {d} polls the newer config {any} (index {d}, term {d})", .{ self.id, self.poll.members[0..self.poll.member_count], resp.config_index, resp.config_term });
+        }
+        if (resp.from == self.id) return;
+        const i = std.mem.indexOfScalar(NodeId, self.poll.members[0..self.poll.member_count], resp.from) orelse return;
+        if (self.poll.answered[i]) return;
+        self.poll.answered[i] = true;
+        self.poll.answers += 1;
+        if (self.poll.answers < self.poll.member_count / 2 + 1) return;
+
+        // Confirmed. A vote recorded for itself in this term means it
+        // grants none in it, here or after a restart.
+        self.lost_log = .none;
+        self.voted_for = self.id;
+        if (!self.persistHardState()) {
+            self.lost_log = .confirming;
+            self.voted_for = NO_VOTE;
+            self.poll.answered[i] = false;
+            self.poll.answers -= 1;
+            return;
+        }
+        self.rearmElectionTimer();
+        log.info("Raft: lost-log node {d} confirmed term {d} with {d} of {d} members; it votes from term {d} on", .{ self.id, self.current_term, self.poll.answers, self.poll.member_count, self.current_term + 1 });
+    }
+
     // ── Internal ────────────────────────────────────────────────────────
 
     fn stepDown(self: *RaftNode, new_term: u64) void {
@@ -908,6 +1092,9 @@ pub const RaftNode = struct {
         self.current_term = new_term;
         self.role = .follower;
         self.voted_for = NO_VOTE;
+        // A term newer than the one being confirmed has a leader to catch
+        // up with first.
+        if (self.lost_log == .confirming) self.lost_log = .catching_up;
         // Kept in memory even if it cannot be persisted: acting in the old
         // term is the worse outcome.
         _ = self.persistHardState();
@@ -920,7 +1107,7 @@ pub const RaftNode = struct {
     /// there is no sink (an ephemeral node has nothing to persist to).
     fn persistHardState(self: *RaftNode) bool {
         const sink = self.hard_state_sink orelse return true;
-        if (sink.persist(sink.ctx, self.current_term, self.voted_for)) return true;
+        if (sink.persist(sink.ctx, self.current_term, self.voted_for, self.lost_log != .none)) return true;
         self.persist_failures += 1;
         log.debug("Raft: hard state not durable, node_id={d}, group_id={d}, term={d}, voted_for={d} (persist_failures={d})", .{ self.id, self.group_id, self.current_term, self.voted_for, self.persist_failures });
         return false;
@@ -1854,11 +2041,13 @@ test "raft node: a granted vote and an election start re-arm the timer" {
 const SinkRecorder = struct {
     term: u64 = 0,
     voted_for: NodeId = 0,
+    lost_log: bool = false,
     calls: u32 = 0,
     fail: bool = false,
 
-    fn persist(ctx: *anyopaque, term: u64, voted_for: NodeId) bool {
+    fn persist(ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool {
         const self: *SinkRecorder = @ptrCast(@alignCast(ctx));
+        self.lost_log = lost_log;
         self.calls += 1;
         if (self.fail) return false;
         self.term = term;
@@ -2566,4 +2755,90 @@ test "raft node: a durable index past a truncation is cut back to it" {
     const resp = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 1, .prev_log_term = 1, .entries = &replacement, .leader_commit = 0 });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 1), follower.durable_index);
+}
+
+/// A lost-log node 2 that leader 1 (term 3) has caught up: entries 1..3
+/// of term 3, the config {1,2,3} at index 2, all committed.
+fn lostLogCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
+    node.hard_state_sink = rec.sink();
+    node.timer_enabled = false;
+    try node.enterLostLog();
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 3, 0, ""),
+    };
+    // Short of the leader's last index: still catching up, even with a
+    // commit of the leader's term.
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = es[0..2], .leader_commit = 2, .leader_last_index = 3 });
+    try testing.expectEqual(LostLog.catching_up, node.lost_log);
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = es[2..3], .leader_commit = 3, .leader_last_index = 3 });
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+}
+
+fn pollAnswer(from: NodeId, term: u64, config_index: u64, config_term: u64, members: []const NodeId) TermPollResponse {
+    var r: TermPollResponse = .{ .term = term, .from = from, .config_index = config_index, .config_term = config_term, .member_count = @intCast(members.len), .members = undefined };
+    @memcpy(r.members[0..members.len], members);
+    return r;
+}
+
+test "raft node: a lost-log node grants no vote and never campaigns until caught up and the term is confirmed" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    try node.enterLostLog();
+    try testing.expect(rec.lost_log);
+    try testing.expect(!node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 }).vote_granted);
+    try testing.expect(!node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0, .is_pre_vote = true }).vote_granted);
+
+    try lostLogCaughtUp(&node, &rec);
+    // Named by the config, yet the timer elects nothing; it polls.
+    _ = node.tick(1);
+    const t = node.tick(1_000_000);
+    try testing.expect(!t.start_election);
+    try testing.expect(t.send_term_poll);
+    var targets: [MAX_PEERS + 1]NodeId = undefined;
+    try testing.expectEqualSlices(NodeId, &.{ 1, 3 }, node.termPollTargets(&targets));
+
+    // Its own seat counts in the quorum's size, not as an answer: one
+    // answer of three is not a majority.
+    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(rec.lost_log);
+    node.handleTermPollResponse(pollAnswer(3, 2, 2, 3, &.{ 1, 2, 3 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
+    try testing.expect(!rec.lost_log);
+    try testing.expectEqual(@as(u64, 3), rec.term);
+    try testing.expectEqual(@as(NodeId, 2), rec.voted_for);
+
+    // Whatever it voted for in term 3 is gone, so it votes in none; it
+    // votes in term 4.
+    node.current_time_ms = 10_000_000;
+    try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 3, .last_log_term = 3 }).vote_granted);
+    try testing.expect(node.handleVoteRequest(.{ .term = 4, .candidate_id = 3, .last_log_index = 3, .last_log_term = 3 }).vote_granted);
+}
+
+test "raft node: a newer term in a poll answer sends a lost-log node back to catch up; a newer config is polled instead" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    try lostLogCaughtUp(&node, &rec);
+
+    // A member reports a config of five from a later term: those are polled.
+    node.handleTermPollResponse(pollAnswer(1, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    var targets: [MAX_PEERS + 1]NodeId = undefined;
+    // Node 1 answered the new set too.
+    try testing.expectEqualSlices(NodeId, &.{ 3, 4, 5 }, node.termPollTargets(&targets));
+    node.handleTermPollResponse(pollAnswer(3, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+
+    // A term past ours: a leader this node has not caught up with.
+    node.handleTermPollResponse(pollAnswer(4, 6, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    try testing.expectEqual(LostLog.catching_up, node.lost_log);
+    try testing.expectEqual(@as(u64, 6), node.current_term);
+    try testing.expect(rec.lost_log);
+    try testing.expect(!node.handleVoteRequest(.{ .term = 7, .candidate_id = 3, .last_log_index = 9, .last_log_term = 6 }).vote_granted);
 }

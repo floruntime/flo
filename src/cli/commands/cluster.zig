@@ -229,6 +229,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         2 => "leader",
         3 => "joining",
         4 => "diverged",
+        5 => "joining: catching up",
+        6 => "joining: confirming the term",
         else => "unknown",
     };
     // No leader is known while electing or joining.
@@ -256,7 +258,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         ctx.print("Leader:     {s}\n", .{leader_shown});
         ctx.print("Term:       {d}\n", .{term});
         ctx.print("Members:    {d}\n", .{member_count});
-        if (state == 4) ctx.print("\nThis node's data diverged from the group and it takes no writes.\nStop it, delete its data directory, and start it again with --join <a live member>.\n", .{});
+        if (state == 5 or state == 6) ctx.print("\nThis node has no log of its own yet (new, or its data was lost). It votes only once a leader has caught\nit up and a majority has confirmed the term. If a majority lost their data, see flo server inspect / force-members.\n", .{});
+        if (state == 4) ctx.print("\nThis node's data diverged from the group and it takes no writes.\nStop it, move its data directory aside, and start it again with --join <a live member>.\nIt rejoins with no log and votes only once it has caught up.\n", .{});
         ctx.print("\n", .{});
     }
 }

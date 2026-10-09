@@ -94,6 +94,9 @@ pub const Scenario = struct {
     crash_permille: u16,
     /// Per-tick per-crashed-node restart chance (per-mille).
     restart_permille: u16,
+    /// Per-mille of crashes that also lose the disk: log and hard state.
+    /// The node restarts with no log, as a lost-log node.
+    wipe_permille: u16,
 
     // ── Workload ───────────────────────────────────────────────────────
     /// Percent chance per tick that a client submits an op.
@@ -160,6 +163,8 @@ pub const Scenario = struct {
             .election_timeout_max_ms = election_max,
             .heartbeat_interval_ms = @max(10, election_min / 4),
             .rpc_timeout_ms = @max(50, delay_max * 3),
+            // Drawn last so the fields above keep their values per seed.
+            .wipe_permille = if (r.uintLessThan(u8, 3) == 0) r.intRangeAtMost(u16, 100, 500) else 0,
         };
     }
 
@@ -190,6 +195,7 @@ pub const Scenario = struct {
         s.duplicate_percent = 0;
         s.partition_permille = 0;
         s.crash_permille = 0;
+        s.wipe_permille = 0;
         s.durability = .sync;
         s.log_capacity = 4 * 1024 * 1024;
         s.payload_max = 2048;
@@ -220,6 +226,7 @@ pub const Scenario = struct {
             \\  "partition_max_ms": {d},
             \\  "crash_permille": {d},
             \\  "restart_permille": {d},
+            \\  "wipe_permille": {d},
             \\  "request_percent": {d},
             \\  "payload_min": {d},
             \\  "payload_max": {d},
@@ -236,6 +243,7 @@ pub const Scenario = struct {
             self.msg_delay_min_ms,        self.msg_delay_max_ms,        self.drop_percent,
             self.duplicate_percent,       self.partition_permille,      self.partition_min_ms,
             self.partition_max_ms,        self.crash_permille,          self.restart_permille,
+            self.wipe_permille,
             self.request_percent,         self.payload_min,             self.payload_max,
             self.election_timeout_min_ms, self.election_timeout_max_ms, self.heartbeat_interval_ms,
             self.rpc_timeout_ms,
@@ -273,6 +281,7 @@ pub const Scenario = struct {
             .partition_max_ms = try jsonU64(obj, "partition_max_ms"),
             .crash_permille = try jsonInt(u16, obj, "crash_permille"),
             .restart_permille = try jsonInt(u16, obj, "restart_permille"),
+            .wipe_permille = try jsonInt(u16, obj, "wipe_permille"),
             .request_percent = try jsonInt(u8, obj, "request_percent"),
             .payload_min = try jsonInt(u32, obj, "payload_min"),
             .payload_max = try jsonInt(u32, obj, "payload_max"),
@@ -388,7 +397,8 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 25), obj.count());
+    try testing.expectEqual(@as(usize, 26), obj.count());
+    try testing.expectEqual(@as(i64, s.wipe_permille), obj.get("wipe_permille").?.integer);
     try testing.expectEqual(@as(i64, 99), obj.get("seed").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.log_capacity)), obj.get("log_capacity").?.integer);
     try testing.expect(obj.get("small_ring").?.bool);

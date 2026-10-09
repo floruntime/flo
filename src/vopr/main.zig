@@ -142,7 +142,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -153,6 +153,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.max_committed,
             s.elections_won,
             s.crashes,
+            s.wipes,
             s.restarts,
             s.messages_delivered,
             s.messages_dropped,
