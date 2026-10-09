@@ -577,11 +577,11 @@ test "e2e/stream: trim refuses two bounds and a zero bound" {
 
     var two = try ctx.cli.run(&.{ "stream", "trim", "trim-bounds", "--maxlen", "1", "--maxage", "60" });
     defer two.deinit();
-    try testing.expect(two.stderrContains("give only one of --before, --maxlen or --maxage"));
+    try testing.expect(two.stderrContains("give only one of before, maxlen or maxage"));
 
     var zero = try ctx.cli.run(&.{ "stream", "trim", "trim-bounds", "--maxlen", "0" });
     defer zero.deinit();
-    try testing.expect(zero.stderrContains("--maxlen must be > 0"));
+    try testing.expect(zero.stderrContains("maxlen must be > 0"));
 
     var read = try ctx.cli.run(&.{ "stream", "read", "trim-bounds", "--limit", "10", "-o", "json" });
     defer read.deinit();

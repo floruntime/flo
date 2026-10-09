@@ -84,13 +84,6 @@ fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Cli
     return client;
 }
 
-/// Parse a boolean query param ("true"/"1" → true). `parseQueryParam` only
-/// handles strings and integers, so booleans are decoded here.
-fn boolParam(query_string: ?[]const u8, key: []const u8) bool {
-    const v = h.parseQueryParam([]const u8, query_string, key) orelse return false;
-    return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-}
-
 /// Logical record count for a stream = sum of each append batch's record count
 /// (a batch may carry N records). The projection maintains this incrementally,
 /// so this is an O(1) read and needs no UAL access — notably avoiding the
@@ -237,21 +230,24 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 /// POST /streams/:name/trim - trim a stream by count or age (loopback write).
 /// Query: ?namespace= &max_len= &max_age_s= &dry_run=
 pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    if (h.unknownQueryParam(query_string, &.{ "namespace", "max_len", "max_age_s", "dry_run" })) |k| {
-        const msg = try std.fmt.allocPrint(allocator, "trim does not take '{s}'; give one of max_len or max_age_s", .{k});
-        defer allocator.free(msg);
-        return try h.jsonError(allocator, msg);
+    var why_buf: [96]u8 = undefined;
+    if (h.queryRefusal(&why_buf, query_string, &.{ "namespace", "max_len", "max_age_s", "dry_run" })) |why| {
+        return try h.jsonError(allocator, why);
     }
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const max_len = h.parseQueryParam(u64, query_string, "max_len");
     const max_age_s = h.parseQueryParam(u64, query_string, "max_age_s");
-    const dry_run = boolParam(query_string, "dry_run");
+    const dry_run = h.boolQueryParam(query_string, "dry_run") catch
+        return try h.jsonError(allocator, "dry_run must be true, false, 1 or 0");
 
     // A value that doesn't parse is refused, not read as absent.
     if (max_len == null and h.parseQueryParam([]const u8, query_string, "max_len") != null)
         return try h.jsonError(allocator, "max_len must be a whole number");
     if (max_age_s == null and h.parseQueryParam([]const u8, query_string, "max_age_s") != null)
         return try h.jsonError(allocator, "max_age_s must be a whole number");
+    if (max_len != null and max_len.? == 0) return try h.jsonError(allocator, "max_len must be > 0");
+    if (max_age_s != null and max_age_s.? == 0) return try h.jsonError(allocator, "max_age_s must be > 0");
+    if (max_len != null and max_age_s != null) return try h.jsonError(allocator, "trim takes only one of max_len or max_age_s");
     if (max_len == null and max_age_s == null) {
         return try h.jsonError(allocator, "trim requires one of max_len or max_age_s");
     }
@@ -281,7 +277,8 @@ pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?
 /// Query: ?namespace= &force=  (force required for non-empty streams)
 pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const force = boolParam(query_string, "force");
+    const force = h.boolQueryParam(query_string, "force") catch
+        return try h.jsonError(allocator, "force must be true, false, 1 or 0");
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();

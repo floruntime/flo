@@ -101,7 +101,24 @@ test "e2e/dashboard: trim refuses parameters it doesn't take" {
 
     var zero = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=0", "");
     defer zero.deinit();
-    try testing.expect(std.mem.indexOf(u8, zero.body, "--maxlen must be > 0") != null);
+    try testing.expect(std.mem.indexOf(u8, zero.body, "max_len must be > 0") != null);
+
+    // A dry_run that isn't true/false/1/0 is refused, never read as a real trim.
+    for ([_][]const u8{ "dry_run=yes", "dry_run=True", "dry_run" }) |d| {
+        var path: [96]u8 = undefined;
+        var r = try http.post(std.fmt.bufPrint(&path, "/api/v1/streams/dash-trim-params/trim?max_len=1&{s}", .{d}) catch unreachable, "");
+        defer r.deinit();
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"error\"") != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, "dry_run") != null);
+    }
+
+    // Repeated and empty parameters are refused by name.
+    var rep = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=1&max_len=abc", "");
+    defer rep.deinit();
+    try testing.expect(std.mem.indexOf(u8, rep.body, "'max_len' is given more than once") != null);
+    var empty = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=2&max_age_s=", "");
+    defer empty.deinit();
+    try testing.expect(std.mem.indexOf(u8, empty.body, "'max_age_s' needs a value") != null);
 
     var r = try ctx.cli.run(&.{ "stream", "read", "dash-trim-params", "--limit", "10", "-o", "json" });
     defer r.deinit();

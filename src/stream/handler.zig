@@ -605,15 +605,15 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(ns_hash, req.key);
 
         if (req.value.len > 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "stream trim takes no value; give --before, --maxlen or --maxage" } };
+            return .{ .err = .{ .code = .invalid_request, .message = "stream trim takes no value; give before, maxlen or maxage" } };
         }
         // Options a trim might be sent but doesn't take: refused by name, not ignored.
         inline for (.{
-            .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of --before, --maxlen or --maxage" },
-            .{ proto.OptionTag.stream_end, "stream trim: stream_end is not a trim bound; give one of --before, --maxlen or --maxage" },
-            .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (--maxlen)" },
-            .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (--maxage)" },
-            .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of --before, --maxlen or --maxage" },
+            .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of before, maxlen or maxage" },
+            .{ proto.OptionTag.stream_end, "stream trim: stream_end is not a trim bound; give one of before, maxlen or maxage" },
+            .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (maxlen)" },
+            .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (maxage)" },
+            .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of before, maxlen or maxage" },
         }) |refused| {
             if (req.findOption(refused[0]) != null) return .{ .err = .{ .code = .invalid_request, .message = refused[1] } };
         }
@@ -623,24 +623,24 @@ pub const StreamHandler = struct {
         const maxlen = req.findOption(.limit);
         const maxage = req.findOption(.max_age_seconds);
         const bounds = @as(u8, @intFromBool(before != null)) + @intFromBool(maxlen != null) + @intFromBool(maxage != null);
-        if (bounds == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give one of --before, --maxlen or --maxage" } };
-        if (bounds > 1) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give only one of --before, --maxlen or --maxage" } };
+        if (bounds == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give one of before, maxlen or maxage" } };
+        if (bounds > 1) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give only one of before, maxlen or maxage" } };
 
         // The boundary: records with id <= it are removed (see `trimStream`).
         var trim_id: StreamID = undefined;
         if (before) |opt| {
-            const sid = opt.asStreamId() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --before must be a stream id" } };
+            const sid = opt.asStreamId() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: before must be a stream id" } };
             if (sid.timestamp_ms > 0) {
                 trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
             } else if (sid.sequence > 0) {
                 trim_id = StreamID.fromSeq(sid.sequence);
             } else {
-                return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --before must be after 0-0" } };
+                return .{ .err = .{ .code = .invalid_request, .message = "stream trim: before must be after 0-0" } };
             }
         } else if (maxlen) |opt| {
             // Keep only the newest N records.
-            const keep = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxlen must be a u64" } };
-            if (keep == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxlen must be > 0" } };
+            const keep = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxlen must be a u64" } };
+            if (keep == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxlen must be > 0" } };
             // Logical records: counting entries would read a batched stream
             // as far shorter than it is.
             const total = self.stream.streamLogicalCount(name_hash);
@@ -651,8 +651,8 @@ pub const StreamHandler = struct {
             if (trim_id.eql(StreamID.MIN)) return trimmed(name_hash, 0, self.stream);
         } else if (maxage) |opt| {
             // Remove records older than now - S.
-            const age_s = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxage must be a u64" } };
-            if (age_s == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxage must be > 0" } };
+            const age_s = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage must be a u64" } };
+            if (age_s == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage must be > 0" } };
             const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
             // Saturates: an age older than the clock trims nothing.
             const age_ms = age_s *| 1000;
@@ -2582,13 +2582,14 @@ test "stream handler: trim refuses what it would otherwise ignore" {
     var ok_buf: [32]u8 = undefined;
     var ok = OptionsBuilder.init(&ok_buf);
     try ok.addU64(.limit, 1);
-    try expectTrimRefused(&handler, "3", ok.getOptions(), "stream trim takes no value; give --before, --maxlen or --maxage");
+    try expectTrimRefused(&handler, "3", ok.getOptions(), "stream trim takes no value; give before, maxlen or maxage");
 
     inline for (.{
-        .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of --before, --maxlen or --maxage" },
-        .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (--maxlen)" },
-        .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (--maxage)" },
-        .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of --before, --maxlen or --maxage" },
+        .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of before, maxlen or maxage" },
+        .{ proto.OptionTag.stream_end, "stream trim: stream_end is not a trim bound; give one of before, maxlen or maxage" },
+        .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (maxlen)" },
+        .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (maxage)" },
+        .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of before, maxlen or maxage" },
     }) |c| {
         var ob: [32]u8 = undefined;
         var b = OptionsBuilder.init(&ob);
@@ -2601,19 +2602,19 @@ test "stream handler: trim refuses what it would otherwise ignore" {
     var two = OptionsBuilder.init(&two_buf);
     try two.addU64(.limit, 1);
     try two.addU64(.max_age_seconds, 60);
-    try expectTrimRefused(&handler, "", two.getOptions(), "stream trim: give only one of --before, --maxlen or --maxage");
+    try expectTrimRefused(&handler, "", two.getOptions(), "stream trim: give only one of before, maxlen or maxage");
 
-    try expectTrimRefused(&handler, "", "", "stream trim: give one of --before, --maxlen or --maxage");
+    try expectTrimRefused(&handler, "", "", "stream trim: give one of before, maxlen or maxage");
 
     var zl_buf: [16]u8 = undefined;
     var zl = OptionsBuilder.init(&zl_buf);
     try zl.addU64(.limit, 0);
-    try expectTrimRefused(&handler, "", zl.getOptions(), "stream trim: --maxlen must be > 0");
+    try expectTrimRefused(&handler, "", zl.getOptions(), "stream trim: maxlen must be > 0");
 
     var za_buf: [16]u8 = undefined;
     var za = OptionsBuilder.init(&za_buf);
     try za.addU64(.max_age_seconds, 0);
-    try expectTrimRefused(&handler, "", za.getOptions(), "stream trim: --maxage must be > 0");
+    try expectTrimRefused(&handler, "", za.getOptions(), "stream trim: maxage must be > 0");
 
     // Nothing was trimmed by any of them.
     try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
