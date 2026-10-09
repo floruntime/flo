@@ -52,7 +52,7 @@ test "e2e/scoping: a queue message is acked or nacked only from its own queue an
     var ack = try ctx.cli.run(&.{ "queue", "ack", "q", seq, "-n", "qa" });
     defer ack.deinit();
     try stdx.testing.assertStdoutContains(ack, "OK");
-    const left = try ctx.execCapture(&.{ "queue", "dequeue", "q", "-n", "qa", "--timeout", "100" });
+    const left = try ctx.execCapture(&.{ "queue", "dequeue", "q", "-n", "qa" });
     try testing.expect(std.mem.indexOf(u8, left, "(no messages)") != null);
 }
 

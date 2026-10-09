@@ -70,7 +70,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo namespace list",
                     "flo ns ls --all",
                 })
-                .boolFlag("all", 'a', "Include system namespaces")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -142,11 +141,10 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const include_all = ctx.getBool("all");
     const endpoint = cli_config.getEndpoint(ctx);
 
     if (output.isVerbose(ctx)) {
-        ctx.printErr("[verbose] LIST namespaces endpoint={s} all={}\n", .{ endpoint, include_all });
+        ctx.printErr("[verbose] LIST namespaces endpoint={s}\n", .{endpoint});
     }
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -158,7 +156,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.namespace.list(&client, include_all) catch |err| {
+    var result = client_mod.namespace.list(&client) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };

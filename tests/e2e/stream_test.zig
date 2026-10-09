@@ -917,67 +917,6 @@ test "e2e/stream: group leave" {
 // Consumer Group Options (Reliability Features)
 // =============================================================================
 
-test "e2e/stream: group read with --no-ack" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |_| {
-        try ctx.exec(&.{ "stream", "append", "noack-test", "noack-msg" });
-    }
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "noack-test", "--group", "noack-group", "--consumer", "c1", "--no-ack", "--limit", "3" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("noack-msg") or result.succeeded());
-}
-
-test "e2e/stream: group read with --ack-timeout" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "timeout-test", "timeout-msg" });
-    }
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "timeout-test", "--group", "timeout-group", "--consumer", "c1", "--ack-timeout", "60000", "--limit", "2" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("timeout-msg") or result.succeeded());
-}
-
-test "e2e/stream: group read with --max-deliver" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "maxdeliver-test", "maxd-msg" });
-    }
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "maxdeliver-test", "--group", "maxdeliver-group", "--consumer", "c1", "--max-deliver", "3", "--limit", "2" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("maxd-msg") or result.succeeded());
-}
-
-test "e2e/stream: group nack with --delay" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "delay-test", "delay-msg" });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "delay-test", "--group", "delay-group", "--consumer", "c1", "--limit", "2" });
-
-    const id = extractStreamId(read_output);
-    if (id) |delay_id| {
-        var result = try ctx.cli.run(&.{ "stream", "group", "nack", "delay-test", "--group", "delay-group", "--consumer", "c1", "--ids", delay_id, "--delay", "5000" });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Released") or result.contains("ok") or result.succeeded());
-    }
-}
-
 test "e2e/stream: group touch" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -997,76 +936,9 @@ test "e2e/stream: group touch" {
     }
 }
 
-test "e2e/stream: group touch with --extend" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "touch-ext-test", "touch-ext-msg" });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "touch-ext-test", "--group", "touch-ext-group", "--consumer", "c1", "--limit", "2" });
-
-    const id = extractStreamId(read_output);
-    if (id) |touch_id| {
-        var result = try ctx.cli.run(&.{ "stream", "group", "touch", "touch-ext-test", "--group", "touch-ext-group", "--consumer", "c1", "--ids", touch_id, "--extend", "60000" });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Extended") or result.contains("touched") or result.contains("ok") or result.succeeded());
-    }
-}
-
 // =============================================================================
 // Consumer Group Advanced Modes
 // =============================================================================
-
-test "e2e/stream: exclusive mode first consumer acquires lease" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..10) |_| {
-        try ctx.exec(&.{ "stream", "append", "exclusive-test", "excl-msg" });
-    }
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "exclusive-test", "--group", "exclusive-group", "--consumer", "c1", "--mode", "exclusive", "--limit", "3" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("excl-msg") or result.succeeded());
-}
-
-test "e2e/stream: exclusive mode second consumer blocked" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..10) |_| {
-        try ctx.exec(&.{ "stream", "append", "excl-block-test", "excl-msg" });
-    }
-
-    // First consumer acquires
-    _ = try ctx.execCapture(&.{ "stream", "group", "read", "excl-block-test", "--group", "excl-block-group", "--consumer", "c1", "--mode", "exclusive", "--limit", "3" });
-
-    // Second consumer should be blocked or standby
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "excl-block-test", "--group", "excl-block-group", "--consumer", "c2", "--mode", "exclusive", "--limit", "3" });
-    defer result.deinit();
-
-    // Second consumer gets conflict/blocked/standby or no messages
-    try testing.expect(result.contains("conflict") or result.contains("Conflict") or result.contains("held") or result.contains("(no messages)") or result.stdout.len == 0 or result.succeeded());
-}
-
-test "e2e/stream: singleton mode (max-standbys 0)" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |_| {
-        try ctx.exec(&.{ "stream", "append", "singleton-test", "single-msg" });
-    }
-
-    // First consumer in singleton mode
-    var result1 = try ctx.cli.run(&.{ "stream", "group", "read", "singleton-test", "--group", "singleton-group", "--consumer", "c1", "--mode", "exclusive", "--max-standbys", "0", "--limit", "2" });
-    defer result1.deinit();
-
-    try testing.expect(result1.contains("single-msg") or result1.succeeded());
-}
 
 // =============================================================================
 // Stream Independence

@@ -175,22 +175,12 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .examples(&.{
                             "flo stream group read events --group mygroup --consumer worker1",
                             "flo stream group read events --group mygroup --consumer worker1 --limit 10",
-                            "flo stream group read events --group mygroup --consumer worker1 --mode exclusive",
-                            "flo stream group read events --group mygroup --consumer worker1 --mode key_shared --slots 16",
-                            "flo stream group read events --group mygroup --consumer worker1 --no-ack",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (required)")
                         .uintFlag("limit", 'l', 1, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
                         .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait)")
-                        .stringFlag("mode", 'm', "", "Consumer mode: shared, exclusive, key_shared")
-                        .uintFlag("max-standbys", 0, 0, "Max standby consumers in exclusive mode (0=singleton, no standbys)")
-                        .uintFlag("slots", 's', 16, "Number of hash slots for key_shared mode")
-                        .uintFlag("ack-timeout", 0, 0, "Ack timeout (ms) before auto-redeliver")
-                        .uintFlag("max-deliver", 0, 0, "Max delivery attempts before DLQ (0=unlimited)")
-                        .uintFlag("redeliver-delay", 0, 0, "Delay before NACK'd message visible (ms)")
-                        .boolFlag("no-ack", 0, "Auto-ack on delivery (at-most-once)")
                         .action(wrapHandler(runGroupRead)),
                 )
                 .subcommand(
@@ -247,7 +237,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (for correct pending key matching)")
                         .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to release")
-                        .uintFlag("delay", 0, 0, "Redelivery delay (ms) before message visible")
                         .action(wrapHandler(runGroupNack)),
                 )
                 .subcommand(
@@ -262,7 +251,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID that owns the messages (required)")
                         .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to touch")
-                        .uintFlag("extend", 0, 0, "Extra time (ms) to extend deadline (default: ack_timeout_ms)")
                         .action(wrapHandler(runGroupTouch)),
                 )
                 .subcommand(
@@ -282,31 +270,18 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .name("create")
                         .about("Create a consumer group with configuration")
                         .longAbout(
-                            \\Create a consumer group with explicit settings.
-                            \\
-                            \\Settings are defined once at creation and apply to all consumers.
-                            \\This is the recommended way to configure consumer groups.
-                            \\
-                            \\Modes:
-                            \\  shared      Multiple consumers compete for messages (default)
-                            \\  exclusive   Single active consumer, standbys auto-promoted on disconnect
-                            \\  key_shared  Messages with same partition key go to same consumer
+                            \\Create a consumer group. Its consumers compete for records: each
+                            \\record goes to one of them. --ack-timeout and --max-deliver set when
+                            \\an unacked record is redelivered and when it is given up on.
                         )
                         .examples(&.{
                             "flo stream group create events --group processors",
-                            "flo stream group create events --group singleton --mode exclusive --max-standbys 0",
-                            "flo stream group create events --group ordered --mode key_shared --slots 256",
                             "flo stream group create events --group reliable --ack-timeout 60000 --max-deliver 5",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .stringFlag("mode", 'm', "shared", "Consumer mode: shared, exclusive, key_shared")
-                        .uintFlag("slots", 's', 256, "Number of hash slots for key_shared mode")
-                        .uintFlag("max-standbys", 0, 65535, "Max standby consumers (exclusive mode, 0=singleton, 65535=unlimited)")
                         .uintFlag("ack-timeout", 0, 30000, "Ack timeout (ms) before auto-redeliver")
                         .uintFlag("max-deliver", 0, 10, "Max delivery attempts before DLQ (0=unlimited)")
-                        .uintFlag("redeliver-delay", 0, 0, "Delay before NACK'd message visible (ms)")
-                        .boolFlag("no-ack", 0, "Auto-ack on delivery (at-most-once)")
                         .action(wrapHandler(runGroupCreate)),
                 )
                 .subcommand(
@@ -667,10 +642,9 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // create(client, namespace, stream, partition_count, retention_count, retention_age, retention_bytes)
     // Convert retention hours to seconds for retention_age, or null
     const retention_age: ?u64 = if (retention) |r| r * 3600 else null;
-    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), null, retention_age, null) catch |err| {
+    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), null, retention_age) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -707,7 +681,7 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var response = client_mod.stream.alter(&client, namespace, stream, null, retention_age, null) catch |err| {
+    var response = client_mod.stream.alter(&client, namespace, stream, null, retention_age) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -1084,29 +1058,6 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    // Parse consumer group options
-    const mode_str = ctx.getString("mode") orelse "";
-    const ack_timeout = ctx.getChangedUint("ack-timeout");
-    const max_deliver = ctx.getChangedUint("max-deliver");
-    const redeliver_delay = ctx.getChangedUint("redeliver-delay");
-    const no_ack = ctx.getBool("no-ack");
-
-    // Parse new options
-    const max_standbys = ctx.getChangedUint("max-standbys");
-    const slots = ctx.getChangedUint("slots");
-
-    // Convert mode string to u8
-    const mode: ?u8 = if (std.mem.eql(u8, mode_str, "exclusive"))
-        1
-    else if (std.mem.eql(u8, mode_str, "key_shared"))
-        2
-    else if (std.mem.eql(u8, mode_str, "shared") or mode_str.len == 0)
-        null
-    else {
-        ctx.printErr("Error: --mode must be 'shared', 'exclusive', or 'key_shared'\n", .{});
-        return error.MissingRequiredArg;
-    };
-
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
@@ -1115,8 +1066,7 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // groupReadWithOptions(client, namespace, stream, group, consumer, limit, block_ms, opts)
-    var response = client_mod.stream.groupReadWithOptions(
+    var response = client_mod.stream.groupRead(
         &client,
         namespace,
         stream,
@@ -1124,15 +1074,6 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         consumer,
         @intCast(limit),
         if (block) |b| @intCast(b) else null,
-        .{
-            .mode = mode,
-            .max_standbys = if (max_standbys) |m| @intCast(m) else null,
-            .num_slots = if (slots) |s| @intCast(s) else null,
-            .ack_timeout_ms = if (ack_timeout) |t| @intCast(t) else null,
-            .max_deliver = if (max_deliver) |m| @intCast(m) else null,
-            .redelivery_delay_ms = if (redeliver_delay) |d| @intCast(d) else null,
-            .no_ack = no_ack,
-        },
     ) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
@@ -1494,7 +1435,6 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
-    const delay = ctx.getChangedUint("delay");
 
     // Parse StreamIDs for the wire protocol
     var ids: std.ArrayList(StreamID) = .empty;
@@ -1528,15 +1468,13 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // Use nackWithDelay to support optional redelivery delay
-    var response = client_mod.stream.groupNackWithDelay(
+    var response = client_mod.stream.groupNack(
         &client,
         namespace,
         stream,
         group,
         consumer,
         ids.items,
-        if (delay) |d| @intCast(d) else null,
     ) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
@@ -1579,7 +1517,6 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
-    const extend_ms = ctx.getChangedUint("extend");
 
     // Parse StreamIDs for the wire protocol
     var ids: std.ArrayList(StreamID) = .empty;
@@ -1620,7 +1557,6 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
         group,
         consumer,
         ids.items,
-        if (extend_ms) |ms| @intCast(ms) else null,
     ) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
@@ -1646,22 +1582,8 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    // Parse mode string to enum value
-    const mode_str = ctx.getString("mode") orelse "shared";
-    const mode: u8 = if (std.mem.eql(u8, mode_str, "exclusive"))
-        1
-    else if (std.mem.eql(u8, mode_str, "key_shared"))
-        2
-    else
-        0; // shared
-
-    const slots = @as(u16, @intCast(ctx.getUint("slots") orelse 256));
-    const max_standbys_raw = ctx.getUint("max-standbys") orelse 65535;
-    const max_standbys: ?u16 = if (max_standbys_raw == 65535) null else @as(u16, @intCast(max_standbys_raw));
     const ack_timeout = @as(u32, @intCast(ctx.getUint("ack-timeout") orelse 30000));
     const max_deliver = @as(u8, @intCast(ctx.getUint("max-deliver") orelse 10));
-    const redeliver_delay = @as(u32, @intCast(ctx.getUint("redeliver-delay") orelse 0));
-    const no_ack = ctx.getBool("no-ack");
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -1675,13 +1597,8 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
         .namespace = namespace,
         .stream = stream,
         .group = group,
-        .mode = mode,
-        .num_slots = slots,
-        .max_standbys = max_standbys,
         .ack_timeout_ms = ack_timeout,
         .max_deliver = max_deliver,
-        .redelivery_delay_ms = redeliver_delay,
-        .no_ack = no_ack,
     }) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
@@ -1694,9 +1611,9 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     }
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\",\"mode\":\"{s}\"}}\n", .{ group, stream, mode_str });
+        ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\"}}\n", .{ group, stream });
     } else {
-        ctx.print("Created consumer group '{s}' on stream '{s}' (mode: {s})\n", .{ group, stream, mode_str });
+        ctx.print("Created consumer group '{s}' on stream '{s}'\n", .{ group, stream });
     }
 }
 

@@ -665,10 +665,7 @@ pub const NamespaceHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *NamespaceHandler, req: Request) CommandResult {
-        // Check if system namespaces should be included
-        const include_system = req.value.len > 0 and req.value[0] != 0;
-        _ = include_system;
-
+        _ = req;
         const data = self.serializeNamespaceList() catch {
             return .{ .err = .{ .code = .internal_error, .message = "namespace list serialization failed" } };
         };

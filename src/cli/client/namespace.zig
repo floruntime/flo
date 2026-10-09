@@ -20,11 +20,10 @@ pub fn delete(client: *Client, name: []const u8, force: bool) !Response {
     return client.sendRequest(.namespace_delete, "", name, &value);
 }
 
-/// List all namespaces
-pub fn list(client: *Client, include_system: bool) !Response {
-    // namespace_list uses include_system flag in value field
-    const value: [1]u8 = .{if (include_system) 1 else 0};
-    return client.sendRequest(.namespace_list, "", "", &value);
+/// List all namespaces; value [limit:u32][cursor] like every list op.
+pub fn list(client: *Client) !Response {
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.namespace_list, "", "", try base.walkValue(&value_buf, null, null));
 }
 
 /// Get namespace info

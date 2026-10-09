@@ -133,7 +133,6 @@ pub const ProcessingHandler = struct {
 
         // Queue sink options
         queue_priority: u8 = 0, // message priority
-        queue_delay_ms: ?u64 = null, // optional visibility delay in ms
     };
 
     /// Per-job pipeline state: source/sink config + read cursor + operator chain.
@@ -1305,7 +1304,6 @@ pub const ProcessingHandler = struct {
                 .kv_write_mode = allocator.dupe(u8, if (snk.write_mode.len > 0) snk.write_mode else "upsert") catch "upsert",
                 .kv_ttl_ms = snk.ttl_ms,
                 .queue_priority = snk.priority,
-                .queue_delay_ms = snk.delay_ms,
             };
         }
 
@@ -1752,7 +1750,6 @@ pub const ProcessingHandler = struct {
         var opt_buf: [64]u8 = undefined;
         var ob = proto.OptionsBuilder.init(&opt_buf);
         if (snk.queue_priority > 0) ob.addU8(.priority, snk.queue_priority) catch {};
-        if (snk.queue_delay_ms) |d| ob.addU64(.delay_ms, d) catch {};
 
         const req = proto.Request{
             .header = makeSinkHeader(.queue_enqueue),

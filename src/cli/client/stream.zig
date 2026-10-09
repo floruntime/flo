@@ -267,18 +267,8 @@ pub fn list(
     limit: ?u32,
     cursor: ?[]const u8,
 ) !Response {
-    var options_buf: [64]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (limit) |l| {
-        try builder.addU32(.limit, l);
-    }
-
-    if (cursor) |c| {
-        try builder.addBytes(.cursor, c);
-    }
-
-    return client.sendRequestWithOptions(.stream_list, namespace, "", "", builder.getOptions());
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.stream_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }
 
 /// Join a consumer group
@@ -306,92 +296,17 @@ pub fn groupRead(
     count: ?u32,
     block_ms: ?u32,
 ) !Response {
-    return groupReadWithOptions(
-        client,
-        namespace,
-        stream,
-        group,
-        consumer,
-        count,
-        block_ms,
-        .{},
-    );
-}
-
-/// Consumer group read options
-pub const GroupReadOptions = struct {
-    /// Consumer group mode: 0=shared, 1=exclusive, 2=key_shared
-    mode: ?u8 = null,
-    /// Max standby consumers in exclusive mode (null=unlimited, 0=singleton)
-    max_standbys: ?u16 = null,
-    /// Number of hash slots for key_shared mode
-    num_slots: ?u16 = null,
-    /// Time before unacked message auto-redelivers (ms)
-    ack_timeout_ms: ?u32 = null,
-    /// Max delivery attempts before DLQ (0 = unlimited)
-    max_deliver: ?u8 = null,
-    /// Delay before NACK'd message becomes visible (ms)
-    redelivery_delay_ms: ?u32 = null,
-    /// Auto-ack on delivery (at-most-once)
-    no_ack: bool = false,
-};
-
-/// Read from a consumer group with advanced options
-pub fn groupReadWithOptions(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-    count: ?u32,
-    block_ms: ?u32,
-    opts: GroupReadOptions,
-) !Response {
-    var options_buf: [64]u8 = undefined;
+    var options_buf: [32]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (count) |c| {
-        try builder.addU32(.count, c);
-    }
-
+    if (count) |c| try builder.addU32(.count, c);
     if (block_ms) |ms| {
         try builder.addU32(.block_ms, ms);
         // Read for as long as the server waits, plus 5 s; 0 does not wait.
         if (ms > 0) client.setReadTimeoutSec(ms / 1000 + 5);
     }
-
-    if (opts.mode) |m| {
-        try builder.addU8(.subscription_mode, m);
-    }
-
-    if (opts.max_standbys) |m| {
-        try builder.addU16(.max_standbys, m);
-    }
-
-    if (opts.num_slots) |s| {
-        try builder.addU16(.num_slots, s);
-    }
-
-    if (opts.ack_timeout_ms) |ms| {
-        try builder.addU32(.ack_timeout_ms, ms);
-    }
-
-    if (opts.max_deliver) |m| {
-        try builder.addU8(.max_deliver, m);
-    }
-
-    if (opts.redelivery_delay_ms) |ms| {
-        try builder.addU32(.redelivery_delay_ms, ms);
-    }
-
-    if (opts.no_ack) {
-        try builder.addFlag(.no_ack);
-    }
-
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
     var writer = FixedWireWriter(512).init();
     try writer.writePair(u16, u16, group, consumer);
-
     return client.sendRequestWithOptions(.stream_group_read, namespace, stream, writer.bytes(), builder.getOptions());
 }
 
@@ -445,19 +360,6 @@ pub fn groupNack(
     consumer: []const u8,
     ids: []const StreamID,
 ) !Response {
-    return groupNackWithDelay(client, namespace, stream, group, consumer, ids, null);
-}
-
-/// Nack messages with optional redelivery delay
-pub fn groupNackWithDelay(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-    ids: []const StreamID,
-    redelivery_delay_ms: ?u32,
-) !Response {
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
     var writer = FixedWireWriter(ID_LIST_BYTES).init();
     try writer.writeLengthPrefixed(u16, group);
@@ -467,17 +369,8 @@ pub fn groupNackWithDelay(
         try writer.writeU64(id.timestamp_ms);
         try writer.writeU64(id.sequence);
     }
-
-    if (redelivery_delay_ms) |ms| {
-        var options_buf: [16]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        try builder.addU32(.redelivery_delay_ms, ms);
-        return client.sendRequestWithOptions(.stream_group_nack, namespace, stream, writer.bytes(), builder.getOptions());
-    }
-
     return client.sendRequest(.stream_group_nack, namespace, stream, writer.bytes());
 }
-
 /// Get pending messages for a consumer group
 pub fn groupPending(
     client: *Client,
@@ -557,13 +450,8 @@ pub const GroupCreateOptions = struct {
     namespace: []const u8,
     stream: []const u8,
     group: []const u8,
-    mode: u8 = 0, // 0=shared, 1=exclusive, 2=key_shared
-    num_slots: u16 = 256,
-    max_standbys: ?u16 = null,
     ack_timeout_ms: u32 = 30_000,
     max_deliver: u8 = 10,
-    redelivery_delay_ms: u32 = 0,
-    no_ack: bool = false,
 };
 
 /// Create a consumer group with configuration
@@ -576,32 +464,11 @@ pub fn groupCreate(client: *Client, opts: GroupCreateOptions) !Response {
     var options_buf: [64]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
-    // Mode
-    try builder.addU8(.subscription_mode, opts.mode);
-
-    // num_slots
-    try builder.addU16(.num_slots, opts.num_slots);
-
-    // max_standbys (only if not unlimited)
-    if (opts.max_standbys) |ms| {
-        try builder.addU16(.max_standbys, ms);
-    }
-
     // ack_timeout_ms
     try builder.addU32(.ack_timeout_ms, opts.ack_timeout_ms);
 
     // max_deliver
     try builder.addU8(.max_deliver, opts.max_deliver);
-
-    // redelivery_delay_ms
-    if (opts.redelivery_delay_ms > 0) {
-        try builder.addU32(.redelivery_delay_ms, opts.redelivery_delay_ms);
-    }
-
-    // no_ack
-    if (opts.no_ack) {
-        try builder.addFlag(.no_ack);
-    }
 
     return client.sendRequestWithOptions(
         .stream_group_create,
@@ -641,7 +508,6 @@ pub fn groupTouch(
     group: []const u8,
     consumer: []const u8,
     ids: []const StreamID,
-    extend_ms: ?u32,
 ) !TouchResult {
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
     var writer = FixedWireWriter(ID_LIST_BYTES).init();
@@ -652,15 +518,7 @@ pub fn groupTouch(
         try writer.writeU64(id.sequence);
     }
 
-    var response: Response = undefined;
-    if (extend_ms) |ms| {
-        var options_buf: [16]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        try builder.addU32(.extend_ack_ms, ms);
-        response = try client.sendRequestWithOptions(.stream_group_touch, namespace, stream, writer.bytes(), builder.getOptions());
-    } else {
-        response = try client.sendRequest(.stream_group_touch, namespace, stream, writer.bytes());
-    }
+    var response = try client.sendRequest(.stream_group_touch, namespace, stream, writer.bytes());
     defer response.deinit();
 
     if (response.isError()) {
@@ -685,7 +543,6 @@ pub fn create(
     partition_count: u32,
     retention_count: ?u64,
     retention_age: ?u64,
-    retention_bytes: ?u64,
 ) !Response {
     var writer = FixedWireWriter(128).init();
     try writer.writeU32(partition_count);
@@ -694,13 +551,9 @@ pub fn create(
     var options_buf: [32]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
-    if (retention_count) |rc| {
-        try builder.addU64(.retention_count, rc);
-    } else if (retention_age) |ra| {
-        try builder.addU64(.retention_age, ra);
-    } else if (retention_bytes) |rb| {
-        try builder.addU64(.retention_bytes, rb);
-    }
+    // Each bound given is sent; the server enforces both.
+    if (retention_count) |rc| try builder.addU64(.retention_count, rc);
+    if (retention_age) |ra| try builder.addU64(.retention_age, ra);
 
     const options: []const u8 = builder.getOptions();
 
@@ -714,19 +567,14 @@ pub fn alter(
     stream: []const u8,
     retention_count: ?u64,
     retention_age: ?u64,
-    retention_bytes: ?u64,
 ) !Response {
     // Build options for retention policies using TLV OptionsBuilder
     var options_buf: [32]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
-    if (retention_count) |rc| {
-        try builder.addU64(.retention_count, rc);
-    } else if (retention_age) |ra| {
-        try builder.addU64(.retention_age, ra);
-    } else if (retention_bytes) |rb| {
-        try builder.addU64(.retention_bytes, rb);
-    }
+    // Each bound given is sent; the server enforces both.
+    if (retention_count) |rc| try builder.addU64(.retention_count, rc);
+    if (retention_age) |ra| try builder.addU64(.retention_age, ra);
 
     const options: []const u8 = builder.getOptions();
 

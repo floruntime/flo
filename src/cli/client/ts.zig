@@ -142,6 +142,13 @@ pub fn list(
     limit: ?u32,
     cursor: ?[]const u8,
 ) !Response {
+    // With no measurement this is a list across shards, whose value is
+    // [limit:u32][cursor] like every list op; a measurement's series list
+    // takes the cursor as the value and the limit as an option.
+    if (measurement.len == 0) {
+        var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+        return client.sendRequest(.ts_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
+    }
     var options_buf: [64]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 

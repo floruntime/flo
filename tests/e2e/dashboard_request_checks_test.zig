@@ -189,7 +189,7 @@ test "e2e/dashboard: a body past the limit is refused whole, never stored cut sh
     const answer = try rawRequest(port, head);
     defer testing.allocator.free(answer);
     try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 413"));
-    const result = try ctx.execCapture(&.{ "queue", "dequeue", "big", "--timeout", "100" });
+    const result = try ctx.execCapture(&.{ "queue", "dequeue", "big" });
     try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
 }
 
@@ -252,6 +252,6 @@ test "e2e/dashboard: a body framed other than by Content-Length is refused, neve
     const answer = try rawRequest(port, chunked);
     defer testing.allocator.free(answer);
     try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 501"));
-    const result = try ctx.execCapture(&.{ "queue", "dequeue", "tq", "--timeout", "100" });
+    const result = try ctx.execCapture(&.{ "queue", "dequeue", "tq" });
     try testing.expect(std.mem.indexOf(u8, result, "(no messages)") != null);
 }

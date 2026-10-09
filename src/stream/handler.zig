@@ -846,6 +846,7 @@ pub const StreamHandler = struct {
     }
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
+        if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
         // Register the stream name for listing (namespace-qualified)
         if (req.key.len > 0) {
             var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -899,6 +900,7 @@ pub const StreamHandler = struct {
         };
 
         // Parse retention options from TLV
+        if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
         const retention = parseRetentionOptions(req);
 
         // Merge: keep existing partition_count and name_hash, update retention
@@ -912,6 +914,10 @@ pub const StreamHandler = struct {
 
         return .ok;
     }
+
+    /// Retention enforces age and count only; a byte bound would be stored
+    /// and never applied.
+    const BYTE_RETENTION_REFUSAL: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream retention by bytes is not supported; use retention_age or retention_count" } };
 
     /// Parse retention TLV options from a request.
     fn parseRetentionOptions(req: Request) struct { age_s: u64, count: u64, bytes: u64 } {
@@ -2867,6 +2873,30 @@ test "stream handler: create is ok (implicit)" {
     const result = handler.handleCommand(makeRequest(.stream_create, "new_stream", "", ""));
     switch (result) {
         .ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stream handler: byte retention is refused, and a refused create registers nothing" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.retention_bytes, 1024);
+    switch (handler.handleCommand(makeRequest(.stream_create, "sized", "", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(handler.stream.stream_metadata.get("sized") == null);
+
+    _ = handler.handleCommand(makeRequest(.stream_create, "sized", "", ""));
+    switch (handler.handleCommand(makeRequest(.stream_alter, "sized", "", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
         else => return error.TestUnexpectedResult,
     }
 }

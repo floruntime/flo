@@ -153,7 +153,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .arg("task_types", "Task types to wait for")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .uintFlag("block", 'b', 5000, "Block for tasks (ms, at most 300000; 0 = don't wait)")
-                .uintFlag("timeout", 't', 30000, "Visibility timeout (ms)")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerAwait)),
@@ -667,7 +666,6 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
     };
 
     const block = ctx.getUint("block") orelse 5000;
-    const timeout = ctx.getUint("timeout") orelse 30000;
     const namespace = ctx.getString("namespace") orelse "default";
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -679,9 +677,8 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // workerAwait(client, namespace, worker_id, task_types, block_ms, timeout_ms, max_tasks)
     const task_types = &[_][]const u8{task_types_str};
-    var result = client_mod.action.workerAwait(&client, namespace, worker_id, task_types, @intCast(block), @intCast(timeout), null) catch |err| {
+    var result = client_mod.action.workerAwait(&client, namespace, worker_id, task_types, @intCast(block)) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
