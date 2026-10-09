@@ -3981,6 +3981,53 @@ test "workflow handler: a re-created trigger keeps its cursor on the same stream
     try testing.expectEqual(@as(u64, 0), moved.stream_cursor_seq);
 }
 
+test "workflow handler: a trigger cursor restored inside an append resumes with its next record" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    handler.registerStreamTrigger("ns", "wf", .{ .stream = "events" });
+
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+    var streams = StreamHandler.init(allocator, &partition);
+    defer streams.deinit();
+
+    // One append of five records: [count:u32]([len:u32][payload][hdr:u16])*
+    var blob: [4 + 5 * 7]u8 = undefined;
+    std.mem.writeInt(u32, blob[0..4], 5, .little);
+    for (0..5) |i| {
+        std.mem.writeInt(u32, blob[4 + i * 7 ..][0..4], 1, .little);
+        blob[4 + i * 7 + 4] = @intCast('a' + i);
+        std.mem.writeInt(u16, blob[4 + i * 7 + 5 ..][0..2], 0, .little);
+    }
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.op_code = @intFromEnum(proto.OpCode.stream_append);
+    _ = streams.handleCommand(.{ .header = header, .namespace = "ns", .key = "events", .value = &blob, .options = "" });
+
+    const all = streams.readPayloadsForStream("events", "ns", StreamID.MIN, 100);
+    defer allocator.free(all.payloads);
+    defer allocator.free(all.ids);
+    try testing.expectEqual(@as(usize, 5), all.payloads.len);
+
+    // Replay restored the run record "b" started: its id is the cursor.
+    var idem_buf: [96]u8 = undefined;
+    const idem = try std.fmt.bufPrint(&idem_buf, "trigger:events@{d}:{d}", .{ all.ids[1].timestamp_ms, all.ids[1].sequence });
+    handler.restoreTriggerCursor("ns", "wf", idem);
+    const t = handler.stream_triggers.getPtr("ns:wf").?;
+    const cursor = StreamID{ .timestamp_ms = t.stream_cursor_ts, .sequence = t.stream_cursor_seq };
+    try testing.expect(cursor.eql(all.ids[1]));
+
+    // The next poll reads c, d, e: the rest of that append, nothing skipped.
+    const rest = streams.readPayloadsForStream("events", "ns", cursor, 100);
+    defer allocator.free(rest.payloads);
+    defer allocator.free(rest.ids);
+    try testing.expectEqual(@as(usize, 3), rest.payloads.len);
+    for (rest.payloads, "cde") |p, want| try testing.expectEqual(want, p[0]);
+}
+
 // ── Step Executor Tests ─────────────────────────────────────────────────
 
 /// Minimal 2-step workflow: start → step_b → flo.Completed
