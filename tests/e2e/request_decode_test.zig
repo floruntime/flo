@@ -65,8 +65,6 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
         .{ .name = "json_set", .op = .kv_json_set, .key = "k", .value = &.{ 0xfe, 0xff }, .status = .bad_request },
         // An unknown worker type.
         .{ .name = "worker", .op = .worker_register, .key = "w", .value = &.{2}, .status = .bad_request },
-        // One setting with an unknown tag.
-        .{ .name = "config", .op = .namespace_config_set, .key = "default", .value = &.{ 1, 8 }, .status = .bad_request },
         .{ .name = "info", .op = .namespace_info, .key = "a" ** 129, .value = "", .status = .bad_request },
     };
     var out: [4096]u8 = undefined;
@@ -77,6 +75,20 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
         };
         if (r.status != @intFromEnum(c.status)) std.debug.print("case {s}: status {d} {s}\n", .{ c.name, r.status, r.data });
         try testing.expectEqual(@intFromEnum(c.status), r.status);
+    }
+    try alive(ctx);
+}
+
+test "e2e/decode: namespace settings are refused with their reason, and the node keeps serving" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var out: [512]u8 = undefined;
+    // A block the old settings format would have applied: queue_max_lease_s=60.
+    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }) |op| {
+        const r = try rawCall(ctx, op, "", "default", &.{ 1, 6, 60, 0, 0, 0 }, &out);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqualStrings("namespace settings aren't supported yet: none would take effect", r.data);
     }
     try alive(ctx);
 }

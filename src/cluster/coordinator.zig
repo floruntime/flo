@@ -58,17 +58,10 @@ pub const MAX_NODES: usize = 64;
 // Metadata Types
 // =============================================================================
 
-/// Namespace configuration — registry entry + admin-configurable settings.
-/// Stored by the Controller Raft, replicated to all nodes, snapshotted.
-///
-/// Registry fields (name, partition_count, etc.) are set at creation time.
-/// Settings fields (nullable) are admin-settable via `namespace_config_set`.
-/// They are stored, replicated and reported, but nothing enforces them yet:
-/// the KV, stream and queue projections run on their own defaults.
+/// A namespace's registry entry. Stored by the Controller Raft, replicated to
+/// all nodes, snapshotted. Every field is set at creation.
 pub const NamespaceConfig = struct {
-    // ── Registry fields (set at creation) ───────────────────────────────
-
-    /// Namespace name (owned by coordinator, "" for update-only instances)
+    /// Namespace name (owned by coordinator)
     name: []const u8 = "",
     /// Number of partitions for this namespace
     partition_count: u16 = 0,
@@ -78,173 +71,6 @@ pub const NamespaceConfig = struct {
     created_at_ns: u64 = 0,
     /// Whether the namespace is being deleted (tombstone)
     deleted: bool = false,
-
-    // ── Admin-configurable settings ─────────────────────────────────────
-
-    /// Max version entries kept in KV projection memory per key.
-    kv_max_hot_versions: ?u32 = null,
-    /// Auto-expire historical versions older than this (seconds).
-    kv_version_ttl_s: ?u64 = null,
-    /// Max stream size in bytes per stream.
-    stream_retention_bytes: ?u64 = null,
-    /// Max age of stream messages (seconds).
-    stream_retention_s: ?u64 = null,
-    /// Dead-letter queue capacity per queue.
-    queue_max_dlq_size: ?u32 = null,
-    /// Max lease hold time for queue messages (seconds).
-    queue_max_lease_s: ?u32 = null,
-
-    // ── Settings TLV serialization ──────────────────────────────────────
-
-    /// Setting tags for TLV serialization of configurable fields.
-    pub const SettingsTag = enum(u8) {
-        kv_max_hot_versions = 1,
-        kv_version_ttl_s = 2,
-        stream_retention_bytes = 3,
-        stream_retention_s = 4,
-        queue_max_dlq_size = 5,
-        queue_max_lease_s = 6,
-        _,
-    };
-
-    /// Count byte plus every setting at its widest (tag + u64).
-    pub const MAX_SETTINGS_SIZE: usize = 1 + 6 * 9;
-
-    /// Returns true if all configurable settings are null (no overrides).
-    pub fn settingsEmpty(self: NamespaceConfig) bool {
-        return self.kv_max_hot_versions == null and
-            self.kv_version_ttl_s == null and
-            self.stream_retention_bytes == null and
-            self.stream_retention_s == null and
-            self.queue_max_dlq_size == null and
-            self.queue_max_lease_s == null;
-    }
-
-    /// Merge configurable settings from `other` into self.
-    /// Non-null fields in `other` overwrite self.
-    pub fn mergeSettings(self: *NamespaceConfig, other: NamespaceConfig) void {
-        if (other.kv_max_hot_versions) |v| self.kv_max_hot_versions = v;
-        if (other.kv_version_ttl_s) |v| self.kv_version_ttl_s = v;
-        if (other.stream_retention_bytes) |v| self.stream_retention_bytes = v;
-        if (other.stream_retention_s) |v| self.stream_retention_s = v;
-        if (other.queue_max_dlq_size) |v| self.queue_max_dlq_size = v;
-        if (other.queue_max_lease_s) |v| self.queue_max_lease_s = v;
-    }
-
-    /// Serialize configurable settings to TLV format: [count:u8] ([tag:u8][value:u32/u64])*
-    /// Returns number of bytes written.
-    pub fn serializeSettings(self: NamespaceConfig, buf: []u8) usize {
-        var count: u8 = 0;
-        var pos: usize = 1; // reserve byte 0 for count
-
-        if (self.kv_max_hot_versions) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.kv_max_hot_versions);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], v, .little);
-            pos += 4;
-            count += 1;
-        }
-        if (self.kv_version_ttl_s) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.kv_version_ttl_s);
-            pos += 1;
-            std.mem.writeInt(u64, buf[pos..][0..8], v, .little);
-            pos += 8;
-            count += 1;
-        }
-        if (self.stream_retention_bytes) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.stream_retention_bytes);
-            pos += 1;
-            std.mem.writeInt(u64, buf[pos..][0..8], v, .little);
-            pos += 8;
-            count += 1;
-        }
-        if (self.stream_retention_s) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.stream_retention_s);
-            pos += 1;
-            std.mem.writeInt(u64, buf[pos..][0..8], v, .little);
-            pos += 8;
-            count += 1;
-        }
-        if (self.queue_max_dlq_size) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.queue_max_dlq_size);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], v, .little);
-            pos += 4;
-            count += 1;
-        }
-        if (self.queue_max_lease_s) |v| {
-            buf[pos] = @intFromEnum(SettingsTag.queue_max_lease_s);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], v, .little);
-            pos += 4;
-            count += 1;
-        }
-
-        buf[0] = count;
-        return pos;
-    }
-
-    /// Decodes exactly one TLV block of distinct, known tags into a NamespaceConfig
-    /// with only settings populated, and refuses anything else rather than reading
-    /// part of it: a client must never be told a setting was applied when the
-    /// server dropped it.
-    pub fn deserializeSettings(data: []const u8) error{InvalidSettings}!NamespaceConfig {
-        var s: NamespaceConfig = .{};
-        if (data.len == 0) return s;
-
-        const count = data[0];
-        var pos: usize = 1;
-        comptime for (std.meta.fields(SettingsTag)) |f| std.debug.assert(f.value < 64);
-        var seen: u64 = 0;
-
-        for (0..count) |_| {
-            if (pos >= data.len) return error.InvalidSettings;
-            const tag: SettingsTag = @enumFromInt(data[pos]);
-            pos += 1;
-            // Unknown tags skip this and are refused by the switch.
-            if (@intFromEnum(tag) < 64) {
-                const bit = @as(u64, 1) << @intCast(@intFromEnum(tag));
-                if (seen & bit != 0) return error.InvalidSettings;
-                seen |= bit;
-            }
-            switch (tag) {
-                .kv_max_hot_versions => {
-                    if (pos + 4 > data.len) return error.InvalidSettings;
-                    s.kv_max_hot_versions = std.mem.readInt(u32, data[pos..][0..4], .little);
-                    pos += 4;
-                },
-                .kv_version_ttl_s => {
-                    if (pos + 8 > data.len) return error.InvalidSettings;
-                    s.kv_version_ttl_s = std.mem.readInt(u64, data[pos..][0..8], .little);
-                    pos += 8;
-                },
-                .stream_retention_bytes => {
-                    if (pos + 8 > data.len) return error.InvalidSettings;
-                    s.stream_retention_bytes = std.mem.readInt(u64, data[pos..][0..8], .little);
-                    pos += 8;
-                },
-                .stream_retention_s => {
-                    if (pos + 8 > data.len) return error.InvalidSettings;
-                    s.stream_retention_s = std.mem.readInt(u64, data[pos..][0..8], .little);
-                    pos += 8;
-                },
-                .queue_max_dlq_size => {
-                    if (pos + 4 > data.len) return error.InvalidSettings;
-                    s.queue_max_dlq_size = std.mem.readInt(u32, data[pos..][0..4], .little);
-                    pos += 4;
-                },
-                .queue_max_lease_s => {
-                    if (pos + 4 > data.len) return error.InvalidSettings;
-                    s.queue_max_lease_s = std.mem.readInt(u32, data[pos..][0..4], .little);
-                    pos += 4;
-                },
-                _ => return error.InvalidSettings,
-            }
-        }
-
-        if (pos != data.len) return error.InvalidSettings;
-        return s;
-    }
 };
 
 /// A partition assignment: which node owns which partition
@@ -289,7 +115,6 @@ pub const NodeStatus = enum(u8) {
 pub const MetadataCommand = union(CommandTag) {
     create_namespace: CreateNamespace,
     delete_namespace: DeleteNamespace,
-    update_namespace_config: UpdateNamespaceConfig,
     assign_partition: AssignPartition,
     add_node: AddNode,
     remove_node: RemoveNode,
@@ -298,7 +123,6 @@ pub const MetadataCommand = union(CommandTag) {
     pub const CommandTag = enum(u8) {
         create_namespace = 0x01,
         delete_namespace = 0x02,
-        update_namespace_config = 0x03,
         assign_partition = 0x10,
         add_node = 0x20,
         remove_node = 0x21,
@@ -315,12 +139,6 @@ pub const MetadataCommand = union(CommandTag) {
     pub const DeleteNamespace = struct {
         name_len: u16,
         // followed by name bytes
-    };
-
-    pub const UpdateNamespaceConfig = struct {
-        name_len: u16,
-        settings_len: u16,
-        // followed by name bytes, then settings TLV bytes
     };
 
     pub const AssignPartition = struct {
@@ -497,35 +315,6 @@ pub const Coordinator = struct {
         return self.raft.propose(.raft_config, 0, 0, buf);
     }
 
-    /// Propose updating namespace settings (admin-only)
-    pub fn proposeUpdateNamespaceConfig(
-        self: *Coordinator,
-        name: []const u8,
-        config: NamespaceConfig,
-    ) !raft_node.ProposeResult {
-        if (!self.is_leader) return error.NotLeader;
-        if (name.len > 255) return error.NameTooLong;
-
-        // Serialize settings to temporary buffer
-        var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-        const settings_len = config.serializeSettings(&settings_buf);
-
-        // tag(1) + name_len(2) + settings_len(2) + name + settings
-        const payload_len = 1 + 2 + 2 + name.len + settings_len;
-        const buf = try self.allocator.alloc(u8, payload_len);
-        defer self.allocator.free(buf);
-
-        buf[0] = @intFromEnum(MetadataCommand.CommandTag.update_namespace_config);
-        std.mem.writeInt(u16, buf[1..3], @intCast(name.len), .little);
-        std.mem.writeInt(u16, buf[3..5], @intCast(settings_len), .little);
-        @memcpy(buf[5..][0..name.len], name);
-        @memcpy(buf[5 + name.len ..][0..settings_len], settings_buf[0..settings_len]);
-
-        self.proposals_total += 1;
-        log.debug("Coordinator: proposing update namespace config={s}", .{name});
-        return self.raft.propose(.raft_config, 0, 0, buf);
-    }
-
     /// Propose adding a node to the cluster
     pub fn proposeAddNode(
         self: *Coordinator,
@@ -632,11 +421,15 @@ pub const Coordinator = struct {
         const payload = entry.payload;
         if (payload.len == 0) return;
 
-        const tag: MetadataCommand.CommandTag = @enumFromInt(payload[0]);
+        // A tag this build doesn't know (0x03 once carried namespace settings)
+        // is skipped rather than crashing the node.
+        const tag = std.enums.fromInt(MetadataCommand.CommandTag, payload[0]) orelse {
+            log.warn("Coordinator: skipped an entry with unknown command tag 0x{x:0>2}", .{payload[0]});
+            return;
+        };
         switch (tag) {
             .create_namespace => try self.applyCreateNamespace(payload[1..]),
             .delete_namespace => try self.applyDeleteNamespace(payload[1..]),
-            .update_namespace_config => try self.applyUpdateNamespaceConfig(payload[1..]),
             .assign_partition => {}, // Applied in Phase 7.2
             .add_node => try self.applyAddNode(payload[1..]),
             .remove_node => try self.applyRemoveNode(payload[1..]),
@@ -680,25 +473,6 @@ pub const Coordinator = struct {
 
         if (self.namespaces.getPtr(hash)) |ns| {
             ns.deleted = true;
-        }
-    }
-
-    fn applyUpdateNamespaceConfig(self: *Coordinator, data: []const u8) !void {
-        if (data.len < 4) return;
-        const name_len = std.mem.readInt(u16, data[0..2], .little);
-        const settings_len = std.mem.readInt(u16, data[2..4], .little);
-        if (data.len < 4 + name_len + settings_len) return;
-
-        const name = data[4..][0..name_len];
-        const hash = hashNamespace(name);
-
-        if (self.namespaces.getPtr(hash)) |ns| {
-            const settings = NamespaceConfig.deserializeSettings(data[4 + name_len ..][0..settings_len]) catch {
-                log.err("Coordinator: dropped undecodable config update for namespace={s}", .{name});
-                return;
-            };
-            ns.mergeSettings(settings);
-            log.debug("Coordinator: updated namespace config={s}", .{name});
         }
     }
 
@@ -748,21 +522,6 @@ pub const Coordinator = struct {
         return self.namespaces.get(hashNamespace(name));
     }
 
-    /// Get namespace settings by name (returns default config if namespace not found)
-    pub fn getNamespaceSettings(self: *const Coordinator, name: []const u8) NamespaceConfig {
-        if (self.namespaces.get(hashNamespace(name))) |ns| {
-            return .{
-                .kv_max_hot_versions = ns.kv_max_hot_versions,
-                .kv_version_ttl_s = ns.kv_version_ttl_s,
-                .stream_retention_bytes = ns.stream_retention_bytes,
-                .stream_retention_s = ns.stream_retention_s,
-                .queue_max_dlq_size = ns.queue_max_dlq_size,
-                .queue_max_lease_s = ns.queue_max_lease_s,
-            };
-        }
-        return .{};
-    }
-
     /// Get node info by id
     pub fn getNode(self: *const Coordinator, nid: NodeId) ?NodeInfo {
         return self.nodes.get(nid);
@@ -795,13 +554,16 @@ pub const Coordinator = struct {
 
     // ── Snapshot ────────────────────────────────────────────────────────
 
+    /// Bumped with every layout change: a snapshot of another layout is refused, not misread.
+    const SNAPSHOT_VERSION: u8 = 3;
+
     /// Serialize coordinator state for snapshot transfer
     pub fn takeSnapshot(self: *const Coordinator, allocator: Allocator) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
-        // Format v2: version(1) + ns_count(4) + [ns entries with settings] + node_count(4) + [node entries]
-        try buf.append(allocator, 2); // version 2 — includes settings
+        // version(1) + ns_count(4) + [ns entries] + node_count(4) + [node entries]
+        try buf.append(allocator, SNAPSHOT_VERSION);
 
         // Namespaces
         const ns_count: u32 = self.namespaces.count();
@@ -811,7 +573,7 @@ pub const Coordinator = struct {
         var ns_iter = self.namespaces.iterator();
         while (ns_iter.next()) |entry| {
             const ns = entry.value_ptr;
-            // hash(4) + name_len(2) + partition_count(2) + repl(1) + deleted(1) + name + settings_len(2) + settings
+            // hash(4) + name_len(2) + partition_count(2) + repl(1) + deleted(1) + name
             const hash_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, entry.key_ptr.*));
             try buf.appendSlice(allocator, &hash_bytes);
             const nlen: u16 = @intCast(ns.name.len);
@@ -822,13 +584,6 @@ pub const Coordinator = struct {
             try buf.append(allocator, ns.replication_factor);
             try buf.append(allocator, if (ns.deleted) @as(u8, 1) else 0);
             try buf.appendSlice(allocator, ns.name);
-
-            // Serialize settings
-            var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-            const slen = ns.serializeSettings(&settings_buf);
-            const slen_bytes = std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, @intCast(slen))));
-            try buf.appendSlice(allocator, &slen_bytes);
-            try buf.appendSlice(allocator, settings_buf[0..slen]);
         }
 
         // Nodes
@@ -857,7 +612,7 @@ pub const Coordinator = struct {
     pub fn restoreSnapshot(self: *Coordinator, data: []const u8) !void {
         if (data.len < 1) return error.InvalidSnapshot;
         const version = data[0];
-        if (version != 2) return error.UnsupportedVersion;
+        if (version != SNAPSHOT_VERSION) return error.UnsupportedVersion;
         var pos: usize = 1;
 
         // Clear existing state
@@ -891,21 +646,13 @@ pub const Coordinator = struct {
             errdefer self.allocator.free(name);
             pos += nlen;
 
-            // Deserialize settings
-            if (pos + 2 > data.len) return error.InvalidSnapshot;
-            const slen = std.mem.readInt(u16, data[pos..][0..2], .little);
-            pos += 2;
-            if (pos + slen > data.len) return error.InvalidSnapshot;
-            var ns_config = NamespaceConfig.deserializeSettings(data[pos..][0..slen]) catch return error.InvalidSnapshot;
-            pos += slen;
-
-            ns_config.name = name;
-            ns_config.partition_count = pc;
-            ns_config.replication_factor = repl;
-            ns_config.created_at_ns = 0;
-            ns_config.deleted = deleted;
-
-            try self.namespaces.put(self.allocator, hash, ns_config);
+            try self.namespaces.put(self.allocator, hash, .{
+                .name = name,
+                .partition_count = pc,
+                .replication_factor = repl,
+                .created_at_ns = 0,
+                .deleted = deleted,
+            });
         }
 
         // Read nodes
@@ -1168,192 +915,14 @@ test "Coordinator multiple namespaces" {
     try testing.expect(coord.getNamespace("ns4") == null);
 }
 
-test "NamespaceConfig settings serialize/deserialize roundtrip" {
-    const original = NamespaceConfig{
-        .kv_max_hot_versions = 50,
-        .kv_version_ttl_s = 3600,
-        .stream_retention_bytes = 1_073_741_824,
-        .stream_retention_s = 86400,
-        .queue_max_dlq_size = 500,
-        .queue_max_lease_s = 60,
-    };
 
-    var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-    const len = original.serializeSettings(&buf);
-    try testing.expect(len > 0);
-
-    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expectEqual(original.kv_max_hot_versions, result.kv_max_hot_versions);
-    try testing.expectEqual(original.kv_version_ttl_s, result.kv_version_ttl_s);
-    try testing.expectEqual(original.stream_retention_bytes, result.stream_retention_bytes);
-    try testing.expectEqual(original.stream_retention_s, result.stream_retention_s);
-    try testing.expectEqual(original.queue_max_dlq_size, result.queue_max_dlq_size);
-    try testing.expectEqual(original.queue_max_lease_s, result.queue_max_lease_s);
-}
-
-test "NamespaceConfig settings serialize/deserialize partial" {
-    const original = NamespaceConfig{
-        .kv_max_hot_versions = 100,
-        .stream_retention_s = 7200,
-    };
-
-    var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-    const len = original.serializeSettings(&buf);
-
-    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expectEqual(@as(?u32, 100), result.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 7200), result.stream_retention_s);
-    try testing.expectEqual(@as(?u64, null), result.kv_version_ttl_s);
-    try testing.expectEqual(@as(?u64, null), result.stream_retention_bytes);
-    try testing.expectEqual(@as(?u32, null), result.queue_max_dlq_size);
-    try testing.expectEqual(@as(?u32, null), result.queue_max_lease_s);
-}
-
-test "NamespaceConfig settings empty roundtrip" {
-    const original = NamespaceConfig{};
-    try testing.expect(original.settingsEmpty());
-
-    var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-    const len = original.serializeSettings(&buf);
-    try testing.expectEqual(@as(usize, 1), len); // just the count byte = 0
-
-    const result = try NamespaceConfig.deserializeSettings(buf[0..len]);
-    try testing.expect(result.settingsEmpty());
-}
-
-test "NamespaceConfig settings refuse anything but a well-formed block of known tags" {
-    const lease = @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s);
-    const ttl = @intFromEnum(NamespaceConfig.SettingsTag.kv_version_ttl_s);
-    const bad = [_][]const u8{
-        // 7 is the first unassigned tag; 0 is not a tag either.
-        &.{ 1, 7, 0, 0, 0, 64, 0, 0, 0, 0 },
-        &.{ 1, 0 },
-        // Value shorter than its tag's width.
-        &.{ 1, ttl, 1, 2 },
-        // Count promises more entries than the block holds.
-        &.{2},
-        // Bytes past the counted entries.
-        &.{ 1, lease, 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 },
-        // The same setting twice.
-        &.{ 2, lease, 60, 0, 0, 0, lease, 90, 0, 0, 0 },
-    };
-    for (bad) |data| {
-        try testing.expectError(error.InvalidSettings, NamespaceConfig.deserializeSettings(data));
-    }
-
-    const good = try NamespaceConfig.deserializeSettings(&.{ 1, lease, 60, 0, 0, 0 });
-    try testing.expectEqual(@as(?u32, 60), good.queue_max_lease_s);
-}
-
-test "NamespaceConfig settings merge" {
-    var base = NamespaceConfig{
-        .kv_max_hot_versions = 50,
-        .stream_retention_s = 3600,
-    };
-
-    const update = NamespaceConfig{
-        .kv_max_hot_versions = 100,
-        .queue_max_dlq_size = 200,
-    };
-
-    base.mergeSettings(update);
-    try testing.expectEqual(@as(?u32, 100), base.kv_max_hot_versions); // overwritten
-    try testing.expectEqual(@as(?u64, 3600), base.stream_retention_s); // preserved
-    try testing.expectEqual(@as(?u32, 200), base.queue_max_dlq_size); // newly set
-    try testing.expectEqual(@as(?u64, null), base.kv_version_ttl_s); // still null
-}
-
-test "Coordinator update namespace config" {
-    const allocator = testing.allocator;
-    var coord = try Coordinator.init(allocator, 1, .{});
+test "Coordinator skips a command tag it doesn't know and applies the next" {
+    var coord = try Coordinator.init(testing.allocator, 1, .{});
     defer coord.deinit();
-
     try coord.bootstrap();
 
-    _ = try coord.proposeCreateNamespace("events", 8, 3);
+    _ = try coord.raft.propose(.raft_config, 0, 0, &.{ 0x03, 3, 0, 0, 0, 'o', 'l', 'd' });
+    _ = try coord.proposeCreateNamespace("after", 4, 1);
     _ = try coord.applyCommitted();
-
-    // Update config
-    const config = NamespaceConfig{ .kv_max_hot_versions = 50, .stream_retention_s = 86400 };
-    _ = try coord.proposeUpdateNamespaceConfig("events", config);
-    _ = try coord.applyCommitted();
-
-    const retrieved = coord.getNamespaceSettings("events");
-    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 86400), retrieved.stream_retention_s);
-    try testing.expectEqual(@as(?u64, null), retrieved.kv_version_ttl_s);
-}
-
-test "Coordinator update namespace config merge" {
-    const allocator = testing.allocator;
-    var coord = try Coordinator.init(allocator, 1, .{});
-    defer coord.deinit();
-
-    try coord.bootstrap();
-
-    _ = try coord.proposeCreateNamespace("app", 4, 1);
-    _ = try coord.applyCommitted();
-
-    // Set initial config
-    _ = try coord.proposeUpdateNamespaceConfig("app", .{ .kv_max_hot_versions = 50 });
-    _ = try coord.applyCommitted();
-
-    // Merge additional settings
-    _ = try coord.proposeUpdateNamespaceConfig("app", .{ .queue_max_dlq_size = 200 });
-    _ = try coord.applyCommitted();
-
-    const retrieved = coord.getNamespaceSettings("app");
-    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions); // preserved
-    try testing.expectEqual(@as(?u32, 200), retrieved.queue_max_dlq_size); // newly set
-}
-
-test "Coordinator snapshot roundtrip with settings" {
-    const allocator = testing.allocator;
-    var coord = try Coordinator.init(allocator, 1, .{});
-    defer coord.deinit();
-
-    try coord.bootstrap();
-
-    _ = try coord.proposeCreateNamespace("events", 8, 3);
-    _ = try coord.proposeCreateNamespace("logs", 4, 1);
-    _ = try coord.applyCommitted();
-
-    // Set config on events
-    _ = try coord.proposeUpdateNamespaceConfig("events", .{
-        .kv_max_hot_versions = 100,
-        .stream_retention_bytes = 4_294_967_296,
-    });
-    _ = try coord.applyCommitted();
-
-    // Take snapshot
-    const snapshot = try coord.takeSnapshot(allocator);
-    defer allocator.free(snapshot);
-
-    // Restore into a new coordinator
-    var coord2 = try Coordinator.init(allocator, 1, .{});
-    defer coord2.deinit();
-
-    try coord2.restoreSnapshot(snapshot);
-    try testing.expectEqual(@as(u32, 2), coord2.namespaceCount());
-
-    // Verify settings survived the roundtrip
-    const settings = coord2.getNamespaceSettings("events");
-    try testing.expectEqual(@as(?u32, 100), settings.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 4_294_967_296), settings.stream_retention_bytes);
-    try testing.expectEqual(@as(?u64, null), settings.stream_retention_s);
-
-    // logs should have empty settings
-    const log_settings = coord2.getNamespaceSettings("logs");
-    try testing.expect(log_settings.settingsEmpty());
-}
-
-test "Coordinator getNamespaceSettings nonexistent" {
-    const allocator = testing.allocator;
-    var coord = try Coordinator.init(allocator, 1, .{});
-    defer coord.deinit();
-
-    try coord.bootstrap();
-
-    const settings = coord.getNamespaceSettings("nonexistent");
-    try testing.expect(settings.settingsEmpty());
+    try testing.expect(coord.getNamespace("after") != null);
 }

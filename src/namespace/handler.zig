@@ -46,7 +46,6 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const coordinator_mod = @import("../cluster/coordinator.zig");
 const Coordinator = coordinator_mod.Coordinator;
-const NamespaceConfig = coordinator_mod.NamespaceConfig;
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
@@ -258,8 +257,6 @@ pub const NamespaceHandler = struct {
         /// Tracks whether data has been written to this namespace.
         /// Incremented by markNamespaceHasData(), used for non-empty delete check.
         data_count: u32 = 0,
-        /// Per-namespace settings, as applied from this shard's log.
-        config: NamespaceConfig = .{},
     };
 
     /// "default" is registered from the start, before replay, with no log
@@ -503,19 +500,23 @@ pub const NamespaceHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @enumFromInt(req.header.op_code);
 
-        // Reads (list, info, config_get) always go to local handler
-        if (op == .namespace_list or op == .namespace_info or op == .namespace_config_get) {
+        if (op == .namespace_config_set or op == .namespace_config_get) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, SETTINGS_REFUSAL);
+            return;
+        }
+
+        // Reads (list, info) always go to local handler
+        if (op == .namespace_list or op == .namespace_info) {
             const cmd_result = shard.namespace_handler.handleCommand(req);
             defer shard.namespace_handler.freeResult(cmd_result);
             sendNamespaceResponse(shard, conn, req.header.request_id, cmd_result);
             return;
         }
 
-        // Mutations (create, delete, config_set): validate then persist via UAL
+        // Mutations (create, delete): validate then persist via UAL
         switch (op) {
             .namespace_create => dispatchCreate(shard, conn, req),
             .namespace_delete => dispatchDelete(shard, conn, req),
-            .namespace_config_set => dispatchConfigSet(shard, conn, req),
             else => shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown namespace mutation"),
         }
     }
@@ -572,55 +573,9 @@ pub const NamespaceHandler = struct {
         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, DELETE_REFUSAL);
     }
 
-    fn dispatchConfigSet(shard: *Shard, conn: *Connection, req: Request) void {
-        const name = req.key;
-
-        if (name.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "namespace name is required");
-            return;
-        }
-        if (!shard.namespace_handler.namespaces.contains(name)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "namespace not found");
-            return;
-        }
-        if (req.value.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "settings payload is required");
-            return;
-        }
-
-        const parsed = NamespaceConfig.deserializeSettings(req.value) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown or malformed setting");
-            return;
-        };
-        if (parsed.settingsEmpty()) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "no settings provided");
-            return;
-        }
-
-        // Serialize settings as the value portion of the UAL entry
-        var settings_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-        const settings_len = parsed.serializeSettings(&settings_buf);
-
-        const proposed = proposeNamespaceEntry(shard, .namespace_config, name, settings_buf[0..settings_len]) catch |err| {
-            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
-            return;
-        };
-        shard.park(conn, req, proposed, respondConfigSet);
-    }
-
-    fn respondConfigSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        // Also propagate to coordinator if wired
-        if (shard.coordinator) |coord| {
-            // dispatchConfigSet validated these bytes before parking; park hands
-            // back the same CRC-checked request.
-            const parsed = NamespaceConfig.deserializeSettings(req.value) catch unreachable;
-            _ = coord.proposeUpdateNamespaceConfig(req.key, parsed) catch {};
-            _ = coord.applyCommitted() catch {};
-        }
-        shard.sendOkResponse(conn, req.header.request_id, "");
-    }
+    /// No namespace setting has anything that enforces it, so none is
+    /// accepted: one comes back together with the code that applies it.
+    pub const SETTINGS_REFUSAL = "namespace settings aren't supported yet: none would take effect";
 
     // ── UAL Persistence ─────────────────────────────────────────────────
 
@@ -667,18 +622,7 @@ pub const NamespaceHandler = struct {
                 if (self.pending_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
             },
             .namespace_delete => self.applyDelete(name),
-            .namespace_config => {
-                if (cmd.value.len > 0) {
-                    // Entries are re-encoded by the server before they are proposed, so
-                    // one that fails to decode came from a build with different tags (or
-                    // is corrupt), not from a client.
-                    const parsed = NamespaceConfig.deserializeSettings(cmd.value) catch {
-                        log.err("namespace: dropped undecodable config entry for namespace={s}", .{name});
-                        return;
-                    };
-                    self.applyConfigUpdate(name, parsed);
-                }
-            },
+            .namespace_config => log.warn("namespace: skipped a settings entry for namespace={s}: namespace settings aren't supported", .{name}),
             else => {},
         }
     }
@@ -692,8 +636,6 @@ pub const NamespaceHandler = struct {
             .namespace_delete => self.handleDelete(req),
             .namespace_list => self.handleList(req),
             .namespace_info => self.handleInfo(req),
-            .namespace_config_get => self.handleConfigGet(req),
-            .namespace_config_set => self.handleConfigSet(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown namespace opcode" } },
         };
     }
@@ -760,74 +702,6 @@ pub const NamespaceHandler = struct {
         } };
     }
 
-    // ── CONFIG GET ──────────────────────────────────────────────────────
-
-    fn handleConfigGet(self: *NamespaceHandler, req: Request) CommandResult {
-        const name = req.key;
-
-        if (name.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
-        }
-
-        if (self.namespaces.get(name)) |meta| {
-            var buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-            const len = meta.config.serializeSettings(&buf);
-            const data = self.allocator.dupe(u8, buf[0..len]) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-            };
-            return .{ .namespace_config_get = .{
-                .data = data,
-                .allocated = true,
-            } };
-        }
-
-        return .{ .err = .{ .code = .not_found, .message = "namespace not found" } };
-    }
-
-    // ── CONFIG SET (local-only path, no Raft) ───────────────────────────
-
-    pub fn handleConfigSet(self: *NamespaceHandler, req: Request) CommandResult {
-        const name = req.key;
-
-        if (name.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
-        }
-
-        if (!self.namespaces.contains(name)) {
-            return .{ .err = .{ .code = .not_found, .message = "namespace not found" } };
-        }
-
-        if (req.value.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "settings payload is required" } };
-        }
-
-        const parsed = NamespaceConfig.deserializeSettings(req.value) catch {
-            return .{ .err = .{ .code = .invalid_request, .message = "unknown or malformed setting" } };
-        };
-        if (parsed.settingsEmpty()) {
-            return .{ .err = .{ .code = .invalid_request, .message = "no settings provided" } };
-        }
-
-        self.applyConfigUpdate(name, parsed);
-        return .{ .namespace_config_set = {} };
-    }
-
-    /// Apply a config update to the local namespace registry.
-    pub fn applyConfigUpdate(self: *NamespaceHandler, name: []const u8, config: NamespaceConfig) void {
-        if (self.namespaces.getPtr(name)) |meta| {
-            meta.config.mergeSettings(config);
-        }
-    }
-
-    /// Get namespace settings for a given namespace name.
-    /// Returns default config if namespace not found.
-    pub fn getSettings(self: *NamespaceHandler, name: []const u8) NamespaceConfig {
-        if (self.namespaces.get(name)) |meta| {
-            return meta.config;
-        }
-        return .{};
-    }
-
     // ── Serialization ───────────────────────────────────────────────────
 
     /// Wire format: [count:u32] ([name_len:u16][name:bytes])*
@@ -870,9 +744,6 @@ pub const NamespaceHandler = struct {
             .namespace_info => |r| {
                 if (r.allocated) self.allocator.free(r.name);
             },
-            .namespace_config_get => |r| {
-                if (r.allocated) self.allocator.free(r.data);
-            },
             else => {},
         }
     }
@@ -885,7 +756,7 @@ pub const NamespaceHandler = struct {
 /// Map namespace CommandResult variants to wire responses.
 fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
     switch (cmd_result) {
-        .ok, .namespace_created, .namespace_deleted, .namespace_config_set => {
+        .ok, .namespace_created, .namespace_deleted => {
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
@@ -903,9 +774,6 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
                 @memcpy(buf[3 .. 3 + n.name.len], n.name);
             }
             shard.sendOkResponse(conn, request_id, buf[0 .. 3 + n.name.len]);
-        },
-        .namespace_config_get => |n| {
-            shard.sendOkResponse(conn, request_id, n.data);
         },
         else => {
             shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled namespace response");
@@ -1348,119 +1216,6 @@ test "namespace handler: applyDelete non-existent is no-op" {
 
     handler.applyDelete("does-not-exist"); // should not crash
     try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
-}
-
-test "namespace handler: config set and get" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("myapp");
-
-    const settings = NamespaceConfig{ .kv_max_hot_versions = 50, .stream_retention_s = 3600 };
-    handler.applyConfigUpdate("myapp", settings);
-
-    const retrieved = handler.getSettings("myapp");
-    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions);
-    try testing.expectEqual(@as(?u64, 3600), retrieved.stream_retention_s);
-    try testing.expectEqual(@as(?u64, null), retrieved.kv_version_ttl_s);
-}
-
-test "namespace handler: config merge preserves unset fields" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("myapp");
-
-    // First update
-    handler.applyConfigUpdate("myapp", .{ .kv_max_hot_versions = 50 });
-    // Second update — should merge, not replace
-    handler.applyConfigUpdate("myapp", .{ .queue_max_dlq_size = 200 });
-
-    const retrieved = handler.getSettings("myapp");
-    try testing.expectEqual(@as(?u32, 50), retrieved.kv_max_hot_versions); // preserved
-    try testing.expectEqual(@as(?u32, 200), retrieved.queue_max_dlq_size); // added
-}
-
-test "namespace handler: config on nonexistent namespace is no-op" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    // Should not crash — namespace doesn't exist
-    handler.applyConfigUpdate("nonexistent", .{ .kv_max_hot_versions = 50 });
-
-    const retrieved = handler.getSettings("nonexistent");
-    try testing.expect(retrieved.settingsEmpty());
-}
-
-test "namespace handler: getSettings defaults for new namespace" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("fresh");
-    const settings = handler.getSettings("fresh");
-    try testing.expect(settings.settingsEmpty());
-}
-
-test "namespace handler: handleConfigGet returns TLV" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("myapp");
-    handler.applyConfigUpdate("myapp", .{ .kv_max_hot_versions = 42 });
-
-    const result = handler.handleCommand(makeRequest(.namespace_config_get, "myapp", ""));
-    switch (result) {
-        .namespace_config_get => |payload| {
-            // Deserialize the returned TLV
-            const de = try NamespaceConfig.deserializeSettings(payload.data);
-            try testing.expectEqual(@as(?u32, 42), de.kv_max_hot_versions);
-            if (payload.allocated) {
-                allocator.free(payload.data);
-            }
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: handleConfigSet via command" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("myapp");
-
-    // Build TLV for settings
-    const config = NamespaceConfig{ .stream_retention_bytes = 1_073_741_824 };
-    var tlv_buf: [NamespaceConfig.MAX_SETTINGS_SIZE]u8 = undefined;
-    const tlv_len = config.serializeSettings(&tlv_buf);
-
-    const result = handler.handleCommand(makeRequest(.namespace_config_set, "myapp", tlv_buf[0..tlv_len]));
-    switch (result) {
-        .namespace_config_set => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Verify it was applied
-    const retrieved = handler.getSettings("myapp");
-    try testing.expectEqual(@as(?u64, 1_073_741_824), retrieved.stream_retention_bytes);
-}
-
-test "namespace handler: handleConfigSet refuses an unknown setting" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("myapp");
-
-    // One known setting followed by an unknown tag: nothing may be applied.
-    const tlv = [_]u8{ 2, @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s), 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 };
-    const result = handler.handleCommand(makeRequest(.namespace_config_set, "myapp", &tlv));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expect(handler.getSettings("myapp").settingsEmpty());
 }
 
 test "namespace: a committed entry's hash resolves to the name until it is deleted" {

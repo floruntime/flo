@@ -105,7 +105,6 @@ const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
 const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
-const NamespaceConfig = @import("../cluster/coordinator.zig").NamespaceConfig;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
@@ -7402,7 +7401,7 @@ test "Shard: park answers from its own entry when a later one has already commit
     try std.testing.expect(!Seen.id.?.eql(shard.stream_handler.stream.streamLastId(hash)));
 }
 
-test "Shard: a namespace config set with a setting the server does not know is refused and proposes nothing" {
+test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -7421,25 +7420,15 @@ test "Shard: a namespace config set with a setting the server does not know is r
     var buf: [256]u8 = undefined;
     var one: [1]proto.Response = undefined;
 
-    try ParkTest.send(&shard, conn, .namespace_create, 1, "cfg", "");
-    try ParkTest.ack(&shard);
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
-
-    const lease = @intFromEnum(NamespaceConfig.SettingsTag.queue_max_lease_s);
     const last = shard.raft_node.log.lastIndex();
-    try ParkTest.send(&shard, conn, .namespace_config_set, 2, "cfg", &.{ 2, lease, 60, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 0 });
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+    // A well-formed block that the old settings format would have applied.
+    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }, 0..) |op, i| {
+        try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, one[0].data);
+    }
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
-    try std.testing.expect(shard.namespace_handler.getSettings("cfg").settingsEmpty());
-
-    // The same known setting on its own goes through.
-    try ParkTest.send(&shard, conn, .namespace_config_set, 3, "cfg", &.{ 1, lease, 60, 0, 0, 0 });
-    try ParkTest.ack(&shard);
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(?u32, 60), shard.namespace_handler.getSettings("cfg").queue_max_lease_s);
 }
 
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {

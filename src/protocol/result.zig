@@ -426,15 +426,6 @@ pub const CommandResult = union(enum) {
         allocated: bool = false,
     },
 
-    /// Namespace config set succeeded
-    namespace_config_set: void,
-
-    /// Namespace config get response (pre-serialized settings TLV)
-    namespace_config_get: struct {
-        data: []const u8,
-        allocated: bool = false,
-    },
-
     // =========================================================================
     // Processing Results
     // =========================================================================
@@ -787,9 +778,6 @@ pub const CommandResult = union(enum) {
             .namespace_info => |n| {
                 if (n.allocated and n.name.len > 0) allocator.free(n.name);
             },
-            .namespace_config_get => |n| {
-                if (n.allocated and n.data.len > 0) allocator.free(n.data);
-            },
             .action_list_result => |a| {
                 if (a.data.len > 0) allocator.free(a.data);
                 if (a.cursor) |c| allocator.free(c);
@@ -981,8 +969,6 @@ pub const CommandResult = union(enum) {
             .namespace_deleted => .namespace_delete_response,
             .namespace_list => .namespace_list_response,
             .namespace_info => .namespace_info_response,
-            .namespace_config_set => .namespace_config_set_response,
-            .namespace_config_get => .namespace_config_get_response,
 
             // Processing results
             .processing_submitted => .processing_submit_response,
@@ -1089,10 +1075,9 @@ pub const CommandResult = union(enum) {
             .cluster_join_ok => 1 + 4 + 4, // tag + assigned_node_id + leader_id
 
             // Namespace results
-            .namespace_created, .namespace_deleted, .namespace_config_set => 1, // just tag
+            .namespace_created, .namespace_deleted => 1, // just tag
             .namespace_list => |n| 1 + 4 + n.data.len, // tag + len + data
             .namespace_info => |n| 1 + 1 + 2 + n.name.len, // tag + exists + name_len + name
-            .namespace_config_get => |n| 1 + 4 + n.data.len, // tag + len + data
 
             // Processing results
             .processing_submitted => |p| 1 + 4 + p.job_id.len, // tag + len + job_id
@@ -1365,7 +1350,7 @@ pub const CommandResult = union(enum) {
             },
 
             // Namespace results
-            .namespace_created, .namespace_deleted, .namespace_config_set => {},
+            .namespace_created, .namespace_deleted => {},
             .namespace_list => |n| {
                 try writeSlice(writer, n.data);
             },
@@ -1373,9 +1358,6 @@ pub const CommandResult = union(enum) {
                 try writer.writeByte(if (n.exists) 1 else 0);
                 try writer.writeInt(u16, @intCast(n.name.len), .little);
                 try writer.writeAll(n.name);
-            },
-            .namespace_config_get => |n| {
-                try writeSlice(writer, n.data);
             },
 
             // Processing results
@@ -1738,11 +1720,6 @@ pub const CommandResult = union(enum) {
                     .allocated = true,
                 } };
             },
-            .namespace_config_set => .{ .namespace_config_set = {} },
-            .namespace_config_get => .{ .namespace_config_get = .{
-                .data = try readSlice(reader, allocator),
-                .allocated = true,
-            } },
 
             // Processing results
             .processing_submitted => .{ .processing_submitted = .{

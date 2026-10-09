@@ -44,14 +44,13 @@ pub const OpCode = enum(u16) {
     namespace_delete = 0x011,
     namespace_list = 0x012,
     namespace_info = 0x013,
+    /// Refused: no namespace setting is supported yet.
     namespace_config_set = 0x014,
     namespace_config_get = 0x015,
     namespace_create_response = 0x020,
     namespace_delete_response = 0x021,
     namespace_list_response = 0x022,
     namespace_info_response = 0x023,
-    namespace_config_set_response = 0x024,
-    namespace_config_get_response = 0x025,
 
     // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
     cluster_status = 0x030,
