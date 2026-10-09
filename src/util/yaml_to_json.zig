@@ -486,12 +486,24 @@ const Converter = struct {
     /// The value without its trailing comment. A `#` starts a comment when it
     /// begins the value or follows whitespace, outside quotes; so `retry:  # x`
     /// is a key whose value is on the next lines, and `"a"  # x` is the
-    /// quoted string `a`.
-    fn stripComment(value: []const u8) []const u8 {
+    /// quoted string `a`. Quotes quote only in a value that starts with one,
+    /// or inside a flow `[...]`/`{...}`; in `don't retry  # why` the
+    /// apostrophe is a plain character.
+    fn stripComment(raw: []const u8) []const u8 {
+        const value = mem.trimStart(u8, raw, " \t");
+        const quotes = value.len > 0 and switch (value[0]) {
+            '"', '\'', '[', '{' => true,
+            else => false,
+        };
         var quote: u8 = 0;
         var i: usize = 0;
         while (i < value.len) : (i += 1) {
             const c = value[i];
+            if (!quotes) {
+                if (c == '#' and (i == 0 or value[i - 1] == ' ' or value[i - 1] == '\t'))
+                    return mem.trim(u8, value[0..i], " \t");
+                continue;
+            }
             if (quote != 0) {
                 if (quote == '"' and c == '\\') {
                     i += 1;
@@ -819,5 +831,7 @@ test "yaml_to_json: comments on list items and flow values" {
         \\  - name: three  # inline
         \\flow: [a, b]  # flow
         \\url: http://x/#frag
-    , "{\"items\":[\"one\",{\"name\":\"two\"},{\"name\":\"three\"}],\"flow\":[\"a\",\"b\"],\"url\":\"http://x/#frag\"}");
+        \\msg: don't retry  # why
+        \\say: he said "hi"  # quoted inside
+    , "{\"items\":[\"one\",{\"name\":\"two\"},{\"name\":\"three\"}],\"flow\":[\"a\",\"b\"],\"url\":\"http://x/#frag\",\"msg\":\"don't retry\",\"say\":\"he said \\\"hi\\\"\"}");
 }
