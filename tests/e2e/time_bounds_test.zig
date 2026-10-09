@@ -67,7 +67,7 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
 
     var out: [4096]u8 = undefined;
     var obuf: [32]u8 = undefined;
-    const huge = try option(&obuf, .ttl_seconds, u64, std.math.maxInt(u64));
+    const huge = try option(&obuf, .ttl_ms, u64, std.math.maxInt(u64));
     try expectRefused(try rawCall(ctx, .kv_put, "k", "v2", huge, &out), "ttl too large");
     var ttl: [8]u8 = undefined;
     std.mem.writeInt(u64, &ttl, std.math.maxInt(u64), .little);
@@ -78,6 +78,74 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
 
     try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
     try testing.expectEqualStrings("{\"a\":1}", try kvValue(ctx, "doc", &out));
+}
+
+test "e2e/time: a TTL option that isn't 8 bytes is refused, and the key keeps its value" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "kv", "set", "k", "v" });
+    try ctx.exec(&.{ "kv", "set", "doc", "{\"a\":1}" });
+
+    var out: [4096]u8 = undefined;
+    // [tag][len][u32 ms]: read as no TTL, the key would never expire.
+    const short = [_]u8{ @intFromEnum(proto.OptionTag.ttl_ms), 4, 0xe8, 0x03, 0, 0 };
+    try expectRefused(try rawCall(ctx, .kv_put, "k", "v2", &short, &out), "ttl_ms must be 8 bytes");
+    const set = [_]u8{ 3, 0 } ++ "$.a".* ++ "2".*;
+    try expectRefused(try rawCall(ctx, .kv_json_set, "doc", &set, &short, &out), "ttl_ms must be 8 bytes");
+
+    // A put inside a transaction is buffered, not proposed: it is checked
+    // before the buffer, and the commit writes nothing.
+    const begin = try rawCall(ctx, .kv_begin_txn, "k", "", "", &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), begin.status);
+    const txn_id = std.mem.readInt(u64, begin.data[1..9], .little);
+    var tbuf: [32]u8 = undefined;
+    var tb = proto.OptionsBuilder.init(&tbuf);
+    try tb.addU64(.txn_id, txn_id);
+    var in_txn: [64]u8 = undefined;
+    @memcpy(in_txn[0..short.len], &short);
+    @memcpy(in_txn[short.len..][0..tb.getOptions().len], tb.getOptions());
+    try expectRefused(try rawCall(ctx, .kv_put, "k", "v3", in_txn[0 .. short.len + tb.getOptions().len], &out), "ttl_ms must be 8 bytes");
+    const commit = try rawCall(ctx, .kv_commit_txn, "k", "", tb.getOptions(), &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), commit.status);
+
+    try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
+    try testing.expectEqualStrings("{\"a\":1}", try kvValue(ctx, "doc", &out));
+}
+
+test "e2e/time: the dashboard's KV put takes ttl_ms in milliseconds and refuses anything else" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    defer ctx.deinit();
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    const path = "/api/v1/kv/namespaces/default/keys/k";
+
+    for ([_][2][]const u8{
+        .{ "{\"value\":\"v\",\"ttl_seconds\":60}", "unknown field \\\"ttl_seconds\\\"" },
+        .{ "{\"value\":\"v\",\"ttl_ms\":1.5}", "ttl_ms must be a whole number of milliseconds" },
+        .{ "{\"value\":\"v\",\"ttl_ms\":\"60s\"}", "ttl_ms must be a whole number of milliseconds" },
+        .{ "{\"value\":\"v\",\"ttl_ms\":-1}", "ttl_ms must not be negative" },
+    }) |case| {
+        var resp = try http.put(path, case[0]);
+        defer resp.deinit();
+        try testing.expect(resp.bodyContains(case[1]));
+    }
+    var absent = try ctx.cli.run(&.{ "kv", "get", "k", "--output", "table" });
+    defer absent.deinit();
+    try stdx.testing.assertContains(absent, "(nil)");
+
+    // The read reports an absolute expiry, not a duration a client could
+    // send back as ttl_ms.
+    var ok = try http.put(path, "{\"value\":\"v\",\"ttl_ms\":800}");
+    defer ok.deinit();
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    var got = try http.get(path);
+    defer got.deinit();
+    try testing.expect(got.bodyContains("\"expires_at_ms\":"));
+    try testing.expect(!got.bodyContains("\"expires_at_ms\":null"));
+    stdx.time.sleep(2000 * std.time.ns_per_ms);
+    var gone = try ctx.cli.run(&.{ "kv", "get", "k", "--output", "table" });
+    defer gone.deinit();
+    try stdx.testing.assertContains(gone, "(nil)");
 }
 
 test "e2e/time: a lower bound past the clock matches nothing, and an age past it trims nothing" {

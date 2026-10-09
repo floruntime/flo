@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   flo kv get <key> [--wait <ms>] [--block <ms>] [--output json|table|raw]
-//!   flo kv set <key> <value> [--ttl <seconds>] [--nx] [--xx]
+//!   flo kv set <key> <value> [--ttl <duration>] [--nx] [--xx]
 //!   flo kv delete <key>
 //!   flo kv list [--prefix <prefix>]
 
@@ -14,6 +14,7 @@ const Client = client_mod.Client;
 const output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const cli_config = @import("../config.zig");
+const time_units = @import("../../util/time_units.zig");
 const WireReader = wire.WireReader;
 
 /// Wrapper to cast *anyopaque to *Context
@@ -75,7 +76,8 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .about("Set a key-value pair")
                 .examples(&.{
                     "flo kv set mykey myvalue",
-                    "flo kv set mykey myvalue --ttl 3600",
+                    "flo kv set mykey myvalue --ttl 1h",
+                    "flo kv set lock:job myvalue --ttl 500ms",
                     "flo kv set mykey myvalue --nx",
                     "flo kv set counter 0 --xx",
                     "flo kv set mykey newvalue --cas 42",
@@ -83,7 +85,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("key", "Key to set")
                 .arg("value", "Value to store")
-                .uintFlag("ttl", 0, 0, "Time-to-live in seconds (0=forever)")
+                .stringFlag("ttl", 0, "", "Time to live: a number and a unit (500ms, 30s, 5m, 1h, 1d); omit for none")
                 .boolFlag("nx", 0, "Only set if key does NOT exist")
                 .boolFlag("xx", 0, "Only set if key DOES exist")
                 .uint64Flag("cas", 0, 0, "Compare-and-swap version (only set if current version matches)")
@@ -145,11 +147,11 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .name("touch")
                 .about("Update the TTL of an existing key")
                 .examples(&.{
-                    "flo kv touch session:abc --ttl 3600",
+                    "flo kv touch session:abc --ttl 1h",
                     "flo kv touch session:abc --ttl 0  # clears the TTL",
                 })
                 .arg("key", "Key whose TTL to update")
-                .uint64Flag("ttl", 0, 0, "New TTL in seconds (0 clears)")
+                .stringFlag("ttl", 0, "", "New TTL: a number and a unit (500ms, 30s, 5m, 1h, 1d); 0 or omitted clears")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .uint64Flag("cas", 0, 0, "Compare-and-swap version (only touch if current version matches)")
@@ -314,7 +316,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
     const value = ctx.getPositional("value").?; // validated by commander
 
-    const ttl = ctx.getUint("ttl");
+    const ttl = try ttlFlag(ctx);
     const nx = ctx.getBool("nx");
     const xx = ctx.getBool("xx");
     const cas = ctx.getChangedUint64("cas");
@@ -353,7 +355,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     const ttl_val: ?u64 = if (ttl) |t| if (t > 0) t else null else null;
 
     var result = client_mod.kv.set(&client, namespace, key, value, .{
-        .ttl_seconds = ttl_val,
+        .ttl_ms = ttl_val,
         .if_not_exists = nx,
         .if_exists = xx,
         .cas_version = cas,
@@ -784,9 +786,20 @@ fn runIncr(ctx: *commander.Context) commander.Error!void {
     ctx.print("{d}\n", .{counter});
 }
 
+/// `--ttl` in milliseconds, or null when not given. A bare number other
+/// than 0 is refused: "3600" could mean seconds or milliseconds.
+fn ttlFlag(ctx: *commander.Context) commander.Error!?u64 {
+    const text = ctx.getString("ttl") orelse return null;
+    if (text.len == 0) return null;
+    return time_units.parseDurationMs(text) orelse {
+        ctx.printErr("Error: --ttl {s} is not a duration; give a number and a unit (500ms, 30s, 5m, 1h, 1d), or 0\n", .{text});
+        return error.CommandFailed;
+    };
+}
+
 fn runTouch(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?;
-    const ttl: u64 = ctx.getUint64("ttl") orelse 0;
+    const ttl: u64 = try ttlFlag(ctx) orelse 0;
     const namespace = cli_config.getNamespace(ctx);
     const routing_key = optionalRoutingKey(ctx);
     const txn_id = optionalTxnId(ctx);

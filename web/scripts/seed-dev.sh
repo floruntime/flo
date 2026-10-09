@@ -46,7 +46,7 @@ done
 curl -fs "$DASH/health" >/dev/null || { echo "server did not come up; see /tmp/flo-server.log"; exit 1; }
 
 ns()   { "$FLO" namespace create "$1" >/dev/null 2>&1 || true; }
-kv()   { "$FLO" kv set "$2" "$3" --namespace "$1" ${4:+--ttl $4} >/dev/null 2>&1 || true; }
+kv()   { "$FLO" kv set "$2" "$3" --namespace "$1" ${4:+--ttl ${4}s} >/dev/null 2>&1 || true; }
 screate() { "$FLO" stream create "$2" --namespace "$1" ${3:+--partitions $3} >/dev/null 2>&1 || true; }
 sapp() { "$FLO" stream append "$2" "$3" --namespace "$1" >/dev/null 2>&1 || true; }
 enq()  { "$FLO" queue enqueue "$2" "$3" --namespace "$1" ${4:+--priority $4} >/dev/null 2>&1 || true; }
