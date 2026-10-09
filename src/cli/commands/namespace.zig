@@ -14,7 +14,7 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
-const NamespaceConfig = @import("../../cluster/coordinator.zig").NamespaceConfig;
+const NamespaceConfig = @import("../../namespace/config.zig").NamespaceConfig;
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {

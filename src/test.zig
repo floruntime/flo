@@ -196,8 +196,7 @@ test {
 
 // Cluster
 test {
-    _ = @import("cluster/coordinator.zig");
-    _ = @import("cluster/partition_table.zig");
+    _ = @import("namespace/config.zig");
 }
 
 // Auth

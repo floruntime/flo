@@ -52,7 +52,6 @@ pub const ClusterConfig = struct {
     failover_timeout_ms: u32 = 1500,
 
     /// Check if no seeds are configured (used for INITIAL setup decisions).
-    /// For runtime checks, use ClusterCoordinator.isSingleNodeCluster() instead.
     /// Single-node = no seeds (or only self in seeds)
     pub fn hasNoSeeds(self: ClusterConfig) bool {
         return self.seeds.len == 0;

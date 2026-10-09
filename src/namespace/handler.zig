@@ -44,9 +44,7 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
-const coordinator_mod = @import("../cluster/coordinator.zig");
-const Coordinator = coordinator_mod.Coordinator;
-const NamespaceConfig = coordinator_mod.NamespaceConfig;
+const NamespaceConfig = @import("config.zig").NamespaceConfig;
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
@@ -258,7 +256,7 @@ pub const NamespaceHandler = struct {
         /// Tracks whether data has been written to this namespace.
         /// Incremented by markNamespaceHasData(), used for non-empty delete check.
         data_count: u32 = 0,
-        /// Per-namespace settings (synced from coordinator)
+        /// Per-namespace settings (`namespace config set`).
         config: NamespaceConfig = .{},
     };
 
@@ -555,11 +553,6 @@ pub const NamespaceHandler = struct {
             .full => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, LIMIT_MESSAGE),
             .failed => return shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace not registered: out of memory"),
         }
-        // Also propagate to coordinator if wired (cluster metadata)
-        if (shard.coordinator) |coord| {
-            _ = coord.proposeCreateNamespace(req.key, 32, 1) catch {};
-            _ = coord.applyCommitted() catch {};
-        }
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -608,12 +601,6 @@ pub const NamespaceHandler = struct {
     fn respondConfigSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        // Also propagate to coordinator if wired
-        if (shard.coordinator) |coord| {
-            const parsed = NamespaceConfig.deserializeSettings(req.value);
-            _ = coord.proposeUpdateNamespaceConfig(req.key, parsed.config) catch {};
-            _ = coord.applyCommitted() catch {};
-        }
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
