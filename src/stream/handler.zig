@@ -86,6 +86,9 @@ pub const StreamHandler = struct {
 
     /// The id the last applied append got (see `Shard.answering_index`).
     last_append: ?StreamID = null,
+    /// Appends a read had to skip: not in hot or warm storage, or not a
+    /// well-formed batch. Each is logged.
+    skipped_appends: u64 = 0,
     /// Backs a refusal message that names request values; sent before the
     /// next command runs.
     err_buf: [128]u8 = undefined,
@@ -93,7 +96,12 @@ pub const StreamHandler = struct {
     last_trim_count: u64 = 0,
 
     /// Maximum number of messages in a single read response.
-    pub const MAX_READ_BATCH: usize = 1000;
+    pub const MAX_READ_BATCH: usize = proto.MAX_STREAM_READ_RECORDS;
+
+    comptime {
+        // One append, the most a read can't split, always fits an answer.
+        std.debug.assert(4 + 2 * persistence_mod.MAX_PERSIST_PAYLOAD + 28 * @as(usize, stream_mod.MAX_BATCH_RECORDS) <= proto.MAX_ANSWER_BYTES);
+    }
     const DEFAULT_READ_BATCH: usize = 100;
 
     pub fn init(allocator: Allocator, partition: *Partition) StreamHandler {
@@ -514,10 +522,9 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const window = self.readWindow(req);
+        var window = self.readWindow(req);
         var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const records = self.readRecords(window, &buf);
-        const result = self.messages(records, req.key);
+        const records, const result = self.readReadable(&window, &buf);
 
         if (self.metrics_registry) |mr| {
             if (result == .stream_messages) if (mr.registerStream(req.namespace, req.key, 0)) |sm| {
@@ -595,17 +602,28 @@ pub const StreamHandler = struct {
         return out[0..stream_mod.wholeEntriesWithin(out[0..count], window.limit)];
     }
 
-    /// The id of an append's last record: a cursor past the whole append.
-    fn lastRecordId(rec: StreamRecord) StreamID {
-        return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
+
+
+    /// The window's records and their answer, past any appends that can't
+    /// be read: an answer with none of a read's records would leave the
+    /// reader's cursor where it was, and a follower re-reading them forever.
+    pub fn readReadable(self: *StreamHandler, window: *waiter_pool_mod.StreamWindow, buf: *[MAX_READ_BATCH]StreamRecord) struct { []StreamRecord, CommandResult } {
+        while (true) {
+            const records = self.readRecords(window.*, buf);
+            const result = self.messages(records, window.after);
+            if (records.len == 0 or result != .stream_messages) return .{ records, result };
+            if (std.mem.readInt(u32, result.stream_messages.data[0..4], .little) > 0) return .{ records, result };
+            self.freeResult(result);
+            window.after = stream_mod.lastRecordOf(records[records.len - 1]);
+        }
     }
 
     /// A read response carrying `records`. The caller frees it.
-    pub fn messages(self: *StreamHandler, records: []const StreamRecord, stream_name: []const u8) CommandResult {
-        const data = self.serializeStreamRecordsWithPayloads(records, stream_name) catch {
+    pub fn messages(self: *StreamHandler, records: []const StreamRecord, after: StreamID) CommandResult {
+        const data = self.serializeStreamRecordsWithPayloads(records, after) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
-        const last_id = if (records.len > 0) lastRecordId(records[records.len - 1]) else StreamID.MIN;
+        const last_id = if (records.len > 0) stream_mod.lastRecordOf(records[records.len - 1]) else StreamID.MIN;
         return .{ .stream_messages = .{
             .data = data,
             .next_timestamp_ms = last_id.timestamp_ms,
@@ -1091,17 +1109,24 @@ pub const StreamHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
 
-        // Deliver via PEL — reads after group's last_delivered_id
+        // The reply is built before the pending list takes its records, so a
+        // reply that can't be built leaves them for the next read.
         var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const count = self.stream.groupDeliver(group_name, name_hash, consumer_id, capped, now_ms, buf[0..capped]) catch |err| {
+        const count = self.stream.groupPeek(group_name, name_hash, capped, buf[0..capped]) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
+        };
+        // A group's cursor passes whole appends, so nothing is left out.
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN) catch {
+            return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
+        };
+        self.stream.groupDeliverRecords(group_name, consumer_id, buf[0..count], now_ms) catch |err| {
+            self.allocator.free(data);
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
                 else => .{ .err = .{ .code = .internal_error, .message = "group deliver failed" } },
             };
-        };
-
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], req.key) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
 
         return .{ .group_messages = .{ .data = data } };
@@ -1319,7 +1344,7 @@ pub const StreamHandler = struct {
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
 
-        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], req.key) catch {
+        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN) catch {
             return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
         };
 
@@ -1388,6 +1413,11 @@ pub const StreamHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    /// The id of record `j` of an append.
+    fn recordId(rec: StreamRecord, j: u64) StreamID {
+        return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + j };
+    }
+
     /// Compute re-serialized header size: stored format uses u16 lengths,
     /// response format uses u32 — each header gains 4 bytes.
     fn responseHeaderSize(hdr_count: u32, headers_raw_len: usize) usize {
@@ -1428,8 +1458,12 @@ pub const StreamHandler = struct {
     ///   [key_present:u8]([key_len:u32][key bytes])?
     ///   [payload_len:u32][payload bytes]
     ///   [header_count:u32]([key_len:u32][key][val_len:u32][val])*
-    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, stream_name: []const u8) ![]u8 {
-        const key_size: usize = if (stream_name.len > 0) 1 + 4 + stream_name.len else 1;
+    /// Records at or before `after` are left out: a cursor inside an append
+    /// resumes with the rest of it.
+    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, after: StreamID) ![]u8 {
+        // The reader named the stream; repeating it per record would let a
+        // long name push one append's answer past a frame.
+        const key_size: usize = 1;
 
         // Every record of every append in `records`, never part of one: a
         // reader's cursor (or a group's delivered id) passes whole appends.
@@ -1443,8 +1477,14 @@ pub const StreamHandler = struct {
             const r = self.getPayloadAndTier(rec.ual_index);
             tiers[i] = r.tier;
             blobs[i] = stream_mod.BatchIterator.init(r.payload) catch null;
-            var it = blobs[i] orelse continue;
-            while (it.next()) |br| {
+            var it = blobs[i] orelse {
+                self.skipped_appends += 1;
+                log.err("stream: the append at log index {d} is in neither hot nor warm storage, or isn't a batch; its records are skipped", .{rec.ual_index});
+                continue;
+            };
+            var j: u64 = 0;
+            while (it.next()) |br| : (j += 1) {
+                if (!recordId(rec, j).greaterThan(after)) continue;
                 count += 1;
                 total += 8 + 8 + 1 + 4 + key_size + 4 + br.payload.len + 4 + responseHeaderSize(br.header_count, br.headers_raw.len);
             }
@@ -1461,6 +1501,7 @@ pub const StreamHandler = struct {
             var it = blobs[i] orelse continue;
             var j: u64 = 0;
             while (it.next()) |br| : (j += 1) {
+                if (!recordId(rec, j).greaterThan(after)) continue;
                 std.mem.writeInt(u64, buf[pos..][0..8], rec.id.sequence + j, .little);
                 pos += 8;
                 std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(rec.id.timestamp_ms)), .little);
@@ -1470,18 +1511,8 @@ pub const StreamHandler = struct {
                 std.mem.writeInt(u32, buf[pos..][0..4], rec.partition_index, .little);
                 pos += 4;
 
-                // key (stream name for multi-stream / pattern reads)
-                if (stream_name.len > 0) {
-                    buf[pos] = 1;
-                    pos += 1;
-                    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(stream_name.len), .little);
-                    pos += 4;
-                    @memcpy(buf[pos .. pos + stream_name.len], stream_name);
-                    pos += stream_name.len;
-                } else {
-                    buf[pos] = 0;
-                    pos += 1;
-                }
+                buf[pos] = 0; // key_present
+                pos += 1;
 
                 std.mem.writeInt(u32, buf[pos..][0..4], @intCast(br.payload.len), .little);
                 pos += 4;
@@ -1538,15 +1569,15 @@ pub const StreamHandler = struct {
     };
 
     pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) PayloadRead {
-        var results: [1000][]const u8 = undefined;
-        var result_ids: [1000]StreamID = undefined;
+        var results: [MAX_READ_BATCH][]const u8 = undefined;
+        var result_ids: [MAX_READ_BATCH]StreamID = undefined;
         var count: usize = 0;
-        const capped = @min(limit, 1000);
+        const capped = @min(limit, MAX_READ_BATCH);
 
         const ns_hash_u32 = router.namespaceHash(namespace);
         const name_hash = router.nameHash(ns_hash_u32, stream_name);
 
-        var rec_buf: [1000]StreamRecord = undefined;
+        var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const read_n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
         // Whole appends only, so `last_id` never lands inside one: resuming
         // after it would skip the rest of that append.
@@ -1557,13 +1588,17 @@ pub const StreamHandler = struct {
             const result = self.getPayloadAndTier(rec.ual_index);
             var it = stream_mod.BatchIterator.init(result.payload) catch null;
             if (it) |*batch| {
-                while (batch.next()) |br| {
+                var j: u64 = 0;
+                while (batch.next()) |br| : (j += 1) {
+                    if (!recordId(rec, j).greaterThan(after_id)) continue;
                     results[count] = br.payload;
-                    result_ids[count] = rec.id;
+                    // Each record its own id: a reader keying on it (a
+                    // trigger's idempotency key) must tell them apart.
+                    result_ids[count] = recordId(rec, j);
                     count += 1;
                 }
             }
-            last_id = lastRecordId(rec);
+            last_id = stream_mod.lastRecordOf(rec);
         }
 
         const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
@@ -2347,8 +2382,9 @@ test "stream handler: a read returns whole appends and its cursor passes them" {
                 try testing.expectEqual(@as(u32, 400), std.mem.readInt(u32, m.data[0..4], .little));
                 const first_seq = std.mem.readInt(u64, m.data[4..12], .little);
                 try testing.expectEqual(first_seq + 399, m.next_sequence);
-                // [seq:u64][ts:i64][tier:u8][partition:u32][1:u8][key_len:u32]["s1"][len:u32][payload]
-                seen[round] = m.data[4 + 8 + 8 + 1 + 4 + 1 + 4 + 2 + 4];
+                // [seq:u64][ts:i64][tier:u8][partition:u32][key_present=0:u8][len:u32][payload]
+                try testing.expectEqual(@as(u8, 0), m.data[4 + 8 + 8 + 1 + 4]);
+                seen[round] = m.data[4 + 8 + 8 + 1 + 4 + 1 + 4];
                 after = .{ .timestamp_ms = m.next_timestamp_ms, .sequence = m.next_sequence };
             },
             else => return error.TestUnexpectedResult,

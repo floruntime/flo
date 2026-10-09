@@ -19,6 +19,17 @@ pub const VERSION: u8 = 0x01;
 /// Most records one stream append may carry; the server refuses more.
 pub const MAX_STREAM_BATCH_RECORDS: u32 = 1000;
 
+/// Most records one stream read returns. A read returns whole appends, so
+/// it holds at least one: this is never below MAX_STREAM_BATCH_RECORDS.
+pub const MAX_STREAM_READ_RECORDS: u32 = 1000;
+
+/// Most data one answer frame carries.
+pub const MAX_ANSWER_BYTES: usize = 256 * 1024;
+
+comptime {
+    std.debug.assert(MAX_STREAM_BATCH_RECORDS <= MAX_STREAM_READ_RECORDS);
+}
+
 /// Maximum number of opcodes supported by the dispatch table.
 /// Layout: Infra(0x0__) + Data(0x1__–0x2__) + Compute(0x3__)
 pub const MAX_OPCODES: u16 = 1024;

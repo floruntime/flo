@@ -3396,9 +3396,12 @@ test "e2e/stream: a batch of 150 records reads back whole" {
     var r = try ctx.cli.run(&.{ "stream", "read", "big-batch", "--limit", "1000", "-o", "json" });
     defer r.deinit();
     try testing.expectEqual(@as(usize, n), r.stdoutCount("bb-"));
+    var prev: usize = 0;
     for (0..n) |i| {
         var b: [16]u8 = undefined;
-        try testing.expect(r.stdoutContains(std.fmt.bufPrint(&b, "bb-{d:0>3}", .{i}) catch unreachable));
+        const at = std.mem.indexOf(u8, r.stdout, std.fmt.bufPrint(&b, "bb-{d:0>3}", .{i}) catch unreachable) orelse return error.RecordMissing;
+        try testing.expect(at >= prev);
+        prev = at;
     }
 }
 
@@ -3454,7 +3457,8 @@ test "e2e/stream: paging through 400-record batches returns every record once" {
             defer r.deinit();
             const n = std.mem.count(u8, r.stdout, "\"data\":\"p");
             if (n == 0) break;
-            try testing.expect(n % 400 == 0);
+            // Whole 400-record appends: limit 500 or 1 takes one, 1000 takes two.
+            try testing.expectEqual(if (std.mem.eql(u8, limit, "1000")) @as(usize, if (pages == 0) 800 else 400) else 400, n);
             try seen.appendSlice(testing.allocator, r.stdout);
             const last = lastJsonId(r.stdout) orelse return error.NoCursor;
             @memcpy(cursor[0..last.len], last);
@@ -3518,4 +3522,26 @@ test "e2e/stream: an append of more than 1000 records is refused and stores noth
     var r = try ctx.cli.run(&.{ "stream", "read", "too-big", "--limit", "10", "-o", "json" });
     defer r.deinit();
     try testing.expect(!r.stdoutContains("\"data\""));
+}
+
+test "e2e/stream: a read starting inside an append returns the rest of it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "mid-append", "m0", "m1", "m2", "m3", "m4" });
+    var all = try ctx.cli.run(&.{ "stream", "read", "mid-append", "--limit", "10", "-o", "json" });
+    defer all.deinit();
+    // The id of m1, the second record.
+    const tag = "\"id\":\"";
+    const first = std.mem.indexOf(u8, all.stdout, tag) orelse return error.NoId;
+    const second = std.mem.indexOfPos(u8, all.stdout, first + 1, tag) orelse return error.NoId;
+    const start = second + tag.len;
+    const id = all.stdout[start..std.mem.indexOfScalarPos(u8, all.stdout, start, '"').?];
+
+    var rest = try ctx.cli.run(&.{ "stream", "read", "mid-append", "--start", id, "--limit", "10", "-o", "json" });
+    defer rest.deinit();
+    try testing.expectEqual(@as(usize, 3), rest.stdoutCount("\"data\":\"m"));
+    try testing.expect(!rest.stdoutContains("\"m1\""));
+    try testing.expect(rest.stdoutContains("\"m2\""));
+    try testing.expect(rest.stdoutContains("\"m4\""));
 }

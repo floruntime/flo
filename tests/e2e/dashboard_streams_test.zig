@@ -208,3 +208,55 @@ test "e2e/dashboard: consumer-group endpoints honor ?namespace=" {
     defer miss.deinit();
     try testing.expect(std.mem.indexOf(u8, miss.body, "nsworker") == null);
 }
+
+test "e2e/dashboard: stream messages page through batches over 100 by the server's cursor" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    // Two 150-record appends.
+    for (0..2) |b| {
+        var bufs: [150][16]u8 = undefined;
+        var args: [3 + 150][]const u8 = undefined;
+        args[0] = "stream";
+        args[1] = "append";
+        args[2] = "dash-big";
+        for (0..150) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "d{d}-{d:0>3}", .{ b, i }) catch unreachable;
+        try ctx.exec(&args);
+    }
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    // limit=200 takes one whole 150-record append per page.
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(testing.allocator);
+    var path_buf: [160]u8 = undefined;
+    var cursor_buf: [48]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (pages < 5) : (pages += 1) {
+        const path = if (cursor) |c|
+            std.fmt.bufPrint(&path_buf, "/api/v1/streams/dash-big/messages?limit=200&cursor={s}", .{c}) catch unreachable
+        else
+            "/api/v1/streams/dash-big/messages?limit=200";
+        var resp = try http.get(path);
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        const n = std.mem.count(u8, resp.body, "\"payload\":\"d");
+        if (n == 0) break;
+        try testing.expectEqual(@as(usize, 150), n);
+        try seen.appendSlice(testing.allocator, resp.body);
+        const tag = "\"next_cursor\":\"";
+        const at = std.mem.indexOf(u8, resp.body, tag) orelse return error.NoCursor;
+        const start = at + tag.len;
+        const c = resp.body[start..std.mem.indexOfScalarPos(u8, resp.body, start, '"').?];
+        @memcpy(cursor_buf[0..c.len], c);
+        cursor = cursor_buf[0..c.len];
+    }
+    for (0..2) |b| for (0..150) |i| {
+        var nb: [24]u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen.items, std.fmt.bufPrint(&nb, "\"d{d}-{d:0>3}\"", .{ b, i }) catch unreachable));
+    };
+}

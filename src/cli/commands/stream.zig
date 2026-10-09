@@ -1184,7 +1184,8 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         _ = reader.readU8() orelse break; // tier
         _ = reader.readU32() orelse break; // partition
         const key_present = reader.readU8() orelse break;
-        var stream_name: ?[]const u8 = null;
+        // The server leaves the name out; it's the stream that was read.
+        var stream_name: ?[]const u8 = stream;
         if (key_present != 0) {
             stream_name = reader.readLengthPrefixed(u32) orelse break;
         }

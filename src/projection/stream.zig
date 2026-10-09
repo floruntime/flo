@@ -137,7 +137,10 @@ pub fn decodeAppendValue(value: []const u8) AppendValue {
 
 /// Most records one append may carry. Reads return whole appends, so this is
 /// also the most a single append adds to one read.
-pub const MAX_BATCH_RECORDS: u32 = @import("../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS;
+pub const MAX_BATCH_RECORDS: u32 = proto_limits.MAX_STREAM_BATCH_RECORDS;
+const proto_limits = @import("../protocol/proto.zig");
+/// Most records one read returns (whole appends, at least one).
+pub const MAX_READ_RECORDS: u32 = proto_limits.MAX_STREAM_READ_RECORDS;
 
 /// One record of a batch blob: its payload and its stored header bytes,
 /// `([key_len:u16][key][val_len:u16][val])*`.
@@ -216,14 +219,29 @@ pub const BatchIterator = struct {
     }
 };
 
+/// The id of an entry's last record: a cursor past the whole append.
+pub fn lastRecordOf(rec: StreamRecord) StreamID {
+    return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
+}
+
+/// An upper bound on an append's bytes in a read answer. Each record adds
+/// at most 28 bytes of framing, and widening its header lengths at most
+/// doubles its stored header bytes.
+pub fn answerBound(rec: StreamRecord) usize {
+    return 2 * @as(usize, rec.byte_len) + 28 * @as(usize, rec.record_count);
+}
+
 /// How many of `records` (whole appends, in order) fit a budget of `limit`
-/// logical records. The first always counts, so a read makes progress even
-/// when one append holds more than `limit`.
+/// logical records and one answer frame. The first always counts, so a read
+/// makes progress even when one append holds more than `limit`; one append
+/// always fits a frame (checked where appends are bounded).
 pub fn wholeEntriesWithin(records: []const StreamRecord, limit: usize) usize {
     var total: usize = 0;
+    var bytes: usize = 4; // the record count
     for (records, 0..) |rec, i| {
         total += rec.record_count;
-        if (i > 0 and total > limit) return i;
+        bytes += answerBound(rec);
+        if (i > 0 and (total > limit or bytes > proto_limits.MAX_ANSWER_BYTES)) return i;
     }
     return records.len;
 }
@@ -310,17 +328,18 @@ pub const StreamState = struct {
 
     /// Read records with IDs in (after_id, to_id]: the start is a cursor,
     /// exclusive like `readAfter`, the end inclusive.
+    /// Entries are whole: one starting at or before `to_id` is returned
+    /// entire, records past `to_id` included.
     pub fn readRange(self: *const StreamState, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
-        const start_idx = self.lowerBound(after_id);
+        const start_idx = self.firstAfter(after_id);
         if (start_idx >= items.len) return 0;
         var n: usize = 0;
         var i = start_idx;
         while (i < items.len and n < buf.len) : (i += 1) {
             const rec = &items[i];
             if (rec.id.greaterThan(to_id)) break;
-            if (!rec.id.greaterThan(after_id)) continue;
             if (filter_partition) |fp| {
                 if (rec.partition_index != fp) continue;
             }
@@ -330,14 +349,22 @@ pub const StreamState = struct {
         return n;
     }
 
-    /// Read records after a given ID (exclusive).
+    /// The first entry holding a record after `after_id`. That can be the
+    /// entry holding `after_id` itself, so a cursor inside an append resumes
+    /// with the rest of it; readers skip its records up to the cursor.
+    fn firstAfter(self: *const StreamState, after_id: StreamID) usize {
+        const items = self.records.items;
+        var i = self.lowerBound(after_id);
+        if (i > 0 and lastRecordOf(items[i - 1]).greaterThan(after_id)) i -= 1;
+        while (i < items.len and !lastRecordOf(items[i]).greaterThan(after_id)) : (i += 1) {}
+        return i;
+    }
+
+    /// Read the entries holding records after `after_id` (exclusive).
     pub fn readAfter(self: *const StreamState, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
-        // Find first record strictly after after_id
-        var start_idx = self.lowerBound(after_id);
-        // Skip records equal to after_id
-        while (start_idx < items.len and items[start_idx].id.eql(after_id)) : (start_idx += 1) {}
+        const start_idx = self.firstAfter(after_id);
         if (start_idx >= items.len) return 0;
         var n: usize = 0;
         var i = start_idx;
@@ -624,9 +651,10 @@ pub const ConsumerGroup = struct {
                 }
             }
         }
-        // Advance last_delivered_id
+        // Advance last_delivered_id past the whole last append, so the next
+        // read starts after it.
         if (records.len > 0) {
-            const last = records[records.len - 1].id;
+            const last = lastRecordOf(records[records.len - 1]);
             if (last.greaterThan(self.last_delivered_id)) {
                 self.last_delivered_id = last;
             }
@@ -1276,17 +1304,25 @@ pub const StreamProjection = struct {
     /// Deliver records from a named stream to a consumer group.
     /// Reads `count` records after the group's last_delivered_id, adds to PEL.
     /// Returns the StreamRecords delivered (fills buf, returns count).
-    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+    /// The whole appends a group read of `count` records would deliver,
+    /// delivering none: the reply is built from these before the pending
+    /// list takes them.
+    pub fn groupPeek(self: *StreamProjection, group_name: []const u8, name_hash: u64, count: usize, buf: []StreamRecord) !usize {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         const ss = self.streams.getPtr(name_hash) orelse return 0;
-
-        // `count` is in records; deliver only whole appends within it, so
-        // the pending list holds exactly what the reply carries.
         const read_n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
-        const n = wholeEntriesWithin(buf[0..read_n], count);
-        if (n > 0) {
-            _ = try group.deliver(consumer_id, buf[0..n], now_ms);
-        }
+        return wholeEntriesWithin(buf[0..read_n], count);
+    }
+
+    /// Put `records` (from `groupPeek`) on the group's pending list.
+    pub fn groupDeliverRecords(self: *StreamProjection, group_name: []const u8, consumer_id: []const u8, records: []const StreamRecord, now_ms: u64) !void {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        if (records.len > 0) _ = try group.deliver(consumer_id, records, now_ms);
+    }
+
+    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+        const n = try self.groupPeek(group_name, name_hash, count, buf);
+        try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], now_ms);
         return n;
     }
 

@@ -3123,3 +3123,39 @@ test "e2e/workflow: list-runs and signal requests whose lengths overrun them are
     const ok = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), ok.status);
 }
+
+test "e2e/workflow: a batched append starts one run per record" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "st-batch" });
+    const workflow_def =
+        \\kind: Workflow
+        \\name: st-batch-run
+        \\version: 1.0.0
+        \\trigger.stream: batch-trigger-events
+        \\trigger.mode: shared
+        \\start.run: @actions/st-batch
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "st-batch-run.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // Five records in one append, then one more: six runs. Keying each run
+    // on its append's first id started one run per append.
+    try ctx.exec(&.{ "stream", "append", "batch-trigger-events", "a", "b", "c", "d", "e" });
+    try ctx.exec(&.{ "stream", "append", "batch-trigger-events", "single" });
+
+    var runs: usize = 0;
+    var waited: usize = 0;
+    while (waited < 50) : (waited += 1) {
+        var r = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-batch-run", "-o", "json" });
+        defer r.deinit();
+        runs = r.stdoutCount("\"run_id\"");
+        if (runs >= 6) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 6), runs);
+}

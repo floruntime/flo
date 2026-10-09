@@ -111,6 +111,10 @@ const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
 pub const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
+comptime {
+    // An answer frame is sized from the request limit.
+    std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
+}
 /// A read buffer grows to hold one whole request (and the start of the next).
 const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 
@@ -4468,7 +4472,8 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const handler = shard.stream_handler;
     const window = &waiter.stream;
     var buf: [StreamHandler.MAX_READ_BATCH]@import("../projection/stream.zig").StreamRecord = undefined;
-    const records = handler.readRecords(window.*, &buf);
+    const records, const result = handler.readReadable(window, &buf);
+    defer handler.freeResult(result);
     if (records.len == 0) {
         // Everything up to the stream's last id (or `end`) was scanned and none
         // of it is in the window; ids only grow, so the next wake starts there
@@ -4479,8 +4484,6 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         return false;
     }
 
-    const result = handler.messages(records, waiter.key());
-    defer handler.freeResult(result);
     switch (result) {
         .stream_messages => |m| shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, m.data),
         else => shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .internal_error, ""),

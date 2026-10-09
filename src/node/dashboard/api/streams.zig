@@ -429,7 +429,7 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
             const sp = &partition.stream;
             const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
             total_count = streamLogicalCount(sp, name_hash);
-            const cap: usize = @min(@as(usize, @intCast(limit)), 1000);
+            const cap: usize = @min(@as(usize, @intCast(limit)), stream_mod.MAX_READ_RECORDS);
 
             const StreamRecord = stream_mod.StreamRecord;
             const buf = allocator.alloc(StreamRecord, cap) catch null;
@@ -467,8 +467,11 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
                     };
                     var j: u64 = 0;
                     while (it.next()) |br| : (j += 1) {
-                        const payload = if (std.unicode.utf8ValidateSlice(br.payload)) br.payload else "<binary>";
                         const seq = rec.id.sequence + j;
+                        // A cursor inside an append resumes with the rest of it.
+                        const rid: stream_mod.StreamID = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = seq };
+                        if (!rid.greaterThan(start_id)) continue;
+                        const payload = if (std.unicode.utf8ValidateSlice(br.payload)) br.payload else "<binary>";
                         try msgs_arr.next();
                         var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                         try mobj.begin();
