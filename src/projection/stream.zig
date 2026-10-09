@@ -2698,6 +2698,7 @@ test "stream: trimCount predicts trim in records, not batches" {
 
     // A boundary before every record removes nothing.
     try testing.expectEqual(@as(u64, 0), s.trimCount(hash, .{ .timestamp_ms = b1.timestamp_ms - 1, .sequence = 0 }));
+}
 
 fn testBatch(buf: []u8, payloads: []const []const u8) []const u8 {
     std.mem.writeInt(u32, buf[0..4], @intCast(payloads.len), .little);
