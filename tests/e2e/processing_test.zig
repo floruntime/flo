@@ -834,29 +834,22 @@ test "e2e/processing: multi-source pipeline merges two input streams" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msrc" });
 }
 
-test "e2e/processing: multi-sink declaration uses primary sink" {
-    // Multi-sink fan-out is wired — all sinks receive records.
-    // This test verifies data flows through the primary (stream) sink;
-    // the secondary KV sink is a no-op (KV write not yet implemented in sink dispatch).
+test "e2e/processing: a record reaches every sink a job declares" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Scope to dedicated namespace for isolation
     try ctx.exec(&.{ "ns", "create", "proc_msink" });
-
-    // Seed source stream
     try ctx.exec(&.{ "stream", "append", "msink-input", "multi-sink-record", "-n", "proc_msink" });
 
-    // Submit job with two sinks declared; only the first (stream) is wired
+    // Two sinks, both in the job's own namespace: a job writes nowhere else.
     const job_def =
         \\kind: Processing
         \\name: e2e-multi-sink
-        \\namespace: proc_msink
         \\sources.[0].stream.name: msink-input
         \\sinks.[0].name: primary-out
         \\sinks.[0].stream.name: msink-stream-out
         \\sinks.[1].name: secondary-kv
-        \\sinks.[1].kv.namespace: msink-kv
+        \\sinks.[1].kv.key_prefix: msink
         \\parallelism: 1
         \\batch_size: 100
     ;
@@ -866,26 +859,15 @@ test "e2e/processing: multi-sink declaration uses primary sink" {
     const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_msink" });
     const job_id = extractJobId(submit_output) orelse return error.NoJobId;
 
-    // Wait for data to appear in the primary (stream) sink
-    const found = try readStreamBlocking(ctx, "msink-stream-out", "proc_msink", "multi-sink-record", "5000");
-
-    if (!found) {
-        std.debug.print("\n[TIMEOUT] Multi-sink data did not flow to primary stream sink\n", .{});
-        var status = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_msink" });
-        defer status.deinit();
-        std.debug.print("Job status: {s}\n", .{status.stdout});
-        ctx.dumpServerLogs();
-        return error.PipelineTimeout;
-    }
+    try testing.expect(try readStreamBlocking(ctx, "msink-stream-out", "proc_msink", "multi-sink-record", "5000"));
+    // With no keyby the record key is empty: the KV sink writes `msink:`.
+    try testing.expect(try kvGetBlocking(ctx, "msink:", "proc_msink", "multi-sink-record", 6000));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msink" });
 }
 
-test "e2e/processing: checkpoint persists to internal KV namespace" {
-    // Use expose_internal_keys so kv scan shows _proc: keys
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .expose_internal_keys = true },
-    });
+test "e2e/processing: a savepoint on a running job is accepted" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // Scope to dedicated namespace for isolation
@@ -911,26 +893,9 @@ test "e2e/processing: checkpoint persists to internal KV namespace" {
     // Wait for data to flow through
     _ = try readStreamBlocking(ctx, "ckpt-output", "proc_ckpt", "checkpoint-test-data", "5000");
 
-    // Take a savepoint — this triggers a checkpoint that persists to KV
     var sp_result = try ctx.cli.run(&.{ "processing", "savepoint", job_id, "-n", "proc_ckpt" });
     defer sp_result.deinit();
-    try stdx.testing.assertSucceeded(sp_result);
-
-    // With expose_internal_keys=true, _proc: checkpoint keys should be visible
-    var scan_result = try ctx.cli.run(&.{ "kv", "list", "-n", "proc_ckpt" });
-    defer scan_result.deinit();
-    if (scan_result.succeeded()) {
-        // Verify checkpoint keys are present under _proc: namespace
-        const has_proc_keys = scan_result.stdoutContains("_proc:");
-        if (!has_proc_keys) {
-            std.debug.print("WARN: kv list did not contain _proc: keys (checkpoint may not have flushed yet)\n", .{});
-            std.debug.print("kv list output:\n{s}\n", .{scan_result.stdout});
-        }
-    }
-
-    // Also verify that a server WITHOUT expose_internal_keys hides these keys.
-    // We've already verified the mechanism in the KVHandler unit: the filter
-    // uses `!is_internal and !self.expose_internal_keys and entry.key[0] == '_'`.
+    try std.testing.expect(sp_result.stdoutContains("Savepoint created"));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_ckpt" });
 }

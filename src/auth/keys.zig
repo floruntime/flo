@@ -8,7 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 
-/// Roles for API keys. Maps directly to `matchScope()` patterns in jwt.zig.
+/// Roles for API keys.
 pub const Role = enum {
     admin,
     operator,
@@ -155,7 +155,7 @@ pub const ApiKey = struct {
         @memcpy(&key.hash, data[pos..][0..32]);
         pos += 32;
 
-        key.role = @enumFromInt(data[pos]);
+        key.role = std.enums.fromInt(@TypeOf(key.role), data[pos]) orelse return error.InvalidPayload;
         pos += 1;
 
         key.created_at = std.mem.bytesAsValue(i64, data[pos..][0..8]).*;
@@ -343,4 +343,16 @@ test "generateSigningSecret produces random bytes" {
     const s2 = generateSigningSecret();
     // Extremely unlikely to be equal
     try std.testing.expect(!std.crypto.timing_safe.eql([32]u8, s1, s2));
+}
+
+test "ApiKey deserialize refuses an unknown role" {
+    const result = try generateKey(std.testing.allocator, "badrole", .operator, 1741500000);
+    defer std.testing.allocator.free(result.plaintext);
+    var buf: [ApiKey.serialized_size]u8 = undefined;
+    _ = try result.key.serialize(&buf);
+    for (0..buf.len) |i| {
+        var bad = buf;
+        bad[i] = 0xee;
+        _ = ApiKey.deserialize(&bad) catch {};
+    }
 }

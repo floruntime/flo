@@ -228,7 +228,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidParallelism,
         };
         if (v <= 0) return error.InvalidParallelism;
-        parallelism = @intCast(v);
+        parallelism = std.math.cast(u32, v) orelse return error.InvalidParallelism;
     }
 
     // --- batch_size (top-level integer default for all sources) ---
@@ -239,7 +239,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
             else => return error.InvalidFormat,
         };
         if (v <= 0) return error.InvalidFormat;
-        batch_size = @intCast(v);
+        batch_size = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // --- sources (required array) ---
@@ -329,7 +329,15 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
                     idx += 1;
                 }
 
-                break :blk entries[0..idx];
+                // Values of other kinds were skipped: keep the slice exactly
+                // as long as its allocation, since later growth frees it.
+                if (idx < entries.len) {
+                    const exact = allocator.alloc(OperatorSpec.ConfigEntry, idx) catch return error.OutOfMemory;
+                    @memcpy(exact, entries[0..idx]);
+                    allocator.free(entries);
+                    break :blk exact;
+                }
+                break :blk entries;
             };
 
             // For classify operators, expand `rules:` array into indexed condition_N/tag_N pairs
@@ -368,6 +376,28 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
                         }
                         config = new_entries[0..write_idx];
                     }
+                }
+            }
+
+            // A lookup that names no namespace reads the job's own, as an
+            // endpoint does; resolved here so the running job and every
+            // replay of it read the same one.
+            if (std.mem.eql(u8, op_type, "kv_lookup")) {
+                const has_ns = if (config) |c| for (c) |e| {
+                    if (std.mem.eql(u8, e.key, "namespace")) break true;
+                } else false else false;
+                if (!has_ns) {
+                    const existing_count = if (config) |c| c.len else 0;
+                    const grown = allocator.alloc(OperatorSpec.ConfigEntry, existing_count + 1) catch return error.OutOfMemory;
+                    if (config) |c| {
+                        @memcpy(grown[0..c.len], c);
+                        allocator.free(c);
+                    }
+                    grown[existing_count] = .{
+                        .key = allocator.dupe(u8, "namespace") catch return error.OutOfMemory,
+                        .value = allocator.dupe(u8, effective_namespace) catch return error.OutOfMemory,
+                    };
+                    config = grown;
                 }
             }
 
@@ -507,12 +537,12 @@ fn appendTsSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(ts_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     var poll_interval_ms: u32 = 1000;
     if (getInt(ts_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_interval_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_interval_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -584,13 +614,13 @@ fn appendStreamSource(
 
     var bs: u32 = default_batch_size;
     if (getInt(stream_obj, "batch_size")) |v| {
-        if (v > 0) bs = @intCast(@as(i64, v));
+        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // Poll interval (default 1000ms) — how often the pipeline reads from the source.
     var poll_ms: u32 = 1000;
     if (getInt(stream_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_ms = @intCast(@as(i64, v));
+        if (v > 0) poll_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     // `partitions:` as string → range/list/all expansion
@@ -602,7 +632,7 @@ fn appendStreamSource(
     // `partitions:` as integer → single partition; default → all
     var partition: u32 = job_definition.PARTITION_ALL;
     if (getInt(stream_obj, "partitions")) |v| {
-        partition = @intCast(@as(i64, v));
+        partition = std.math.cast(u32, v) orelse return error.InvalidFormat;
     }
 
     const name_dup = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
@@ -835,7 +865,9 @@ fn appendKvSink(
 
     var ttl: ?u64 = null;
     if (getInt(kv_obj, "ttl_ms")) |v| {
-        if (v > 0) ttl = @intCast(@as(i64, v));
+        // A TTL is applied in nanoseconds; one that can't be is refused here.
+        if (v > std.math.maxInt(u64) / std.time.ns_per_ms) return error.InvalidFormat;
+        if (v > 0) ttl = @intCast(v);
     }
 
     sinks.append(allocator, .{
@@ -2051,14 +2083,14 @@ test "parser: kv_lookup operator minimal config" {
         \\    lookup_key: "${$.id}"
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinitionWithNamespace(allocator, text, "acme");
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
     try std.testing.expectEqualStrings("kv_lookup", op.type_name);
     try std.testing.expectEqualStrings("${$.id}", op.getConfig("lookup_key").?);
-    // namespace and mode not specified — registry will use defaults
-    try std.testing.expect(op.getConfig("namespace") == null);
+    // No namespace named: the lookup reads the job's own, as endpoints do.
+    try std.testing.expectEqualStrings("acme", op.getConfig("namespace").?);
     try std.testing.expect(op.getConfig("mode") == null);
 }
 
@@ -2425,4 +2457,22 @@ test "parser: classify operator with default tag" {
         }
     }
     try std.testing.expect(has_default);
+}
+
+test "parser: a stream or queue name holding a NUL, or too long for its namespace, is refused at submit" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in\u0000x"}}],"sinks":[{"stream":{"name":"out"}}]}
+        ,
+        \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"queue":{"name":"q\u0000x"}}]}
+    }) |json_def| {
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme");
+        defer def.deinit(allocator);
+        try std.testing.expectEqualStrings("stream or queue name must not contain NUL", def.namespaceRefusal().?);
+    }
+    const long = "s" ** 4096;
+    const too_long = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"" ++ long ++ "\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}";
+    var def = try parseJobDefinitionWithNamespace(allocator, too_long, "acme");
+    defer def.deinit(allocator);
+    try std.testing.expectEqualStrings("stream or queue name too long for its namespace", def.namespaceRefusal().?);
 }

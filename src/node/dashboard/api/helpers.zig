@@ -219,11 +219,13 @@ pub fn writeRunCountsJson(writer: anytype, counts: RunCounts) !void {
 // Percent-Decoding (for URL path segments)
 // =============================================================================
 
-/// Decode percent-encoded bytes in-place (e.g. `%2F` → `/`).
-/// Returns a slice into `buf` with the decoded content.
-/// If input has no `%` sequences, returns the original slice unchanged.
-pub fn percentDecode(buf: []u8, input: []const u8) []const u8 {
+/// Percent-decode `input` into `buf` (e.g. `%2F` → `/`). Input with no `%` is
+/// returned as is; otherwise the decoded slice of `buf`, or null when input is
+/// longer than `buf`.
+pub fn percentDecode(buf: []u8, input: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, input, '%') == null) return input;
+    // Decoding never lengthens, so an input that fits can't overrun buf.
+    if (input.len > buf.len) return null;
     var i: usize = 0;
     var o: usize = 0;
     while (i < input.len) {
@@ -322,4 +324,11 @@ test "dashboard: the client endpoint follows the bind address" {
     try std.testing.expectEqualStrings("127.0.0.1:9000", try ctx.clientEndpoint(&buf));
     ctx.client_ip4 = .{ 10, 0, 1, 12 };
     try std.testing.expectEqualStrings("10.0.1.12:9000", try ctx.clientEndpoint(&buf));
+}
+
+test "percentDecode refuses an escaped input longer than its buffer" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(percentDecode(&buf, "abcdefg%41") == null);
+    try std.testing.expectEqualStrings("abcdeA", percentDecode(&buf, "abcde%41").?);
+    try std.testing.expectEqualStrings("no-escapes-at-all", percentDecode(&buf, "no-escapes-at-all").?);
 }

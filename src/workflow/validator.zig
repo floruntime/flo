@@ -382,6 +382,9 @@ fn validateStepReference(result: *ValidationResult, step: Step, step_name: []con
 }
 
 fn isValidActionOrPlanReference(target: []const u8) bool {
+    // An action name is part of its registry key ("ns\x00name"): one
+    // holding a NUL could name another namespace's action.
+    if (mem.indexOfScalar(u8, target, 0) != null) return false;
     // Valid formats:
     // @actions/<name>
     // @plan/<name>
@@ -761,6 +764,7 @@ fn validateExecutorConfig(result: *ValidationResult, exec: ExecutorConfig, plan_
 }
 
 fn isValidActionReference(target: []const u8) bool {
+    if (mem.indexOfScalar(u8, target, 0) != null) return false; // as above
     // Plan executors can only reference actions, not other plans
     if (mem.startsWith(u8, target, "@actions/")) {
         return target.len > "@actions/".len;
@@ -1451,4 +1455,10 @@ test "validateWorkflow: negative interval rejected" {
         }
     }
     try testing.expect(found);
+}
+
+test "validator: an action reference holding a NUL is not valid" {
+    try std.testing.expect(isValidActionOrPlanReference("@actions/x"));
+    try std.testing.expect(!isValidActionOrPlanReference("@actions/b\x00x"));
+    try std.testing.expect(!isValidActionReference("@actions/b\x00x"));
 }

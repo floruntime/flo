@@ -385,7 +385,7 @@ pub const QueueHandler = struct {
         var dequeued_bytes: usize = 0;
         for (results[0..actual]) |r| {
             dequeued_bytes += r.payload.len;
-            self.persistAck(ns_hash, r.seq);
+            self.persistAck(req.namespace, queue_name_hash, r.seq);
         }
 
         if (self.metrics_registry) |mr| {
@@ -400,103 +400,79 @@ pub const QueueHandler = struct {
     // ── COMPLETE (ACK) ──────────────────────────────────────────────────
 
     fn handleComplete(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-
-        // Sequence from value
-        const seq = parseSeqFromValue(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
-        };
-
-        // Persist through Raft
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, seq, .little);
-        if (self.shard_ptr) |sptr| {
-            const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ack not persisted") } };
-            };
-            return .{ .parked = proposed };
-        }
-
-        // No shard (unit tests): apply a locally built entry.
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = router.namespaceHash(req.namespace);
-        const next_index = self.partition.ual.max_index + 1;
-
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8; // 8-byte seq key, no value
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
-
-        const entry = entry_mod.buildCommandEntry(
-            .queue_ack,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            &seq_key,
-            &[_]u8{},
-            payload_buf[0..payload_size],
-        ) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-        };
-
-        _ = self.partition.apply(&entry) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-        };
-
-        return .ok;
+        return self.handleAckBatch(req, .queue_ack, "ack not persisted");
     }
 
     // ── FAIL (NACK) ─────────────────────────────────────────────────────
 
     fn handleFail(self: *QueueHandler, req: Request) CommandResult {
+        return self.handleAckBatch(req, .queue_nack, "nack not persisted");
+    }
+
+    /// Most seqs one ack or nack may name.
+    const MAX_ACK_BATCH: u32 = 1024;
+
+    /// Ack or nack `[count:u32][seq:u64]*` in the request's queue. Every
+    /// message must be in that queue, in that namespace: seqs are numbered
+    /// across the partition, so the batch is refused whole if any is in
+    /// another queue. A message already gone is no error (it may have been
+    /// taken and acked) and, like a repeated seq, is not logged. Each seq
+    /// logged gets its own entry naming the queue, and the applier checks
+    /// the same.
+    fn handleAckBatch(self: *QueueHandler, req: Request, kind: entry_mod.EntryType, not_persisted: []const u8) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         }
-
-        const seq = parseSeqFromValue(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "message sequence is required" } };
+        const seqs = parseSeqs(req.value) orelse {
+            return .{ .err = .{ .code = .invalid_request, .message = "message sequences are required: [count:u32][seq:u64]*" } };
         };
-
-        // Persist through Raft
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, seq, .little);
-        if (self.shard_ptr) |sptr| {
-            const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_nack, entry_mod.Flags.NONE, req.namespace, &seq_key, &[_]u8{}) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "nack not persisted") } };
-            };
-            return .{ .parked = proposed };
+        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        var held: [MAX_ACK_BATCH]u64 = undefined;
+        var held_count: usize = 0;
+        for (0..seqs.count) |i| {
+            const seq = seqs.at(i);
+            const msg = self.queue.messages.get(seq) orelse continue;
+            if (msg.queue_name_hash != queue_hash) {
+                return .{ .err = .{ .code = .not_found, .message = "message not found in this queue" } };
+            }
+            if (std.mem.indexOfScalar(u64, held[0..held_count], seq) == null) {
+                held[held_count] = seq;
+                held_count += 1;
+            }
         }
 
-        // No shard (unit tests): apply a locally built entry.
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = router.namespaceHash(req.namespace);
-        const next_index = self.partition.ual.max_index + 1;
-
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
-
-        const entry = entry_mod.buildCommandEntry(
-            .queue_nack,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            &seq_key,
-            &[_]u8{},
-            payload_buf[0..payload_size],
-        ) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-        };
-
-        _ = self.partition.apply(&entry) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-        };
-
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
+        var last: ?persistence_mod.ProposeResult = null;
+        for (held[0..held_count]) |seq| {
+            var seq_key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &seq_key, seq, .little);
+            if (self.shard_ptr) |sptr| {
+                const shard: *Shard = @ptrCast(@alignCast(sptr));
+                last = persistence_mod.proposeEntry(shard, kind, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
+                    return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, not_persisted) } };
+                };
+                continue;
+            }
+            // No shard (unit tests): apply a locally built entry.
+            var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
+            const entry = entry_mod.buildCommandEntry(
+                kind,
+                entry_mod.Flags.NONE,
+                self.partition.current_term,
+                self.partition.ual.max_index + 1,
+                @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000,
+                router.namespaceHash(req.namespace),
+                &seq_key,
+                &queue_key,
+                &payload_buf,
+            ) orelse return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
+            _ = self.partition.apply(&entry) catch {
+                return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
+            };
+        }
+        // Answered once the last of them applies.
+        if (last) |p| return .{ .parked = p };
         return .ok;
     }
 
@@ -524,11 +500,25 @@ pub const QueueHandler = struct {
 
     // ── STATS ───────────────────────────────────────────────────────────
 
+    /// One queue's numbers, in the request's namespace.
     fn handleStats(self: *QueueHandler, req: Request) CommandResult {
-        _ = req;
-
-        const stats = self.queue.stats;
-        const data = serializeStats(self.allocator, stats, self.queue.readyCount(), self.queue.leasedCount(), self.queue.dlqCount()) catch {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
+        }
+        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const counts = self.queue.queueCounts(queue_hash);
+        var stats: QueueProjection.Stats = .{};
+        if (self.queue.known_queues.get(queue_hash)) |meta| {
+            stats = .{
+                .enqueued = meta.enqueued,
+                .dequeued = meta.dequeued,
+                .acked = meta.acked,
+                .nacked = meta.nacked,
+                .dlq_count = meta.dead_lettered,
+                .leases_expired = meta.leases_expired,
+            };
+        }
+        const data = serializeStats(self.allocator, stats, counts.ready, counts.leased, counts.dead) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stats serialization failed" } };
         };
 
@@ -538,10 +528,13 @@ pub const QueueHandler = struct {
 
     // ── DLQ LIST ────────────────────────────────────────────────────────
 
+    /// One queue's dead letters, in the request's namespace.
     fn handleDlqList(self: *QueueHandler, req: Request) CommandResult {
-        _ = req;
-
-        const dlq_count = self.queue.dlqCount();
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
+        }
+        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const dlq_count = self.queue.queueCounts(queue_hash).dead;
         const data = serializeDlqSummary(self.allocator, dlq_count) catch {
             return .{ .err = .{ .code = .internal_error, .message = "dlq list serialization failed" } };
         };
@@ -710,18 +703,20 @@ pub const QueueHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Persist a queue_ack UAL entry for a dequeued message.
-    /// Called automatically after dequeue so consumed messages don't reappear after restart.
-    fn persistAck(self: *QueueHandler, ns_hash: u32, seq: u64) void {
+    /// Persist a queue_ack UAL entry for a dequeued message, naming its queue
+    /// as any ack does, so consumed messages don't reappear after restart.
+    fn persistAck(self: *QueueHandler, namespace: []const u8, queue_hash: u64, seq: u64) void {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
 
         // Persist through Raft; the applier acks the projection. A failed
         // persist means the message can reappear after a restart, which
         // the operator must hear about.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
                 log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
             };
             return;
@@ -731,8 +726,8 @@ pub const QueueHandler = struct {
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const next_index = self.partition.ual.max_index + 1;
 
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 8;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 8]u8 = undefined;
+        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 16;
+        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
 
         const entry = entry_mod.buildCommandEntry(
             .queue_ack,
@@ -740,9 +735,9 @@ pub const QueueHandler = struct {
             self.partition.current_term,
             next_index,
             timestamp_ns,
-            ns_hash,
+            router.namespaceHash(namespace),
             &seq_key,
-            &[_]u8{},
+            &queue_key,
             payload_buf[0..payload_size],
         ) orelse return;
 
@@ -807,11 +802,22 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
 // Serialization
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn parseSeqFromValue(value: []const u8) ?u64 {
-    if (value.len == 0) return null;
-    return std.fmt.parseInt(u64, value, 10) catch null;
-}
+const Seqs = struct {
+    bytes: []const u8,
+    count: u32,
+    fn at(self: Seqs, i: usize) u64 {
+        return std.mem.readInt(u64, self.bytes[i * 8 ..][0..8], .little);
+    }
+};
 
+/// `[count:u32][seq:u64]*`, exactly, with 1..MAX_ACK_BATCH seqs.
+fn parseSeqs(value: []const u8) ?Seqs {
+    if (value.len < 4) return null;
+    const count = std.mem.readInt(u32, value[0..4], .little);
+    if (count == 0 or count > QueueHandler.MAX_ACK_BATCH) return null;
+    if (value.len != 4 + @as(usize, count) * 8) return null;
+    return .{ .bytes = value[4..], .count = count };
+}
 /// Serialize dequeue results.
 /// Wire format: [count:u32] ([seq:u64][payload_len:u32][payload][enqueued_at:i64][delivery_count:u32][priority:u8])*
 fn serializeDequeueResults(allocator: Allocator, results: []const DequeueResult) ![]u8 {
@@ -854,7 +860,8 @@ pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const Dequeue
         offset += 8;
         std.mem.writeInt(u32, buf[offset..][0..4], r.attempts, .little);
         offset += 4;
-        buf[offset] = @intCast(r.priority);
+        // The wire carries a u8; a client can't set more, but a stored u32 can hold it.
+        buf[offset] = @intCast(@min(r.priority, std.math.maxInt(u8)));
         offset += 1;
     }
 
@@ -909,6 +916,13 @@ fn serializeDlqSummary(allocator: Allocator, dlq_count: usize) ![]u8 {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+/// One seq as an ack carries it: [count:u32][seq:u64].
+fn seqBatch(buf: []u8, seq: u64) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], 1, .little);
+    std.mem.writeInt(u64, buf[4..12], seq, .little);
+    return buf[0..12];
+}
 
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
     return .{
@@ -1090,8 +1104,7 @@ test "queue handler: complete (ack)" {
 
     // Complete the message
     var buf: [20]u8 = undefined;
-    const seq_str = std.fmt.bufPrint(&buf, "{d}", .{deq_seq}) catch unreachable;
-    const ack_result = handler.handleCommand(makeRequest(.queue_complete, "q1", seq_str, ""));
+    const ack_result = handler.handleCommand(makeRequest(.queue_complete, "q1", seqBatch(&buf, deq_seq), ""));
     switch (ack_result) {
         .ok => {},
         else => return error.TestUnexpectedResult,
@@ -1125,8 +1138,7 @@ test "queue handler: fail (nack)" {
 
     // Fail the message
     var buf: [20]u8 = undefined;
-    const seq_str = std.fmt.bufPrint(&buf, "{d}", .{deq_seq}) catch unreachable;
-    const nack_result = handler.handleCommand(makeRequest(.queue_fail, "q1", seq_str, ""));
+    const nack_result = handler.handleCommand(makeRequest(.queue_fail, "q1", seqBatch(&buf, deq_seq), ""));
     switch (nack_result) {
         .ok => {},
         else => return error.TestUnexpectedResult,
@@ -1187,7 +1199,8 @@ test "queue handler: complete invalid seq" {
     var handler = QueueHandler.init(allocator, partition);
 
     // ack on non-existent seq is a silent no-op in the projection
-    const result = handler.handleCommand(makeRequest(.queue_complete, "q1", "999", ""));
+    var buf: [12]u8 = undefined;
+    const result = handler.handleCommand(makeRequest(.queue_complete, "q1", seqBatch(&buf, 999), ""));
     switch (result) {
         .ok => {},
         else => return error.TestUnexpectedResult,
@@ -1241,4 +1254,80 @@ test "queue handler: peek empty" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "queue handler: an ack batch naming another queue's message is refused whole" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    var handler = QueueHandler.init(allocator, partition);
+
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "b", ""));
+    var mine: u64 = 0;
+    var theirs: u64 = 0;
+    var it = handler.queue.messages.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.value_ptr.payload, "a")) mine = kv.key_ptr.* else theirs = kv.key_ptr.*;
+    }
+
+    var batch: [4 + 16]u8 = undefined;
+    std.mem.writeInt(u32, batch[0..4], 2, .little);
+    std.mem.writeInt(u64, batch[4..12], mine, .little);
+    std.mem.writeInt(u64, batch[12..20], theirs, .little);
+    switch (handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, ""))) {
+        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 2), handler.queue.messages.count());
+
+    // Malformed batches are refused, not read as something else.
+    for ([_][]const u8{ "", "\x00\x00\x00\x00", "\x01\x00\x00\x00\x01" }) |bad| {
+        try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", bad, "")) == .err);
+    }
+
+    var one: [12]u8 = undefined;
+    try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", seqBatch(&one, mine), "")) != .err);
+    try testing.expectEqual(@as(usize, 1), handler.queue.messages.count());
+}
+
+test "queue handler: stats and the dead-letter count are one queue's, in its namespace" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    var handler = QueueHandler.init(allocator, partition);
+
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "b", ""));
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "c", ""));
+    const result = handler.handleCommand(makeRequest(.queue_stats, "mine", "", ""));
+    defer handler.freeResult(result);
+    const data = switch (result) {
+        .queue_messages => |m| m.data,
+        else => return error.TestUnexpectedResult,
+    };
+    // [enqueued][dequeued][acked][nacked][dlq][expired][ready][leased][dead]
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[48..56], .little));
+    try testing.expect(handler.handleCommand(makeRequest(.queue_stats, "", "", "")) == .err);
+}
+
+test "queue handler: an ack batch logs each held message once, and nothing for one already gone" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    var handler = QueueHandler.init(allocator, partition);
+
+    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
+    var it = handler.queue.messages.keyIterator();
+    const seq = it.next().?.*;
+    const before = handler.partition.ual.max_index;
+
+    var batch: [4 + 24]u8 = undefined;
+    std.mem.writeInt(u32, batch[0..4], 3, .little);
+    std.mem.writeInt(u64, batch[4..12], seq, .little);
+    std.mem.writeInt(u64, batch[12..20], seq, .little);
+    std.mem.writeInt(u64, batch[20..28], 99_999, .little);
+    try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, "")) != .err);
+    try testing.expectEqual(before + 1, handler.partition.ual.max_index);
+    try testing.expectEqual(@as(usize, 0), handler.queue.messages.count());
 }

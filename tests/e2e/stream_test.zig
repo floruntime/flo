@@ -1788,16 +1788,10 @@ test "e2e/stream: tiered storage - read range across tiers" {
     std.debug.print("\n✓ Tier distribution: {d} warm, {d} hot\n", .{ warm_count, hot_count });
 }
 
-test "e2e/stream: tiered storage - cold tier with file backend" {
-    // Test: Configure cold storage with file backend and verify archival path
-    // This tests the full tiered storage pipeline: hot → warm → cold
+test "e2e/stream: tiered storage - every record readable with a tiny hot tier" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{
             .durability = .sync,
-            .cold_storage = .{
-                .provider = .file,
-                // file_base_path defaults to data_dir/archive
-            },
             .tiered_log = .{
                 .hot_buffer_capacity = 2048, // Very small to force spills
                 .max_hot_entries = 3, // Very small hot tier

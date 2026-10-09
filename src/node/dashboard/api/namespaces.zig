@@ -19,6 +19,7 @@ const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler
 const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const ns_keys = @import("../../../namespace/handler.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
 
@@ -129,30 +130,23 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /namespaces — Create a new namespace (direct integration with shard 0 namespace handler)
+/// POST /namespaces — Create a new namespace. Proposed over the node's own
+/// protocol port like any client's create: the registry belongs to its
+/// shard's thread, and a create must be logged.
 pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     // Parse the name from JSON body: {"name": "..."}
     const name = extractName(body) orelse {
         return h.jsonError(allocator, "missing or invalid \"name\" field");
     };
+    if (ns_keys.nameRefusal(name)) |why| return h.jsonError(allocator, why);
 
-    // Validate
-    if (name.len == 0) return h.jsonError(allocator, "namespace name is required");
-    if (name.len > 128) return h.jsonError(allocator, "namespace name too long (max 128)");
-    if (!isValidNamespaceName(name)) return h.jsonError(allocator, "invalid namespace name: must start with letter/underscore, contain only [a-zA-Z0-9_.-]");
-    if (isReservedNamespace(name)) return h.jsonError(allocator, "reserved namespace name");
-
-    // Access shard 0 (namespace commands are controller-only)
-    const ptrs = ctx.shard_ptrs orelse return h.jsonError(allocator, "shards not initialized");
-    if (ptrs.len == 0) return h.jsonError(allocator, "no shards available");
-    const shard: *Shard = @ptrCast(@alignCast(ptrs[0]));
-
-    // Check if already exists
-    if (std.mem.eql(u8, name, "default")) return h.jsonError(allocator, "namespace already exists");
-    if (shard.namespace_handler.namespaces.contains(name)) return h.jsonError(allocator, "namespace already exists");
-
-    // Apply creation to shard 0's namespace handler (in-memory registration)
-    shard.namespace_handler.applyCreate(name);
+    var client = @import("kv.zig").loopbackConnect(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var resp = client_mod.namespace.create(&client, name) catch
+        return try h.jsonError(allocator, "namespace create failed");
+    defer resp.deinit();
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     // Return success
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -180,31 +174,6 @@ fn extractName(body: []const u8) ?[]const u8 {
     while (i < after.len and after[i] != '"') : (i += 1) {}
     if (i >= after.len) return null;
     return after[start..i];
-}
-
-fn isValidNamespaceName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
-            else => return false,
-        }
-    }
-    return switch (name[0]) {
-        'a'...'z', 'A'...'Z', '_' => true,
-        else => false,
-    };
-}
-
-fn isReservedNamespace(name: []const u8) bool {
-    const reserved = [_][]const u8{ "__system", "__internal", "__meta", "_flo" };
-    for (reserved) |prefix| {
-        if (name.len >= prefix.len and std.mem.eql(u8, name[0..prefix.len], prefix)) {
-            if (name.len == prefix.len) return true;
-            if (name[prefix.len] == ':' or name[prefix.len] == '.') return true;
-        }
-    }
-    return false;
 }
 
 /// GET /namespaces/:name - Namespace detail with resource arrays
@@ -468,7 +437,7 @@ fn countKVInNamespace(ctx: *DashboardContext, namespace: []const u8) u64 {
     // Scan the KV projection per namespace (the metrics key_count counter is not
     // updated on write, so it under-reports). Mirrors api/kv.zig getKVKeys filtering.
     var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
+    const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace) catch return 0;
 
     var count: u64 = 0;
     const n = shardCount(ctx);

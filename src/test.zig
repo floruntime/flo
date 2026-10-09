@@ -27,6 +27,7 @@ test {
 // Node layer
 test {
     _ = @import("node/reactor.zig");
+    _ = @import("node/runtime.zig");
     _ = @import("node/inbox.zig");
     _ = @import("node/mailbox.zig");
     _ = @import("node/reply_to.zig");
@@ -39,12 +40,10 @@ test {
     _ = @import("node/acceptor.zig");
     _ = @import("node/shard_walker.zig");
     _ = @import("node/task_scheduler.zig");
-    _ = @import("node/ws_handler.zig");
-    _ = @import("node/network/jwt.zig");
-    _ = @import("node/network/jwks.zig");
     _ = @import("node/manifest.zig");
     _ = @import("node/shard_manifest.zig");
     _ = @import("storage/persistence.zig");
+    _ = @import("util/time_units.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");
@@ -102,9 +101,25 @@ test {
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
     _ = @import("ts/handler.zig");
+    _ = @import("ts/floql/ast.zig");
+    _ = @import("ts/floql/parser.zig");
+    _ = @import("ts/floql/stages.zig");
+    _ = @import("ts/floql/executor.zig");
+    _ = @import("ts/floql/series_set.zig");
+    _ = @import("workflow/parser.zig");
+    _ = @import("workflow/definition.zig");
+    _ = @import("workflow/plan_types.zig");
     _ = @import("namespace/handler.zig");
     _ = @import("actions/handler.zig");
     _ = @import("workflow/handler.zig");
+    _ = @import("worker/handler.zig");
+    _ = @import("workflow/validator.zig");
+    _ = @import("workflow/parser.zig");
+    _ = @import("workflow/definition.zig");
+    _ = @import("workflow/cron.zig");
+    _ = @import("workflow/jsonpath.zig");
+    _ = @import("workflow/plan_types.zig");
+    _ = @import("workflow/types.zig");
     _ = @import("processing/handler.zig");
     _ = @import("processing/operator.zig");
     _ = @import("processing/collector.zig");
@@ -166,6 +181,16 @@ test {
     _ = @import("node/dashboard/api/processing.zig");
     _ = @import("node/dashboard/api.zig");
     _ = @import("node/dashboard/http_server.zig");
+    _ = @import("util/http/mod.zig");
+    _ = @import("util/http/request.zig");
+    _ = @import("util/http/serve.zig");
+    _ = @import("metrics/http_server.zig");
+}
+
+// Config
+test {
+    _ = @import("config/server.zig");
+    _ = @import("config/dashboard.zig");
 }
 
 // Cluster

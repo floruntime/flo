@@ -678,34 +678,6 @@ test "e2e/ts: set retention raw TTL" {
     try testing.expect(std.mem.indexOf(u8, output, "OK") != null);
 }
 
-test "e2e/ts: set retention with downsample rule" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "ts", "write", "retention_ds_test", "--tags", "host=a", "--value", "50.0" });
-
-    // flo ts retention retention_ds_test --raw-ttl 7d --downsample 1m:avg:30d
-    const output = try ctx.execCapture(&.{
-        "ts",         "retention", "retention_ds_test",
-        "--raw-ttl",  "7d",        "--downsample",
-        "1m:avg:30d",
-    });
-    try testing.expect(std.mem.indexOf(u8, output, "OK") != null);
-}
-
-test "e2e/ts: retention requires --raw-ttl or --downsample" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "ts", "write", "retention_fail_test", "--tags", "host=a", "--value", "50.0" });
-
-    // No --raw-ttl or --downsample should fail
-    var result = try ctx.cli.run(&.{ "ts", "retention", "retention_fail_test" });
-    defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
-}
-
 // =============================================================================
 // FloQL Pipeline Queries
 // =============================================================================
@@ -1487,4 +1459,100 @@ test "e2e/ts: points survive restart exactly once" {
     defer after.deinit();
     try stdx.testing.assertSucceeded(after);
     for (values) |v| try testing.expectEqual(@as(usize, 1), after.stdoutCount(v));
+}
+
+test "e2e/ts: retention trims only its own measurement in its own namespace" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // A day's retention leaves nothing from 2024.
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "111", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "444" });
+    try ctx.exec(&.{ "ts", "write", "ret_b", "--value", "222", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "ret_a", "--value", "333", "--timestamp", "1708700400000", "-n", "other" });
+    try ctx.exec(&.{ "ts", "retention", "ret_a", "--raw-ttl", "1d" });
+
+    var a = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer a.deinit();
+    // Values as the raw output prints them, so a timestamp can't match.
+    try testing.expect(a.contains(" 444.000000"));
+    try testing.expect(!a.contains(" 111.000000"));
+    var b = try ctx.cli.run(&.{ "ts", "read", "ret_b", "--from", "1708700000000", "--output", "raw", "--limit", "100" });
+    defer b.deinit();
+    try testing.expect(b.contains(" 222.000000"));
+    var other = try ctx.cli.run(&.{ "ts", "read", "ret_a", "--from", "1708700000000", "--output", "raw", "--limit", "100", "-n", "other" });
+    defer other.deinit();
+    try testing.expect(other.contains(" 333.000000"));
+}
+
+test "e2e/ts: a FloQL percentile outside 0..100 or a window with too many buckets is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "1" });
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "2" });
+    // Three in one bucket: 150% of the way through them is past the last.
+    try ctx.exec(&.{ "ts", "write", "pct", "--value", "3" });
+    // Two points far enough apart that one-second buckets number in the millions.
+    try ctx.exec(&.{ "ts", "write", "span", "--value", "1", "--timestamp", "1708700400000" });
+    try ctx.exec(&.{ "ts", "write", "span", "--value", "2" });
+
+    for ([_][]const u8{
+        "pct[1h] | window(1m) | percentile(150)",
+        "span[1708700000000..4102444800000] | window(1s) | sum()",
+    }) |q| {
+        var r = try ctx.cli.run(&.{ "ts", "floql", q });
+        defer r.deinit();
+        try testing.expect(r.contains("out of range"));
+    }
+
+    var ok = try ctx.cli.run(&.{ "ts", "floql", "pct[1h] | window(1m) | percentile(50)" });
+    defer ok.deinit();
+    try testing.expect(!ok.contains("out of range") and !ok.contains("rror"));
+
+    try ctx.exec(&.{ "kv", "set", "alive", "yes" });
+    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "kv", "get", "alive" }), "yes") != null);
+}
+
+test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsample rule" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var missing = try ctx.cli.run(&.{ "ts", "retention", "cpu" });
+    defer missing.deinit();
+    try testing.expect(missing.contains("--raw-ttl is required"));
+    for ([_][]const u8{ "--show", "--downsample" }) |flag| {
+        var r = try ctx.cli.run(&.{ "ts", "retention", "cpu", "--raw-ttl", "7d", flag, "1m:avg:30d" });
+        defer r.deinit();
+        try testing.expect(!r.succeeded());
+    }
+
+    // An older client's rule is refused, not ignored.
+    const proto = @import("src").protocol.proto;
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(proto.OpCode.ts_retention);
+    header.request_id = 7;
+    var obuf: [64]u8 = undefined;
+    var b = proto.OptionsBuilder.init(&obuf);
+    try b.addString(.ts_raw_ttl, "7d");
+    try b.addString(.ts_downsample, "1m:avg:30d");
+    const req: proto.Request = .{ .header = header, .namespace = "default", .key = "cpu", .value = "", .options = b.getOptions() };
+    var buf: [256]u8 = undefined;
+    const bytes = try req.serialize(&buf);
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, bytes.ptr, bytes.len);
+    var out: [512]u8 = undefined;
+    var got: usize = 0;
+    const resp = for (0..300) |_| {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break null;
+        if (proto.Response.parse(out[0..got])) |r| break r else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    } else null;
+    try testing.expect(resp != null);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.?.header.status);
+    try testing.expect(std.mem.indexOf(u8, resp.?.data, "downsampling isn't supported") != null);
 }

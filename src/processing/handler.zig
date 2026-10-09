@@ -494,6 +494,22 @@ pub const ProcessingHandler = struct {
             return;
         };
         defer def.deinit(self.allocator);
+        if (def.namespaceRefusal()) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
+        const home = if (req.namespace.len > 0) req.namespace else "default";
+        var why_buf: [256]u8 = undefined;
+        if (def.homeRefusal(home, &why_buf)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
+        if (self.operatorRefusal(&def)) |name| {
+            var buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "operator '{s}' has a missing or invalid setting", .{name}) catch "an operator has a missing or invalid setting";
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, msg);
+            return;
+        }
 
         // Generate a unique job ID with embedded partition bits.
         //
@@ -521,7 +537,9 @@ pub const ProcessingHandler = struct {
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
         const now = @import("stdx").time.milliTimestamp();
-        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, def.namespace, yaml) catch |err| {
+        // Admitted at dispatch; the definition has now passed, so reserve.
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
+        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, now, home, yaml) catch |err| {
             shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "job not persisted"));
             return;
         };
@@ -530,6 +548,15 @@ pub const ProcessingHandler = struct {
 
     // ── Stop ─────────────────────────────────────────────────────────────
 
+    /// The job `job_id`, if it lives in `namespace` (empty is "default"):
+    /// a job is seen, stopped and changed only from its own namespace, so
+    /// from any other it is not found.
+    fn ownedJob(self: *ProcessingHandler, job_id: []const u8, namespace: []const u8) ?*JobRecord {
+        const job = self.jobs.getPtr(job_id) orelse return null;
+        const home = if (namespace.len > 0) namespace else "default";
+        return if (std.mem.eql(u8, job.namespace_owned, home)) job else null;
+    }
+
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const job_id = req.key;
         if (job_id.len == 0) {
@@ -537,7 +564,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .stopped) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "stop not persisted"));
                 return;
@@ -557,7 +584,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .cancelled) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "cancel not persisted"));
                 return;
@@ -577,7 +604,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.get(job_id)) |job| {
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Binary wire format:
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
@@ -688,7 +715,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.get(job_id)) |job| {
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Generate savepoint ID with partition from parent job
             const partition_id = run_id_mod.extractPartition(job_id) orelse 0;
             var id_buf: [32]u8 = undefined;
@@ -722,8 +749,8 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        // Check job exists
-        if (self.jobs.getPtr(job_id)) |job| {
+        // Check job exists, in this namespace
+        if (self.ownedJob(job_id, req.namespace)) |job| {
             // Check savepoint exists
             if (self.savepoints.get(savepoint_id)) |sp| {
                 // Verify the savepoint belongs to this job
@@ -766,7 +793,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.jobs.contains(job_id)) {
+        if (self.ownedJob(job_id, req.namespace) != null) {
             const proposed = self.proposeRescale(shard, req.namespace, job_id, parallelism) catch |err| {
                 shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "rescale not persisted"));
                 return;
@@ -894,7 +921,7 @@ pub const ProcessingHandler = struct {
         const job_id = key;
 
         var off: usize = 0;
-        const status: JobStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(JobStatus, value[off]) orelse return;
         off += 1;
         const parallelism = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
@@ -912,11 +939,18 @@ pub const ProcessingHandler = struct {
 
         const yaml = value[off..];
 
-        // Extract name from YAML by re-parsing. Keep `def` alive so we can also
-        // rebuild the execution pipeline below — createPipeline
-        // deep-copies what it retains, so freeing `def` at function end is safe.
-        var def = parser.parseJobDefinition(self.allocator, yaml) catch return;
+        // Re-parse with the job's namespace as fallback, as the submit did, so
+        // endpoints and lookups that name none resolve alike on every replica
+        // and restart. `def` stays alive for createPipeline, which deep-copies
+        // what it keeps.
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw) catch return;
         defer def.deinit(self.allocator);
+        // The submit checked these; the applier holds every replica to them.
+        var why_buf: [256]u8 = undefined;
+        if (def.namespaceRefusal() orelse def.homeRefusal(ns_raw, &why_buf)) |why| {
+            log.err("processing job {s} not started: {s}", .{ job_id, why });
+            return;
+        }
         const name = self.allocator.dupe(u8, def.name) catch return;
 
         // Use the embedded namespace (authoritative from original submit)
@@ -1068,26 +1102,7 @@ pub const ProcessingHandler = struct {
         };
         tag_registry_ptr.* = definition.TagRegistry{};
         const tag_registry = tag_registry_ptr;
-        for (def.sinks.items) |snk| {
-            if (snk.match) |tag_list| {
-                for (tag_list) |tag| _ = tag_registry.getOrCreate(tag);
-            }
-        }
-        for (def.operators.items) |op_spec| {
-            if (std.mem.eql(u8, op_spec.type_name, "classify")) {
-                if (op_spec.config) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.startsWith(u8, entry.key, "tag_")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                        // Also register default_tag so it can be resolved
-                        if (std.mem.eql(u8, entry.key, "default_tag")) {
-                            _ = tag_registry.getOrCreate(entry.value);
-                        }
-                    }
-                }
-            }
-        }
+        fillTagRegistry(tag_registry, def);
 
         // Resolve required_tags bitmask for each sink.
         for (def.sinks.items) |*snk| {
@@ -1107,6 +1122,38 @@ pub const ProcessingHandler = struct {
                 const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, idx }) catch continue;
                 const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
                 self.createPipeline(ms_owned, src, def.sinks.items, def, tag_registry);
+            }
+        }
+    }
+
+    /// The first native operator that can't be built, by name. Building
+    /// happens again when the job applies, where a failure skips the
+    /// operator and the job runs without it; refusing here is what stops that.
+    fn operatorRefusal(self: *ProcessingHandler, def: *const definition.JobDefinition) ?[]const u8 {
+        var tags = definition.TagRegistry{};
+        fillTagRegistry(&tags, def);
+        for (def.operators.items) |*spec| {
+            if (!native_registry.isNativeType(spec.type_name)) continue;
+            const built = native_registry.create(self.allocator, spec, &tags) catch return spec.name;
+            built.deinit(self.allocator);
+        }
+        return null;
+    }
+
+    /// Every tag the job's sinks match on and its classify operators assign.
+    fn fillTagRegistry(tags: *definition.TagRegistry, def: *const definition.JobDefinition) void {
+        for (def.sinks.items) |snk| {
+            if (snk.match) |tag_list| {
+                for (tag_list) |tag| _ = tags.getOrCreate(tag);
+            }
+        }
+        for (def.operators.items) |op_spec| {
+            if (!std.mem.eql(u8, op_spec.type_name, "classify")) continue;
+            const entries = op_spec.config orelse continue;
+            for (entries) |entry| {
+                if (std.mem.startsWith(u8, entry.key, "tag_") or std.mem.eql(u8, entry.key, "default_tag")) {
+                    _ = tags.getOrCreate(entry.value);
+                }
             }
         }
     }
@@ -1547,6 +1594,12 @@ pub const ProcessingHandler = struct {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            // A sink writes without passing a client's request gate: a
+            // namespace this shard may not create takes no write.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| {
+                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                continue;
+            }
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
@@ -1589,6 +1642,12 @@ pub const ProcessingHandler = struct {
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
+            // A sink writes without passing a client's request gate: a
+            // namespace this shard may not create takes no write.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| {
+                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                continue;
+            }
             switch (snk.kind) {
                 .stream => {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
@@ -1991,4 +2050,16 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
     defer allocator.free(records);
     // key_not_empty filter rejects records with empty key
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+
+    // [status=0xee][parallelism][batch_size][created_at_ms][ns_len=0]
+    var val = [_]u8{0} ** 21;
+    val[0] = 0xee;
+    handler.replaySubmit("job-bad", &val);
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }

@@ -397,6 +397,50 @@ pub const JobDefinition = struct {
     // Cleanup
     // =========================================================================
 
+    /// The reason the first invalid namespace this job names (at the top,
+    /// on a source or sink, or in an operator's `namespace` setting) is
+    /// refused, or null if all are valid. A job reads and writes without
+    /// passing a client's request check, so its definition is checked
+    /// whole, at submit.
+    pub fn namespaceRefusal(self: *const JobDefinition) ?[]const u8 {
+        const nameRefusal = @import("../namespace/handler.zig").nameRefusal;
+        if (self.namespace.len > 0) if (nameRefusal(self.namespace)) |why| return why;
+        for (self.sources.items) |src| if (src.namespace.len > 0) if (nameRefusal(src.namespace)) |why| return why;
+        for (self.sinks.items) |snk| if (snk.namespace.len > 0) if (nameRefusal(snk.namespace)) |why| return why;
+        for (self.operators.items) |*op| {
+            if (op.getConfig("namespace")) |ns| if (ns.len > 0) if (nameRefusal(ns)) |why| return why;
+        }
+        // Stream and queue names are keyed under their namespace with NUL
+        // separators: one holding a NUL, or too long to qualify, could be
+        // read or listed as another namespace's.
+        for (self.sources.items) |src| if (resourceRefusal(src.namespace, src.stream)) |why| return why;
+        for (self.sinks.items) |snk| if (resourceRefusal(snk.namespace, snk.target)) |why| return why;
+        return null;
+    }
+
+    fn resourceRefusal(namespace: []const u8, name: []const u8) ?[]const u8 {
+        if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return "stream or queue name must not contain NUL";
+        if (@import("../namespace/handler.zig").validateKeySize(namespace, name) != null) return "stream or queue name too long for its namespace";
+        return null;
+    }
+
+    /// Why this job cannot live in `home` (the namespace it is submitted
+    /// to), or null: a job lives where it is submitted and writes only
+    /// there. It may read other namespaces (sources, `kv_lookup`); a sink
+    /// elsewhere would write into a namespace whose owner never chose it.
+    /// The message is written into `buf`.
+    pub fn homeRefusal(self: *const JobDefinition, home: []const u8, buf: []u8) ?[]const u8 {
+        if (!std.mem.eql(u8, self.namespace, home)) {
+            return std.fmt.bufPrint(buf, "the definition's namespace '{s}' is not the one it is submitted to ('{s}'); submit it with -n {s}", .{ self.namespace, home, self.namespace }) catch "the definition's namespace is not the one it is submitted to";
+        }
+        for (self.sinks.items) |snk| {
+            if (std.mem.eql(u8, snk.namespace, home)) continue;
+            return std.fmt.bufPrint(buf, "{s} sink '{s}' writes namespace '{s}', but a job writes only into its own ('{s}'); submit a job in '{s}' that reads from '{s}' instead", .{ @tagName(snk.kind), if (snk.target.len > 0) snk.target else snk.name, snk.namespace, home, snk.namespace, home }) catch "a sink writes outside the job's namespace";
+        }
+        return null;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);

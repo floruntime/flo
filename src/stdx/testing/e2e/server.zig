@@ -49,8 +49,6 @@ pub const ServerProcess = struct {
     started: bool,
     config: ServerConfig,
     log_thread: ?std.Thread = null,
-    /// Root admin API key from bootstrap (set when config.auth_enabled = true)
-    api_key: ?[]const u8 = null,
 
     /// Default timeout for server readiness (ms)
     pub const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
@@ -82,29 +80,6 @@ pub const ServerProcess = struct {
         }
     };
 
-    /// Cold storage provider for tests
-    pub const ColdStorageProvider = enum {
-        /// No cold storage
-        none,
-        /// Local filesystem
-        file,
-
-        fn toConfigString(self: ColdStorageProvider) []const u8 {
-            return switch (self) {
-                .none => "none",
-                .file => "file",
-            };
-        }
-    };
-
-    /// Cold storage configuration for tests
-    pub const ColdStorageConfig = struct {
-        /// Provider type
-        provider: ColdStorageProvider = .none,
-        /// Base path for file provider (relative to data_dir)
-        file_base_path: ?[]const u8 = null,
-    };
-
     /// Tiered log configuration for tests
     pub const TieredLogConfig = struct {
         /// Hot tier buffer capacity in bytes (default: 16MB)
@@ -119,6 +94,9 @@ pub const ServerProcess = struct {
     pub const ServerConfig = struct {
         /// Enable dashboard HTTP server
         dashboard_enabled: bool = false,
+        /// `[dashboard] hosts` and `cors_origins`, written as given.
+        dashboard_hosts: ?[]const u8 = null,
+        dashboard_cors_origins: ?[]const u8 = null,
         /// Enable metrics HTTP server (Prometheus)
         metrics_enabled: bool = false,
         /// Number of shards (1 = faster startup)
@@ -129,15 +107,11 @@ pub const ServerProcess = struct {
         log_level: []const u8 = "info",
         /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
         durability: Durability = .async_flush,
-        /// Cold storage configuration (for tiered storage tests)
-        cold_storage: ColdStorageConfig = .{},
+        /// Serve from this data dir rather than the node's own, e.g. another
+        /// node's. Config and log stay in the node's own.
+        data_dir_of: ?[]const u8 = null,
         /// Tiered log configuration (for controlling hot→warm transitions)
         tiered_log: TieredLogConfig = .{},
-
-        // Background task intervals
-        /// Namespace deletion task interval in milliseconds
-        /// Default: 100ms for tests (faster cleanup than production's 5s)
-        namespace_deletion_interval_ms: i64 = 100,
 
         // Cluster configuration
         /// Join addresses for cluster mode (e.g., "127.0.0.1:4445")
@@ -159,12 +133,10 @@ pub const ServerProcess = struct {
         /// `[server] bind` for this node; null = the server default (0.0.0.0),
         /// reached at 127.0.0.1 by the harness.
         bind: ?[]const u8 = null,
-        /// Expose internal keys (prefixed with '_') in kv scan for testing
-        /// When true, kv list/scan will show _proc:, _action:, etc. keys
-        expose_internal_keys: bool = false,
-        /// Enable auth bootstrapping — server will run `flo server bootstrap` on start
-        /// and expose the root API key via ServerProcess.api_key
-        auth_enabled: bool = false,
+        /// Appended to the generated flo.toml as is.
+        extra_config: ?[]const u8 = null,
+        /// Start with `--config` naming a file that doesn't exist.
+        config_file_missing: bool = false,
     };
 
     /// Initialize a new server process manager with default config
@@ -207,7 +179,6 @@ pub const ServerProcess = struct {
         self.metrics_port = 0;
         self.raft_port = 0;
         self.started = false;
-        self.api_key = null;
         // `allocator.create` leaves the struct uninitialised, so the field
         // defaults declared above do NOT apply — every field must be assigned
         // here. `log_thread` in particular is otherwise only set inside
@@ -226,7 +197,6 @@ pub const ServerProcess = struct {
             self.stop();
         }
 
-        if (self.api_key) |k| self.allocator.free(k);
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.config_file);
         self.allocator.free(self.log_file_path);
@@ -278,14 +248,6 @@ pub const ServerProcess = struct {
         }
         try config_writer.print("\n", .{});
 
-        // Background task intervals
-        try config_writer.print("[background_tasks]\nnamespace_deletion_interval_ms = {d}\n\n", .{self.config.namespace_deletion_interval_ms});
-
-        // KV configuration (for testing internal key visibility)
-        if (self.config.expose_internal_keys) {
-            try config_writer.print("[kv]\nexpose_internal_keys = true\n\n", .{});
-        }
-
         try config_writer.print("[metrics]\nenabled = {}\n", .{self.config.metrics_enabled});
         if (self.config.metrics_enabled) {
             try config_writer.print("port = {d}\n", .{self.metrics_port});
@@ -294,17 +256,8 @@ pub const ServerProcess = struct {
         if (self.config.dashboard_enabled) {
             try config_writer.print("port = {d}\n", .{self.dashboard_port});
         }
-
-        // Cold storage section (for tiered storage tests)
-        if (self.config.cold_storage.provider != .none) {
-            try config_writer.print("\n[cold_storage]\nprovider = \"{s}\"\n", .{self.config.cold_storage.provider.toConfigString()});
-            if (self.config.cold_storage.file_base_path) |path| {
-                try config_writer.print("file_base_path = \"{s}\"\n", .{path});
-            } else {
-                // Default to data_dir/archive
-                try config_writer.print("file_base_path = \"{s}/archive\"\n", .{self.data_dir});
-            }
-        }
+        if (self.config.dashboard_hosts) |h| try config_writer.print("hosts = \"{s}\"\n", .{h});
+        if (self.config.dashboard_cors_origins) |o| try config_writer.print("cors_origins = \"{s}\"\n", .{o});
 
         // Same predicate as the raft port allocation below: the config is
         // written before the port is picked.
@@ -315,10 +268,13 @@ pub const ServerProcess = struct {
         }
 
         try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});
+        if (self.config.extra_config) |x| try config_writer.print("\n{s}", .{x});
 
-        const config_file = try self.tmp_dir.dir.createFile(stdx.io.instance(), "flo.toml", .{});
-        defer stdx.fs.closeFile(config_file);
-        try stdx.fs.writeAll(config_file, fbs.buffered());
+        if (!self.config.config_file_missing) {
+            const config_file = try self.tmp_dir.dir.createFile(stdx.io.instance(), "flo.toml", .{});
+            defer stdx.fs.closeFile(config_file);
+            try stdx.fs.writeAll(config_file, fbs.buffered());
+        }
 
         // Open log file for output redirection
         var log_file = try stdx.fs.createFileAbsolute(self.log_file_path, .{
@@ -357,7 +313,7 @@ pub const ServerProcess = struct {
             "--port",
             port_str,
             "--data-dir",
-            self.data_dir,
+            self.config.data_dir_of orelse self.data_dir,
             "--config",
             self.config_file,
             "--shards",
@@ -421,11 +377,6 @@ pub const ServerProcess = struct {
         };
 
         self.started = true;
-
-        // Run auth bootstrap if auth is enabled
-        if (self.config.auth_enabled) {
-            self.api_key = try self.runBootstrap();
-        }
     }
 
     /// Stop the server gracefully
@@ -586,63 +537,6 @@ pub const ServerProcess = struct {
         defer self.allocator.free(logs);
 
         std.debug.print("\n=== SERVER LOGS ({s}) ===\n{s}\n=== END SERVER LOGS ===\n", .{ self.log_file_path, logs });
-    }
-
-    /// Run `flo server bootstrap` against this server and return the API key.
-    /// Caller owns the returned slice.
-    fn runBootstrap(self: *Self) ![]const u8 {
-        const bootstrap_file = try std.fmt.allocPrint(self.allocator, "{s}/bootstrap.key", .{self.data_dir});
-        defer self.allocator.free(bootstrap_file);
-
-        const argv = &[_][]const u8{
-            self.flo_binary,
-            "server",
-            "bootstrap",
-            "--data-dir",
-            self.data_dir,
-            "--out",
-            bootstrap_file,
-        };
-
-        var child = stdx.process.Child.init(argv, self.allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        try child.spawn();
-
-        var stdout_list: std.ArrayList(u8) = .empty;
-        var stderr_list: std.ArrayList(u8) = .empty;
-        defer stdout_list.deinit(self.allocator);
-        defer stderr_list.deinit(self.allocator);
-
-        try child.collectOutput(self.allocator, &stdout_list, &stderr_list, 64 * 1024);
-        const term = try child.wait();
-        const exit_code: u8 = switch (term) {
-            .Exited => |code| code,
-            else => 255,
-        };
-
-        if (exit_code != 0) {
-            std.debug.print("[e2e] bootstrap failed (exit {d}): {s}\n", .{ exit_code, stderr_list.items });
-            return error.BootstrapFailed;
-        }
-
-        // Read the key from the output file
-        const key_raw = stdx.fs.readFileAlloc(self.allocator, bootstrap_file, 1024) catch {
-            // Fall back to parsing stdout if file read fails
-            const out = std.mem.trim(u8, stdout_list.items, &std.ascii.whitespace);
-            // Extract the key token starting with "flo_sk_"
-            if (std.mem.indexOf(u8, out, "flo_sk_")) |pos| {
-                const key_start = out[pos..];
-                const end = std.mem.indexOfAny(u8, key_start, &std.ascii.whitespace) orelse key_start.len;
-                return try self.allocator.dupe(u8, key_start[0..end]);
-            }
-            return error.BootstrapKeyNotFound;
-        };
-        defer self.allocator.free(key_raw);
-
-        const key = std.mem.trim(u8, key_raw, &std.ascii.whitespace);
-        return try self.allocator.dupe(u8, key);
     }
 
     /// Force kill the server process

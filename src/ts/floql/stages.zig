@@ -59,8 +59,34 @@ const BucketAcc = struct {
 
 /// Apply aggregation to a windowed (or raw) SeriesSet.
 /// Recomputes bucket values using the specified function.
+/// Most buckets one stage builds per series: a long span over a short
+/// interval would otherwise allocate without bound.
+pub const MAX_BUCKETS: usize = 1_000_000;
+
+const BucketSpan = struct { min_ts: i64, count: usize };
+
+/// The earliest point and the bucket count covering every point. Taken over
+/// all points, not the ends, so no point falls before the first bucket.
+fn bucketSpan(points: []const DataPoint, interval_ms: i64) StageError!BucketSpan {
+    var min_ts = points[0].timestamp_ms;
+    var max_ts = min_ts;
+    for (points) |pt| {
+        min_ts = @min(min_ts, pt.timestamp_ms);
+        max_ts = @max(max_ts, pt.timestamp_ms);
+    }
+    const width = std.math.sub(i64, max_ts, min_ts) catch return error.InvalidInput;
+    const count = @divTrunc(width, interval_ms) + 1;
+    if (count > MAX_BUCKETS) return error.InvalidInput;
+    return .{ .min_ts = min_ts, .count = @intCast(count) };
+}
+
 pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
     if (interval_ms <= 0) return error.InvalidInput;
+
+    // Checked before anything is allocated, so a refusal leaves nothing behind.
+    for (input.series) |s| if (s.points.len > 0) {
+        _ = try bucketSpan(s.points, interval_ms);
+    };
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
 
@@ -70,9 +96,9 @@ pub fn applyAggregate(input: SeriesSet, func: ast.AggFunction, interval_ms: i64,
             continue;
         }
 
-        const min_ts = s.points[0].timestamp_ms;
-        const max_ts = s.points[s.points.len - 1].timestamp_ms;
-        const bucket_count: usize = @intCast(@divTrunc(max_ts - min_ts, interval_ms) + 1);
+        const span = bucketSpan(s.points, interval_ms) catch unreachable;
+        const min_ts = span.min_ts;
+        const bucket_count = span.count;
 
         var buckets = allocator.alloc(BucketAcc, bucket_count) catch return error.OutOfMemory;
         defer allocator.free(buckets);
@@ -518,6 +544,13 @@ pub fn applyMath(input: SeriesSet, op: ast.MathOp, operand: f64, allocator: Allo
 /// Requires windowed input (points already bucketed).
 pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Allocator) StageError!SeriesSet {
     if (interval_ms <= 0) return error.InvalidInput;
+    // Also refuses NaN, which no comparison admits.
+    if (!(p >= 0 and p <= 100)) return error.InvalidInput;
+
+    // Checked before anything is allocated, so a refusal leaves nothing behind.
+    for (input.series) |s| if (s.points.len > 0) {
+        _ = try bucketSpan(s.points, interval_ms);
+    };
 
     var output_series = allocator.alloc(Series, input.series.len) catch return error.OutOfMemory;
 
@@ -527,9 +560,9 @@ pub fn applyPercentile(input: SeriesSet, p: f64, interval_ms: i64, allocator: Al
             continue;
         }
 
-        const min_ts = s.points[0].timestamp_ms;
-        const max_ts = s.points[s.points.len - 1].timestamp_ms;
-        const bucket_count: usize = @intCast(@divTrunc(max_ts - min_ts, interval_ms) + 1);
+        const span = bucketSpan(s.points, interval_ms) catch unreachable;
+        const min_ts = span.min_ts;
+        const bucket_count = span.count;
 
         // Collect values per bucket
         var bucket_values: std.ArrayList(std.ArrayList(f64)) = .empty;
@@ -1022,4 +1055,36 @@ test "stages_extractMeasurement" {
     try std.testing.expectEqualStrings("cpu", extractMeasurement("cpu,host=web-01,dc=a"));
     try std.testing.expectEqualStrings("cpu", extractMeasurement("cpu"));
     try std.testing.expectEqualStrings("http_requests", extractMeasurement("http_requests,method=GET"));
+}
+
+test "stages: a percentile outside 0..100 is refused" {
+    const allocator = std.testing.allocator;
+    var input = try makeTestSeries(allocator);
+    defer input.deinit();
+    for ([_]f64{ 150, -1, std.math.nan(f64) }) |p| {
+        try std.testing.expectError(error.InvalidInput, applyPercentile(input, p, 2000, allocator));
+    }
+}
+
+test "stages: buckets cover points out of order, and too many buckets are refused" {
+    const allocator = std.testing.allocator;
+    var points = try allocator.alloc(DataPoint, 3);
+    points[0] = .{ .timestamp_ms = 2000, .value = 1.0 };
+    points[1] = .{ .timestamp_ms = 0, .value = 2.0 };
+    points[2] = .{ .timestamp_ms = 1000, .value = 3.0 };
+    var series = try allocator.alloc(Series, 1);
+    series[0] = .{ .key = "test", .field = "value", .points = points };
+    var input = SeriesSet.fromOwned(allocator, series);
+    defer input.deinit();
+
+    var agg = try applyAggregate(input, .sum, 1000, allocator);
+    defer agg.deinit();
+    try std.testing.expectEqual(@as(usize, 3), agg.series[0].points.len);
+    var pct = try applyPercentile(input, 50, 1000, allocator);
+    defer pct.deinit();
+    try std.testing.expectEqual(@as(usize, 3), pct.series[0].points.len);
+
+    points[0].timestamp_ms = @intCast(MAX_BUCKETS);
+    try std.testing.expectError(error.InvalidInput, applyAggregate(input, .sum, 1, allocator));
+    try std.testing.expectError(error.InvalidInput, applyPercentile(input, 50, 1, allocator));
 }

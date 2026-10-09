@@ -53,14 +53,14 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("delete")
-                .about("Delete an existing namespace")
+                .about("Delete a namespace (not supported yet: the server refuses it)")
                 .aliases(&.{ "rm", "remove" })
                 .examples(&.{
                     "flo namespace delete myapp",
                     "flo ns rm staging",
                 })
                 .arg("name", "Name of the namespace to delete")
-                .boolFlag("force", 'f', "Force delete even if not empty (deletes all resources)")
+                .boolFlag("force", 'f', "No effect while delete is refused")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -105,25 +105,6 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
 
-    // Validate namespace name
-    if (name.len == 0) {
-        ctx.printErr("Error: Namespace name cannot be empty\n", .{});
-        return error.CommandFailed;
-    }
-
-    if (name.len > 64) {
-        ctx.printErr("Error: Namespace name cannot exceed 64 characters\n", .{});
-        return error.CommandFailed;
-    }
-
-    // Check for invalid characters
-    for (name) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') {
-            ctx.printErr("Error: Namespace name can only contain alphanumeric characters, underscores, and hyphens\n", .{});
-            return error.CommandFailed;
-        }
-    }
-
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
@@ -151,12 +132,6 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
     const force = ctx.getBool("force");
-
-    // Prevent deletion of reserved namespaces
-    if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "_system")) {
-        ctx.printErr("Error: Cannot delete system namespace '{s}'\n", .{name});
-        return error.CommandFailed;
-    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();

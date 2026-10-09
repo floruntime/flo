@@ -92,6 +92,7 @@ pub fn appendEx(
     defer response.deinit();
 
     if (response.isError()) {
+        client.keepError(response);
         return error.ServerError;
     }
 
@@ -650,6 +651,7 @@ pub fn groupTouch(
     defer response.deinit();
 
     if (response.isError()) {
+        client.keepError(response);
         return error.ServerError;
     }
 

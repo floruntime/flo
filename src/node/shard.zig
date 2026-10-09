@@ -296,6 +296,8 @@ pub const Shard = struct {
     elections_unlogged: u64,
     /// One limiter per peer for each thing the leader loop says about it.
     peer_silent_warn_ms: [raft_node_mod.MAX_PEERS]u64,
+    /// When a failed sync flush was last logged; it repeats on every request.
+    flush_fail_warn_ms: u64,
     peer_batch_warn_ms: [raft_node_mod.MAX_PEERS]u64,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
@@ -365,6 +367,9 @@ pub const Shard = struct {
     /// queued while it runs waits for the next tick: one entry per
     /// connection at most, and both lists are reserved as above.
     resume_fds: std.ArrayListUnmanaged(i32) = .empty,
+    /// Reads one connection gets per event before the others' turn; the
+    /// rest is read at the end of the tick. A field so tests can shrink it.
+    reads_per_event: u32 = 8,
     resume_running: std.ArrayListUnmanaged(i32) = .empty,
     /// The line of connections whose next request waits for room to go to
     /// another shard (`waitForward`), in the order they began waiting,
@@ -470,7 +475,8 @@ pub const Shard = struct {
         // Create Namespace handler (no projection needed)
         const namespace_handler = try allocator.create(NamespaceHandler);
         errdefer allocator.destroy(namespace_handler);
-        namespace_handler.* = NamespaceHandler.init(allocator);
+        namespace_handler.* = try NamespaceHandler.init(allocator);
+        errdefer namespace_handler.deinit();
 
         // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
         // namespace handler. Done HERE — before replaySegments runs below — so that
@@ -700,6 +706,7 @@ pub const Shard = struct {
         // whose entries are already covered by the Raft log's persistence.
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
+        seg_writer.stop_at_gap = durability == .sync;
         if (durable_log) |dl| {
             raft_node.log.catch_up = .{ .ctx = @ptrCast(dl), .read_range = catchUpReadRange };
             raft_node.log.on_truncate_ctx = @ptrCast(dl);
@@ -783,6 +790,7 @@ pub const Shard = struct {
             .election_warn_ms = 0,
             .elections_unlogged = 0,
             .peer_silent_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .flush_fail_warn_ms = 0,
             .peer_batch_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
@@ -843,7 +851,39 @@ pub const Shard = struct {
     /// sealed under the current commit index.
     pub fn flushSegmentToDisk(self: *Shard) !void {
         const dl = self.durable_log orelse return;
+        try self.rebufferGap(dl.writer);
         try dl.flush(self.raft_node.commit_index);
+    }
+
+    /// Buffer again what the append hook could not, from the log, so the
+    /// flush writes a run without a gap. The log evicts by size, so the
+    /// entry may be gone; then nothing after it can reach disk, and the
+    /// shard takes no more writes until a restart.
+    fn rebufferGap(self: *Shard, writer: *SegmentWriter) !void {
+        const raft = self.raft_node;
+        const from = writer.first_unbuffered orelse {
+            // A truncation cut the missing entry away: nothing is owed.
+            if (raft.writes_stopped) {
+                raft.writes_stopped = false;
+                log.info("shard {d}: the entry that never reached disk was cut from the log; taking writes again", .{self.id});
+            }
+            return;
+        };
+        var idx = from;
+        while (idx <= raft.log.lastIndex()) : (idx += 1) {
+            const e = raft.log.getEntryCopy(idx, self.apply_buf) orelse {
+                if (!raft.writes_stopped) {
+                    raft.writes_stopped = true;
+                    log.err("shard {d}: entry index={d} left memory before it reached disk, so nothing after it can be flushed; this shard takes no more writes until it restarts", .{ self.id, idx });
+                }
+                return error.EntryUnavailable;
+            };
+            writer.addEntry(&e) catch |err| {
+                writer.first_unbuffered = idx;
+                return err;
+            };
+        }
+        writer.first_unbuffered = null;
     }
 
     /// Apply what replay loaded into the log above the commit watermark.
@@ -854,8 +894,10 @@ pub const Shard = struct {
     pub fn applyDeferredTail(self: *Shard) void {
         const raft = self.raft_node;
         const pending = raft.commit_index -| raft.last_applied;
-        // A bootstrapped shard's noop is always one of them.
-        if (pending > 1) {
+        // Bootstrapping commits the term's noop with the tail, unless
+        // commits wait for the disk: then it isn't committed yet.
+        const noop: u64 = if (self.durability == .sync) 0 else 1;
+        if (pending > noop) {
             log.info("shard {d}: applying {d} durable entries above the commit watermark (indices {d}..{d})", .{ self.id, pending, raft.last_applied + 1, raft.commit_index });
         }
         if (!self.applyCommitted()) {
@@ -863,15 +905,45 @@ pub const Shard = struct {
         }
     }
 
-    /// Flush segments when `durability == .sync` (after projections are applied).
+    /// With sync durability, flush what the log holds and tell the Raft
+    /// node it's on disk: a leader's own copy counts toward commit only then.
     pub fn syncFlushIfNeeded(self: *Shard) void {
-        if (self.durability == .sync) {
-            self.flushSegmentToDisk() catch |err| {
-                // In sync mode a flush failure breaks the durability contract —
-                // surface it loudly instead of acking a write that isn't on disk.
-                self.persist_failures += 1;
-                log.err("shard {d}: sync flush failed: {s} (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
-            };
+        if (self.durability != .sync) return;
+        const raft = self.raft_node;
+        const through = raft.log.lastIndex();
+        self.flushSegmentToDisk() catch |err| {
+            self.persist_failures += 1;
+            const now = nowMs();
+            if (now -| self.flush_fail_warn_ms >= WARN_INTERVAL_MS) {
+                self.flush_fail_warn_ms = now;
+                log.err("shard {d}: sync flush failed: {s}; writes not on disk are not acked (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+            }
+            // Alone, nothing else can make these writes durable: tell their
+            // clients now rather than leave them waiting on the disk.
+            if (raft.role == .leader and raft.peer_count == 0) {
+                self.failPendingAbove(raft.durable_index, if (raft.writes_stopped) LOST_AT_RESTART else NOT_ON_DISK);
+            }
+            return;
+        };
+        raft.markDurable(through);
+    }
+
+    /// What a client is told when its write is in the log but its flush
+    /// failed: it may still commit once the disk recovers.
+    pub const NOT_ON_DISK = "unavailable: write not on disk (flush failed); it may still apply once the disk recovers — check before resending";
+
+    /// The same, once the shard has stopped taking writes: nothing more
+    /// reaches disk, so the write is gone when the node restarts.
+    pub const LOST_AT_RESTART = "unavailable: write not on disk, and this shard stopped taking writes; it is lost when the node restarts — resend after the restart";
+
+    fn failPendingAbove(self: *Shard, index: u64, message: []const u8) void {
+        if (self.pending_count == 0) return;
+        for (self.pending) |*slot| {
+            if (!slot.active or slot.index <= index) continue;
+            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, message);
+            self.allocator.free(slot.bytes);
+            slot.active = false;
+            self.pending_count -= 1;
         }
     }
 
@@ -1136,6 +1208,15 @@ pub const Shard = struct {
             }
         }
 
+        // Every namespace a request names meets the one rule here, before
+        // anything runs: a write to an unknown namespace creates it.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
@@ -1274,6 +1355,29 @@ pub const Shard = struct {
             self.forwardToLeader(conn, req);
             return;
         }
+        // Requests forwarded from another node arrive here without passing
+        // `dispatchRequest`'s check.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                return;
+            }
+        }
+        // A write that brings data into a namespace this shard has not seen
+        // creates it. Checked after forwarding because only the leader knows
+        // the creates in flight; the create is proposed here, ahead of the
+        // write, so it holds the room before the next request is admitted.
+        // Other writes (a delete, an ack, a wait for what is not there yet)
+        // create nothing, wherever they are sent, and nor does a request
+        // that names nothing to write to. A job submit names its targets in
+        // its definition: its handler reserves once the definition passes.
+        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@enumFromInt(req.header.op_code))) {
+            if (self.namespace_handler.admission(req.namespace)) |r| {
+                self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
+                return;
+            }
+            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
+        }
         self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
     }
 
@@ -1285,44 +1389,16 @@ pub const Shard = struct {
         return self.router.route(hash);
     }
 
-    /// Allocate and re-serialize a parsed Request back to wire bytes so it
-    /// can be passed to another shard via the inbox. Mirrors the layout
-    /// `proto.Request.parse` consumes: header (32 B) + payload
-    /// `[ns_len:u16][ns][key_len:u16][key][value_len:u32][value][opts_len:u16][opts]`.
-    /// CRC is preserved from the original header so the receiver re-validates.
+    /// The request as wire bytes on the heap, for a copy that outlives the
+    /// connection's buffer: a forward to another shard or to the leader, or a
+    /// write held until commit. Length and CRC are recomputed.
     fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
-        const header_size = @sizeOf(proto.RequestHeader);
-        const total = header_size + req.header.payload_length;
-        const buf = try allocator.alloc(u8, total);
+        // Sized from the parts, not header.payload_length: a client may omit
+        // the options trailer, which serialize always writes.
+        const size = @sizeOf(proto.RequestHeader) + 2 + req.namespace.len + 2 + req.key.len + 4 + req.value.len + 2 + req.options.len;
+        const buf = try allocator.alloc(u8, size);
         errdefer allocator.free(buf);
-
-        @memcpy(buf[0..header_size], std.mem.asBytes(&req.header));
-
-        var off: usize = header_size;
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.namespace.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.namespace.len], req.namespace);
-        off += req.namespace.len;
-
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.key.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.key.len], req.key);
-        off += req.key.len;
-
-        std.mem.writeInt(u32, buf[off..][0..4], @intCast(req.value.len), .little);
-        off += 4;
-        @memcpy(buf[off..][0..req.value.len], req.value);
-        off += req.value.len;
-
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(req.options.len), .little);
-        off += 2;
-        @memcpy(buf[off..][0..req.options.len], req.options);
-        off += req.options.len;
-
-        // Header.payload_length must match the recomposed payload exactly,
-        // otherwise the receiver's parse() will reject the message.
-        if (off != total) return error.RequestSerializationMismatch;
-
+        _ = try req.serialize(buf);
         return buf;
     }
 
@@ -1945,7 +2021,7 @@ pub const Shard = struct {
 
     // ─── Writes on a node that does not lead ─────────────────────────────
 
-    /// Send a client's write to the leader as the bytes it arrived in, and
+    /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
     fn forwardToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
@@ -2280,6 +2356,7 @@ pub const Shard = struct {
                         log.err("shard {d}: sync flush failed: {s}; not acking the batch (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
                         return;
                     };
+                    raft.markDurable(raft.log.lastIndex());
                 }
                 var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
                 const n = transport.serializeAppendResponse(resp, &buf) orelse return;
@@ -2424,7 +2501,7 @@ pub const Shard = struct {
                 self.broadcastVote(req);
                 if (raft.role == .leader) {
                     log.info("shard {d}: elected leader for term {d} as the only member", .{ self.id, raft.current_term });
-                    // Alone, the win committed the whole log.
+                    // Alone, the win commits the whole log.
                     if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                 }
             }
@@ -2637,43 +2714,47 @@ pub const Shard = struct {
     /// `applyCommitted`, stopping after index `limit`.
     fn applyThrough(self: *Shard, limit: u64) bool {
         if (self.applying) return true;
+        // With sync durability a leader's writes commit only once on disk:
+        // flushing first lets what that commits apply now.
+        self.syncFlushIfNeeded();
         // Called after every request: nothing to apply is the common case.
-        // A `sync` flush still happens, as it did before this shortcut.
-        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) {
-            self.syncFlushIfNeeded();
-            return true;
-        }
+        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) return true;
         self.applying = true;
         defer self.applying = false;
 
         const raft = self.raft_node;
         var all_applied = true;
-        while (raft.last_applied < @min(raft.commit_index, limit)) {
-            const next_idx = raft.last_applied + 1;
-            // Advanced before the apply: whatever a notification does, this
-            // entry is never taken twice, and the loop cannot stall.
-            raft.last_applied = next_idx;
-            if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
-                const applied = self.applyEntry(&e);
-                if (!applied) all_applied = false;
-                self.last_entry_applied = applied;
-                self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
-            } else {
-                self.last_entry_applied = false;
-                self.answerPending(next_idx, 0, 0, false);
-                // A committed index is always within the log, in the ring
-                // or below it in the durable log, and the buffer fits every
-                // entry; an unreadable one is a bug or a damaged segment.
-                // Said out loud, because the write was already acked.
-                log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
-                all_applied = false;
+        while (true) {
+            while (raft.last_applied < @min(raft.commit_index, limit)) {
+                const next_idx = raft.last_applied + 1;
+                // Advanced before the apply: whatever a notification does, this
+                // entry is never taken twice, and the loop cannot stall.
+                raft.last_applied = next_idx;
+                if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                    const applied = self.applyEntry(&e);
+                    if (!applied) all_applied = false;
+                    self.last_entry_applied = applied;
+                    self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
+                } else {
+                    self.last_entry_applied = false;
+                    self.answerPending(next_idx, 0, 0, false);
+                    // A committed index is always within the log, in the ring
+                    // or below it in the durable log, and the buffer fits every
+                    // entry; an unreadable one is a bug or a damaged segment.
+                    // Said out loud, because the write was already acked.
+                    log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
+                    all_applied = false;
+                }
             }
+            // Applying can propose (a workflow's next step); flushing that
+            // can commit it, so apply again until a flush commits nothing new.
+            self.syncFlushIfNeeded();
+            if (raft.last_applied >= @min(raft.commit_index, limit)) break;
         }
         if (self.wake_workers) {
             self.wake_workers = false;
             ActionsHandler.wakeWorkers(self);
         }
-        self.syncFlushIfNeeded();
         if (self.replies_held > 0) self.releaseReplies();
         return all_applied;
     }
@@ -2962,7 +3043,7 @@ pub const Shard = struct {
     fn hotFlushTask(ctx: *anyopaque, _: u64) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const now_ns: u64 = @intCast(@import("stdx").time.nanoTimestamp());
-        const cutoff_ns = now_ns -| (self.hot_flush_seconds * std.time.ns_per_s);
+        const cutoff_ns = now_ns -| (self.hot_flush_seconds *| std.time.ns_per_s);
 
         var total_evicted: u64 = 0;
         for (self.partitions) |partition| {
@@ -2991,7 +3072,7 @@ pub const Shard = struct {
 
             // Age-based retention: compute cutoff StreamID, persist trim through Raft
             if (meta.retention_age_s > 0) {
-                const cutoff_ms = now_ms -| (meta.retention_age_s * 1000);
+                const cutoff_ms = now_ms -| (meta.retention_age_s *| 1000);
                 if (cutoff_ms > 0) {
                     const cutoff_id = StreamID{ .timestamp_ms = cutoff_ms, .sequence = std.math.maxInt(u64) };
                     // Only trim if there are records to remove
@@ -3096,56 +3177,79 @@ pub const Shard = struct {
     /// Read data from a client socket, parse request(s), and dispatch.
     fn readFromClient(self: *Shard, fd: i32) void {
         const conn = self.getConnection(fd) orelse return;
-        // A readable event can still arrive after a pause (same poll batch,
-        // or an interest change not yet submitted); what it would read
-        // could not drain, and would look like one oversized request.
-        if (conn.reads_paused or conn.closing or conn.waiting != null) return;
+        // A readable event comes when data arrives, not while it waits
+        // (io_uring polls are multishot). A read that filled the room it
+        // had may have left the rest of a request in the socket with
+        // nothing to announce it, so read again until a read comes back short.
+        var reads: u32 = 0;
+        while (true) {
+            // A readable event can still arrive after a pause (same poll batch,
+            // or an interest change not yet submitted); what it would read
+            // could not drain, and would look like one oversized request.
+            if (conn.reads_paused or conn.closing or conn.waiting != null) return;
 
-        // Read no more than the read buffer has room for: bytes read and
-        // not kept would be requests silently lost.
-        var tmp_buf: [65536]u8 = undefined;
-        if (conn.read_buf.writable() == 0) {
-            // A request may be larger than the buffer: grow it to hold one
-            // whole request. Full at that size, the client sent more than a
-            // request can be. Every request says its size in its header and
-            // one that cannot fit is refused from it, so this should not be
-            // reached; if it is, one connection is closed rather than its
-            // buffer growing without bound.
-            const cap = conn.read_buf.buf.len * 2;
-            if (cap > MAX_READ_BUFFER) {
-                self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
-                self.flushToClient(fd);
-                return self.markClosing(fd);
+            // Read no more than the read buffer has room for: bytes read and
+            // not kept would be requests silently lost.
+            var tmp_buf: [65536]u8 = undefined;
+            if (conn.read_buf.writable() == 0) {
+                // A request may be larger than the buffer: grow it to hold one
+                // whole request. Full at that size, the client sent more than a
+                // request can be. Every request says its size in its header and
+                // one that cannot fit is refused from it, so this should not be
+                // reached; if it is, one connection is closed rather than its
+                // buffer growing without bound.
+                const cap = conn.read_buf.buf.len * 2;
+                if (cap > MAX_READ_BUFFER) {
+                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
+                    self.flushToClient(fd);
+                    return self.markClosing(fd);
+                }
+                conn.read_buf.resize(cap) catch return self.markClosing(fd);
             }
-            conn.read_buf.resize(cap) catch return self.markClosing(fd);
+            const room = @min(tmp_buf.len, conn.read_buf.writable());
+
+            const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeConnection(fd);
+                return;
+            };
+            if (n == 0) {
+                // EOF — peer closed
+                self.closeConnection(fd);
+                return;
+            }
+
+            if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
+            if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
+
+            // Accumulate data in the read buffer
+            _ = conn.read_buf.write(tmp_buf[0..n]);
+
+            // Detect protocol on first data if not yet determined
+            if (conn.protocol == .unknown) {
+                conn.detectAndSetProtocol();
+            }
+
+            self.processRequests(fd, conn);
+            // Closing is deferred, so the connection is still ours here.
+            conn.shrinkReadBuffer();
+            if (n < room) return;
+            reads += 1;
+            if (reads == self.reads_per_event) {
+                // More may wait. It is read at the end of the tick, so one
+                // busy client doesn't hold the shard's others back.
+                self.queueResume(fd, conn);
+                return;
+            }
         }
-        const room = @min(tmp_buf.len, conn.read_buf.writable());
+    }
 
-        const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
-            if (err == error.WouldBlock) return;
-            self.closeConnection(fd);
-            return;
-        };
-        if (n == 0) {
-            // EOF — peer closed
-            self.closeConnection(fd);
-            return;
-        }
-
-        if (self.metrics_registry) |m| m.server.recordBytesReceived(@intCast(n));
-        if (self.shard_metrics) |sm| sm.recordBytesReceived(@intCast(n));
-
-        // Accumulate data in the read buffer
-        _ = conn.read_buf.write(tmp_buf[0..n]);
-
-        // Detect protocol on first data if not yet determined
-        if (conn.protocol == .unknown) {
-            conn.detectAndSetProtocol();
-        }
-
-        self.processRequests(fd, conn);
-        // Closing is deferred, so the connection is still ours here.
-        conn.shrinkReadBuffer();
+    /// Run `conn` again at the end of the tick: what it buffered, and
+    /// what its socket still holds.
+    fn queueResume(self: *Shard, fd: i32, conn: *Connection) void {
+        if (conn.resume_queued) return;
+        conn.resume_queued = true;
+        self.resume_fds.appendAssumeCapacity(fd);
     }
 
     /// Try to parse and dispatch request(s) from a connection's read buffer.
@@ -3271,11 +3375,9 @@ pub const Shard = struct {
         self.paused_count -= 1;
         self.reactor.modifyInterests(fd, .{ .readable = true, .writable = conn.hasPendingWrites() }) catch {};
         // What it had already sent runs at the end of the tick, not inside
-        // whoever resumed it.
-        if (conn.read_buf.readable() > 0 and !conn.resume_queued) {
-            conn.resume_queued = true;
-            self.resume_fds.appendAssumeCapacity(fd);
-        }
+        // whoever resumed it; its socket may hold more that announces
+        // nothing, so it is queued even with nothing buffered.
+        self.queueResume(fd, conn);
     }
 
     /// Lift pacing from paused clients that have read nothing for
@@ -3538,6 +3640,9 @@ pub const Shard = struct {
             if (conn.closing or conn.reads_paused or conn.waiting != null) continue;
             ran = true;
             self.processRequests(fd, conn);
+            // Bytes left in the socket while it waited or was paused get no
+            // event of their own on Linux: read them now.
+            self.readFromClient(fd);
         }
         self.resume_running.clearRetainingCapacity();
         // What they proposed goes out at the next tick's pump; that tick
@@ -4118,7 +4223,7 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
         pos += n.len;
         // partition_count from stream metadata, keyed by the qualified name
         var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-        const pc = stream.getPartitionCount(handler_mod.qualifyKey(&qbuf, ns, n) catch n);
+        const pc = if (handler_mod.qualifyKey(&qbuf, ns, n)) |q| stream.getPartitionCount(q) else |_| 1;
         std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
         pos += 4;
     }
@@ -4302,14 +4407,20 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
     defer shard.queue_handler.allocator.free(data);
 
-    // Auto-ack: persist a queue_ack entry so the message doesn't reappear after restart
+    // Auto-ack: persist a queue_ack entry so the message doesn't reappear
+    // after restart; it names the queue, as any ack does.
     {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
+        var queue_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &queue_key, queue_name_hash, .little);
+        // The waiter holds only the queue's hash; its namespace comes from
+        // the queue's registration.
+        const namespace = if (partition.queue.known_queues.get(queue_name_hash)) |meta| meta.namespace else "default";
 
         // Same contract as the queue handler's dequeue-ack: log, never fail
         // the dequeue. The ack applies when it commits.
-        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, "", &seq_key, &[_]u8{}) catch |err| {
+        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
             log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
         };
     }
@@ -4328,11 +4439,16 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// by value from init), so the hook is valid before bootstrap.
 fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const writer: *SegmentWriter = @ptrCast(@alignCast(ctx));
+    // Behind a gap nothing is buffered: the flush re-buffers from the gap.
+    if (writer.stop_at_gap and writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
-        // Do not swallow: a failed persist means this committed entry is not
-        // queued for disk and would be lost on restart. Surface it.
         writer.buffer_failures += 1;
-        log.err("shard {d}: failed to buffer entry index={d} for persistence: {s} (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        if (writer.stop_at_gap) {
+            writer.first_unbuffered = entry.header.index;
+            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        } else {
+            log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
+        }
     };
 }
 
@@ -4460,6 +4576,8 @@ const JOIN_ASK_INTERVAL_MS: u64 = 1000;
 /// Membership at boot comes from the log's latest config entry; a single
 /// node and a first member with nothing in the log lead at once.
 fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32) !void {
+    // Everything replay put in the log came from disk.
+    raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
     if (role == .single) {
         // A data directory that belonged to a group must not lead alone:
@@ -4830,9 +4948,6 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     @memset(std.mem.asBytes(&header), 0);
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 5;
-    // Namespace, key, value and options, each length-prefixed, as the
-    // wire carries them: the held copy is rebuilt from this length.
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     // Held for the leader, not answered.
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
@@ -4928,10 +5043,8 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 1;
-    header.payload_length = @intCast(2 + 2 + 3 + 4 + value.len + 2);
     const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
     defer std.testing.allocator.free(put);
-    std.mem.bytesAsValue(proto.RequestHeader, put[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(put[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, try proto.Request.parse(put));
     _ = shard.applyCommitted();
     var drain_buf: [4096]u8 = undefined;
@@ -4939,9 +5052,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
 
     header.op_code = @intFromEnum(proto.OpCode.kv_get);
     header.request_id = 2;
-    header.payload_length = 2 + 2 + 3 + 4 + 2;
     const get = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = "" });
-    std.mem.bytesAsValue(proto.RequestHeader, get[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(get[@sizeOf(proto.RequestHeader)..]);
     shard.runForwardedRequest(.{ .tag = .forward_request, .src_shard = 0, .payload_len = @intCast(get.len), .sequence = seq, .payload_ptr = get.ptr });
     const big_out = try std.testing.allocator.alloc(u8, 300 * 1024);
     defer std.testing.allocator.free(big_out);
@@ -5077,10 +5188,7 @@ fn testRequestWith(op: proto.OpCode, request_id: u64, key: []const u8, value: []
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(op);
     header.request_id = request_id;
-    header.payload_length = @intCast(2 + 2 + key.len + 4 + value.len + 2 + options.len);
-    const bytes = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
-    std.mem.bytesAsValue(proto.RequestHeader, bytes[0..@sizeOf(proto.RequestHeader)]).crc32 = header.computeCRC32(bytes[@sizeOf(proto.RequestHeader)..]);
-    return bytes;
+    return Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
 }
 
 /// A shard alone and a connected client socket pair, both ends non-blocking
@@ -6577,7 +6685,6 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 9;
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     defer std.testing.allocator.free(wire);
     const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + 3 + wire.len);
@@ -6655,11 +6762,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     header.version = proto.VERSION;
     header.op_code = @intFromEnum(proto.OpCode.kv_put);
     header.request_id = 5;
-    header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
-    // The held copy is re-parsed as the wire would be: the CRC must hold.
-    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
-    defer std.testing.allocator.free(wire);
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
@@ -6683,7 +6785,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // Sent to a leader: it waits past any deadline for that leader's
     // answer, until the term moves on. (No network here, so the link is
     // not consulted.)
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6702,7 +6803,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Sent over a link that then went down, with the term unchanged: the
     // answer will never come either.
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6716,7 +6816,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // so the answer is not coming over it either.
     rn.linked_ids[0].store(2, .release);
     rn.linked_sessions[0].store(5, .release);
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6730,7 +6829,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Same link, same leader, same term, and no answer: waited on until
     // the backstop, then answered.
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
@@ -6750,7 +6848,6 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // runs here as the client's own request.
     raft.leader_id = 0;
     header.request_id = 6;
-    header.crc32 = header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     raft.role = .leader;
@@ -6815,8 +6912,6 @@ const ParkTest = struct {
         try std.testing.expect(sh.applyCommitted());
     }
 
-    /// A request as the wire carries it: a parked request is re-parsed
-    /// from its bytes, so its length and checksum must hold.
     fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
         var header: proto.RequestHeader = undefined;
         @memset(std.mem.asBytes(&header), 0);
@@ -6824,12 +6919,7 @@ const ParkTest = struct {
         header.version = proto.VERSION;
         header.op_code = @intFromEnum(op);
         header.request_id = id;
-        header.payload_length = @intCast(2 + ns.len + 2 + key.len + 4 + value.len + 2 + options.len);
-        var req: proto.Request = .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
-        const wire = try Shard.serializeRequest(std.testing.allocator, req);
-        defer std.testing.allocator.free(wire);
-        req.header.crc32 = req.header.computeCRC32(wire[@sizeOf(proto.RequestHeader)..]);
-        return req;
+        return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
     }
 
     fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
@@ -6855,6 +6945,56 @@ const ParkTest = struct {
         try std.testing.expectEqual(total, off);
     }
 };
+
+test "Shard: a write to a new namespace holds its room before it commits, so writes in flight cannot overshoot the limit" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // An explicit create in flight holds its name and id as a write's does.
+    shard.dispatchRequest(conn, try ParkTest.request(.namespace_create, 42, "", "explicit", "", ""));
+    try std.testing.expect(shard.namespace_handler.pending_creates.contains("explicit"));
+    try ParkTest.ack(&shard);
+    try std.testing.expect(!shard.namespace_handler.pending_creates.contains("explicit"));
+    var created: [1]proto.Response = undefined;
+    var created_buf: [256]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &created_buf, &created);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created[0].header.status);
+
+    // One namespace short of the limit.
+    var name_buf: [16]u8 = undefined;
+    const room = 1024 - shard.namespace_handler.namespaces.count() - 1;
+    for (0..room) |i| _ = shard.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
+
+    // Two writes to new namespaces, neither committed: the first holds
+    // the last room, the second is refused at once.
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 40, "first", "k", "v", ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 41, "second", "k", "v", ""));
+    var buf: [1024]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 41), one[0].header.request_id);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, one[0].data);
+
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 40), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(shard.namespace_handler.namespaces.contains("first"));
+    try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
+}
 
 test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {
     const pipe_fds = try @import("stdx").io.pipe();
@@ -7083,12 +7223,12 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     try ParkTest.ack(&shard);
     shard.namespace_handler.markNamespaceHasData("other", &shard);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 1), shard.namespace_handler.pending_creates.count());
 
     // What this leader had in flight may be gone with its log's tail.
     shard.leadershipLost("test");
     try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
-    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.implicit_creates.count());
+    try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.pending_creates.count());
 }
 
 test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {
@@ -7156,15 +7296,16 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
     try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
 
-    // A namespace a run key cannot carry is refused, for a definition and
-    // for a start, before anything is proposed.
+    // A namespace a run key cannot carry (the key is read back up to its
+    // first ':') is refused, for a definition and for a start, before
+    // anything is proposed.
     const before = shard.raft_node.log.lastIndex();
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""));
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""));
     try ParkTest.responses(&shard, conn, pair[1], &big, &two);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
-    try std.testing.expectEqualStrings("invalid namespace name", two[1].data);
+    try std.testing.expect(std.mem.startsWith(u8, two[1].data, "invalid namespace name"));
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 
@@ -7893,4 +8034,288 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
     try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
     // Nothing the snapshot covers was offered to the projections again.
     try std.testing.expectEqual(@as(u64, 0), shard.partitions[0].router.stats.entries_skipped);
+}
+
+/// A lone shard answering one client over a socket pair; `client` is the
+/// client's end.
+const ReadTest = struct {
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *ReadTest) !void {
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        const flags = std.c.fcntl(self.pair[0], std.c.F.GETFL, @as(c_int, 0));
+        _ = std.c.fcntl(self.pair[0], std.c.F.SETFL, flags | @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *ReadTest) void {
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+    }
+
+    /// A kv_get as the client sends it.
+    fn sendGet(self: *ReadTest, id: u64) !void {
+        const wire = try Shard.serializeRequest(std.testing.allocator, try ParkTest.request(.kv_get, id, "", "some-key-for-the-test", "", ""));
+        defer std.testing.allocator.free(wire);
+        try std.testing.expectEqual(@as(isize, @intCast(wire.len)), std.c.write(self.pair[1], wire.ptr, wire.len));
+    }
+
+    /// End-of-tick passes until `want` answers arrived, or none came in a pass.
+    fn answers(self: *ReadTest, want: usize) !usize {
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        var got: usize = 0;
+        for (0..64) |_| {
+            self.shard.settleConnections();
+            self.shard.flushToClient(self.conn.fd);
+            while (true) {
+                const n = std.c.recv(self.pair[1], buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+                if (n <= 0) break;
+                total += @intCast(n);
+            }
+            var off: usize = 0;
+            got = 0;
+            while (proto.Response.parse(buf[off..total])) |r| : (got += 1) {
+                off += @sizeOf(proto.ResponseHeader) + r.data.len;
+            } else |_| {}
+            if (got >= want) break;
+        }
+        return got;
+    }
+};
+
+test "Shard: a request read a little per event is still answered, the rest read at the end of the tick" {
+    var t: ReadTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // One read per event, into a buffer smaller than the request: every
+    // read fills its room, so each event stops with more in the socket.
+    t.shard.reads_per_event = 1;
+    t.conn.read_buf.deinit();
+    t.conn.read_buf = try RingBuffer.initWithCapacity(std.testing.allocator, 16);
+
+    try t.sendGet(1);
+    t.shard.readFromClient(t.conn.fd);
+    try std.testing.expect(t.conn.resume_queued);
+    try std.testing.expectEqual(@as(usize, 1), try t.answers(1));
+}
+
+test "Shard: what a client sent while its reads were paused is read when they resume" {
+    var t: ReadTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    t.shard.pauseReads(t.conn.fd, t.conn);
+    try t.sendGet(1);
+    t.shard.readFromClient(t.conn.fd);
+    try std.testing.expectEqual(@as(usize, 0), t.conn.read_buf.readable());
+    t.shard.resumeReads(t.conn.fd, t.conn);
+    try std.testing.expectEqual(@as(usize, 1), try t.answers(1));
+}
+
+/// A lone node with sync durability, its data dir under `tmp`, answering a
+/// client over a socket pair.
+const SyncAlone = struct {
+    data_dir: []const u8,
+    segs_z: [:0]u8,
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *SyncAlone, tmp: *std.testing.TmpDir) !void {
+        self.data_dir = try testDataDir(tmp);
+        self.segs_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/00000/segs", .{self.data_dir}, 0);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{ .self_counts_when_durable = true });
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *SyncAlone) void {
+        _ = std.c.chmod(self.segs_z, 0o700);
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.segs_z);
+        std.testing.allocator.free(self.data_dir);
+    }
+
+    /// The answer borrows from `buf`.
+    fn put(self: *SyncAlone, id: u64, key: []const u8, buf: []u8) !proto.Response {
+        try ParkTest.send(&self.shard, self.conn, .kv_put, id, key, "v");
+        _ = self.shard.applyCommitted();
+        var r: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &r);
+        return r[0];
+    }
+};
+
+test "Shard: alone with sync durability, a write whose flush fails is not acked, and applies once the disk recovers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+
+    // The segments directory refuses new files: the flush fails.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o500));
+    var buf: [1024]u8 = undefined;
+    const refused = try s.put(1, "k1", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "not on disk") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.get("k1") == null);
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o700));
+    const acked = try s.put(2, "k2", &buf);
+    try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
+    // The refused write was in the log; it reached disk with this one.
+    try std.testing.expect(s.shard.kv_handler.kv.get("k1") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.get("k2") != null);
+}
+
+test "Shard: an entry the writer could not buffer is buffered again from the log before the flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+
+    // As if the append hook had failed on the next entry: nothing from it
+    // on is buffered, and the flush must buffer it from the log.
+    const writer = s.shard.durable_log.?.writer;
+    writer.first_unbuffered = s.shard.raft_node.log.lastIndex() + 1;
+    var buf: [1024]u8 = undefined;
+    const acked = try s.put(1, "k1", &buf);
+    try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
+    try std.testing.expect(writer.first_unbuffered == null);
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena) == 1);
+}
+
+test "Shard: with sync durability, entries after one the writer could not buffer reach disk once each, in order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k0", &buf)).getStatus());
+
+    // An empty buffer with no room: buffering the next entry allocates,
+    // and that allocation fails. The one after it is appended before any
+    // flush, as a follower appends a batch.
+    const writer = s.shard.durable_log.?.writer;
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_count);
+    writer.data.clearAndFree(writer.allocator);
+    writer.sparse_index.clearAndFree(writer.allocator);
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    const first = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    writer.allocator = real;
+    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+
+    s.shard.syncFlushIfNeeded();
+    try std.testing.expectEqual(first.index + 1, s.shard.raft_node.durable_index);
+    var got: [4]entry_mod.Entry = undefined;
+    var arena: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena));
+    try std.testing.expectEqual(first.index, got[0].header.index);
+    try std.testing.expectEqual(first.index + 1, got[1].header.index);
+}
+
+test "Shard: with sync durability, an entry that left memory before reaching disk stops the shard's writes, by name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: SyncAlone = undefined;
+    try s.init(&tmp);
+    defer s.deinit();
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqual(proto.StatusCode.ok, (try s.put(1, "k1", &buf)).getStatus());
+
+    // The hook could not buffer k2, and the ring evicted it before the
+    // flush: it is nowhere.
+    const writer = s.shard.durable_log.?.writer;
+    writer.first_unbuffered = s.shard.raft_node.log.lastIndex() + 1;
+    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
+
+    const lost = try s.put(3, "k3", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, lost.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, lost.data, "lost when the node restarts") != null);
+    try std.testing.expect(s.shard.raft_node.writes_stopped);
+
+    // The next write is refused before it reaches the log.
+    const last = s.shard.raft_node.log.lastIndex();
+    const refused = try s.put(4, "k4", &buf);
+    try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
+    try std.testing.expect(std.mem.indexOf(u8, refused.data, "stopped taking writes") != null);
+    try std.testing.expectEqual(last, s.shard.raft_node.log.lastIndex());
+}
+
+test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try shard.flushSegmentToDisk();
+
+    const writer = shard.durable_log.?.writer;
+    writer.data.clearAndFree(writer.allocator);
+    writer.sparse_index.clearAndFree(writer.allocator);
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    writer.allocator = real;
+    const second = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+    try std.testing.expect(writer.first_unbuffered == null);
+    try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
+    try std.testing.expectEqual(second.index, writer.first_index);
+    try shard.flushSegmentToDisk();
+}
+
+test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
+    const payload = [_]u8{ 0, 0, 2, 0, 'k', '0', 0, 0, 0, 0 };
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = @intFromEnum(proto.OpCode.kv_get);
+    header.request_id = 5;
+    header.payload_length = payload.len;
+    header.crc32 = header.computeCRC32(&payload);
+    var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;
+    @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
+    @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
+    const req = try proto.Request.parse(&frame);
+
+    const wire = try Shard.serializeRequest(std.testing.allocator, req);
+    defer std.testing.allocator.free(wire);
+    const again = try proto.Request.parse(wire);
+    try std.testing.expectEqualStrings("k0", again.key);
+    try std.testing.expectEqual(@as(u64, 5), again.header.request_id);
+    try std.testing.expectEqual(@as(usize, 0), again.options.len);
 }

@@ -20,6 +20,8 @@ pub const StatusCode = enum(u16) {
     method_not_allowed = 405,
     conflict = 409,
     payload_too_large = 413,
+    unsupported_media_type = 415,
+    misdirected_request = 421,
     unprocessable_entity = 422,
     too_many_requests = 429,
 
@@ -48,6 +50,8 @@ pub const StatusCode = enum(u16) {
             .method_not_allowed => "Method Not Allowed",
             .conflict => "Conflict",
             .payload_too_large => "Payload Too Large",
+            .unsupported_media_type => "Unsupported Media Type",
+            .misdirected_request => "Misdirected Request",
             .unprocessable_entity => "Unprocessable Entity",
             .too_many_requests => "Too Many Requests",
             .internal_server_error => "Internal Server Error",
@@ -74,6 +78,8 @@ pub const StatusCode = enum(u16) {
             .method_not_allowed => "405 Method Not Allowed",
             .conflict => "409 Conflict",
             .payload_too_large => "413 Payload Too Large",
+            .unsupported_media_type => "415 Unsupported Media Type",
+            .misdirected_request => "421 Misdirected Request",
             .unprocessable_entity => "422 Unprocessable Entity",
             .too_many_requests => "429 Too Many Requests",
             .internal_server_error => "500 Internal Server Error",
@@ -344,15 +350,7 @@ pub fn writeResponse(client: std.posix.socket_t, status: StatusCode, content_typ
     try writeAllTo(client, body);
 }
 
-/// Write the whole buffer — `sysWrite` retries neither a short write nor EINTR.
-fn writeAllTo(client: std.posix.socket_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = try @import("stdx").net.sysWrite(client, bytes[off..]);
-        if (n == 0) return error.WriteFailed;
-        off += n;
-    }
-}
+const writeAllTo = @import("serve.zig").writeAll;
 
 test "build JSON response" {
     const resp = json(std.testing.allocator, "{\"key\":\"value\"}");

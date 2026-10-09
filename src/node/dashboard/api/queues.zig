@@ -222,10 +222,12 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
 }
 
 /// GET /queues/:name/dlq - Dead-letter queue entries
-/// Query params: ?limit=
+/// Query params: ?limit=&namespace=
 pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
     const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const qhash = queueHash(ns_q, queue_name);
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -243,6 +245,7 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
         for (0..n) |i| {
             if (getQueueProjection(ctx, i)) |qp| {
                 for (qp.dlq.items) |dlq_entry| {
+                    if (dlq_entry.queue_name_hash != qhash) continue;
                     if (entry_count >= limit) break;
                     try entries_arr.next();
                     var eobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);

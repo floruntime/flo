@@ -184,24 +184,16 @@ pub fn delete(
     return client.sendRequest(.ts_delete, namespace, measurement, "");
 }
 
-/// Set retention policy
+/// Delete a measurement's points older than `raw_ttl`, once.
 pub fn retention(
     client: *Client,
     namespace: []const u8,
     measurement: []const u8,
-    raw_ttl: ?[]const u8,
-    downsample_rules: []const []const u8,
+    raw_ttl: []const u8,
 ) !Response {
     var options_buf: [512]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (raw_ttl) |ttl| {
-        builder.addString(.ts_raw_ttl, ttl) catch return error.OptionsBufferTooSmall;
-    }
-
-    for (downsample_rules) |rule| {
-        builder.addString(.ts_downsample, rule) catch return error.OptionsBufferTooSmall;
-    }
+    builder.addString(.ts_raw_ttl, raw_ttl) catch return error.OptionsBufferTooSmall;
 
     return client.sendRequestWithOptions(.ts_retention, namespace, measurement, "", builder.getOptions());
 }

@@ -5,11 +5,13 @@
 //! Handler bodies use DashboardContext instead of old Core/Dispatcher.
 
 const std = @import("std");
+const ns_keys = @import("../../namespace/handler.zig");
 const Allocator = std.mem.Allocator;
 const Method = @import("../../util/http/mod.zig").Method;
 
 // Sub-modules
 pub const helpers = @import("api/helpers.zig");
+const h = helpers;
 pub const namespaces = @import("api/namespaces.zig");
 pub const streams = @import("api/streams.zig");
 pub const queues = @import("api/queues.zig");
@@ -23,6 +25,30 @@ pub const system = @import("api/system.zig");
 
 pub const DashboardContext = helpers.DashboardContext;
 
+/// Every route takes exactly the methods it names; any other is refused
+/// (`error.MethodNotAllowed`, a 405), so a link or an image tag on another
+/// site, which can only GET, can never change anything.
+pub fn only(method: Method, allowed: []const Method) error{MethodNotAllowed}!void {
+    for (allowed) |m| if (method == m) return;
+    return error.MethodNotAllowed;
+}
+
+/// The reason a namespace this request names (in `?namespace=` or the path)
+/// is invalid, or null. Checked before any route, so an invalid name is
+/// never looked up.
+fn namespaceRefusal(path: []const u8, query_string: ?[]const u8) ?[]const u8 {
+    if (h.parseQueryParam([]const u8, query_string, "namespace")) |ns| {
+        if (ns.len > 0) if (ns_keys.nameRefusal(ns)) |why| return why;
+    }
+    for ([_][]const u8{ "namespaces/", "kv/namespaces/" }) |prefix| {
+        if (!std.mem.startsWith(u8, path, prefix)) continue;
+        const rest = path[prefix.len..];
+        const ns = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+        if (ns_keys.nameRefusal(ns)) |why| return why;
+    }
+    return null;
+}
+
 /// Main API request router.
 /// `path` is the portion after `/api/v1/` — e.g. "streams", "kv/namespaces/default/keys".
 pub fn handleRequest(
@@ -33,17 +59,22 @@ pub fn handleRequest(
     body: []const u8,
     ctx: *DashboardContext,
 ) ![]const u8 {
+    if (namespaceRefusal(path, query_string)) |why| return h.jsonError(allocator, why);
+
     // ── namespaces ──────────────────────────────────────────
     if (std.mem.eql(u8, path, "namespaces")) {
+        try only(method, &.{ .GET, .POST });
         if (method == .POST) return namespaces.createNamespace(allocator, body, ctx);
         return namespaces.getNamespaces(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "namespaces/")) {
+        try only(method, &.{.GET});
         return routeNamespace(allocator, path["namespaces/".len..], query_string, ctx);
     }
 
     // ── streams ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "streams")) {
+        try only(method, &.{.GET});
         return streams.getStreams(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "streams/")) {
@@ -52,6 +83,7 @@ pub fn handleRequest(
 
     // ── queues ──────────────────────────────────────────────
     if (std.mem.eql(u8, path, "queues")) {
+        try only(method, &.{.GET});
         return queues.getQueues(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "queues/")) {
@@ -60,6 +92,7 @@ pub fn handleRequest(
 
     // ── kv ──────────────────────────────────────────────────
     if (std.mem.eql(u8, path, "kv/namespaces")) {
+        try only(method, &.{.GET});
         return kv.getKVNamespaces(allocator, ctx);
     }
     if (std.mem.startsWith(u8, path, "kv/namespaces/")) {
@@ -68,12 +101,15 @@ pub fn handleRequest(
 
     // ── timeseries ──────────────────────────────────────────
     if (std.mem.eql(u8, path, "timeseries")) {
+        try only(method, &.{.GET});
         return timeseries.getMeasurements(allocator, query_string, ctx);
     }
     if (std.mem.eql(u8, path, "timeseries/floql")) {
+        try only(method, &.{ .GET, .POST });
         return timeseries.executeFloql(allocator, method, query_string, body, ctx);
     }
     if (std.mem.startsWith(u8, path, "timeseries/")) {
+        try only(method, &.{.GET});
         return routeTimeseries(allocator, path["timeseries/".len..], query_string, ctx);
     }
 
@@ -113,26 +149,31 @@ pub fn handleRequest(
 
     // ── actions ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "actions")) {
+        try only(method, &.{.GET});
         return actions.getActions(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "actions/")) {
-        return routeAction(allocator, path["actions/".len..], query_string, body, ctx);
+        return routeAction(allocator, method, path["actions/".len..], query_string, body, ctx);
     }
 
     // ── workers ─────────────────────────────────────────────
     if (std.mem.eql(u8, path, "workers")) {
+        try only(method, &.{.GET});
         return workers.getWorkers(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "workers/")) {
+        try only(method, &.{.GET});
         const worker_id = path["workers/".len..];
-        return workers.getWorkerDetail(allocator, worker_id, ctx);
+        return workers.getWorkerDetail(allocator, worker_id, query_string, ctx);
     }
 
     // ── cluster / metrics ────────────────────────────────────
     if (std.mem.eql(u8, path, "cluster/stats")) {
+        try only(method, &.{.GET});
         return system.getClusterStats(allocator, ctx);
     }
     if (std.mem.eql(u8, path, "metrics")) {
+        try only(method, &.{.GET});
         return system.getMetricsJson(allocator, ctx);
     }
 
@@ -151,22 +192,33 @@ fn routeQueue(allocator: Allocator, method: Method, rest: []const u8, query_stri
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
     if (sub.len == 0) {
+        try only(method, &.{ .GET, .POST });
         if (method == .POST) return queues.enqueueMessage(allocator, name, body, query_string, ctx);
         return queues.getQueueDetail(allocator, name, query_string, ctx);
     }
-    if (std.mem.eql(u8, sub, "messages")) return queues.getQueueMessages(allocator, name, query_string, ctx);
-    if (std.mem.eql(u8, sub, "dlq")) return queues.getQueueDLQ(allocator, name, query_string, ctx);
-    if (std.mem.eql(u8, sub, "purge")) return queues.purgeQueue(allocator, name, query_string, ctx);
+    if (std.mem.eql(u8, sub, "messages")) {
+        try only(method, &.{.GET});
+        return queues.getQueueMessages(allocator, name, query_string, ctx);
+    }
+    if (std.mem.eql(u8, sub, "dlq")) {
+        try only(method, &.{.GET});
+        return queues.getQueueDLQ(allocator, name, query_string, ctx);
+    }
+    if (std.mem.eql(u8, sub, "purge")) {
+        try only(method, &.{.POST});
+        return queues.purgeQueue(allocator, name, query_string, ctx);
+    }
 
     // dlq/:seq or dlq/:seq/requeue
     if (std.mem.startsWith(u8, sub, "dlq/")) {
         const dlq_rest = sub["dlq/".len..];
         if (std.mem.endsWith(u8, dlq_rest, "/requeue")) {
+            try only(method, &.{.POST});
             const seq_str = dlq_rest[0 .. dlq_rest.len - "/requeue".len];
             return queues.requeueDLQEntry(allocator, name, seq_str, query_string, ctx);
         }
-        // DELETE /dlq/:seq
-        if (method == .DELETE) return queues.deleteDLQEntry(allocator, name, dlq_rest, ctx);
+        try only(method, &.{.DELETE});
+        return queues.deleteDLQEntry(allocator, name, dlq_rest, ctx);
     }
 
     return helpers.jsonError(allocator, "Not found");
@@ -201,13 +253,17 @@ fn routeStream(allocator: Allocator, method: Method, rest: []const u8, query_str
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
     if (sub.len == 0) {
+        try only(method, &.{ .GET, .DELETE });
         if (method == .DELETE) return streams.deleteStream(allocator, name, query_string, ctx);
         return streams.getStreamDetail(allocator, name, query_string, ctx);
     }
-    if (std.mem.eql(u8, sub, "messages")) return streams.getStreamMessages(allocator, name, query_string, ctx);
+    if (std.mem.eql(u8, sub, "messages")) {
+        try only(method, &.{.GET});
+        return streams.getStreamMessages(allocator, name, query_string, ctx);
+    }
     if (std.mem.eql(u8, sub, "trim")) {
-        if (method == .POST) return streams.trimStream(allocator, name, query_string, ctx);
-        return helpers.jsonError(allocator, "Method not allowed");
+        try only(method, &.{.POST});
+        return streams.trimStream(allocator, name, query_string, ctx);
     }
 
     // groups/:group[/pending|/members]
@@ -218,9 +274,11 @@ fn routeStream(allocator: Allocator, method: Method, rest: []const u8, query_str
         const group_sub = if (group_slash) |idx| group_rest[idx + 1 ..] else "";
 
         if (group_sub.len == 0) {
+            try only(method, &.{ .GET, .DELETE });
             if (method == .DELETE) return streams.deleteGroup(allocator, name, group_name, query_string, ctx);
             return streams.getGroupDetail(allocator, name, group_name, query_string, ctx);
         }
+        try only(method, &.{.GET});
         if (std.mem.eql(u8, group_sub, "pending")) return streams.getGroupPending(allocator, name, group_name, query_string, ctx);
         if (std.mem.eql(u8, group_sub, "members")) return streams.getGroupMembers(allocator, name, group_name, query_string, ctx);
     }
@@ -237,22 +295,28 @@ fn routeKV(allocator: Allocator, method: Method, rest: []const u8, query_string:
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
     // /kv/namespaces/:ns (same as namespace KV overview)
-    if (sub.len == 0) return namespaces.getNamespaceKV(allocator, ns, ctx);
+    if (sub.len == 0) {
+        try only(method, &.{.GET});
+        return namespaces.getNamespaceKV(allocator, ns, ctx);
+    }
 
     // /kv/namespaces/:ns/keys[/:key[/history]]
     if (std.mem.eql(u8, sub, "keys")) {
+        try only(method, &.{.GET});
         return kv.getKVKeys(allocator, ns, query_string, ctx);
     }
     if (std.mem.startsWith(u8, sub, "keys/")) {
         const key_rest_raw = sub["keys/".len..];
         // Percent-decode the key (frontend sends encodeURIComponent)
         var decode_buf: [4096]u8 = undefined;
-        const key_rest = helpers.percentDecode(&decode_buf, key_rest_raw);
+        const key_rest = helpers.percentDecode(&decode_buf, key_rest_raw) orelse return error.NotFound;
         // Check for /history suffix
         if (std.mem.endsWith(u8, key_rest, "/history")) {
+            try only(method, &.{.GET});
             const key_name = key_rest[0 .. key_rest.len - "/history".len];
             return kv.getKVKeyHistory(allocator, ns, key_name, query_string, ctx);
         }
+        try only(method, &.{ .GET, .PUT, .DELETE });
         // PUT or DELETE on key
         if (method == .PUT) return kv.putKVKey(allocator, ns, key_rest, body, ctx);
         if (method == .DELETE) return kv.deleteKVKey(allocator, ns, key_rest, ctx);
@@ -277,14 +341,18 @@ fn routeTimeseries(allocator: Allocator, rest: []const u8, query_string: ?[]cons
 }
 
 /// Route /actions/:name[/runs|/invoke]
-fn routeAction(allocator: Allocator, rest: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
+fn routeAction(allocator: Allocator, method: Method, rest: []const u8, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     const slash_idx = std.mem.indexOfScalar(u8, rest, '/');
     const name = if (slash_idx) |idx| rest[0..idx] else rest;
     const sub = if (slash_idx) |idx| rest[idx + 1 ..] else "";
 
+    if (std.mem.eql(u8, sub, "invoke")) {
+        try only(method, &.{.POST});
+        return actions.invokeAction(allocator, name, body, query_string, ctx);
+    }
+    try only(method, &.{.GET});
     if (sub.len == 0) return actions.getActionDetail(allocator, name, query_string, ctx);
     if (std.mem.eql(u8, sub, "runs")) return actions.getActionRuns(allocator, name, query_string, ctx);
-    if (std.mem.eql(u8, sub, "invoke")) return actions.invokeAction(allocator, name, body, query_string, ctx);
 
     return helpers.jsonError(allocator, "Not found");
 }
@@ -492,4 +560,32 @@ test "route queue purge" {
     const result = try handleRequest(allocator, .POST, "queues/myq/purge", null, "", &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+}
+
+test "route: every change refuses GET, and every read refuses a change" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    const changes = [_][]const u8{
+        "queues/q/purge",                 "queues/q/dlq/1/requeue",    "queues/q/dlq/1",
+        "actions/a/invoke",               "streams/s/trim",            "workflow/definitions/w/enable",
+        "workflow/definitions/w/disable", "workflow/runs/r/signal",    "processing/jobs/j/stop",
+        "processing/jobs/j/savepoint",    "processing/jobs/j/restore", "processing/jobs/j/rescale",
+    };
+    for (changes) |path| {
+        if (handleRequest(allocator, .GET, path, null, "", &ctx)) |r| {
+            allocator.free(r);
+            std.debug.print("GET {s} was served\n", .{path});
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.MethodNotAllowed, err);
+    }
+    const reads = [_][]const u8{ "namespaces/n", "streams", "queues", "queues/q/messages", "kv/namespaces", "timeseries", "actions", "workers", "cluster/stats", "metrics", "actions/a/runs", "workflow/runs/r/history" };
+    for (reads) |path| {
+        if (handleRequest(allocator, .POST, path, null, "", &ctx)) |r| {
+            allocator.free(r);
+            std.debug.print("POST {s} was served\n", .{path});
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.MethodNotAllowed, err);
+    }
 }

@@ -18,6 +18,7 @@
 //! - FloQL provides a pipeline query language (KEEP — parser + executor).
 
 const std = @import("std");
+const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -308,12 +309,12 @@ pub const TSHandler = struct {
 
         const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else 0;
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
         } else 0;
 
         const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else std.math.maxInt(u64);
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
         } else std.math.maxInt(u64);
 
         // Query raw points
@@ -348,12 +349,12 @@ pub const TSHandler = struct {
 
         const from_ns = if (req.findOption(.ts_from_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else 0;
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else 0;
         } else 0;
 
         const to_ns = if (req.findOption(.ts_to_ms)) |opt| blk: {
             const ms = opt.asI64() orelse 0;
-            break :blk if (ms > 0) @as(u64, @bitCast(ms)) * 1_000_000 else std.math.maxInt(u64);
+            break :blk if (ms > 0) time_units.msToNsSat(@intCast(ms)) else std.math.maxInt(u64);
         } else std.math.maxInt(u64);
 
         const agg_name = if (req.findOption(.ts_aggregation)) |opt|
@@ -441,12 +442,12 @@ pub const TSHandler = struct {
         var to_ns: u64 = std.math.maxInt(u64);
         if (query.source.range.duration_ms > 0) {
             const from_ms = now_ms - query.source.range.duration_ms;
-            from_ns = if (from_ms > 0) @intCast(@as(u64, @bitCast(from_ms)) * 1_000_000) else 0;
-            to_ns = @intCast(@as(u64, @bitCast(now_ms)) * 1_000_000);
+            from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0;
+            to_ns = time_units.msToNsSat(@intCast(now_ms));
         } else if (query.source.range.from_ms > 0) {
-            from_ns = @intCast(@as(u64, @bitCast(query.source.range.from_ms)) * 1_000_000);
+            from_ns = time_units.msToNsSat(@intCast(query.source.range.from_ms));
             if (query.source.range.to_ms > 0) {
-                to_ns = @intCast(@as(u64, @bitCast(query.source.range.to_ms)) * 1_000_000);
+                to_ns = time_units.msToNsSat(@intCast(query.source.range.to_ms));
             }
         }
 
@@ -497,8 +498,9 @@ pub const TSHandler = struct {
         // 5. Execute the pipeline stages
         // Note: execute() returns the input unchanged (same pointer) when pipeline is empty.
         // When pipeline has stages, it returns a new SeriesSet and does NOT free initial.
-        var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch {
+        var result_set = floql_executor.execute(query.stages, initial, self.allocator) catch |err| {
             initial.deinit();
+            if (err == error.InvalidInput) return .{ .err = .{ .code = .invalid_request, .message = "floql: a stage argument is out of range (percentile 0-100, at most 1000000 buckets per series)" } };
             return .{ .err = .{ .code = .internal_error, .message = "floql: execution failed" } };
         };
         defer result_set.deinit();
@@ -549,6 +551,12 @@ pub const TSHandler = struct {
     // ── RETENTION ───────────────────────────────────────────────────────
 
     fn handleRetention(self: *TSHandler, req: Request) CommandResult {
+        if (req.key.len == 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
+        }
+        if (req.findOption(.ts_downsample) != null) {
+            return .{ .err = .{ .code = .invalid_request, .message = "downsampling isn't supported; retention deletes points older than a duration, once" } };
+        }
         // Retention policy: key = measurement, duration from TLV option or value
         // Client sends raw_ttl via OptionTag.ts_raw_ttl; fallback to req.value
         const duration_str: []const u8 = if (req.findOption(.ts_raw_ttl)) |opt|
@@ -566,11 +574,11 @@ pub const TSHandler = struct {
         const now_ms = @import("stdx").time.milliTimestamp();
         const cutoff_ms = now_ms - duration_ms;
         const cutoff_ns: u64 = if (cutoff_ms > 0)
-            @intCast(@as(u64, @bitCast(cutoff_ms)) * 1_000_000)
+            time_units.msToNsSat(@intCast(cutoff_ms))
         else
             0;
 
-        const evicted = self.ts.applyRetention(cutoff_ns);
+        const evicted = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, cutoff_ns);
         _ = evicted;
         return .ok;
     }

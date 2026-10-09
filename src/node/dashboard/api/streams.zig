@@ -153,7 +153,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
     // Build namespace prefix for filtering (same logic as stream handler)
     var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const ns_prefix = if (ns_filter) |ns| ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
+    const ns_prefix = if (ns_filter) |ns| try ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
     const effective_ns = ns_filter orelse "default";
 
     // Scan StreamProjection on each shard for registered stream names
@@ -315,6 +315,14 @@ pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []
     return try json_aw.toOwnedSlice();
 }
 
+/// The key of `group` on `stream` in `namespace`, or null when either name
+/// holds a NUL (it could spell another namespace's group) or the key would
+/// not fit: never the bare name.
+fn groupKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, group: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, stream, 0) != null or std.mem.indexOfScalar(u8, group, 0) != null) return null;
+    return ns_keys.qualifyGroupKey(buf, namespace, stream, group) catch null;
+}
+
 /// GET /streams/:name - Stream detail with partitions and consumer groups
 pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
@@ -377,7 +385,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
         var groups_arr = try obj.arrayField("consumer_groups");
         try groups_arr.begin();
         var sp_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch stream_name;
+        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch return error.NotFound;
         const n = shardCount(ctx);
         for (0..n) |i| {
             if (getStreamProjection(ctx, i)) |sp| {
@@ -539,7 +547,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     // as `qualifyGroupKey(ns, stream, group)`; honor the `?namespace=` param so
     // non-default-namespace streams resolve (matches getStreamDetail).
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
+    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
     var found = false;
     const n = shardCount(ctx);
     for (0..n) |i| {
@@ -606,7 +614,7 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     try arr.begin();
 
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
+    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
@@ -646,7 +654,7 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     try pending_arr.begin();
 
     var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = ns_keys.qualifyGroupKey(&gk_buf, ns_q, stream_name, group_name) catch group_name;
+    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
     var pel_count: usize = 0;
     const n = shardCount(ctx);
     for (0..n) |i| {

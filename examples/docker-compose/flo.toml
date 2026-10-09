@@ -24,3 +24,4 @@ bind = "0.0.0.0"
 enabled = true
 bind = "0.0.0.0"
 # port = 9002 (auto: listen_port + 2)
+# hosts = "flo.example.internal, 10.0.1.5"   # names/addresses you browse to it by (besides localhost)

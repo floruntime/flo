@@ -78,8 +78,8 @@ pub const TxnState = struct {
     txn_id: u64,
     /// Wyhash of `namespace \0 routing_key` — the pinned partition routing hash.
     pinned_hash: u64,
-    /// Wyhash of the namespace string — every op in the txn must share this.
-    /// (v1 limitation: a txn is single-namespace.)
+    /// Wyhash of the namespace the txn was begun in; it is found only from
+    /// there.
     namespace_hash: u32,
     /// The connection that opened this txn (for cleanup on disconnect).
     /// 0 = anonymous / not bound to a connection (e.g. tests).

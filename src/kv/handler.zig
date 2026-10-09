@@ -27,6 +27,7 @@
 //! are system-owned and blocked from user operations.
 
 const std = @import("std");
+const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
@@ -171,11 +172,8 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        // Upfront key size validation — give the user a clear error before any business logic
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        // Upfront key validation — give the user a clear error before any business logic
+        if (refuseKey(shard, conn, req)) return;
 
         // Namespace-qualify the key for projection lookup
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
@@ -264,11 +262,8 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        // Upfront key size validation — give the user a clear error before any business logic
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        // Upfront key validation — give the user a clear error before any business logic
+        if (refuseKey(shard, conn, req)) return;
 
         // Namespace-qualify the key
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
@@ -290,7 +285,10 @@ pub const KVHandler = struct {
         if (req.getTtlSeconds()) |ttl_secs| {
             if (ttl_secs > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                put_expiry_ns = now_ns + ttl_secs * 1_000_000_000;
+                put_expiry_ns = time_units.expiryNs(now_ns, ttl_secs) orelse {
+                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+                    return;
+                };
             }
         }
 
@@ -321,6 +319,7 @@ pub const KVHandler = struct {
     }
 
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
+        if (err == error.TtlTooLarge) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
         shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
     }
 
@@ -328,11 +327,8 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        // Upfront key size validation — give the user a clear error before any business logic
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        // Upfront key validation — give the user a clear error before any business logic
+        if (refuseKey(shard, conn, req)) return;
 
         // Namespace-qualify the key
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
@@ -381,10 +377,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
         if (req.key.len == 0) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "key is required" } });
             return;
@@ -464,10 +457,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
         if (req.key.len == 0) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "key is required" } });
             return;
@@ -511,7 +501,10 @@ pub const KVHandler = struct {
             }
             if (ttl_seconds > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                expiry_ns = now_ns + ttl_seconds * 1_000_000_000;
+                expiry_ns = time_units.expiryNs(now_ns, ttl_seconds) orelse {
+                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+                    return;
+                };
             }
         }
 
@@ -532,10 +525,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
 
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
@@ -577,10 +567,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
 
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
@@ -625,10 +612,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
         if (isReservedKey(req.key)) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
             return;
@@ -639,7 +623,7 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: missing path_len" } });
             return;
         }
-        const path_len = std.mem.readInt(u16, req.value[0..2], .little);
+        const path_len: usize = std.mem.readInt(u16, req.value[0..2], .little);
         if (req.value.len < 2 + path_len) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "json_set: truncated path" } });
             return;
@@ -697,10 +681,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
-        if (validateKeySize(req.namespace, req.key)) |err_msg| {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = err_msg } });
-            return;
-        }
+        if (refuseKey(shard, conn, req)) return;
         if (isReservedKey(req.key)) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } });
             return;
@@ -763,8 +744,10 @@ pub const KVHandler = struct {
             threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
         };
 
+        // In "default" the filter is the whole scan prefix, so one holding a NUL would select another namespace's keys.
+        if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
         // Build scan prefix: namespace prefix + optional filter
-        const ns_prefix = nsPrefix(&S.ns_buf, namespace);
+        const ns_prefix = nsPrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
         var scan_prefix = ns_prefix;
         if (filter.len > 0 and ns_prefix.len + filter.len <= S.ns_buf.len) {
             @memcpy(S.ns_buf[ns_prefix.len..][0..filter.len], filter);
@@ -780,6 +763,8 @@ pub const KVHandler = struct {
         for (S.key_buf[0..raw_count]) |key| {
             if (count >= cap) break;
             const stripped = stripNsPrefix(key, namespace);
+            // A default scan has no prefix, so it also sees other namespaces' "ns\x00key" entries.
+            if (std.mem.indexOfScalar(u8, stripped, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
             if (!isReservedKey(stripped)) {
                 S.key_buf[count] = stripped;
                 count += 1;
@@ -870,7 +855,7 @@ pub const KVHandler = struct {
             // Namespace-qualify key
             var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
             const qkey = qualifyKey(&qbuf, req.namespace, raw_key) catch {
-                // Key too large — treat as not found
+                // Unqualifiable (too large or holds a NUL): report not found
                 if (resp_offset + 1 + 2 + raw_key.len + 8 + 4 > resp_buf.len) break;
                 resp_buf[resp_offset] = 2; // not_found
                 resp_offset += 1;
@@ -990,7 +975,8 @@ pub const KVHandler = struct {
             if (req.getTtlSeconds()) |ttl_secs| {
                 if (ttl_secs > 0) {
                     flags |= entry_mod.Flags.HAS_TTL;
-                    const expiry_ns = timestamp_ns + ttl_secs * 1_000_000_000;
+                    // JSON set/delete reach here without dispatchPut's check.
+                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_secs) orelse return error.TtlTooLarge;
                     std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
                     payload_len += 8;
                 }
@@ -1066,7 +1052,7 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_unknown,
                 .message = "transaction not found",
@@ -1121,6 +1107,14 @@ pub const KVHandler = struct {
         } });
     }
 
+    /// Transaction `txn_id`, if it was begun in `namespace`. Ids are small
+    /// per-shard counters, so one begun in another namespace is not found
+    /// from this one.
+    fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
+        const t = txn_table.get(txn_id) orelse return null;
+        return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
+    }
+
     fn dispatchRollbackTxn(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -1134,7 +1128,7 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        if (txn_table.get(txn_id) == null) {
+        if (txnIn(txn_table, txn_id, req.namespace) == null) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_unknown,
                 .message = "transaction not found",
@@ -1181,7 +1175,7 @@ pub const KVHandler = struct {
         };
 
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
             return true;
         };
@@ -1192,16 +1186,6 @@ pub const KVHandler = struct {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
                 .code = .kv_txn_cross_shard,
                 .message = "key hashes to a different partition than the transaction",
-            } });
-            return true;
-        }
-
-        // Single-namespace guard.
-        const req_ns_hash = router.namespaceHash(req.namespace);
-        if (txn_state.namespace_hash != req_ns_hash) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{
-                .code = .kv_txn_unsupported_op,
-                .message = "transaction is bound to a different namespace",
             } });
             return true;
         }
@@ -1250,18 +1234,13 @@ pub const KVHandler = struct {
             return .err;
         };
         const txn_table = &shard.kv_handler.*.txn_table;
-        const txn_state = txn_table.get(txn_id) orelse {
+        const txn_state = txnIn(txn_table, txn_id, req.namespace) orelse {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unknown, .message = "transaction not found" } });
             return .err;
         };
         const expected_hash = preRouteByKey(req) orelse 0;
         if (txn_state.pinned_hash != expected_hash) {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_cross_shard, .message = "key hashes to a different partition than the transaction" } });
-            return .err;
-        }
-        const req_ns_hash = router.namespaceHash(req.namespace);
-        if (txn_state.namespace_hash != req_ns_hash) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_txn_unsupported_op, .message = "transaction is bound to a different namespace" } });
             return .err;
         }
         const last = txn_table.lastOpForKey(txn_id, qkey) orelse return .miss;
@@ -1303,8 +1282,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection lookup
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch |err|
+            return qualifyRefusal(err);
 
         const entry = self.kv.get(qkey) orelse return .kv_not_found;
         return .{ .kv_value = .{ .value = entry.value, .version = entry.version } };
@@ -1324,8 +1303,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection operations
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch |err|
+            return qualifyRefusal(err);
 
         // CAS check (qualified key)
         if (req.getCasVersion()) |expected_version| {
@@ -1353,7 +1332,8 @@ pub const KVHandler = struct {
         const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
         const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
             if (ttl_secs == 0) break :blk 0;
-            break :blk timestamp + ttl_secs * 1_000_000_000;
+            break :blk time_units.expiryNs(timestamp, ttl_secs) orelse
+                return .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } };
         } else 0;
 
         self.kv.put(qkey, req.value, lsn, 0, timestamp, expiry_ns) catch {
@@ -1436,10 +1416,10 @@ pub const KVHandler = struct {
         //   - If no namespace + user prefix: "prefix"
         //   - If no namespace + no prefix: full scan
         const scan_prefix: []const u8 = if (req.key.len > 0)
-            qualifyKey(&qbuf, ns, req.key) catch
-                return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } }
+            qualifyKey(&qbuf, ns, req.key) catch |err| return qualifyRefusal(err)
         else
-            nsPrefix(&qbuf, ns);
+            nsPrefix(&qbuf, ns) catch
+                return .{ .err = .{ .code = .invalid_request, .message = "namespace name too long" } };
 
         // Allocate scan buffer on stack
         var scan_buf: [MAX_SCAN_LIMIT]ScanEntry = undefined;
@@ -1454,9 +1434,12 @@ pub const KVHandler = struct {
         // Filter out reserved keys and strip namespace prefix from results
         var filtered_count: usize = 0;
         for (out[0..found_count]) |entry| {
-            if (!isReservedKey(entry.key)) {
+            const key = stripNsPrefix(entry.key, ns);
+            // A default scan has no prefix, so it also sees other namespaces' "ns\x00key" entries.
+            if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
+            if (!isReservedKey(key)) {
                 var stripped = entry;
-                stripped.key = stripNsPrefix(entry.key, ns);
+                stripped.key = key;
                 scan_buf[filtered_count] = stripped;
                 filtered_count += 1;
             }
@@ -1485,8 +1468,8 @@ pub const KVHandler = struct {
 
         // Namespace-qualify key for projection lookup
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } };
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch |err|
+            return qualifyRefusal(err);
 
         // Fetch version history from projection
         var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
@@ -1562,6 +1545,22 @@ const MAX_RESPONSE_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
 /// Convert a CommandResult to a wire response and queue it on the connection.
 /// Handles all KV result variants: kv_value (with version prefix), kv_put_ok,
 /// kv_not_found, kv_cas_failed, kv_condition_not_met, kv_scan_result, ok, err.
+fn qualifyRefusal(err: error{ KeyTooLarge, KeyHasNul }) CommandResult {
+    return switch (err) {
+        error.KeyHasNul => .{ .err = .{ .code = .invalid_request, .message = "key must not contain NUL" } },
+        error.KeyTooLarge => .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } },
+    };
+}
+
+/// Answers a request whose key is empty, holds a NUL or won't fit once
+/// qualified; true when it did.
+fn refuseKey(shard: *Shard, conn: *Connection, req: Request) bool {
+    const msg = validateKeySize(req.namespace, req.key) orelse return false;
+    const code: CommandResult.ErrorCode = if (std.mem.indexOfScalar(u8, req.key, ns_keys.NAMESPACE_SEPARATOR) != null) .invalid_request else .kv_key_too_large;
+    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = code, .message = msg } });
+    return true;
+}
+
 fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
     switch (cmd_result) {
         .kv_value => |v| {
@@ -2181,4 +2180,73 @@ test "kv handler: reserved key prefixes" {
     try testing.expect(!isReservedKey("normal_key"));
     try testing.expect(!isReservedKey("_other:prefix")); // not a reserved prefix
     try testing.expect(!isReservedKey("")); // empty key
+}
+
+test "kv handler: a key holding a NUL is refused, and a default scan lists only default's keys" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    var b_put = makeRequest(.kv_put, "k", "b-value", "");
+    b_put.namespace = "b";
+    _ = handler.handleCommand(b_put);
+    _ = handler.handleCommand(makeRequest(.kv_put, "mine", "default-value", ""));
+
+    // "default" keys are stored bare, so this spells b's "k".
+    for ([_]OpCode{ .kv_put, .kv_get, .kv_history, .kv_scan }) |op| {
+        switch (handler.handleCommand(makeRequest(op, "b\x00k", "overwrite", ""))) {
+            .err => |e| {
+                try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
+                try testing.expectEqualStrings("key must not contain NUL", e.message);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqualStrings("b-value", kv.get("b\x00k").?.value);
+
+    const scan = handler.handleCommand(makeRequest(.kv_scan, "", "", ""));
+    defer handler.freeResult(scan);
+    const data = switch (scan) {
+        .kv_scan_result => |r| r.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(std.mem.indexOf(u8, data, "mine") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "b-value") == null);
+}
+
+test "kv handler: the key walk refuses a NUL filter and lists only default's keys in default" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    var b_put = makeRequest(.kv_put, "k", "b-value", "");
+    b_put.namespace = "b";
+    _ = handler.handleCommand(b_put);
+    _ = handler.handleCommand(makeRequest(.kv_put, "mine", "default-value", ""));
+
+    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, "default", "b\x00", null, 0).items.len);
+    const all = KVHandler.localScanKeys(&kv, "default", "", null, 0).items;
+    try testing.expectEqual(@as(usize, 1), all.len);
+    try testing.expectEqualStrings("mine", all[0]);
+    const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 0).items;
+    try testing.expectEqual(@as(usize, 1), b_keys.len);
+    try testing.expectEqualStrings("k", b_keys[0]);
+}
+
+test "kv handler: a TTL too large to represent is refused" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    var obuf: [32]u8 = undefined;
+    var b = proto.OptionsBuilder.init(&obuf);
+    try b.addU64(.ttl_seconds, std.math.maxInt(u64));
+    switch (handler.handleCommand(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("ttl too large", e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(kv.get("k") == null);
 }

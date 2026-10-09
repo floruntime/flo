@@ -524,20 +524,8 @@ pub const WorkflowHandler = struct {
 
     // ── CREATE ──────────────────────────────────────────────────────────
 
-    /// Runs and definitions are keyed "namespace:name", and every node
-    /// reads the namespace back up to the first ':'. Checked where a
-    /// definition is created and a client starts a run: every producer's
-    /// start comes from a definition.
-    fn keyableNamespace(namespace: []const u8) bool {
-        return std.mem.indexOfAny(u8, namespace, ":\x00") == null;
-    }
-
     fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const yaml = req.value;
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
-            return null;
-        }
 
         if (yaml.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow definition is required");
@@ -550,6 +538,13 @@ pub const WorkflowHandler = struct {
             return null;
         };
         defer def.deinit(self.allocator);
+
+        // A trigger reads from its stream without passing a client's
+        // request check, so the namespace it names is checked here.
+        if (def.trigger) |t| if (t.namespace) |ns| if (ns.len > 0) if (@import("../namespace/handler.zig").nameRefusal(ns)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return null;
+        };
 
         // Validate the definition
         var validation = validator.validateWorkflow(self.allocator, &def) catch {
@@ -610,10 +605,6 @@ pub const WorkflowHandler = struct {
 
         if (workflow_name.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return null;
-        }
-        if (!keyableNamespace(req.namespace)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid namespace name");
             return null;
         }
 
@@ -912,8 +903,8 @@ pub const WorkflowHandler = struct {
             return;
         }
 
-        const sig_len = std.mem.readInt(u16, req.value[0..2], .little);
-        if (2 + sig_len > req.value.len) {
+        const sig_len: usize = std.mem.readInt(u16, req.value[0..2], .little);
+        if (req.value.len - 2 < sig_len) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "malformed signal");
             return;
         }
@@ -1199,44 +1190,46 @@ pub const WorkflowHandler = struct {
         }
     }
 
+    const ListRunsQuery = struct {
+        limit: u32,
+        status: ?[]const u8,
+        cursor: ?[]const u8,
+        search: ?[]const u8,
+    };
+
+    /// Value: [limit:u32]([len:u16][bytes]) for status, cursor and search; an
+    /// empty field is no filter. Null when any field runs past the value.
+    fn parseListRunsQuery(value: []const u8) ?ListRunsQuery {
+        if (value.len < 4) return null;
+        var offset: usize = 4;
+        var fields: [3]?[]const u8 = undefined;
+        for (&fields) |*field| {
+            if (value.len - offset < 2) return null;
+            const len = std.mem.readInt(u16, value[offset..][0..2], .little);
+            offset += 2;
+            if (value.len - offset < len) return null;
+            field.* = if (len > 0) value[offset .. offset + len] else null;
+            offset += len;
+        }
+        return .{
+            .limit = std.mem.readInt(u32, value[0..4], .little),
+            .status = fields[0],
+            .cursor = fields[1],
+            .search = fields[2],
+        };
+    }
+
     fn handleListRuns(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const workflow_name = req.key;
 
-        // Parse value: [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]
-        if (req.value.len < 10) { // 4 + 2 + 2 + 2 minimum
+        const query = parseListRunsQuery(req.value) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid list-runs request");
             return;
-        }
-
-        const limit = std.mem.readInt(u32, req.value[0..4], .little);
-        var offset: usize = 4;
-
-        // Status filter
-        const sf_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const status_filter: ?[]const u8 = if (sf_len > 0 and offset + sf_len <= req.value.len) blk: {
-            const s = req.value[offset .. offset + sf_len];
-            offset += sf_len;
-            break :blk s;
-        } else null;
-
-        // Cursor
-        const c_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const cursor_filter: ?[]const u8 = if (c_len > 0 and offset + c_len <= req.value.len) blk: {
-            const c = req.value[offset .. offset + c_len];
-            offset += c_len;
-            break :blk c;
-        } else null;
-
-        // Search query
-        const sq_len = std.mem.readInt(u16, req.value[offset..][0..2], .little);
-        offset += 2;
-        const search_query: ?[]const u8 = if (sq_len > 0 and offset + sq_len <= req.value.len) blk: {
-            const s = req.value[offset .. offset + sq_len];
-            offset += sq_len;
-            break :blk s;
-        } else null;
+        };
+        const limit = query.limit;
+        const status_filter = query.status;
+        const cursor_filter = query.cursor;
+        const search_query = query.search;
 
         // Lowercase the search query once for case-insensitive matching
         var search_lower_buf: [256]u8 = undefined;
@@ -1671,7 +1664,8 @@ pub const WorkflowHandler = struct {
 
                     // Record timeout deadline if configured
                     if (wait_step.timeout_ms) |timeout_ms| {
-                        run.wait_timeout_at_ms = now_ms + timeout_ms;
+                        // Saturating: a timeout past the clock never fires.
+                        run.wait_timeout_at_ms = now_ms +| timeout_ms;
                         if (wait_step.on_timeout) |target| {
                             if (run.wait_timeout_target_owned) |old| self.allocator.free(old);
                             run.wait_timeout_target_owned = self.allocator.dupe(u8, target) catch null;
@@ -1952,7 +1946,7 @@ pub const WorkflowHandler = struct {
 
         if (is_local) {
             // Local shard: use invokeByName directly (same thread, no threading concerns)
-            return self.invokeActionLocal(shard, run, action_name, input, step_label, target_shard_id, now_ms);
+            return self.invokeActionLocal(shard, run, namespace, action_name, input, step_label, target_shard_id, now_ms);
         }
 
         // Cross-shard: the target shard creates the run on its own thread,
@@ -1962,7 +1956,7 @@ pub const WorkflowHandler = struct {
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
         const peer_mailboxes = shard.peer_mailboxes orelse return definition.StepOutcome.execution_failure;
         if (target_shard_id >= peer_mailboxes.len) return definition.StepOutcome.execution_failure;
-        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
+        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, namespace, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned) orelse {
             return definition.StepOutcome.execution_failure;
         };
         if (!peer_mailboxes[target_shard_id].inbox.send(.{
@@ -1982,18 +1976,22 @@ pub const WorkflowHandler = struct {
         return null; // signals: parked
     }
 
-    /// Same-shard action invocation (no threading concerns).
+    /// Same-shard action invocation (no threading concerns). The action is
+    /// the one in the workflow's namespace.
     fn invokeActionLocal(
         self: *WorkflowHandler,
         shard: *Shard,
         run: *RunRecord,
+        namespace: []const u8,
         action_name: []const u8,
         input: []const u8,
         step_label: []const u8,
         target_shard_id: u16,
         now_ms: i64,
     ) ?[]const u8 {
-        const action = shard.actions_handler.actions.get(action_name) orelse {
+        var kbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+        const key = ActionsHandler.defKey(&kbuf, namespace, action_name) orelse "";
+        const action = shard.actions_handler.actions.get(key) orelse {
             self.addHistoryEvent(run, "action_not_found", action_name, now_ms);
             return definition.StepOutcome.target_not_found;
         };
@@ -2004,7 +2002,7 @@ pub const WorkflowHandler = struct {
         }
 
         var action_id_buf: [32]u8 = undefined;
-        const invoked = shard.actions_handler.invokeByName(shard, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
+        const invoked = shard.actions_handler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
             return definition.StepOutcome.execution_failure;
         };
         // The run exists once the invoke applies; `checkPendingActions`
@@ -2124,7 +2122,7 @@ pub const WorkflowHandler = struct {
             else
                 @intCast(poll_cfg.calculateDelay(run.poll_attempt - 1));
             run.poll_attempt += 1;
-            run.poll_next_at_ms = now_ms + delay;
+            run.poll_next_at_ms = now_ms +| delay;
             run.status = .waiting;
             self.addHistoryEvent(run, "poll_scheduled", step_label, now_ms);
             return .parked;
@@ -3597,7 +3595,7 @@ pub const WorkflowHandler = struct {
         off += ver_len;
 
         if (off + 1 > value.len) return;
-        const status: RunStatus = @enumFromInt(value[off]);
+        const status = std.enums.fromInt(RunStatus, value[off]) orelse return;
         off += 1;
 
         if (off + 8 > value.len) return;
@@ -3710,8 +3708,8 @@ pub const WorkflowHandler = struct {
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
     fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
-        if (value.len < 9) return;
-        const status: RunStatus = @enumFromInt(value[0]);
+        if (value.len < 10) return;
+        const status = std.enums.fromInt(RunStatus, value[0]) orelse return;
         const completed_at_ms = std.mem.readInt(i64, value[1..9], .little);
 
         // Look up existing run (must have been replayed via workflow_start first)
@@ -3993,7 +3991,9 @@ fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_ns);
         return;
     };
-    actions.actions.put(owned_name, .{
+    const owned_key = alloc.dupe(u8, name) catch unreachable;
+    actions.actions.put(owned_key, .{
+        .key_owned = owned_key,
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
         .owner_owned = owned_owner,
@@ -4021,7 +4021,9 @@ fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
         alloc.free(owned_ns);
         return;
     };
-    actions.actions.put(owned_name, .{
+    const owned_key = alloc.dupe(u8, name) catch unreachable;
+    actions.actions.put(owned_key, .{
+        .key_owned = owned_key,
         .name_owned = owned_name,
         .namespace_owned = owned_ns,
         .owner_owned = owned_owner,
@@ -4740,6 +4742,7 @@ test "step executor: checkPendingActions handles completed async action" {
         actions.runs.put(arid, .{
             .run_id_owned = arid,
             .action_name_owned = aname,
+            .namespace_owned = actions.allocator.dupe(u8, "default") catch unreachable,
             .input_owned = null,
             .status = .completed,
             .created_at_ms = 0,
@@ -4775,4 +4778,48 @@ test "step executor: checkPendingActions handles completed async action" {
     const run = handler.runs.get("default:run-8").?;
     // After resuming start → step_b (success) → flo.Completed
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+}
+
+test "list-runs query: every truncation of a valid value is refused, not read past" {
+    const valid = [_]u8{ 7, 0, 0, 0, 7, 0 } ++ "running".* ++ [_]u8{ 2, 0 } ++ "c1".* ++ [_]u8{ 3, 0 } ++ "abc".*;
+    for (0..valid.len) |n| {
+        try testing.expect(WorkflowHandler.parseListRunsQuery(valid[0..n]) == null);
+    }
+    const q = WorkflowHandler.parseListRunsQuery(&valid).?;
+    try testing.expectEqual(@as(u32, 7), q.limit);
+    try testing.expectEqualStrings("running", q.status.?);
+    try testing.expectEqualStrings("c1", q.cursor.?);
+    try testing.expectEqualStrings("abc", q.search.?);
+
+    const empty = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const e = WorkflowHandler.parseListRunsQuery(&empty).?;
+    try testing.expect(e.status == null and e.cursor == null and e.search == null);
+}
+
+test "list-runs query: a length that overruns the value is refused" {
+    // Each value's last length prefix, or the bytes it claims, runs past the end.
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }) == null);
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 }) == null);
+    try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 'a', 'b' }) == null);
+}
+
+test "workflow replay: an unknown status, or a complete entry without its output flag, is skipped" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    // [wf_len][wf][ver_len][ver][status][created_at][evt_len][idem_len]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
+    var bad_status = start;
+    bad_status[7] = 0xee;
+    handler.replayStart("default:r0", &bad_status);
+    try testing.expectEqual(@as(usize, 0), handler.runCount());
+
+    handler.replayStart("default:r1", &start);
+    try testing.expectEqual(@as(usize, 1), handler.runCount());
+
+    // Missing has_output byte; then an unknown status. Neither may change the run.
+    handler.replayComplete("default:r1", &([_]u8{3} ++ [_]u8{0} ** 8));
+    handler.replayComplete("default:r1", &([_]u8{0xee} ++ [_]u8{0} ** 9));
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
 }

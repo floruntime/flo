@@ -90,10 +90,6 @@ pub const HttpRunner = struct {
     allocator: Allocator,
     host: []const u8,
     port: u16,
-    /// API key injected as X-Api-Key header on every request (set when auth is enabled)
-    api_key: ?[]const u8 = null,
-    /// Session JWT injected as Authorization: Bearer header (set after loginWithApiKey())
-    token: ?[]const u8 = null,
 
     /// Default request timeout (ms)
     pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -111,48 +107,8 @@ pub const HttpRunner = struct {
 
     /// Clean up resources
     pub fn deinit(self: *Self) void {
-        if (self.api_key) |k| self.allocator.free(k);
-        if (self.token) |t| self.allocator.free(t);
         self.allocator.free(self.host);
         self.allocator.destroy(self);
-    }
-
-    /// Set the API key for all subsequent requests (injects X-Api-Key header).
-    /// Clears any stored session token.
-    pub fn setApiKey(self: *Self, key: []const u8) !void {
-        if (self.api_key) |old| self.allocator.free(old);
-        self.api_key = try self.allocator.dupe(u8, key);
-    }
-
-    /// Set a pre-existing session JWT for all subsequent requests (Authorization: Bearer).
-    pub fn setToken(self: *Self, jwt: []const u8) !void {
-        if (self.token) |old| self.allocator.free(old);
-        self.token = try self.allocator.dupe(u8, jwt);
-    }
-
-    /// POST /api/v1/auth/session with the provided API key and store the returned JWT.
-    /// After this call, all requests will carry Authorization: Bearer <token>.
-    pub fn loginWithApiKey(self: *Self, key: []const u8) !void {
-        const auth_headers = &[_][2][]const u8{
-            .{ "X-Api-Key", key },
-        };
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"api_key\":\"{s}\"}}", .{key});
-        defer self.allocator.free(body);
-
-        var resp = try self.doRequest(.POST, "/api/v1/auth/session", body, auth_headers);
-        defer resp.deinit();
-
-        if (resp.status != 200 and resp.status != 201) return error.LoginFailed;
-
-        // Parse token from JSON body: {"token":"<jwt>",...}
-        const token_key = "\"token\":\"";
-        const start_pos = std.mem.indexOf(u8, resp.body, token_key) orelse return error.TokenNotFound;
-        const token_start = start_pos + token_key.len;
-        const token_end = std.mem.indexOfScalarPos(u8, resp.body, token_start, '"') orelse return error.TokenNotFound;
-
-        const jwt = resp.body[token_start..token_end];
-        if (self.token) |old| self.allocator.free(old);
-        self.token = try self.allocator.dupe(u8, jwt);
     }
 
     /// Make a GET request
@@ -224,7 +180,21 @@ pub const HttpRunner = struct {
         body: ?[]const u8,
         extra_headers: ?[]const [2][]const u8,
     ) !HttpResponse {
-        return self.doRequest(method, path, body, extra_headers);
+        return self.doRequest(method, path, body, extra_headers, true);
+    }
+
+    /// A request with the headers given and without the Origin and
+    /// Content-Type the dashboard's own pages add to a change, which
+    /// `request` adds. Host, Connection, Content-Length and any auth
+    /// header are sent as usual.
+    pub fn requestExact(
+        self: *Self,
+        method: Method,
+        path: []const u8,
+        body: ?[]const u8,
+        headers: []const [2][]const u8,
+    ) !HttpResponse {
+        return self.doRequest(method, path, body, headers, false);
     }
 
     /// Full request with stream access (internal)
@@ -234,6 +204,7 @@ pub const HttpRunner = struct {
         path: []const u8,
         body: ?[]const u8,
         extra_headers: ?[]const [2][]const u8,
+        as_console: bool,
     ) !HttpResponse {
         // Connect to server
         const addr = @import("../../net.zig").Address.initIp4(parseIp4(self.host) catch .{ 127, 0, 0, 1 }, self.port);
@@ -250,17 +221,17 @@ pub const HttpRunner = struct {
         try writer.print("Host: {s}:{d}\r\n", .{ self.host, self.port });
         try writer.writeAll("Connection: close\r\n");
 
-        // Inject auth header: prefer Bearer token, fall back to X-Api-Key
-        if (self.token) |tok| {
-            try writer.print("Authorization: Bearer {s}\r\n", .{tok});
-        } else if (self.api_key) |key| {
-            try writer.print("X-Api-Key: {s}\r\n", .{key});
-        }
-
         if (extra_headers) |headers| {
             for (headers) |hdr| {
                 try writer.print("{s}: {s}\r\n", .{ hdr[0], hdr[1] });
             }
+        }
+        // A change from the dashboard's own pages: the browser names their
+        // origin, and the console names a JSON body.
+        const change = method != .GET and method != .HEAD and method != .OPTIONS;
+        if (as_console and change) {
+            if (!hasHeader(extra_headers, "origin")) try writer.print("Origin: http://{s}:{d}\r\n", .{ self.host, self.port });
+            if (!hasHeader(extra_headers, "content-type")) try writer.writeAll("Content-Type: application/json\r\n");
         }
 
         if (body) |b| {
@@ -295,6 +266,13 @@ pub const HttpRunner = struct {
 
         // Parse response
         return self.parseResponse(response_data);
+    }
+
+    fn hasHeader(headers: ?[]const [2][]const u8, name: []const u8) bool {
+        for (headers orelse return false) |h| {
+            if (std.ascii.eqlIgnoreCase(h[0], name)) return true;
+        }
+        return false;
     }
 
     fn parseResponse(self: *Self, data: []const u8) !HttpResponse {
