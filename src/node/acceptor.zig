@@ -192,8 +192,9 @@ pub const Acceptor = struct {
     fn routeFromHeader(self: *Acceptor, data: []const u8) ?u16 {
         if (data.len < @sizeOf(proto.RequestHeader)) return null;
 
-        const header_bytes = data[0..@sizeOf(proto.RequestHeader)];
-        const header: *const proto.RequestHeader = @ptrCast(@alignCast(header_bytes.ptr));
+        // Copied out: the peek buffer is bytes, with no alignment for the
+        // header's u64 fields.
+        const header = std.mem.bytesToValue(proto.RequestHeader, data[0..@sizeOf(proto.RequestHeader)]);
 
         // Validate magic
         if (header.magic != proto.MAGIC) return null;
@@ -308,6 +309,20 @@ test "Acceptor: round-robin routing" {
     try std.testing.expectEqual(@as(u16, 0), s0);
     try std.testing.expectEqual(@as(u16, 1), s1);
     try std.testing.expectEqual(@as(u16, 0), s2);
+}
+
+test "Acceptor: a header at an odd offset in the peek buffer is read, not trapped on" {
+    var pipes: [2]i32 = .{ -1, -1 };
+    var acceptor = Acceptor.init(&pipes, Router.init(4096, 2, 0));
+    var header: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&header), 0);
+    header.magic = proto.MAGIC;
+    header.version = proto.VERSION;
+    header.op_code = 0x01;
+    // One byte past an 8-byte boundary: a cast would trap in a safe build.
+    var buf: [128]u8 align(8) = undefined;
+    @memcpy(buf[1..][0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
+    try std.testing.expectEqual(@as(?u16, 0), acceptor.routeFromHeader(buf[1 .. 1 + @sizeOf(proto.RequestHeader)]));
 }
 
 test "Acceptor: extractKeyFromPayload" {
