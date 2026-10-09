@@ -59,7 +59,9 @@ pub const TSHandler = struct {
     /// Set after init by Shard.wireHandlerShardPtrs(). Required to propose Raft entries.
     shard_ptr: ?*anyopaque,
 
-    /// Holds a refusal that names the request's own input until it is sent.
+    /// Holds a refusal that names the request's own input. The next
+    /// request overwrites it, so a refusal from it is sent at once, never
+    /// parked.
     why_buf: [512]u8 = undefined,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
