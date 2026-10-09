@@ -83,16 +83,66 @@ test "e2e/ts: write with explicit timestamp" {
     try testing.expect(std.mem.indexOf(u8, output, "OK") != null);
 }
 
-test "e2e/ts: write multiple fields" {
+test "e2e/ts: write multiple fields stores each field at one timestamp" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo ts write cpu --tags host=web-01 --fields user=72.5,system=7.4,idle=20.1
-    const output = try ctx.execCapture(&.{
+    var w = try ctx.cli.run(&.{
         "ts",          "write",    "cpu",                            "--tags",
-        "host=web-01", "--fields", "user=72.5,system=7.4,idle=20.1",
+        "host=web-01", "--fields", "user=72.5,system=7.4,idle=20.1", "--timestamp",
+        "1708700400000",
     });
-    try testing.expect(std.mem.indexOf(u8, output, "OK") != null);
+    defer w.deinit();
+    try testing.expectEqual(@as(u8, 0), w.exit_code);
+    try testing.expect(w.stdoutContains("OK (3 fields at 1708700400000)"));
+
+    const expected = [_][2][]const u8{
+        .{ "user", "1708700400000 72.500000\n" },
+        .{ "system", "1708700400000 7.400000\n" },
+        .{ "idle", "1708700400000 20.100000\n" },
+    };
+    for (expected) |e| {
+        var r = try ctx.cli.run(&.{
+            "ts",      "read", "cpu",    "--tags", "host=web-01",   "--field",
+            e[0],      "--from", "1708700000000", "-o", "raw",
+        });
+        defer r.deinit();
+        try testing.expectEqualStrings(e[1], r.stdout);
+    }
+}
+
+test "e2e/ts: write stores the exact value and timestamp" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Eight or more characters: the server used to read these bytes as f64 bits.
+    try ctx.exec(&.{ "ts", "write", "exact", "--value", "1234.5678", "--timestamp", "1708700400123" });
+    try ctx.exec(&.{ "ts", "write", "exact", "--value", "-0.25", "--timestamp", "1708700400456" });
+
+    var r = try ctx.cli.run(&.{ "ts", "read", "exact", "--from", "1708700000000", "-o", "raw" });
+    defer r.deinit();
+    try testing.expectEqualStrings("1708700400123 1234.567800\n1708700400456 -0.250000\n", r.stdout);
+}
+
+test "e2e/ts: write refuses a value that is not a finite number" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for ([_][]const u8{ "abc", "nan", "inf", "1.5x" }) |v| {
+        var r = try ctx.cli.run(&.{ "ts", "write", "bad_value", "--value", v });
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains(v));
+    }
+    var f = try ctx.cli.run(&.{ "ts", "write", "bad_value", "--fields", "a=1,b=nope" });
+    defer f.deinit();
+    try testing.expect(f.exit_code != 0);
+    try testing.expect(f.stderrContains("nope"));
+
+    // Nothing was written, not even field a.
+    var r = try ctx.cli.run(&.{ "ts", "read", "bad_value", "--field", "a", "--from", "0", "-o", "raw" });
+    defer r.deinit();
+    try testing.expect(!r.stdoutContains("1.000000"));
 }
 
 test "e2e/ts: write no tags" {
@@ -130,11 +180,10 @@ test "e2e/ts: write without --value or --fields fails" {
 // Write: Batch (Line Protocol)
 // =============================================================================
 
-test "e2e/ts: write batch from file" {
+test "e2e/ts: write batch from file stores every point" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Create a temp line-protocol file
     const tmp_path = "/tmp/flo-e2e-ts-batch.txt";
     {
         const file = try @import("stdx").fs.createFile(tmp_path, .{});
@@ -148,12 +197,72 @@ test "e2e/ts: write batch from file" {
     }
     defer @import("stdx").fs.deleteFile(tmp_path) catch {};
 
-    // flo ts write --batch --file /tmp/flo-e2e-ts-batch.txt --precision ms
-    const output = try ctx.execCapture(&.{
-        "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms",
-    });
-    try testing.expect(std.mem.indexOf(u8, output, "Wrote") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "points") != null);
+    var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ms" });
+    defer w.deinit();
+    try testing.expectEqual(@as(u8, 0), w.exit_code);
+    try testing.expect(w.stdoutContains("Wrote 5 points\n"));
+
+    const expected = [_][4][]const u8{
+        .{ "cpu", "host=web-01", "user", "1708700400000 72.500000\n" },
+        .{ "cpu", "host=web-01", "system", "1708700400000 7.400000\n" },
+        .{ "cpu", "host=web-02", "user", "1708700400000 55.300000\n" },
+        .{ "cpu", "host=web-02", "system", "1708700400000 12.100000\n" },
+        .{ "memory", "host=web-01", "used", "1708700400000 4096.000000\n" },
+    };
+    for (expected) |e| {
+        var r = try ctx.cli.run(&.{ "ts", "read", e[0], "--tags", e[1], "--field", e[2], "--from", "1708700000000", "-o", "raw" });
+        defer r.deinit();
+        try testing.expectEqualStrings(e[3], r.stdout);
+    }
+}
+
+test "e2e/ts: write batch converts the timestamp precision" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const tmp_path = "/tmp/flo-e2e-ts-batch-ns.txt";
+    {
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, "disk,host=a free=12.5 1708700400123000000\n");
+    }
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+
+    var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path, "--precision", "ns" });
+    defer w.deinit();
+    try testing.expectEqual(@as(u8, 0), w.exit_code);
+
+    var r = try ctx.cli.run(&.{ "ts", "read", "disk", "--tags", "host=a", "--field", "free", "--from", "1708700000000", "-o", "raw" });
+    defer r.deinit();
+    try testing.expectEqualStrings("1708700400123 12.500000\n", r.stdout);
+}
+
+test "e2e/ts: write batch reports a bad line and stores the rest" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const tmp_path = "/tmp/flo-e2e-ts-batch-bad.txt";
+    {
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file,
+            \\net,host=a rx=1.5 1708700400000
+            \\this line is not line protocol
+            \\net,host=a rx=2.5 1708700401000
+            \\
+        );
+    }
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+
+    var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path });
+    defer w.deinit();
+    try testing.expect(w.exit_code != 0);
+    try testing.expect(w.stderrContains("line 2:"));
+    try testing.expect(w.stdoutContains("Wrote 2 points (1 lines failed)"));
+
+    var r = try ctx.cli.run(&.{ "ts", "read", "net", "--tags", "host=a", "--field", "rx", "--from", "1708700000000", "-o", "raw" });
+    defer r.deinit();
+    try testing.expectEqualStrings("1708700400000 1.500000\n1708700401000 2.500000\n", r.stdout);
 }
 
 // =============================================================================

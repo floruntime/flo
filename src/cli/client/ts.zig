@@ -7,7 +7,7 @@
 //!   OpCode: ts_write / ts_read / ts_query / ts_list / ts_delete / ts_retention
 //!   namespace = req.namespace
 //!   key = measurement name
-//!   value = payload (fields, line-protocol batch, etc.)
+//!   value = the payload (for a write, one f64, little-endian)
 //!   options = TLV-encoded parameters (tags, time range, window, etc.)
 
 const std = @import("std");
@@ -16,48 +16,33 @@ const Client = base.Client;
 const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
 
-/// Write a single data point (single or multi-field)
-/// Fields format: "field1=1.0,field2=2.0" or just "1.0" for single-field
+/// Write one value of one field. `field` null means the server's default
+/// field ("value"); a null `timestamp_ms` lets the server stamp the point.
 pub fn write(
     client: *Client,
     namespace: []const u8,
     measurement: []const u8,
+    field: ?[]const u8,
+    value: f64,
     tags: []const u8,
-    fields_str: []const u8,
     timestamp_ms: ?i64,
 ) !Response {
-    var options_buf: [256]u8 = undefined;
+    var options_buf: [1024]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
     if (tags.len > 0) {
         builder.addString(.ts_tags, tags) catch return error.OptionsBufferTooSmall;
     }
-
+    if (field) |f| {
+        builder.addString(.ts_field, f) catch return error.OptionsBufferTooSmall;
+    }
     if (timestamp_ms) |ts| {
         builder.addI64(.ts_timestamp, ts) catch return error.OptionsBufferTooSmall;
     }
 
-    return client.sendRequestWithOptions(.ts_write, namespace, measurement, fields_str, builder.getOptions());
-}
-
-/// Write a batch of line-protocol points
-pub fn writeBatch(
-    client: *Client,
-    namespace: []const u8,
-    line_protocol_text: []const u8,
-    precision: ?u8,
-) !Response {
-    var options_buf: [16]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    builder.addFlag(.ts_batch) catch return error.OptionsBufferTooSmall;
-
-    if (precision) |p| {
-        builder.addU8(.ts_precision, p) catch return error.OptionsBufferTooSmall;
-    }
-
-    // For batch mode, measurement (key) is empty — it's encoded in the line protocol
-    return client.sendRequestWithOptions(.ts_write, namespace, "", line_protocol_text, builder.getOptions());
+    var value_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value_buf, @bitCast(value), .little);
+    return client.sendRequestWithOptions(.ts_write, namespace, measurement, &value_buf, builder.getOptions());
 }
 
 /// Read raw data points for a measurement
