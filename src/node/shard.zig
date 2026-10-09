@@ -104,7 +104,6 @@ const ReplayRegistry = persistence_mod.ReplayRegistry;
 const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
-const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
@@ -331,10 +330,6 @@ pub const Shard = struct {
     /// Reused sequentially — safe because each shard's reactor is single-
     /// threaded and `drainInbox` processes one message at a time.
     forward_proxy: *Connection,
-
-    /// Controller Raft coordinator (set on Shard 0 — routes namespace
-    /// create/delete through Raft for multi-node consistency).
-    coordinator: ?*Coordinator,
 
     /// Replay registry — maps EntryType → handler apply callback for the
     /// entry types no projection owns. Used by the one applier, whether the
@@ -816,7 +811,6 @@ pub const Shard = struct {
             .peer_shards = null,
             .peer_mailboxes = null,
             .forward_proxy = forward_proxy,
-            .coordinator = null,
             .replay_registry = replay_registry,
             .apply_buf = apply_buf,
             .applying = false,
@@ -826,14 +820,6 @@ pub const Shard = struct {
             .run_id_gen = .{ .shard = @intCast(shard_id) },
             .metrics_registry = null,
         };
-    }
-
-    // ─── Cluster wiring ──────────────────────────────────────────────────
-
-    /// Wire the Controller Raft coordinator (enables Raft-replicated namespace ops).
-    /// Should only be called on Shard 0.
-    pub fn setCoordinator(self: *Shard, coord: *Coordinator) void {
-        self.coordinator = coord;
     }
 
     /// Namespace resolver wired into the queue and stream projections: hash →
