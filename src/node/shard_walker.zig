@@ -26,6 +26,7 @@
 //! ```
 
 const std = @import("std");
+const log = @import("stdx").log;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ShardWalker
@@ -229,6 +230,20 @@ pub fn ShardWalker(comptime ResultT: type) type {
             };
         }
     };
+}
+
+/// A shard's local scan writes its names here, sized to the source each
+/// time, so a scan returns every matching name and the walker pages through
+/// them by offset. One per thread: a walk copies a scan's names out before
+/// the next scan runs.
+threadlocal var scan_scratch: std.ArrayListUnmanaged([]const u8) = .empty;
+
+pub fn scanScratch(n: usize) [][]const u8 {
+    scan_scratch.ensureTotalCapacity(std.heap.page_allocator, n) catch {
+        log.err("list scan: no memory for {d} names; this page lists what fits", .{n});
+    };
+    const all = scan_scratch.allocatedSlice();
+    return all[0..@min(n, all.len)];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

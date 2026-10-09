@@ -44,21 +44,30 @@ fn queueEntry(d: []const u8, pos: *usize) []const u8 {
 }
 
 fn listPage(ctx: *stdx.testing.TestContext, op: proto.OpCode, cursor: []const u8, out: []u8) ![]const u8 {
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    return listPageOn(fd, op, 2, cursor, out);
+}
+
+fn listPageOn(fd: std.c.fd_t, op: proto.OpCode, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
     var value: [4 + 256]u8 = undefined;
-    std.mem.writeInt(u32, value[0..4], 2, .little);
+    std.mem.writeInt(u32, value[0..4], limit, .little);
     @memcpy(value[4..][0..cursor.len], cursor);
+    return call(fd, op, "", value[0 .. 4 + cursor.len], out);
+}
+
+/// Sends one request on `fd` and returns the data of its ok answer.
+fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, out: []u8) ![]const u8 {
     var h: proto.RequestHeader = undefined;
     @memset(std.mem.asBytes(&h), 0);
     h.magic = proto.MAGIC;
     h.version = proto.VERSION;
     h.op_code = @intFromEnum(op);
     h.request_id = 1;
-    const req: proto.Request = .{ .header = h, .namespace = "default", .key = "", .value = value[0 .. 4 + cursor.len], .options = "" };
+    const req: proto.Request = .{ .header = h, .namespace = "default", .key = key, .value = value, .options = "" };
     var frame_buf: [1024]u8 = undefined;
     const frame = try req.serialize(&frame_buf);
 
-    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
-    defer _ = std.c.close(fd);
     if (std.c.write(fd, frame.ptr, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
     var got: usize = 0;
     for (0..300) |_| {
@@ -133,4 +142,69 @@ test "e2e/list: the CLI's --limit is the server's page size" {
     var r = try ctx.cli.run(&.{ "stream", "list", "--limit", "3", "-o", "json" });
     defer r.deinit();
     try testing.expectEqual(@as(usize, 3), r.stdoutCount("\"name\":\"pg-"));
+}
+
+/// Runs `args` and checks exactly three of NAMES are printed, each once.
+fn expectThreeListed(ctx: *stdx.testing.TestContext, args: []const []const u8) !void {
+    var r = try ctx.cli.run(args);
+    defer r.deinit();
+    var listed: usize = 0;
+    for (NAMES) |n| {
+        const c = r.stdoutCount(n);
+        try testing.expect(c <= 1);
+        listed += c;
+    }
+    if (listed != 3) std.debug.print("{s} listed {d}:\n{s}\n", .{ args[0], listed, r.stdout });
+    try testing.expectEqual(@as(usize, 3), listed);
+}
+
+test "e2e/list: queue, ts and kv lists take --limit as the page size" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    for (NAMES) |n| {
+        try ctx.exec(&.{ "queue", "enqueue", n, "x" });
+        try ctx.exec(&.{ "ts", "write", n, "--value", "1" });
+        try ctx.exec(&.{ "kv", "set", n, "x" });
+    }
+    try expectThreeListed(ctx, &.{ "queue", "list", "--limit", "3" });
+    try expectThreeListed(ctx, &.{ "ts", "list", "--limit", "3" });
+    try expectThreeListed(ctx, &.{ "kv", "list", "--limit", "3" });
+}
+
+test "e2e/list: a shard holding more names than one page lists them all" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 1 } });
+    defer ctx.deinit();
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+
+    // More than the 1024 names a local scan once held.
+    const total = 1100;
+    var out: [256 * 1024]u8 = undefined;
+    for (0..total) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i});
+        _ = try call(fd, .kv_put, key, "x", &out);
+    }
+
+    var seen = [_]u8{0} ** total;
+    var cursor_buf: [256]u8 = undefined;
+    var cursor: []const u8 = "";
+    for (0..20) |_| {
+        const d = try listPageOn(fd, .kv_scan, 300, cursor, &out);
+        const count = std.mem.readInt(u32, d[0..4], .little);
+        try testing.expect(count <= 300);
+        var pos: usize = 4;
+        for (0..count) |_| {
+            const name = scanEntry(d, &pos);
+            const vlen = std.mem.readInt(u32, d[pos - 4 ..][0..4], .little);
+            pos += vlen;
+            seen[try std.fmt.parseInt(usize, name[4..], 10)] += 1;
+        }
+        const has_more = d[pos] != 0;
+        const clen = std.mem.readInt(u16, d[pos + 1 ..][0..2], .little);
+        if (!has_more) break;
+        @memcpy(cursor_buf[0..clen], d[pos + 3 ..][0..clen]);
+        cursor = cursor_buf[0..clen];
+    }
+    for (seen) |n| try testing.expectEqual(@as(u8, 1), n);
 }

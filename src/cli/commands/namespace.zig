@@ -3,7 +3,7 @@
 //! Usage:
 //!   flo namespace create <name>
 //!   flo namespace delete <name>
-//!   flo namespace list [--all]
+//!   flo namespace list
 //!   flo namespace info <name>
 
 const std = @import("std");
@@ -68,7 +68,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"ls"})
                 .examples(&.{
                     "flo namespace list",
-                    "flo ns ls --all",
+                    "flo ns ls",
                 })
                 .action(wrapHandler(runList)),
         )

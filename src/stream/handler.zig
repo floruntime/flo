@@ -173,33 +173,33 @@ pub const StreamHandler = struct {
     ) dispatcher_mod.NameWalker.ScanResult {
         const stream: *StreamProjection = @ptrCast(@alignCast(ctx));
         const S = struct {
-            threadlocal var name_buf: [1024][]const u8 = undefined;
             threadlocal var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         };
+        const name_buf = dispatcher_mod.scanScratch(stream.stream_names.count());
 
         // Build namespace prefix for filtering
         const ns_prefix = ns_keys.namespacePrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
 
         // Scan all qualified names
-        const raw_count = stream.scanStreamNames(&S.name_buf);
+        const raw_count = stream.scanStreamNames(name_buf);
 
         // Filter by namespace and strip prefix
         var count: usize = 0;
-        for (S.name_buf[0..raw_count]) |name| {
+        for (name_buf[0..raw_count]) |name| {
             if (ns_prefix.len == 0) {
                 // Default namespace — only include bare names (no NUL separator)
                 if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) == null) {
-                    S.name_buf[count] = name;
+                    name_buf[count] = name;
                     count += 1;
                 }
             } else if (std.mem.startsWith(u8, name, ns_prefix)) {
                 // Non-default namespace — strip prefix
-                S.name_buf[count] = name[ns_prefix.len..];
+                name_buf[count] = name[ns_prefix.len..];
                 count += 1;
             }
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     // ── Dispatch Wrappers ───────────────────────────────────────────────

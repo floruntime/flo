@@ -6,8 +6,8 @@
 //!   - Special values: "0" or "0-0" (beginning), "$" (latest/tail)
 //!
 //! Usage:
-//!   flo stream create <stream> [--partitions N] [--retention N]
-//!   flo stream alter <stream> [--retention N]
+//!   flo stream create <stream> [--partitions N] [--retention N] [--retention-count N]
+//!   flo stream alter <stream> [--retention N] [--retention-count N]
 //!   flo stream append <stream> <payload>... [--header <k=v,k=v,...>]
 //!   flo stream read <stream> [--start <streamid>] [--limit <n>] [--follow] [--block <ms>]
 //!   flo stream info <stream>
@@ -102,6 +102,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .arg("stream", "Stream name")
                 .uintFlag("partitions", 'p', 1, "Number of partitions")
                 .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
+                .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 = no count bound)")
                 .action(wrapHandler(runCreate)),
         )
         .subcommand(
@@ -145,9 +146,11 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo stream alter events --retention 24",
                     "flo stream alter logs --retention 168",
+                    "flo stream alter audit --retention-count 100000",
                 })
                 .arg("stream", "Stream name")
                 .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
+                .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 = no count bound)")
                 .action(wrapHandler(runAlter)),
         )
         .subcommand(
@@ -231,7 +234,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .about("Release messages back for redelivery")
                         .examples(&.{
                             "flo stream group nack events --group mygroup --ids 1703350800000-0,1703350800000-1",
-                            "flo stream group nack events --group mygroup --ids 1703350800000-0 --delay 5000",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
@@ -245,7 +247,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .about("Extend ack deadline for pending messages")
                         .examples(&.{
                             "flo stream group touch events --group mygroup --consumer worker1 --ids 1703350800000-0",
-                            "flo stream group touch events --group mygroup --consumer worker1 --ids 1703350800000-0,1703350800000-1 --extend 60000",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
@@ -644,7 +645,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
     // Convert retention hours to seconds for retention_age, or null
     const retention_age: ?u64 = if (retention) |r| r * 3600 else null;
-    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), null, retention_age) catch |err| {
+    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), ctx.getUint64("retention-count"), retention_age) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -681,7 +682,7 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var response = client_mod.stream.alter(&client, namespace, stream, null, retention_age) catch |err| {
+    var response = client_mod.stream.alter(&client, namespace, stream, ctx.getUint64("retention-count"), retention_age) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };

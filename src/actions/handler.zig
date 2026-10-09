@@ -851,24 +851,22 @@ pub const ActionsHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *ActionsHandler = @ptrCast(@alignCast(ctx));
+        const name_buf = dispatcher_mod.scanScratch(handler.actions.count());
         handler.runs_mu.lock();
         defer handler.runs_mu.unlock();
 
         const effective_ns = if (namespace.len == 0) "default" else namespace;
-        const S = struct {
-            threadlocal var name_buf: [1024][]const u8 = undefined;
-        };
 
         var count: usize = 0;
         var it = handler.actions.iterator();
         while (it.next()) |entry| {
-            if (count >= S.name_buf.len) break;
+            if (count >= name_buf.len) break;
             if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, effective_ns)) continue;
-            S.name_buf[count] = entry.value_ptr.name_owned;
+            name_buf[count] = entry.value_ptr.name_owned;
             count += 1;
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     // ── DELETE ───────────────────────────────────────────────────────────

@@ -1,12 +1,12 @@
 //! Queue commands for Flo CLI using Commander framework
 //!
 //! Usage:
-//!   flo queue enqueue <queue> <payload> [--priority <0-255>] [--delay <ms>]
-//!   flo queue dequeue <queue> [--count <n>] [--timeout <ms>]
+//!   flo queue enqueue <queue> <payload> [--priority <0-255>]
+//!   flo queue dequeue <queue> [--count <n>] [--block <ms>]
 //!   flo queue watch <queue>              - Continuously watch for messages
 //!   flo queue peek <queue> [--count <n>]
 //!   flo queue ack <queue> <seq>...
-//!   flo queue nack <queue> <seq>... [--dlq]
+//!   flo queue nack <queue> <seq>...
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -48,7 +48,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo queue enqueue myqueue 'Hello, World!'",
                     "flo queue enqueue tasks '{\"id\":1}' --priority 10",
-                    "flo queue enqueue jobs payload --delay 5000",
                 })
                 .arg("queue", "Queue name")
                 .arg("payload", "Message payload")
@@ -63,7 +62,7 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo queue dequeue myqueue",
                     "flo queue dequeue myqueue --count 10",
-                    "flo queue dequeue myqueue --timeout 5000",
+                    "flo queue dequeue myqueue --block 5000",
                 })
                 .arg("queue", "Queue name")
                 .uintFlag("count", 'c', 1, "Number of messages to dequeue")

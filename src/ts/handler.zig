@@ -108,11 +108,9 @@ pub const TSHandler = struct {
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const ts: *TSProjection = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var name_buf: [1024][]const u8 = undefined;
-        };
-        const count = ts.scanMeasurementNames(router.namespaceHash(namespace), &S.name_buf);
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        const name_buf = dispatcher_mod.scanScratch(ts.buffers.count());
+        const count = ts.scanMeasurementNames(router.namespaceHash(namespace), name_buf);
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

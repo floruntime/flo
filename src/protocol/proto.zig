@@ -232,7 +232,6 @@ pub const OptionTag = enum(u8) {
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
     limit = 0x05, // u32: Maximum number of results for scan/list operations
-    keys_only = 0x06, // u8: Skip values in scan response (0/1)
     routing_key = 0x08, // string: Explicit routing key for shard co-location (overrides key-based routing)
     txn_id = 0x09, // u64: Per-shard transaction ID (returned by kv_begin_txn)
 
@@ -772,14 +771,6 @@ pub const Request = struct {
             return opt.asU32();
         }
         return null;
-    }
-
-    /// Get keys_only option if present (convenience method)
-    pub fn getKeysOnly(self: Request) bool {
-        if (self.findOption(.keys_only)) |opt| {
-            if (opt.asU8()) |v| return v != 0;
-        }
-        return false;
     }
 
     /// Get priority option if present (convenience method)

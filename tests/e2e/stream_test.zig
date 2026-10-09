@@ -3419,3 +3419,19 @@ test "e2e/stream: a read starting inside an append returns the rest of it" {
     try testing.expect(rest.stdoutContains("\"m2\""));
     try testing.expect(rest.stdoutContains("\"m4\""));
 }
+
+test "e2e/stream: create and alter set a count retention" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "create", "ret-count", "--retention", "1", "--retention-count", "5" });
+    var created = try ctx.cli.run(&.{ "stream", "info", "ret-count", "-o", "json" });
+    defer created.deinit();
+    try testing.expect(std.mem.indexOf(u8, created.stdout, "\"retention\":{\"age_s\":3600,\"count\":5}") != null);
+
+    // An alter that names only the count keeps the age.
+    try ctx.exec(&.{ "stream", "alter", "ret-count", "--retention-count", "9" });
+    var altered = try ctx.cli.run(&.{ "stream", "info", "ret-count", "-o", "json" });
+    defer altered.deinit();
+    try testing.expect(std.mem.indexOf(u8, altered.stdout, "\"retention\":{\"age_s\":3600,\"count\":9}") != null);
+}

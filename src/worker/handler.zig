@@ -626,20 +626,18 @@ pub const WorkerHandler = struct {
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *WorkerHandler = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var name_buf: [1024][]const u8 = undefined;
-        };
+        const name_buf = dispatcher_mod.scanScratch(handler.workers.count());
 
         var count: usize = 0;
         var it = handler.workers.iterator();
         while (it.next()) |entry| {
             if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
-            if (count >= S.name_buf.len) break;
-            S.name_buf[count] = entry.value_ptr.id_owned;
+            if (count >= name_buf.len) break;
+            name_buf[count] = entry.value_ptr.id_owned;
             count += 1;
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 };
 

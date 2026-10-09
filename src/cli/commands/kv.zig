@@ -454,7 +454,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Walk all shards until no more data
     while (all_keys.items.len < limit) {
-        var result = client_mod.kv.scan(&client, namespace, prefix, cursor, @intCast(limit), true) catch |err| {
+        var result = client_mod.kv.scan(&client, namespace, prefix, cursor, @intCast(limit)) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
             return error.CommandFailed;
         };

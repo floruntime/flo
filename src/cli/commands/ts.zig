@@ -105,15 +105,12 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("list")
-                .about("List measurements or series")
+                .about("List measurements")
                 .aliases(&.{"ls"})
                 .examples(&.{
                     "flo ts list",
-                    "flo ts list cpu_usage",
-                    "flo ts list cpu --fields",
+                    "flo ts list --limit 50",
                 })
-                .optionalArg("measurement", "Measurement to inspect (omit to list all)")
-                .boolFlag("fields", 0, "Show field names for measurement")
                 .uintFlag("limit", 'l', 1000, "Maximum items to return")
                 .action(wrapHandler(runList)),
         )
@@ -732,7 +729,6 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const measurement = ctx.getPositional("measurement") orelse "";
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const limit = ctx.getUint("limit") orelse 1000;
@@ -765,7 +761,6 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         var result = client_mod.ts.list(
             &client,
             namespace,
-            measurement,
             per_page,
             if (cursor) |c| c[0..] else null,
         ) catch |err| {

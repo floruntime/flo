@@ -669,38 +669,6 @@ test "e2e/ts: list with no measurements shows none" {
     );
 }
 
-test "e2e/ts: list specific measurement shows series" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Write several series under same measurement
-    try ctx.exec(&.{ "ts", "write", "detail_cpu", "--tags", "host=web-01", "--value", "70.0" });
-    try ctx.exec(&.{ "ts", "write", "detail_cpu", "--tags", "host=web-02", "--value", "80.0" });
-
-    // List specific measurement
-    var result = try ctx.cli.run(&.{ "ts", "list", "detail_cpu" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-}
-
-test "e2e/ts: list with --fields flag" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Write multi-field data
-    try ctx.exec(&.{
-        "ts",     "write",    "fields_cpu",                     "--tags",
-        "host=a", "--fields", "user=72.5,system=7.4,idle=20.1",
-    });
-
-    // List with --fields to see field names
-    var result = try ctx.cli.run(&.{ "ts", "list", "fields_cpu", "--fields" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-}
-
 test "e2e/ts: list json format" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -757,22 +725,6 @@ test "e2e/ts: list cursor walks all shards" {
     try stdx.testing.assertContains(result, "cursor_beta");
     try stdx.testing.assertContains(result, "cursor_gamma");
     try stdx.testing.assertContains(result, "cursor_delta");
-}
-
-test "e2e/ts: list series with --limit" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Write several series under one measurement
-    try ctx.exec(&.{ "ts", "write", "limit_series", "--tags", "host=a", "--value", "1.0" });
-    try ctx.exec(&.{ "ts", "write", "limit_series", "--tags", "host=b", "--value", "2.0" });
-    try ctx.exec(&.{ "ts", "write", "limit_series", "--tags", "host=c", "--value", "3.0" });
-
-    // List series with --limit 2
-    var result = try ctx.cli.run(&.{ "ts", "list", "limit_series", "--limit", "2" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
 }
 
 // =============================================================================
