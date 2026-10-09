@@ -172,16 +172,15 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
 /// Why a route refuses its query string: a parameter not in `allowed`, one
 /// given twice, or one with no value; null when there's none. Written into
 /// `buf`. Checked first, so the route's own reads see each name at most once.
-pub fn queryRefusal(buf: []u8, query_string: ?[]const u8, allowed: []const []const u8) ?[]const u8 {
+pub fn queryRefusal(buf: []u8, query_string: ?[]const u8, comptime allowed: []const []const u8) ?[]const u8 {
     const qs = query_string orelse return null;
-    var seen = [_]bool{false} ** 16;
-    std.debug.assert(allowed.len <= seen.len);
+    var seen = [_]bool{false} ** allowed.len;
     var pairs = std.mem.splitScalar(u8, qs, '&');
     next: while (pairs.next()) |pair| {
         if (pair.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, pair, '=');
         const k = if (eq) |e| pair[0..e] else pair;
-        for (allowed, 0..) |a, i| if (std.mem.eql(u8, k, a)) {
+        inline for (allowed, 0..) |a, i| if (std.mem.eql(u8, k, a)) {
             if (eq == null or eq.? + 1 == pair.len) return std.fmt.bufPrint(buf, "'{s}' needs a value", .{k}) catch "a parameter needs a value";
             if (seen[i]) return std.fmt.bufPrint(buf, "'{s}' is given more than once", .{k}) catch "a parameter is given more than once";
             seen[i] = true;
