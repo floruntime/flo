@@ -61,7 +61,7 @@ pub const HandlerFn = *const fn (shard: *anyopaque, conn: *anyopaque, req: proto
 pub const PreRouteFn = *const fn (req: proto.Request) ?u64;
 
 /// Error callback — invoked when no handler is registered for an opcode.
-pub const ErrorFn = *const fn (conn: *anyopaque, request_id: u64, op_code: u16) void;
+pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: u64, op_code: u16) void;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Dispatcher
@@ -219,13 +219,13 @@ pub const Dispatcher = struct {
     pub fn dispatch(self: *const Dispatcher, shard: *anyopaque, conn: *anyopaque, req: proto.Request) void {
         const idx = req.header.op_code;
         if (idx >= proto.MAX_OPCODES) {
-            if (self.on_error) |err_fn| err_fn(conn, req.header.request_id, idx);
+            if (self.on_error) |err_fn| err_fn(shard, conn, req.header.request_id, idx);
             return;
         }
         if (self.handlers[idx]) |handler| {
             handler(shard, conn, req);
         } else if (self.on_error) |err_fn| {
-            err_fn(conn, req.header.request_id, idx);
+            err_fn(shard, conn, req.header.request_id, idx);
         }
     }
 
@@ -276,7 +276,7 @@ fn mockHandler2(shard: *anyopaque, _: *anyopaque, req: proto.Request) void {
     ctx.last_opcode = req.header.op_code;
 }
 
-fn mockErrorHandler(conn: *anyopaque, _: u64, op_code: u16) void {
+fn mockErrorHandler(_: *anyopaque, conn: *anyopaque, _: u64, op_code: u16) void {
     const ctx: *TestContext = @ptrCast(@alignCast(conn));
     ctx.error_count += 1;
     ctx.last_error_opcode = op_code;
@@ -325,6 +325,17 @@ test "Dispatcher: unrecognized opcode calls error handler" {
     try std.testing.expectEqual(@as(u32, 0), ctx.dispatch_count);
     try std.testing.expectEqual(@as(u32, 1), ctx.error_count);
     try std.testing.expectEqual(@intFromEnum(proto.OpCode.kv_get), ctx.last_error_opcode);
+}
+
+test "Dispatcher: an opcode past the table calls the error handler" {
+    var d = Dispatcher.init();
+    d.setErrorHandler(mockErrorHandler);
+    var ctx = TestContext{};
+    var req = makeRequest(.kv_get);
+    req.header.op_code = 0xFFFF;
+    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), req);
+    try std.testing.expectEqual(@as(u32, 1), ctx.error_count);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), ctx.last_error_opcode);
 }
 
 test "Dispatcher: unrecognized opcode without error handler is silent" {

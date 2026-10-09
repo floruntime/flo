@@ -277,7 +277,7 @@ pub const Connection = struct {
     proxy_for: ?ReplyTo = null,
 
     /// Set by handlers that intentionally defer the response (e.g. blocking GET).
-    /// processRequests checks this to suppress the default "not implemented" error.
+    /// The dispatcher checks this before treating no answer as a handler bug.
     response_deferred: bool,
 
     /// `queueWrite` refused an answer: a client connection is closed at its

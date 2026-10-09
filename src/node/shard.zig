@@ -724,6 +724,7 @@ pub const Shard = struct {
 
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
+        dispatcher.setErrorHandler(answerUnknownOp);
         KVHandler.register(&dispatcher);
         StreamHandler.register(&dispatcher);
         QueueHandler.register(&dispatcher);
@@ -1780,9 +1781,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            // Handler produced nothing — report not_implemented like the
-            // owner-side processRequests would.
-            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
+            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, self.noAnswer(req), &err_buf) catch return;
             self.deliverDeferred(reply_to, serialized);
         }
     }
@@ -2176,7 +2175,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(reply_to, request_id, .internal_error, "no response");
+            self.deliverDeferredResponse(reply_to, request_id, .internal_error, self.noAnswer(req));
         }
     }
 
@@ -2241,7 +2240,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
+            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, self.noAnswer(req), &err_buf) catch return;
             self.sendForwardReply(frame.source_node, id, serialized);
         }
     }
@@ -3416,7 +3415,7 @@ pub const Shard = struct {
                 if (answered_deferred) {
                     self.answeredAsDeferred(req);
                 } else {
-                    self.sendErrorResponse(conn, req.header.request_id, .internal_error, "not implemented");
+                    self.sendErrorResponse(conn, req.header.request_id, .internal_error, self.noAnswer(req));
                 }
             }
             // Each request says for itself whether it parked.
@@ -3919,6 +3918,26 @@ pub const Shard = struct {
         const serialized = proto.Response.serializeNew(.ok, request_id, data, &buf) catch
             proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
         _ = conn.queueWrite(serialized);
+    }
+
+    /// A request whose handler neither answered nor parked it: a handler
+    /// bug, answered internal_error so the client isn't left waiting.
+    /// Returns the answer's text.
+    fn noAnswer(self: *Shard, req: proto.Request) []const u8 {
+        const name = if (std.enums.tagName(proto.OpCode, @enumFromInt(req.header.op_code))) |n| n else "?";
+        log.err("shard {d}: request {d} ({s}) got no answer from its handler. This is a bug", .{ self.id, req.header.request_id, name });
+        if (self.shard_metrics) |sm| sm.recordHandlerNoAnswer();
+        if (builtin.mode == .Debug) @panic("a handler produced no answer");
+        return "internal error: the handler produced no answer";
+    }
+
+    /// An op no handler serves: refused, the same way wherever it runs.
+    fn answerUnknownOp(shard_ptr: *anyopaque, conn_ptr: *anyopaque, request_id: u64, op: u16) void {
+        const self: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        var buf: [32]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "unknown op 0x{x}", .{op}) catch unreachable;
+        self.sendErrorResponse(conn, request_id, .bad_request, message);
     }
 
     // ─── Built-in handlers ───────────────────────────────────────────────
