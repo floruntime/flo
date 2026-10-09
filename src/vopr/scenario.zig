@@ -94,8 +94,10 @@ pub const Scenario = struct {
     crash_permille: u16,
     /// Per-tick per-crashed-node restart chance (per-mille).
     restart_permille: u16,
-    /// Per-mille of crashes that also lose the disk: log and hard state.
-    /// The node restarts with no log, as a lost-log node.
+    /// Per-mille of crashes that also lose data: half the whole disk (the
+    /// node restarts with no log), half only the hard state (it keeps its
+    /// log). Guarded on restart either way; the simulator's
+    /// `max_lost_nodes` (one by default) caps how many are lost at once.
     wipe_permille: u16,
 
     // ── Workload ───────────────────────────────────────────────────────

@@ -1,10 +1,11 @@
 //! Raft hard state — what a node must not forget across a crash.
 //!
 //! `HARDSTATE` in each shard directory holds the node's identity, its current
-//! term and the vote it cast in that term. It is rewritten (tmp → fsync →
-//! rename → directory fsync) before the node grants a vote, and whenever it
-//! adopts a term, so a restarted node can neither vote twice in one term nor
-//! re-enter a term it already left.
+//! term, the vote it cast in that term, and whether its lost-log guard is on.
+//! It is rewritten (tmp → fsync → rename → directory fsync) before the node
+//! grants a vote, whenever it adopts a term, and when the guard starts or
+//! ends, so a restarted node can neither vote twice in one term, re-enter a
+//! term it already left, nor drop a guard it has not finished.
 //! Terms change per election, not per write, so the fsync never sits on the
 //! write path.
 //!

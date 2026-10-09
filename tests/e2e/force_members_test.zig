@@ -54,7 +54,8 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     defer forced.deinit();
     try testing.expect(forced.stdoutContains("is now the only voter"));
 
-    // The old secret is refused, by name, at this and every later start.
+    // The old secret is refused, by name, at the next start (and every
+    // later one: the record is on disk).
     node.dump_log_on_failure = false;
     try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
     try testing.expect(try node.logsContain("retired by force-members"));

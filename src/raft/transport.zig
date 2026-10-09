@@ -26,8 +26,8 @@ const VoteRequest = node_mod.VoteRequest;
 const VoteResponse = node_mod.VoteResponse;
 const AppendRequest = node_mod.AppendRequest;
 const AppendResponse = node_mod.AppendResponse;
-const TermPollRequest = node_mod.TermPollRequest;
-const TermPollResponse = node_mod.TermPollResponse;
+const TermCheckRequest = node_mod.TermCheckRequest;
+const TermCheckResponse = node_mod.TermCheckResponse;
 const Entry = entry_mod.Entry;
 const ENTRY_HEADER_SIZE = entry_mod.HEADER_SIZE;
 
@@ -67,10 +67,10 @@ pub const MsgType = enum(u8) {
     hello_back = 11,
     verify = 12,
     welcome = 13,
-    /// A lost-log node asking a member for its term and latest config,
-    /// and the answer.
-    term_poll = 14,
-    term_poll_response = 15,
+    /// A guarded node asking a member for its term and latest config, and
+    /// the answer.
+    term_check = 14,
+    term_check_response = 15,
 };
 
 /// Write one frame (header, checksum, payload) into `buf`; returns the
@@ -238,10 +238,10 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — AppendResponse (29 bytes)
+// Serialization — AppendResponse (30 bytes; the last is the guarded flag)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 29;
+pub const APPEND_RESP_SIZE: usize = 30;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -256,6 +256,8 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 4;
     std.mem.writeInt(u64, buf[off..][0..8], resp.hint_index, .little);
     off += 8;
+    buf[off] = @intFromBool(resp.guarded);
+    off += 1;
     return off;
 }
 
@@ -271,75 +273,80 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
     const from = std.mem.readInt(u32, data[off..][0..4], .little);
     off += 4;
     const hint_index = std.mem.readInt(u64, data[off..][0..8], .little);
+    off += 8;
     return .{
         .term = term,
         .success = success,
         .match_index = match_idx,
         .from = from,
         .hint_index = hint_index,
+        .guarded = data[off] & 1 != 0,
     };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — TermPollRequest (12 bytes), TermPollResponse (33 + 4n bytes)
+// Serialization — TermCheckRequest (12 bytes), TermCheckResponse (30 + 4n bytes)
+//   Response: term u64, from u32, config_index u64, config_term u64,
+//             flags u8 (bit 0: guarded), member_count u8, members u32 × n
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const TERM_POLL_SIZE: usize = 12;
-pub const TERM_POLL_RESP_MAX: usize = 33 + 4 * node_mod.MAX_PEERS + 4;
+pub const TERM_CHECK_SIZE: usize = 12;
+pub const TERM_CHECK_RESP_MAX: usize = 30 + 4 * (node_mod.MAX_PEERS + 1);
 
-pub fn serializeTermPoll(req: TermPollRequest, buf: []u8) ?usize {
-    if (buf.len < TERM_POLL_SIZE) return null;
+pub fn serializeTermCheck(req: TermCheckRequest, buf: []u8) ?usize {
+    if (buf.len < TERM_CHECK_SIZE) return null;
     std.mem.writeInt(u64, buf[0..8], req.term, .little);
     std.mem.writeInt(u32, buf[8..12], req.from, .little);
-    return TERM_POLL_SIZE;
+    return TERM_CHECK_SIZE;
 }
 
-pub fn deserializeTermPoll(data: []const u8) ?TermPollRequest {
-    if (data.len < TERM_POLL_SIZE) return null;
+pub fn deserializeTermCheck(data: []const u8) ?TermCheckRequest {
+    if (data.len < TERM_CHECK_SIZE) return null;
     return .{
         .term = std.mem.readInt(u64, data[0..8], .little),
         .from = std.mem.readInt(u32, data[8..12], .little),
     };
 }
 
-pub fn serializeTermPollResponse(resp: TermPollResponse, buf: []u8) ?usize {
+pub fn serializeTermCheckResponse(resp: TermCheckResponse, buf: []u8) ?usize {
     const n: usize = @min(resp.member_count, resp.members.len);
-    const size = 33 + 4 * n;
+    const size = 30 + 4 * n;
     if (buf.len < size) return null;
     std.mem.writeInt(u64, buf[0..8], resp.term, .little);
     std.mem.writeInt(u32, buf[8..12], resp.from, .little);
     std.mem.writeInt(u64, buf[12..20], resp.config_index, .little);
     std.mem.writeInt(u64, buf[20..28], resp.config_term, .little);
-    std.mem.writeInt(u32, buf[28..32], 0, .little);
-    buf[32] = @intCast(n);
-    for (resp.members[0..n], 0..) |id, i| std.mem.writeInt(u32, buf[33 + 4 * i ..][0..4], id, .little);
+    buf[28] = @intFromBool(resp.guarded);
+    buf[29] = @intCast(n);
+    for (resp.members[0..n], 0..) |id, i| std.mem.writeInt(u32, buf[30 + 4 * i ..][0..4], id, .little);
     return size;
 }
 
-pub fn deserializeTermPollResponse(data: []const u8) ?TermPollResponse {
-    if (data.len < 33) return null;
-    const n = data[32];
-    if (n > node_mod.MAX_PEERS + 1 or data.len < 33 + 4 * @as(usize, n)) return null;
-    var resp: TermPollResponse = .{
+pub fn deserializeTermCheckResponse(data: []const u8) ?TermCheckResponse {
+    if (data.len < 30) return null;
+    const n = data[29];
+    if (n > node_mod.MAX_PEERS + 1 or data.len < 30 + 4 * @as(usize, n)) return null;
+    var resp: TermCheckResponse = .{
         .term = std.mem.readInt(u64, data[0..8], .little),
         .from = std.mem.readInt(u32, data[8..12], .little),
         .config_index = std.mem.readInt(u64, data[12..20], .little),
         .config_term = std.mem.readInt(u64, data[20..28], .little),
+        .guarded = data[28] & 1 != 0,
         .member_count = n,
         .members = undefined,
     };
-    for (0..n) |i| resp.members[i] = std.mem.readInt(u32, data[33 + 4 * i ..][0..4], .little);
+    for (0..n) |i| resp.members[i] = std.mem.readInt(u32, data[30 + 4 * i ..][0..4], .little);
     return resp;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization — AppendRequest (variable size)
-//   Fixed prefix: 48 bytes (term, leader_id, prev_log_index, prev_log_term,
-//                           leader_commit, leader_last_index, entry_count)
+//   Fixed prefix: 40 bytes (term, leader_id, prev_log_index, prev_log_term,
+//                           leader_commit, entry_count)
 //   Then N entries, each: 40-byte header + payload_len payload bytes.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_REQ_PREFIX: usize = 48;
+pub const APPEND_REQ_PREFIX: usize = 40;
 
 /// Compute the serialized size for an AppendRequest.
 pub fn appendRequestSize(req: AppendRequest) usize {
@@ -365,8 +372,6 @@ pub fn serializeAppendRequest(req: AppendRequest, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u64, buf[off..][0..8], req.leader_commit, .little);
     off += 8;
-    std.mem.writeInt(u64, buf[off..][0..8], req.leader_last_index, .little);
-    off += 8;
     std.mem.writeInt(u32, buf[off..][0..4], @intCast(req.entries.len), .little);
     off += 4;
 
@@ -387,7 +392,6 @@ pub const AppendRequestHeader = struct {
     prev_log_index: u64,
     prev_log_term: u64,
     leader_commit: u64,
-    leader_last_index: u64,
     entry_count: u32,
     entries_data: []const u8,
 };
@@ -406,8 +410,6 @@ pub fn deserializeAppendRequestHeader(data: []const u8) ?AppendRequestHeader {
     off += 8;
     const leader_commit = std.mem.readInt(u64, data[off..][0..8], .little);
     off += 8;
-    const leader_last_index = std.mem.readInt(u64, data[off..][0..8], .little);
-    off += 8;
     const entry_count = std.mem.readInt(u32, data[off..][0..4], .little);
     off += 4;
 
@@ -417,7 +419,6 @@ pub fn deserializeAppendRequestHeader(data: []const u8) ?AppendRequestHeader {
         .prev_log_index = prev_idx,
         .prev_log_term = prev_term,
         .leader_commit = leader_commit,
-        .leader_last_index = leader_last_index,
         .entry_count = entry_count,
         .entries_data = data[off..],
     };
@@ -832,4 +833,28 @@ test "transport: a batch stops at an entry of unknown type or with a bad CRC" {
         var out: [8]Entry = undefined;
         try testing.expectEqual(@as(usize, 1), parseEntries(header.entries_data, header.entry_count, &out));
     }
+}
+
+test "transport: a term check answer and an append ack carry the guarded flag" {
+    var buf: [TERM_CHECK_RESP_MAX]u8 = undefined;
+    var resp: TermCheckResponse = .{ .term = 9, .from = 3, .guarded = true, .config_index = 12, .config_term = 4, .member_count = 3, .members = undefined };
+    resp.members[0] = 1;
+    resp.members[1] = 2;
+    resp.members[2] = 3;
+    const n = serializeTermCheckResponse(resp, &buf).?;
+    try testing.expectEqual(@as(usize, 30 + 12), n);
+    const back = deserializeTermCheckResponse(buf[0..n]).?;
+    try testing.expectEqual(@as(u64, 9), back.term);
+    try testing.expect(back.guarded);
+    try testing.expectEqual(@as(u64, 12), back.config_index);
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, back.members[0..back.member_count]);
+    // A member count past the group's cap is refused.
+    buf[29] = node_mod.MAX_PEERS + 2;
+    try testing.expect(deserializeTermCheckResponse(buf[0..n]) == null);
+
+    var abuf: [APPEND_RESP_SIZE]u8 = undefined;
+    _ = serializeAppendResponse(.{ .term = 2, .success = true, .match_index = 5, .from = 3, .guarded = true }, &abuf).?;
+    try testing.expect(deserializeAppendResponse(&abuf).?.guarded);
+    _ = serializeAppendResponse(.{ .term = 2, .success = true, .match_index = 5, .from = 3 }, &abuf).?;
+    try testing.expect(!deserializeAppendResponse(&abuf).?.guarded);
 }

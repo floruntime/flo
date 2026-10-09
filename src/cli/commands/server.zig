@@ -120,10 +120,10 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .longAbout(
                     \\Read the cluster group's log and hard state from a stopped node's
                     \\data directory: last index and term, what is committed, the latest
-                    \\member list, and whether the node is still rejoining after losing
-                    \\its log. Writes nothing. When a majority has lost its data, run it
-                    \\on each survivor and pick the one with the longest log for
-                    \\force-members.
+                    \\member list, and whether its lost-log guard is still on. Writes
+                    \\nothing. When a majority has lost its data, run it on each survivor
+                    \\and pick the most up-to-date log for force-members: the highest last
+                    \\term, then the highest last index.
                 )
                 .examples(&.{
                     "flo server inspect --data-dir /var/lib/flo",
@@ -138,12 +138,13 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .about("Make a stopped node the cluster's only voter")
                 .longAbout(
                     \\For when a majority of the cluster has lost its data and no leader
-                    \\can be elected. Run on the stopped survivor with the longest log
-                    \\(see inspect). It writes a member list naming only this node and
-                    \\retires this node's cluster secret, so the nodes left out are refused
-                    \\at the handshake. Then restart this node with a new secret
-                    \\(flo server secret), and reset the other nodes' data before they
-                    \\rejoin with --join and that secret.
+                    \\can be elected. Run on the stopped survivor with the most up-to-date
+                    \\log (see inspect: the highest last term, then the highest last
+                    \\index). It writes a member list naming only this node and retires
+                    \\this node's cluster secret, so the server refuses to start with it.
+                    \\Then restart this node with a new secret (flo server secret): the new
+                    \\secret is what keeps the nodes left out from linking. Reset the
+                    \\other nodes' data before they rejoin with --join and that secret.
                     \\
                     \\Without --yes it prints what it would change and stops.
                 )
@@ -624,9 +625,9 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
     };
     ctx.print("data dir:    {s} (cluster group)\n", .{data_dir});
     if (sum.hard_state) |hs| {
-        ctx.print("hard state:  node {d}, term {d}, voted for {d}{s}\n", .{ hs.node_id, hs.term, hs.voted_for, if (hs.lost_log) "; rejoining after a lost log, not yet voting" else "" });
+        ctx.print("hard state:  node {d}, term {d}, voted for {d}{s}\n", .{ hs.node_id, hs.term, hs.voted_for, if (hs.lost_log) "; lost-log guard on, not voting yet" else "" });
     } else {
-        ctx.print("hard state:  none (this node never adopted a term)\n", .{});
+        ctx.print("hard state:  none (never written, or lost)\n", .{});
     }
     if (sum.last_index == 0) {
         ctx.print("log:         empty\n", .{});
@@ -675,7 +676,7 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
     const hs = sum.hard_state orelse {
-        ctx.printErr("Error: this node has a log but no hard state; it is not a node force-members can recover from\n", .{});
+        ctx.printErr("Error: this node has a log but no hard state, so its node id is not on disk and force-members cannot name it. Start it once with --join and --node-id set to its id from the member list above (it writes its hard state and waits guarded), stop it, then run force-members again\n", .{});
         return error.CommandFailed;
     };
     if (sum.truncation_pending) {
@@ -683,6 +684,7 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
     if (!ctx.getBool("yes")) {
+        if (hs.lost_log) ctx.print("\nWarning: this node's lost-log guard never finished; its log may be behind what the group committed. Prefer a survivor whose guard is off.\n", .{});
         ctx.print("\nWould make node {d} the only voter (a member list at index {d}, everything through it committed) and retire this node's cluster secret. Run again with --yes to do it.\n", .{ hs.node_id, sum.last_index + 1 });
         return;
     }
@@ -693,11 +695,11 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
     offline.forceMembers(ctx.allocator, data_dir, &sum) catch |err| {
-        ctx.printErr("Error: cannot write the member list: {}\n", .{err});
+        ctx.printErr("Error: cannot write the member list: {}. This node's secret is already retired and its members are unchanged, which fails safe: fix the cause and run force-members again\n", .{err});
         return error.CommandFailed;
     };
     ctx.print("\nNode {d} is now the only voter (member list at index {d}).\n", .{ hs.node_id, sum.last_index + 1 });
-    ctx.print("Restart it with a new [cluster] secret (flo server secret); nodes left out are refused at the handshake.\n", .{});
+    ctx.print("Restart it with a new [cluster] secret (flo server secret); with it the nodes left out cannot link.\n", .{});
     ctx.print("Reset the other nodes' data before they rejoin with --join and the new secret.\n", .{});
 }
 

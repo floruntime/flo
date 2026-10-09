@@ -58,6 +58,10 @@ pub const PeerState = struct {
     /// anything from us: the leader loop's resend and heartbeat clocks.
     sent_at_ms: u64 = 0,
     heartbeat_at_ms: u64 = 0,
+    /// The peer's last response said it is guarded (`LostLog`): its acks
+    /// keep this leader in office but count toward no commit, since what
+    /// it acks it may hold for a leader the group has already replaced.
+    guarded: bool = false,
 };
 
 /// Configuration for RaftNode behavior.
@@ -103,41 +107,47 @@ pub const Config = struct {
     }
 };
 
-/// Where the node writes its hard state. `persist` returns only once the
-/// state is durable and reports its own failures. A false return means the
-/// state is not durable: a vote is then not
-/// granted, an election is not started and bootstrap fails; an adopted
-/// higher term is kept in memory anyway and counted in `persist_failures`.
+/// Where the node writes its hard state: term, vote and whether the
+/// lost-log guard is on. `persist` returns only once the state is durable
+/// and reports its own failures. A false return means the state is not
+/// durable: a vote is then not granted, an election is not started,
+/// bootstrap fails and a guard neither starts nor ends; an adopted higher
+/// term is kept in memory anyway and counted in `persist_failures`.
 pub const HardStateSink = struct {
     ctx: *anyopaque,
     persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool,
 };
 
-/// Where a node that has no log, or lost it, stands. Before it lost its
-/// disk it may have voted in a term, or held entries a quorum counted, so
-/// until it has both caught up with a leader and had a quorum confirm the
-/// term it grants no vote and never campaigns; after, it votes only in
-/// later terms. Persisted with the hard state until it is `none`.
+/// Where a node that lost its log or its hard state stands (a new node
+/// with no log looks the same). Before it lost them it may have voted in a
+/// term, or acked entries a quorum counted, so until it has caught up with
+/// a leader and the term is confirmed it grants no vote, never campaigns,
+/// and leaders count none of its acks; after, it votes only in later
+/// terms. Persisted with the hard state until it is `none`.
 pub const LostLog = enum {
     none,
-    /// Following a leader until this log reaches the leader's last index
-    /// and the leader has committed an entry of its own term.
+    /// Following a leader until this log holds everything the leader had
+    /// committed when it sent a batch.
     catching_up,
-    /// Asking the members of the latest config it knows for their terms.
+    /// Asking members for their terms: of the latest committed config and
+    /// every config after it.
     confirming,
 };
 
-/// A lost-log node asking a member for its term and its latest config.
-pub const TermPollRequest = struct {
+/// A guarded node asking a member for its term and its latest config.
+pub const TermCheckRequest = struct {
     term: u64,
     from: NodeId,
 };
 
-pub const TermPollResponse = struct {
+pub const TermCheckResponse = struct {
     term: u64,
     from: NodeId,
-    /// The responder's latest config: what the poller polls instead when
-    /// it is newer than its own.
+    /// The responder is guarded itself: its term is no evidence of the
+    /// votes this node cast, and its answer does not count.
+    guarded: bool = false,
+    /// The responder's latest config: when newer than any the asker knows,
+    /// its members are checked too.
     config_index: u64,
     config_term: u64,
     member_count: u8,
@@ -149,9 +159,9 @@ pub const TickResult = struct {
     /// Actions the caller must take after the tick.
     send_heartbeats: bool = false,
     start_election: bool = false,
-    /// A lost-log node is confirming the term: send `termPollRequest` to
-    /// every node in `termPollTargets`.
-    send_term_poll: bool = false,
+    /// A guarded node is confirming the term: send `termCheckRequest` to
+    /// every node in `termCheckTargets`.
+    send_term_check: bool = false,
     /// The leader has not heard from a majority within an election timeout
     /// and stepped down; the caller resolves what it was holding for commit.
     step_down: bool = false,
@@ -193,9 +203,6 @@ pub const AppendRequest = struct {
     prev_log_term: u64,
     entries: []const Entry,
     leader_commit: u64,
-    /// The leader's last index when it sent this, so a lost-log follower
-    /// knows when it has caught up. Unset, it never has.
-    leader_last_index: u64 = std.math.maxInt(u64),
 };
 
 /// AppendEntries response.
@@ -209,6 +216,9 @@ pub const AppendResponse = struct {
     /// the conflicting term. The leader jumps there instead of walking
     /// back one index per round trip.
     hint_index: u64 = 0,
+    /// The responder is guarded (`LostLog`): the leader counts none of its
+    /// acks toward commit.
+    guarded: bool = false,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -227,15 +237,26 @@ fn entropySeed() u64 {
     return std.mem.readInt(u64, &buf, .little);
 }
 
-/// The confirmation poll of a lost-log node: the members of the newest
-/// config it has heard of, and which of them have answered.
-const TermPoll = struct {
-    members: [MAX_PEERS + 1]NodeId = undefined,
-    member_count: u8 = 0,
-    config_index: u64 = 0,
-    config_term: u64 = 0,
-    answered: [MAX_PEERS + 1]bool = @splat(false),
-    answers: u8 = 0,
+const MemberSet = struct {
+    ids: [MAX_PEERS + 1]NodeId = undefined,
+    count: u8 = 0,
+
+    fn slice(self: *const MemberSet) []const NodeId {
+        return self.ids[0..self.count];
+    }
+};
+
+/// A guarded node's term check: the configs whose members must answer, and
+/// who has.
+const TermCheck = struct {
+    /// The latest committed config, the node's own latest, and newer ones
+    /// members reported.
+    sets: [4]MemberSet = @splat(.{}),
+    set_count: u8 = 0,
+    newest_index: u64 = 0,
+    newest_term: u64 = 0,
+    answered: [16]NodeId = undefined,
+    answered_count: u8 = 0,
     sent_ms: u64 = 0,
 };
 
@@ -311,11 +332,14 @@ pub const RaftNode = struct {
 
     // ── Lost-log guard ─────────────────────────────────────────────────
     lost_log: LostLog = .none,
-    poll: TermPoll = .{},
-    /// A lost-log node counts no poll answer until one maximum election
-    /// timeout after it booted: a candidacy it voted for before it lost its
-    /// disk has by then either won, so the poll sees its term, or given up.
-    /// Armed at the first tick, the first clock the node has.
+    check: TermCheck = .{},
+    /// A guarded node neither sends a term check nor counts an answer until
+    /// one maximum election timeout, plus an RPC timeout of slack, after it
+    /// booted. That rests on candidates stopping counting votes at their
+    /// election deadline, at most one maximum timeout after they stood
+    /// (`handleVoteResponse`): a candidacy it voted for before it lost its
+    /// vote has by then either won, so the check sees its term, or given
+    /// up. Armed at the first tick, the first clock the node has.
     hold_pending: bool = false,
     hold_until_ms: u64 = 0,
 
@@ -555,11 +579,17 @@ pub const RaftNode = struct {
                 if (self.lost_log != .none) {
                     if (self.hold_pending) {
                         self.hold_pending = false;
-                        self.hold_until_ms = now_ms + self.config.election_timeout_max_ms;
+                        self.hold_until_ms = now_ms + self.config.election_timeout_max_ms + self.config.rpcTimeoutMs();
                     }
-                    if (self.lost_log == .confirming and !self.holding() and now_ms -| self.poll.sent_ms >= self.config.heartbeat_interval_ms) {
-                        self.poll.sent_ms = now_ms;
-                        result.send_term_poll = true;
+                    if (self.lost_log == .confirming and !self.holding()) {
+                        // A confirmation whose hard state could not be
+                        // written is retried here.
+                        if (self.checkSatisfied()) {
+                            _ = self.confirmTerm();
+                        } else if (now_ms -| self.check.sent_ms >= self.config.heartbeat_interval_ms) {
+                            self.check.sent_ms = now_ms;
+                            result.send_term_check = true;
+                        }
                     }
                     return result;
                 }
@@ -597,6 +627,13 @@ pub const RaftNode = struct {
         const n = self.peer_count + 1;
         std.mem.sort(u64, contacts[0..n], {}, std.sort.desc(u64));
         return contacts[self.quorum() - 1];
+    }
+
+    /// The owner's clock, before it hands over messages: a decision that
+    /// depends on time (a candidacy's deadline) is not made on the last
+    /// tick's clock after a stall.
+    pub fn observeTime(self: *RaftNode, now_ms: u64) void {
+        self.current_time_ms = @max(self.current_time_ms, now_ms);
     }
 
     /// Re-arm from the last tick's clock — for events that carry no time.
@@ -688,9 +725,12 @@ pub const RaftNode = struct {
             log.warn("Raft: vote request for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
         }
-        // What this node voted for before it lost its log is gone; it
-        // answers no poll and grants no vote until the guard completes.
+        // What this node voted for before it lost its log or hard state is
+        // gone: it grants no vote, real or pre-vote, until the guard
+        // completes. A real request's higher term is still adopted, so a
+        // stale leader that reaches it is refused sooner.
         if (self.lost_log != .none) {
+            if (!req.is_pre_vote and req.term > self.current_term) self.stepDown(req.term);
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
         }
         // A leader spoke to us within an election timeout: whoever is
@@ -776,6 +816,11 @@ pub const RaftNode = struct {
         // mix of the two.
         if (self.role != .candidate or self.pollOpen()) return .none;
         if (resp.term != self.current_term) return .none;
+        // Past its election deadline a candidacy has given up, even before
+        // the tick that stands again: a lost-log node's boot wait counts on
+        // no candidate winning later than one maximum timeout after it
+        // stood.
+        if (self.election_deadline_ms != 0 and self.current_time_ms >= self.election_deadline_ms) return .none;
         if (resp.vote_granted) {
             // Count each peer at most once; grants from unknown nodes (or a
             // duplicated response for self) never count toward quorum.
@@ -794,8 +839,16 @@ pub const RaftNode = struct {
 
     // ── AppendEntries ───────────────────────────────────────────────────
 
-    /// Handle an incoming AppendEntries RPC.
+    /// Handle an incoming AppendEntries RPC. A guarded node takes and acks
+    /// the batch like any follower (catching up needs it, and the contact
+    /// keeps the leader in office) but says it is guarded.
     pub fn handleAppendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
+        var resp = try self.appendEntries(req);
+        resp.guarded = self.lost_log != .none;
+        return resp;
+    }
+
+    fn appendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
         if (!self.termPlausible(req.term)) {
             log.warn("Raft: AppendEntries for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
             return .{ .term = self.current_term, .success = false, .match_index = self.log.lastIndex(), .from = self.id };
@@ -888,13 +941,12 @@ pub const RaftNode = struct {
         const last_new = req.prev_log_index + req.entries.len;
         self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
 
-        // Caught up: everything the leader had when it sent this, and the
-        // leader has committed an entry of its own term, so no earlier
-        // leader's suffix is still pending.
-        if (self.lost_log == .catching_up and last_new >= req.leader_last_index and
-            self.commit_index > 0 and self.log.entryTerm(self.commit_index) == self.current_term)
-        {
-            self.startTermPoll();
+        // Caught up: this node holds everything the leader had committed
+        // when it sent this batch, so it refuses any candidate missing a
+        // committed entry. Commit, not the leader's last index, so a
+        // joiner under steady writes still gets there.
+        if (self.lost_log == .catching_up and last_new >= req.leader_commit) {
+            self.startTermCheck();
         }
 
         // Only the prefix this RPC verified counts as matched. lastIndex()
@@ -927,6 +979,7 @@ pub const RaftNode = struct {
             if (self.peer_ids[i] == resp.from) {
                 self.peers[i].inflight = false;
                 self.peers[i].last_contact_ms = self.current_time_ms;
+                self.peers[i].guarded = resp.guarded;
                 if (resp.success) {
                     // A late or duplicated ack may report less than we already
                     // know matched; a response can also outlive the log it
@@ -991,7 +1044,8 @@ pub const RaftNode = struct {
 
     // ── Lost-log guard ──────────────────────────────────────────────────
 
-    /// This node has no log: guard it, durably, before it answers anyone.
+    /// This node has no log, or a log with no config and no hard state:
+    /// guard it, durably, before it answers anyone.
     pub fn enterLostLog(self: *RaftNode) !void {
         self.lost_log = .catching_up;
         self.hold_pending = true;
@@ -1005,93 +1059,127 @@ pub const RaftNode = struct {
         self.hold_pending = true;
     }
 
-    /// Within the boot wait: no poll answer counts yet.
+    /// Within the boot wait: no term check is sent and no answer counts.
     fn holding(self: *const RaftNode) bool {
         return self.hold_pending or self.current_time_ms < self.hold_until_ms;
     }
 
     /// This node kept its log but lost its hard state: the log is real, so
     /// there is nothing to catch up, but the vote it cast in the current
-    /// term is gone. It confirms the term before it votes again.
+    /// term is gone. It confirms the term, after the boot wait, before it
+    /// votes again.
     pub fn enterLostVote(self: *RaftNode) !void {
         self.hold_pending = true;
-        self.startTermPoll();
+        self.startTermCheck();
         if (!self.persistHardState()) return error.HardStateNotDurable;
     }
 
-    /// Caught up: poll the members of the latest config this log holds.
-    fn startTermPoll(self: *RaftNode) void {
-        var ids: [MAX_PEERS + 1]NodeId = undefined;
-        // The node's own seat counts in the quorum's size, not as an answer.
-        const members = self.memberIds(&ids);
+    /// Check the term against the latest committed config and every config
+    /// after it the log holds; members report any newer one.
+    fn startTermCheck(self: *RaftNode) void {
         self.lost_log = .confirming;
-        self.poll = .{ .config_index = self.membership_index, .config_term = self.membership_term };
-        self.setPollMembers(members);
-        log.info("Raft: lost-log node {d} at index {d} (term {d}); confirming the term with members {any}", .{ self.id, self.log.lastIndex(), self.current_term, members });
-        // A group of one has no other vote to have counted.
-        if (std.mem.indexOfNone(NodeId, members, &.{self.id}) == null) _ = self.confirmTerm();
+        self.check = .{ .newest_index = self.membership_index, .newest_term = self.membership_term };
+        if (self.committed_member_count > 0) self.addCheckSet(self.committed_member_ids[0..self.committed_member_count]);
+        var ids: [MAX_PEERS + 1]NodeId = undefined;
+        self.addCheckSet(self.memberIds(&ids));
+        log.info("Raft: guarded node {d} at index {d} (term {d}); confirming the term with {d} member set(s)", .{ self.id, self.log.lastIndex(), self.current_term, self.check.set_count });
+        // No other member in any set: no other vote could have counted.
+        if (self.checkSatisfied()) _ = self.confirmTerm();
     }
 
-    /// Answers that must meet every quorum a vote of this node could have
-    /// counted in, at a member other than this node: a quorum holds at
-    /// least ⌊n/2⌋ others, so n − ⌊n/2⌋ of the n − 1 others always overlap
-    /// it. Not named, its vote counted in no quorum of this set, and a
-    /// plain majority answers.
-    fn pollAnswersNeeded(self: *const RaftNode) u8 {
-        const members = self.poll.members[0..self.poll.member_count];
-        const n = self.poll.member_count;
-        return if (std.mem.indexOfScalar(NodeId, members, self.id) != null) n - n / 2 else n / 2 + 1;
-    }
-
-    /// The term is confirmed. A vote recorded for itself in this term means
-    /// it grants none in it, here or after a restart. False when that
-    /// cannot be made durable; the poll goes on.
-    fn confirmTerm(self: *RaftNode) bool {
-        self.lost_log = .none;
-        self.voted_for = self.id;
-        if (!self.persistHardState()) {
-            self.lost_log = .confirming;
-            self.voted_for = NO_VOTE;
-            return false;
+    fn addCheckSet(self: *RaftNode, members: []const NodeId) void {
+        if (members.len == 0) return;
+        for (self.check.sets[0..self.check.set_count]) |*set| {
+            if (set.count == members.len and std.mem.eql(NodeId, set.slice(), members)) return;
         }
-        self.rearmElectionTimer();
-        log.info("Raft: lost-log node {d} confirmed term {d} with {d} of {d} members; it votes from term {d} on", .{ self.id, self.current_term, self.poll.answers, self.poll.member_count, self.current_term + 1 });
+        // Full: the newest reported config replaces the last one reported;
+        // the committed and own sets are never dropped.
+        const slot = if (self.check.set_count < self.check.sets.len) blk: {
+            self.check.set_count += 1;
+            break :blk self.check.set_count - 1;
+        } else self.check.sets.len - 1;
+        const n = @min(members.len, self.check.sets[slot].ids.len);
+        @memcpy(self.check.sets[slot].ids[0..n], members[0..n]);
+        self.check.sets[slot].count = @intCast(n);
+        // Ask the new members at the next tick.
+        self.check.sent_ms = 0;
+    }
+
+    fn answeredBy(self: *const RaftNode, id: NodeId) bool {
+        return std.mem.indexOfScalar(NodeId, self.check.answered[0..self.check.answered_count], id) != null;
+    }
+
+    fn inCheck(self: *const RaftNode, id: NodeId) bool {
+        for (self.check.sets[0..self.check.set_count]) |*set| {
+            if (std.mem.indexOfScalar(NodeId, set.slice(), id) != null) return true;
+        }
+        return false;
+    }
+
+    /// Answers a set needs: enough to meet, at a member other than this
+    /// node, every quorum of the set its lost vote could have counted in.
+    /// A quorum holds at least ⌊n/2⌋ others, so n − ⌊n/2⌋ of the n − 1
+    /// others always meet it; alone in the set, nothing could have counted
+    /// its vote. Not named, its vote counted in no quorum of the set, and
+    /// a plain majority answers.
+    fn checkNeeded(self: *const RaftNode, set: *const MemberSet) u8 {
+        const n = set.count;
+        if (std.mem.indexOfScalar(NodeId, set.slice(), self.id) == null) return n / 2 + 1;
+        return if (n == 1) 0 else n - n / 2;
+    }
+
+    fn checkGot(self: *const RaftNode, set: *const MemberSet) u8 {
+        var got: u8 = 0;
+        for (set.slice()) |id| {
+            if (id != self.id and self.answeredBy(id)) got += 1;
+        }
+        return got;
+    }
+
+    fn checkSatisfied(self: *const RaftNode) bool {
+        if (self.check.set_count == 0) return false;
+        for (self.check.sets[0..self.check.set_count]) |*set| {
+            if (self.checkGot(set) < self.checkNeeded(set)) return false;
+        }
         return true;
     }
 
-    fn setPollMembers(self: *RaftNode, members: []const NodeId) void {
-        const n = @min(members.len, self.poll.members.len);
-        @memcpy(self.poll.members[0..n], members[0..n]);
-        self.poll.member_count = @intCast(n);
-        self.poll.answered = @splat(false);
-        self.poll.answers = 0;
-        // Ask the new set at the next tick.
-        self.poll.sent_ms = 0;
+    /// Answers in, and how many more the check needs across its sets.
+    pub fn checkStatus(self: *const RaftNode) struct { answers: u8, missing: u8 } {
+        var missing: u8 = 0;
+        for (self.check.sets[0..self.check.set_count]) |*set| missing += self.checkNeeded(set) -| self.checkGot(set);
+        return .{ .answers = self.check.answered_count, .missing = missing };
     }
 
-    /// Whom a confirming node polls: the poll's members other than itself.
-    pub fn termPollTargets(self: *const RaftNode, out: *[MAX_PEERS + 1]NodeId) []NodeId {
+    /// Whom a confirming node asks: the members of every set, other than
+    /// itself and those that have answered.
+    pub fn termCheckTargets(self: *const RaftNode, out: *[MAX_PEERS + 1]NodeId) []NodeId {
         var n: usize = 0;
-        for (self.poll.members[0..self.poll.member_count], 0..) |id, i| {
-            if (id == self.id or self.poll.answered[i]) continue;
-            out[n] = id;
-            n += 1;
+        for (self.check.sets[0..self.check.set_count]) |*set| {
+            for (set.slice()) |id| {
+                if (id == self.id or self.answeredBy(id)) continue;
+                if (std.mem.indexOfScalar(NodeId, out[0..n], id) != null) continue;
+                if (n == out.len) return out[0..n];
+                out[n] = id;
+                n += 1;
+            }
         }
         return out[0..n];
     }
 
-    pub fn termPollRequest(self: *const RaftNode) TermPollRequest {
+    pub fn termCheckRequest(self: *const RaftNode) TermCheckRequest {
         return .{ .term = self.current_term, .from = self.id };
     }
 
-    /// Answer a lost-log node's poll with our term and latest config.
-    /// Nothing is adopted: the poller's term is a leader's it followed,
-    /// and may be stale.
-    pub fn handleTermPoll(self: *const RaftNode, req: TermPollRequest) TermPollResponse {
+    /// Answer a guarded node with our term and latest config, saying
+    /// whether we are guarded too. Nothing is adopted: the asker's term
+    /// is a leader's it followed, and may be stale.
+    pub fn handleTermCheck(self: *const RaftNode, req: TermCheckRequest) TermCheckResponse {
         _ = req;
-        var resp: TermPollResponse = .{
+        var resp: TermCheckResponse = .{
             .term = self.current_term,
             .from = self.id,
+            .guarded = self.lost_log != .none,
             .config_index = self.membership_index,
             .config_term = self.membership_term,
             .member_count = 0,
@@ -1106,37 +1194,45 @@ pub const RaftNode = struct {
     }
 
     /// One member's answer. A newer term sends the node back to catch up
-    /// with that term's leader; a newer config replaces the polled set;
-    /// a quorum of the set, this node excluded, confirms the term. Every
-    /// term a vote of this node could have counted in was reached by a
-    /// quorum overlapping that one, so none is above ours.
-    pub fn handleTermPollResponse(self: *RaftNode, resp: TermPollResponse) void {
+    /// with that term's leader; a newer config adds its members to the
+    /// check; an answer from a non-guarded member counts in every set it
+    /// is in. Within the boot wait nothing counts.
+    pub fn handleTermCheckResponse(self: *RaftNode, resp: TermCheckResponse) void {
         if (self.lost_log != .confirming or !self.termPlausible(resp.term)) return;
-        // Polls go out only after the wait; an answer within it is a
-        // duplicate or a stray, and counts for nothing.
         if (self.holding()) return;
         if (resp.term > self.current_term) {
             self.stepDown(resp.term);
             return;
         }
-        const newer = resp.config_term > self.poll.config_term or
-            (resp.config_term == self.poll.config_term and resp.config_index > self.poll.config_index);
+        const newer = resp.config_term > self.check.newest_term or
+            (resp.config_term == self.check.newest_term and resp.config_index > self.check.newest_index);
         if (newer and resp.member_count > 0) {
-            self.poll.config_index = resp.config_index;
-            self.poll.config_term = resp.config_term;
-            self.setPollMembers(resp.members[0..@min(resp.member_count, resp.members.len)]);
-            log.info("Raft: lost-log node {d} polls the newer config {any} (index {d}, term {d})", .{ self.id, self.poll.members[0..self.poll.member_count], resp.config_index, resp.config_term });
+            self.check.newest_index = resp.config_index;
+            self.check.newest_term = resp.config_term;
+            self.addCheckSet(resp.members[0..@min(resp.member_count, resp.members.len)]);
+            log.info("Raft: guarded node {d} also checks the newer config {any} (index {d}, term {d})", .{ self.id, resp.members[0..@min(resp.member_count, resp.members.len)], resp.config_index, resp.config_term });
         }
-        if (resp.from == self.id) return;
-        const i = std.mem.indexOfScalar(NodeId, self.poll.members[0..self.poll.member_count], resp.from) orelse return;
-        if (self.poll.answered[i]) return;
-        self.poll.answered[i] = true;
-        self.poll.answers += 1;
-        if (self.poll.answers < self.pollAnswersNeeded()) return;
-        if (!self.confirmTerm()) {
-            self.poll.answered[i] = false;
-            self.poll.answers -= 1;
+        if (resp.guarded or resp.from == self.id or self.answeredBy(resp.from) or !self.inCheck(resp.from)) return;
+        if (self.check.answered_count == self.check.answered.len) return;
+        self.check.answered[self.check.answered_count] = resp.from;
+        self.check.answered_count += 1;
+        if (self.checkSatisfied()) _ = self.confirmTerm();
+    }
+
+    /// The term is confirmed. A vote recorded for itself in this term means
+    /// it grants none in it, here or after a restart. False when that
+    /// cannot be made durable; the next tick tries again.
+    fn confirmTerm(self: *RaftNode) bool {
+        self.lost_log = .none;
+        self.voted_for = self.id;
+        if (!self.persistHardState()) {
+            self.lost_log = .confirming;
+            self.voted_for = NO_VOTE;
+            return false;
         }
+        self.rearmElectionTimer();
+        log.info("Raft: guarded node {d} confirmed term {d} with {d} answer(s); it votes from term {d} on", .{ self.id, self.current_term, self.check.answered_count, self.current_term + 1 });
+        return true;
     }
 
     // ── Internal ────────────────────────────────────────────────────────
@@ -1245,7 +1341,7 @@ pub const RaftNode = struct {
 
             var replicas: u8 = if (self.selfCountedThrough(idx) >= idx) 1 else 0;
             for (0..self.peer_count) |i| {
-                if (self.peers[i].match_index >= idx) {
+                if (self.peers[i].match_index >= idx and !self.peers[i].guarded) {
                     replicas += 1;
                 }
             }
@@ -1394,7 +1490,7 @@ test "raft node: vote handling — grant vote" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-    });
+   });
 
     try testing.expect(resp.vote_granted);
     try testing.expectEqual(@as(u32, 1), node.voted_for);
@@ -1415,7 +1511,7 @@ test "raft node: vote handling — reject stale term" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-    });
+   });
 
     try testing.expect(!resp.vote_granted);
     try testing.expectEqual(@as(u64, 5), resp.term);
@@ -1433,7 +1529,7 @@ test "raft node: vote handling — reject already voted" {
         .candidate_id = 3,
         .last_log_index = 0,
         .last_log_term = 0,
-    });
+   });
 
     // Node 1 asks for vote in same term — reject
     const resp = node.handleVoteRequest(.{
@@ -1441,7 +1537,7 @@ test "raft node: vote handling — reject already voted" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-    });
+   });
 
     try testing.expect(!resp.vote_granted);
 }
@@ -1460,7 +1556,7 @@ test "raft node: step down on higher term" {
         .candidate_id = 2,
         .last_log_index = 0,
         .last_log_term = 0,
-    });
+   });
 
     try testing.expectEqual(Role.follower, node.role);
     try testing.expectEqual(@as(u64, 5), node.current_term);
@@ -1487,7 +1583,7 @@ test "raft node: election win with majority" {
         .term = node.current_term,
         .vote_granted = true,
         .from = 2,
-    });
+   });
 
     try testing.expect(won == .won);
     try testing.expectEqual(Role.leader, node.role);
@@ -1510,7 +1606,7 @@ test "raft node: election loss — not enough votes" {
         .term = node.current_term,
         .vote_granted = false,
         .from = 2,
-    });
+   });
 
     try testing.expect(won == .none);
     try testing.expectEqual(Role.candidate, node.role);
@@ -1532,7 +1628,7 @@ test "raft node: handleAppendEntries as follower" {
         .prev_log_term = 0,
         .entries = &[_]Entry{e1},
         .leader_commit = 1,
-    });
+   });
 
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 1), resp.match_index);
@@ -1556,7 +1652,7 @@ test "raft node: reject AppendEntries with stale term" {
         .prev_log_term = 0,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-    });
+   });
 
     try testing.expect(!resp.success);
     try testing.expectEqual(@as(u64, 5), resp.term);
@@ -1581,7 +1677,7 @@ test "raft node: AppendEntries log matching failure" {
         .prev_log_term = 2, // wrong term!
         .entries = &[_]Entry{},
         .leader_commit = 0,
-    });
+   });
 
     try testing.expect(!resp.success);
 }
@@ -1611,7 +1707,7 @@ test "raft node: leader commit advancement with 3-node cluster" {
         .success = true,
         .match_index = 2,
         .from = 2,
-    });
+   });
 
     // Now we have majority (self + peer 2 = 2 of 3)
     try testing.expectEqual(@as(u64, 2), node.commit_index);
@@ -1666,7 +1762,7 @@ test "raft node: heartbeat over stale suffix does not commit unverified entries"
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 7,
-    });
+   });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 7), resp.match_index);
 
@@ -1701,7 +1797,7 @@ test "raft node: append of N entries at prev P reports match P+N" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-    });
+   });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), resp.match_index);
 
@@ -1714,7 +1810,7 @@ test "raft node: append of N entries at prev P reports match P+N" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-    });
+   });
     try testing.expect(resp2.success);
     try testing.expectEqual(@as(u64, 5), resp2.match_index);
     try testing.expectEqual(@as(u64, 5), node.log.lastIndex());
@@ -1747,7 +1843,7 @@ test "raft node: conflict truncation reports match through appended batch" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-    });
+   });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 4), resp.match_index);
     try testing.expectEqual(@as(u64, 4), node.log.lastIndex());
@@ -1869,7 +1965,7 @@ test "raft node: follower does not commit its stale suffix on a heartbeat" {
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 10,
-    });
+   });
     try testing.expect(hb.success);
     try testing.expectEqual(@as(u64, 7), follower.commit_index);
 
@@ -1886,7 +1982,7 @@ test "raft node: follower does not commit its stale suffix on a heartbeat" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 10,
-    });
+   });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 10), follower.commit_index);
     try testing.expectEqual(@as(u64, 3), follower.log.entryTerm(10).?);
@@ -1913,7 +2009,7 @@ test "raft node: a heartbeat below the commit index never lowers it" {
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 6,
-    });
+   });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), follower.commit_index);
 }
@@ -2048,7 +2144,7 @@ test "raft node: a current-term AppendEntries re-arms the timer even when the lo
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-    });
+   });
     try testing.expect(!resp.success);
     try testing.expect(node.election_deadline_ms >= 1350);
     try testing.expect(node.election_deadline_ms > armed_at_start);
@@ -2064,7 +2160,7 @@ test "raft node: a current-term AppendEntries re-arms the timer even when the lo
         .prev_log_term = 0,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-    });
+   });
     try testing.expectEqual(deadline_before, node.election_deadline_ms);
 }
 
@@ -2811,9 +2907,10 @@ test "raft node: a durable index past a truncation is cut back to it" {
     try testing.expectEqual(@as(u64, 1), follower.durable_index);
 }
 
-/// A lost-log node 2 that leader 1 (term 3) has caught up: entries 1..3
-/// of term 3, the config {1,2,3} at index 2, all committed.
-fn lostLogCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
+/// A guarded node 2 that leader 1 (term 3) has caught up: entries 1..3
+/// of term 3, the config {1,2,3} at index 2, all committed. Past the boot
+/// wait.
+fn guardedCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
     node.hard_state_sink = rec.sink();
     node.timer_enabled = false;
     try node.enterLostLog();
@@ -2823,11 +2920,12 @@ fn lostLogCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
         entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 3, 0, ""),
     };
-    // Short of the leader's last index: still catching up, even with a
-    // commit of the leader's term.
-    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = es[0..2], .leader_commit = 2, .leader_last_index = 3 });
+    // Short of what the leader had committed: still catching up, and its
+    // acks say it is guarded.
+    const r1 = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = es[0..2], .leader_commit = 3 });
     try testing.expectEqual(LostLog.catching_up, node.lost_log);
-    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = es[2..3], .leader_commit = 3, .leader_last_index = 3 });
+    try testing.expect(r1.success and r1.guarded);
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = es[2..3], .leader_commit = 3 });
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     passBootWait(node);
 }
@@ -2836,16 +2934,16 @@ fn lostLogCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
 fn passBootWait(node: *RaftNode) void {
     const start = node.current_time_ms + 1;
     _ = node.tick(start);
-    _ = node.tick(start + node.config.election_timeout_max_ms + 1);
+    _ = node.tick(start + node.config.election_timeout_max_ms + node.config.rpcTimeoutMs());
 }
 
-fn pollAnswer(from: NodeId, term: u64, config_index: u64, config_term: u64, members: []const NodeId) TermPollResponse {
-    var r: TermPollResponse = .{ .term = term, .from = from, .config_index = config_index, .config_term = config_term, .member_count = @intCast(members.len), .members = undefined };
+fn checkAnswer(from: NodeId, term: u64, config_index: u64, config_term: u64, members: []const NodeId) TermCheckResponse {
+    var r: TermCheckResponse = .{ .term = term, .from = from, .config_index = config_index, .config_term = config_term, .member_count = @intCast(members.len), .members = undefined };
     @memcpy(r.members[0..members.len], members);
     return r;
 }
 
-test "raft node: a lost-log node grants no vote and never campaigns until caught up and the term is confirmed" {
+test "raft node: a guarded node grants no vote and never campaigns until caught up and the term is confirmed" {
     var rec = SinkRecorder{};
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
@@ -2855,54 +2953,120 @@ test "raft node: a lost-log node grants no vote and never campaigns until caught
     try testing.expect(!node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 }).vote_granted);
     try testing.expect(!node.handleVoteRequest(.{ .term = 1, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0, .is_pre_vote = true }).vote_granted);
 
-    try lostLogCaughtUp(&node, &rec);
-    // Named by the config, yet the timer elects nothing; it polls.
-    _ = node.tick(1);
-    const t = node.tick(1_000_000);
+    try guardedCaughtUp(&node, &rec);
+    // Named by the config, yet the timer elects nothing; it checks the term.
+    const t = node.tick(node.current_time_ms + 1_000_000);
     try testing.expect(!t.start_election);
-    try testing.expect(t.send_term_poll);
+    try testing.expect(t.send_term_check);
     var targets: [MAX_PEERS + 1]NodeId = undefined;
-    try testing.expectEqualSlices(NodeId, &.{ 1, 3 }, node.termPollTargets(&targets));
+    try testing.expectEqualSlices(NodeId, &.{ 1, 3 }, node.termCheckTargets(&targets));
 
-    // Its own seat counts in the quorum's size, not as an answer: one
-    // answer of three is not a majority.
-    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
-    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    // Of three, both others must answer; node 3 answering while guarded
+    // itself is no evidence of the votes this node cast.
+    node.handleTermCheckResponse(checkAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermCheckResponse(checkAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    var guarded = checkAnswer(3, 3, 2, 3, &.{ 1, 2, 3 });
+    guarded.guarded = true;
+    node.handleTermCheckResponse(guarded);
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     try testing.expect(rec.lost_log);
-    node.handleTermPollResponse(pollAnswer(3, 2, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermCheckResponse(checkAnswer(3, 2, 2, 3, &.{ 1, 2, 3 }));
     try testing.expectEqual(LostLog.none, node.lost_log);
     try testing.expect(!rec.lost_log);
     try testing.expectEqual(@as(u64, 3), rec.term);
     try testing.expectEqual(@as(NodeId, 2), rec.voted_for);
+    const after = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 3, .entries = &.{}, .leader_commit = 3 });
+    try testing.expect(!after.guarded);
 
     // Whatever it voted for in term 3 is gone, so it votes in none; it
     // votes in term 4.
-    node.current_time_ms = 10_000_000;
+    node.current_time_ms += 10_000_000;
     try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 3, .last_log_term = 3 }).vote_granted);
     try testing.expect(node.handleVoteRequest(.{ .term = 4, .candidate_id = 3, .last_log_index = 3, .last_log_term = 3 }).vote_granted);
 }
 
-test "raft node: a newer term in a poll answer sends a lost-log node back to catch up; a newer config is polled instead" {
+test "raft node: a newer config a member reports is checked as well, and a newer term sends the guarded node back to catch up" {
     var rec = SinkRecorder{};
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
-    try lostLogCaughtUp(&node, &rec);
+    try guardedCaughtUp(&node, &rec);
 
-    // A member reports a config of five from a later term: those are polled.
-    node.handleTermPollResponse(pollAnswer(1, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    // A config of five from a later term: three of its four others must
+    // answer, on top of both others of the three.
+    node.handleTermCheckResponse(checkAnswer(1, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
     var targets: [MAX_PEERS + 1]NodeId = undefined;
-    // Node 1 answered the new set too.
-    try testing.expectEqualSlices(NodeId, &.{ 3, 4, 5 }, node.termPollTargets(&targets));
-    node.handleTermPollResponse(pollAnswer(3, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    try testing.expectEqualSlices(NodeId, &.{ 3, 4, 5 }, node.termCheckTargets(&targets));
+    // Nodes 1, 4 and 5 meet the five; the three it already had still need
+    // node 3, so the newer set was added, not swapped in.
+    node.handleTermCheckResponse(checkAnswer(4, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
+    node.handleTermCheckResponse(checkAnswer(5, 3, 7, 4, &.{ 1, 2, 3, 4, 5 }));
     try testing.expectEqual(LostLog.confirming, node.lost_log);
-
+    node.handleTermCheckResponse(checkAnswer(3, 6, 7, 4, &.{ 1, 2, 3, 4, 5 }));
     // A term past ours: a leader this node has not caught up with.
-    node.handleTermPollResponse(pollAnswer(4, 6, 7, 4, &.{ 1, 2, 3, 4, 5 }));
     try testing.expectEqual(LostLog.catching_up, node.lost_log);
     try testing.expectEqual(@as(u64, 6), node.current_term);
     try testing.expect(rec.lost_log);
-    try testing.expect(!node.handleVoteRequest(.{ .term = 7, .candidate_id = 3, .last_log_index = 9, .last_log_term = 6 }).vote_granted);
+}
+
+test "raft node: the latest committed config is checked as well as an uncommitted one after it" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    // {1,2,3} committed; {1,2,3,4} appended by a leader the group may
+    // have replaced.
+    node.commitMembership(&.{ 1, 2, 3 });
+    node.setMembership(&.{ 1, 2, 3, 4 }, 9);
+    node.membership_term = 3;
+    node.current_term = 3;
+    try node.enterLostVote();
+    passBootWait(&node);
+    // Two of {1,3,4} meet the four, not the three: node 3 must answer.
+    node.handleTermCheckResponse(checkAnswer(1, 3, 9, 3, &.{ 1, 2, 3, 4 }));
+    node.handleTermCheckResponse(checkAnswer(4, 3, 9, 3, &.{ 1, 2, 3, 4 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    node.handleTermCheckResponse(checkAnswer(3, 3, 9, 3, &.{ 1, 2, 3, 4 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
+}
+
+test "raft node: a guarded node in a group of two confirms with the other member's answer" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.timer_enabled = false;
+    try node.enterLostLog();
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf)),
+    };
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 1 });
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    passBootWait(&node);
+    // Any quorum that counted this node's vote also held node 1.
+    node.handleTermCheckResponse(checkAnswer(1, 1, 2, 1, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
+}
+
+test "raft node: a guarded node sends no term check and counts no answer within the boot wait" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9, .election_timeout_max_ms = 300, .heartbeat_interval_ms = 50 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.setMembership(&.{ 1, 2 }, 1);
+    try node.enterLostVote();
+    // Before the first tick there is no clock: it waits. The wait is one
+    // maximum election timeout plus an RPC timeout: 300 + 100.
+    node.handleTermCheckResponse(checkAnswer(1, 0, 1, 0, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(!node.tick(1000).send_term_check);
+    try testing.expect(!node.tick(1399).send_term_check);
+    node.handleTermCheckResponse(checkAnswer(1, 0, 1, 0, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(node.tick(1400).send_term_check);
+    node.handleTermCheckResponse(checkAnswer(1, 0, 1, 0, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
 }
 
 test "raft node: a node that kept its log but lost its hard state confirms the term before it votes again" {
@@ -2910,33 +3074,25 @@ test "raft node: a node that kept its log but lost its hard state confirms the t
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
     node.hard_state_sink = rec.sink();
-    // The log a leader of term 3 gave it, kept on disk.
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
         entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
     };
-    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2, .leader_last_index = 2 });
-    // Restarted without HARDSTATE: term 0, no vote on record.
-    node.current_term = 0;
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
+    // Restarted without HARDSTATE: no vote on record (the owner boots at
+    // the log's last term).
     node.voted_for = NO_VOTE;
     node.leader_id = NO_VOTE;
     try node.enterLostVote();
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     try testing.expect(rec.lost_log);
     passBootWait(&node);
-    node.current_time_ms = 10_000_000;
+    node.current_time_ms += 10_000_000;
     try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
-
-    // The members are at term 3: it follows that term's leader first.
-    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
-    try testing.expectEqual(LostLog.catching_up, node.lost_log);
-    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = &.{}, .leader_commit = 2, .leader_last_index = 2 });
-    try testing.expectEqual(LostLog.confirming, node.lost_log);
-    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
-    node.handleTermPollResponse(pollAnswer(3, 3, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermCheckResponse(checkAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermCheckResponse(checkAnswer(3, 3, 2, 3, &.{ 1, 2, 3 }));
     try testing.expectEqual(LostLog.none, node.lost_log);
-    node.current_time_ms = 20_000_000;
     try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
     try testing.expect(node.handleVoteRequest(.{ .term = 4, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
 }
@@ -2952,41 +3108,46 @@ test "raft node: a group of one has no other vote to wait for" {
     try testing.expect(!rec.lost_log);
 }
 
-test "raft node: a lost-log node in a group of two confirms with the other member's answer" {
+test "raft node: a leader counts a guarded follower's ack toward no commit" {
+    var leader = try RaftNode.init(testing.allocator, 1, 0, 4096, .{ .rng_seed = 9 });
+    defer leader.deinit();
+    leader.addPeer(2);
+    leader.addPeer(3);
+    _ = candidacy(&leader);
+    _ = leader.handleVoteResponse(.{ .term = leader.current_term, .vote_granted = true, .from = 3 });
+    try testing.expectEqual(Role.leader, leader.role);
+    const p = try leader.propose(.raft_noop, entry_mod.Flags.NONE, 0, "");
+    leader.peers[0].sent_up_to = p.index;
+    leader.peers[1].sent_up_to = p.index;
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = p.index, .from = 2, .guarded = true });
+    try testing.expect(leader.commit_index < p.index);
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = p.index, .from = 2 });
+    try testing.expectEqual(p.index, leader.commit_index);
+}
+
+test "raft node: a guarded node adopts a higher term from a vote request it refuses" {
     var rec = SinkRecorder{};
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
     node.hard_state_sink = rec.sink();
-    node.timer_enabled = false;
     try node.enterLostLog();
-    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
-    var es = [_]Entry{
-        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf)),
-    };
-    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2, .leader_last_index = 2 });
-    try testing.expectEqual(LostLog.confirming, node.lost_log);
-    passBootWait(&node);
-    // Any quorum that counted this node's vote also held node 1.
-    node.handleTermPollResponse(pollAnswer(1, 1, 2, 1, &.{ 1, 2 }));
-    try testing.expectEqual(LostLog.none, node.lost_log);
+    try testing.expect(!node.handleVoteRequest(.{ .term = 7, .candidate_id = 3, .last_log_index = 0, .last_log_term = 0 }).vote_granted);
+    try testing.expectEqual(@as(u64, 7), node.current_term);
+    try testing.expectEqual(@as(u64, 7), rec.term);
+    try testing.expect(rec.lost_log);
+    // A stale leader at an older term is now refused.
+    const r = try node.handleAppendEntries(.{ .term = 5, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!r.success);
 }
 
-test "raft node: a lost-log node counts no poll answer, and polls no one, within one election timeout of boot" {
-    var rec = SinkRecorder{};
-    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9, .election_timeout_max_ms = 300 });
+test "raft node: a candidate counts no vote that arrives past its election deadline" {
+    var node = try RaftNode.init(testing.allocator, 1, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
-    node.hard_state_sink = rec.sink();
-    node.setMembership(&.{ 1, 2 }, 1);
-    try node.enterLostVote();
-    // Before the first tick there is no clock: it waits.
-    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
-    try testing.expectEqual(LostLog.confirming, node.lost_log);
-    try testing.expect(!node.tick(1000).send_term_poll);
-    try testing.expect(!node.tick(1299).send_term_poll);
-    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
-    try testing.expectEqual(LostLog.confirming, node.lost_log);
-    try testing.expect(node.tick(1300).send_term_poll);
-    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
-    try testing.expectEqual(LostLog.none, node.lost_log);
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = node.tick(1);
+    _ = candidacy(&node);
+    node.observeTime(node.election_deadline_ms);
+    try testing.expectEqual(VoteOutcome.none, node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 }));
+    try testing.expectEqual(Role.candidate, node.role);
 }

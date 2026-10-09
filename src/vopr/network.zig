@@ -24,7 +24,6 @@ pub const AppendReq = struct {
     prev_log_index: u64,
     prev_log_term: u64,
     leader_commit: u64,
-    leader_last_index: u64,
     entries: []OwnedEntry,
 };
 
@@ -42,8 +41,8 @@ pub const Body = union(enum) {
     vote_resp: raft_node.VoteResponse,
     append_req: AppendReq,
     append_resp: raft_node.AppendResponse,
-    term_poll: raft_node.TermPollRequest,
-    term_poll_resp: raft_node.TermPollResponse,
+    term_check: raft_node.TermCheckRequest,
+    term_check_resp: raft_node.TermCheckResponse,
 };
 
 pub const Message = struct {
@@ -261,7 +260,6 @@ test "vopr network: delivery is ordered by (deliver_at, seq) and owned memory is
         .prev_log_index = 0,
         .prev_log_term = 0,
         .leader_commit = 0,
-        .leader_last_index = 0,
         .entries = entries1,
     } });
     try net.send(&prng, &scenario, 0, 1, 2, .{ .vote_resp = .{ .term = 1, .vote_granted = true, .from = 2 } });

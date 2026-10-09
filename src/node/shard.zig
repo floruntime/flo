@@ -1919,6 +1919,9 @@ pub const Shard = struct {
     /// Every frame the network queued since the last drain.
     fn drainRaftQueue(self: *Shard) void {
         const q = self.raft_queue orelse return;
+        // The clock before the messages: a vote that arrives past the
+        // candidacy's deadline is not counted on the last tick's clock.
+        self.raft_node.observeTime(nowMs());
         while (q.pop()) |frame| {
             defer self.allocator.free(frame.payload);
             self.handleRaftFrame(frame);
@@ -2333,7 +2336,6 @@ pub const Shard = struct {
                     .prev_log_index = hdr.prev_log_index,
                     .prev_log_term = hdr.prev_log_term,
                     .leader_commit = hdr.leader_commit,
-                    .leader_last_index = hdr.leader_last_index,
                     .entries = self.rpc_entries[0..count],
                 };
                 const led_by = raft.leader_id;
@@ -2407,18 +2409,19 @@ pub const Shard = struct {
                     },
                 }
             },
-            .term_poll => {
-                const req = transport.deserializeTermPoll(frame.payload) orelse return self.badFrame(frame);
+            .term_check => {
+                const req = transport.deserializeTermCheck(frame.payload) orelse return self.badFrame(frame);
                 if (req.from != frame.source_node) return self.impostorFrame(frame, req.from);
-                var buf: [transport.TERM_POLL_RESP_MAX]u8 = undefined;
-                const n = transport.serializeTermPollResponse(raft.handleTermPoll(req), &buf) orelse return;
-                self.sendRaft(frame.source_node, .term_poll_response, buf[0..n]);
+                var buf: [transport.TERM_CHECK_RESP_MAX]u8 = undefined;
+                const n = transport.serializeTermCheckResponse(raft.handleTermCheck(req), &buf) orelse return;
+                self.sendRaft(frame.source_node, .term_check_response, buf[0..n]);
             },
-            .term_poll_response => {
-                const resp = transport.deserializeTermPollResponse(frame.payload) orelse return self.badFrame(frame);
+            .term_check_response => {
+                const resp = transport.deserializeTermCheckResponse(frame.payload) orelse return self.badFrame(frame);
                 if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
-                raft.handleTermPollResponse(resp);
-                if (raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term + 1 });
+                const was = raft.lost_log;
+                raft.handleTermCheckResponse(resp);
+                if (was != .none and raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term + 1 });
             },
             .join_request => self.handleJoinRequest(frame.source_node),
             .forward_write => self.runForwardedWrite(frame),
@@ -2526,11 +2529,11 @@ pub const Shard = struct {
                 }
             }
         }
-        if (r.send_term_poll) {
-            var buf: [transport.TERM_POLL_SIZE]u8 = undefined;
-            const n = transport.serializeTermPoll(raft.termPollRequest(), &buf).?;
+        if (r.send_term_check) {
+            var buf: [transport.TERM_CHECK_SIZE]u8 = undefined;
+            const n = transport.serializeTermCheck(raft.termCheckRequest(), &buf).?;
             var ids: [raft_node_mod.MAX_PEERS + 1]u32 = undefined;
-            for (raft.termPollTargets(&ids)) |peer| self.sendRaft(peer, .term_poll, buf[0..n]);
+            for (raft.termCheckTargets(&ids)) |peer| self.sendRaft(peer, .term_check, buf[0..n]);
         }
         if (raft.lost_log != .none) self.warnLostLog(now);
         if (r.step_down) self.leadershipLost("no contact with a majority");
@@ -2539,12 +2542,13 @@ pub const Shard = struct {
         if (self.forward_count > 0) self.sweepForwards(now);
     }
 
-    /// A lost-log node that stays guarded says where it is waiting: with
-    /// no leader (a majority lost its data too) or no quorum answering, it
-    /// waits forever, and the operator needs the way out.
+    /// A guarded node that stays guarded says where it is waiting: with no
+    /// leader (a majority lost its data too) or not enough members
+    /// answering, it waits forever, and the operator needs the way out.
     fn warnLostLog(self: *Shard, now: u64) void {
         if (now -| self.lost_log_warn_ms < WARN_INTERVAL_MS) return;
-        // The first line waits a timeout: catching up usually takes less.
+        // The first line waits one warn interval: catching up usually
+        // takes less.
         if (self.lost_log_warn_ms == 0) {
             self.lost_log_warn_ms = now;
             return;
@@ -2554,11 +2558,14 @@ pub const Shard = struct {
         switch (raft.lost_log) {
             .none => {},
             .catching_up => if (raft.leader_id == 0) {
-                log.warn("shard {d}: lost-log guard: catching up — no leader heard yet; this node votes only once a leader has caught it up and a quorum has confirmed the term. If a majority lost their data, see flo server inspect / force-members", .{self.id});
+                log.warn("shard {d}: lost-log guard: catching up — no leader heard yet; this node votes only once a leader has caught it up and the members have confirmed the term. If a majority lost their data, see flo server inspect / force-members", .{self.id});
             } else {
                 log.warn("shard {d}: lost-log guard: catching up with leader {d} (term {d}, at index {d}); no votes until caught up and confirmed", .{ self.id, raft.leader_id, raft.current_term, raft.log.lastIndex() });
             },
-            .confirming => log.warn("shard {d}: lost-log guard: confirming term {d}; {d} of the {d} members polled have answered and a majority of them is needed. If a majority lost their data, see flo server inspect / force-members", .{ self.id, raft.current_term, raft.poll.answers, raft.poll.member_count }),
+            .confirming => {
+                const st = raft.checkStatus();
+                log.warn("shard {d}: lost-log guard: confirming term {d}; {d} member(s) have answered and {d} more answer(s) are needed. If a majority lost their data, see flo server inspect / force-members", .{ self.id, raft.current_term, st.answers, st.missing });
+            },
         }
     }
 
@@ -2647,7 +2654,6 @@ pub const Shard = struct {
                 .prev_log_index = prev_index,
                 .prev_log_term = prev_term,
                 .leader_commit = raft.commit_index,
-                .leader_last_index = raft.log.lastIndex(),
                 .entries = entries,
             };
             const n = transport.serializeAppendRequest(req, self.rpc_out) orelse {
@@ -3758,8 +3764,8 @@ pub const Shard = struct {
     /// `cluster_status` — this node's identity, role and group. A node
     /// running alone is the leader of a one-member group. States: 0
     /// follower, 1 electing, 2 leader, 3 joining (no seat yet), 4
-    /// diverged, 5 and 6 joining with no log (new, or lost): catching up, then
-    /// confirming the term.
+    /// diverged, 5 and 6 guarded (no log or no hard state of its own, new
+    /// or lost): catching up, then confirming the term.
     fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -4653,11 +4659,15 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 return error.DataDirWasClustered;
             }
         }
-        // Alone, nothing was lost that another node could vote against.
+        // Alone, nothing was lost that another node could vote against;
+        // bootstrap writes the cleared flag with its new term.
         raft.lost_log = .none;
         return raft.bootstrap();
     }
     const empty = raft.log.lastIndex() == 0;
+    // The log is evidence of the term too: a hard state that is missing,
+    // or behind it, never lets the node act in a term it already left.
+    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (cfg_index > 0) {
         const e = raft.log.getEntryCopy(cfg_index, buf) orelse {
             log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess the membership", .{ shard_id, cfg_index });
@@ -4679,7 +4689,7 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         // the current term is gone, so the term is confirmed first.
         if (!had_hard_state and raft.lost_log == .none) {
             try raft.enterLostVote();
-            log.warn("shard {d}: this node has a log but no {s}; it votes only once a majority of the members has confirmed the term", .{ shard_id, hard_state_mod.FILENAME });
+            log.warn("shard {d}: this node has a log but no {s}; it votes only once the members have confirmed the term", .{ shard_id, hard_state_mod.FILENAME });
         }
         return;
     }
@@ -4700,11 +4710,13 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         .join => {
             raft.commit_index = raft.last_applied;
             raft.timer_enabled = false;
-            // No log: whatever this node voted for or acked before is
-            // gone, whether it is new or lost its disk. Durable before it
-            // answers anyone.
-            if (empty) try raft.enterLostLog();
-            log.info("shard {d}: joining{s}; following until a config entry names this node", .{ shard_id, if (empty) " with no log, voting only once caught up and confirmed" else "" });
+            // No log, or a log with no config and no hard state: a new node
+            // and one that lost its disk look the same, and whatever the
+            // latter voted for or acked is gone. Durable before it answers
+            // anyone.
+            const guard = empty or !had_hard_state;
+            if (guard) try raft.enterLostLog();
+            log.info("shard {d}: joining{s}; following until a config entry names this node", .{ shard_id, if (guard) " with nothing in the log and no hard state to vote from; voting only once caught up and the term is confirmed" else "" });
         },
     }
 }
@@ -7042,6 +7054,33 @@ test "Shard: a member that kept its log but lost its hard state confirms the ter
     defer member.deinit();
     try std.testing.expectEqual(raft_node_mod.LostLog.confirming, member.raft_node.lost_log);
     try std.testing.expect((try hard_state_mod.load(shard_dir)).?.lost_log);
+    // The log's last term, not term 0: the hard state that is gone held at
+    // least that.
+    try std.testing.expectEqual(@as(u64, 1), member.raft_node.current_term);
+}
+
+test "Shard: --join with a log but no config entry and no hard state is guarded too" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 2, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    w.commit_index_at_seal = 1;
+    try w.writeToFile(segs);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    defer joiner.deinit();
+    try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, joiner.raft_node.lost_log);
 }
 
 /// Writes parked behind a second member's ack, driven over a socket pair
