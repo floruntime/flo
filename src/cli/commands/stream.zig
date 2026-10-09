@@ -26,6 +26,7 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const wire = @import("../../util/wire.zig");
 const StreamID = @import("../../stream/stream_id.zig").StreamID;
+const MAX_BATCH_RECORDS = @import("../../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
 
@@ -83,7 +84,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .arg("stream", "Stream name")
                 .stringFlag("start", 's', "0-0", "Read records after this StreamID (exclusive; timestamp-sequence, 0-0=beginning, $=latest)")
                 .stringFlag("end", 'e', "", "Ending StreamID (timestamp-sequence, inclusive)")
-                .uintFlag("limit", 'l', 10, "Maximum records to read")
+                .uintFlag("limit", 'l', 10, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
                 .boolFlag("follow", 'f', "Follow mode - continuously tail for new records (like tail -f)")
                 .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait). Single read unlike --follow.")
                 .uintFlag("partition", 'P', 0, "Partition to read from (default: 0)")
@@ -181,7 +182,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (required)")
-                        .uintFlag("limit", 'l', 1, "Maximum records to read")
+                        .uintFlag("limit", 'l', 1, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
                         .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait)")
                         .stringFlag("mode", 'm', "", "Consumer mode: shared, exclusive, key_shared")
                         .uintFlag("max-standbys", 0, 0, "Max standby consumers in exclusive mode (0=singleton, no standbys)")
@@ -343,6 +344,10 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         ctx.printErr("Error: at least one payload is required\n", .{});
         return error.MissingRequiredArg;
     }
+    if (payloads.len > MAX_BATCH_RECORDS) {
+        ctx.printErr("Error: a batch of {d} records is over the limit of {d}\n", .{ payloads.len, MAX_BATCH_RECORDS });
+        return error.CommandFailed;
+    }
 
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
@@ -381,8 +386,8 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
 
     // Apply the same headers to every payload in the batch
     const rec_headers: []const Header = parsed_headers[0..header_count];
-    var per_payload_headers: [256][]const Header = undefined;
-    for (0..@min(payloads.len, 256)) |i| {
+    var per_payload_headers: [MAX_BATCH_RECORDS][]const Header = undefined;
+    for (0..payloads.len) |i| {
         per_payload_headers[i] = rec_headers;
     }
     const headers_arg: ?[]const []const Header = if (header_count > 0)

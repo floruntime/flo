@@ -7270,11 +7270,12 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     // the next entry's applier overwrites what it reads. Answering after
     // the whole batch applied would give the first of each pair the
     // second's id.
-    try ParkTest.send(&shard, conn, .stream_append, 10, "s", "a");
+    // An append's value is a batch: [count:u32]([len:u32][payload][header_count:u16])*
+    try ParkTest.send(&shard, conn, .stream_append, 10, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
     try ParkTest.send(&shard, conn, .queue_enqueue, 11, "q", "m1");
     try ParkTest.send(&shard, conn, .ts_write, 12, "cpu", &f64_bytes);
     const ts_index = raft.log.lastIndex();
-    try ParkTest.send(&shard, conn, .stream_append, 13, "s", "b");
+    try ParkTest.send(&shard, conn, .stream_append, 13, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "b" ++ "\x00\x00");
     try ParkTest.send(&shard, conn, .queue_enqueue, 14, "q", "m2");
     try std.testing.expectEqual(@as(u32, 5), shard.pending_count);
     var buf: [2048]u8 = undefined;
@@ -7700,7 +7701,7 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
 
     // The append's applier names the stream by resolving its namespace, so
     // the namespace's create must apply first, here and on every replay.
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "a", ""));
+    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00", ""));
     try ParkTest.ack(&shard);
     var buf: [256]u8 = undefined;
     var one: [1]proto.Response = undefined;

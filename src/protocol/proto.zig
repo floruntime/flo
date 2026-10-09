@@ -16,6 +16,9 @@ pub const MAGIC: u32 = 0x004F4C46;
 /// Protocol version (for future evolution)
 pub const VERSION: u8 = 0x01;
 
+/// Most records one stream append may carry; the server refuses more.
+pub const MAX_STREAM_BATCH_RECORDS: u32 = 1000;
+
 /// Maximum number of opcodes supported by the dispatch table.
 /// Layout: Infra(0x0__) + Data(0x1__–0x2__) + Compute(0x3__)
 pub const MAX_OPCODES: u16 = 1024;

@@ -195,3 +195,35 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), pong.header.status);
     try testing.expectEqualStrings("PONG", pong.data);
 }
+
+test "e2e/bounds: a stream append of more than 1000 records, or not a batch, is refused by name" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const n = 1001;
+    const big = try testing.allocator.alloc(u8, 4 + n * 7);
+    defer testing.allocator.free(big);
+    std.mem.writeInt(u32, big[0..4], n, .little);
+    for (0..n) |i| {
+        const at = 4 + i * 7;
+        std.mem.writeInt(u32, big[at..][0..4], 1, .little);
+        big[at + 4] = 'x';
+        std.mem.writeInt(u16, big[at + 5 ..][0..2], 0, .little);
+    }
+
+    var out: [4096]u8 = undefined;
+    for ([_]struct { value: []const u8, why: []const u8 }{
+        .{ .value = big, .why = "stream append: a batch of 1001 records is over the limit of 1000" },
+        .{ .value = "not a batch", .why = "stream append: malformed batch" },
+    }) |c| {
+        const frame = try request(.stream_append, "", "s", c.value);
+        defer testing.allocator.free(frame);
+        const r = try send(ctx, frame, &out);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqualStrings(c.why, r.data);
+    }
+
+    var read = try ctx.cli.run(&.{ "stream", "read", "s", "--limit", "10", "-o", "json" });
+    defer read.deinit();
+    try testing.expect(!read.stdoutContains("\"data\""));
+}

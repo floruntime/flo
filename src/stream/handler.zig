@@ -86,6 +86,9 @@ pub const StreamHandler = struct {
 
     /// The id the last applied append got (see `Shard.answering_index`).
     last_append: ?StreamID = null,
+    /// Backs a refusal message that names request values; sent before the
+    /// next command runs.
+    err_buf: [128]u8 = undefined,
     /// What the last applied trim removed (see `Shard.answering_index`).
     last_trim_count: u64 = 0,
 
@@ -448,7 +451,14 @@ pub const StreamHandler = struct {
             }
         }
 
-        const payload_value = if (req.value.len > 0) req.value else "";
+        const payload_value = req.value;
+        _ = stream_mod.BatchIterator.init(payload_value) catch |err| return .{ .err = .{
+            .code = .invalid_request,
+            .message = switch (err) {
+                error.TooManyRecords => std.fmt.bufPrint(&self.err_buf, "stream append: a batch of {d} records is over the limit of {d}", .{ stream_mod.BatchIterator.claimedCount(payload_value), stream_mod.MAX_BATCH_RECORDS }) catch "stream append: batch over the record limit",
+                error.Malformed => "stream append: malformed batch",
+            },
+        } };
         // The append goes through Raft and is applied from the committed log
         // by the shard's one applier, so it replicates and survives restart;
         // the client is parked until then and `respondAppend` reads the
@@ -565,7 +575,9 @@ pub const StreamHandler = struct {
         return window;
     }
 
-    /// The `count` option, bounded; absent or zero means the default batch.
+    /// The `count` option in records, bounded; absent or zero means the
+    /// default. A read returns whole appends, so it can exceed this when the
+    /// first append alone does.
     fn readLimit(req: Request) u32 {
         const asked = req.getCount() orelse 0;
         return @intCast(if (asked == 0) DEFAULT_READ_BATCH else @min(asked, MAX_READ_BATCH));
@@ -573,12 +585,19 @@ pub const StreamHandler = struct {
 
     /// The records in `window`, at most `window.limit` of them.
     pub fn readRecords(self: *StreamHandler, window: waiter_pool_mod.StreamWindow, buf: *[MAX_READ_BATCH]StreamRecord) []StreamRecord {
+        // Every append holds at least one record, so `limit` appends cover
+        // the record budget; then keep the whole appends that fit it.
         const out = buf[0..window.limit];
         const count = if (window.end.eql(StreamID.MAX))
             self.stream.readStreamAfter(window.name_hash, window.after, window.partition, out)
         else
             self.stream.readStreamRange(window.name_hash, window.after, window.end, window.partition, out);
-        return out[0..count];
+        return out[0..stream_mod.wholeEntriesWithin(out[0..count], window.limit)];
+    }
+
+    /// The id of an append's last record: a cursor past the whole append.
+    fn lastRecordId(rec: StreamRecord) StreamID {
+        return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
     }
 
     /// A read response carrying `records`. The caller frees it.
@@ -586,7 +605,7 @@ pub const StreamHandler = struct {
         const data = self.serializeStreamRecordsWithPayloads(records, stream_name) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
-        const last_id = if (records.len > 0) records[records.len - 1].id else StreamID.MIN;
+        const last_id = if (records.len > 0) lastRecordId(records[records.len - 1]) else StreamID.MIN;
         return .{ .stream_messages = .{
             .data = data,
             .next_timestamp_ms = last_id.timestamp_ms,
@@ -1369,46 +1388,6 @@ pub const StreamHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// A resolved record ready for wire serialization.
-    /// Produced by expanding batch payloads from the UAL.
-    const ResolvedRecord = struct {
-        sequence: u64,
-        timestamp_ms: u64,
-        partition_index: u32,
-        tier: u8,
-        payload: []const u8,
-        /// Raw stored header bytes: [key_len:u16][key][val_len:u16][val]...
-        headers_raw: []const u8,
-        header_count: u32,
-    };
-
-    /// Expand StreamRecords into resolved records by unpacking batch payloads.
-    /// One StreamRecord may expand into N records if it contains a batch blob.
-    fn expandRecords(self: *StreamHandler, records: []const StreamRecord, out: []ResolvedRecord) usize {
-        var count: usize = 0;
-        for (records) |rec| {
-            if (count >= out.len) break;
-            const result = self.getPayloadAndTier(rec.ual_index);
-            var batch_buf: [100]UnpackedRecord = undefined;
-            const batch_n = unpackBatch(result.payload, &batch_buf);
-
-            for (batch_buf[0..batch_n], 0..) |br, j| {
-                if (count >= out.len) break;
-                out[count] = .{
-                    .sequence = rec.id.sequence + j,
-                    .timestamp_ms = rec.id.timestamp_ms,
-                    .partition_index = rec.partition_index,
-                    .tier = result.tier,
-                    .payload = br.payload,
-                    .headers_raw = br.headers_raw,
-                    .header_count = br.header_count,
-                };
-                count += 1;
-            }
-        }
-        return count;
-    }
-
     /// Compute re-serialized header size: stored format uses u16 lengths,
     /// response format uses u32 — each header gains 4 bytes.
     fn responseHeaderSize(hdr_count: u32, headers_raw_len: usize) usize {
@@ -1452,62 +1431,71 @@ pub const StreamHandler = struct {
     pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, stream_name: []const u8) ![]u8 {
         const key_size: usize = if (stream_name.len > 0) 1 + 4 + stream_name.len else 1;
 
-        // Expand batch payloads into individual records
-        var expanded: [MAX_READ_BATCH]ResolvedRecord = undefined;
-        const expanded_count = self.expandRecords(records, &expanded);
-
-        // Compute total buffer size
+        // Every record of every append in `records`, never part of one: a
+        // reader's cursor (or a group's delivered id) passes whole appends.
+        // Each append's blob is read once and walked twice, to size and to write.
+        std.debug.assert(records.len <= MAX_READ_BATCH);
+        var blobs: [MAX_READ_BATCH]?stream_mod.BatchIterator = undefined;
+        var tiers: [MAX_READ_BATCH]u8 = undefined;
+        var count: usize = 0;
         var total: usize = 4; // count header
-        for (expanded[0..expanded_count]) |e| {
-            const hdr_size = responseHeaderSize(e.header_count, e.headers_raw.len);
-            total += 8 + 8 + 1 + 4 + key_size + 4 + e.payload.len + 4 + hdr_size;
+        for (records, 0..) |rec, i| {
+            const r = self.getPayloadAndTier(rec.ual_index);
+            tiers[i] = r.tier;
+            blobs[i] = stream_mod.BatchIterator.init(r.payload) catch null;
+            var it = blobs[i] orelse continue;
+            while (it.next()) |br| {
+                count += 1;
+                total += 8 + 8 + 1 + 4 + key_size + 4 + br.payload.len + 4 + responseHeaderSize(br.header_count, br.headers_raw.len);
+            }
         }
 
         const buf = try self.allocator.alloc(u8, total);
         errdefer self.allocator.free(buf);
 
         var pos: usize = 0;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(expanded_count), .little);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(count), .little);
         pos += 4;
 
-        for (expanded[0..expanded_count]) |e| {
-            std.mem.writeInt(u64, buf[pos..][0..8], e.sequence, .little);
-            pos += 8;
-            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(e.timestamp_ms)), .little);
-            pos += 8;
-            buf[pos] = e.tier;
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], e.partition_index, .little);
-            pos += 4;
-
-            // key (stream name for multi-stream / pattern reads)
-            if (stream_name.len > 0) {
-                buf[pos] = 1;
+        for (records, 0..) |rec, i| {
+            var it = blobs[i] orelse continue;
+            var j: u64 = 0;
+            while (it.next()) |br| : (j += 1) {
+                std.mem.writeInt(u64, buf[pos..][0..8], rec.id.sequence + j, .little);
+                pos += 8;
+                std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(rec.id.timestamp_ms)), .little);
+                pos += 8;
+                buf[pos] = tiers[i];
                 pos += 1;
-                std.mem.writeInt(u32, buf[pos..][0..4], @intCast(stream_name.len), .little);
+                std.mem.writeInt(u32, buf[pos..][0..4], rec.partition_index, .little);
                 pos += 4;
-                @memcpy(buf[pos .. pos + stream_name.len], stream_name);
-                pos += stream_name.len;
-            } else {
-                buf[pos] = 0;
-                pos += 1;
-            }
 
-            // payload (clean, without batch wrapper)
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.payload.len), .little);
-            pos += 4;
-            if (e.payload.len > 0) {
-                @memcpy(buf[pos .. pos + e.payload.len], e.payload);
-                pos += e.payload.len;
-            }
+                // key (stream name for multi-stream / pattern reads)
+                if (stream_name.len > 0) {
+                    buf[pos] = 1;
+                    pos += 1;
+                    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(stream_name.len), .little);
+                    pos += 4;
+                    @memcpy(buf[pos .. pos + stream_name.len], stream_name);
+                    pos += stream_name.len;
+                } else {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
 
-            // headers
-            std.mem.writeInt(u32, buf[pos..][0..4], e.header_count, .little);
-            pos += 4;
-            if (e.header_count > 0) {
-                pos = writeResponseHeaders(e.headers_raw, e.header_count, buf, pos);
+                std.mem.writeInt(u32, buf[pos..][0..4], @intCast(br.payload.len), .little);
+                pos += 4;
+                @memcpy(buf[pos .. pos + br.payload.len], br.payload);
+                pos += br.payload.len;
+
+                std.mem.writeInt(u32, buf[pos..][0..4], br.header_count, .little);
+                pos += 4;
+                if (br.header_count > 0) {
+                    pos = writeResponseHeaders(br.headers_raw, br.header_count, buf, pos);
+                }
             }
         }
+        std.debug.assert(pos == total);
 
         return buf;
     }
@@ -1559,23 +1547,23 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(ns_hash_u32, stream_name);
 
         var rec_buf: [1000]StreamRecord = undefined;
-        const n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
+        const read_n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
+        // Whole appends only, so `last_id` never lands inside one: resuming
+        // after it would skip the rest of that append.
+        const n = stream_mod.wholeEntriesWithin(rec_buf[0..read_n], capped);
 
         var last_id = after_id;
         for (rec_buf[0..n]) |rec| {
-            if (count >= capped) break;
             const result = self.getPayloadAndTier(rec.ual_index);
-            if (result.payload.len > 0) {
-                var batch_buf: [100]UnpackedRecord = undefined;
-                const batch_n = unpackBatch(result.payload, &batch_buf);
-                for (batch_buf[0..batch_n]) |br| {
-                    if (count >= capped) break;
+            var it = stream_mod.BatchIterator.init(result.payload) catch null;
+            if (it) |*batch| {
+                while (batch.next()) |br| {
                     results[count] = br.payload;
                     result_ids[count] = rec.id;
                     count += 1;
                 }
             }
-            last_id = rec.id;
+            last_id = lastRecordId(rec);
         }
 
         const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
@@ -1586,69 +1574,6 @@ pub const StreamHandler = struct {
         @memcpy(out, results[0..count]);
         @memcpy(ids, result_ids[0..count]);
         return .{ .payloads = out, .ids = ids, .last_id = last_id };
-    }
-
-    /// A single record extracted from a batch blob, with payload and raw header bytes.
-    const UnpackedRecord = struct {
-        payload: []const u8,
-        /// Raw header bytes in wire format: [key_len:u16][key][val_len:u16][val]...
-        headers_raw: []const u8,
-        header_count: u32,
-    };
-
-    /// Parse a stored value as batch format and extract individual records
-    /// with their payloads AND headers.  Returns 0 if value is not valid batch format.
-    fn unpackBatch(value: []const u8, out: []UnpackedRecord) usize {
-        if (value.len < 10) return 0;
-
-        const record_count = std.mem.readInt(u32, value[0..4], .little);
-        if (record_count == 0 or record_count > 10000) return 0;
-
-        var pos: usize = 4;
-        var count: usize = 0;
-
-        var i: u32 = 0;
-        while (i < record_count) : (i += 1) {
-            if (pos + 4 > value.len) return 0;
-            const payload_len = std.mem.readInt(u32, value[pos..][0..4], .little);
-            pos += 4;
-
-            if (pos + payload_len > value.len) return 0;
-            const payload = value[pos .. pos + payload_len];
-            pos += payload_len;
-
-            // Parse header_count and capture raw header bytes
-            if (pos + 2 > value.len) return 0;
-            const hdr_count = std.mem.readInt(u16, value[pos..][0..2], .little);
-            pos += 2;
-
-            const headers_start = pos;
-            var h: u16 = 0;
-            while (h < hdr_count) : (h += 1) {
-                if (pos + 2 > value.len) return 0;
-                const hkey_len = std.mem.readInt(u16, value[pos..][0..2], .little);
-                pos += 2;
-                if (pos + hkey_len > value.len) return 0;
-                pos += hkey_len;
-                if (pos + 2 > value.len) return 0;
-                const hval_len = std.mem.readInt(u16, value[pos..][0..2], .little);
-                pos += 2;
-                if (pos + hval_len > value.len) return 0;
-                pos += hval_len;
-            }
-
-            if (count < out.len) {
-                out[count] = .{
-                    .payload = payload,
-                    .headers_raw = value[headers_start..pos],
-                    .header_count = hdr_count,
-                };
-                count += 1;
-            }
-        }
-
-        if (pos != value.len) return 0;
-        return count;
     }
 
     /// Read a payload from the UAL by entry index (zero-copy fast path).
@@ -1663,7 +1588,7 @@ pub const StreamHandler = struct {
     /// (that would force a copy + a response-lived buffer for no correctness gain).
     fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
         // Hot path — entry still in the UAL ring buffer. Strip the partition
-        // prefix so callers see the bare batch blob `unpackBatch` expects.
+        // prefix so callers see the bare batch blob `BatchIterator` reads.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
                 if (self.tiered_metrics) |tm| tm.recordHotHit();
@@ -2360,6 +2285,102 @@ test "stream handler: read" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+fn makeNRecordBatch(buf: []u8, n: u32, tag: u8) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], n, .little);
+    var pos: usize = 4;
+    for (0..n) |_| {
+        std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+        buf[pos + 4] = tag;
+        std.mem.writeInt(u16, buf[pos + 5 ..][0..2], 0, .little);
+        pos += 7;
+    }
+    return buf[0..pos];
+}
+
+test "stream handler: append refuses a batch over the limit or malformed, by name" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var big_buf: [4 + (stream_mod.MAX_BATCH_RECORDS + 1) * 7]u8 = undefined;
+    const big = makeNRecordBatch(&big_buf, stream_mod.MAX_BATCH_RECORDS + 1, 'x');
+    switch (handler.handleCommand(makeRequest(.stream_append, "s1", big, ""))) {
+        .err => |e| try testing.expectEqualStrings("stream append: a batch of 1001 records is over the limit of 1000", e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    for ([_][]const u8{ "", "raw payload" }) |v| switch (handler.handleCommand(makeRequest(.stream_append, "s1", v, ""))) {
+        .err => |e| try testing.expectEqualStrings("stream append: malformed batch", e.message),
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
+}
+
+test "stream handler: a read returns whole appends and its cursor passes them" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var bufs: [3][4 + 400 * 7]u8 = undefined;
+    for (0..3) |i| _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeNRecordBatch(&bufs[i], 400, @intCast('a' + i)), ""));
+
+    // A budget of 500 records takes one 400-record append whole, not 500
+    // records split across two; the cursor is that append's last record.
+    var after: ?StreamID = null;
+    var seen: [3]u8 = undefined;
+    for (0..3) |round| {
+        var ob: [64]u8 = undefined;
+        var b = OptionsBuilder.init(&ob);
+        try b.addU32(.count, 500);
+        if (after) |a| try b.addStreamId(.stream_start, a.timestamp_ms, a.sequence);
+        const result = handler.handleCommand(makeRequest(.stream_read, "s1", "", b.getOptions()));
+        switch (result) {
+            .stream_messages => |m| {
+                defer handler.freeResult(result);
+                try testing.expectEqual(@as(u32, 400), std.mem.readInt(u32, m.data[0..4], .little));
+                const first_seq = std.mem.readInt(u64, m.data[4..12], .little);
+                try testing.expectEqual(first_seq + 399, m.next_sequence);
+                // [seq:u64][ts:i64][tier:u8][partition:u32][1:u8][key_len:u32]["s1"][len:u32][payload]
+                seen[round] = m.data[4 + 8 + 8 + 1 + 4 + 1 + 4 + 2 + 4];
+                after = .{ .timestamp_ms = m.next_timestamp_ms, .sequence = m.next_sequence };
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqualStrings("abc", &seen);
+}
+
+test "stream handler: the processing source resumes after whole appends" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var bufs: [3][4 + 400 * 7]u8 = undefined;
+    for (0..3) |i| _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeNRecordBatch(&bufs[i], 400, @intCast('a' + i)), ""));
+
+    var after = StreamID.MIN;
+    for ("abc") |tag| {
+        const got = handler.readPayloadsForStream("s1", "default", after, 500);
+        defer allocator.free(got.payloads);
+        defer allocator.free(got.ids);
+        try testing.expectEqual(@as(usize, 400), got.payloads.len);
+        for (got.payloads) |p| try testing.expectEqual(tag, p[0]);
+        // The cursor is the append's last record, not its first.
+        try testing.expectEqual(got.ids[0].sequence + 399, got.last_id.sequence);
+        after = got.last_id;
+    }
+    const done = handler.readPayloadsForStream("s1", "default", after, 500);
+    try testing.expectEqual(@as(usize, 0), done.payloads.len);
 }
 
 test "stream handler: read honors count" {

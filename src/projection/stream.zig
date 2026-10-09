@@ -135,6 +135,99 @@ pub fn decodeAppendValue(value: []const u8) AppendValue {
     };
 }
 
+/// Most records one append may carry. Reads return whole appends, so this is
+/// also the most a single append adds to one read.
+pub const MAX_BATCH_RECORDS: u32 = @import("../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS;
+
+/// One record of a batch blob: its payload and its stored header bytes,
+/// `([key_len:u16][key][val_len:u16][val])*`.
+pub const BatchRecord = struct {
+    payload: []const u8,
+    headers_raw: []const u8,
+    header_count: u16,
+};
+
+/// The records of a batch blob:
+/// `[count:u32]([payload_len:u32][payload][header_count:u16]([klen:u16][k][vlen:u16][v])*)*`.
+/// `init` checks the whole blob, so `next` never meets a malformed record.
+pub const BatchIterator = struct {
+    blob: []const u8,
+    pos: usize = 4,
+    left: u32,
+    count: u32,
+
+    pub const Error = error{ Malformed, TooManyRecords };
+
+    pub fn init(blob: []const u8) Error!BatchIterator {
+        if (blob.len < 4) return error.Malformed;
+        const count = std.mem.readInt(u32, blob[0..4], .little);
+        if (count == 0) return error.Malformed;
+        // Each record takes at least 6 bytes; a count the blob can't hold
+        // means it isn't a batch at all.
+        if (count > (blob.len - 4) / 6) return error.Malformed;
+        if (count > MAX_BATCH_RECORDS) return error.TooManyRecords;
+        const it: BatchIterator = .{ .blob = blob, .left = count, .count = count };
+        var walk = it;
+        while (walk.left > 0) : (walk.left -= 1) {
+            _ = walk.step() orelse return error.Malformed;
+        }
+        if (walk.pos != blob.len) return error.Malformed;
+        return it;
+    }
+
+    /// The record count a blob claims, without checking the rest; for
+    /// naming it in a refusal.
+    pub fn claimedCount(blob: []const u8) u32 {
+        if (blob.len < 4) return 0;
+        return std.mem.readInt(u32, blob[0..4], .little);
+    }
+
+    pub fn next(self: *BatchIterator) ?BatchRecord {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.step().?;
+    }
+
+    fn step(self: *BatchIterator) ?BatchRecord {
+        const b = self.blob;
+        var pos = self.pos;
+        if (b.len - pos < 4) return null;
+        const payload_len = std.mem.readInt(u32, b[pos..][0..4], .little);
+        pos += 4;
+        if (b.len - pos < payload_len) return null;
+        const payload = b[pos .. pos + payload_len];
+        pos += payload_len;
+        if (b.len - pos < 2) return null;
+        const header_count = std.mem.readInt(u16, b[pos..][0..2], .little);
+        pos += 2;
+        const headers_start = pos;
+        var h: u16 = 0;
+        while (h < header_count) : (h += 1) {
+            inline for (0..2) |_| {
+                if (b.len - pos < 2) return null;
+                const len = std.mem.readInt(u16, b[pos..][0..2], .little);
+                pos += 2;
+                if (b.len - pos < len) return null;
+                pos += len;
+            }
+        }
+        self.pos = pos;
+        return .{ .payload = payload, .headers_raw = b[headers_start..pos], .header_count = header_count };
+    }
+};
+
+/// How many of `records` (whole appends, in order) fit a budget of `limit`
+/// logical records. The first always counts, so a read makes progress even
+/// when one append holds more than `limit`.
+pub fn wholeEntriesWithin(records: []const StreamRecord, limit: usize) usize {
+    var total: usize = 0;
+    for (records, 0..) |rec, i| {
+        total += rec.record_count;
+        if (i > 0 and total > limit) return i;
+    }
+    return records.len;
+}
+
 /// Number of logical records packed into a batch blob. Every append is stored
 /// batch-wrapped as `[count:u32][...]`, so the count is a fixed-offset read —
 /// no payload scan and no UAL re-read. Malformed/empty blobs count as one.
@@ -1187,7 +1280,10 @@ pub const StreamProjection = struct {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         const ss = self.streams.getPtr(name_hash) orelse return 0;
 
-        const n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
+        // `count` is in records; deliver only whole appends within it, so
+        // the pending list holds exactly what the reply carries.
+        const read_n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
+        const n = wholeEntriesWithin(buf[0..read_n], count);
         if (n > 0) {
             _ = try group.deliver(consumer_id, buf[0..n], now_ms);
         }
@@ -2560,4 +2656,76 @@ test "stream: trimCount predicts trim in records, not batches" {
 
     // A boundary before every record removes nothing.
     try testing.expectEqual(@as(u64, 0), s.trimCount(hash, .{ .timestamp_ms = b1.timestamp_ms - 1, .sequence = 0 }));
+
+fn testBatch(buf: []u8, payloads: []const []const u8) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], @intCast(payloads.len), .little);
+    var pos: usize = 4;
+    for (payloads) |p| {
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(p.len), .little);
+        pos += 4;
+        @memcpy(buf[pos .. pos + p.len], p);
+        pos += p.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
+        pos += 2;
+    }
+    return buf[0..pos];
+}
+
+test "BatchIterator: yields every record with its headers" {
+    // Two records; the second carries one header k=v.
+    const blob = "\x02\x00\x00\x00" ++ "\x01\x00\x00\x00a\x00\x00" ++ "\x02\x00\x00\x00bc\x01\x00\x01\x00k\x01\x00v";
+    var it = try BatchIterator.init(blob);
+    try testing.expectEqual(@as(u32, 2), it.count);
+    const r1 = it.next().?;
+    try testing.expectEqualStrings("a", r1.payload);
+    try testing.expectEqual(@as(u16, 0), r1.header_count);
+    const r2 = it.next().?;
+    try testing.expectEqualStrings("bc", r2.payload);
+    try testing.expectEqual(@as(u16, 1), r2.header_count);
+    try testing.expectEqualStrings("\x01\x00k\x01\x00v", r2.headers_raw);
+    try testing.expectEqual(@as(?BatchRecord, null), it.next());
+}
+
+test "BatchIterator: refuses malformed blobs and too many records" {
+    const bad = [_][]const u8{
+        "",
+        "\x01\x00\x00",
+        "\x00\x00\x00\x00", // no records
+        "\x01\x00\x00\x00\x05\x00\x00\x00ab\x00\x00", // payload runs past the end
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x00", // header count cut short
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x01\x00\x09\x00k", // header key runs past the end
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x00\x00X", // trailing byte
+        "\x02\x00\x00\x00\x01\x00\x00\x00a\x00\x00", // claims two, holds one
+        "a", // a raw payload, not a batch
+    };
+    for (bad) |b| try testing.expectError(error.Malformed, BatchIterator.init(b));
+
+    const payloads = [_][]const u8{"x"} ** (MAX_BATCH_RECORDS + 1);
+    var buf: [4 + (MAX_BATCH_RECORDS + 1) * 7]u8 = undefined;
+    const over = testBatch(&buf, &payloads);
+    try testing.expectError(error.TooManyRecords, BatchIterator.init(over));
+    try testing.expectEqual(MAX_BATCH_RECORDS + 1, BatchIterator.claimedCount(over));
+}
+
+test "BatchIterator: accepts exactly the record limit" {
+    const payloads = [_][]const u8{"x"} ** MAX_BATCH_RECORDS;
+    var buf: [4 + MAX_BATCH_RECORDS * 7]u8 = undefined;
+    var it = try BatchIterator.init(testBatch(&buf, &payloads));
+    var n: u32 = 0;
+    while (it.next()) |_| n += 1;
+    try testing.expectEqual(MAX_BATCH_RECORDS, n);
+}
+
+test "wholeEntriesWithin: whole appends within the record budget, at least one" {
+    const rec = struct {
+        fn of(n: u32) StreamRecord {
+            return .{ .id = StreamID.MIN, .ual_index = 0, .partition_index = 0, .record_count = n };
+        }
+    }.of;
+    const recs = [_]StreamRecord{ rec(400), rec(400), rec(400) };
+    try testing.expectEqual(@as(usize, 1), wholeEntriesWithin(&recs, 10)); // first alone exceeds
+    try testing.expectEqual(@as(usize, 1), wholeEntriesWithin(&recs, 799));
+    try testing.expectEqual(@as(usize, 2), wholeEntriesWithin(&recs, 800));
+    try testing.expectEqual(@as(usize, 3), wholeEntriesWithin(&recs, 1000 * 1000));
+    try testing.expectEqual(@as(usize, 0), wholeEntriesWithin(recs[0..0], 5));
 }
