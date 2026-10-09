@@ -366,7 +366,7 @@ fn parseInlinePlans(allocator: Allocator, root: JsonValue, d: D) ParseError![]In
 }
 
 fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue, d: D) ParseError!InlinePlan {
-    try checkKeys(d, obj, &.{ "selection", "classify_error", "executors", "health", "cache", "fallback" });
+    try checkKeys(d, obj, &.{ "selection", "errors", "executors", "health", "cache", "fallback" });
 
     const selection = try oneOf(SelectionStrategy, d, "selection", try optString(d, obj, "selection") orelse "static-order", &.{
         .{ "static-order", .static_order },       .{ "round-robin", .round_robin },
@@ -701,8 +701,8 @@ fn freeStringList(allocator: Allocator, list: *std.ArrayList([]const u8)) void {
 }
 
 fn parseErrorClassification(allocator: Allocator, root: JsonValue, d: D) ParseError!?ErrorClassification {
-    const classify_obj = try optObject(d, root, "classify_error") orelse return null;
-    const mark = d.push("classify_error");
+    const classify_obj = try optObject(d, root, "errors") orelse return null;
+    const mark = d.push("errors");
     defer d.pop(mark);
     try checkKeys(d, classify_obj, &.{ "retryable", "fatal" });
 
@@ -820,13 +820,10 @@ fn parseHealthConfig(root: JsonValue, d: D) ParseError!?HealthConfig {
     const health_obj = try optObject(d, root, "health") orelse return null;
     const mark = d.push("health");
     defer d.pop(mark);
-    try checkKeys(d, health_obj, &.{ "window", "decay", "min_samples" });
+    try checkKeys(d, health_obj, &.{ "window_ms", "decay", "min_samples" });
 
-    // A window like "5m" -> 300000 ms
-    const window_ms: i64 = if (try optString(d, health_obj, "window")) |w|
-        parseTimeString(w) orelse return d.fail(ParseError.InvalidFieldType, "\"window\" must be a duration like 30s, 5m, 1h or 1d, not \"{s}\"", .{w})
-    else
-        300000;
+    const window_ms: i64 = try optIntAs(u32, d, health_obj, "window_ms") orelse 300000;
+    if (window_ms == 0) return d.fail(ParseError.InvalidFieldType, "\"window_ms\" must be at least 1", .{});
 
     return .{
         .window_ms = window_ms,
@@ -839,10 +836,10 @@ fn parseCacheConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?Cac
     const cache_obj = try optObject(d, root, "cache") orelse return null;
     const mark = d.push("cache");
     defer d.pop(mark);
-    try checkKeys(d, cache_obj, &.{ "ttl_ms", "key_template", "invalidate_on" });
+    try checkKeys(d, cache_obj, &.{ "ttl_ms", "key", "invalidate_on" });
 
     const ttl_ms = try optInt(d, cache_obj, "ttl_ms") orelse 300000;
-    const key_template = try reqString(d, cache_obj, "key_template");
+    const key_template = try reqString(d, cache_obj, "key");
 
     var invalidate_on: std.ArrayList([]const u8) = .empty;
     errdefer freeStringList(allocator, &invalidate_on);
@@ -874,22 +871,6 @@ fn parseFallbackConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?
     };
 }
 
-/// Parse time string like "5m", "1h", "30s" to milliseconds
-fn parseTimeString(s: []const u8) ?i64 {
-    if (s.len < 2) return null;
-
-    const unit = s[s.len - 1];
-    const num_str = s[0 .. s.len - 1];
-    const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
-    const ms_per: i64 = switch (unit) {
-        's' => 1000,
-        'm' => 60 * 1000,
-        'h' => 60 * 60 * 1000,
-        'd' => 24 * 60 * 60 * 1000,
-        else => return null,
-    };
-    return std.math.mul(i64, num, ms_per) catch null;
-}
 
 // =============================================================================
 // Tests
@@ -1023,15 +1004,6 @@ test "parseWorkflow: with custom terminals" {
     try testing.expectEqual(@as(usize, 2), def.terminals.len);
 }
 
-test "parseTimeString" {
-    const testing = std.testing;
-
-    try testing.expectEqual(@as(?i64, 5000), parseTimeString("5s"));
-    try testing.expectEqual(@as(?i64, 300000), parseTimeString("5m"));
-    try testing.expectEqual(@as(?i64, 3600000), parseTimeString("1h"));
-    try testing.expectEqual(@as(?i64, 86400000), parseTimeString("1d"));
-    try testing.expectEqual(@as(?i64, null), parseTimeString("x"));
-}
 
 test "parseWorkflow: YAML with inline plans" {
     const testing = std.testing;
@@ -1186,10 +1158,6 @@ test "parseWorkflow: a count or delay that doesn't fit its field is refused" {
     }
 }
 
-test "parseTimeString: a duration that doesn't fit is invalid" {
-    try std.testing.expectEqual(@as(?i64, null), parseTimeString("106751991168d"));
-    try std.testing.expectEqual(@as(?i64, null), parseTimeString("9223372036854775807s"));
-}
 
 /// The diagnostic a definition is refused with.
 fn expectRefused(content: []const u8, expected: ParseError, message: []const u8) !void {
@@ -1248,14 +1216,14 @@ test "parseWorkflow: an unknown enum value is refused, not defaulted" {
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "fallback": { "value": "{}", "condition": "any" } } },
     ), ParseError.InvalidFallbackCondition, "\"condition\" must be one of exhausted|any_error, not \"any\" at plans.p.fallback");
     try expectRefused(wrap("",
-        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "health": { "window": "5 minutes" } } },
-    ), ParseError.InvalidFieldType, "\"window\" must be a duration like 30s, 5m, 1h or 1d, not \"5 minutes\" at plans.p.health");
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "health": { "window": "5m" } } },
+    ), ParseError.UnknownKey, "unknown key \"window\" at plans.p.health");
 }
 
 test "parseWorkflow: a required key that was silently optional is required" {
     try expectRefused(wrap("",
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "cache": { "ttl_ms": 5 } } },
-    ), ParseError.MissingRequiredField, "missing required key \"key_template\" at plans.p.cache");
+    ), ParseError.MissingRequiredField, "missing required key \"key\" at plans.p.cache");
     try expectRefused(wrap("", "\"search_attributes\": [ { \"name\": \"a\" } ],"), ParseError.MissingRequiredField, "missing required key \"from\" at search_attributes[0]");
     try expectRefused(
         \\{ "kind": "Workflow", "name": "w", "version": "1", "start": { "transitions": {} } }
@@ -1297,7 +1265,7 @@ test "parseWorkflow: snake_case keys parse" {
         \\plans:
         \\  pay:
         \\    selection: round-robin
-        \\    classify_error:
+        \\    errors:
         \\      retryable: [timeout]
         \\    executors:
         \\      - name: a
@@ -1309,11 +1277,11 @@ test "parseWorkflow: snake_case keys parse" {
         \\          cooldown_ms: 100
         \\          half_open_max_calls: 1
         \\    health:
-        \\      window: 1m
+        \\      window_ms: 60000
         \\      min_samples: 10
         \\    cache:
         \\      ttl_ms: 1000
-        \\      key_template: "k"
+        \\      key: "k"
         \\      invalidate_on: [x]
         \\start:
         \\  run: "@plan/pay"
@@ -1344,5 +1312,7 @@ test "parseWorkflow: snake_case keys parse" {
     try std.testing.expectEqualStrings("g", def.trigger.?.consumer_group.?);
     try std.testing.expectEqual(@as(?u32, 5), def.plans[0].executors[0].rate_limit.?.max_per_second);
     try std.testing.expectEqual(@as(u32, 10), def.plans[0].health_config.?.min_samples);
+    try std.testing.expectEqual(@as(i64, 60000), def.plans[0].health_config.?.window_ms);
+    try std.testing.expectEqualStrings("k", def.plans[0].cache_config.?.key_template);
     try std.testing.expectEqual(@as(usize, 1), def.plans[0].error_classification.?.retryable.len);
 }
