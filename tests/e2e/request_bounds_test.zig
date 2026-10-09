@@ -152,6 +152,30 @@ test "e2e/bounds: a ts write value that isn't one finite f64 is refused by name"
     try testing.expectEqualStrings("(no data)\n", read.stdout);
 }
 
+/// Sends one `op` request on `fd` and returns its answer, which must be
+/// the only bytes the server wrote back.
+fn roundTrip(fd: std.c.fd_t, op: u16, out: []u8) !proto.Response {
+    var h = header(.kv_get);
+    h.op_code = op;
+    const payload = [_]u8{ 0, 0, 1, 0, 'k', 0, 0, 0, 0, 0, 0 };
+    h.payload_length = payload.len;
+    h.crc32 = h.computeCRC32(&payload);
+    var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;
+    @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&h));
+    @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
+    if (std.c.write(fd, &frame, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
+
+    var got: usize = 0;
+    const r = for (0..300) |_| {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) return error.Closed;
+        if (proto.Response.parse(out[0..got])) |r| break r else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    } else return error.NoResponse;
+    try testing.expectEqual(got, @sizeOf(proto.ResponseHeader) + r.data.len);
+    return r;
+}
+
 test "e2e/bounds: an op no handler serves is refused as unknown, and the connection keeps serving" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
@@ -159,32 +183,16 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
     var out: [4096]u8 = undefined;
-    for ([_]struct { op: u16, why: []const u8 }{
-        .{ .op = @intFromEnum(proto.OpCode.queue_touch), .why = "" },
-        .{ .op = 0x0FFE, .why = "unknown op 0xffe" },
-        .{ .op = 0xFFFF, .why = "unknown op 0xffff" },
-    }) |c| {
-        var h = header(.kv_get);
-        h.op_code = c.op;
-        const payload = [_]u8{ 0, 0, 1, 0, 'k', 0, 0, 0, 0, 0, 0 };
-        h.payload_length = payload.len;
-        h.crc32 = h.computeCRC32(&payload);
-        var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;
-        @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&h));
-        @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
-        if (std.c.write(fd, &frame, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
-
-        var got: usize = 0;
-        const r = for (0..300) |_| {
-            const rc = std.c.read(fd, out[got..].ptr, out.len - got);
-            if (rc > 0) got += @intCast(rc) else if (rc == 0) return error.Closed;
-            if (proto.Response.parse(out[0..got])) |r| break r else |_| {}
-            stdx.time.sleep(10 * std.time.ns_per_ms);
-        } else return error.NoResponse;
-        try testing.expectEqual(got, @sizeOf(proto.ResponseHeader) + r.data.len);
+    // queue_touch is in the op table with no handler; 0x0FFE and 0xFFFF
+    // both lie past the table and take the same branch.
+    for ([_]u16{ @intFromEnum(proto.OpCode.queue_touch), 0x0FFE, 0xFFFF }) |op| {
+        const r = try roundTrip(fd, op, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
         var want: [32]u8 = undefined;
-        try testing.expectEqualStrings(if (c.why.len > 0) c.why else std.fmt.bufPrint(&want, "unknown op 0x{x}", .{c.op}) catch unreachable, r.data);
+        try testing.expectEqualStrings(std.fmt.bufPrint(&want, "unknown op 0x{x}", .{op}) catch unreachable, r.data);
     }
-    try testing.expect(try kvAlive(ctx));
+    // The same connection still answers.
+    const pong = try roundTrip(fd, @intFromEnum(proto.OpCode.ping), &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), pong.header.status);
+    try testing.expectEqualStrings("PONG", pong.data);
 }

@@ -1512,9 +1512,8 @@ pub const Shard = struct {
         }
         if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
 
-        // The answer arrives on this shard's reply ring. Suppress the "not
-        // implemented" guard in processRequests so the connection waits for
-        // it rather than getting a stub error.
+        // The answer arrives on this shard's reply ring; marked deferred so
+        // the no-answer fallback leaves the connection waiting for it.
         conn.recordForward();
         conn.response_deferred = true;
     }
@@ -3410,8 +3409,10 @@ pub const Shard = struct {
             conn.head_since_ms = null;
             conn.has_turn = false;
 
-            // If handler didn't queue any response, check if it was deferred
-            if (conn.write_buf.readable() == pending_before and !conn.response_deferred) {
+            // If handler didn't queue any response, check if it was deferred.
+            // An answer refused because the client let 4 MiB of answers pile
+            // up unread was produced; the connection closes on the next flush.
+            if (conn.write_buf.readable() == pending_before and !conn.response_deferred and !conn.write_overflow and !conn.closing) {
                 if (answered_deferred) {
                     self.answeredAsDeferred(req);
                 } else {
@@ -3927,7 +3928,7 @@ pub const Shard = struct {
         const name = if (std.enums.tagName(proto.OpCode, @enumFromInt(req.header.op_code))) |n| n else "?";
         log.err("shard {d}: request {d} ({s}) got no answer from its handler. This is a bug", .{ self.id, req.header.request_id, name });
         if (self.shard_metrics) |sm| sm.recordHandlerNoAnswer();
-        if (builtin.mode == .Debug) @panic("a handler produced no answer");
+        if (builtin.mode == .Debug and !builtin.is_test) @panic("a handler produced no answer");
         return "internal error: the handler produced no answer";
     }
 
@@ -8720,4 +8721,120 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
     try std.testing.expect(std.unicode.utf8ValidateSlice(one[0].data));
     try std.testing.expect(std.mem.endsWith(u8, one[0].data, proto.Response.TRUNCATED_MARKER));
     try std.testing.expect(one[0].data.len > 900);
+}
+
+test "Shard: a request whose handler answers nothing is answered internal_error and counted" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var sm = ShardMetrics{ .shard_id = 0 };
+    shard.shard_metrics = &sm;
+    defer shard.shard_metrics = null;
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    const Silent = struct {
+        fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
+    };
+    shard.dispatcher.register(.queue_touch, Silent.handle);
+
+    const frame = try testRequest(.queue_touch, 12, "q", "");
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    var one: [1]proto.Response = undefined;
+    var buf: [1024]u8 = undefined;
+    try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 12), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+    try std.testing.expectEqualStrings("internal error: the handler produced no answer", one[0].data);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().handler_no_answer);
+}
+
+test "Shard: an answer refused for a full write buffer is not taken for a missing answer" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    shard.shard_metrics = &sm;
+    defer shard.shard_metrics = null;
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    // A client unpaced after stalling, its unsent answers 8 bytes short of
+    // the cap: the ping's answer doesn't fit and is refused.
+    c.conn.pacing_off = true;
+    const filler = try std.testing.allocator.alloc(u8, Connection.MAX_WRITE_BUFFER - 8);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 0);
+    try std.testing.expectEqual(filler.len, c.conn.queueWrite(filler));
+
+    const ping = try testRequest(.ping, 13, "", "");
+    defer std.testing.allocator.free(ping);
+    try std.testing.expectEqual(@as(isize, @intCast(ping.len)), std.c.write(c.pair[1], ping.ptr, ping.len));
+    shard.readFromClient(c.conn.fd);
+    try std.testing.expect(c.conn.write_overflow);
+    try std.testing.expectEqual(@as(u64, 0), sm.snapshot().handler_no_answer);
+}
+
+test "Shard: a run whose task couldn't be sent goes to an await parked on another shard" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        try std.testing.expect(s.applyCommitted());
+    }
+    const owner = &two.shards[0];
+    const other = &two.shards[1];
+    // An action name shard 0 owns, so its register and invoke run there.
+    var name_buf: [16]u8 = undefined;
+    const name = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
+        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+    } else return error.NoLocalName;
+
+    const ca = try TestClient.open(owner);
+    defer _ = std.c.close(ca.pair[1]);
+    var out: [4096]u8 = undefined;
+    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job";
+    for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
+        .{ .op = .action_register, .id = 1, .value = "" },
+        .{ .op = .action_invoke, .id = 2, .value = invoke_value },
+    }) |r| {
+        const frame = try testRequest(r.op, r.id, name, r.value);
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(ca.pair[1], owner, ca.conn.fd, frame);
+        _ = owner.applyCommitted();
+        const resp = try nextAnswer(ca, owner, &out);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    }
+
+    // Claimed, as by an await whose task then couldn't be built. The
+    // invoke's own wake is spent before the other shard's await parks.
+    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
+    _ = other.drainInbox();
+    const cb = try TestClient.open(other);
+    defer _ = std.c.close(cb.pair[1]);
+    var await_value: [64]u8 = undefined;
+    std.mem.writeInt(u32, await_value[0..4], 1, .little);
+    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
+    @memcpy(await_value[6..][0..name.len], name);
+    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    defer std.testing.allocator.free(aw);
+    _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
+    other.flushToClient(cb.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
+
+    @import("../actions/handler.zig").releaseAndWake(owner, task);
+    _ = other.drainInbox();
+    const resp = try nextAnswer(cb, other, &out);
+    try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
 }
