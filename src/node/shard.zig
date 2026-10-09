@@ -616,7 +616,7 @@ pub const Shard = struct {
                 }
                 raft_node.current_term = hs.term;
                 raft_node.voted_for = hs.voted_for;
-                if (hs.lost_log) raft_node.lost_log = .catching_up;
+                if (hs.lost_log) raft_node.resumeLostLog();
             }
             const store = try allocator.create(HardStateStore);
             store.* = .{ .dir = shard_dir, .node_id = node_id, .shard_id = shard_id };

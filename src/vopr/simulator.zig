@@ -363,6 +363,9 @@ pub const Options = struct {
     /// Restart wiped nodes without the lost-log guard: the demonstrator
     /// of what the guard prevents.
     no_lost_log_guard: bool = false,
+    /// The guard without its boot wait: the demonstrator of the split vote
+    /// the wait prevents.
+    no_lost_log_wait: bool = false,
     /// Print per-phase progress.
     verbose: bool = false,
     /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
@@ -622,7 +625,7 @@ pub const Simulator = struct {
         // mode, so such a node restarts at term 0.
         node.raft.current_term = node.disk.term;
         node.raft.voted_for = node.disk.voted_for;
-        if (node.disk.lost_log) node.raft.lost_log = .catching_up;
+        if (node.disk.lost_log) node.raft.resumeLostLog();
         self.attachDisk(node);
         if (node.wiped) {
             node.wiped = false;
@@ -632,6 +635,7 @@ pub const Simulator = struct {
             node.lost_hard_state = false;
             if (!self.options.no_lost_log_guard) node.raft.enterLostVote() catch unreachable;
         }
+        if (self.options.no_lost_log_wait) node.raft.hold_pending = false;
         node.up = true;
         node.sent_at = @splat(0);
         node.last_heartbeat = @splat(0);
@@ -1432,4 +1436,82 @@ test "vopr sim: swarms with wiped disks keep every invariant" {
     // Some runs end with a node still guarded, and convergence waited for
     // it to finish.
     try testing.expect(watched >= 1);
+}
+
+/// Seven nodes. A and B stand in one term t, cut off from the rest; X votes
+/// for A, loses its disk, restarts, catches up from the old leader L and
+/// polls. The moment X's guard is done, the votes are split: X, L and P
+/// to A (X's from before the wipe), and X, Q and R to B. Two leaders in t
+/// unless every candidacy in t has given up by then.
+fn splitVoteAcrossAWipe(sim: *Simulator) !void {
+    try runTicks(sim, 10_000);
+    // No new writes, so every log is the same and each candidate's is
+    // up to date for every voter.
+    sim.scenario.request_percent = 0;
+    try runTicks(sim, 2_000);
+    const l = leaderOf(sim) orelse return error.NoLeader;
+    var rest: [6]NodeId = undefined;
+    var n: usize = 0;
+    for (sim.nodes) |*node| {
+        if (node.id == l) continue;
+        rest[n] = node.id;
+        n += 1;
+    }
+    const a = sim.node_(rest[0]);
+    const b = sim.node_(rest[1]);
+    const x = sim.node_(rest[2]);
+    const p = sim.node_(rest[3]);
+    const q = sim.node_(rest[4]);
+    const r = sim.node_(rest[5]);
+    sim.net.isolate(a.id);
+    sim.net.isolate(b.id);
+    const req_a = a.raft.startElectionNow().?;
+    const req_b = b.raft.startElectionNow().?;
+    try testing.expectEqual(req_a.term, req_b.term);
+    // X had lost touch with L too when A asked.
+    x.raft.last_leader_contact_ms = 0;
+    const x_for_a = x.raft.handleVoteRequest(req_a);
+    try testing.expect(x_for_a.vote_granted);
+
+    sim.wipeNode(x);
+    try sim.restartNode(x);
+    var guard_ticks: u64 = 0;
+    while (x.raft.lost_log != .none) : (guard_ticks += 1) {
+        if (guard_ticks > 20_000) return error.GuardNeverDone;
+        try sim.tick();
+    }
+
+    // L is gone from here on, as far as X, P, Q and R can tell.
+    for ([_]*SimNode{ x, p, q, r }) |node| node.raft.last_leader_contact_ms = 0;
+    const x_for_b = x.raft.handleVoteRequest(req_b);
+    const votes_a = [_]raft_node.VoteResponse{ x_for_a, sim.node_(l).raft.handleVoteRequest(req_a), p.raft.handleVoteRequest(req_a) };
+    const votes_b = [_]raft_node.VoteResponse{ x_for_b, q.raft.handleVoteRequest(req_b), r.raft.handleVoteRequest(req_b) };
+    for (votes_a) |v| if (a.raft.handleVoteResponse(v) == .won) sim.checker.onLeader(a, sim.now);
+    for (votes_b) |v| if (b.raft.handleVoteResponse(v) == .won) sim.checker.onLeader(b, sim.now);
+}
+
+fn splitVoteScenario() Scenario {
+    var scenario = Scenario.calm(21);
+    scenario.node_count = 7;
+    scenario.restart_permille = 0;
+    // Long candidacies, so one is still collecting votes when a guard
+    // without the wait finishes.
+    scenario.election_timeout_min_ms = 2000;
+    scenario.election_timeout_max_ms = 3000;
+    scenario.heartbeat_interval_ms = 50;
+    return scenario;
+}
+
+test "vopr sim: a wiped voter's guard without the boot wait lets a split vote elect two leaders in one term" {
+    var sim = try Simulator.init(testing.allocator, splitVoteScenario(), .{ .no_lost_log_wait = true });
+    defer sim.deinit();
+    try splitVoteAcrossAWipe(&sim);
+    try testing.expect(hasViolation(&sim, .election_safety));
+}
+
+test "vopr sim: with the boot wait, a split vote across a wipe elects no second leader" {
+    var sim = try Simulator.init(testing.allocator, splitVoteScenario(), .{});
+    defer sim.deinit();
+    try splitVoteAcrossAWipe(&sim);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
 }

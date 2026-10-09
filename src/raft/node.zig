@@ -312,6 +312,12 @@ pub const RaftNode = struct {
     // ── Lost-log guard ─────────────────────────────────────────────────
     lost_log: LostLog = .none,
     poll: TermPoll = .{},
+    /// A lost-log node counts no poll answer until one maximum election
+    /// timeout after it booted: a candidacy it voted for before it lost its
+    /// disk has by then either won, so the poll sees its term, or given up.
+    /// Armed at the first tick, the first clock the node has.
+    hold_pending: bool = false,
+    hold_until_ms: u64 = 0,
 
     // ── Log ────────────────────────────────────────────────────────────
     log: RaftLog,
@@ -547,7 +553,11 @@ pub const RaftNode = struct {
             },
             .follower, .candidate => {
                 if (self.lost_log != .none) {
-                    if (self.lost_log == .confirming and now_ms -| self.poll.sent_ms >= self.config.heartbeat_interval_ms) {
+                    if (self.hold_pending) {
+                        self.hold_pending = false;
+                        self.hold_until_ms = now_ms + self.config.election_timeout_max_ms;
+                    }
+                    if (self.lost_log == .confirming and !self.holding() and now_ms -| self.poll.sent_ms >= self.config.heartbeat_interval_ms) {
                         self.poll.sent_ms = now_ms;
                         result.send_term_poll = true;
                     }
@@ -984,13 +994,27 @@ pub const RaftNode = struct {
     /// This node has no log: guard it, durably, before it answers anyone.
     pub fn enterLostLog(self: *RaftNode) !void {
         self.lost_log = .catching_up;
+        self.hold_pending = true;
         if (!self.persistHardState()) return error.HardStateNotDurable;
+    }
+
+    /// Booted with the guard on record from a run that did not finish it:
+    /// it starts over, wait included.
+    pub fn resumeLostLog(self: *RaftNode) void {
+        self.lost_log = .catching_up;
+        self.hold_pending = true;
+    }
+
+    /// Within the boot wait: no poll answer counts yet.
+    fn holding(self: *const RaftNode) bool {
+        return self.hold_pending or self.current_time_ms < self.hold_until_ms;
     }
 
     /// This node kept its log but lost its hard state: the log is real, so
     /// there is nothing to catch up, but the vote it cast in the current
     /// term is gone. It confirms the term before it votes again.
     pub fn enterLostVote(self: *RaftNode) !void {
+        self.hold_pending = true;
         self.startTermPoll();
         if (!self.persistHardState()) return error.HardStateNotDurable;
     }
@@ -1088,6 +1112,9 @@ pub const RaftNode = struct {
     /// quorum overlapping that one, so none is above ours.
     pub fn handleTermPollResponse(self: *RaftNode, resp: TermPollResponse) void {
         if (self.lost_log != .confirming or !self.termPlausible(resp.term)) return;
+        // Polls go out only after the wait; an answer within it is a
+        // duplicate or a stray, and counts for nothing.
+        if (self.holding()) return;
         if (resp.term > self.current_term) {
             self.stepDown(resp.term);
             return;
@@ -2802,6 +2829,14 @@ fn lostLogCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
     try testing.expectEqual(LostLog.catching_up, node.lost_log);
     _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = es[2..3], .leader_commit = 3, .leader_last_index = 3 });
     try testing.expectEqual(LostLog.confirming, node.lost_log);
+    passBootWait(node);
+}
+
+/// Past the boot wait: the first tick arms it, a later one ends it.
+fn passBootWait(node: *RaftNode) void {
+    const start = node.current_time_ms + 1;
+    _ = node.tick(start);
+    _ = node.tick(start + node.config.election_timeout_max_ms + 1);
 }
 
 fn pollAnswer(from: NodeId, term: u64, config_index: u64, config_term: u64, members: []const NodeId) TermPollResponse {
@@ -2889,6 +2924,7 @@ test "raft node: a node that kept its log but lost its hard state confirms the t
     try node.enterLostVote();
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     try testing.expect(rec.lost_log);
+    passBootWait(&node);
     node.current_time_ms = 10_000_000;
     try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
 
@@ -2930,7 +2966,27 @@ test "raft node: a lost-log node in a group of two confirms with the other membe
     };
     _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2, .leader_last_index = 2 });
     try testing.expectEqual(LostLog.confirming, node.lost_log);
+    passBootWait(&node);
     // Any quorum that counted this node's vote also held node 1.
     node.handleTermPollResponse(pollAnswer(1, 1, 2, 1, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
+}
+
+test "raft node: a lost-log node counts no poll answer, and polls no one, within one election timeout of boot" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9, .election_timeout_max_ms = 300 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.setMembership(&.{ 1, 2 }, 1);
+    try node.enterLostVote();
+    // Before the first tick there is no clock: it waits.
+    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(!node.tick(1000).send_term_poll);
+    try testing.expect(!node.tick(1299).send_term_poll);
+    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(node.tick(1300).send_term_poll);
+    node.handleTermPollResponse(pollAnswer(1, 0, 1, 0, &.{ 1, 2 }));
     try testing.expectEqual(LostLog.none, node.lost_log);
 }
