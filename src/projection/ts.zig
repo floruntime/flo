@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.ts_projection);
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
 
@@ -980,6 +981,23 @@ pub const TSProjection = struct {
                             rec.tags,
                         );
                     }
+                }
+            },
+            .ts_delete => {
+                if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
+                    _ = self.deleteMeasurement(cmd.namespace_hash, cmd.key);
+                } else {
+                    log.err("ts delete entry index={d} is malformed; skipped, so the measurement stays", .{ual_entry.header.index});
+                }
+            },
+            // The cutoff was taken once, where the entry was proposed, so
+            // every replica trims the same points.
+            .ts_retention => {
+                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload);
+                if (cmd != null and cmd.?.value.len == 8) {
+                    _ = self.applyRetention(cmd.?.namespace_hash, cmd.?.key, std.mem.readInt(u64, cmd.?.value[0..8], .little));
+                } else {
+                    log.err("ts retention entry index={d} is malformed; skipped, so nothing is trimmed", .{ual_entry.header.index});
                 }
             },
             else => {},

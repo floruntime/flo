@@ -115,12 +115,22 @@ pub const TSHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.ts_handler.handleCommand(req);
         defer shard.ts_handler.freeResult(result);
-        if (result == .parked) return shard.park(conn, req, result.parked, respondTS);
+        if (result == .parked) {
+            const op: OpCode = @enumFromInt(req.header.op_code);
+            return shard.park(conn, req, result.parked, if (op == .ts_write) respondTS else respondApplied);
+        }
         switch (result) {
             .ts_write_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
         }
         sendTSResponse(shard, conn, req.header.request_id, result);
+    }
+
+    /// A parked delete or retention applied: nothing to report but that.
+    fn respondApplied(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        sendTSResponse(shard, conn, req.header.request_id, .ok);
     }
 
     /// A parked write applied: the point's timestamp is the client's or,
@@ -543,8 +553,15 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
         }
 
-        const removed = self.ts.deleteMeasurement(router.namespaceHash(req.namespace), req.key);
-        _ = removed;
+        // Through the log, so the delete survives a restart and every
+        // replica applies it. Without a shard (unit tests), applied here.
+        if (self.shard_ptr) |sptr| {
+            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_delete, entry_mod.Flags.NONE, req.namespace, req.key, "") catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts delete not persisted") } };
+            };
+            return .{ .parked = proposed };
+        }
+        _ = self.ts.deleteMeasurement(router.namespaceHash(req.namespace), req.key);
         return .ok;
     }
 
@@ -578,8 +595,15 @@ pub const TSHandler = struct {
         else
             0;
 
-        const evicted = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, cutoff_ns);
-        _ = evicted;
+        if (self.shard_ptr) |sptr| {
+            var cutoff: [8]u8 = undefined;
+            std.mem.writeInt(u64, &cutoff, cutoff_ns, .little);
+            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_retention, entry_mod.Flags.NONE, req.namespace, req.key, &cutoff) catch |err| {
+                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts retention not persisted") } };
+            };
+            return .{ .parked = proposed };
+        }
+        _ = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, cutoff_ns);
         return .ok;
     }
 

@@ -252,7 +252,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => .queue,
 
         // TimeSeries
-        .ts_write, .ts_write_batch => .ts,
+        .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .ts,
 
         // Stream — no projection (UAL direct reads)
         .stream_append, .stream_trim, .stream_delete => .none,

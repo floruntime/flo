@@ -79,6 +79,8 @@ pub const EntryType = enum(u8) {
     // ── TimeSeries ──
     ts_write = 0x30,
     ts_write_batch = 0x31,
+    ts_delete = 0x32,
+    ts_retention = 0x33,
 
     // ── Consumer Groups ──
     cg_commit = 0x40,
@@ -123,7 +125,7 @@ pub const EntryType = enum(u8) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_touch => true,
             .stream_append, .stream_trim, .stream_delete => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
-            .ts_write, .ts_write_batch => true,
+            .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start, .workflow_complete => true,
             .namespace_create, .namespace_delete, .namespace_config => true,
