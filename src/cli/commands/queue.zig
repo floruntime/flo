@@ -89,15 +89,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("touch")
-                .about("Extend message visibility timeout")
-                .arg("queue", "Queue name")
-                .arg("seq", "Sequence number(s)")
-                .uintFlag("extend", 'e', 0, "New visibility timeout in milliseconds (default: reset to original timeout)")
-                .action(wrapHandler(runTouch)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
                 .name("ack")
                 .about("Acknowledge message processing")
                 .aliases(&.{"complete"})
@@ -327,42 +318,6 @@ fn runPeek(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.print("(empty)\n", .{});
     }
-}
-
-fn runTouch(ctx: *commander.Context) commander.Error!void {
-    const queue = ctx.getPositional("queue").?; // validated by commander
-    const seq_str = ctx.getPositional("seq").?; // validated by commander
-
-    const seq = std.fmt.parseInt(u64, seq_str, 10) catch {
-        ctx.printErr("Error: Invalid sequence number\n", .{});
-        return error.CommandFailed;
-    };
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-    const extend_ms: u32 = @intCast(ctx.getUint("extend").?);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
-
-    // touch(client, namespace, queue, seqs, extend_ms)
-    var result = client_mod.queue.touch(&client, namespace, queue, &[_]u64{seq}, extend_ms) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
-    defer result.deinit();
-
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
-
-    ctx.print("OK\n", .{});
 }
 
 fn runAck(ctx: *commander.Context) commander.Error!void {

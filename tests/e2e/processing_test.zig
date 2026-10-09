@@ -277,52 +277,6 @@ test "e2e/processing: protocol request building - restore" {
 // Processing Result Tests
 // =============================================================================
 
-test "e2e/processing: result opcode mapping" {
-    const CommandResult = src.protocol.result.CommandResult;
-    const proto = src.protocol.proto;
-
-    // Test all processing result → opcode mappings
-    const submitted = CommandResult{ .processing_submitted = .{ .job_id = "job-1" } };
-    try testing.expectEqual(proto.OpCode.processing_submit_response, submitted.opcode());
-
-    const stopped = CommandResult{ .processing_stopped = {} };
-    try testing.expectEqual(proto.OpCode.processing_stop_response, stopped.opcode());
-
-    const cancelled = CommandResult{ .processing_cancelled = {} };
-    try testing.expectEqual(proto.OpCode.processing_cancel_response, cancelled.opcode());
-
-    const status_result = CommandResult{ .processing_status_result = .{ .data = "{}" } };
-    try testing.expectEqual(proto.OpCode.processing_status_response, status_result.opcode());
-
-    const list_result = CommandResult{ .processing_list_result = .{ .data = "[]" } };
-    try testing.expectEqual(proto.OpCode.processing_list_response, list_result.opcode());
-
-    const sp_result = CommandResult{ .processing_savepoint_result = .{ .savepoint_id = "sp-1" } };
-    try testing.expectEqual(proto.OpCode.processing_savepoint_response, sp_result.opcode());
-
-    const restored = CommandResult{ .processing_restored = {} };
-    try testing.expectEqual(proto.OpCode.processing_restore_response, restored.opcode());
-
-    const rescaled = CommandResult{ .processing_rescaled = {} };
-    try testing.expectEqual(proto.OpCode.processing_rescale_response, rescaled.opcode());
-}
-
-test "e2e/processing: result serialized size" {
-    const CommandResult = src.protocol.result.CommandResult;
-
-    const submitted = CommandResult{ .processing_submitted = .{ .job_id = "job-123" } };
-    const size = submitted.serializedSize();
-    // tag(1) + len(4) + "job-123"(7) = 12
-    try testing.expectEqual(@as(usize, 12), size);
-
-    const stopped = CommandResult{ .processing_stopped = {} };
-    try testing.expectEqual(@as(usize, 1), stopped.serializedSize());
-
-    const list_result = CommandResult{ .processing_list_result = .{ .data = "[]" } };
-    // tag(1) + len(4) + "[]"(2) + has_cursor(1) = 8
-    try testing.expectEqual(@as(usize, 8), list_result.serializedSize());
-}
-
 // =============================================================================
 // Processing OpCode Contract Tests
 // =============================================================================
@@ -339,20 +293,6 @@ test "e2e/processing: processing opcodes are defined" {
     try testing.expectEqual(@as(u16, 0x365), @intFromEnum(proto.OpCode.processing_savepoint));
     try testing.expectEqual(@as(u16, 0x366), @intFromEnum(proto.OpCode.processing_restore));
     try testing.expectEqual(@as(u16, 0x367), @intFromEnum(proto.OpCode.processing_rescale));
-}
-
-test "e2e/processing: processing response opcodes are defined" {
-    const proto = src.protocol.proto;
-
-    // Response opcodes must pair with request opcodes (wire contract)
-    try testing.expectEqual(@as(u16, 0x370), @intFromEnum(proto.OpCode.processing_submit_response));
-    try testing.expectEqual(@as(u16, 0x371), @intFromEnum(proto.OpCode.processing_stop_response));
-    try testing.expectEqual(@as(u16, 0x372), @intFromEnum(proto.OpCode.processing_cancel_response));
-    try testing.expectEqual(@as(u16, 0x373), @intFromEnum(proto.OpCode.processing_status_response));
-    try testing.expectEqual(@as(u16, 0x374), @intFromEnum(proto.OpCode.processing_list_response));
-    try testing.expectEqual(@as(u16, 0x375), @intFromEnum(proto.OpCode.processing_savepoint_response));
-    try testing.expectEqual(@as(u16, 0x376), @intFromEnum(proto.OpCode.processing_restore_response));
-    try testing.expectEqual(@as(u16, 0x377), @intFromEnum(proto.OpCode.processing_rescale_response));
 }
 
 // =============================================================================

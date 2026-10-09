@@ -90,43 +90,6 @@ pub const RequestBuilder = struct {
     }
 
     // =========================================================================
-    // Durability
-    // =========================================================================
-
-    /// Durability mode for per-connection override
-    pub const DurabilityMode = enum(u8) {
-        sync = 0,
-        async_mode = 1,
-        use_default = 255, // Clear override, use server config
-    };
-
-    /// Set durability mode for this connection
-    ///
-    /// Call once after connecting to override the server's default durability.
-    /// - `.sync`: Full ACID (waits for fdatasync) - payments, workflows
-    /// - `.async_mode`: High throughput (kernel page cache) - logs, analytics
-    /// - `.use_default`: Clear override, use server's config default
-    pub fn setDurability(self: *RequestBuilder, mode: DurabilityMode) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.set_durability),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
-            .namespace = &[_]u8{},
-            .key = &[_]u8{},
-            .value = &[_]u8{@intFromEnum(mode)},
-        };
-    }
-
-    // =========================================================================
     // Namespace-aware API
     // =========================================================================
 

@@ -269,7 +269,7 @@ pub fn jsonDel(client: *Client, namespace: []const u8, key: []const u8, path: []
 // ── Per-Shard Transactions ───────────────────────────────────────────────
 
 /// BEGIN — open a per-shard transaction pinned to `routing_key`'s partition.
-/// On success the response is a `kv_txn_response` carrying the new txn_id.
+/// On success the response carries the new txn_id.
 /// Use `Response.getTxnId()` to extract it.
 pub fn beginTxn(client: *Client, namespace: []const u8, routing_key: []const u8) !Response {
     var options_buf: [96]u8 = undefined;

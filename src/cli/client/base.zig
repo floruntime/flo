@@ -100,7 +100,7 @@ pub const Response = struct {
         };
     }
 
-    /// Decode a kv_txn_response carrying a `kv_txn_begin_ok` payload.
+    /// Decode a transaction begin answer.
     /// Wire payload: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE].
     /// Returns null if the response is not a valid begin-ok envelope.
     pub fn getTxnBeginResult(self: Response) ?struct { txn_id: u64, pinned_hash: u64 } {
@@ -111,7 +111,7 @@ pub const Response = struct {
         };
     }
 
-    /// Decode a kv_txn_response carrying a `kv_txn_commit_ok` payload.
+    /// Decode a transaction commit answer.
     /// Wire payload: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE].
     pub fn getTxnCommitResult(self: Response) ?struct { commit_index: u64, op_count: u16 } {
         if (self.status != .ok or self.data.len < 11 or self.data[0] != 1) return null;

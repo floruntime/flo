@@ -183,9 +183,8 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
     var out: [4096]u8 = undefined;
-    // queue_touch is in the op table with no handler; 0x0FFE and 0xFFFF
-    // both lie past the table and take the same branch.
-    for ([_]u16{ @intFromEnum(proto.OpCode.queue_touch), 0x0FFE, 0xFFFF }) |op| {
+    // 0x0FFE and 0xFFFF lie past the op table.
+    for ([_]u16{ 0x0FFE, 0xFFFF }) |op| {
         const r = try roundTrip(fd, op, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
         var want: [32]u8 = undefined;
