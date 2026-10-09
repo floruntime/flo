@@ -126,9 +126,29 @@ pub fn parseLine(line: []const u8, allocator: Allocator) !ParsedLine {
     return parseLineWithPrecision(line, .ms, allocator);
 }
 
+/// The part of a line a parse error is about, for naming it.
+pub const Diagnostic = struct {
+    token: []const u8 = "",
+};
+
 /// Parse a single line with explicit timestamp precision.
 pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator: Allocator) !ParsedLine {
+    var diag: Diagnostic = .{};
+    return parseLineDiagnosed(line, precision, allocator, &diag);
+}
+
+/// Parse a single line, naming in `diag` the token an error is about.
+/// Strict: a bad or non-positive timestamp, anything after it, a repeated
+/// tag key or field, an integer past 2^53 and a backslash escape are each
+/// refused rather than read loosely.
+pub fn parseLineDiagnosed(line: []const u8, precision: Precision, allocator: Allocator, diag: *Diagnostic) !ParsedLine {
     var input = line;
+
+    // Escapes aren't decoded, so a line using them would be stored wrong.
+    if (std.mem.indexOfScalar(u8, line, '\\')) |at| {
+        diag.token = line[at..@min(line.len, at + 2)];
+        return error.EscapesNotSupported;
+    }
 
     // Skip leading whitespace
     while (input.len > 0 and (input[0] == ' ' or input[0] == '\t')) {
@@ -151,7 +171,16 @@ pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator:
     if (input.len > 0 and input[0] == ',') {
         input = input[1..]; // skip comma
         while (true) {
-            const tag = try parseTag(input);
+            const tag = parseTag(input) catch |err| {
+                tags.deinit(allocator);
+                diag.token = tokenAt(input);
+                return err;
+            };
+            for (tags.items) |t| if (std.mem.eql(u8, t.key, tag.tag.key)) {
+                tags.deinit(allocator);
+                diag.token = tag.tag.key;
+                return error.DuplicateTag;
+            };
             try tags.append(allocator, tag.tag);
             input = input[tag.consumed..];
             if (input.len > 0 and input[0] == ',') {
@@ -177,10 +206,16 @@ pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator:
     // Parse fields (required, at least one)
     var fields: std.ArrayListUnmanaged(ParsedField) = .empty;
     while (true) {
-        const field = parseField(input) catch |err| {
+        const field = parseField(input, diag) catch |err| {
             fields.deinit(allocator);
             tags.deinit(allocator);
             return err;
+        };
+        for (fields.items) |f| if (std.mem.eql(u8, f.name, field.field.name)) {
+            fields.deinit(allocator);
+            tags.deinit(allocator);
+            diag.token = f.name;
+            return error.DuplicateField;
         };
         try fields.append(allocator, field.field);
         input = input[field.consumed..];
@@ -206,8 +241,23 @@ pub fn parseLineWithPrecision(line: []const u8, precision: Precision, allocator:
             input = input[1..];
         }
         if (input.len > 0) {
-            timestamp_ms = parseTimestamp(input, precision) catch 0;
+            const token = tokenAt(input);
+            timestamp_ms = parseTimestamp(token, precision) catch |err| {
+                fields.deinit(allocator);
+                tags.deinit(allocator);
+                diag.token = token;
+                return err;
+            };
+            input = input[token.len..];
         }
+    }
+    // Only spaces may follow the timestamp.
+    const rest = std.mem.trimStart(u8, input, " \t\r");
+    if (rest.len > 0) {
+        fields.deinit(allocator);
+        tags.deinit(allocator);
+        diag.token = tokenAt(rest);
+        return error.TrailingInput;
     }
 
     return .{
@@ -315,7 +365,8 @@ const FieldParseResult = struct {
     consumed: usize,
 };
 
-fn parseField(input: []const u8) !FieldParseResult {
+fn parseField(input: []const u8, diag: *Diagnostic) !FieldParseResult {
+    diag.token = tokenAt(input);
     // Find '=' separator
     const eq_pos = std.mem.indexOfScalar(u8, input, '=') orelse return error.InvalidField;
     if (eq_pos == 0) return error.InvalidField;
@@ -348,8 +399,8 @@ fn parseField(input: []const u8) !FieldParseResult {
     if (end == eq_pos + 1) return error.InvalidField; // empty value
     const value_str = input[eq_pos + 1 .. end];
 
-    // Parse field value
-    const value = parseFieldValue(value_str) orelse return error.InvalidFieldValue;
+    diag.token = value_str;
+    const value = try parseFieldValue(value_str);
 
     return .{
         .field = .{ .name = name, .value = value },
@@ -357,8 +408,8 @@ fn parseField(input: []const u8) !FieldParseResult {
     };
 }
 
-fn parseFieldValue(s: []const u8) ?f64 {
-    if (s.len == 0) return null;
+fn parseFieldValue(s: []const u8) !f64 {
+    if (s.len == 0) return error.InvalidFieldValue;
 
     // Boolean
     if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "True") or std.mem.eql(u8, s, "TRUE") or std.mem.eql(u8, s, "t") or std.mem.eql(u8, s, "T")) {
@@ -370,25 +421,53 @@ fn parseFieldValue(s: []const u8) ?f64 {
 
     // Integer (suffix 'i' or 'u')
     if (s[s.len - 1] == 'i' or s[s.len - 1] == 'u') {
-        const num_str = s[0 .. s.len - 1];
-        const int_val = std.fmt.parseInt(i64, num_str, 10) catch return null;
-        return @floatFromInt(int_val);
+        const digits = s[0 .. s.len - 1];
+        if (!isIntegerLiteral(digits)) return error.InvalidFieldValue;
+        if (integerPastExact(digits)) return error.IntegerTooLarge;
+        return @floatFromInt(std.fmt.parseInt(i64, digits, 10) catch unreachable);
     }
 
-    // Float
-    return std.fmt.parseFloat(f64, s) catch null;
+    const v = std.fmt.parseFloat(f64, s) catch return error.InvalidFieldValue;
+    if (!std.math.isFinite(v)) return error.NotFinite;
+    if (integerPastExact(s)) return error.IntegerTooLarge;
+    return v;
 }
 
-fn parseTimestamp(input: []const u8, precision: Precision) !i64 {
-    // Find end of numeric portion
+/// Past this, an f64 can't hold every integer, so a value would be stored
+/// as a neighbour of the one written.
+pub const MAX_EXACT_INTEGER: u128 = 1 << 53;
+
+/// A whole number past 2^53, judged on its text: parsed as a float, 2^53 + 1
+/// already rounds to 2^53 and would pass.
+pub fn integerPastExact(s: []const u8) bool {
+    if (!isIntegerLiteral(s)) return false;
+    const n = std.fmt.parseInt(i128, s, 10) catch return true;
+    return @abs(n) > MAX_EXACT_INTEGER;
+}
+
+/// A number written as a whole number: digits, with an optional sign.
+pub fn isIntegerLiteral(s: []const u8) bool {
+    const digits = if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s[1..] else s;
+    if (digits.len == 0) return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// The run of input up to the next space or comma.
+fn tokenAt(input: []const u8) []const u8 {
     var end: usize = 0;
-    while (end < input.len and (input[end] >= '0' and input[end] <= '9')) : (end += 1) {}
+    while (end < input.len and input[end] != ' ' and input[end] != ',' and input[end] != '\t') : (end += 1) {}
+    return input[0..end];
+}
 
-    if (end == 0) return error.InvalidTimestamp;
-    const raw = std.fmt.parseInt(i64, input[0..end], 10) catch return error.InvalidTimestamp;
-
-    // Convert to milliseconds using caller-specified precision
-    return precision.toMillis(raw);
+/// A whole token of digits, converted to ms; it must come out above zero.
+fn parseTimestamp(token: []const u8, precision: Precision) !i64 {
+    if (token.len == 0) return error.InvalidTimestamp;
+    for (token) |c| if (!std.ascii.isDigit(c)) return error.InvalidTimestamp;
+    const raw = std.fmt.parseInt(i64, token, 10) catch return error.InvalidTimestamp;
+    const ms = precision.toMillis(raw);
+    if (ms <= 0) return error.InvalidTimestamp;
+    return ms;
 }
 
 // ============================================================================
@@ -586,4 +665,34 @@ test "parseLinesWithPrecision - millisecond batch" {
     // With .ms precision, values are used as-is
     try std.testing.expectEqual(@as(i64, 1000), result.lines[0].timestamp_ms);
     try std.testing.expectEqual(@as(i64, 2000), result.lines[1].timestamp_ms);
+}
+
+test "parseLineDiagnosed refuses what it used to read loosely, naming the token" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { line: []const u8, err: anyerror, token: []const u8 }{
+        .{ .line = "cpu x=1 abc", .err = error.InvalidTimestamp, .token = "abc" },
+        .{ .line = "cpu x=1 1708700407000xyz", .err = error.InvalidTimestamp, .token = "1708700407000xyz" },
+        .{ .line = "cpu x=1 -5", .err = error.InvalidTimestamp, .token = "-5" },
+        .{ .line = "cpu x=1 0", .err = error.InvalidTimestamp, .token = "0" },
+        .{ .line = "cpu x=1 1708700407000 extra", .err = error.TrailingInput, .token = "extra" },
+        .{ .line = "cpu,host=a\\ b x=11", .err = error.EscapesNotSupported, .token = "\\ " },
+        .{ .line = "cpu,host=a,host=b x=1", .err = error.DuplicateTag, .token = "host" },
+        .{ .line = "cpu x=1,x=2", .err = error.DuplicateField, .token = "x" },
+        .{ .line = "cpu x=9007199254740993i", .err = error.IntegerTooLarge, .token = "9007199254740993i" },
+        .{ .line = "cpu x=9007199254740993", .err = error.IntegerTooLarge, .token = "9007199254740993" },
+        .{ .line = "cpu x=5,y=inf", .err = error.NotFinite, .token = "inf" },
+        .{ .line = "cpu x=nope", .err = error.InvalidFieldValue, .token = "nope" },
+    };
+    for (cases) |c| {
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(c.err, parseLineDiagnosed(c.line, .ms, allocator, &diag));
+        try std.testing.expectEqualStrings(c.token, diag.token);
+    }
+
+    // 2^53 itself is exact, and a timestamp may be followed by spaces.
+    var diag: Diagnostic = .{};
+    const ok = try parseLineDiagnosed("cpu x=9007199254740992i 1708700407000  ", .ms, allocator, &diag);
+    defer freeParsedLine(ok, allocator);
+    try std.testing.expectEqual(@as(f64, 9007199254740992), ok.fields[0].value);
+    try std.testing.expectEqual(@as(i64, 1708700407000), ok.timestamp_ms);
 }

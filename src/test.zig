@@ -102,6 +102,7 @@ test {
     _ = @import("stream/handler.zig");
     _ = @import("queue/handler.zig");
     _ = @import("ts/handler.zig");
+    _ = @import("ts/line_protocol.zig");
     _ = @import("ts/floql/ast.zig");
     _ = @import("ts/floql/parser.zig");
     _ = @import("ts/floql/stages.zig");

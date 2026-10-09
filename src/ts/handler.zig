@@ -1153,6 +1153,21 @@ test "ts handler: write refuses a value that is not one finite f64" {
     try testing.expectEqual(@as(u64, 0), ts.stats.points_inserted);
 }
 
+test "ts handler: write accepts negative zero and subnormals" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+    for ([_]f64{ -0.0, std.math.floatTrueMin(f64), -std.math.floatTrueMin(f64) }) |v| {
+        switch (handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(v), ""))) {
+            .ts_write_ok => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
+}
+
 test "ts handler: multiple writes same measurement" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator, .{});

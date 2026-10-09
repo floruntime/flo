@@ -142,7 +142,7 @@ test "e2e/ts: write refuses a value that is not a finite number" {
     // Nothing was written, not even field a.
     var r = try ctx.cli.run(&.{ "ts", "read", "bad_value", "--field", "a", "--from", "0", "-o", "raw" });
     defer r.deinit();
-    try testing.expect(!r.stdoutContains("1.000000"));
+    try testing.expectEqualStrings("(no data)\n", r.stdout);
 }
 
 test "e2e/ts: write no tags" {
@@ -247,8 +247,17 @@ test "e2e/ts: write batch reports a bad line and stores the rest" {
         defer @import("stdx").fs.closeFile(file);
         try @import("stdx").fs.writeAll(file,
             \\net,host=a rx=1.5 1708700400000
+            \\
+            \\# a comment counts as a line too
             \\this line is not line protocol
             \\net,host=a rx=2.5 1708700401000
+            \\net,host=a rx=3.5,tx=inf 1708700402000
+            \\net,host=a rx=4.5 abc
+            \\net,host=a rx=4.5 1708700403000 extra
+            \\net,host=a\ b rx=4.5
+            \\net,host=a,host=b rx=4.5
+            \\net,host=a rx=4.5,rx=5.5
+            \\net,host=a rx=9007199254740993i
             \\
         );
     }
@@ -257,12 +266,73 @@ test "e2e/ts: write batch reports a bad line and stores the rest" {
     var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path });
     defer w.deinit();
     try testing.expect(w.exit_code != 0);
-    try testing.expect(w.stderrContains("line 2:"));
-    try testing.expect(w.stdoutContains("Wrote 2 points (1 lines failed)"));
+    // Blank and comment lines are counted, so the bad line is number 4.
+    try testing.expect(w.stderrContains("line 4: "));
+    // A line with one bad field writes none of its fields.
+    try testing.expect(w.stderrContains("line 6: field value 'inf' is not a finite number"));
+    try testing.expect(w.stderrContains("line 7: timestamp 'abc' is not a positive whole number"));
+    try testing.expect(w.stderrContains("line 8: unexpected 'extra' after the timestamp"));
+    try testing.expect(w.stderrContains("line 9: backslash escapes"));
+    try testing.expect(w.stderrContains("line 10: tag key 'host' is given more than once"));
+    try testing.expect(w.stderrContains("line 11: field 'rx' is given more than once"));
+    try testing.expect(w.stderrContains("line 12: integer '9007199254740993i' is past 2^53"));
+    try testing.expect(w.stdoutContains("Wrote 2 points (8 lines failed)"));
 
     var r = try ctx.cli.run(&.{ "ts", "read", "net", "--tags", "host=a", "--field", "rx", "--from", "1708700000000", "-o", "raw" });
     defer r.deinit();
     try testing.expectEqualStrings("1708700400000 1.500000\n1708700401000 2.500000\n", r.stdout);
+}
+
+test "e2e/ts: a batch line without a timestamp stamps its fields once" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const tmp_path = "/tmp/flo-e2e-ts-batch-nots.txt";
+    {
+        const file = try @import("stdx").fs.createFile(tmp_path, .{});
+        defer @import("stdx").fs.closeFile(file);
+        try @import("stdx").fs.writeAll(file, "load,host=a one=1,two=2\n");
+    }
+    defer @import("stdx").fs.deleteFile(tmp_path) catch {};
+    try ctx.exec(&.{ "ts", "write", "--batch", "--file", tmp_path });
+
+    var one = try ctx.cli.run(&.{ "ts", "read", "load", "--tags", "host=a", "--field", "one", "--from", "-1h", "-o", "raw" });
+    defer one.deinit();
+    var two = try ctx.cli.run(&.{ "ts", "read", "load", "--tags", "host=a", "--field", "two", "--from", "-1h", "-o", "raw" });
+    defer two.deinit();
+    const ts_one = one.stdout[0 .. std.mem.indexOfScalar(u8, one.stdout, ' ') orelse return error.NoPoint];
+    const ts_two = two.stdout[0 .. std.mem.indexOfScalar(u8, two.stdout, ' ') orelse return error.NoPoint];
+    try testing.expectEqualStrings(ts_one, ts_two);
+    try testing.expect(std.mem.endsWith(u8, one.stdout, " 1.000000\n"));
+    try testing.expect(std.mem.endsWith(u8, two.stdout, " 2.000000\n"));
+}
+
+test "e2e/ts: write refuses flags --batch would ignore, and bad timestamps and fields" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const cases = [_]struct { args: []const []const u8, why: []const u8 }{
+        .{ .args = &.{ "ts", "write", "m", "--batch" }, .why = "--batch takes no measurement" },
+        .{ .args = &.{ "ts", "write", "--batch", "--tags", "h=a" }, .why = "--batch can't be combined with --tags" },
+        .{ .args = &.{ "ts", "write", "--batch", "--value", "1" }, .why = "--batch can't be combined with --value" },
+        .{ .args = &.{ "ts", "write", "--batch", "--fields", "a=1" }, .why = "--batch can't be combined with --fields" },
+        .{ .args = &.{ "ts", "write", "--batch", "--timestamp", "5" }, .why = "--batch can't be combined with --timestamp" },
+        .{ .args = &.{ "ts", "write", "bad", "--value", "1", "--timestamp", "-5" }, .why = "--timestamp must be > 0 ms" },
+        .{ .args = &.{ "ts", "write", "bad", "--fields", "a=1,b=2", "--timestamp", "0" }, .why = "--timestamp must be > 0 ms" },
+        .{ .args = &.{ "ts", "write", "bad", "--fields", "a=1,a=2" }, .why = "field 'a' is given more than once" },
+        .{ .args = &.{ "ts", "write", "bad", "--fields", "a=1, b=2" }, .why = "field name ' b' has surrounding spaces" },
+        .{ .args = &.{ "ts", "write", "bad", "--value", "9007199254740993" }, .why = "past 2^53" },
+    };
+    for (cases) |c| {
+        var r = try ctx.cli.run(c.args);
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains(c.why));
+    }
+
+    var r = try ctx.cli.run(&.{ "ts", "read", "bad", "--field", "a", "--from", "0", "-o", "raw" });
+    defer r.deinit();
+    try testing.expectEqualStrings("(no data)\n", r.stdout);
 }
 
 // =============================================================================

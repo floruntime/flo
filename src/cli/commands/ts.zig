@@ -63,7 +63,7 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("timestamp", 0, "", "Explicit timestamp in milliseconds")
                 .boolFlag("batch", 'b', "Read InfluxDB line protocol from stdin")
                 .stringFlag("file", 'f', "", "Read line protocol from file (with --batch)")
-                .stringFlag("precision", 'p', "ms", "Timestamp precision: ns, us, ms, s (for --batch)")
+                .stringFlag("precision", 0, "ms", "Timestamp precision: ns, us, ms, s (for --batch)")
                 .action(wrapHandler(runWrite)),
         )
         .subcommand(
@@ -226,6 +226,18 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     };
 
     if (is_batch) {
+        // Line protocol carries its own measurement, tags, fields and time.
+        if (ctx.getPositional("measurement") != null) {
+            ctx.printErr("Error: --batch takes no measurement; each line names its own\n", .{});
+            return error.CommandFailed;
+        }
+        inline for (.{ "tags", "value", "fields", "timestamp" }) |flag| {
+            const given: []const u8 = ctx.getString(flag) orelse "";
+            if (given.len > 0) {
+                ctx.printErr("Error: --batch can't be combined with --" ++ flag ++ "; each line carries its own\n", .{});
+                return error.CommandFailed;
+            }
+        }
         return runWriteBatch(ctx, &client, namespace);
     }
 
@@ -244,6 +256,10 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error: --timestamp '{s}' is not a whole number of milliseconds\n", .{ts_str});
             return error.CommandFailed;
         };
+        if (timestamp_ms.? <= 0) {
+            ctx.printErr("Error: --timestamp must be > 0 ms, not {s}\n", .{ts_str});
+            return error.CommandFailed;
+        }
     }
 
     if (value_flag.len > 0 and fields_flag.len > 0) {
@@ -288,29 +304,38 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
             ctx.printErr("Error: field '{s}' is not name=value\n", .{pair});
             return error.CommandFailed;
         };
-        if (eq == 0) {
+        const name = pair[0..eq];
+        if (name.len == 0) {
             ctx.printErr("Error: field '{s}' has no name\n", .{pair});
             return error.CommandFailed;
         }
+        if (std.mem.trim(u8, name, " \t").len != name.len) {
+            ctx.printErr("Error: field name '{s}' has surrounding spaces\n", .{name});
+            return error.CommandFailed;
+        }
+        for (names[0..n]) |seen| if (std.mem.eql(u8, seen, name)) {
+            ctx.printErr("Error: field '{s}' is given more than once\n", .{name});
+            return error.CommandFailed;
+        };
         if (n == names.len) {
             ctx.printErr("Error: at most {d} fields\n", .{names.len});
             return error.CommandFailed;
         }
-        names[n] = pair[0..eq];
-        values[n] = parseValue(ctx, pair[0..eq], pair[eq + 1 ..]) orelse return error.CommandFailed;
+        names[n] = name;
+        values[n] = parseValue(ctx, name, pair[eq + 1 ..]) orelse return error.CommandFailed;
         n += 1;
     }
 
     // One timestamp for every field, so they read back as one point.
     const ts = timestamp_ms orelse @import("stdx").time.milliTimestamp();
-    for (names[0..n], values[0..n]) |name, value| {
+    for (names[0..n], values[0..n], 0..) |name, value, written| {
         var result = client_mod.ts.write(&client, namespace, measurement, name, value, tags, ts) catch |err| {
-            ctx.printErr("Error: field {s}: request failed: {}\n", .{ name, err });
+            ctx.printErr("Error: field {s}: request failed: {} ({d} of {d} fields written)\n", .{ name, err, written, n });
             return error.CommandFailed;
         };
         defer result.deinit();
         if (result.isError()) {
-            ctx.printErr("Error: field {s}: {s}\n", .{ name, result.errorMessage() });
+            ctx.printErr("Error: field {s}: {s} ({d} of {d} fields written)\n", .{ name, result.errorMessage(), written, n });
             return error.CommandFailed;
         }
     }
@@ -327,7 +352,26 @@ fn parseValue(ctx: *commander.Context, what: []const u8, text: []const u8) ?f64 
         ctx.printErr("Error: {s} '{s}' is not a finite number\n", .{ what, text });
         return null;
     }
+    if (line_protocol.integerPastExact(text)) {
+        ctx.printErr("Error: {s} '{s}' is past 2^53 and would not be stored exactly\n", .{ what, text });
+        return null;
+    }
     return v;
+}
+
+/// A batch line's parse error as a sentence naming the token at fault.
+fn lineError(buf: []u8, err: anyerror, token: []const u8) []const u8 {
+    return switch (err) {
+        error.InvalidTimestamp => std.fmt.bufPrint(buf, "timestamp '{s}' is not a positive whole number", .{token}),
+        error.TrailingInput => std.fmt.bufPrint(buf, "unexpected '{s}' after the timestamp", .{token}),
+        error.EscapesNotSupported => std.fmt.bufPrint(buf, "backslash escapes ('{s}') are not supported", .{token}),
+        error.DuplicateTag => std.fmt.bufPrint(buf, "tag key '{s}' is given more than once", .{token}),
+        error.DuplicateField => std.fmt.bufPrint(buf, "field '{s}' is given more than once", .{token}),
+        error.IntegerTooLarge => std.fmt.bufPrint(buf, "integer '{s}' is past 2^53 and would not be stored exactly", .{token}),
+        error.NotFinite => std.fmt.bufPrint(buf, "field value '{s}' is not a finite number", .{token}),
+        error.InvalidFieldValue => std.fmt.bufPrint(buf, "field value '{s}' is not a number", .{token}),
+        else => std.fmt.bufPrint(buf, "{s} at '{s}'", .{ @errorName(err), token }),
+    } catch @errorName(err);
 }
 
 fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8) commander.Error!void {
@@ -377,6 +421,7 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
     // and the rest still go; any failure fails the command.
     var points: u32 = 0;
     var lines_failed: u32 = 0;
+    var diag_buf: [192]u8 = undefined;
     var line_no: u32 = 0;
     var line_iter = std.mem.splitScalar(u8, line_data, '\n');
     while (line_iter.next()) |raw| {
@@ -384,8 +429,9 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
         const line = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t', '\r' });
         if (line.len == 0 or line[0] == '#') continue;
 
-        const parsed = line_protocol.parseLineWithPrecision(line, precision, ctx.allocator) catch |err| {
-            ctx.printErr("line {d}: {s}\n", .{ line_no, @errorName(err) });
+        var diag: line_protocol.Diagnostic = .{};
+        const parsed = line_protocol.parseLineDiagnosed(line, precision, ctx.allocator, &diag) catch |err| {
+            ctx.printErr("line {d}: {s}\n", .{ line_no, lineError(&diag_buf, err, diag.token) });
             lines_failed += 1;
             continue;
         };
@@ -394,34 +440,30 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
         var tags_buf: [1024]u8 = undefined;
         var tags_w = std.Io.Writer.fixed(&tags_buf);
         for (parsed.tags, 0..) |tag, i| {
-            tags_w.print("{s}{s}={s}", .{ if (i > 0) "," else "", tag.key, tag.value }) catch {
-                ctx.printErr("line {d}: tags too long\n", .{line_no});
-                lines_failed += 1;
-                break;
-            };
+            tags_w.print("{s}{s}={s}", .{ if (i > 0) "," else "", tag.key, tag.value }) catch break;
         } else {
-            // A line without a timestamp is stamped once, so its fields agree.
+            // The parser checked every field, so a line is written whole
+            // unless the server refuses part of it. A line without a
+            // timestamp is stamped once, so its fields agree.
             const ts = if (parsed.timestamp_ms != 0) parsed.timestamp_ms else @import("stdx").time.milliTimestamp();
-            for (parsed.fields) |field| {
-                if (!std.math.isFinite(field.value)) {
-                    ctx.printErr("line {d}: field {s} is not a finite number\n", .{ line_no, field.name });
-                    lines_failed += 1;
-                    break;
-                }
+            for (parsed.fields, 0..) |field, written| {
                 var result = client_mod.ts.write(client, namespace, parsed.measurement, field.name, field.value, tags_w.buffered(), ts) catch |err| {
-                    ctx.printErr("line {d}: request failed: {}\n", .{ line_no, err });
+                    ctx.printErr("line {d}: request failed: {} ({d} of {d} fields written)\n", .{ line_no, err, written, parsed.fields.len });
                     lines_failed += 1;
                     break;
                 };
                 defer result.deinit();
                 if (result.isError()) {
-                    ctx.printErr("line {d}: field {s}: {s}\n", .{ line_no, field.name, result.errorMessage() });
+                    ctx.printErr("line {d}: field {s}: {s} ({d} of {d} fields written)\n", .{ line_no, field.name, result.errorMessage(), written, parsed.fields.len });
                     lines_failed += 1;
                     break;
                 }
                 points += 1;
             }
+            continue;
         }
+        ctx.printErr("line {d}: tags too long\n", .{line_no});
+        lines_failed += 1;
     }
 
     if (lines_failed > 0) {

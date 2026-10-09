@@ -123,3 +123,31 @@ test "e2e/bounds: a percent-encoded dashboard key path longer than any key is no
     defer ok.deinit();
     try testing.expectEqual(@as(u16, 200), ok.status);
 }
+
+test "e2e/bounds: a ts write value that isn't one finite f64 is refused by name" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var nan: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nan, @bitCast(std.math.nan(f64)), .little);
+    var inf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &inf, @bitCast(std.math.inf(f64)), .little);
+
+    var out: [4096]u8 = undefined;
+    for ([_]struct { value: []const u8, why: []const u8 }{
+        .{ .value = "1234567", .why = "ts write: value must be 8 bytes (f64, little-endian)" },
+        .{ .value = "1234.5678", .why = "ts write: value must be 8 bytes (f64, little-endian)" },
+        .{ .value = &nan, .why = "ts write: value must be a finite number" },
+        .{ .value = &inf, .why = "ts write: value must be a finite number" },
+    }) |c| {
+        const frame = try request(.ts_write, "", "m", c.value);
+        defer testing.allocator.free(frame);
+        const r = try send(ctx, frame, &out);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqualStrings(c.why, r.data);
+    }
+
+    var read = try ctx.cli.run(&.{ "ts", "read", "m", "--from", "0", "-o", "raw" });
+    defer read.deinit();
+    try testing.expectEqualStrings("(no data)\n", read.stdout);
+}
