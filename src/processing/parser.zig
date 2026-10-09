@@ -296,6 +296,8 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
         .{op_type},
     );
 
+    try checkOperatorSettings(d, item, op_type);
+
     var config: std.ArrayList(OperatorSpec.ConfigEntry) = .empty;
     errdefer {
         freeConfig(allocator, config.items);
@@ -364,6 +366,53 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
     };
 
     operators.append(allocator, .{ .type_name = type_d, .name = name_d, .config = config_s }) catch return ParseError.OutOfMemory;
+}
+
+/// The settings each operator type needs, and the values its enums take,
+/// refused here so `flo validate processing` refuses what submit refuses,
+/// with a place. Keys are checked against `operator_keys` separately.
+fn checkOperatorSettings(d: D, item: JsonValue, op_type: []const u8) ParseError!void {
+    const need = struct {
+        fn key(dd: D, it: JsonValue, k: []const u8) ParseError!void {
+            if (!it.object.contains(k)) return dd.fail(ParseError.MissingRequiredField, "missing required key \"{s}\"", .{k});
+        }
+        fn oneOf(dd: D, it: JsonValue, k: []const u8, comptime names: []const []const u8) ParseError!void {
+            const v = try optString(dd, it, k) orelse return;
+            inline for (names) |n| {
+                if (mem.eql(u8, v, n)) return;
+            }
+            const list = comptime blk: {
+                var l: []const u8 = "";
+                for (names, 0..) |n, i| l = l ++ (if (i == 0) "" else "|") ++ n;
+                break :blk l;
+            };
+            return dd.fail(ParseError.InvalidFieldType, "\"{s}\" must be one of " ++ list ++ ", not \"{s}\"", .{ k, v });
+        }
+    };
+    if (mem.eql(u8, op_type, "filter")) {
+        try need.key(d, item, "condition");
+    } else if (mem.eql(u8, op_type, "keyby")) {
+        try need.key(d, item, "key_expression");
+    } else if (mem.eql(u8, op_type, "flatmap")) {
+        try need.key(d, item, "array_field");
+    } else if (mem.eql(u8, op_type, "kv_lookup")) {
+        try need.key(d, item, "lookup_key");
+        try need.oneOf(d, item, "mode", &.{ "filter", "enrich" });
+    } else if (mem.eql(u8, op_type, "classify")) {
+        try need.key(d, item, "rules");
+    } else if (mem.eql(u8, op_type, "aggregate")) {
+        try need.key(d, item, "function");
+        try need.oneOf(d, item, "function", &.{ "sum", "count", "avg", "min", "max" });
+        const function = (try optString(d, item, "function")).?;
+        if (!mem.eql(u8, function, "count")) try need.key(d, item, "field");
+        if (item.object.contains("window")) {
+            try need.oneOf(d, item, "window", &.{ "tumbling", "count" });
+            if (try optPositive(u64, d, item, "window_size", ParseError.InvalidFormat) == null)
+                return d.fail(ParseError.MissingRequiredField, "missing required key \"window_size\"", .{});
+        } else if (item.object.contains("window_size")) {
+            return d.fail(ParseError.MissingRequiredField, "\"window_size\" needs \"window\"", .{});
+        }
+    }
 }
 
 // =============================================================================
@@ -1047,6 +1096,7 @@ test "parser: nested YAML with operator list" {
         \\operators:
         \\  - type: filter
         \\    name: positive
+        \\    condition: not_empty
         \\  - type: map
         \\    name: transform
     ;
@@ -2189,4 +2239,13 @@ test "parser: a duplicated key is refused by name" {
         \\  - stream:
         \\      name: out
     , ParseError.DuplicateKey, "key \"name\" appears twice at sources[0].stream");
+}
+
+test "parser: an operator missing what it needs, or with an unknown mode, is refused at parse" {
+    try expectRefused(job("\"operators\": [ { \"type\": \"filter\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"condition\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"median\", \"field\": \"$.a\" } ],", "", ""), ParseError.InvalidFieldType, "\"function\" must be one of sum|count|avg|min|max, not \"median\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"sum\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"field\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of tumbling|count, not \"sliding\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_size\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_size\" must be at least 1, not 0 at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"kv_lookup\", \"lookup_key\": \"k\", \"mode\": \"join\" } ],", "", ""), ParseError.InvalidFieldType, "\"mode\" must be one of filter|enrich, not \"join\" at operators[0]");
 }

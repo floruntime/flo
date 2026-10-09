@@ -118,7 +118,7 @@ const Converter = struct {
                 self.output.append(self.allocator, ':') catch return ConvertError.OutOfMemory;
 
                 const after_colon = if (colon_pos + 1 < line.content.len)
-                    mem.trimStart(u8, line.content[colon_pos + 1 ..], " \t")
+                    stripComment(line.content[colon_pos + 1 ..])
                 else
                     "";
 
@@ -182,7 +182,7 @@ const Converter = struct {
                 }
                 first = false;
 
-                const item_content = mem.trimStart(u8, line.content[1..], " \t");
+                const item_content = stripComment(line.content[1..]);
 
                 if (item_content.len == 0) {
                     // Array item with value on next line
@@ -239,7 +239,7 @@ const Converter = struct {
             first_property = false;
 
             const after_colon = if (colon_pos + 1 < item_content.len)
-                mem.trimStart(u8, item_content[colon_pos + 1 ..], " \t")
+                stripComment(item_content[colon_pos + 1 ..])
             else
                 "";
 
@@ -293,7 +293,7 @@ const Converter = struct {
                 self.output.append(self.allocator, ':') catch return ConvertError.OutOfMemory;
 
                 const after_colon = if (colon_pos + 1 < prop_line.content.len)
-                    mem.trimStart(u8, prop_line.content[colon_pos + 1 ..], " \t")
+                    stripComment(prop_line.content[colon_pos + 1 ..])
                 else
                     "";
 
@@ -328,7 +328,7 @@ const Converter = struct {
     }
 
     fn writeValue(self: *Converter, value: []const u8) ConvertError!void {
-        const trimmed = mem.trim(u8, value, " \t");
+        const trimmed = stripComment(value);
 
         // Already quoted string — don't strip comments inside quotes
         if (trimmed.len >= 2) {
@@ -336,8 +336,16 @@ const Converter = struct {
                 (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\''))
             {
                 if (trimmed[0] == '\'') {
+                    // In a single-quoted scalar, '' is one quote.
                     const inner = trimmed[1 .. trimmed.len - 1];
-                    try self.writeString(inner);
+                    var buf: std.ArrayList(u8) = .empty;
+                    defer buf.deinit(self.allocator);
+                    var k: usize = 0;
+                    while (k < inner.len) : (k += 1) {
+                        buf.append(self.allocator, inner[k]) catch return ConvertError.OutOfMemory;
+                        if (inner[k] == '\'' and k + 1 < inner.len and inner[k + 1] == '\'') k += 1;
+                    }
+                    try self.writeString(buf.items);
                 } else {
                     self.output.appendSlice(self.allocator, trimmed) catch return ConvertError.OutOfMemory;
                 }
@@ -357,8 +365,7 @@ const Converter = struct {
             return;
         }
 
-        // Strip inline comments from unquoted values (YAML spec: " #" starts a comment)
-        const clean = stripInlineComment(trimmed);
+        const clean = trimmed;
 
         // Boolean
         if (mem.eql(u8, clean, "true") or mem.eql(u8, clean, "false")) {
@@ -476,16 +483,32 @@ const Converter = struct {
         try self.writeString(k);
     }
 
-    /// Strip inline YAML comments: " # ..." (space-hash) outside quoted strings.
-    fn stripInlineComment(value: []const u8) []const u8 {
-        // Find " #" which starts an inline comment per YAML spec
-        var i: usize = 1;
+    /// The value without its trailing comment. A `#` starts a comment when it
+    /// begins the value or follows whitespace, outside quotes; so `retry:  # x`
+    /// is a key whose value is on the next lines, and `"a"  # x` is the
+    /// quoted string `a`.
+    fn stripComment(value: []const u8) []const u8 {
+        var quote: u8 = 0;
+        var i: usize = 0;
         while (i < value.len) : (i += 1) {
-            if (value[i] == '#' and value[i - 1] == ' ') {
-                return mem.trimEnd(u8, value[0 .. i - 1], " \t");
+            const c = value[i];
+            if (quote != 0) {
+                if (quote == '"' and c == '\\') {
+                    i += 1;
+                } else if (c == quote) {
+                    quote = 0;
+                }
+                continue;
+            }
+            switch (c) {
+                '"', '\'' => quote = c,
+                '#' => if (i == 0 or value[i - 1] == ' ' or value[i - 1] == '\t') {
+                    return mem.trim(u8, value[0..i], " \t");
+                },
+                else => {},
             }
         }
-        return value;
+        return mem.trim(u8, value, " \t");
     }
 
     fn writeString(self: *Converter, s: []const u8) ConvertError!void {
@@ -760,4 +783,41 @@ test "yaml_to_json: flow mapping with multiple keys and nesting" {
     try std.testing.expect(mem.indexOf(u8, json, "\"x\":1") != null);
     try std.testing.expect(mem.indexOf(u8, json, "\"y\":\"two\"") != null);
     try std.testing.expect(mem.indexOf(u8, json, "\"z\":{\"deep\":true}") != null);
+}
+
+fn expectConverts(yaml: []const u8, json: []const u8) !void {
+    const out = try convert(std.testing.allocator, yaml);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(json, out);
+}
+
+test "yaml_to_json: a comment after a block key leaves its children nested" {
+    try expectConverts(
+        \\retry:   # optional policy
+        \\  max_attempts: 3
+        \\tags:  # tag: value
+        \\  host: a
+        \\list:  # items
+        \\  - a
+    , "{\"retry\":{\"max_attempts\":3},\"tags\":{\"host\":\"a\"},\"list\":[\"a\"]}");
+}
+
+test "yaml_to_json: a quoted value followed by a comment loses the comment, not its quotes" {
+    try expectConverts(
+        \\cron: "0 */6 * * *"   # every 6 hours
+        \\note: 'it''s # not a comment'  # but this is
+        \\hash: "a # b"
+    , "{\"cron\":\"0 */6 * * *\",\"note\":\"it's # not a comment\",\"hash\":\"a # b\"}");
+}
+
+test "yaml_to_json: comments on list items and flow values" {
+    try expectConverts(
+        \\items:
+        \\  - one   # first
+        \\  - # second, on the next lines
+        \\    name: two
+        \\  - name: three  # inline
+        \\flow: [a, b]  # flow
+        \\url: http://x/#frag
+    , "{\"items\":[\"one\",{\"name\":\"two\"},{\"name\":\"three\"}],\"flow\":[\"a\",\"b\"],\"url\":\"http://x/#frag\"}");
 }

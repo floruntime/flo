@@ -948,7 +948,11 @@ pub const ProcessingHandler = struct {
         // endpoints and lookups that name none resolve alike on every replica
         // and restart. `def` stays alive for createPipeline, which deep-copies
         // what it keeps.
-        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw, null) catch return;
+        var diag: parser.Diagnostic = .{};
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw, &diag) catch |err| {
+            log.err("processing job {s} not started: {s}", .{ job_id, if (err == error.OutOfMemory) "out of memory" else diag.message() });
+            return;
+        };
         defer def.deinit(self.allocator);
         // The submit checked these; the applier holds every replica to them.
         var why_buf: [256]u8 = undefined;

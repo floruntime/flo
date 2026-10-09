@@ -124,6 +124,14 @@ fn optIntAs(comptime T: type, d: D, obj: JsonValue, key: []const u8) ParseError!
     );
 }
 
+/// An integer key that must be at least `min` (0 where zero means "now",
+/// 1 where a zero would never fire or never expire).
+fn optAtLeast(d: D, obj: JsonValue, key: []const u8, min: i64) ParseError!?i64 {
+    const v = try optInt(d, obj, key) orelse return null;
+    if (v < min) return d.fail(ParseError.InvalidFieldType, "\"{s}\" must be at least {d}, not {d}", .{ key, min, v });
+    return v;
+}
+
 fn optFloat(d: D, obj: JsonValue, key: []const u8) ParseError!?f64 {
     const v = obj.object.get(key) orelse return null;
     return switch (v) {
@@ -465,7 +473,7 @@ fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, d: D) ParseError
     const mark = d.push("wait_for_signal");
     try checkKeys(d, wait_obj, &.{ "type", "timeout_ms", "on_timeout" });
     const signal_type = try reqString(d, wait_obj, "type");
-    const timeout_ms = try optInt(d, wait_obj, "timeout_ms");
+    const timeout_ms = try optAtLeast(d, wait_obj, "timeout_ms", 1);
     const on_timeout: ?[]u8 = if (try optString(d, wait_obj, "on_timeout")) |t| try dupe(allocator, t) else null;
     errdefer if (on_timeout) |t| allocator.free(t);
     d.pop(mark);
@@ -588,7 +596,7 @@ fn parseSchedule(allocator: Allocator, root: JsonValue, d: D) ParseError!?Schedu
     try checkKeys(d, sched_obj, &.{ "cron", "interval", "max_concurrent", "input", "paused" });
 
     const cron = try optString(d, sched_obj, "cron");
-    const interval = try optInt(d, sched_obj, "interval");
+    const interval = try optAtLeast(d, sched_obj, "interval", 1);
     if ((cron == null) == (interval == null)) return d.fail(ParseError.InvalidFieldType, "a schedule needs exactly one of \"cron\" or \"interval\"", .{});
     const max_concurrent = try optIntAs(u32, d, sched_obj, "max_concurrent") orelse 1;
     const input = try optString(d, sched_obj, "input");
@@ -665,7 +673,7 @@ fn parseRetryPolicy(obj: JsonValue, d: D) ParseError!RetryPolicy {
 fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
     try checkKeys(d, obj, &.{ "initial_delay_ms", "max_attempts", "base_delay_ms", "max_delay_ms", "backoff" });
     return .{
-        .initial_delay_ms = try optInt(d, obj, "initial_delay_ms") orelse 0,
+        .initial_delay_ms = try optAtLeast(d, obj, "initial_delay_ms", 0) orelse 0,
         .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 10,
         .backoff = try parseBackoff(d, obj),
         .base_delay_ms = try optIntAs(u32, d, obj, "base_delay_ms") orelse 1000,
@@ -792,7 +800,7 @@ fn parseCircuitBreakerConfig(obj: JsonValue, d: D) ParseError!CircuitBreakerConf
     try checkKeys(d, obj, &.{ "failure_threshold", "cooldown_ms", "half_open_max_calls" });
     return .{
         .failure_threshold = try optIntAs(u32, d, obj, "failure_threshold") orelse 5,
-        .cooldown_ms = try optInt(d, obj, "cooldown_ms") orelse 60000,
+        .cooldown_ms = try optAtLeast(d, obj, "cooldown_ms", 1) orelse 60000,
         .half_open_max_calls = try optIntAs(u32, d, obj, "half_open_max_calls") orelse 2,
     };
 }
@@ -803,7 +811,7 @@ fn parseTrackingConfig(obj: JsonValue, d: D) ParseError!TrackingConfig {
         .mode = try oneOf(TrackingMode, d, "mode", try optString(d, obj, "mode") orelse "sync", &.{
             .{ "sync", .sync }, .{ "async", .async_mode },
         }, ParseError.InvalidTrackingMode),
-        .timeout_ms = try optInt(d, obj, "timeout_ms"),
+        .timeout_ms = try optAtLeast(d, obj, "timeout_ms", 1),
     };
 }
 
@@ -838,7 +846,7 @@ fn parseCacheConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?Cac
     defer d.pop(mark);
     try checkKeys(d, cache_obj, &.{ "ttl_ms", "key", "invalidate_on" });
 
-    const ttl_ms = try optInt(d, cache_obj, "ttl_ms") orelse 300000;
+    const ttl_ms = try optAtLeast(d, cache_obj, "ttl_ms", 1) orelse 300000;
     const key_template = try reqString(d, cache_obj, "key");
 
     var invalidate_on: std.ArrayList([]const u8) = .empty;
@@ -1315,4 +1323,13 @@ test "parseWorkflow: snake_case keys parse" {
     try std.testing.expectEqual(@as(i64, 60000), def.plans[0].health_config.?.window_ms);
     try std.testing.expectEqualStrings("k", def.plans[0].cache_config.?.key_template);
     try std.testing.expectEqual(@as(usize, 1), def.plans[0].error_classification.?.retryable.len);
+}
+
+test "parseWorkflow: a negative or zero duration is refused" {
+    try expectRefused(wrap("\"poll\": { \"initial_delay_ms\": -1 },", ""), ParseError.InvalidFieldType, "\"initial_delay_ms\" must be at least 0, not -1 at start.poll");
+    try expectRefused(wrap("", "\"steps\": { \"b\": { \"wait_for_signal\": { \"type\": \"go\", \"timeout_ms\": 0 } } },"), ParseError.InvalidFieldType, "\"timeout_ms\" must be at least 1, not 0 at steps.b.wait_for_signal");
+    try expectRefused(wrap("", "\"schedule\": { \"interval\": -5 },"), ParseError.InvalidFieldType, "\"interval\" must be at least 1, not -5 at schedule");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldown_ms": -1 }, "tracking": { "timeout_ms": 0 } } ] } },
+    ), ParseError.InvalidFieldType, "\"cooldown_ms\" must be at least 1, not -1 at plans.p.executors[0].breaker");
 }

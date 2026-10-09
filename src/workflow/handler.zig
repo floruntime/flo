@@ -522,6 +522,17 @@ pub const WorkflowHandler = struct {
         return null;
     }
 
+    /// A stored definition parsed again. One that no longer parses (the
+    /// parser's rules changed under it) is logged by name, never dropped in
+    /// silence: its runs stop advancing.
+    fn parseStored(self: *WorkflowHandler, yaml: []const u8, what: []const u8) parser.ParseError!parser.WorkflowDefinition {
+        var diag: parser.Diagnostic = .{};
+        return parser.parseWorkflow(self.allocator, yaml, &diag) catch |err| {
+            log.err("workflow {s} not loaded: {s}", .{ what, if (err == error.OutOfMemory) "out of memory" else diag.message() });
+            return err;
+        };
+    }
+
     // ── CREATE ──────────────────────────────────────────────────────────
 
     fn handleCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
@@ -1533,7 +1544,7 @@ pub const WorkflowHandler = struct {
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
         // Parse the definition to access the step graph
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
+        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
@@ -2340,7 +2351,7 @@ pub const WorkflowHandler = struct {
         const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
         defer self.allocator.free(def_ns_key);
         const def_record = self.definitions.get(def_ns_key) orelse return;
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
+        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const step: definition.Step = if (run.current_step_name_owned) |sn|
@@ -2424,7 +2435,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(def_ns_key);
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
+        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const step: definition.Step = if (run.current_step_name_owned) |sn|
@@ -2557,7 +2568,7 @@ pub const WorkflowHandler = struct {
             defer self.allocator.free(def_ns_key);
             const def_record = self.definitions.get(def_ns_key) orelse return;
 
-            var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
+            var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
             defer def.deinit(self.allocator);
 
             // Check if timeout target is a terminal (builtin or custom)
@@ -2684,10 +2695,7 @@ pub const WorkflowHandler = struct {
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
         // Parse definition to access the output mapping
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch |err| {
-            log.warn("Failed to parse workflow definition for output resolution: {}", .{err});
-            return;
-        };
+        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
         defer def.deinit(self.allocator);
 
         const output_expr = def.output orelse return;
@@ -2735,7 +2743,7 @@ pub const WorkflowHandler = struct {
     /// or null if the definition has no search attributes.
     fn buildSearchTags(self: *WorkflowHandler, def_ns_key: []const u8, run: *RunRecord) ?[]const u8 {
         const def_rec = self.definitions.get(def_ns_key) orelse return null;
-        var def = parser.parseWorkflow(self.allocator, def_rec.yaml_owned, null) catch return null;
+        var def = self.parseStored(def_rec.yaml_owned, def_ns_key) catch return null;
         defer def.deinit(self.allocator);
         if (def.search_attributes.len == 0) return null;
 
@@ -3526,7 +3534,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(old.value.yaml_owned);
         }
 
-        var def = parser.parseWorkflow(self.allocator, yaml, null) catch {
+        var def = self.parseStored(yaml, ns_key_raw) catch {
             self.allocator.free(ns_key);
             return;
         };

@@ -46,6 +46,7 @@ test {
     _ = @import("storage/persistence.zig");
     _ = @import("util/time_units.zig");
     _ = @import("util/definition_diag.zig");
+    _ = @import("util/yaml_to_json.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");

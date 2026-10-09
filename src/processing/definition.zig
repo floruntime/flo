@@ -47,19 +47,18 @@
 //!   - name: late-events
 //!     stream:                     # receives only records tagged "late"
 //!       name: late-data
-//!     tags: [late]
+//!     match: [late]
 //!
 //!   - name: errors
 //!     queue:                      # receives only records tagged "errors"
 //!       name: error-queue
 //!       namespace: default
-//!     tags: [errors]
+//!     match: [errors]
 //!
 //!   - name: profiles
 //!     kv:                         # KV sink
 //!       namespace: profiles
 //!       key_prefix: user
-//!       write_mode: upsert
 //!
 //!   - name: tasks
 //!     queue:                      # queue sink
