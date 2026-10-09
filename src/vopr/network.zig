@@ -41,6 +41,8 @@ pub const Body = union(enum) {
     vote_resp: raft_node.VoteResponse,
     append_req: AppendReq,
     append_resp: raft_node.AppendResponse,
+    term_check: raft_node.TermCheckRequest,
+    term_check_resp: raft_node.TermCheckResponse,
 };
 
 pub const Message = struct {
@@ -95,6 +97,9 @@ pub const SimNetwork = struct {
     side: [MAX_NODES]bool,
     /// Nodes permanently cut from the rest (liveness-phase non-core).
     isolated: [MAX_NODES]bool,
+    /// Single links cut both ways, for scenarios that need a partial
+    /// partition (two nodes that cannot talk, a third that reaches both).
+    pair_cut: [MAX_NODES][MAX_NODES]bool = @splat(@splat(false)),
     /// Liveness-phase core: once set, links between core members carry no
     /// drop/dup faults — core faults are frozen, only latency remains.
     core_healed: bool,
@@ -128,6 +133,7 @@ pub const SimNetwork = struct {
 
     fn cut(self: *const SimNetwork, a: NodeId, b: NodeId) bool {
         if (self.isolated[a - 1] or self.isolated[b - 1]) return true;
+        if (self.pair_cut[a - 1][b - 1]) return true;
         if (self.partition_active and self.side[a - 1] != self.side[b - 1]) return true;
         return false;
     }
@@ -229,6 +235,11 @@ pub const SimNetwork = struct {
 
     pub fn healAll(self: *SimNetwork) void {
         self.partition_active = false;
+    }
+
+    pub fn cutPair(self: *SimNetwork, a: NodeId, b: NodeId) void {
+        self.pair_cut[a - 1][b - 1] = true;
+        self.pair_cut[b - 1][a - 1] = true;
     }
 
     pub fn isolate(self: *SimNetwork, id: NodeId) void {

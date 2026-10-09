@@ -373,6 +373,14 @@ pub const ClusterContext = struct {
         if (node >= self.node_count) return error.InvalidNodeIndex;
         const server = self.servers[node] orelse return error.NodeNotInitialized;
         try server.start();
+        // A restart takes a new port: the node's CLI follows it.
+        const endpoint = try server.getEndpoint(self.allocator);
+        errdefer self.allocator.free(endpoint);
+        const cli = try CliRunner.init(self.allocator, server.flo_binary, endpoint);
+        if (self.clis[node]) |old| old.deinit();
+        if (self.endpoints[node]) |old| self.allocator.free(old);
+        self.clis[node] = cli;
+        self.endpoints[node] = endpoint;
 
         // Small delay for node to rejoin cluster
         stdx.time.sleep(500 * std.time.ns_per_ms);
@@ -429,7 +437,7 @@ pub const ClusterContext = struct {
                 // Read log content
                 const buf = try self.allocator.alloc(u8, max_bytes_per_node);
                 defer self.allocator.free(buf);
-                const n = log_file.readAll(buf) catch 0;
+                const n = stdx.fs.readAll(log_file, buf) catch 0;
                 try output.appendSlice(self.allocator, buf[0..n]);
                 try output.append(self.allocator, '\n');
             }
