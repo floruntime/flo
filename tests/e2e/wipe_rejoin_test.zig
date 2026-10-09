@@ -1,6 +1,9 @@
 //! A member whose disk is wiped rejoins with --join: it catches up, is
 //! guarded until the members have confirmed the term, then votes, and the
-//! group elects with it once the old leader is gone.
+//! group elects with it once the old leader is gone. A smoke test of the
+//! real path; it would pass without the guard too. The guard's safety is
+//! shown in the simulator (src/vopr/simulator.zig), where each hazard has a
+//! scenario that fails without its check.
 
 const std = @import("std");
 const testing = std.testing;

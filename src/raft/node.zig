@@ -246,6 +246,14 @@ const MemberSet = struct {
     }
 };
 
+/// A config entry the log holds: what the term check reads, so it does not
+/// depend on the owner having applied the entry yet.
+const ConfigRecord = struct {
+    index: u64,
+    term: u64,
+    members: MemberSet,
+};
+
 /// A guarded node's term check: the configs whose members must answer, and
 /// who has.
 const TermCheck = struct {
@@ -329,6 +337,10 @@ pub const RaftNode = struct {
     committed_member_count: u8,
     /// Term of the config entry at `membership_index`, 0 when unknown.
     membership_term: u64 = 0,
+    /// The most recent config entries appended, oldest first; a truncation
+    /// drops those it cuts.
+    config_records: [4]ConfigRecord = undefined,
+    config_record_count: u8 = 0,
 
     // ── Lost-log guard ─────────────────────────────────────────────────
     lost_log: LostLog = .none,
@@ -493,9 +505,28 @@ pub const RaftNode = struct {
         };
         self.setMembership(members, e.header.index);
         self.membership_term = e.header.term;
+        self.recordConfig(e.header.index, e.header.term, members);
+    }
+
+    /// A config entry in the log, for the term check: what the owner
+    /// replays at boot, and every one appended after.
+    pub fn recordConfig(self: *RaftNode, index: u64, term: u64, members: []const NodeId) void {
+        if (self.config_record_count == self.config_records.len) {
+            std.mem.copyForwards(ConfigRecord, self.config_records[0 .. self.config_records.len - 1], self.config_records[1..]);
+            self.config_record_count -= 1;
+        }
+        var rec: ConfigRecord = .{ .index = index, .term = term, .members = .{} };
+        const n = @min(members.len, rec.members.ids.len);
+        @memcpy(rec.members.ids[0..n], members[0..n]);
+        rec.members.count = @intCast(n);
+        self.config_records[self.config_record_count] = rec;
+        self.config_record_count += 1;
     }
 
     fn truncatedBelowMembership(self: *RaftNode, after_index: u64) void {
+        while (self.config_record_count > 0 and self.config_records[self.config_record_count - 1].index > after_index) {
+            self.config_record_count -= 1;
+        }
         if (self.membership_index == 0 or self.membership_index <= after_index) return;
         var ids: [MAX_PEERS + 1]NodeId = undefined;
         const n = self.committed_member_count;
@@ -943,9 +974,14 @@ pub const RaftNode = struct {
 
         // Caught up: this node holds everything the leader had committed
         // when it sent this batch, so it refuses any candidate missing a
-        // committed entry. Commit, not the leader's last index, so a
-        // joiner under steady writes still gets there.
-        if (self.lost_log == .catching_up and last_new >= req.leader_commit) {
+        // committed entry. The leader must have committed in its own term:
+        // a new leader's commit index can sit below what earlier leaders
+        // committed until then, and catching up to it would leave this
+        // node short. Commit, not the leader's last index, so a joiner
+        // under steady writes still gets there.
+        if (self.lost_log == .catching_up and last_new >= req.leader_commit and
+            self.commit_index > 0 and self.log.entryTerm(self.commit_index) == self.current_term)
+        {
             self.startTermCheck();
         }
 
@@ -988,8 +1024,16 @@ pub const RaftNode = struct {
                     // never past what this leadership sent it.
                     const ceiling = @min(self.log.lastIndex(), self.peers[i].sent_up_to);
                     const acked = @min(resp.match_index, ceiling);
-                    self.peers[i].match_index = @max(self.peers[i].match_index, acked);
-                    self.peers[i].next_index = self.peers[i].match_index + 1;
+                    if (resp.guarded) {
+                        // Sending moves on; match does not, or a delayed ack
+                        // from before the peer lost its disk would flip it
+                        // back to unguarded and this one would count. Its
+                        // first unguarded ack reports the real match.
+                        self.peers[i].next_index = @max(self.peers[i].next_index, acked + 1);
+                    } else {
+                        self.peers[i].match_index = @max(self.peers[i].match_index, acked);
+                        self.peers[i].next_index = self.peers[i].match_index + 1;
+                    }
                 } else {
                     // Retry from where the follower says its log stops
                     // agreeing, never forward. Below the recorded match it
@@ -1075,11 +1119,25 @@ pub const RaftNode = struct {
     }
 
     /// Check the term against the latest committed config and every config
-    /// after it the log holds; members report any newer one.
+    /// after it the log holds; members report any newer one. Read from the
+    /// log's own config entries: the owner applies a committed one only
+    /// after the append that brought it returns.
     fn startTermCheck(self: *RaftNode) void {
         self.lost_log = .confirming;
         self.check = .{ .newest_index = self.membership_index, .newest_term = self.membership_term };
-        if (self.committed_member_count > 0) self.addCheckSet(self.committed_member_ids[0..self.committed_member_count]);
+        const recs = self.config_records[0..self.config_record_count];
+        var committed: ?usize = null;
+        for (recs, 0..) |rec, i| {
+            if (rec.index <= self.commit_index) committed = i;
+        }
+        if (committed) |i| {
+            self.addCheckSet(recs[i].members.slice());
+        } else if (self.committed_member_count > 0) {
+            self.addCheckSet(self.committed_member_ids[0..self.committed_member_count]);
+        }
+        for (recs) |*rec| {
+            if (rec.index > self.commit_index) self.addCheckSet(rec.members.slice());
+        }
         var ids: [MAX_PEERS + 1]NodeId = undefined;
         self.addCheckSet(self.memberIds(&ids));
         log.info("Raft: guarded node {d} at index {d} (term {d}); confirming the term with {d} member set(s)", .{ self.id, self.log.lastIndex(), self.current_term, self.check.set_count });
@@ -1490,7 +1548,7 @@ test "raft node: vote handling — grant vote" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-   });
+    });
 
     try testing.expect(resp.vote_granted);
     try testing.expectEqual(@as(u32, 1), node.voted_for);
@@ -1511,7 +1569,7 @@ test "raft node: vote handling — reject stale term" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-   });
+    });
 
     try testing.expect(!resp.vote_granted);
     try testing.expectEqual(@as(u64, 5), resp.term);
@@ -1529,7 +1587,7 @@ test "raft node: vote handling — reject already voted" {
         .candidate_id = 3,
         .last_log_index = 0,
         .last_log_term = 0,
-   });
+    });
 
     // Node 1 asks for vote in same term — reject
     const resp = node.handleVoteRequest(.{
@@ -1537,7 +1595,7 @@ test "raft node: vote handling — reject already voted" {
         .candidate_id = 1,
         .last_log_index = 0,
         .last_log_term = 0,
-   });
+    });
 
     try testing.expect(!resp.vote_granted);
 }
@@ -1556,7 +1614,7 @@ test "raft node: step down on higher term" {
         .candidate_id = 2,
         .last_log_index = 0,
         .last_log_term = 0,
-   });
+    });
 
     try testing.expectEqual(Role.follower, node.role);
     try testing.expectEqual(@as(u64, 5), node.current_term);
@@ -1583,7 +1641,7 @@ test "raft node: election win with majority" {
         .term = node.current_term,
         .vote_granted = true,
         .from = 2,
-   });
+    });
 
     try testing.expect(won == .won);
     try testing.expectEqual(Role.leader, node.role);
@@ -1606,7 +1664,7 @@ test "raft node: election loss — not enough votes" {
         .term = node.current_term,
         .vote_granted = false,
         .from = 2,
-   });
+    });
 
     try testing.expect(won == .none);
     try testing.expectEqual(Role.candidate, node.role);
@@ -1628,7 +1686,7 @@ test "raft node: handleAppendEntries as follower" {
         .prev_log_term = 0,
         .entries = &[_]Entry{e1},
         .leader_commit = 1,
-   });
+    });
 
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 1), resp.match_index);
@@ -1652,7 +1710,7 @@ test "raft node: reject AppendEntries with stale term" {
         .prev_log_term = 0,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-   });
+    });
 
     try testing.expect(!resp.success);
     try testing.expectEqual(@as(u64, 5), resp.term);
@@ -1677,7 +1735,7 @@ test "raft node: AppendEntries log matching failure" {
         .prev_log_term = 2, // wrong term!
         .entries = &[_]Entry{},
         .leader_commit = 0,
-   });
+    });
 
     try testing.expect(!resp.success);
 }
@@ -1707,7 +1765,7 @@ test "raft node: leader commit advancement with 3-node cluster" {
         .success = true,
         .match_index = 2,
         .from = 2,
-   });
+    });
 
     // Now we have majority (self + peer 2 = 2 of 3)
     try testing.expectEqual(@as(u64, 2), node.commit_index);
@@ -1762,7 +1820,7 @@ test "raft node: heartbeat over stale suffix does not commit unverified entries"
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 7,
-   });
+    });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 7), resp.match_index);
 
@@ -1797,7 +1855,7 @@ test "raft node: append of N entries at prev P reports match P+N" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-   });
+    });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), resp.match_index);
 
@@ -1810,7 +1868,7 @@ test "raft node: append of N entries at prev P reports match P+N" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-   });
+    });
     try testing.expect(resp2.success);
     try testing.expectEqual(@as(u64, 5), resp2.match_index);
     try testing.expectEqual(@as(u64, 5), node.log.lastIndex());
@@ -1843,7 +1901,7 @@ test "raft node: conflict truncation reports match through appended batch" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 0,
-   });
+    });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 4), resp.match_index);
     try testing.expectEqual(@as(u64, 4), node.log.lastIndex());
@@ -1965,7 +2023,7 @@ test "raft node: follower does not commit its stale suffix on a heartbeat" {
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 10,
-   });
+    });
     try testing.expect(hb.success);
     try testing.expectEqual(@as(u64, 7), follower.commit_index);
 
@@ -1982,7 +2040,7 @@ test "raft node: follower does not commit its stale suffix on a heartbeat" {
         .prev_log_term = 1,
         .entries = &batch,
         .leader_commit = 10,
-   });
+    });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 10), follower.commit_index);
     try testing.expectEqual(@as(u64, 3), follower.log.entryTerm(10).?);
@@ -2009,7 +2067,7 @@ test "raft node: a heartbeat below the commit index never lowers it" {
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 6,
-   });
+    });
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 5), follower.commit_index);
 }
@@ -2144,7 +2202,7 @@ test "raft node: a current-term AppendEntries re-arms the timer even when the lo
         .prev_log_term = 1,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-   });
+    });
     try testing.expect(!resp.success);
     try testing.expect(node.election_deadline_ms >= 1350);
     try testing.expect(node.election_deadline_ms > armed_at_start);
@@ -2160,7 +2218,7 @@ test "raft node: a current-term AppendEntries re-arms the timer even when the lo
         .prev_log_term = 0,
         .entries = &[_]Entry{},
         .leader_commit = 0,
-   });
+    });
     try testing.expectEqual(deadline_before, node.election_deadline_ms);
 }
 
@@ -3150,4 +3208,50 @@ test "raft node: a candidate counts no vote that arrives past its election deadl
     node.observeTime(node.election_deadline_ms);
     try testing.expectEqual(VoteOutcome.none, node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 }));
     try testing.expectEqual(Role.candidate, node.role);
+}
+
+test "raft node: a delayed unguarded ack from before a wipe does not make a guarded ack count" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 8192, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    _ = try node.propose(.kv_put, 0, 0, "a");
+    sentAll(&node);
+    // Peer 2, guarded (it lost its disk), acks index 2: no commit.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 2, .from = 2, .guarded = true });
+    try testing.expectEqual(@as(u64, 0), node.commit_index);
+    // A duplicated response from before its wipe, unguarded, acking only
+    // index 1: index 2 still does not commit on the guarded ack.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 1, .from = 2, .guarded = false });
+    try testing.expect(node.commit_index < 2);
+}
+
+test "raft node: an empty-log node checks the committed config it caught up to, before the owner applies it" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.timer_enabled = false;
+    try node.enterLostLog();
+    var a: [membership.MAX_SIZE]u8 = undefined;
+    var b: [membership.MAX_SIZE]u8 = undefined;
+    // {1,2,3} committed at index 2; {1,2,3,4} appended at 3 by leader 1
+    // (term 3), not committed.
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &a)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 3, 0, membership.encode(&.{ 1, 2, 3, 4 }, &b)),
+    };
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    passBootWait(&node);
+    // Node 3 (in the committed {1,2,3}) has not answered; 1 and 4 have.
+    node.handleTermCheckResponse(checkAnswer(1, 3, 3, 3, &.{ 1, 2, 3, 4 }));
+    node.handleTermCheckResponse(checkAnswer(4, 3, 3, 3, &.{ 1, 2, 3, 4 }));
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    node.handleTermCheckResponse(checkAnswer(3, 3, 3, 3, &.{ 1, 2, 3, 4 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
 }

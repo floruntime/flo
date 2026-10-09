@@ -1919,11 +1919,12 @@ pub const Shard = struct {
     /// Every frame the network queued since the last drain.
     fn drainRaftQueue(self: *Shard) void {
         const q = self.raft_queue orelse return;
-        // The clock before the messages: a vote that arrives past the
-        // candidacy's deadline is not counted on the last tick's clock.
-        self.raft_node.observeTime(nowMs());
         while (q.pop()) |frame| {
             defer self.allocator.free(frame.payload);
+            // The clock before each message: a vote that arrives past the
+            // candidacy's deadline is not counted on an older clock, even
+            // after a stall part way through the queue.
+            self.raft_node.observeTime(nowMs());
             self.handleRaftFrame(frame);
         }
     }
@@ -4680,6 +4681,7 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         };
         raft.setMembership(members, cfg_index);
         raft.membership_term = e.header.term;
+        raft.recordConfig(cfg_index, e.header.term, members);
         if (cfg_index <= raft.last_applied) raft.commitMembership(members);
         // What the segments flushed under a commit watermark is committed;
         // the rest of the log waits for a leader to say so.

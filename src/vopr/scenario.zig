@@ -99,6 +99,11 @@ pub const Scenario = struct {
     /// log). Guarded on restart either way; the simulator's
     /// `max_lost_nodes` (one by default) caps how many are lost at once.
     wipe_permille: u16,
+    /// How many nodes may be lost (wiped and not yet done with the guard)
+    /// at once. More than a minority can lose committed data whatever Raft
+    /// does; two in a larger group has guarded nodes answering each
+    /// other's term checks.
+    max_lost_nodes: u8,
 
     // ── Workload ───────────────────────────────────────────────────────
     /// Percent chance per tick that a client submits an op.
@@ -167,7 +172,22 @@ pub const Scenario = struct {
             .rpc_timeout_ms = @max(50, delay_max * 3),
             // Drawn last so the fields above keep their values per seed.
             .wipe_permille = if (r.uintLessThan(u8, 3) == 0) r.intRangeAtMost(u16, 100, 500) else 0,
+            .max_lost_nodes = if (node_count >= 5 and r.boolean()) 2 else 1,
         };
+    }
+
+    /// The lost-disk slice: same sampling as `fromSeed`, with crashes that
+    /// often lose a disk or its hard state, up to two lost nodes at once in
+    /// groups of five or more, and partitions to put a guarded node beside
+    /// a stale leader.
+    pub fn wipes(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        s.wipe_permille = 600;
+        s.crash_permille = @max(s.crash_permille, 3);
+        s.restart_permille = @max(s.restart_permille, 20);
+        s.partition_permille = @max(s.partition_permille, 3);
+        s.max_lost_nodes = if (s.node_count >= 5) 2 else 1;
+        return s;
     }
 
     /// The deliberately-small-ring slice: same sampling as `fromSeed` but
@@ -198,6 +218,7 @@ pub const Scenario = struct {
         s.partition_permille = 0;
         s.crash_permille = 0;
         s.wipe_permille = 0;
+        s.max_lost_nodes = 1;
         s.durability = .sync;
         s.log_capacity = 4 * 1024 * 1024;
         s.payload_max = 2048;
@@ -229,6 +250,7 @@ pub const Scenario = struct {
             \\  "crash_permille": {d},
             \\  "restart_permille": {d},
             \\  "wipe_permille": {d},
+            \\  "max_lost_nodes": {d},
             \\  "request_percent": {d},
             \\  "payload_min": {d},
             \\  "payload_max": {d},
@@ -239,16 +261,15 @@ pub const Scenario = struct {
             \\}}
             \\
         , .{
-            self.seed,                    self.node_count,              self.log_capacity,
-            self.small_ring,              self.ticks_safety,            self.ticks_convergence,
-            self.hard_state.name(),       self.durability.name(),       self.flush_interval_ms,
-            self.msg_delay_min_ms,        self.msg_delay_max_ms,        self.drop_percent,
-            self.duplicate_percent,       self.partition_permille,      self.partition_min_ms,
-            self.partition_max_ms,        self.crash_permille,          self.restart_permille,
-            self.wipe_permille,
-            self.request_percent,         self.payload_min,             self.payload_max,
-            self.election_timeout_min_ms, self.election_timeout_max_ms, self.heartbeat_interval_ms,
-            self.rpc_timeout_ms,
+            self.seed,                    self.node_count,            self.log_capacity,
+            self.small_ring,              self.ticks_safety,          self.ticks_convergence,
+            self.hard_state.name(),       self.durability.name(),     self.flush_interval_ms,
+            self.msg_delay_min_ms,        self.msg_delay_max_ms,      self.drop_percent,
+            self.duplicate_percent,       self.partition_permille,    self.partition_min_ms,
+            self.partition_max_ms,        self.crash_permille,        self.restart_permille,
+            self.wipe_permille,           self.max_lost_nodes,        self.request_percent,
+            self.payload_min,             self.payload_max,           self.election_timeout_min_ms,
+            self.election_timeout_max_ms, self.heartbeat_interval_ms, self.rpc_timeout_ms,
         });
     }
 
@@ -284,6 +305,7 @@ pub const Scenario = struct {
             .crash_permille = try jsonInt(u16, obj, "crash_permille"),
             .restart_permille = try jsonInt(u16, obj, "restart_permille"),
             .wipe_permille = try jsonInt(u16, obj, "wipe_permille"),
+            .max_lost_nodes = try jsonInt(u8, obj, "max_lost_nodes"),
             .request_percent = try jsonInt(u8, obj, "request_percent"),
             .payload_min = try jsonInt(u32, obj, "payload_min"),
             .payload_max = try jsonInt(u32, obj, "payload_max"),
@@ -399,7 +421,7 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 26), obj.count());
+    try testing.expectEqual(@as(usize, 27), obj.count());
     try testing.expectEqual(@as(i64, s.wipe_permille), obj.get("wipe_permille").?.integer);
     try testing.expectEqual(@as(i64, 99), obj.get("seed").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.log_capacity)), obj.get("log_capacity").?.integer);
