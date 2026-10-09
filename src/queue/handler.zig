@@ -3,8 +3,8 @@
 //! Read operations (peek, stats, dlq_list) query the QueueProjection directly.
 //! Write operations (enqueue, ack, nack, purge) persist an entry through
 //! Raft; the projection router applies it to the QueueProjection under
-//! `Shard.applyCommitted()`. Dequeue is a projection-local lease whose ack
-//! is persisted the same way.
+//! `Shard.applyCommitted()`. A dequeue proposes an ack for each message it
+//! hands out, so delivery is at-most-once.
 //!
 //! ## Queue Semantics
 //!
