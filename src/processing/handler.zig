@@ -1445,9 +1445,15 @@ pub const ProcessingHandler = struct {
         // Read from the named source stream using namespace-qualified name-hash filtering
         const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, pipe.batch_size);
         log.debug("TICK: read {d} payloads, last_id ts={d} seq={d}", .{ result.payloads.len, result.last_id.timestamp_ms, result.last_id.sequence });
-        if (result.payloads.len == 0) return;
         defer src_handler.allocator.free(result.payloads);
         defer src_handler.allocator.free(result.ids);
+        if (result.payloads.len == 0) {
+            // Appends that couldn't be read still move the cursor past them
+            // (the stream handler logged them), so the source doesn't stall.
+            pipe.stream_cursor_ts = result.last_id.timestamp_ms;
+            pipe.stream_cursor_seq = result.last_id.sequence;
+            return;
+        }
 
         for (result.payloads) |payload| {
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });

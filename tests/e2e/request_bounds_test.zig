@@ -225,5 +225,5 @@ test "e2e/bounds: a stream append of more than 1000 records, or not a batch, is 
 
     var read = try ctx.cli.run(&.{ "stream", "read", "s", "--limit", "10", "-o", "json" });
     defer read.deinit();
-    try testing.expect(!read.stdoutContains("\"data\""));
+    try testing.expectEqualStrings("[]\n", read.stdout);
 }

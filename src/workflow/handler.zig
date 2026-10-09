@@ -3050,9 +3050,16 @@ pub const WorkflowHandler = struct {
                 cursor,
                 @max(batch_limit, 1) * 10, // read ahead for batching
             );
-            if (result.payloads.len == 0) continue;
             defer stream_handler.allocator.free(result.payloads);
             defer stream_handler.allocator.free(result.ids);
+            if (result.payloads.len == 0) {
+                // Appends that couldn't be read still move the cursor past
+                // them (the stream handler logged them), so the trigger
+                // doesn't stall.
+                trigger.stream_cursor_ts = result.last_id.timestamp_ms;
+                trigger.stream_cursor_seq = result.last_id.sequence;
+                continue;
+            }
 
             // Start one run per event (or per batch if batch_size > 1)
             if (trigger.batch_size <= 1) {

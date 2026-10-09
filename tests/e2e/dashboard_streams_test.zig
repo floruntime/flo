@@ -260,3 +260,38 @@ test "e2e/dashboard: stream messages page through batches over 100 by the server
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen.items, std.fmt.bufPrint(&nb, "\"d{d}-{d:0>3}\"", .{ b, i }) catch unreachable));
     };
 }
+
+test "e2e/dashboard: stream messages from a cursor inside an append return the rest of it" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    var bufs: [150][16]u8 = undefined;
+    var args: [3 + 150][]const u8 = undefined;
+    args[0] = "stream";
+    args[1] = "append";
+    args[2] = "dash-mid";
+    for (0..150) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "m-{d:0>3}", .{i}) catch unreachable;
+    try ctx.exec(&args);
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var first = try http.get("/api/v1/streams/dash-mid/messages?limit=200");
+    defer first.deinit();
+    // The 50th record's id: "id_ms":T,"id_seq":S
+    var at: usize = 0;
+    for (0..50) |_| at = (std.mem.indexOfPos(u8, first.body, at + 1, "\"id_ms\":") orelse return error.NoId);
+    const ms_start = at + "\"id_ms\":".len;
+    const ms = first.body[ms_start..std.mem.indexOfScalarPos(u8, first.body, ms_start, ',').?];
+    const seq_tag = std.mem.indexOfPos(u8, first.body, ms_start, "\"id_seq\":").? + "\"id_seq\":".len;
+    const seq = first.body[seq_tag..std.mem.indexOfScalarPos(u8, first.body, seq_tag, ',').?];
+
+    var path: [160]u8 = undefined;
+    var rest = try http.get(std.fmt.bufPrint(&path, "/api/v1/streams/dash-mid/messages?limit=200&cursor={s}-{s}", .{ ms, seq }) catch unreachable);
+    defer rest.deinit();
+    try testing.expectEqual(@as(usize, 100), std.mem.count(u8, rest.body, "\"payload\":\"m-"));
+    try testing.expect(std.mem.indexOf(u8, rest.body, "\"m-049\"") == null);
+    try testing.expect(std.mem.indexOf(u8, rest.body, "\"m-050\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rest.body, "\"m-149\"") != null);
+}

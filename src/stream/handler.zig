@@ -87,8 +87,11 @@ pub const StreamHandler = struct {
     /// The id the last applied append got (see `Shard.answering_index`).
     last_append: ?StreamID = null,
     /// Appends a read had to skip: not in hot or warm storage, or not a
-    /// well-formed batch. Each is logged.
+    /// well-formed batch. Each is counted and logged once.
     skipped_appends: u64 = 0,
+    /// The highest log index counted in `skipped_appends`: reads move
+    /// forward, so a re-read or a waiter's next wake doesn't count it again.
+    highest_skipped_ual: u64 = 0,
     /// Backs a refusal message that names request values; sent before the
     /// next command runs.
     err_buf: [128]u8 = undefined,
@@ -620,7 +623,7 @@ pub const StreamHandler = struct {
 
     /// A read response carrying `records`. The caller frees it.
     pub fn messages(self: *StreamHandler, records: []const StreamRecord, after: StreamID) CommandResult {
-        const data = self.serializeStreamRecordsWithPayloads(records, after) catch {
+        const data = self.serializeStreamRecordsWithPayloads(records, after, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
         const last_id = if (records.len > 0) stream_mod.lastRecordOf(records[records.len - 1]) else StreamID.MIN;
@@ -1118,10 +1121,20 @@ pub const StreamHandler = struct {
             };
         };
         // A group's cursor passes whole appends, so nothing is left out.
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN) catch {
+        var readable: [MAX_READ_BATCH]bool = undefined;
+        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
-        self.stream.groupDeliverRecords(group_name, consumer_id, buf[0..count], now_ms) catch |err| {
+        // Only appends the reply carries go pending; the cursor passes the
+        // rest too, or the next read would meet them again.
+        var sent: [MAX_READ_BATCH]StreamRecord = undefined;
+        var sent_n: usize = 0;
+        for (buf[0..count], readable[0..count]) |rec, ok| if (ok) {
+            sent[sent_n] = rec;
+            sent_n += 1;
+        };
+        const through = if (count > 0) stream_mod.lastRecordOf(buf[count - 1]) else StreamID.MIN;
+        self.stream.groupDeliverRecords(group_name, consumer_id, sent[0..sent_n], through, now_ms) catch |err| {
             self.allocator.free(data);
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
@@ -1344,7 +1357,7 @@ pub const StreamHandler = struct {
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
 
-        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN) catch {
+        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
         };
 
@@ -1413,6 +1426,15 @@ pub const StreamHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    /// An append a read can't return: counted and logged once.
+    fn noteUnreadable(self: *StreamHandler, rec: StreamRecord) void {
+        if (rec.ual_index <= self.highest_skipped_ual) return;
+        self.highest_skipped_ual = rec.ual_index;
+        self.skipped_appends += 1;
+        if (self.shard_ptr) |sptr| if (shardFromPtr(sptr).shard_metrics) |sm| sm.recordStreamSkippedAppend();
+        log.err("stream: the append at log index {d} is in neither hot nor warm storage, or isn't a batch; its records are skipped", .{rec.ual_index});
+    }
+
     /// The id of record `j` of an append.
     fn recordId(rec: StreamRecord, j: u64) StreamID {
         return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + j };
@@ -1460,7 +1482,8 @@ pub const StreamHandler = struct {
     ///   [header_count:u32]([key_len:u32][key][val_len:u32][val])*
     /// Records at or before `after` are left out: a cursor inside an append
     /// resumes with the rest of it.
-    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, after: StreamID) ![]u8 {
+    /// `readable`, if given, is set per append: whether its records went in.
+    pub fn serializeStreamRecordsWithPayloads(self: *StreamHandler, records: []const StreamRecord, after: StreamID, readable: ?[]bool) ![]u8 {
         // The reader named the stream; repeating it per record would let a
         // long name push one append's answer past a frame.
         const key_size: usize = 1;
@@ -1477,9 +1500,9 @@ pub const StreamHandler = struct {
             const r = self.getPayloadAndTier(rec.ual_index);
             tiers[i] = r.tier;
             blobs[i] = stream_mod.BatchIterator.init(r.payload) catch null;
+            if (readable) |rd| rd[i] = blobs[i] != null;
             var it = blobs[i] orelse {
-                self.skipped_appends += 1;
-                log.err("stream: the append at log index {d} is in neither hot nor warm storage, or isn't a batch; its records are skipped", .{rec.ual_index});
+                self.noteUnreadable(rec);
                 continue;
             };
             var j: u64 = 0;
@@ -1587,6 +1610,7 @@ pub const StreamHandler = struct {
         for (rec_buf[0..n]) |rec| {
             const result = self.getPayloadAndTier(rec.ual_index);
             var it = stream_mod.BatchIterator.init(result.payload) catch null;
+            if (it == null) self.noteUnreadable(rec);
             if (it) |*batch| {
                 var j: u64 = 0;
                 while (batch.next()) |br| : (j += 1) {
@@ -1601,10 +1625,11 @@ pub const StreamHandler = struct {
             last_id = stream_mod.lastRecordOf(rec);
         }
 
-        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
+        // Out of memory: nothing read, so the cursor stays put.
+        const out = self.allocator.alloc([]const u8, count) catch return .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
         const ids = self.allocator.alloc(StreamID, count) catch {
             self.allocator.free(out);
-            return .{ .payloads = &.{}, .ids = &.{}, .last_id = last_id };
+            return .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
         };
         @memcpy(out, results[0..count]);
         @memcpy(ids, result_ids[0..count]);
@@ -2417,6 +2442,107 @@ test "stream handler: the processing source resumes after whole appends" {
     }
     const done = handler.readPayloadsForStream("s1", "default", after, 500);
     try testing.expectEqual(@as(usize, 0), done.payloads.len);
+}
+
+test "stream handler: one maximal append's answer is within its bound" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // 1000 empty records with 14 empty headers each: the shape whose answer
+    // grows most over its stored size (each header's lengths double).
+    const n = stream_mod.MAX_BATCH_RECORDS;
+    const per = 4 + 2 + 14 * 4;
+    const blob = try allocator.alloc(u8, 4 + n * per);
+    defer allocator.free(blob);
+    @memset(blob, 0);
+    std.mem.writeInt(u32, blob[0..4], n, .little);
+    for (0..n) |i| std.mem.writeInt(u16, blob[4 + i * per + 4 ..][0..2], 14, .little);
+    switch (handler.handleCommand(makeRequest(.stream_append, "s1", blob, ""))) {
+        .stream_append_ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    var recs: [1]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 1), handler.stream.readStreamAfter(h, StreamID.MIN, null, &recs));
+    const data = try handler.serializeStreamRecordsWithPayloads(&recs, StreamID.MIN, null);
+    defer allocator.free(data);
+    try testing.expectEqual(@as(u32, n), std.mem.readInt(u32, data[0..4], .little));
+    try testing.expect(data.len <= 4 + stream_mod.answerBound(recs[0]));
+}
+
+test "stream handler: a read steps past an append it can't read" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // An append the projection knows but whose payload is in no tier.
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
+
+    // A one-record read meets only the lost append first; it steps past it
+    // rather than answering empty with the cursor left where it was.
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU32(.count, 1);
+    const result = handler.handleCommand(makeRequest(.stream_read, "s1", "", b.getOptions()));
+    switch (result) {
+        .stream_messages => |m| {
+            defer handler.freeResult(result);
+            try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, m.data[0..4], .little));
+            try testing.expect(std.mem.endsWith(u8, m.data, "ok\x00\x00\x00\x00"));
+            try testing.expect(StreamID.greaterThan(.{ .timestamp_ms = m.next_timestamp_ms, .sequence = m.next_sequence }, lost));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
+
+    // Read again from the start: the same lost append isn't counted twice.
+    const again = handler.handleCommand(makeRequest(.stream_read, "s1", "", b.getOptions()));
+    handler.freeResult(again);
+    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
+}
+
+test "stream handler: a group read that can't build its answer leaves nothing pending" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "m"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
+
+    // The answer's allocation fails.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    handler.allocator = failing.allocator();
+    const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
+    handler.allocator = allocator;
+    switch (r) {
+        .err => {},
+        else => return error.TestUnexpectedResult,
+    }
+    // The next read still delivers it: it reached neither the pending list
+    // nor the group's cursor.
+    const ok = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
+    switch (ok) {
+        .group_messages => |m| {
+            defer handler.freeResult(ok);
+            try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, m.data[0..4], .little));
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "stream handler: read honors count" {

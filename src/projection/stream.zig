@@ -224,9 +224,11 @@ pub fn lastRecordOf(rec: StreamRecord) StreamID {
     return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
 }
 
-/// An upper bound on an append's bytes in a read answer. Each record adds
-/// at most 28 bytes of framing, and widening its header lengths at most
-/// doubles its stored header bytes.
+/// An upper bound on an append's bytes in a read answer. A record's answer
+/// framing is 30 bytes against the 6 its stored form has (payload length,
+/// header count), so 24 more; widening its header lengths from 2 to 4 bytes
+/// at most doubles its stored header bytes. Twice the stored size covers the
+/// headers, and 28 per record the framing.
 pub fn answerBound(rec: StreamRecord) usize {
     return 2 * @as(usize, rec.byte_len) + 28 * @as(usize, rec.record_count);
 }
@@ -1314,15 +1316,19 @@ pub const StreamProjection = struct {
         return wholeEntriesWithin(buf[0..read_n], count);
     }
 
-    /// Put `records` (from `groupPeek`) on the group's pending list.
-    pub fn groupDeliverRecords(self: *StreamProjection, group_name: []const u8, consumer_id: []const u8, records: []const StreamRecord, now_ms: u64) !void {
+    /// Put `records` (from `groupPeek`) on the group's pending list, and
+    /// move its cursor to `through` (the last record peeked), which may pass
+    /// appends left off the list.
+    pub fn groupDeliverRecords(self: *StreamProjection, group_name: []const u8, consumer_id: []const u8, records: []const StreamRecord, through: StreamID, now_ms: u64) !void {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         if (records.len > 0) _ = try group.deliver(consumer_id, records, now_ms);
+        if (through.greaterThan(group.last_delivered_id)) group.last_delivered_id = through;
     }
 
     pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
         const n = try self.groupPeek(group_name, name_hash, count, buf);
-        try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], now_ms);
+        const through = if (n > 0) lastRecordOf(buf[n - 1]) else StreamID.MIN;
+        try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], through, now_ms);
         return n;
     }
 

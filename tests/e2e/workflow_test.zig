@@ -3148,14 +3148,46 @@ test "e2e/workflow: a batched append starts one run per record" {
     try ctx.exec(&.{ "stream", "append", "batch-trigger-events", "a", "b", "c", "d", "e" });
     try ctx.exec(&.{ "stream", "append", "batch-trigger-events", "single" });
 
-    var runs: usize = 0;
+    try expectOneRunPerInput(ctx, "st-batch-run", &.{ "a", "b", "c", "d", "e", "single" });
+
+    // After a restart the runs are restored, the trigger's cursor with them,
+    // and no record starts a second run.
+    try ctx.restartServer();
+    stdx.time.sleep(500 * std.time.ns_per_ms);
+    try expectOneRunPerInput(ctx, "st-batch-run", &.{ "a", "b", "c", "d", "e", "single" });
+}
+
+/// The workflow has exactly one run per input, waiting up to 5 s for them.
+fn expectOneRunPerInput(ctx: *stdx.testing.TestContext, workflow: []const u8, inputs: []const []const u8) !void {
+    var ids_buf: [4096]u8 = undefined;
+    var ids: []const u8 = "";
     var waited: usize = 0;
     while (waited < 50) : (waited += 1) {
-        var r = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-batch-run", "-o", "json" });
+        var r = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", workflow, "-o", "json" });
         defer r.deinit();
-        runs = r.stdoutCount("\"run_id\"");
-        if (runs >= 6) break;
+        if (r.stdoutCount("\"run_id\"") >= inputs.len) {
+            @memcpy(ids_buf[0..r.stdout.len], r.stdout);
+            ids = ids_buf[0..r.stdout.len];
+            break;
+        }
         stdx.time.sleep(100 * std.time.ns_per_ms);
     }
-    try testing.expectEqual(@as(usize, 6), runs);
+    try testing.expectEqual(inputs.len, std.mem.count(u8, ids, "\"run_id\""));
+
+    var seen = [_]usize{0} ** 16;
+    var it = std.mem.splitSequence(u8, ids, "\"run_id\":\"");
+    _ = it.next();
+    while (it.next()) |rest| {
+        const run_id = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse continue];
+        var st = try ctx.cli.run(&.{ "workflow", "status", run_id });
+        defer st.deinit();
+        const tag = "Input:";
+        const at = std.mem.indexOf(u8, st.stdout, tag) orelse return error.NoInput;
+        const line_end = std.mem.indexOfScalarPos(u8, st.stdout, at, '\n') orelse st.stdout.len;
+        const input = std.mem.trim(u8, st.stdout[at + tag.len .. line_end], " ");
+        for (inputs, 0..) |want, i| {
+            if (std.mem.eql(u8, want, input)) seen[i] += 1;
+        }
+    }
+    for (inputs, 0..) |_, i| try testing.expectEqual(@as(usize, 1), seen[i]);
 }
