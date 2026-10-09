@@ -714,14 +714,13 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
             snk.ttl_ms = ttl;
         }
     } else if (mem.eql(u8, kk, "queue")) {
-        try checkKeys(d, obj, &.{ "name", "namespace", "priority", "delay_ms", "use_key_as_dedup" });
+        try checkKeys(d, obj, &.{ "name", "namespace", "priority", "use_key_as_dedup" });
         snk.kind = .queue;
         snk.target = try dupe(allocator, try optString(d, obj, "name") orelse sink_name);
         snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
         if (try optInt(d, obj, "priority")) |p| {
             snk.priority = std.math.cast(u8, p) orelse return d.fail(ParseError.InvalidFormat, "\"priority\" must be from 0 to 255, not {d}", .{p});
         }
-        snk.delay_ms = try optPositive(u64, d, obj, "delay_ms", ParseError.InvalidFormat);
         snk.use_key_as_dedup = try optBool(d, obj, "use_key_as_dedup") orelse true;
     } else if (mem.eql(u8, kk, "ts")) {
         try checkKeys(d, obj, &.{ "measurement", "namespace", "value_field", "tags", "fields" });
@@ -1044,7 +1043,6 @@ test "parser: multi-sink array (stream + kv + queue)" {
         \\      name: task-queue
         \\      namespace: work
         \\      priority: 5
-        \\      delay_ms: 1000
         \\      use_key_as_dedup: false
     ;
 
@@ -1077,7 +1075,7 @@ test "parser: multi-sink array (stream + kv + queue)" {
     try std.testing.expectEqualStrings("task-queue", s2.target);
     try std.testing.expectEqualStrings("work", s2.namespace);
     try std.testing.expectEqual(@as(u8, 5), s2.priority);
-    try std.testing.expectEqual(@as(?u64, 1000), s2.delay_ms);
+    try std.testing.expectEqual(@as(?u64, null), s2.delay_ms);
     try std.testing.expectEqual(false, s2.use_key_as_dedup);
 }
 
@@ -2214,6 +2212,10 @@ test "parser: a value of the wrong kind or out of range is refused, not ignored"
         \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
         \\  "sinks": [ { "queue": { "name": "q", "priority": 300 } } ] }
     , ParseError.InvalidFormat, "\"priority\" must be from 0 to 255, not 300 at sinks[0].queue");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "queue": { "name": "q", "delay_ms": 1000 } } ] }
+    , ParseError.UnknownKey, "unknown key \"delay_ms\" at sinks[0].queue");
     try expectRefused(
         \\{ "kind": "Processing", "sources": [ { "ts": { "measurement": "m", "tags": { "host": 1 } } } ],
         \\  "sinks": [ { "stream": { "name": "out" } } ] }
