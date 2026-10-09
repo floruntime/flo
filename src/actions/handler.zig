@@ -1827,16 +1827,26 @@ const TASK_NOT_SENT = "internal error: the task could not be sent; it is pending
 /// be built or wouldn't fit one answer.
 fn encodeForAnswer(shard: *Shard, task: ActionsHandler.ClaimedTask) ?[]u8 {
     const body = encodeTaskAssignment(shard.allocator, task) catch {
-        task.owner.releaseClaim(task.run_id);
+        releaseAndWake(shard, task);
         return null;
     };
     if (body.len > shard_mod.MAX_REQUEST_SIZE) {
         log.err("actions: run {s}'s task is {d} bytes, over one answer; left pending", .{ task.run_id, body.len });
         shard.allocator.free(body);
-        task.owner.releaseClaim(task.run_id);
+        releaseAndWake(shard, task);
         return null;
     }
     return body;
+}
+
+/// Put the run back to pending and have every shard's waiting workers try
+/// it on their next tick: a flag, not a wake now, since this can run inside
+/// a waiter's own resolution.
+fn releaseAndWake(shard: *Shard, task: ActionsHandler.ClaimedTask) void {
+    task.owner.releaseClaim(task.run_id);
+    if (shard.peer_mailboxes) |mailboxes| {
+        for (mailboxes) |mb| mb.wake.set(.action_invoked);
+    }
 }
 
 /// Extract the first task type (action name) from the action_await value.
