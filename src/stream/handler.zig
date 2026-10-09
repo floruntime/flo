@@ -607,64 +607,59 @@ pub const StreamHandler = struct {
         if (req.value.len > 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "stream trim takes no value; give --before, --maxlen or --maxage" } };
         }
-        if (req.findOption(.max_bytes) != null) {
-            return .{ .err = .{ .code = .invalid_request, .message = "byte-based trim (max_bytes) is not supported; use --before, --maxlen or --maxage" } };
+        // Options a trim might be sent but doesn't take: refused by name, not ignored.
+        inline for (.{
+            .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of --before, --maxlen or --maxage" },
+            .{ proto.OptionTag.stream_end, "stream trim: stream_end is not a trim bound; give one of --before, --maxlen or --maxage" },
+            .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (--maxlen)" },
+            .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (--maxage)" },
+            .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of --before, --maxlen or --maxage" },
+        }) |refused| {
+            if (req.findOption(refused[0]) != null) return .{ .err = .{ .code = .invalid_request, .message = refused[1] } };
         }
         const dry_run = req.findOption(.dry_run) != null;
 
-        // Resolve the trim boundary into a StreamID. Records with id <= the
-        // boundary are removed (trim is inclusive — see `trimStream`).
-        // Whichever bound is present wins, checked most-specific first.
-        var trim_id = StreamID.MIN;
+        const before = req.findOption(.stream_start);
+        const maxlen = req.findOption(.limit);
+        const maxage = req.findOption(.max_age_seconds);
+        const bounds = @as(u8, @intFromBool(before != null)) + @intFromBool(maxlen != null) + @intFromBool(maxage != null);
+        if (bounds == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give one of --before, --maxlen or --maxage" } };
+        if (bounds > 1) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give only one of --before, --maxlen or --maxage" } };
 
-        // `--before <id>` (.stream_start) or `.stream_end`: remove everything
-        // up to and including this id.
-        const boundary_opt = req.findOption(.stream_start) orelse req.findOption(.stream_end);
-        if (boundary_opt) |opt| {
-            if (opt.asStreamId()) |sid| {
-                if (sid.timestamp_ms > 0) {
-                    trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
-                } else if (sid.sequence > 0) {
-                    trim_id = StreamID.fromSeq(sid.sequence);
-                }
+        // The boundary: records with id <= it are removed (see `trimStream`).
+        var trim_id: StreamID = undefined;
+        if (before) |opt| {
+            const sid = opt.asStreamId() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --before must be a stream id" } };
+            if (sid.timestamp_ms > 0) {
+                trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+            } else if (sid.sequence > 0) {
+                trim_id = StreamID.fromSeq(sid.sequence);
+            } else {
+                return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --before must be after 0-0" } };
             }
-        }
-
-        // `--maxlen N` (.limit): keep only the newest N records, so the boundary
-        // is the (total - N)th record. Nothing to trim when total <= N.
-        if (trim_id.eql(StreamID.MIN)) {
-            if (req.findOption(.limit)) |opt| {
-                if (opt.asU64()) |keep| {
-                    if (keep > 0) {
-                        // Logical records: counting entries would read a
-                        // batched stream as far shorter than it is.
-                        const total = self.stream.streamLogicalCount(name_hash);
-                        if (total <= keep) return trimmed(name_hash, 0, self.stream);
-                        trim_id = self.stream.resolveNthRecordId(name_hash, total - keep);
-                    }
-                }
-            }
-        }
-
-        // `--maxage S` (.max_age_seconds): remove records older than now - S.
-        if (trim_id.eql(StreamID.MIN)) {
-            if (req.findOption(.max_age_seconds)) |opt| {
-                if (opt.asU64()) |age_s| {
-                    if (age_s > 0) {
-                        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-                        // Saturates: an age older than the clock trims nothing.
-                        const age_ms = age_s *| 1000;
-                        const cutoff_ms = if (now_ms > age_ms) now_ms - age_ms else 0;
-                        if (cutoff_ms == 0) return trimmed(name_hash, 0, self.stream);
-                        trim_id = StreamID.fromTimestamp(cutoff_ms);
-                    }
-                }
-            }
-        }
-
-        if (trim_id.eql(StreamID.MIN)) {
-            return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
-        }
+        } else if (maxlen) |opt| {
+            // Keep only the newest N records.
+            const keep = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxlen must be a u64" } };
+            if (keep == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxlen must be > 0" } };
+            // Logical records: counting entries would read a batched stream
+            // as far shorter than it is.
+            const total = self.stream.streamLogicalCount(name_hash);
+            if (total <= keep) return trimmed(name_hash, 0, self.stream);
+            trim_id = self.stream.resolveNthRecordId(name_hash, total - keep);
+            // Trim cuts whole batches; when the cut falls inside the first
+            // one, nothing can go without dropping records inside the window.
+            if (trim_id.eql(StreamID.MIN)) return trimmed(name_hash, 0, self.stream);
+        } else if (maxage) |opt| {
+            // Remove records older than now - S.
+            const age_s = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxage must be a u64" } };
+            if (age_s == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: --maxage must be > 0" } };
+            const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+            // Saturates: an age older than the clock trims nothing.
+            const age_ms = age_s *| 1000;
+            const cutoff_ms = if (now_ms > age_ms) now_ms - age_ms else 0;
+            if (cutoff_ms == 0) return trimmed(name_hash, 0, self.stream);
+            trim_id = StreamID.fromTimestamp(cutoff_ms);
+        } else unreachable;
 
         // A dry run answers from the projection on the owning shard: what the
         // trim would remove and the first record it would leave, with no
@@ -2562,7 +2557,14 @@ test "stream handler: trim" {
     try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(s1_hash));
 }
 
-test "stream handler: trim refuses a value and max_bytes" {
+fn expectTrimRefused(handler: *StreamHandler, value: []const u8, options: []const u8, message: []const u8) !void {
+    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", value, options))) {
+        .err => |e| try testing.expectEqualStrings(message, e.message),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stream handler: trim refuses what it would otherwise ignore" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -2571,23 +2573,78 @@ test "stream handler: trim refuses a value and max_bytes" {
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    var vb: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "a"), ""));
+    var vba: [64]u8 = undefined;
+    var vbb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vba, "a"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbb, "b"), ""));
 
-    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "3", ""))) {
-        .err => |e| try testing.expectEqual(@as(@TypeOf(e.code), .invalid_request), e.code),
-        else => return error.TestUnexpectedResult,
+    // Each request carries a valid bound, so only the named cause can refuse it.
+    var ok_buf: [32]u8 = undefined;
+    var ok = OptionsBuilder.init(&ok_buf);
+    try ok.addU64(.limit, 1);
+    try expectTrimRefused(&handler, "3", ok.getOptions(), "stream trim takes no value; give --before, --maxlen or --maxage");
+
+    inline for (.{
+        .{ proto.OptionTag.max_bytes, "stream trim: max_bytes is not supported; give one of --before, --maxlen or --maxage" },
+        .{ proto.OptionTag.retention_count, "stream trim: retention_count is not a trim bound; send limit (--maxlen)" },
+        .{ proto.OptionTag.retention_age, "stream trim: retention_age is not a trim bound; send max_age_seconds (--maxage)" },
+        .{ proto.OptionTag.retention_bytes, "stream trim: retention_bytes is not supported; give one of --before, --maxlen or --maxage" },
+    }) |c| {
+        var ob: [32]u8 = undefined;
+        var b = OptionsBuilder.init(&ob);
+        try b.addU64(.limit, 1);
+        try b.addU64(c[0], 10);
+        try expectTrimRefused(&handler, "", b.getOptions(), c[1]);
     }
 
-    // max_bytes alongside a bound it would otherwise be ignored next to.
-    var ob: [32]u8 = undefined;
-    var b = OptionsBuilder.init(&ob);
-    try b.addU64(.limit, 1);
-    try b.addU64(.max_bytes, 10);
-    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", b.getOptions()))) {
-        .err => |e| try testing.expectEqual(@as(@TypeOf(e.code), .invalid_request), e.code),
-        else => return error.TestUnexpectedResult,
+    var two_buf: [32]u8 = undefined;
+    var two = OptionsBuilder.init(&two_buf);
+    try two.addU64(.limit, 1);
+    try two.addU64(.max_age_seconds, 60);
+    try expectTrimRefused(&handler, "", two.getOptions(), "stream trim: give only one of --before, --maxlen or --maxage");
+
+    try expectTrimRefused(&handler, "", "", "stream trim: give one of --before, --maxlen or --maxage");
+
+    var zl_buf: [16]u8 = undefined;
+    var zl = OptionsBuilder.init(&zl_buf);
+    try zl.addU64(.limit, 0);
+    try expectTrimRefused(&handler, "", zl.getOptions(), "stream trim: --maxlen must be > 0");
+
+    var za_buf: [16]u8 = undefined;
+    var za = OptionsBuilder.init(&za_buf);
+    try za.addU64(.max_age_seconds, 0);
+    try expectTrimRefused(&handler, "", za.getOptions(), "stream trim: --maxage must be > 0");
+
+    // Nothing was trimmed by any of them.
+    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
+}
+
+test "stream handler: --maxlen cutting inside the first batch trims nothing" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // One 3-record batch: keeping 1 would cut inside it.
+    const batch = [_]u8{ 3, 0, 0, 0, 1, 0, 0, 0, 'a', 0, 0, 1, 0, 0, 0, 'b', 0, 0, 1, 0, 0, 0, 'c', 0, 0 };
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", &batch, ""));
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    try testing.expectEqual(@as(u64, 3), handler.stream.streamLogicalCount(h));
+
+    for ([_]bool{ true, false }) |dry| {
+        var ob: [32]u8 = undefined;
+        var b = OptionsBuilder.init(&ob);
+        try b.addU64(.limit, 1);
+        if (dry) try b.addFlag(.dry_run);
+        switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", b.getOptions()))) {
+            .stream_trimmed => |t| try testing.expectEqual(@as(u64, 0), t.deleted_count),
+            else => return error.TestUnexpectedResult,
+        }
     }
+    try testing.expectEqual(@as(u64, 3), handler.stream.streamLogicalCount(h));
 }
 
 test "stream handler: info" {

@@ -237,11 +237,21 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 /// POST /streams/:name/trim - trim a stream by count or age (loopback write).
 /// Query: ?namespace= &max_len= &max_age_s= &dry_run=
 pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    if (h.unknownQueryParam(query_string, &.{ "namespace", "max_len", "max_age_s", "dry_run" })) |k| {
+        const msg = try std.fmt.allocPrint(allocator, "trim does not take '{s}'; give one of max_len or max_age_s", .{k});
+        defer allocator.free(msg);
+        return try h.jsonError(allocator, msg);
+    }
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const max_len = h.parseQueryParam(u64, query_string, "max_len");
     const max_age_s = h.parseQueryParam(u64, query_string, "max_age_s");
     const dry_run = boolParam(query_string, "dry_run");
 
+    // A value that doesn't parse is refused, not read as absent.
+    if (max_len == null and h.parseQueryParam([]const u8, query_string, "max_len") != null)
+        return try h.jsonError(allocator, "max_len must be a whole number");
+    if (max_age_s == null and h.parseQueryParam([]const u8, query_string, "max_age_s") != null)
+        return try h.jsonError(allocator, "max_age_s must be a whole number");
     if (max_len == null and max_age_s == null) {
         return try h.jsonError(allocator, "trim requires one of max_len or max_age_s");
     }

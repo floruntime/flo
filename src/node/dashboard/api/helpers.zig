@@ -169,6 +169,27 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
     return null;
 }
 
+/// The first query parameter not in `allowed`, so a route can refuse it
+/// rather than ignore it.
+pub fn unknownQueryParam(query_string: ?[]const u8, allowed: []const []const u8) ?[]const u8 {
+    const qs = query_string orelse return null;
+    var pairs = std.mem.splitScalar(u8, qs, '&');
+    next: while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+        const k = if (std.mem.indexOfScalar(u8, pair, '=')) |eq| pair[0..eq] else pair;
+        for (allowed) |a| if (std.mem.eql(u8, k, a)) continue :next;
+        return k;
+    }
+    return null;
+}
+
+test "unknownQueryParam names the first parameter not allowed" {
+    const allowed: []const []const u8 = &.{ "namespace", "max_len" };
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownQueryParam("namespace=a&max_len=3", allowed));
+    try std.testing.expectEqualStrings("max_bytes", unknownQueryParam("max_len=3&max_bytes=10", allowed).?);
+    try std.testing.expectEqualStrings("flag", unknownQueryParam("flag", allowed).?);
+}
+
 // =============================================================================
 // JSON Error Response
 // =============================================================================

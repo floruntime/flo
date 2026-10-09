@@ -566,6 +566,48 @@ test "e2e/stream: trim --dry-run on batches reports what the trim removes" {
     try testing.expect(!after.stdoutContains("bm-0-"));
 }
 
+test "e2e/stream: trim refuses two bounds and a zero bound" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for (0..3) |i| {
+        var buf: [16]u8 = undefined;
+        try ctx.exec(&.{ "stream", "append", "trim-bounds", std.fmt.bufPrint(&buf, "tb-{d}", .{i}) catch unreachable });
+    }
+
+    var two = try ctx.cli.run(&.{ "stream", "trim", "trim-bounds", "--maxlen", "1", "--maxage", "60" });
+    defer two.deinit();
+    try testing.expect(two.stderrContains("give only one of --before, --maxlen or --maxage"));
+
+    var zero = try ctx.cli.run(&.{ "stream", "trim", "trim-bounds", "--maxlen", "0" });
+    defer zero.deinit();
+    try testing.expect(zero.stderrContains("--maxlen must be > 0"));
+
+    var read = try ctx.cli.run(&.{ "stream", "read", "trim-bounds", "--limit", "10", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 3), read.stdoutCount("tb-"));
+}
+
+test "e2e/stream: --maxlen cutting inside one batch trims nothing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "trim-one-batch", "ob-0", "ob-1", "ob-2" });
+    for ([_][]const u8{ "dry_run", "ok" }) |status| {
+        const dry = std.mem.eql(u8, status, "dry_run");
+        var r = try ctx.cli.run(if (dry)
+            &.{ "stream", "trim", "trim-one-batch", "--maxlen", "1", "--dry-run", "-o", "json" }
+        else
+            &.{ "stream", "trim", "trim-one-batch", "--maxlen", "1", "-o", "json" });
+        defer r.deinit();
+        var want: [64]u8 = undefined;
+        try testing.expect(r.stdoutContains(std.fmt.bufPrint(&want, "\"status\":\"{s}\",\"trimmed\":0,", .{status}) catch unreachable));
+    }
+    var read = try ctx.cli.run(&.{ "stream", "read", "trim-one-batch", "--limit", "10", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 3), read.stdoutCount("ob-"));
+}
+
 test "e2e/stream: delete removes a stream" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
