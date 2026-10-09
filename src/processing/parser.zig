@@ -1,17 +1,9 @@
 //! Processing Job Definition Parser
 //!
-//! Parses job definitions from YAML or JSON format, following the same
-//! patterns as the workflow parser (`src/workflow/parser.zig`).
-//!
-//! # Supported Formats
-//!
-//! - YAML (primary, converted to JSON internally via util/yaml_to_json)
-//! - JSON (native via std.json)
-//! # Source/Sink Format
-//!
-//! Sources and sinks are specified as arrays (`sources:` / `sinks:`).
-//!
-//! Both stream and TS sources use the same nested object syntax:
+//! Parses job definitions from YAML (converted to JSON internally) or JSON,
+//! with the same rule as the workflow parser: a key the parser doesn't read,
+//! a value of the wrong kind, an unknown operator type, or a duplicated key
+//! is refused, naming the key and where it is.
 //!
 //! ```yaml
 //! sources:
@@ -35,18 +27,11 @@
 //!       key_prefix: user
 //! ```
 //!
-//! # Usage
-//!
 //! ```zig
-//! const parser = @import("processing/parser.zig");
-//!
-//! var def = try parser.parseJobDefinition(allocator, yaml_content);
+//! var diag: parser.Diagnostic = .{};
+//! var def = try parser.parseJobDefinition(allocator, yaml_content, &diag);
 //! defer def.deinit(allocator);
 //! ```
-//!
-//! Only nested YAML is accepted on the server side. Flat dotted-key format
-//! (e.g., `source.stream: x`) is a test convenience — the CLI test helper
-//! `writeDottedToTempYaml` converts it to proper nested YAML before sending.
 
 const std = @import("std");
 const mem = std.mem;
@@ -54,7 +39,9 @@ const Allocator = mem.Allocator;
 
 const job_definition = @import("definition.zig");
 const yaml_to_json = @import("../util/yaml_to_json.zig");
-const interpolate = @import("../util/interpolate.zig");
+const definition_diag = @import("../util/definition_diag.zig");
+
+pub const Diagnostic = definition_diag.Diagnostic;
 
 // Re-export types for convenience
 pub const JobDefinition = job_definition.JobDefinition;
@@ -71,6 +58,10 @@ pub const OperatorSpec = job_definition.OperatorSpec;
 pub const ParseError = error{
     MissingRequiredField,
     InvalidKind,
+    InvalidFieldType,
+    UnknownKey,
+    DuplicateKey,
+    UnknownOperatorType,
     MissingSource,
     MissingSink,
     MissingSourceStream,
@@ -82,395 +73,334 @@ pub const ParseError = error{
 };
 
 // =============================================================================
-// JSON Value Helpers (mirroring workflow/parser.zig)
+// Strict JSON Value Helpers
 // =============================================================================
 
 const JsonValue = std.json.Value;
-const JsonObjectMap = std.json.ObjectMap;
+const D = *Diagnostic;
+const kindName = definition_diag.kindName;
 
-fn getString(obj: JsonValue, key: []const u8) ?[]const u8 {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .string) val.string else null;
+fn checkKeys(d: D, obj: JsonValue, comptime allowed: []const []const u8) ParseError!void {
+    return definition_diag.checkKeys(d, obj, allowed, ParseError.UnknownKey);
 }
 
-fn getInt(obj: JsonValue, key: []const u8) ?i64 {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return switch (val) {
-        .integer => val.integer,
-        .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-        else => null,
-    };
+fn wrongKind(d: D, key: []const u8, want: []const u8, v: JsonValue) ParseError {
+    return d.fail(ParseError.InvalidFieldType, "\"{s}\" must be {s}, not {s}", .{ key, want, kindName(v) });
 }
 
-fn getObject(obj: JsonValue, key: []const u8) ?JsonValue {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .object) val else null;
+fn optString(d: D, obj: JsonValue, key: []const u8) ParseError!?[]const u8 {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .string) v.string else wrongKind(d, key, "a string", v);
 }
 
-fn getArray(obj: JsonValue, key: []const u8) ?[]const JsonValue {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .array) val.array.items else null;
+fn reqString(d: D, obj: JsonValue, key: []const u8, err: ParseError) ParseError![]const u8 {
+    return try optString(d, obj, key) orelse d.fail(err, "missing required key \"{s}\"", .{key});
+}
+
+fn optInt(d: D, obj: JsonValue, key: []const u8) ParseError!?i64 {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .integer) v.integer else wrongKind(d, key, "an integer", v);
+}
+
+/// A positive integer key as `T`, or refused when it is zero, negative or
+/// more than `T` holds.
+fn optPositive(comptime T: type, d: D, obj: JsonValue, key: []const u8, err: ParseError) ParseError!?T {
+    const v = try optInt(d, obj, key) orelse return null;
+    if (v <= 0) return d.fail(err, "\"{s}\" must be at least 1, not {d}", .{ key, v });
+    return std.math.cast(T, v) orelse d.fail(err, "\"{s}\" must be at most {d}, not {d}", .{ key, std.math.maxInt(T), v });
+}
+
+fn optBool(d: D, obj: JsonValue, key: []const u8) ParseError!?bool {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .bool) v.bool else wrongKind(d, key, "true or false", v);
+}
+
+fn optObject(d: D, obj: JsonValue, key: []const u8) ParseError!?JsonValue {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .object) v else wrongKind(d, key, "a map", v);
+}
+
+fn optArray(d: D, obj: JsonValue, key: []const u8) ParseError!?[]const JsonValue {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .array) v.array.items else wrongKind(d, key, "a list", v);
+}
+
+fn dupe(allocator: Allocator, s: []const u8) ParseError![]u8 {
+    return allocator.dupe(u8, s) catch ParseError.OutOfMemory;
 }
 
 // =============================================================================
 // Job Definition Parser
 // =============================================================================
 
-/// Parse a job definition from YAML or JSON content.
-///
-/// Tries JSON first, falls back to YAML→JSON conversion.
-/// Requires the plural `sources:`/`sinks:` array format.
-///
-/// ```yaml
-/// kind: Processing
-/// name: my-pipeline
-/// sources:
-///   - name: events-source
-///     stream:
-///       name: events
-/// sinks:
-///   - name: output
-///     stream:
-///       name: results
-/// ```
-///
-/// Caller owns the returned definition and must call `deinit()`.
-pub fn parseJobDefinition(allocator: Allocator, content: []const u8) ParseError!JobDefinition {
-    return parseJobDefinitionWithNamespace(allocator, content, null);
+/// Parse a job definition from YAML or JSON. On a refusal other than
+/// OutOfMemory, `diag` (when given) says what and where.
+pub fn parseJobDefinition(allocator: Allocator, content: []const u8, diag: ?*Diagnostic) ParseError!JobDefinition {
+    return parseJobDefinitionWithNamespace(allocator, content, null, diag);
 }
 
 /// Parse a job definition with an optional fallback namespace.
 ///
 /// Resolution order for source/sink namespaces:
 ///   1. Explicit `namespace:` on the individual source/sink
-///   2. Top-level `namespace:` in the YAML definition
+///   2. Top-level `namespace:` in the definition
 ///   3. `fallback_namespace` (typically the command/job namespace)
 ///   4. `"default"`
-pub fn parseJobDefinitionWithNamespace(allocator: Allocator, content: []const u8, fallback_namespace: ?[]const u8) ParseError!JobDefinition {
-    // First, try to parse as JSON directly
+pub fn parseJobDefinitionWithNamespace(allocator: Allocator, content: []const u8, fallback_namespace: ?[]const u8, diag: ?*Diagnostic) ParseError!JobDefinition {
+    var scratch: Diagnostic = .{};
+    const d = diag orelse &scratch;
+
     if (std.json.parseFromSlice(JsonValue, allocator, content, .{})) |parsed| {
         defer parsed.deinit();
-        return parseJobDefinitionFromJson(allocator, parsed.value, fallback_namespace);
-    } else |_| {
-        // JSON parse failed — try converting from YAML
-        const json_content = yaml_to_json.convert(allocator, content) catch {
-            return ParseError.InvalidFormat;
-        };
-        defer allocator.free(json_content);
+        return parseJobDefinitionFromJson(allocator, parsed.value, fallback_namespace, d);
+    } else |err| switch (err) {
+        error.OutOfMemory => return ParseError.OutOfMemory,
+        error.DuplicateField => return definition_diag.failDuplicateKey(allocator, d, content, ParseError.DuplicateKey),
+        else => {},
+    }
 
-        const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch {
-            return ParseError.InvalidFormat;
-        };
-        defer parsed.deinit();
+    // Not JSON: YAML, converted to JSON.
+    const json_content = yaml_to_json.convert(allocator, content) catch
+        return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{});
+    defer allocator.free(json_content);
 
-        return parseJobDefinitionFromJson(allocator, parsed.value, fallback_namespace);
+    const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return ParseError.OutOfMemory,
+        error.DuplicateField => return definition_diag.failDuplicateKey(allocator, d, json_content, ParseError.DuplicateKey),
+        else => return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{}),
+    };
+    defer parsed.deinit();
+
+    return parseJobDefinitionFromJson(allocator, parsed.value, fallback_namespace, d);
+}
+
+fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_namespace: ?[]const u8, d: D) ParseError!JobDefinition {
+    if (root != .object) return d.fail(ParseError.InvalidFormat, "a job definition must be a map, not {s}", .{kindName(root)});
+    try checkKeys(d, root, &.{
+        "kind",       "name",    "description", "namespace", "parallelism", "batch_size",
+        "sources",    "sinks",   "operators",   "checkpointing",
+    });
+
+    const kind = try reqString(d, root, "kind", ParseError.MissingRequiredField);
+    if (!mem.eql(u8, kind, "Processing")) return d.fail(ParseError.InvalidKind, "\"kind\" must be Processing, not \"{s}\"", .{kind});
+
+    const name = try optString(d, root, "name") orelse "unnamed-job";
+    const description = try optString(d, root, "description") orelse "";
+    const effective_namespace: []const u8 = try optString(d, root, "namespace") orelse (fallback_namespace orelse "default");
+    const parallelism = try optPositive(u32, d, root, "parallelism", ParseError.InvalidParallelism) orelse 1;
+    const batch_size = try optPositive(u32, d, root, "batch_size", ParseError.InvalidFormat) orelse 100;
+
+    var checkpoint_interval_ms: ?u64 = null;
+    if (try optObject(d, root, "checkpointing")) |cp_obj| {
+        const mark = d.push("checkpointing");
+        defer d.pop(mark);
+        try checkKeys(d, cp_obj, &.{"interval_ms"});
+        checkpoint_interval_ms = try optPositive(u64, d, cp_obj, "interval_ms", ParseError.InvalidFormat);
+    }
+
+    // Owns everything from here; "" frees as nothing.
+    var def: JobDefinition = .{
+        .name = "",
+        .description = "",
+        .namespace = "",
+        .parallelism = parallelism,
+        .batch_size = batch_size,
+        .sources = .empty,
+        .sinks = .empty,
+        .operators = .empty,
+        .checkpoint_interval_ms = checkpoint_interval_ms,
+    };
+    errdefer def.deinit(allocator);
+    def.name = try dupe(allocator, name);
+    def.description = try dupe(allocator, description);
+    def.namespace = try dupe(allocator, effective_namespace);
+
+    if (try optArray(d, root, "sources")) |arr| {
+        const list_mark = d.push("sources");
+        defer d.pop(list_mark);
+        for (arr, 0..) |item, idx| {
+            const mark = d.pushIndex(idx);
+            defer d.pop(mark);
+            try parseOneSource(allocator, d, item, idx, batch_size, effective_namespace, &def.sources);
+        }
+    }
+
+    if (try optArray(d, root, "sinks")) |arr| {
+        const list_mark = d.push("sinks");
+        defer d.pop(list_mark);
+        for (arr, 0..) |item, idx| {
+            const mark = d.pushIndex(idx);
+            defer d.pop(mark);
+            try parseOneSink(allocator, d, item, idx, effective_namespace, &def.sinks);
+        }
+    }
+
+    if (try optArray(d, root, "operators")) |arr| {
+        const list_mark = d.push("operators");
+        defer d.pop(list_mark);
+        for (arr, 0..) |item, idx| {
+            const mark = d.pushIndex(idx);
+            defer d.pop(mark);
+            try parseOperator(allocator, d, item, effective_namespace, &def.operators);
+        }
+    }
+
+    if (def.sources.items.len == 0) return d.fail(ParseError.MissingSource, "a job needs at least one source", .{});
+    if (def.sinks.items.len == 0) return d.fail(ParseError.MissingSink, "a job needs at least one sink", .{});
+
+    return def;
+}
+
+// =============================================================================
+// Operators
+// =============================================================================
+
+/// Each operator type and the keys it reads besides `type` and `name`.
+/// `map` reads every other key as an output field.
+const operator_keys = [_]struct { []const u8, ?[]const []const u8 }{
+    .{ "filter", &.{"condition"} },
+    .{ "passthrough", &.{} },
+    .{ "keyby", &.{"key_expression"} },
+    .{ "aggregate", &.{ "function", "field", "window", "window_size" } },
+    .{ "map", null },
+    .{ "flatmap", &.{ "array_field", "element_key" } },
+    .{ "kv_lookup", &.{ "lookup_key", "namespace", "mode", "enrich_field" } },
+    .{ "classify", &.{ "rules", "default_tag" } },
+};
+
+fn freeConfig(allocator: Allocator, entries: []const OperatorSpec.ConfigEntry) void {
+    for (entries) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
     }
 }
 
-/// Parse job definition from a parsed JSON value tree.
-fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_namespace: ?[]const u8) ParseError!JobDefinition {
-    if (root != .object) return ParseError.InvalidFormat;
+fn appendConfig(allocator: Allocator, config: *std.ArrayList(OperatorSpec.ConfigEntry), key: []const u8, value: []const u8) ParseError!void {
+    const k = try dupe(allocator, key);
+    errdefer allocator.free(k);
+    const v = try dupe(allocator, value);
+    errdefer allocator.free(v);
+    config.append(allocator, .{ .key = k, .value = v }) catch return ParseError.OutOfMemory;
+}
 
-    // Validate kind
-    const kind = getString(root, "kind") orelse return ParseError.MissingRequiredField;
-    if (!mem.eql(u8, kind, "Processing")) return ParseError.InvalidKind;
+fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace: []const u8, operators: *std.ArrayList(OperatorSpec)) ParseError!void {
+    if (item != .object) return d.fail(ParseError.InvalidFieldType, "an operator must be a map, not {s}", .{kindName(item)});
+    const op_type = try reqString(d, item, "type", ParseError.MissingRequiredField);
+    const op_name = try optString(d, item, "name") orelse op_type;
 
-    // Accumulators with errdefer cleanup
-    var name: ?[]u8 = null;
-    var description: ?[]u8 = null;
-    var namespace: ?[]u8 = null;
-    var parallelism: u32 = 1;
-    var batch_size: u32 = 100;
-    var sources: std.ArrayList(SourceSpec) = .empty;
-    var sinks: std.ArrayList(SinkSpec) = .empty;
-    var operators: std.ArrayList(OperatorSpec) = .empty;
+    const allowed: ?[]const []const u8 = inline for (operator_keys) |entry| {
+        if (mem.eql(u8, op_type, entry[0])) break entry[1];
+    } else return d.fail(
+        ParseError.UnknownOperatorType,
+        "unknown operator type \"{s}\" (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify)",
+        .{op_type},
+    );
 
+    var config: std.ArrayList(OperatorSpec.ConfigEntry) = .empty;
     errdefer {
-        if (name) |n| allocator.free(n);
-        if (description) |d| allocator.free(d);
-        if (namespace) |ns| allocator.free(ns);
-        freeSourceSpecs(allocator, &sources);
-        freeSinkSpecs(allocator, &sinks);
-        freeOperatorSpecs(allocator, &operators);
+        freeConfig(allocator, config.items);
+        config.deinit(allocator);
     }
 
-    // --- name (optional, defaults to "unnamed-job") ---
-    if (getString(root, "name")) |v| {
-        name = allocator.dupe(u8, v) catch return error.OutOfMemory;
-    }
+    var it = item.object.iterator();
+    next: while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (mem.eql(u8, key, "type") or mem.eql(u8, key, "name")) continue;
+        if (allowed) |keys| {
+            for (keys) |k| {
+                if (mem.eql(u8, key, k)) break;
+            } else return d.fail(ParseError.UnknownKey, "unknown key \"{s}\" for a {s} operator", .{ key, op_type });
+        }
+        if (mem.eql(u8, op_type, "classify") and mem.eql(u8, key, "rules")) continue :next;
 
-    // --- description (optional, defaults to "") ---
-    if (getString(root, "description")) |v| {
-        description = allocator.dupe(u8, v) catch return error.OutOfMemory;
-    }
-
-    // --- namespace (optional, defaults to fallback_namespace or "default") ---
-    //
-    // Resolution order for sources/sinks:
-    //   1. Explicit namespace on the individual source/sink
-    //   2. Top-level namespace in the YAML definition
-    //   3. fallback_namespace (command/job-level namespace)
-    //   4. "default"
-    const effective_namespace: []const u8 = getString(root, "namespace") orelse
-        (fallback_namespace orelse "default");
-
-    namespace = allocator.dupe(u8, effective_namespace) catch return error.OutOfMemory;
-
-    // --- parallelism (top-level integer, required to be valid if present) ---
-    if (root.object.get("parallelism")) |pval| {
-        const v = switch (pval) {
-            .integer => |i| i,
-            .string => |s| std.fmt.parseInt(i64, s, 10) catch return error.InvalidParallelism,
-            else => return error.InvalidParallelism,
+        var num_buf: [64]u8 = undefined;
+        const value: []const u8 = switch (entry.value_ptr.*) {
+            .string => |s| s,
+            .integer => |n| std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch unreachable,
+            .float => |f| std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch unreachable,
+            .bool => |b| if (b) "true" else "false",
+            else => |v| return wrongKind(d, key, "a string, number or boolean", v),
         };
-        if (v <= 0) return error.InvalidParallelism;
-        parallelism = std.math.cast(u32, v) orelse return error.InvalidParallelism;
+        try appendConfig(allocator, &config, key, value);
     }
 
-    // --- batch_size (top-level integer default for all sources) ---
-    if (root.object.get("batch_size")) |bval| {
-        const v = switch (bval) {
-            .integer => |i| i,
-            .string => |s| std.fmt.parseInt(i64, s, 10) catch return error.InvalidFormat,
-            else => return error.InvalidFormat,
-        };
-        if (v <= 0) return error.InvalidFormat;
-        batch_size = std.math.cast(u32, v) orelse return error.InvalidFormat;
-    }
-
-    // --- sources (required array) ---
-    if (getArray(root, "sources")) |arr| {
-        for (arr, 0..) |item, idx| {
-            try parseOneSource(allocator, item, idx, batch_size, effective_namespace, &sources);
-        }
-    }
-
-    // --- sinks (required array) ---
-    if (getArray(root, "sinks")) |arr| {
-        for (arr, 0..) |item, idx| {
-            try parseOneSink(allocator, item, idx, effective_namespace, &sinks);
-        }
-    }
-
-    // --- operators (array of { type, name, module, config... } objects) ---
-    if (getArray(root, "operators")) |arr| {
-        for (arr) |item| {
-            if (item != .object) continue;
-            const op_type = getString(item, "type") orelse continue;
-            const op_name = getString(item, "name") orelse op_type;
-
-            const type_dup = allocator.dupe(u8, op_type) catch return error.OutOfMemory;
-            errdefer allocator.free(type_dup);
-            const name_dup = allocator.dupe(u8, op_name) catch return error.OutOfMemory;
-            errdefer allocator.free(name_dup);
-
-            const module: ?[]u8 = if (getString(item, "module")) |mp|
-                (interpolate.resolve(allocator, mp, .{}) catch return error.OutOfMemory)
-            else
-                null;
-
-            // Parse config entries — all keys except reserved ones (type, name, module, rules)
-            var config: ?[]const OperatorSpec.ConfigEntry = blk: {
-                const obj_map = item.object;
-                // Reserved keys that are not config
-                const reserved = [_][]const u8{ "type", "name", "module", "rules" };
-                // Count non-reserved string entries
-                var config_count: usize = 0;
-                var it = obj_map.iterator();
-                while (it.next()) |entry| {
-                    const k = entry.key_ptr.*;
-                    var is_reserved = false;
-                    for (reserved) |r| {
-                        if (std.mem.eql(u8, k, r)) {
-                            is_reserved = true;
-                            break;
-                        }
-                    }
-                    if (!is_reserved) config_count += 1;
-                }
-
-                if (config_count == 0) break :blk null;
-
-                const entries = allocator.alloc(OperatorSpec.ConfigEntry, config_count) catch return error.OutOfMemory;
-                var idx: usize = 0;
-                var it2 = obj_map.iterator();
-                while (it2.next()) |entry| {
-                    const k = entry.key_ptr.*;
-                    var is_reserved = false;
-                    for (reserved) |r| {
-                        if (std.mem.eql(u8, k, r)) {
-                            is_reserved = true;
-                            break;
-                        }
-                    }
-                    if (is_reserved) continue;
-
-                    // Convert value to string representation
-                    const val_str: []const u8 = switch (entry.value_ptr.*) {
-                        .string => |s| s,
-                        .integer => |n| std.fmt.allocPrint(allocator, "{d}", .{n}) catch return error.OutOfMemory,
-                        .float => |f| std.fmt.allocPrint(allocator, "{d}", .{f}) catch return error.OutOfMemory,
-                        .bool => |b| if (b) "true" else "false",
-                        else => continue,
-                    };
-
-                    const key_dup = allocator.dupe(u8, k) catch return error.OutOfMemory;
-                    const val_dup = switch (entry.value_ptr.*) {
-                        .string => allocator.dupe(u8, val_str) catch return error.OutOfMemory,
-                        .integer, .float => val_str, // already allocated by allocPrint
-                        else => allocator.dupe(u8, val_str) catch return error.OutOfMemory,
-                    };
-
-                    entries[idx] = .{ .key = key_dup, .value = val_dup };
-                    idx += 1;
-                }
-
-                // Values of other kinds were skipped: keep the slice exactly
-                // as long as its allocation, since later growth frees it.
-                if (idx < entries.len) {
-                    const exact = allocator.alloc(OperatorSpec.ConfigEntry, idx) catch return error.OutOfMemory;
-                    @memcpy(exact, entries[0..idx]);
-                    allocator.free(entries);
-                    break :blk exact;
-                }
-                break :blk entries;
-            };
-
-            // For classify operators, expand `rules:` array into indexed condition_N/tag_N pairs
-            if (std.mem.eql(u8, op_type, "classify")) {
-                if (getArray(item, "rules")) |rules_arr| {
-                    // Count valid rule objects
-                    var valid_rules: usize = 0;
-                    for (rules_arr) |rule_item| {
-                        if (rule_item == .object and getString(rule_item, "condition") != null and getString(rule_item, "tag") != null) {
-                            valid_rules += 1;
-                        }
-                    }
-                    if (valid_rules > 0) {
-                        const existing_count = if (config) |c| c.len else 0;
-                        const new_entries = allocator.alloc(OperatorSpec.ConfigEntry, existing_count + valid_rules * 2) catch return error.OutOfMemory;
-                        // Copy existing entries
-                        if (config) |c| {
-                            @memcpy(new_entries[0..c.len], c);
-                            allocator.free(c);
-                        }
-                        var write_idx = existing_count;
-                        var rule_idx: usize = 0;
-                        for (rules_arr) |rule_item| {
-                            if (rule_item != .object) continue;
-                            const cond = getString(rule_item, "condition") orelse continue;
-                            const tag = getString(rule_item, "tag") orelse continue;
-                            const cond_key = std.fmt.allocPrint(allocator, "condition_{d}", .{rule_idx}) catch return error.OutOfMemory;
-                            const tag_key = std.fmt.allocPrint(allocator, "tag_{d}", .{rule_idx}) catch return error.OutOfMemory;
-                            const cond_dup = allocator.dupe(u8, cond) catch return error.OutOfMemory;
-                            const tag_dup = allocator.dupe(u8, tag) catch return error.OutOfMemory;
-                            new_entries[write_idx] = .{ .key = cond_key, .value = cond_dup };
-                            write_idx += 1;
-                            new_entries[write_idx] = .{ .key = tag_key, .value = tag_dup };
-                            write_idx += 1;
-                            rule_idx += 1;
-                        }
-                        config = new_entries[0..write_idx];
-                    }
-                }
+    // A classify operator's `rules:` list becomes indexed condition_N/tag_N pairs.
+    if (mem.eql(u8, op_type, "classify")) {
+        if (try optArray(d, item, "rules")) |rules| {
+            const rules_mark = d.push("rules");
+            defer d.pop(rules_mark);
+            for (rules, 0..) |rule, i| {
+                const mark = d.pushIndex(i);
+                defer d.pop(mark);
+                if (rule != .object) return d.fail(ParseError.InvalidFieldType, "a rule must be a map, not {s}", .{kindName(rule)});
+                try checkKeys(d, rule, &.{ "condition", "tag" });
+                const cond = try reqString(d, rule, "condition", ParseError.MissingRequiredField);
+                const tag = try reqString(d, rule, "tag", ParseError.MissingRequiredField);
+                var key_buf: [32]u8 = undefined;
+                try appendConfig(allocator, &config, std.fmt.bufPrint(&key_buf, "condition_{d}", .{i}) catch unreachable, cond);
+                try appendConfig(allocator, &config, std.fmt.bufPrint(&key_buf, "tag_{d}", .{i}) catch unreachable, tag);
             }
-
-            // A lookup that names no namespace reads the job's own, as an
-            // endpoint does; resolved here so the running job and every
-            // replay of it read the same one.
-            if (std.mem.eql(u8, op_type, "kv_lookup")) {
-                const has_ns = if (config) |c| for (c) |e| {
-                    if (std.mem.eql(u8, e.key, "namespace")) break true;
-                } else false else false;
-                if (!has_ns) {
-                    const existing_count = if (config) |c| c.len else 0;
-                    const grown = allocator.alloc(OperatorSpec.ConfigEntry, existing_count + 1) catch return error.OutOfMemory;
-                    if (config) |c| {
-                        @memcpy(grown[0..c.len], c);
-                        allocator.free(c);
-                    }
-                    grown[existing_count] = .{
-                        .key = allocator.dupe(u8, "namespace") catch return error.OutOfMemory,
-                        .value = allocator.dupe(u8, effective_namespace) catch return error.OutOfMemory,
-                    };
-                    config = grown;
-                }
-            }
-
-            operators.append(allocator, .{
-                .type_name = type_dup,
-                .name = name_dup,
-                .module = module,
-                .config = config,
-            }) catch return error.OutOfMemory;
         }
     }
 
-    // --- checkpointing (optional object with interval_ms) ---
-    var checkpoint_interval_ms: ?u64 = null;
-    if (getObject(root, "checkpointing")) |cp_obj| {
-        if (getInt(cp_obj, "interval_ms")) |v| {
-            if (v > 0) checkpoint_interval_ms = @intCast(@as(i64, v));
-        }
+    // A lookup that names no namespace reads the job's own, as an endpoint
+    // does; resolved here so the running job and every replay of it read the
+    // same one.
+    if (mem.eql(u8, op_type, "kv_lookup") and !item.object.contains("namespace")) {
+        try appendConfig(allocator, &config, "namespace", default_namespace);
     }
 
-    // Validate required fields
-    if (sources.items.len == 0) return error.MissingSource;
-    if (sinks.items.len == 0) return error.MissingSink;
+    const type_d = try dupe(allocator, op_type);
+    errdefer allocator.free(type_d);
+    const name_d = try dupe(allocator, op_name);
+    errdefer allocator.free(name_d);
+    const config_s: ?[]const OperatorSpec.ConfigEntry = if (config.items.len == 0) blk: {
+        config.deinit(allocator);
+        break :blk null;
+    } else config.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    errdefer if (config_s) |c| {
+        freeConfig(allocator, c);
+        allocator.free(c);
+    };
 
-    // Apply defaults
-    if (name == null) {
-        name = allocator.dupe(u8, "unnamed-job") catch return error.OutOfMemory;
-    }
-    if (description == null) {
-        description = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    }
+    operators.append(allocator, .{ .type_name = type_d, .name = name_d, .config = config_s }) catch return ParseError.OutOfMemory;
+}
 
-    return .{
-        .name = name.?,
-        .description = description.?,
-        .namespace = namespace.?,
-        .parallelism = parallelism,
-        .batch_size = batch_size,
-        .sources = sources,
-        .sinks = sinks,
-        .operators = operators,
-        .checkpoint_interval_ms = checkpoint_interval_ms,
+// =============================================================================
+// Sources
+// =============================================================================
+
+fn freeSource(allocator: Allocator, src: SourceSpec) void {
+    allocator.free(src.name);
+    allocator.free(src.stream);
+    allocator.free(src.namespace);
+    allocator.free(src.ts_measurement);
+    allocator.free(src.ts_field);
+    for (src.ts_tags) |t| allocator.free(t);
+    allocator.free(src.ts_tags);
+}
+
+fn appendSource(allocator: Allocator, sources: *std.ArrayList(SourceSpec), src: SourceSpec) ParseError!void {
+    sources.append(allocator, src) catch {
+        freeSource(allocator, src);
+        return ParseError.OutOfMemory;
     };
 }
 
-// =============================================================================
-// Source / Sink Parsing Helpers
-// =============================================================================
-
-/// Parse a single source object and append to the sources list.
+/// One source object: exactly one of `stream:` or `ts:`.
 ///
-/// Source kind detection:
-///   - `ts:` object present     → SourceKind.ts
-///   - `stream:` object present → SourceKind.stream
-///
-/// Stream source syntax:
+/// Stream source:
 ///   ```yaml
 ///   - name: events-source
 ///     stream:
 ///       name: input-events
 ///       namespace: production
-///       partitions: all
+///       partitions: all          # 2 | "0-63" | "0,3,7" | all (default)
 ///       batch_size: 100
+///       poll_interval_ms: 1000
 ///   ```
 ///
-/// Partition syntax (stream sources):
-///   - `partitions: 2`         → single partition (integer)
-///   - `partitions: "0-63"`     → range → creates 64 SourceSpec entries
-///   - `partitions: "0,3,7"`    → list  → creates 3 SourceSpec entries
-///   - `partitions: "all"`      → sentinel (PARTITION_ALL), handler resolves
-///   - omitted                  → defaults to all partitions (PARTITION_ALL)
-///
-/// TS source syntax:
+/// TS source:
 ///   ```yaml
 ///   - name: cpu-metrics
 ///     ts:
@@ -481,616 +411,325 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
 ///       field: usage_idle
 ///       poll_interval_ms: 500
 ///   ```
-fn parseOneSource(allocator: Allocator, item: JsonValue, index: usize, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
-    if (item != .object) return;
+fn parseOneSource(allocator: Allocator, d: D, item: JsonValue, index: usize, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
+    if (item != .object) return d.fail(ParseError.InvalidFieldType, "a source must be a map, not {s}", .{kindName(item)});
+    try checkKeys(d, item, &.{ "name", "stream", "ts" });
 
     // Default the source name to a per-index unique value so multiple unnamed
-    // sources (e.g. the doc's flow-style `- stream: { name: … }`) don't collide.
+    // sources (e.g. flow-style `- stream: { name: … }`) don't collide.
     var name_buf: [32]u8 = undefined;
-    const base_name = getString(item, "name") orelse
-        (std.fmt.bufPrint(&name_buf, "default-source-{d}", .{index}) catch "default-source");
+    const base_name = try optString(d, item, "name") orelse
+        (std.fmt.bufPrint(&name_buf, "default-source-{d}", .{index}) catch unreachable);
 
-    // Detect TS source
-    if (getObject(item, "ts")) |ts_obj| {
-        try appendTsSource(allocator, base_name, ts_obj, default_batch_size, default_namespace, sources);
-        return;
+    const ts_obj = try optObject(d, item, "ts");
+    const stream_obj = try optObject(d, item, "stream");
+    if (ts_obj != null and stream_obj != null) return d.fail(ParseError.InvalidFieldType, "a source has \"stream\" or \"ts\", not both", .{});
+    if (ts_obj) |o| {
+        const mark = d.push("ts");
+        defer d.pop(mark);
+        return appendTsSource(allocator, d, base_name, o, default_batch_size, default_namespace, sources);
     }
-
-    // Detect stream source:
-    //   stream:
-    //     name: input-events
-    //     namespace: production
-    //     partitions: all
-    //     batch_size: 100
-    if (getObject(item, "stream")) |stream_obj| {
-        try appendStreamSource(allocator, base_name, stream_obj, default_batch_size, default_namespace, sources);
-        return;
+    if (stream_obj) |o| {
+        const mark = d.push("stream");
+        defer d.pop(mark);
+        return appendStreamSource(allocator, d, base_name, o, default_batch_size, default_namespace, sources);
     }
-
-    return error.MissingSourceStream;
+    return d.fail(ParseError.MissingSourceStream, "a source needs \"stream\" or \"ts\"", .{});
 }
 
-/// Append a TS source spec parsed from a `ts:` object.
-///
-/// ```yaml
-/// - name: cpu-metrics
-///   ts:
-///     measurement: cpu
-///     namespace: production
-///     tags:
-///       host: web-01
-///     field: usage_idle
-///     poll_interval_ms: 500
-///     batch_size: 200
-/// ```
+/// A map whose keys are user names and whose values are strings, as flat
+/// key/value pairs.
+fn parseStringPairs(allocator: Allocator, d: D, obj: JsonValue, key: []const u8) ParseError![]const []const u8 {
+    const map = try optObject(d, obj, key) orelse return &.{};
+    const mark = d.push(key);
+    defer d.pop(mark);
+
+    const pairs = allocator.alloc([]const u8, map.object.count() * 2) catch return ParseError.OutOfMemory;
+    var filled: usize = 0;
+    errdefer {
+        for (pairs[0..filled]) |s| allocator.free(s);
+        allocator.free(pairs);
+    }
+    var it = map.object.iterator();
+    while (it.next()) |entry| {
+        const v = entry.value_ptr.*;
+        if (v != .string) return wrongKind(d, entry.key_ptr.*, "a string", v);
+        pairs[filled] = try dupe(allocator, entry.key_ptr.*);
+        filled += 1;
+        pairs[filled] = try dupe(allocator, v.string);
+        filled += 1;
+    }
+    return pairs;
+}
+
 fn appendTsSource(
     allocator: Allocator,
+    d: D,
     source_name: []const u8,
     ts_obj: JsonValue,
     default_batch_size: u32,
     default_namespace: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
-    const measurement_raw = getString(ts_obj, "measurement") orelse return error.MissingSourceStream;
-    const ns_raw = getString(ts_obj, "namespace") orelse default_namespace;
-    const field_raw = getString(ts_obj, "field") orelse "";
+    try checkKeys(d, ts_obj, &.{ "measurement", "namespace", "field", "tags", "batch_size", "poll_interval_ms" });
+    const measurement = try reqString(d, ts_obj, "measurement", ParseError.MissingSourceStream);
+    const ns = try optString(d, ts_obj, "namespace") orelse default_namespace;
+    const field = try optString(d, ts_obj, "field") orelse "";
+    const bs = try optPositive(u32, d, ts_obj, "batch_size", ParseError.InvalidFormat) orelse default_batch_size;
+    const poll_ms = try optPositive(u32, d, ts_obj, "poll_interval_ms", ParseError.InvalidFormat) orelse 1000;
 
-    var bs: u32 = default_batch_size;
-    if (getInt(ts_obj, "batch_size")) |v| {
-        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
-    }
-
-    var poll_interval_ms: u32 = 1000;
-    if (getInt(ts_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_interval_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
-    }
-
-    const name_d = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-    const stream_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    errdefer allocator.free(stream_d);
-    const ns_d = allocator.dupe(u8, ns_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(ns_d);
-    const meas_d = allocator.dupe(u8, measurement_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(meas_d);
-    const field_d = allocator.dupe(u8, field_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(field_d);
-
-    // Parse tags: object mapping tag_key → tag_value (flat pairs)
-    var tag_keys: [][]const u8 = &.{};
-    if (getObject(ts_obj, "tags")) |tags_obj| {
-        if (tags_obj == .object) {
-            const count = tags_obj.object.count();
-            if (count > 0) {
-                const keys = allocator.alloc([]const u8, count * 2) catch return error.OutOfMemory;
-                var idx: usize = 0;
-                var it = tags_obj.object.iterator();
-                while (it.next()) |entry| {
-                    keys[idx] = allocator.dupe(u8, entry.key_ptr.*) catch return error.OutOfMemory;
-                    idx += 1;
-                    const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.string else entry.key_ptr.*;
-                    keys[idx] = allocator.dupe(u8, val_str) catch return error.OutOfMemory;
-                    idx += 1;
-                }
-                tag_keys = keys;
-            }
-        }
-    }
-
-    sources.append(allocator, .{
-        .kind = .ts,
-        .name = name_d,
-        .stream = stream_d,
-        .namespace = ns_d,
-        .partition = 0,
-        .batch_size = bs,
-        .ts_measurement = meas_d,
-        .ts_tags = tag_keys,
-        .ts_field = field_d,
-        .ts_poll_interval_ms = poll_interval_ms,
-    }) catch return error.OutOfMemory;
+    var src: SourceSpec = .{ .kind = .ts, .name = "", .stream = "", .namespace = "", .partition = 0, .batch_size = bs, .ts_poll_interval_ms = poll_ms };
+    errdefer freeSource(allocator, src);
+    src.name = try dupe(allocator, source_name);
+    src.namespace = try dupe(allocator, ns);
+    src.ts_measurement = try dupe(allocator, measurement);
+    src.ts_field = try dupe(allocator, field);
+    src.ts_tags = try parseStringPairs(allocator, d, ts_obj, "tags");
+    try appendSource(allocator, sources, src);
 }
 
-/// Append a stream source spec parsed from a `stream:` object.
-///
-/// ```yaml
-/// - name: events-source
-///   stream:
-///     name: input-events
-///     namespace: production
-///     partitions: all
-///     batch_size: 100
-/// ```
 fn appendStreamSource(
     allocator: Allocator,
+    d: D,
     source_name: []const u8,
     stream_obj: JsonValue,
     default_batch_size: u32,
     default_namespace: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
-    const stream_name = getString(stream_obj, "name") orelse return error.MissingSourceStream;
-    const ns_raw = getString(stream_obj, "namespace") orelse default_namespace;
+    try checkKeys(d, stream_obj, &.{ "name", "namespace", "partitions", "batch_size", "poll_interval_ms" });
+    const stream_name = try reqString(d, stream_obj, "name", ParseError.MissingSourceStream);
+    const ns = try optString(d, stream_obj, "namespace") orelse default_namespace;
+    const bs = try optPositive(u32, d, stream_obj, "batch_size", ParseError.InvalidFormat) orelse default_batch_size;
+    const poll_ms = try optPositive(u32, d, stream_obj, "poll_interval_ms", ParseError.InvalidFormat) orelse 1000;
 
-    var bs: u32 = default_batch_size;
-    if (getInt(stream_obj, "batch_size")) |v| {
-        if (v > 0) bs = std.math.cast(u32, v) orelse return error.InvalidFormat;
+    const partitions = stream_obj.object.get("partitions") orelse JsonValue{ .string = "all" };
+    switch (partitions) {
+        .integer => |v| {
+            const p = std.math.cast(u32, v) orelse return d.fail(ParseError.InvalidPartitions, "\"partitions\" must be a partition number, a range like 0-63, a list like 0,3,7 or all, not {d}", .{v});
+            try appendStreamSpec(allocator, sources, source_name, null, stream_name, ns, p, bs, poll_ms);
+        },
+        .string => |s| try expandPartitions(allocator, d, source_name, stream_name, ns, bs, poll_ms, s, sources),
+        else => |v| return wrongKind(d, "partitions", "a partition number, a range, a list or all", v),
     }
-
-    // Poll interval (default 1000ms) — how often the pipeline reads from the source.
-    var poll_ms: u32 = 1000;
-    if (getInt(stream_obj, "poll_interval_ms")) |v| {
-        if (v > 0) poll_ms = std.math.cast(u32, v) orelse return error.InvalidFormat;
-    }
-
-    // `partitions:` as string → range/list/all expansion
-    if (getString(stream_obj, "partitions")) |partitions_str| {
-        try expandPartitions(allocator, source_name, stream_name, ns_raw, bs, poll_ms, partitions_str, sources);
-        return;
-    }
-
-    // `partitions:` as integer → single partition; default → all
-    var partition: u32 = job_definition.PARTITION_ALL;
-    if (getInt(stream_obj, "partitions")) |v| {
-        partition = std.math.cast(u32, v) orelse return error.InvalidFormat;
-    }
-
-    const name_dup = allocator.dupe(u8, source_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_dup);
-    const stream_dup = allocator.dupe(u8, stream_name) catch return error.OutOfMemory;
-    errdefer allocator.free(stream_dup);
-    const ns_dup = allocator.dupe(u8, ns_raw) catch return error.OutOfMemory;
-
-    sources.append(allocator, .{
-        .name = name_dup,
-        .stream = stream_dup,
-        .namespace = ns_dup,
-        .partition = partition,
-        .batch_size = bs,
-        .ts_poll_interval_ms = poll_ms,
-    }) catch return error.OutOfMemory;
 }
 
-/// Expand a `partitions:` string into multiple SourceSpec entries.
-///
-/// Supported formats:
-///   - `"all"`   → single entry with partition = PARTITION_ALL (sentinel)
-///   - `"0-63"`  → range from 0 to 63 inclusive (64 entries)
-///   - `"0,3,7"` → comma-separated list (3 entries)
+/// Expand a `partitions:` string into one SourceSpec per partition:
+///   - `"all"`   → one entry with partition = PARTITION_ALL (the handler resolves it)
+///   - `"0-63"`  → range, inclusive (64 entries)
+///   - `"0,3,7"` → list (3 entries)
 fn expandPartitions(
     allocator: Allocator,
+    d: D,
     base_name: []const u8,
     stream_name: []const u8,
-    ns_raw: []const u8,
+    ns: []const u8,
     bs: u32,
     poll_ms: u32,
     partitions_str: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
-    const PARTITION_ALL = job_definition.PARTITION_ALL;
-
-    if (std.mem.eql(u8, partitions_str, "all")) {
-        // Sentinel — handler resolves actual count at runtime
-        const name_d = allocator.dupe(u8, base_name) catch return error.OutOfMemory;
-        errdefer allocator.free(name_d);
-        const stream_d = allocator.dupe(u8, stream_name) catch return error.OutOfMemory;
-        errdefer allocator.free(stream_d);
-        const ns_d = allocator.dupe(u8, ns_raw) catch return error.OutOfMemory;
-
-        sources.append(allocator, .{
-            .name = name_d,
-            .stream = stream_d,
-            .namespace = ns_d,
-            .partition = PARTITION_ALL,
-            .batch_size = bs,
-            .ts_poll_interval_ms = poll_ms,
-        }) catch return error.OutOfMemory;
-        return;
+    if (mem.eql(u8, partitions_str, "all")) {
+        return appendStreamSpec(allocator, sources, base_name, null, stream_name, ns, job_definition.PARTITION_ALL, bs, poll_ms);
     }
+    const bad = "\"partitions\" must be a partition number, a range like 0-63, a list like 0,3,7 or all, not \"{s}\"";
 
-    // Try range format: "start-end"
-    if (std.mem.indexOfScalar(u8, partitions_str, '-')) |dash_pos| {
-        const start_str = partitions_str[0..dash_pos];
-        const end_str = partitions_str[dash_pos + 1 ..];
-        const start = std.fmt.parseInt(u32, start_str, 10) catch return error.InvalidPartitions;
-        const end = std.fmt.parseInt(u32, end_str, 10) catch return error.InvalidPartitions;
-        if (start > end) return error.InvalidPartitions;
-
+    if (mem.indexOfScalar(u8, partitions_str, '-')) |dash_pos| {
+        const start = std.fmt.parseInt(u32, partitions_str[0..dash_pos], 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
+        const end = std.fmt.parseInt(u32, partitions_str[dash_pos + 1 ..], 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
+        if (start > end) return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
         var p = start;
-        while (p <= end) : (p += 1) {
-            try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, poll_ms, sources);
+        while (true) : (p += 1) {
+            try appendStreamSpec(allocator, sources, base_name, p, stream_name, ns, p, bs, poll_ms);
+            if (p == end) break;
         }
         return;
     }
 
-    // Comma-separated list: "0,3,7"
-    var iter = std.mem.splitScalar(u8, partitions_str, ',');
+    var iter = mem.splitScalar(u8, partitions_str, ',');
     var count: u32 = 0;
     while (iter.next()) |seg| {
-        const trimmed = std.mem.trim(u8, seg, " ");
+        const trimmed = mem.trim(u8, seg, " ");
         if (trimmed.len == 0) continue;
-        const p = std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidPartitions;
-        try appendExpandedSource(allocator, base_name, stream_name, ns_raw, p, bs, poll_ms, sources);
+        const p = std.fmt.parseInt(u32, trimmed, 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
+        try appendStreamSpec(allocator, sources, base_name, p, stream_name, ns, p, bs, poll_ms);
         count += 1;
     }
-    if (count == 0) return error.InvalidPartitions;
+    if (count == 0) return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
 }
 
-/// Append a single expanded SourceSpec with a partition-suffixed name.
-fn appendExpandedSource(
+/// One stream SourceSpec; an expanded partition gets a "-p<N>" name suffix.
+fn appendStreamSpec(
     allocator: Allocator,
+    sources: *std.ArrayList(SourceSpec),
     base_name: []const u8,
+    suffix_partition: ?u32,
     stream_name: []const u8,
-    ns_raw: []const u8,
+    ns: []const u8,
     partition: u32,
     bs: u32,
     poll_ms: u32,
-    sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
-    // Generate name: "base_name-p3"
-    const name_d = std.fmt.allocPrint(allocator, "{s}-p{d}", .{ base_name, partition }) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-    const stream_d = allocator.dupe(u8, stream_name) catch return error.OutOfMemory;
-    errdefer allocator.free(stream_d);
-    const ns_d = allocator.dupe(u8, ns_raw) catch return error.OutOfMemory;
-
-    sources.append(allocator, .{
-        .name = name_d,
-        .stream = stream_d,
-        .namespace = ns_d,
-        .partition = partition,
-        .batch_size = bs,
-        .ts_poll_interval_ms = poll_ms,
-    }) catch return error.OutOfMemory;
+    var src: SourceSpec = .{ .name = "", .stream = "", .namespace = "", .partition = partition, .batch_size = bs, .ts_poll_interval_ms = poll_ms };
+    errdefer freeSource(allocator, src);
+    src.name = if (suffix_partition) |p|
+        std.fmt.allocPrint(allocator, "{s}-p{d}", .{ base_name, p }) catch return ParseError.OutOfMemory
+    else
+        try dupe(allocator, base_name);
+    src.stream = try dupe(allocator, stream_name);
+    src.namespace = try dupe(allocator, ns);
+    try appendSource(allocator, sources, src);
 }
 
-/// Parse a single sink object and append to the sinks list.
-///
-/// Sink kind detection:
-///   - `kv:` object present  → SinkKind.kv
-///   - `queue:` object present → SinkKind.queue
-///   - `ts:` object present  → SinkKind.ts
-///   - `stream:` object present → SinkKind.stream
-///
-/// Optional `match:` array maps this sink to tagged records only (AND match).
-fn parseOneSink(allocator: Allocator, item: JsonValue, index: usize, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
-    if (item != .object) return;
+// =============================================================================
+// Sinks
+// =============================================================================
 
-    // Default the sink name to a per-index unique value so multiple unnamed sinks
-    // (e.g. the doc's flow-style `- stream: { name: … }`) don't trip the
-    // duplicate-name validation check.
+fn freeSink(allocator: Allocator, snk: SinkSpec) void {
+    allocator.free(snk.name);
+    allocator.free(snk.target);
+    allocator.free(snk.namespace);
+    allocator.free(snk.key_prefix);
+    allocator.free(snk.separator);
+    allocator.free(snk.write_mode);
+    if (snk.match) |tags| {
+        for (tags) |t| allocator.free(t);
+        allocator.free(tags);
+    }
+    allocator.free(snk.ts_measurement);
+    allocator.free(snk.ts_value_field);
+    for (snk.ts_tag_keys) |k| allocator.free(k);
+    allocator.free(snk.ts_tag_keys);
+    for (snk.ts_field_keys) |k| allocator.free(k);
+    allocator.free(snk.ts_field_keys);
+}
+
+/// One sink object: exactly one of `kv:`, `queue:`, `ts:` or `stream:`, and
+/// optionally `match:` (a tag, or a list of tags all of which a record must
+/// carry).
+fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, default_namespace: []const u8, sinks: *std.ArrayList(SinkSpec)) ParseError!void {
+    if (item != .object) return d.fail(ParseError.InvalidFieldType, "a sink must be a map, not {s}", .{kindName(item)});
+    try checkKeys(d, item, &.{ "name", "match", "kv", "queue", "ts", "stream" });
+
+    // Default the sink name to a per-index unique value so multiple unnamed
+    // sinks don't trip the duplicate-name check.
     var name_buf: [32]u8 = undefined;
-    const sink_name = getString(item, "name") orelse
-        (std.fmt.bufPrint(&name_buf, "default-sink-{d}", .{index}) catch "default-sink");
+    const sink_name = try optString(d, item, "name") orelse
+        (std.fmt.bufPrint(&name_buf, "default-sink-{d}", .{index}) catch unreachable);
 
-    // Parse match list — either a YAML array of strings, or a single string (sugar)
-    const sink_match: ?[]const []const u8 = blk: {
-        if (getArray(item, "match")) |arr| {
-            if (arr.len == 0) break :blk null;
-            const list = allocator.alloc([]const u8, arr.len) catch return error.OutOfMemory;
-            for (arr, 0..) |elem, i| {
-                if (elem == .string) {
-                    list[i] = allocator.dupe(u8, elem.string) catch return error.OutOfMemory;
-                } else {
-                    // Free already-allocated entries on error
-                    for (list[0..i]) |prev| allocator.free(prev);
-                    allocator.free(list);
-                    return error.InvalidFormat;
-                }
-            }
-            break :blk list;
-        } else if (getString(item, "match")) |single| {
-            // Sugar: `match: late` → treated as `match: [late]`
-            const list = allocator.alloc([]const u8, 1) catch return error.OutOfMemory;
-            list[0] = allocator.dupe(u8, single) catch return error.OutOfMemory;
-            break :blk list;
-        }
-        break :blk null;
-    };
-
-    // Detect sink kind
-    if (getObject(item, "kv")) |kv_obj| {
-        try appendKvSink(allocator, sink_name, kv_obj, sink_match, default_namespace, sinks);
-    } else if (getObject(item, "queue")) |q_obj| {
-        try appendQueueSink(allocator, sink_name, q_obj, sink_match, default_namespace, sinks);
-    } else if (getObject(item, "ts")) |ts_obj| {
-        try appendTsSink(allocator, sink_name, ts_obj, sink_match, default_namespace, sinks);
-    } else if (getObject(item, "stream")) |stream_obj| {
-        try appendStreamSink(allocator, sink_name, stream_obj, sink_match, default_namespace, sinks);
-    } else {
-        return error.MissingSinkTarget;
+    const kinds = [_][]const u8{ "kv", "queue", "ts", "stream" };
+    var kind_key: ?[]const u8 = null;
+    for (kinds) |k| {
+        if (!item.object.contains(k)) continue;
+        if (kind_key) |first| return d.fail(ParseError.InvalidFieldType, "a sink has one of kv, queue, ts or stream, not both \"{s}\" and \"{s}\"", .{ first, k });
+        kind_key = k;
     }
-}
+    const kk = kind_key orelse return d.fail(ParseError.MissingSinkTarget, "a sink needs one of kv, queue, ts or stream", .{});
+    const obj = (try optObject(d, item, kk)).?;
 
-fn appendStreamSink(
-    allocator: Allocator,
-    sink_name: []const u8,
-    stream_obj: JsonValue,
-    sink_match: ?[]const []const u8,
-    default_namespace: []const u8,
-    sinks: *std.ArrayList(SinkSpec),
-) ParseError!void {
-    const stream_name = getString(stream_obj, "name") orelse return error.MissingSinkTarget;
-    const ns_raw = getString(stream_obj, "namespace") orelse default_namespace;
-
-    const name_d = allocator.dupe(u8, sink_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-    const target_d = allocator.dupe(u8, stream_name) catch return error.OutOfMemory;
-    errdefer allocator.free(target_d);
-    const ns_d = allocator.dupe(u8, ns_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(ns_d);
-    const kp_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    errdefer allocator.free(kp_d);
-    const sep_d = allocator.dupe(u8, ":") catch return error.OutOfMemory;
-    errdefer allocator.free(sep_d);
-    const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
-    errdefer allocator.free(wm_d);
-
-    sinks.append(allocator, .{
-        .name = name_d,
+    var snk: SinkSpec = .{
+        .name = "",
         .kind = .stream,
-        .target = target_d,
-        .namespace = ns_d,
-        .match = sink_match,
-        .key_prefix = kp_d,
-        .separator = sep_d,
-        .write_mode = wm_d,
+        .target = "",
+        .namespace = "",
+        .key_prefix = "",
+        .separator = "",
+        .write_mode = "",
         .ttl_ms = null,
         .priority = 0,
         .delay_ms = null,
         .use_key_as_dedup = true,
-    }) catch return error.OutOfMemory;
+    };
+    errdefer freeSink(allocator, snk);
+    snk.name = try dupe(allocator, sink_name);
+    snk.match = try parseMatch(allocator, d, item);
+    // Only upsert exists; the field stays for the sink writer.
+    snk.write_mode = try dupe(allocator, "upsert");
+    snk.separator = try dupe(allocator, ":");
+
+    const mark = d.push(kk);
+    defer d.pop(mark);
+    if (mem.eql(u8, kk, "kv")) {
+        try checkKeys(d, obj, &.{ "namespace", "key_prefix", "separator", "ttl_ms" });
+        snk.kind = .kv;
+        snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
+        snk.key_prefix = try dupe(allocator, try optString(d, obj, "key_prefix") orelse "");
+        if (try optString(d, obj, "separator")) |sep| {
+            allocator.free(snk.separator);
+            snk.separator = "";
+            snk.separator = try dupe(allocator, sep);
+        }
+        if (try optPositive(u64, d, obj, "ttl_ms", ParseError.InvalidFormat)) |ttl| {
+            // A TTL is applied in nanoseconds; one that can't be is refused here.
+            if (ttl > std.math.maxInt(u64) / std.time.ns_per_ms) return d.fail(ParseError.InvalidFormat, "\"ttl_ms\" must be at most {d}, not {d}", .{ std.math.maxInt(u64) / std.time.ns_per_ms, ttl });
+            snk.ttl_ms = ttl;
+        }
+    } else if (mem.eql(u8, kk, "queue")) {
+        try checkKeys(d, obj, &.{ "name", "namespace", "priority", "delay_ms", "use_key_as_dedup" });
+        snk.kind = .queue;
+        snk.target = try dupe(allocator, try optString(d, obj, "name") orelse sink_name);
+        snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
+        if (try optInt(d, obj, "priority")) |p| {
+            snk.priority = std.math.cast(u8, p) orelse return d.fail(ParseError.InvalidFormat, "\"priority\" must be from 0 to 255, not {d}", .{p});
+        }
+        snk.delay_ms = try optPositive(u64, d, obj, "delay_ms", ParseError.InvalidFormat);
+        snk.use_key_as_dedup = try optBool(d, obj, "use_key_as_dedup") orelse true;
+    } else if (mem.eql(u8, kk, "ts")) {
+        try checkKeys(d, obj, &.{ "measurement", "namespace", "value_field", "tags", "fields" });
+        snk.kind = .ts;
+        const measurement = try optString(d, obj, "measurement") orelse sink_name;
+        snk.target = try dupe(allocator, measurement);
+        snk.ts_measurement = try dupe(allocator, measurement);
+        snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
+        snk.ts_value_field = try dupe(allocator, try optString(d, obj, "value_field") orelse "value");
+        snk.ts_tag_keys = try parseStringPairs(allocator, d, obj, "tags");
+        snk.ts_field_keys = try parseStringPairs(allocator, d, obj, "fields");
+    } else {
+        try checkKeys(d, obj, &.{ "name", "namespace" });
+        snk.kind = .stream;
+        snk.target = try dupe(allocator, try reqString(d, obj, "name", ParseError.MissingSinkTarget));
+        snk.namespace = try dupe(allocator, try optString(d, obj, "namespace") orelse default_namespace);
+    }
+
+    sinks.append(allocator, snk) catch return ParseError.OutOfMemory;
 }
 
-fn appendKvSink(
-    allocator: Allocator,
-    sink_name: []const u8,
-    kv_obj: JsonValue,
-    sink_match: ?[]const []const u8,
-    default_namespace: []const u8,
-    sinks: *std.ArrayList(SinkSpec),
-) ParseError!void {
-    const name_d = allocator.dupe(u8, sink_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-    const target_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    errdefer allocator.free(target_d);
-    const ns_d = allocator.dupe(u8, getString(kv_obj, "namespace") orelse default_namespace) catch return error.OutOfMemory;
-    errdefer allocator.free(ns_d);
-    const kp_d = allocator.dupe(u8, getString(kv_obj, "key_prefix") orelse "") catch return error.OutOfMemory;
-    errdefer allocator.free(kp_d);
-    const sep_d = allocator.dupe(u8, getString(kv_obj, "separator") orelse ":") catch return error.OutOfMemory;
-    errdefer allocator.free(sep_d);
-    const wm_d = allocator.dupe(u8, getString(kv_obj, "write_mode") orelse "upsert") catch return error.OutOfMemory;
-    errdefer allocator.free(wm_d);
-
-    var ttl: ?u64 = null;
-    if (getInt(kv_obj, "ttl_ms")) |v| {
-        // A TTL is applied in nanoseconds; one that can't be is refused here.
-        if (v > std.math.maxInt(u64) / std.time.ns_per_ms) return error.InvalidFormat;
-        if (v > 0) ttl = @intCast(v);
-    }
-
-    sinks.append(allocator, .{
-        .name = name_d,
-        .kind = .kv,
-        .target = target_d,
-        .namespace = ns_d,
-        .match = sink_match,
-        .key_prefix = kp_d,
-        .separator = sep_d,
-        .write_mode = wm_d,
-        .ttl_ms = ttl,
-        .priority = 0,
-        .delay_ms = null,
-        .use_key_as_dedup = true,
-    }) catch return error.OutOfMemory;
-}
-
-fn appendQueueSink(
-    allocator: Allocator,
-    sink_name: []const u8,
-    q_obj: JsonValue,
-    sink_match: ?[]const []const u8,
-    default_namespace: []const u8,
-    sinks: *std.ArrayList(SinkSpec),
-) ParseError!void {
-    const name_d = allocator.dupe(u8, sink_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-    const target_d = allocator.dupe(u8, getString(q_obj, "name") orelse sink_name) catch return error.OutOfMemory;
-    errdefer allocator.free(target_d);
-    const ns_d = allocator.dupe(u8, getString(q_obj, "namespace") orelse default_namespace) catch return error.OutOfMemory;
-    errdefer allocator.free(ns_d);
-    const kp_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    errdefer allocator.free(kp_d);
-    const sep_d = allocator.dupe(u8, ":") catch return error.OutOfMemory;
-    errdefer allocator.free(sep_d);
-    const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
-    errdefer allocator.free(wm_d);
-
-    var priority: u8 = 0;
-    if (getInt(q_obj, "priority")) |v| {
-        if (v >= 0 and v <= 255) priority = @intCast(@as(i64, v));
-    }
-
-    var delay: ?u64 = null;
-    if (getInt(q_obj, "delay_ms")) |v| {
-        if (v > 0) delay = @intCast(@as(i64, v));
-    }
-
-    var use_dedup = true;
-    if (q_obj.object.get("use_key_as_dedup")) |dv| {
-        if (dv == .bool) use_dedup = dv.bool;
-    }
-
-    sinks.append(allocator, .{
-        .name = name_d,
-        .kind = .queue,
-        .target = target_d,
-        .namespace = ns_d,
-        .match = sink_match,
-        .key_prefix = kp_d,
-        .separator = sep_d,
-        .write_mode = wm_d,
-        .ttl_ms = null,
-        .priority = priority,
-        .delay_ms = delay,
-        .use_key_as_dedup = use_dedup,
-    }) catch return error.OutOfMemory;
-}
-
-/// Append a time-series (ts) sink from YAML.
-///
-/// YAML format:
-/// ```yaml
-/// sinks:
-///   - name: metrics-out
-///     ts:
-///       measurement: cpu_usage
-///       namespace: monitoring
-///       value_field: value       # shorthand: single numeric field (default)
-///       tags:
-///         host: hostname          # tag_key: json_key
-///         region: dc
-///       fields:
-///         cpu: cpu_percent        # field_name: json_key
-///         mem: mem_percent
-/// ```
-fn appendTsSink(
-    allocator: Allocator,
-    sink_name: []const u8,
-    ts_obj: JsonValue,
-    sink_match: ?[]const []const u8,
-    default_namespace: []const u8,
-    sinks: *std.ArrayList(SinkSpec),
-) ParseError!void {
-    const name_d = allocator.dupe(u8, sink_name) catch return error.OutOfMemory;
-    errdefer allocator.free(name_d);
-
-    const measurement_raw = getString(ts_obj, "measurement") orelse sink_name;
-    const measurement_d = allocator.dupe(u8, measurement_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(measurement_d);
-
-    const ns_d = allocator.dupe(u8, getString(ts_obj, "namespace") orelse default_namespace) catch return error.OutOfMemory;
-    errdefer allocator.free(ns_d);
-
-    // Default, unused fields for non-ts kinds
-    const target_d = allocator.dupe(u8, measurement_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(target_d);
-    const kp_d = allocator.dupe(u8, "") catch return error.OutOfMemory;
-    errdefer allocator.free(kp_d);
-    const sep_d = allocator.dupe(u8, ":") catch return error.OutOfMemory;
-    errdefer allocator.free(sep_d);
-    const wm_d = allocator.dupe(u8, "upsert") catch return error.OutOfMemory;
-    errdefer allocator.free(wm_d);
-
-    // Parse value_field (shorthand for single field)
-    const vf_raw = getString(ts_obj, "value_field") orelse "value";
-    const vf_d = allocator.dupe(u8, vf_raw) catch return error.OutOfMemory;
-    errdefer allocator.free(vf_d);
-
-    // Parse tags: object mapping tag_key → json_key
-    var tag_keys: [][]const u8 = &.{};
-    if (getObject(ts_obj, "tags")) |tags_obj| {
-        if (tags_obj == .object) {
-            const count = tags_obj.object.count();
-            if (count > 0) {
-                const keys = allocator.alloc([]const u8, count * 2) catch return error.OutOfMemory;
-                var idx: usize = 0;
-                var it = tags_obj.object.iterator();
-                while (it.next()) |entry| {
-                    keys[idx] = allocator.dupe(u8, entry.key_ptr.*) catch return error.OutOfMemory;
-                    idx += 1;
-                    const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.string else entry.key_ptr.*;
-                    keys[idx] = allocator.dupe(u8, val_str) catch return error.OutOfMemory;
-                    idx += 1;
-                }
-                tag_keys = keys;
+/// `match:` as a list of tags (a single tag is sugar for a one-tag list).
+fn parseMatch(allocator: Allocator, d: D, item: JsonValue) ParseError!?[]const []const u8 {
+    const v = item.object.get("match") orelse return null;
+    const mark = d.push("match");
+    defer d.pop(mark);
+    switch (v) {
+        .string => |s| {
+            const list = allocator.alloc([]const u8, 1) catch return ParseError.OutOfMemory;
+            errdefer allocator.free(list);
+            list[0] = try dupe(allocator, s);
+            return list;
+        },
+        .array => |arr| {
+            if (arr.items.len == 0) return null;
+            const list = allocator.alloc([]const u8, arr.items.len) catch return ParseError.OutOfMemory;
+            var filled: usize = 0;
+            errdefer {
+                for (list[0..filled]) |t| allocator.free(t);
+                allocator.free(list);
             }
-        }
-    }
-
-    // Parse fields: object mapping field_name → json_key
-    var field_keys: [][]const u8 = &.{};
-    if (getObject(ts_obj, "fields")) |fields_obj| {
-        if (fields_obj == .object) {
-            const count = fields_obj.object.count();
-            if (count > 0) {
-                const keys = allocator.alloc([]const u8, count * 2) catch return error.OutOfMemory;
-                var idx: usize = 0;
-                var it = fields_obj.object.iterator();
-                while (it.next()) |entry| {
-                    keys[idx] = allocator.dupe(u8, entry.key_ptr.*) catch return error.OutOfMemory;
-                    idx += 1;
-                    const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.string else entry.key_ptr.*;
-                    keys[idx] = allocator.dupe(u8, val_str) catch return error.OutOfMemory;
-                    idx += 1;
+            for (arr.items, 0..) |elem, i| {
+                if (elem != .string) {
+                    const im = d.pushIndex(i);
+                    defer d.pop(im);
+                    return d.fail(ParseError.InvalidFormat, "a tag must be a string, not {s}", .{kindName(elem)});
                 }
-                field_keys = keys;
+                list[i] = try dupe(allocator, elem.string);
+                filled += 1;
             }
-        }
+            return list;
+        },
+        else => {
+            d.pop(mark);
+            return wrongKind(d, "match", "a tag or a list of tags", v);
+        },
     }
-
-    sinks.append(allocator, .{
-        .name = name_d,
-        .kind = .ts,
-        .target = target_d,
-        .namespace = ns_d,
-        .match = sink_match,
-        .key_prefix = kp_d,
-        .separator = sep_d,
-        .write_mode = wm_d,
-        .ttl_ms = null,
-        .priority = 0,
-        .delay_ms = null,
-        .use_key_as_dedup = true,
-        .ts_measurement = measurement_d,
-        .ts_tag_keys = tag_keys,
-        .ts_field_keys = field_keys,
-        .ts_value_field = vf_d,
-    }) catch return error.OutOfMemory;
-}
-
-// =============================================================================
-// Cleanup Helpers (used by errdefer)
-// =============================================================================
-
-fn freeSourceSpecs(allocator: Allocator, sources: *std.ArrayList(SourceSpec)) void {
-    for (sources.items) |src| {
-        allocator.free(src.name);
-        allocator.free(src.stream);
-        allocator.free(src.namespace);
-        // TS-specific fields
-        if (src.ts_measurement.len > 0) allocator.free(src.ts_measurement);
-        if (src.ts_field.len > 0) allocator.free(src.ts_field);
-        for (src.ts_tags) |t| allocator.free(t);
-        if (src.ts_tags.len > 0) allocator.free(src.ts_tags);
-    }
-    sources.deinit(allocator);
-}
-
-fn freeSinkSpecs(allocator: Allocator, sinks_list: *std.ArrayList(SinkSpec)) void {
-    for (sinks_list.items) |snk| {
-        allocator.free(snk.name);
-        allocator.free(snk.target);
-        allocator.free(snk.namespace);
-        allocator.free(snk.key_prefix);
-        allocator.free(snk.separator);
-        allocator.free(snk.write_mode);
-        if (snk.match) |tag_list| {
-            for (tag_list) |t| allocator.free(t);
-            allocator.free(tag_list);
-        }
-    }
-    sinks_list.deinit(allocator);
-}
-
-fn freeOperatorSpecs(allocator: Allocator, operators: *std.ArrayList(OperatorSpec)) void {
-    for (operators.items) |op| {
-        allocator.free(op.type_name);
-        allocator.free(op.name);
-        if (op.module) |mp| allocator.free(mp);
-    }
-    operators.deinit(allocator);
 }
 
 // =============================================================================
@@ -1118,7 +757,7 @@ test "parser: nested YAML full definition" {
         \\batch_size: 500
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("my-pipeline", def.name);
@@ -1152,7 +791,7 @@ test "parser: nested YAML minimal with defaults" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("unnamed-job", def.name);
@@ -1192,7 +831,7 @@ test "parser: multi-source array" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sources.items.len);
@@ -1231,7 +870,7 @@ test "parser: stream source object form full" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
@@ -1257,7 +896,7 @@ test "parser: stream source object form minimal" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const src = def.primarySource().?;
@@ -1283,7 +922,7 @@ test "parser: stream source object form with partitions range" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), def.sources.items.len);
@@ -1308,7 +947,7 @@ test "parser: stream source object form with partitions all" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
@@ -1328,7 +967,7 @@ test "parser: stream object form missing name" {
         \\  - stream:
         \\      name: out
     ;
-    try std.testing.expectError(error.MissingSourceStream, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingSourceStream, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: multi-sink array (stream + kv + queue)" {
@@ -1350,7 +989,6 @@ test "parser: multi-sink array (stream + kv + queue)" {
         \\      namespace: user-store
         \\      key_prefix: user
         \\      separator: ":"
-        \\      write_mode: upsert
         \\      ttl_ms: 86400000
         \\  - name: tasks
         \\    queue:
@@ -1361,7 +999,7 @@ test "parser: multi-sink array (stream + kv + queue)" {
         \\      use_key_as_dedup: false
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), def.sinks.items.len);
@@ -1413,7 +1051,7 @@ test "parser: nested YAML with operator list" {
         \\    name: transform
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("filtered-pipeline", def.name);
@@ -1433,7 +1071,7 @@ test "parser: missing source" {
         \\  - stream:
         \\      name: output
     ;
-    try std.testing.expectError(error.MissingSource, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingSource, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: missing sink" {
@@ -1445,7 +1083,7 @@ test "parser: missing sink" {
         \\  - stream:
         \\      name: input
     ;
-    try std.testing.expectError(error.MissingSink, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingSink, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: source without stream field" {
@@ -1454,12 +1092,12 @@ test "parser: source without stream field" {
     const text =
         \\kind: Processing
         \\sources:
-        \\  - namespace: ns
+        \\  - name: no-stream
         \\sinks:
         \\  - stream:
         \\      name: out
     ;
-    try std.testing.expectError(error.MissingSourceStream, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingSourceStream, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: sink without target" {
@@ -1471,9 +1109,9 @@ test "parser: sink without target" {
         \\  - stream:
         \\      name: in
         \\sinks:
-        \\  - namespace: ns
+        \\  - name: no-target
     ;
-    try std.testing.expectError(error.MissingSinkTarget, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingSinkTarget, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: invalid parallelism" {
@@ -1489,7 +1127,7 @@ test "parser: invalid parallelism" {
         \\      name: out
         \\parallelism: abc
     ;
-    try std.testing.expectError(error.InvalidParallelism, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.InvalidFieldType, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: zero parallelism rejected" {
@@ -1505,12 +1143,12 @@ test "parser: zero parallelism rejected" {
         \\      name: out
         \\parallelism: 0
     ;
-    try std.testing.expectError(error.InvalidParallelism, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.InvalidParallelism, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: empty text" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.MissingRequiredField, parseJobDefinition(allocator, ""));
+    try std.testing.expectError(error.MissingRequiredField, parseJobDefinition(allocator, "", null));
 }
 
 test "parser: comments and blank lines" {
@@ -1530,7 +1168,7 @@ test "parser: comments and blank lines" {
         \\
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("events", def.primarySource().?.stream);
@@ -1550,7 +1188,7 @@ test "parser: no operators field yields empty list" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), def.operators.items.len);
@@ -1572,7 +1210,7 @@ test "parser: JSON input (native)" {
         \\}
     ;
 
-    var def = try parseJobDefinition(allocator, json);
+    var def = try parseJobDefinition(allocator, json, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("json-job", def.name);
@@ -1603,7 +1241,7 @@ test "parser: JSON multi-source multi-sink" {
         \\}
     ;
 
-    var def = try parseJobDefinition(allocator, json);
+    var def = try parseJobDefinition(allocator, json, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sources.items.len);
@@ -1634,7 +1272,7 @@ test "parser: operator without explicit name uses type" {
         \\  - type: passthrough
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
@@ -1654,7 +1292,7 @@ test "parser: missing kind field" {
         \\  - stream:
         \\      name: out
     ;
-    try std.testing.expectError(error.MissingRequiredField, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.MissingRequiredField, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: invalid kind rejected" {
@@ -1670,7 +1308,7 @@ test "parser: invalid kind rejected" {
         \\  - stream:
         \\      name: out
     ;
-    try std.testing.expectError(error.InvalidKind, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.InvalidKind, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: source batch_size overrides top-level" {
@@ -1692,7 +1330,7 @@ test "parser: source batch_size overrides top-level" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 500), def.sources.items[0].batch_size);
@@ -1713,7 +1351,7 @@ test "parser: KV sink defaults" {
         \\      namespace: my-ns
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const snk = def.primarySink().?;
@@ -1744,7 +1382,7 @@ test "parser: partitions range expands to multiple sources" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 4), def.sources.items.len);
@@ -1778,7 +1416,7 @@ test "parser: partitions comma list" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), def.sources.items.len);
@@ -1805,7 +1443,7 @@ test "parser: partitions all sentinel" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
@@ -1831,7 +1469,7 @@ test "parser: partitions with batch_size" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sources.items.len);
@@ -1852,7 +1490,7 @@ test "parser: invalid partitions range" {
         \\  - stream:
         \\      name: out
     ;
-    try std.testing.expectError(error.InvalidPartitions, parseJobDefinition(allocator, text));
+    try std.testing.expectError(error.InvalidPartitions, parseJobDefinition(allocator, text, null));
 }
 
 test "parser: partitions mixed with single partition source" {
@@ -1874,7 +1512,7 @@ test "parser: partitions mixed with single partition source" {
         \\      name: out
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     // 1 single + 3 expanded = 4 total
@@ -1908,7 +1546,7 @@ test "parser: sink with match" {
         \\      - late
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), def.sinks.items.len);
@@ -1934,7 +1572,7 @@ test "parser: KV sink with match" {
         \\      - error-records
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const snk = def.primarySink().?;
@@ -1960,7 +1598,7 @@ test "parser: queue sink with match" {
         \\      - failures
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const snk = def.primarySink().?;
@@ -1988,7 +1626,7 @@ test "parser: sink with multiple match tags (AND match)" {
         \\      - high-value
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const snk = def.primarySink().?;
@@ -2021,7 +1659,7 @@ test "parser: kv_lookup operator with all config" {
         \\    mode: filter
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
@@ -2056,7 +1694,7 @@ test "parser: kv_lookup operator with enrich mode" {
         \\    enrich_field: user_data
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
@@ -2083,7 +1721,7 @@ test "parser: kv_lookup operator minimal config" {
         \\    lookup_key: "${$.id}"
     ;
 
-    var def = try parseJobDefinitionWithNamespace(allocator, text, "acme");
+    var def = try parseJobDefinitionWithNamespace(allocator, text, "acme", null);
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
@@ -2112,7 +1750,7 @@ test "parser: top-level namespace inherited by sources and sinks" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("production", def.namespace);
@@ -2136,7 +1774,7 @@ test "parser: source/sink namespace overrides top-level" {
         \\      namespace: analytics
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("production", def.namespace);
@@ -2158,7 +1796,7 @@ test "parser: fallback namespace from command" {
     ;
 
     // No top-level namespace in YAML, but command provides "my-team"
-    var def = try parseJobDefinitionWithNamespace(allocator, text, "my-team");
+    var def = try parseJobDefinitionWithNamespace(allocator, text, "my-team", null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("my-team", def.namespace);
@@ -2181,7 +1819,7 @@ test "parser: YAML namespace takes priority over fallback" {
     ;
 
     // YAML has namespace "from-yaml", command provides "from-command"
-    var def = try parseJobDefinitionWithNamespace(allocator, text, "from-command");
+    var def = try parseJobDefinitionWithNamespace(allocator, text, "from-command", null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("from-yaml", def.namespace);
@@ -2205,7 +1843,7 @@ test "parser: namespace inheritance with TS source and TS sink" {
         \\      measurement: processed_cpu
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("monitoring", def.namespace);
@@ -2228,7 +1866,7 @@ test "parser: namespace inheritance with queue sink" {
         \\      name: dead-letter
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("team-x", def.namespace);
@@ -2248,7 +1886,7 @@ test "parser: no namespace anywhere defaults to 'default'" {
         \\      name: results
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("default", def.namespace);
@@ -2281,7 +1919,7 @@ test "parser: classify operator with rules array" {
         \\        tag: warnings
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
@@ -2330,7 +1968,7 @@ test "parser: classify operator with rules array and inline config" {
         \\        tag: critical
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
@@ -2381,7 +2019,7 @@ test "parser: classify operator with json conditions" {
         \\        tag: high-value
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
@@ -2440,7 +2078,7 @@ test "parser: classify operator with default tag" {
         \\        tag: errors
     ;
 
-    var def = try parseJobDefinition(allocator, text);
+    var def = try parseJobDefinition(allocator, text, null);
     defer def.deinit(allocator);
 
     const op = def.operators.items[0];
@@ -2466,13 +2104,89 @@ test "parser: a stream or queue name holding a NUL, or too long for its namespac
         ,
         \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in"}}],"sinks":[{"queue":{"name":"q\u0000x"}}]}
     }) |json_def| {
-        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme");
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
         defer def.deinit(allocator);
         try std.testing.expectEqualStrings("stream or queue name must not contain NUL", def.namespaceRefusal().?);
     }
     const long = "s" ** 4096;
     const too_long = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"" ++ long ++ "\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}";
-    var def = try parseJobDefinitionWithNamespace(allocator, too_long, "acme");
+    var def = try parseJobDefinitionWithNamespace(allocator, too_long, "acme", null);
     defer def.deinit(allocator);
     try std.testing.expectEqualStrings("stream or queue name too long for its namespace", def.namespaceRefusal().?);
+}
+
+/// The diagnostic a job definition is refused with.
+fn expectRefused(content: []const u8, expected: ParseError, message: []const u8) !void {
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(expected, parseJobDefinition(std.testing.allocator, content, &diag));
+    try std.testing.expectEqualStrings(message, diag.message());
+}
+
+fn job(comptime extra: []const u8, comptime source: []const u8, comptime sink: []const u8) []const u8 {
+    return
+    \\{ "kind": "Processing", "name": "j",
+    ++ extra ++
+    \\  "sources": [ { "stream": { "name": "in"
+    ++ source ++
+    \\ } } ],
+    \\  "sinks": [ { "stream": { "name": "out" }
+    ++ sink ++
+    \\ } ] }
+    ;
+}
+
+test "parser: an unknown key is refused by name and place" {
+    try expectRefused(job("\"paralelism\": 2,", "", ""), ParseError.UnknownKey, "unknown key \"paralelism\" at the top level");
+    try expectRefused(job("", ", \"batchSize\": 5", ""), ParseError.UnknownKey, "unknown key \"batchSize\" at sources[0].stream");
+    try expectRefused(job("", "", ", \"matches\": \"x\""), ParseError.UnknownKey, "unknown key \"matches\" at sinks[0]");
+    try expectRefused(job("\"checkpointing\": { \"interval\": 5 },", "", ""), ParseError.UnknownKey, "unknown key \"interval\" at checkpointing");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "kv": { "write_mode": "versioned" } } ] }
+    , ParseError.UnknownKey, "unknown key \"write_mode\" at sinks[0].kv");
+    try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"key_not_empty\", \"conditon\": \"x\" } ],", "", ""), ParseError.UnknownKey, "unknown key \"conditon\" for a filter operator at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"map\", \"module\": \"x.wasm\", \"a\": \"$.b\" }, { \"type\": \"passthrough\", \"module\": \"m\" } ],", "", ""), ParseError.UnknownKey, "unknown key \"module\" for a passthrough operator at operators[1]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"key_not_empty\", \"tag\": \"t\", \"tags\": \"u\" } ] } ],", "", ""), ParseError.UnknownKey, "unknown key \"tags\" at operators[0].rules[0]");
+}
+
+test "parser: an unknown operator type is refused at parse" {
+    try expectRefused(job("\"operators\": [ { \"type\": \"fliter\", \"condition\": \"key_not_empty\" } ],", "", ""), ParseError.UnknownOperatorType, "unknown operator type \"fliter\" (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify) at operators[0]");
+}
+
+test "parser: a value of the wrong kind or out of range is refused, not ignored" {
+    try expectRefused(job("", ", \"batch_size\": 0", ""), ParseError.InvalidFormat, "\"batch_size\" must be at least 1, not 0 at sources[0].stream");
+    try expectRefused(job("", ", \"poll_interval_ms\": \"fast\"", ""), ParseError.InvalidFieldType, "\"poll_interval_ms\" must be an integer, not a string at sources[0].stream");
+    try expectRefused(job("\"checkpointing\": { \"interval_ms\": -1 },", "", ""), ParseError.InvalidFormat, "\"interval_ms\" must be at least 1, not -1 at checkpointing");
+    try expectRefused(job("\"operators\": [ \"filter\" ],", "", ""), ParseError.InvalidFieldType, "an operator must be a map, not a string at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"map\", \"out\": { \"nested\": 1 } } ],", "", ""), ParseError.InvalidFieldType, "\"out\" must be a string, number or boolean, not a map at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"key_not_empty\" } ] } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"tag\" at operators[0].rules[0]");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "queue": { "name": "q", "priority": 300 } } ] }
+    , ParseError.InvalidFormat, "\"priority\" must be from 0 to 255, not 300 at sinks[0].queue");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "ts": { "measurement": "m", "tags": { "host": 1 } } } ],
+        \\  "sinks": [ { "stream": { "name": "out" } } ] }
+    , ParseError.InvalidFieldType, "\"host\" must be a string, not an integer at sources[0].ts.tags");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" }, "ts": { "measurement": "m" } } ],
+        \\  "sinks": [ { "stream": { "name": "out" } } ] }
+    , ParseError.InvalidFieldType, "a source has \"stream\" or \"ts\", not both at sources[0]");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "stream": { "name": "out" }, "kv": {} } ] }
+    , ParseError.InvalidFieldType, "a sink has one of kv, queue, ts or stream, not both \"kv\" and \"stream\" at sinks[0]");
+}
+
+test "parser: a duplicated key is refused by name" {
+    try expectRefused(
+        \\kind: Processing
+        \\sources:
+        \\  - stream:
+        \\      name: in
+        \\      name: other
+        \\sinks:
+        \\  - stream:
+        \\      name: out
+    , ParseError.DuplicateKey, "key \"name\" appears twice at sources[0].stream");
 }

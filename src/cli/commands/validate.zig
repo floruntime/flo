@@ -137,8 +137,9 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     defer ctx.allocator.free(content);
 
     // Phase 1: Parse
-    var def = proc_parser.parseJobDefinition(ctx.allocator, content) catch |err| {
-        ctx.printErr("FAIL  Parse error: {s}\n", .{processingParseErrorString(err)});
+    var diag: proc_parser.Diagnostic = .{};
+    var def = proc_parser.parseJobDefinition(ctx.allocator, content, &diag) catch |err| {
+        ctx.printErr("FAIL  {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
         return error.CommandFailed;
     };
     defer def.deinit(ctx.allocator);
@@ -275,25 +276,6 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
         ctx.print("PASSED: processing definition is valid\n", .{});
     }
 }
-
-fn processingParseErrorString(err: proc_parser.ParseError) []const u8 {
-    return switch (err) {
-        error.MissingRequiredField => "missing required field (kind or name)",
-        error.InvalidKind => "kind must be 'Processing'",
-        error.MissingSource => "missing source definition",
-        error.MissingSink => "missing sink definition",
-        error.MissingSourceStream => "source is missing stream name",
-        error.MissingSinkTarget => "sink is missing target name",
-        error.InvalidParallelism => "parallelism must be a positive integer",
-        error.InvalidPartitions => "invalid partitions value",
-        error.InvalidFormat => "invalid YAML/JSON format",
-        error.OutOfMemory => "out of memory",
-    };
-}
-
-// =============================================================================
-// Shared Helpers
-// =============================================================================
 
 fn readFile(ctx: *commander.Context, file_path: []const u8) ?[]u8 {
     const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {

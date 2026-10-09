@@ -2059,7 +2059,7 @@ test "e2e/processing: TS source definition parser roundtrip" {
         \\      name: output
     ;
 
-    var def = try parser.parseJobDefinition(testing.allocator, yaml);
+    var def = try parser.parseJobDefinition(testing.allocator, yaml, null);
     defer def.deinit(testing.allocator);
 
     try testing.expectEqualStrings("parser-test-ts-source", def.name);
@@ -2092,7 +2092,7 @@ test "e2e/processing: stream source definition is default kind" {
         \\      name: output
     ;
 
-    var def = try parser.parseJobDefinition(testing.allocator, yaml);
+    var def = try parser.parseJobDefinition(testing.allocator, yaml, null);
     defer def.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), def.sources.items.len);

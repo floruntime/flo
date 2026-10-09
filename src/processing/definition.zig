@@ -323,8 +323,6 @@ pub const OperatorSpec = struct {
     type_name: []const u8,
     /// Operator name (e.g., "positive-filter", "transform")
     name: []const u8,
-    /// Module path (reserved for future use). Null for built-in operators.
-    module: ?[]const u8 = null,
     /// Declarative configuration for native operators.
     /// Keys are operator-specific (e.g., "condition", "key_expression").
     /// Stored as string→string pairs parsed from YAML operator config block.
@@ -483,7 +481,6 @@ pub const JobDefinition = struct {
         for (self.operators.items) |op| {
             allocator.free(op.type_name);
             allocator.free(op.name);
-            if (op.module) |mp| allocator.free(mp);
             if (op.config) |entries| {
                 for (entries) |entry| {
                     allocator.free(entry.key);
