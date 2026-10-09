@@ -186,9 +186,9 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
                 const ts_ms = @as(i64, @intCast(entry.timestamp_ns / std.time.ns_per_ms));
                 try obj.intField("updated_at", ts_ms);
                 if (entry.expiry_ns > 0) {
-                    try obj.intField("ttl_ms", @as(i64, @intCast(entry.expiry_ns / std.time.ns_per_ms)));
+                    try obj.intField("expires_at_ms", @as(i64, @intCast(entry.expiry_ns / std.time.ns_per_ms)));
                 } else {
-                    try obj.nullField("ttl_ms");
+                    try obj.nullField("expires_at_ms");
                 }
                 break;
             }

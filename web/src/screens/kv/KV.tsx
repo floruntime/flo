@@ -16,9 +16,9 @@ const secondsToMs = (s: number | null) => (s == null ? null : s * 1000)
 
 const isCounter = (v?: string) => !!v && /^-?\d+$/.test(v.trim())
 
-function ttlLabel(ttl_ms?: number | null): string {
-  if (ttl_ms == null) return '—'
-  const secs = Math.round((ttl_ms - Date.now()) / 1000)
+function ttlLabel(expires_at_ms?: number | null): string {
+  if (expires_at_ms == null) return '—'
+  const secs = Math.round((expires_at_ms - Date.now()) / 1000)
   if (secs <= 0) return 'expired'
   if (secs < 60) return secs + 's'
   if (secs < 3600) return Math.floor(secs / 60) + 'm'
@@ -152,7 +152,7 @@ export function KV() {
               </Pill>
             </div>
             <div className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)', marginBottom: 12 }}>
-              version {detail?.version ?? '—'} · {detail?.size ?? 0} B · TTL {ttlLabel(detail?.ttl_ms)}
+              version {detail?.version ?? '—'} · {detail?.size ?? 0} B · TTL {ttlLabel(detail?.expires_at_ms)}
               {counter ? ' · counter' : ''}
             </div>
 

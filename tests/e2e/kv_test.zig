@@ -424,18 +424,28 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl needs a unit, and tou
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl", "500ms" });
+    // Read as seconds, either TTL would outlive the test.
+    try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl", "800ms" });
+    try ctx.exec(&.{ "kv", "set", "touched_key", "touched_value" });
+    try ctx.exec(&.{ "kv", "touch", "touched_key", "--ttl", "800ms" });
     var early = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
     defer early.deinit();
     try testing.expect(early.stdoutContains("ms_value"));
-    @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
+    var early_touched = try ctx.cli.run(&.{ "kv", "get", "touched_key", "--output", "table" });
+    defer early_touched.deinit();
+    try testing.expect(early_touched.stdoutContains("touched_value"));
+    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
     var late = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
     defer late.deinit();
     try stdx.testing.assertContains(late, "(nil)");
+    var late_touched = try ctx.cli.run(&.{ "kv", "get", "touched_key", "--output", "table" });
+    defer late_touched.deinit();
+    try stdx.testing.assertContains(late_touched, "(nil)");
 
     // "3600" could mean seconds or milliseconds: refused, and nothing set.
     var bare = try ctx.cli.run(&.{ "kv", "set", "bare_key", "v", "--ttl", "3600" });
     defer bare.deinit();
+    try stdx.testing.assertFailed(bare);
     try testing.expect(bare.contains("not a duration"));
     var unset = try ctx.cli.run(&.{ "kv", "get", "bare_key", "--output", "table" });
     defer unset.deinit();
@@ -1710,7 +1720,7 @@ test "e2e/kv: touch sets ttl, persist clears it" {
 
     try ctx.exec(&.{ "kv", "set", "session", "active" });
 
-    // touch with --ttl 3600 (server-side; we don't sleep — just verify ack).
+    // touch with --ttl 1h (server-side; we don't sleep — just verify ack).
     var touch_ok = try ctx.cli.run(&.{ "kv", "touch", "session", "--ttl", "1h" });
     defer touch_ok.deinit();
     try stdx.testing.assertSucceeded(touch_ok);
