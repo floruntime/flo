@@ -554,6 +554,9 @@ pub const TSHandler = struct {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
         }
+        if (req.findOption(.ts_downsample) != null) {
+            return .{ .err = .{ .code = .invalid_request, .message = "downsampling isn't supported; retention deletes points older than a duration, once" } };
+        }
         // Retention policy: key = measurement, duration from TLV option or value
         // Client sends raw_ttl via OptionTag.ts_raw_ttl; fallback to req.value
         const duration_str: []const u8 = if (req.findOption(.ts_raw_ttl)) |opt|

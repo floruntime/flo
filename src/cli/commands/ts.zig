@@ -8,7 +8,7 @@
 //!   flo ts query <measurement> [--tags "k=v,..."] [--from <time>] [--window <duration>] [--agg <fn>]
 //!   flo ts list [<measurement>] [--fields] [--limit <n>]
 //!   flo ts delete <measurement> [--tags "k=v,..."] [--confirm]
-//!   flo ts retention <measurement> [--raw-ttl <duration>] [--downsample "interval:agg:ttl"]
+//!   flo ts retention <measurement> --raw-ttl <duration>
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -132,17 +132,16 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("retention")
-                .about("Configure retention and downsampling policy")
+                .about("Delete a measurement's points older than a duration, once")
+                .longAbout(
+                    \\Deletes the measurement's points older than --raw-ttl, now. It is not
+                    \\a standing policy: later points stay until it is run again.
+                )
                 .examples(&.{
                     "flo ts retention cpu_usage --raw-ttl 7d",
-                    "flo ts retention cpu_usage --downsample 1m:avg:30d",
-                    "flo ts retention cpu_usage --raw-ttl 7d --downsample 1m:avg:30d --downsample 1h:avg:365d",
-                    "flo ts retention cpu_usage --show",
                 })
                 .arg("measurement", "Measurement name")
-                .stringFlag("raw-ttl", 0, "", "Raw data TTL: Nd, Nh, Nm (e.g., 7d)")
-                .stringFlag("downsample", 'd', "", "Downsample rule: interval:agg:ttl (repeatable)")
-                .boolFlag("show", 0, "Show current retention policy")
+                .stringFlag("raw-ttl", 0, "", "Age to keep: Ns, Nm, Nh or Nd (e.g., 7d)")
                 .action(wrapHandler(runRetention)),
         )
         .subcommand(
@@ -791,28 +790,9 @@ fn runRetention(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
-    const raw_ttl_str = ctx.getString("raw-ttl") orelse "";
-    const downsample_str = ctx.getString("downsample") orelse "";
-    const show = ctx.getBool("show");
-
-    if (show) {
-        // Show current policy (use ts_list with retention info)
-        ctx.print("Retention policy for '{s}': (not yet implemented)\n", .{measurement});
-        return;
-    }
-
-    const raw_ttl: ?[]const u8 = if (raw_ttl_str.len > 0) raw_ttl_str else null;
-
-    // Parse downsample rules (single for now, multi-flag support later)
-    var rules: [4][]const u8 = undefined;
-    var rule_count: usize = 0;
-    if (downsample_str.len > 0) {
-        rules[0] = downsample_str;
-        rule_count = 1;
-    }
-
-    if (raw_ttl == null and rule_count == 0) {
-        ctx.printErr("Error: specify --raw-ttl and/or --downsample rules\n", .{});
+    const raw_ttl = ctx.getString("raw-ttl") orelse "";
+    if (raw_ttl.len == 0) {
+        ctx.printErr("Error: --raw-ttl is required (e.g. --raw-ttl 7d)\n", .{});
         return error.CommandFailed;
     }
 
@@ -824,7 +804,7 @@ fn runRetention(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.ts.retention(&client, namespace, measurement, raw_ttl, rules[0..rule_count]) catch |err| {
+    var result = client_mod.ts.retention(&client, namespace, measurement, raw_ttl) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
