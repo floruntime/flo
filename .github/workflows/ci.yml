@@ -117,6 +117,11 @@ jobs:
       - name: Swarm
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
         timeout-minutes: 20
+      - name: Swarm with lost disks
+        # Crashes that lose a disk or its hard state, up to two nodes at once:
+        # the lost-log guard's slice.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --wipes --seed-timeout=120 --out-dir=/tmp/vopr-wipes
+        timeout-minutes: 20
       - name: Pins still fail by design
         # Each pin is the acceptance test for a product fix; a pin going
         # green means that fix landed and the pin should be retired here.
