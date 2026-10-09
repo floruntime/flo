@@ -35,30 +35,32 @@ const Allocator = std.mem.Allocator;
 const ServerProcess = @import("server.zig").ServerProcess;
 const CliRunner = @import("client.zig").CliRunner;
 
-/// Kill any stale flo server processes from crashed previous tests.
-/// This prevents port conflicts and resource contention.
+/// Kill servers a crashed earlier run of this checkout left holding ports.
+/// Only those started from this checkout's own binary: a pattern any flo
+/// matches kills other checkouts' test runs and hand-started servers too,
+/// which then die with status 9 mid-test.
 fn cleanupStaleProcesses() void {
-    // Use pkill to kill any lingering flo processes
-    // This is a best-effort cleanup - ignore errors
-    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
-        const io = stdx.io.instance();
-        if (std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "pkill", "-9", "-f", "flo server" },
-        })) |r| {
-            std.heap.page_allocator.free(r.stdout);
-            std.heap.page_allocator.free(r.stderr);
-        } else |_| {}
-
-        if (std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "pkill", "-9", "flo" },
-        })) |r| {
-            std.heap.page_allocator.free(r.stdout);
-            std.heap.page_allocator.free(r.stderr);
-        } else |_| {}
-
-        // Brief wait for processes to terminate and release resources
-        stdx.time.sleep(500 * std.time.ns_per_ms);
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    const binary = @import("server.zig").findFloBinary(std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(binary);
+    // pkill -f takes an extended regex: escape the path so it matches only itself.
+    var pattern: std.ArrayListUnmanaged(u8) = .empty;
+    defer pattern.deinit(std.heap.page_allocator);
+    pattern.append(std.heap.page_allocator, '^') catch return;
+    for (binary) |c| {
+        if (std.mem.indexOfScalar(u8, "\\.^$|?*+()[]{}", c) != null) pattern.append(std.heap.page_allocator, '\\') catch return;
+        pattern.append(std.heap.page_allocator, c) catch return;
     }
+    pattern.appendSlice(std.heap.page_allocator, " server ") catch return;
+    const io = stdx.io.instance();
+    if (std.process.run(std.heap.page_allocator, io, .{
+        .argv = &.{ "pkill", "-9", "-f", pattern.items },
+    })) |r| {
+        std.heap.page_allocator.free(r.stdout);
+        std.heap.page_allocator.free(r.stderr);
+    } else |_| {}
+    // Brief wait for processes to terminate and release resources
+    stdx.time.sleep(500 * std.time.ns_per_ms);
 }
 
 /// Start a server with retry: under heavy test load, port allocation
