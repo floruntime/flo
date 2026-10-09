@@ -6,6 +6,7 @@
 const std = @import("std");
 
 // Feature tests
+pub const harness_test = @import("harness_test.zig");
 pub const kv_test = @import("kv_test.zig");
 pub const kv_key_nul_test = @import("kv_key_nul_test.zig");
 pub const http_test = @import("http_test.zig");
