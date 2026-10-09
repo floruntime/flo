@@ -304,6 +304,16 @@ pub const RaftNetwork = struct {
     linked_ids: [MAX_PEERS]std.atomic.Value(u32),
     /// Each linked peer's session, beside `linked_ids`.
     linked_sessions: [MAX_PEERS]std.atomic.Value(u64),
+    /// Each linked peer's client address from its hello, packed
+    /// `ip4 << 16 | port`, for the shard thread to name a leader.
+    linked_clients: [MAX_PEERS]std.atomic.Value(u64),
+    /// The group's voters, from the shard (`setVoters`); 0 marks an empty
+    /// slot. Until the shard publishes any, a node not yet named takes
+    /// addresses from whoever it links to.
+    voter_ids: [MAX_PEERS + 1]std.atomic.Value(u32),
+    voters_known: std.atomic.Value(bool),
+    /// Set by a node the group removed: it reaches out to no one again.
+    dialing_stopped: std.atomic.Value(bool),
     next_session: u64 = 0,
     /// Bytes of forwarded frames queued per peer, from `sendForward` until
     /// they are sealed onto the socket or dropped. Guarded by `mutex`.
@@ -383,6 +393,10 @@ pub const RaftNetwork = struct {
             .outbound = .empty,
             .linked_ids = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MAX_PEERS,
             .linked_sessions = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_PEERS,
+            .linked_clients = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_PEERS,
+            .voter_ids = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** (MAX_PEERS + 1),
+            .voters_known = std.atomic.Value(bool).init(false),
+            .dialing_stopped = std.atomic.Value(bool).init(false),
             .dial_mutex = .{},
             .dial_requests = .empty,
             .wake_rd = wake_pipe[0],
@@ -534,6 +548,35 @@ pub const RaftNetwork = struct {
 
     /// The ids of the peers with a link up right now, as the loop thread
     /// last published them.
+    /// The voters whose `peer_info` this node takes: a replica's word on
+    /// where members are is not the group's.
+    pub fn setVoters(self: *RaftNetwork, ids: []const u32) void {
+        for (&self.voter_ids, 0..) |*slot, i| slot.store(if (i < ids.len) ids[i] else 0, .release);
+        self.voters_known.store(true, .release);
+    }
+
+    fn fromVoter(self: *const RaftNetwork, node_id: u32) bool {
+        if (!self.voters_known.load(.acquire)) return true;
+        for (&self.voter_ids) |*slot| if (slot.load(.acquire) == node_id) return true;
+        return false;
+    }
+
+    pub const ClientAddress = struct { ip4: [4]u8, port: u16 };
+
+    /// Where clients reach `node_id`, as its hello said, while a link to it
+    /// is up.
+    pub fn clientAddress(self: *const RaftNetwork, node_id: u32) ?ClientAddress {
+        for (&self.linked_ids, &self.linked_clients) |*id, *client| {
+            if (id.load(.acquire) != node_id) continue;
+            const packed_addr = client.load(.acquire);
+            if (packed_addr == 0) return null;
+            var ip4: [4]u8 = undefined;
+            std.mem.writeInt(u32, &ip4, @truncate(packed_addr >> 16), .big);
+            return .{ .ip4 = ip4, .port = @truncate(packed_addr) };
+        }
+        return null;
+    }
+
     pub fn linkedPeers(self: *const RaftNetwork, out: *[MAX_PEERS]u32) []u32 {
         var n: usize = 0;
         for (&self.linked_ids) |*slot| {
@@ -779,7 +822,13 @@ pub const RaftNetwork = struct {
     /// and is due. Both sides dial: a restarted node remembers nobody, so
     /// waiting to be dialled could wait forever. Two links that cross are
     /// settled by `linkWins`, the same way on both nodes.
+    /// Dial no one from now on; links already up stay until they drop.
+    pub fn stopDialing(self: *RaftNetwork) void {
+        self.dialing_stopped.store(true, .release);
+    }
+
     fn dialDue(self: *RaftNetwork) void {
+        if (self.dialing_stopped.load(.acquire)) return;
         const now = stdx.time.milliTimestamp();
         for (&self.known) |*k| {
             if (!k.active or k.dialing or k.next_dial_ms > now) continue;
@@ -1224,6 +1273,8 @@ pub const RaftNetwork = struct {
         if (idle_opt) |opt| _ = std.c.setsockopt(l.fd, posix.IPPROTO.TCP, opt, @ptrCast(&idle), @sizeOf(c_int));
         self.peer_count += 1;
         if (self.peerSlot(slot)) |i| {
+            const client_port: u16 = if (l.their) |h| h.main_port else 0;
+            self.linked_clients[i].store(@as(u64, std.mem.readInt(u32, &ip4, .big)) << 16 | client_port, .release);
             self.linked_sessions[i].store(slot.session, .release);
             self.linked_ids[i].store(node_id, .release);
         }
@@ -1346,9 +1397,10 @@ pub const RaftNetwork = struct {
 
     fn handleFrame(self: *RaftNetwork, p: *PeerState, frame: framer_mod.Frame) void {
         switch (frame.msg_type) {
-            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .forward_write, .forward_reply, .join_request, .term_check, .term_check_response => self.deliver(p, frame),
+            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .forward_write, .forward_reply, .join_request, .term_check, .term_check_response, .removed_notice => self.deliver(p, frame),
             .peer_info => {
                 if (frame.payload.len < PEER_INFO_SIZE) return;
+                if (!self.fromVoter(p.node_id)) return;
                 const info = PeerInfo.decode(frame.payload[0..PEER_INFO_SIZE]);
                 if (info.node_id != self.node_id and info.raft_port > 0 and stdx_net.isUnicastPeerAddress(info.ip4)) {
                     self.noteKnown(info.node_id, info.ip4, info.raft_port, false);
@@ -1474,6 +1526,7 @@ pub const RaftNetwork = struct {
         if (self.peerSlot(p)) |i| {
             self.linked_ids[i].store(0, .release);
             self.linked_sessions[i].store(0, .release);
+            self.linked_clients[i].store(0, .release);
         }
         if (self.peer_count > 0) self.peer_count -= 1;
         if (self.repl_metrics) |m| m.setPeersLinked(self.peer_count);
@@ -2388,4 +2441,24 @@ test "raft network: peer info naming a non-dialable address is not remembered" {
     rn.drainFramer(p);
     try testing.expectEqual(@as(usize, 1), knownCount(&rn));
     try testing.expectEqual(@as(u32, 5), rn.knownByAddress(.{ 10, 0, 0, 5 }, 9500).?.node_id);
+}
+
+test "raft network: peer_info is taken only from voters once the shard has said who they are" {
+    var rn = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var tp = try testPeer(2);
+    const p = &tp.peer;
+    defer p.framer.?.deinit();
+    var payload: [PEER_INFO_SIZE]u8 = undefined;
+    // Peer 2 is a replica: its word on where members are is not taken.
+    rn.setVoters(&.{ 1, 3 });
+    PeerInfo.encode(.{ .node_id = 5, .ip4 = .{ 10, 0, 0, 5 }, .raft_port = 9500 }, &payload);
+    feedSealed(p, &tp.far, .peer_info, 2, &payload);
+    rn.drainFramer(p);
+    try testing.expectEqual(@as(usize, 0), knownCount(&rn));
+    // Promoted, it is.
+    rn.setVoters(&.{ 1, 2, 3 });
+    feedSealed(p, &tp.far, .peer_info, 2, &payload);
+    rn.drainFramer(p);
+    try testing.expectEqual(@as(usize, 1), knownCount(&rn));
 }

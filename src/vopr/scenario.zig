@@ -115,8 +115,18 @@ pub const Scenario = struct {
     election_timeout_min_ms: u64,
     election_timeout_max_ms: u64,
     heartbeat_interval_ms: u64,
-    /// Resend an inflight AppendEntries after this many ticks w/o reply.
+    /// Resend an inflight AppendEntries after this many ticks w/o reply;
+    /// also the RPC slack each node's lost-log boot wait allows.
     rpc_timeout_ms: u64,
+
+    // ── Membership and clocks ──────────────────────────────────────────
+    /// Per-tick per-mille chance the leader changes the membership: adds a
+    /// node that is not a member as a replica, promotes a caught-up one, or
+    /// removes a voter (itself included).
+    config_change_permille: u16 = 0,
+    /// Each node's clock runs at 1 ± up to this many parts per million of
+    /// the simulation's.
+    clock_drift_ppm: u32 = 0,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -173,7 +183,21 @@ pub const Scenario = struct {
             // Drawn last so the fields above keep their values per seed.
             .wipe_permille = if (r.uintLessThan(u8, 3) == 0) r.intRangeAtMost(u16, 100, 500) else 0,
             .max_lost_nodes = if (node_count >= 5 and r.boolean()) 2 else 1,
+            .config_change_permille = if (r.uintLessThan(u8, 3) == 0) r.intRangeAtMost(u16, 1, 5) else 0,
+            .clock_drift_ppm = r.intRangeAtMost(u32, 0, 2000),
         };
+    }
+
+    /// The membership slice: the leader changes the membership often, with
+    /// partitions to strand a leader holding a change the others never
+    /// take, and crashes to lose one across a restart.
+    pub fn memberships(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        s.config_change_permille = 5;
+        s.partition_permille = @max(s.partition_permille, 3);
+        s.crash_permille = @max(s.crash_permille, 2);
+        s.restart_permille = @max(s.restart_permille, 20);
+        return s;
     }
 
     /// The lost-disk slice: same sampling as `fromSeed`, with crashes that
@@ -222,6 +246,8 @@ pub const Scenario = struct {
         s.durability = .sync;
         s.log_capacity = 4 * 1024 * 1024;
         s.payload_max = 2048;
+        s.config_change_permille = 0;
+        s.clock_drift_ppm = 0;
         return s;
     }
 
@@ -257,7 +283,9 @@ pub const Scenario = struct {
             \\  "election_timeout_min_ms": {d},
             \\  "election_timeout_max_ms": {d},
             \\  "heartbeat_interval_ms": {d},
-            \\  "rpc_timeout_ms": {d}
+            \\  "rpc_timeout_ms": {d},
+            \\  "config_change_permille": {d},
+            \\  "clock_drift_ppm": {d}
             \\}}
             \\
         , .{
@@ -270,6 +298,7 @@ pub const Scenario = struct {
             self.wipe_permille,           self.max_lost_nodes,        self.request_percent,
             self.payload_min,             self.payload_max,           self.election_timeout_min_ms,
             self.election_timeout_max_ms, self.heartbeat_interval_ms, self.rpc_timeout_ms,
+            self.config_change_permille,  self.clock_drift_ppm,
         });
     }
 
@@ -313,6 +342,8 @@ pub const Scenario = struct {
             .election_timeout_max_ms = try jsonU64(obj, "election_timeout_max_ms"),
             .heartbeat_interval_ms = try jsonU64(obj, "heartbeat_interval_ms"),
             .rpc_timeout_ms = try jsonU64(obj, "rpc_timeout_ms"),
+            .config_change_permille = try jsonInt(u16, obj, "config_change_permille"),
+            .clock_drift_ppm = try jsonInt(u32, obj, "clock_drift_ppm"),
         };
     }
 };
@@ -421,7 +452,9 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 27), obj.count());
+    try testing.expectEqual(@as(usize, 29), obj.count());
+    try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);
+    try testing.expectEqual(@as(i64, s.clock_drift_ppm), obj.get("clock_drift_ppm").?.integer);
     try testing.expectEqual(@as(i64, s.wipe_permille), obj.get("wipe_permille").?.integer);
     try testing.expectEqual(@as(i64, 99), obj.get("seed").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.log_capacity)), obj.get("log_capacity").?.integer);

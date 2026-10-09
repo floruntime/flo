@@ -33,6 +33,7 @@ pub const definition_bounds_test = @import("definition_bounds_test.zig");
 pub const definition_keys_test = @import("definition_keys_test.zig");
 pub const force_members_test = @import("force_members_test.zig");
 pub const wipe_rejoin_test = @import("wipe_rejoin_test.zig");
+pub const membership_test = @import("membership_test.zig");
 pub const processing_test = @import("processing_test.zig");
 pub const ts_test = @import("ts_test.zig");
 pub const dual_connection_test = @import("dual_connection_test.zig");

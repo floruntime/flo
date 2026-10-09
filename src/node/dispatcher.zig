@@ -75,6 +75,9 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 pub fn opWrites(op: proto.OpCode) bool {
     return switch (op) {
         .namespace_create, .namespace_delete, .namespace_config_set => true,
+        // Membership changes are made by the leader; a follower carries
+        // them there like any write.
+        .cluster_promote, .cluster_remove => true,
         .kv_put, .kv_delete, .kv_incr, .kv_json_set, .kv_json_del, .kv_begin_txn, .kv_commit_txn, .kv_rollback_txn, .kv_touch, .kv_persist => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
