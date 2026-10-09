@@ -86,8 +86,8 @@ test "e2e/definitions: a wait whose timeout is past the clock parks the run, and
         \\start.run: @actions/far-init
         \\start.transitions.success: hold
         \\start.transitions.failure: flo.Failed
-        \\steps.hold.waitForSignal.type: go
-        \\steps.hold.waitForSignal.timeoutMs: 9223372036854775807
+        \\steps.hold.wait_for_signal.type: go
+        \\steps.hold.wait_for_signal.timeout_ms: 9223372036854775807
         \\steps.hold.transitions.success: flo.Completed
         \\steps.hold.transitions.timeout: flo.Failed
     , "far-wait.yaml");

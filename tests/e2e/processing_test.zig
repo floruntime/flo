@@ -2425,8 +2425,8 @@ test "e2e/processing: classify operator routes tagged records to filtered sink" 
         \\sources.[0].stream.name: clf-input
         \\operators.[0].type: classify
         \\operators.[0].name: error-tagger
-        \\operators.[0].condition_0: value_contains:error
-        \\operators.[0].tag_0: errors
+        \\operators.[0].rules.[0].condition: value_contains:error
+        \\operators.[0].rules.[0].tag: errors
         \\sinks.[0].name: all-events
         \\sinks.[0].stream.name: clf-all-out
         \\sinks.[1].name: error-events
@@ -2504,10 +2504,10 @@ test "e2e/processing: classify multi-tag routing with AND match" {
         \\sources.[0].stream.name: clftag-in
         \\operators.[0].type: classify
         \\operators.[0].name: severity-tagger
-        \\operators.[0].condition_0: value_contains:error
-        \\operators.[0].tag_0: errors
-        \\operators.[0].condition_1: value_contains:critical
-        \\operators.[0].tag_1: critical
+        \\operators.[0].rules.[0].condition: value_contains:error
+        \\operators.[0].rules.[0].tag: errors
+        \\operators.[0].rules.[1].condition: value_contains:critical
+        \\operators.[0].rules.[1].tag: critical
         \\sinks.[0].name: all-sink
         \\sinks.[0].stream.name: clftag-all
         \\sinks.[1].name: error-sink
@@ -2752,7 +2752,6 @@ test "e2e/processing: kv sink writes records to KV" {
         \\operators.[0].key_expression: $.user_id
         \\sinks.[0].kv.namespace: proc_bug_kvsink
         \\sinks.[0].kv.key_prefix: user
-        \\sinks.[0].kv.write_mode: upsert
         \\parallelism: 1
         \\batch_size: 100
     ;
@@ -2787,7 +2786,6 @@ test "e2e/processing: a kv sink's sub-second ttl_ms expires the keys it writes" 
         \\operators.[0].key_expression: $.user_id
         \\sinks.[0].kv.namespace: proc_kvttl
         \\sinks.[0].kv.key_prefix: user
-        \\sinks.[0].kv.write_mode: upsert
         \\sinks.[0].kv.ttl_ms: 900
         \\parallelism: 1
         \\batch_size: 100

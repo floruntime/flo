@@ -371,16 +371,16 @@ test "e2e/workflow: multi-step workflow with custom terminals" {
         \\kind: Workflow
         \\name: multi-step
         \\version: 1.0.0
-        \\terminals.Approved.status: approval_success
-        \\terminals.Rejected.status: approval_denied
+        \\terminals.Approved.status: completed
+        \\terminals.Rejected.status: failed
         \\start.run: @actions/validate
         \\start.transitions.success: process
         \\start.transitions.failure: flo.Failed
         \\steps.process.run: @actions/process-data
         \\steps.process.transitions.success: review
         \\steps.process.transitions.failure: flo.Failed
-        \\steps.review.waitForSignal.type: approval
-        \\steps.review.waitForSignal.timeoutMs: 3600000
+        \\steps.review.wait_for_signal.type: approval
+        \\steps.review.wait_for_signal.timeout_ms: 3600000
         \\steps.review.transitions.success: Approved
         \\steps.review.transitions.timeout: Rejected
     ;
@@ -562,13 +562,13 @@ test "e2e/workflow: workflow with signal wait" {
         \\kind: Workflow
         \\name: approval-workflow
         \\version: 1.0.0
-        \\terminals.Approved.status: approved
-        \\terminals.Rejected.status: rejected
+        \\terminals.Approved.status: completed
+        \\terminals.Rejected.status: failed
         \\start.run: @actions/approval-action
         \\start.transitions.success: wait-approval
         \\start.transitions.failure: flo.Failed
-        \\steps.wait-approval.waitForSignal.type: approval
-        \\steps.wait-approval.waitForSignal.timeoutMs: 60000
+        \\steps.wait-approval.wait_for_signal.type: approval
+        \\steps.wait-approval.wait_for_signal.timeout_ms: 60000
         \\steps.wait-approval.transitions.success: Approved
         \\steps.wait-approval.transitions.timeout: Rejected
     ;
@@ -602,8 +602,8 @@ test "e2e/workflow: multi-step workflow execution" {
         \\kind: Workflow
         \\name: order-flow
         \\version: 1.0.0
-        \\terminals.OrderComplete.status: success
-        \\terminals.OrderFailed.status: failure
+        \\terminals.OrderComplete.status: completed
+        \\terminals.OrderFailed.status: failed
         \\start.run: @actions/validate-order
         \\start.transitions.success: payment
         \\start.transitions.failure: OrderFailed
@@ -758,8 +758,8 @@ test "e2e/workflow: cancel running workflow" {
         \\start.run: @actions/cancel-action
         \\start.transitions.success: wait-step
         \\start.transitions.failure: flo.Failed
-        \\steps.wait-step.waitForSignal.type: proceed
-        \\steps.wait-step.waitForSignal.timeoutMs: 300000
+        \\steps.wait-step.wait_for_signal.type: proceed
+        \\steps.wait-step.wait_for_signal.timeout_ms: 300000
         \\steps.wait-step.transitions.success: flo.Completed
         \\steps.wait-step.transitions.timeout: flo.Failed
     ;
@@ -1250,7 +1250,7 @@ test "e2e/workflow: E2E-2 scheduled workflow creation" {
 // =============================================================================
 // Timeout enforcement (14.16) is implemented — timer processing wired in
 // dispatcher tick loop. This test verifies that a 2s signal timeout fires
-// and transitions the workflow to its onTimeout target (flo.Failed).
+// and transitions the workflow to its on_timeout target (flo.Failed).
 
 test "e2e/workflow: timeout enforcement" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
@@ -1270,8 +1270,8 @@ test "e2e/workflow: timeout enforcement" {
         \\start.run: @actions/e2e3-slow-action
         \\start.transitions.success: wait-forever
         \\start.transitions.failure: flo.Failed
-        \\steps.wait-forever.waitForSignal.type: never-comes
-        \\steps.wait-forever.waitForSignal.timeoutMs: 2000
+        \\steps.wait-forever.wait_for_signal.type: never-comes
+        \\steps.wait-forever.wait_for_signal.timeout_ms: 2000
         \\steps.wait-forever.transitions.success: flo.Completed
         \\steps.wait-forever.transitions.timeout: flo.Failed
     ;
@@ -1310,7 +1310,7 @@ test "e2e/workflow: timeout enforcement" {
     // Wait for the 2s signal timeout to fire (3s to be safe)
     @import("stdx").time.sleep(3000 * std.time.ns_per_ms);
 
-    // Workflow should have timed out: wait-forever's onTimeout → flo.Failed
+    // Workflow should have timed out: wait-forever's on_timeout → flo.Failed
     var status = try ctx.cli.run(&.{ "workflow", "status", "e2e3-timeout-run" });
     defer status.deinit();
     try stdx.testing.assertSucceeded(status);
@@ -1331,13 +1331,13 @@ test "e2e/workflow: E2E-4 signal delivery resumes waiting workflow" {
         \\kind: Workflow
         \\name: e2e4-signal-wf
         \\version: 1.0.0
-        \\terminals.Approved.status: approved
-        \\terminals.Rejected.status: rejected
+        \\terminals.Approved.status: completed
+        \\terminals.Rejected.status: failed
         \\start.run: @actions/e2e4-init-action
         \\start.transitions.success: await-approval
         \\start.transitions.failure: flo.Failed
-        \\steps.await-approval.waitForSignal.type: approval
-        \\steps.await-approval.waitForSignal.timeoutMs: 30000
+        \\steps.await-approval.wait_for_signal.type: approval
+        \\steps.await-approval.wait_for_signal.timeout_ms: 30000
         \\steps.await-approval.transitions.success: Approved
         \\steps.await-approval.transitions.timeout: Rejected
     ;
@@ -1655,8 +1655,8 @@ test "e2e/workflow: E2E-9 cascading cancellation parent cancels child" {
         \\start.run: @actions/e2e9-action
         \\start.transitions.success: child-wait
         \\start.transitions.failure: flo.Failed
-        \\steps.child-wait.waitForSignal.type: never-arrives
-        \\steps.child-wait.waitForSignal.timeoutMs: 300000
+        \\steps.child-wait.wait_for_signal.type: never-arrives
+        \\steps.child-wait.wait_for_signal.timeout_ms: 300000
         \\steps.child-wait.transitions.success: flo.Completed
         \\steps.child-wait.transitions.timeout: flo.Failed
     ;
@@ -2009,8 +2009,8 @@ test "e2e/workflow: E2E-15 persistence survives server restart" {
         \\start.run: @actions/e2e15-action
         \\start.transitions.success: wait-step
         \\start.transitions.failure: flo.Failed
-        \\steps.wait-step.waitForSignal.type: resume
-        \\steps.wait-step.waitForSignal.timeoutMs: 300000
+        \\steps.wait-step.wait_for_signal.type: resume
+        \\steps.wait-step.wait_for_signal.timeout_ms: 300000
         \\steps.wait-step.transitions.success: flo.Completed
         \\steps.wait-step.transitions.timeout: flo.Failed
     ;
@@ -2188,8 +2188,8 @@ test "e2e/workflow: E2E-17 definition overwrite safety" {
         \\start.run: @actions/e2e17-v1-action
         \\start.transitions.success: wait-step
         \\start.transitions.failure: flo.Failed
-        \\steps.wait-step.waitForSignal.type: proceed
-        \\steps.wait-step.waitForSignal.timeoutMs: 60000
+        \\steps.wait-step.wait_for_signal.type: proceed
+        \\steps.wait-step.wait_for_signal.timeout_ms: 60000
         \\steps.wait-step.transitions.success: flo.Completed
         \\steps.wait-step.transitions.timeout: flo.Failed
     ;
@@ -2853,8 +2853,8 @@ test "e2e/workflow: stream trigger fires runs under multi-shard topology" {
             "name: " ++ p.wf ++ "\n" ++
             "version: 1.0.0\n" ++
             "trigger.stream: " ++ p.stream ++ "\n" ++
-            "trigger.batchTimeoutMs: 500\n" ++
-            "trigger.batchSize: 1\n" ++
+            "trigger.batch_timeout_ms: 500\n" ++
+            "trigger.batch_size: 1\n" ++
             "start.run: @actions/audit-trig-act\n" ++
             "start.transitions.success: flo.Completed\n" ++
             "start.transitions.failure: flo.Failed";
@@ -2864,7 +2864,7 @@ test "e2e/workflow: stream trigger fires runs under multi-shard topology" {
         try ctx.exec(&.{ "stream", "append", p.stream, "{\"e\":1}", "{\"e\":2}" });
     }
 
-    // Poll interval is batchTimeoutMs (500ms); wait several cycles.
+    // Poll interval is batch_timeout_ms (500ms); wait several cycles.
     @import("stdx").time.sleep(2500 * std.time.ns_per_ms);
 
     inline for (pairs) |p| {
@@ -2924,7 +2924,7 @@ test "e2e/workflow: steps.outcome resolves in input mapping" {
         \\steps:
         \\  process:
         \\    run: "@actions/audit-s2"
-        \\    inputMapping: '{"prev_outcome": "$.steps.start.outcome"}'
+        \\    input_mapping: '{"prev_outcome": "$.steps.start.outcome"}'
         \\    transitions:
         \\      success: flo.Completed
         \\      failure: flo.Failed
@@ -2978,8 +2978,8 @@ test "e2e/workflow: stream trigger fires promptly via push-wake" {
             "name: " ++ p.wf ++ "\n" ++
             "version: 1.0.0\n" ++
             "trigger.stream: " ++ p.stream ++ "\n" ++
-            "trigger.batchTimeoutMs: 60000\n" ++ // 60s timer — must NOT be what fires the run
-            "trigger.batchSize: 1\n" ++
+            "trigger.batch_timeout_ms: 60000\n" ++ // 60s timer — must NOT be what fires the run
+            "trigger.batch_size: 1\n" ++
             "start.run: @actions/push-act\n" ++
             "start.transitions.success: flo.Completed\n" ++
             "start.transitions.failure: flo.Failed";
@@ -3099,8 +3099,8 @@ test "e2e/workflow: list-runs and signal requests whose lengths overrun them are
         \\name: overrun-wf
         \\version: 1.0.0
         \\start.run: @actions/overrun-action
-        \\start.transition.success: flo.Completed
-        \\start.transition.failure: flo.Failed
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
     ;
     const path = try writeDottedToTempYaml(testing.allocator, def, "overrun-wf.yaml");
     defer cleanupTempFile(testing.allocator, path);

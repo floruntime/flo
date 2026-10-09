@@ -29,93 +29,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-// =============================================================================
-// Configuration Types for Builder Methods
-// =============================================================================
-
-/// Key-value pair for step input mappings (e.g., JSONPath expressions)
-pub const InputPair = struct {
-    key: []const u8,
-    value: []const u8,
-};
-
-/// Search attribute definition
-pub const SearchAttr = struct {
-    name: []const u8,
-    attr_type: []const u8,
-    path: []const u8,
-};
-
-/// Poll configuration for steps that poll external systems
-pub const PollConfig = struct {
-    initial_delay_ms: u32 = 5000,
-    max_attempts: u32 = 10,
-    backoff: []const u8 = "exponential",
-    base_delay_ms: u32 = 1000,
-    max_delay_ms: u32 = 60000,
-};
-
-/// Full executor configuration with all optional features
-pub const ExecutorConfig = struct {
-    name: []const u8,
-    action: []const u8,
-    priority: i32,
-    retry: ?RetryConfig = null,
-    breaker: ?BreakerConfig = null,
-    rate_limit: ?RateLimitConfig = null,
-    tracking: ?TrackingConfig = null,
-};
-
-pub const RetryConfig = struct {
-    max_attempts: u32 = 3,
-    backoff: []const u8 = "exponential",
-    initial_delay_ms: ?u32 = null,
-    max_delay_ms: ?u32 = null,
-    within_ms: ?u32 = null,
-};
-
-pub const BreakerConfig = struct {
-    failure_threshold: u32 = 5,
-    cooldown_ms: u64 = 30000,
-    half_open_max_calls: ?u32 = null,
-};
-
-pub const RateLimitConfig = struct {
-    max_per_second: ?u32 = null,
-    max_per_minute: ?u32 = null,
-};
-
-pub const TrackingConfig = struct {
-    mode: []const u8 = "sync",
-    timeout_ms: ?u64 = null,
-};
-
-/// Plan-level health configuration
-pub const HealthConfig = struct {
-    window_ms: u64,
-    decay: []const u8, // String to avoid float formatting (e.g., "0.9")
-    min_samples: u32,
-};
-
-/// Plan-level cache configuration
-pub const CacheConfig = struct {
-    ttl_ms: u64,
-    key: []const u8,
-    invalidate_on: []const []const u8 = &.{},
-};
-
-/// Plan-level fallback configuration
-pub const FallbackConfig = struct {
-    value: []const u8,
-    condition: []const u8 = "exhausted",
-};
-
-/// Plan-level error classification
-pub const ErrorClassification = struct {
-    retryable: []const []const u8 = &.{},
-    fatal: []const []const u8 = &.{},
-};
-
 /// Helper to build workflow YAML programmatically for E2E tests
 pub const YamlBuilder = struct {
     const Self = @This();
@@ -153,44 +66,6 @@ pub const YamlBuilder = struct {
         return self;
     }
 
-    /// Add a schedule block (cron, optional max_concurrent + input)
-    pub fn schedule(self: *Self, cron: []const u8, max_concurrent: ?u32, input_json: ?[]const u8) *Self {
-        self.appendLine("") catch {};
-        self.appendLine("schedule:") catch {};
-        self.indent = 2;
-        self.appendFmt("cron: \"{s}\"", .{cron}) catch {};
-        if (max_concurrent) |mc| {
-            self.appendFmt("max_concurrent: {d}", .{mc}) catch {};
-        }
-        if (input_json) |ij| {
-            self.appendFmt("input: '{s}'", .{ij}) catch {};
-        }
-        self.indent = 0;
-        return self;
-    }
-
-    /// Set namespace
-    pub fn namespace(self: *Self, ns: []const u8) *Self {
-        self.appendFmt("namespace: {s}", .{ns}) catch {};
-        return self;
-    }
-
-    /// Add search attributes block
-    pub fn searchAttributes(self: *Self, attrs: []const SearchAttr) *Self {
-        self.appendLine("") catch {};
-        self.appendLine("searchAttributes:") catch {};
-        self.indent = 2;
-        for (attrs) |attr| {
-            self.appendFmt("- name: {s}", .{attr.name}) catch {};
-            self.indent = 4;
-            self.appendFmt("type: {s}", .{attr.attr_type}) catch {};
-            self.appendFmt("path: {s}", .{attr.path}) catch {};
-            self.indent = 2;
-        }
-        self.indent = 0;
-        return self;
-    }
-
     /// Start the plans section
     pub fn plans(self: *Self) *PlanSectionBuilder {
         self.appendLine("") catch {};
@@ -206,24 +81,6 @@ pub const YamlBuilder = struct {
         self.appendLine("start:") catch {};
         self.indent = 2;
         self.appendFmt("run: \"{s}\"", .{target}) catch {};
-        self.appendLine("transitions:") catch {};
-        self.indent = 4;
-        return @ptrCast(self);
-    }
-
-    /// Define the start step with input mappings
-    pub fn startWithInput(self: *Self, target: []const u8, inputs: []const InputPair) *StepBuilder {
-        self.indent = 0;
-        self.appendLine("") catch {};
-        self.appendLine("start:") catch {};
-        self.indent = 2;
-        self.appendFmt("run: \"{s}\"", .{target}) catch {};
-        self.appendLine("input:") catch {};
-        self.indent = 4;
-        for (inputs) |pair| {
-            self.appendFmt("{s}: \"{s}\"", .{ pair.key, pair.value }) catch {};
-        }
-        self.indent = 2;
         self.appendLine("transitions:") catch {};
         self.indent = 4;
         return @ptrCast(self);
@@ -259,22 +116,6 @@ pub const YamlBuilder = struct {
         self.appendFmt("{s}:", .{name}) catch {};
         self.indent = 4;
         self.appendFmt("status: {s}", .{status}) catch {};
-        self.indent = 2;
-        return self;
-    }
-
-    /// Add a custom terminal with output mapping
-    pub fn terminalWithOutput(self: *Self, name: []const u8, status: []const u8, outputs: []const InputPair) *Self {
-        self.appendFmt("{s}:", .{name}) catch {};
-        self.indent = 4;
-        self.appendFmt("status: {s}", .{status}) catch {};
-        if (outputs.len > 0) {
-            self.appendLine("output:") catch {};
-            self.indent = 6;
-            for (outputs) |pair| {
-                self.appendFmt("{s}: \"{s}\"", .{ pair.key, pair.value }) catch {};
-            }
-        }
         self.indent = 2;
         return self;
     }
@@ -383,7 +224,7 @@ pub const PlanBuilder = struct {
         y.appendFmt("priority: {d}", .{priority}) catch {};
         y.appendLine("retry:") catch {};
         y.indent = 10;
-        y.appendFmt("max: {d}", .{max_retries}) catch {};
+        y.appendFmt("max_attempts: {d}", .{max_retries}) catch {};
         y.appendFmt("backoff: {s}", .{backoff}) catch {};
         y.indent = 6;
         return self;
@@ -405,127 +246,9 @@ pub const PlanBuilder = struct {
         y.appendFmt("priority: {d}", .{priority}) catch {};
         y.appendLine("breaker:") catch {};
         y.indent = 10;
-        y.appendFmt("failureThreshold: {d}", .{failure_threshold}) catch {};
-        y.appendFmt("cooldownMs: {d}", .{cooldown_ms}) catch {};
+        y.appendFmt("failure_threshold: {d}", .{failure_threshold}) catch {};
+        y.appendFmt("cooldown_ms: {d}", .{cooldown_ms}) catch {};
         y.indent = 6;
-        return self;
-    }
-
-    /// Add an executor with full configuration (retry, breaker, rate_limit, tracking)
-    pub fn executorFull(self: *Self, config: ExecutorConfig) *Self {
-        const y = self.yaml();
-        y.appendFmt("- name: {s}", .{config.name}) catch {};
-        y.indent = 8;
-        y.appendFmt("action: \"{s}\"", .{config.action}) catch {};
-        y.appendFmt("priority: {d}", .{config.priority}) catch {};
-
-        if (config.retry) |retry| {
-            y.appendLine("retry:") catch {};
-            y.indent = 10;
-            y.appendFmt("max_attempts: {d}", .{retry.max_attempts}) catch {};
-            y.appendFmt("backoff: {s}", .{retry.backoff}) catch {};
-            if (retry.initial_delay_ms) |v| y.appendFmt("initial_delay_ms: {d}", .{v}) catch {};
-            if (retry.max_delay_ms) |v| y.appendFmt("max_delay_ms: {d}", .{v}) catch {};
-            if (retry.within_ms) |v| y.appendFmt("within_ms: {d}", .{v}) catch {};
-            y.indent = 8;
-        }
-
-        if (config.breaker) |breaker| {
-            y.appendLine("breaker:") catch {};
-            y.indent = 10;
-            y.appendFmt("failure_threshold: {d}", .{breaker.failure_threshold}) catch {};
-            y.appendFmt("cooldown_ms: {d}", .{breaker.cooldown_ms}) catch {};
-            if (breaker.half_open_max_calls) |v| y.appendFmt("half_open_max_calls: {d}", .{v}) catch {};
-            y.indent = 8;
-        }
-
-        if (config.rate_limit) |rl| {
-            y.appendLine("rate_limit:") catch {};
-            y.indent = 10;
-            if (rl.max_per_second) |v| y.appendFmt("max_per_second: {d}", .{v}) catch {};
-            if (rl.max_per_minute) |v| y.appendFmt("max_per_minute: {d}", .{v}) catch {};
-            y.indent = 8;
-        }
-
-        if (config.tracking) |t| {
-            y.appendLine("tracking:") catch {};
-            y.indent = 10;
-            y.appendFmt("mode: {s}", .{t.mode}) catch {};
-            if (t.timeout_ms) |v| y.appendFmt("timeout_ms: {d}", .{v}) catch {};
-            y.indent = 8;
-        }
-
-        y.indent = 6;
-        return self;
-    }
-
-    /// Add plan-level health configuration
-    pub fn health(self: *Self, config: HealthConfig) *Self {
-        const y = self.yaml();
-        y.indent = 4;
-        y.appendLine("health:") catch {};
-        y.indent = 6;
-        y.appendFmt("window_ms: {d}", .{config.window_ms}) catch {};
-        y.appendFmt("decay: {s}", .{config.decay}) catch {};
-        y.appendFmt("min_samples: {d}", .{config.min_samples}) catch {};
-        y.indent = 4;
-        return self;
-    }
-
-    /// Add plan-level cache configuration
-    pub fn cache(self: *Self, config: CacheConfig) *Self {
-        const y = self.yaml();
-        y.indent = 4;
-        y.appendLine("cache:") catch {};
-        y.indent = 6;
-        y.appendFmt("ttl_ms: {d}", .{config.ttl_ms}) catch {};
-        y.appendFmt("key: \"{s}\"", .{config.key}) catch {};
-        if (config.invalidate_on.len > 0) {
-            y.appendLine("invalidate_on:") catch {};
-            y.indent = 8;
-            for (config.invalidate_on) |event| {
-                y.appendFmt("- \"{s}\"", .{event}) catch {};
-            }
-        }
-        y.indent = 4;
-        return self;
-    }
-
-    /// Add plan-level fallback configuration
-    pub fn fallback(self: *Self, config: FallbackConfig) *Self {
-        const y = self.yaml();
-        y.indent = 4;
-        y.appendLine("fallback:") catch {};
-        y.indent = 6;
-        y.appendFmt("value: '{s}'", .{config.value}) catch {};
-        y.appendFmt("condition: {s}", .{config.condition}) catch {};
-        y.indent = 4;
-        return self;
-    }
-
-    /// Add plan-level error classification
-    pub fn errors(self: *Self, config: ErrorClassification) *Self {
-        const y = self.yaml();
-        y.indent = 4;
-        y.appendLine("errors:") catch {};
-        y.indent = 6;
-        if (config.retryable.len > 0) {
-            y.appendLine("retryable:") catch {};
-            y.indent = 8;
-            for (config.retryable) |err_name| {
-                y.appendFmt("- \"{s}\"", .{err_name}) catch {};
-            }
-            y.indent = 6;
-        }
-        if (config.fatal.len > 0) {
-            y.appendLine("fatal:") catch {};
-            y.indent = 8;
-            for (config.fatal) |err_name| {
-                y.appendFmt("- \"{s}\"", .{err_name}) catch {};
-            }
-            y.indent = 6;
-        }
-        y.indent = 4;
         return self;
     }
 
@@ -549,20 +272,6 @@ pub const StepBuilder = struct {
     pub fn run(self: *Self, target: []const u8) *Self {
         const y = self.yaml();
         y.appendFmt("run: \"{s}\"", .{target}) catch {};
-        y.appendLine("transitions:") catch {};
-        y.indent += 2;
-        return self;
-    }
-
-    /// Set wait for signal
-    pub fn waitForSignal(self: *Self, signal_type: []const u8, timeout_ms: ?i64) *Self {
-        const y = self.yaml();
-        y.appendLine("waitForSignal:") catch {};
-        y.indent += 2;
-        y.appendFmt("type: {s}", .{signal_type}) catch {};
-        if (timeout_ms) |t| {
-            y.appendFmt("timeoutMs: {d}", .{t}) catch {};
-        }
         y.appendLine("transitions:") catch {};
         y.indent += 2;
         return self;
@@ -594,58 +303,6 @@ pub const StepBuilder = struct {
         const y = self.yaml();
         y.appendFmt("{s}: {s}", .{ outcome, target }) catch {};
         return self;
-    }
-
-    /// Set the run target with input mappings
-    pub fn runWithInput(self: *Self, target: []const u8, inputs: []const InputPair) *Self {
-        const y = self.yaml();
-        y.appendFmt("run: \"{s}\"", .{target}) catch {};
-        y.appendLine("input:") catch {};
-        y.indent += 2;
-        for (inputs) |pair| {
-            y.appendFmt("{s}: \"{s}\"", .{ pair.key, pair.value }) catch {};
-        }
-        y.indent -= 2;
-        y.appendLine("transitions:") catch {};
-        y.indent += 2;
-        return self;
-    }
-
-    /// Set the run target with poll configuration
-    pub fn runWithPoll(self: *Self, target: []const u8, poll: PollConfig) *Self {
-        const y = self.yaml();
-        y.appendFmt("run: \"{s}\"", .{target}) catch {};
-        emitPoll(y, poll);
-        y.appendLine("transitions:") catch {};
-        y.indent += 2;
-        return self;
-    }
-
-    /// Set the run target with input mappings and poll configuration
-    pub fn runWithInputAndPoll(self: *Self, target: []const u8, inputs: []const InputPair, poll: PollConfig) *Self {
-        const y = self.yaml();
-        y.appendFmt("run: \"{s}\"", .{target}) catch {};
-        y.appendLine("input:") catch {};
-        y.indent += 2;
-        for (inputs) |pair| {
-            y.appendFmt("{s}: \"{s}\"", .{ pair.key, pair.value }) catch {};
-        }
-        y.indent -= 2;
-        emitPoll(y, poll);
-        y.appendLine("transitions:") catch {};
-        y.indent += 2;
-        return self;
-    }
-
-    fn emitPoll(y: *YamlBuilder, poll: PollConfig) void {
-        y.appendLine("poll:") catch {};
-        y.indent += 2;
-        y.appendFmt("initialDelayMs: {d}", .{poll.initial_delay_ms}) catch {};
-        y.appendFmt("maxAttempts: {d}", .{poll.max_attempts}) catch {};
-        y.appendFmt("backoff: {s}", .{poll.backoff}) catch {};
-        y.appendFmt("baseDelayMs: {d}", .{poll.base_delay_ms}) catch {};
-        y.appendFmt("maxDelayMs: {d}", .{poll.max_delay_ms}) catch {};
-        y.indent -= 2;
     }
 
     /// Finish this step, return to main builder
@@ -1085,7 +742,7 @@ test "YamlBuilder: workflow with retry config" {
     defer testing.allocator.free(yaml);
 
     try testing.expect(std.mem.indexOf(u8, yaml, "retry:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "max: 3") != null);
+    try testing.expect(std.mem.indexOf(u8, yaml, "max_attempts: 3") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "backoff: exponential") != null);
 }
 
@@ -1105,8 +762,8 @@ test "YamlBuilder: workflow with circuit breaker" {
     defer testing.allocator.free(yaml);
 
     try testing.expect(std.mem.indexOf(u8, yaml, "breaker:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "failureThreshold: 5") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "cooldownMs: 60000") != null);
+    try testing.expect(std.mem.indexOf(u8, yaml, "failure_threshold: 5") != null);
+    try testing.expect(std.mem.indexOf(u8, yaml, "cooldown_ms: 60000") != null);
 }
 
 test "YamlBuilder: multi-step workflow with terminals" {
@@ -1145,276 +802,4 @@ test "YamlBuilder: multi-step workflow with terminals" {
     try testing.expect(std.mem.indexOf(u8, yaml, "terminals:") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "ValidationFailed:") != null);
     try testing.expect(std.mem.indexOf(u8, yaml, "status: failed") != null);
-}
-
-test "YamlBuilder: workflow with schedule" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("scheduled-wf", "1.0.0")
-        .schedule("0 */6 * * *", 1, "{\"mode\":\"full\"}");
-    _ = builder.start("@actions/reconcile")
-        .onSuccess("flo.Completed")
-        .onFailure("flo.Failed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "schedule:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "cron: \"0 */6 * * *\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "max_concurrent: 1") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "input:") != null);
-}
-
-test "YamlBuilder: step with waitForSignal" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("signal-test", "1.0.0");
-    _ = builder.start("@actions/init")
-        .onSuccess("wait_approval")
-        .onFailure("flo.Failed");
-
-    _ = builder.steps();
-
-    _ = builder.step("wait_approval")
-        .waitForSignal("approval", 300000)
-        .onSuccess("flo.Completed")
-        .onTimeout("flo.TimedOut");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "waitForSignal:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "type: approval") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "timeoutMs: 300000") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "timeout: flo.TimedOut") != null);
-}
-
-test "YamlBuilder: namespace" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("ns-test", "1.0.0")
-        .namespace("prod");
-    _ = builder.start("@actions/test")
-        .onSuccess("flo.Completed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "namespace: prod") != null);
-}
-
-test "YamlBuilder: search attributes" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("sa-test", "1.0.0")
-        .searchAttributes(&.{
-        .{ .name = "customer_id", .attr_type = "string", .path = "$.input.customer_id" },
-        .{ .name = "priority", .attr_type = "string", .path = "$.input.priority" },
-    });
-    _ = builder.start("@actions/test")
-        .onSuccess("flo.Completed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "searchAttributes:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "- name: customer_id") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "type: string") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "path: $.input.customer_id") != null);
-}
-
-test "YamlBuilder: step with input mappings" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("input-test", "1.0.0");
-    _ = builder.startWithInput("@actions/validate", &.{
-        .{ .key = "raw_data", .value = "$.input.raw_data" },
-    })
-        .onSuccess("enrich")
-        .onFailure("flo.Failed");
-
-    _ = builder.steps();
-    _ = builder.step("enrich")
-        .runWithInput("@actions/enricher", &.{
-            .{ .key = "normalized", .value = "$.steps._start.output.normalized" },
-            .{ .key = "customer_id", .value = "$.input.customer_id" },
-        })
-        .onSuccess("flo.Completed")
-        .onFailure("flo.Failed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "input:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "raw_data: \"$.input.raw_data\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "normalized: \"$.steps._start.output.normalized\"") != null);
-}
-
-test "YamlBuilder: step with poll config" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("poll-test", "1.0.0");
-    _ = builder.start("@actions/initiate")
-        .onSuccess("check")
-        .onFailure("flo.Failed");
-
-    _ = builder.steps();
-    _ = builder.step("check")
-        .runWithPoll("@actions/check-status", .{
-            .initial_delay_ms = 5000,
-            .max_attempts = 10,
-            .backoff = "exponential",
-            .base_delay_ms = 1000,
-            .max_delay_ms = 60000,
-        })
-        .onSuccess("flo.Completed")
-        .on("timeout", "flo.Failed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "poll:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "initialDelayMs: 5000") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "maxAttempts: 10") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "backoff: exponential") != null);
-}
-
-test "YamlBuilder: step with input and poll" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("input-poll-test", "1.0.0");
-    _ = builder.start("@actions/init")
-        .onSuccess("check");
-
-    _ = builder.steps();
-    _ = builder.step("check")
-        .runWithInputAndPoll(
-            "@actions/check-status",
-            &.{
-                .{ .key = "transfer_id", .value = "$.steps._start.output.transfer_id" },
-            },
-            .{ .initial_delay_ms = 5000, .max_attempts = 10 },
-        )
-        .onSuccess("flo.Completed")
-        .on("timeout", "flo.Failed");
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "input:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "transfer_id:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "poll:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "initialDelayMs: 5000") != null);
-}
-
-test "YamlBuilder: terminal with output" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("output-test", "1.0.0");
-    _ = builder.start("@actions/test")
-        .onSuccess("Done");
-
-    _ = builder.terminals()
-        .terminalWithOutput("Done", "completed", &.{
-        .{ .key = "result", .value = "$.steps._start.output" },
-    });
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "Done:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "status: completed") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "output:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "result: \"$.steps._start.output\"") != null);
-}
-
-test "YamlBuilder: full executor config" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("full-exec-test", "1.0.0");
-    _ = builder.plans()
-        .plan("payment", "health-weighted")
-        .executorFull(.{
-            .name = "stripe",
-            .action = "@actions/charge-stripe",
-            .priority = 100,
-            .retry = .{ .max_attempts = 3, .backoff = "exponential", .initial_delay_ms = 1000 },
-            .breaker = .{ .failure_threshold = 5, .cooldown_ms = 30000 },
-            .rate_limit = .{ .max_per_second = 100 },
-            .tracking = .{ .mode = "async", .timeout_ms = 300000 },
-        })
-        .done()
-        .done();
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "- name: stripe") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "action: \"@actions/charge-stripe\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "retry:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "max_attempts: 3") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "breaker:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "rate_limit:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "tracking:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "mode: async") != null);
-}
-
-test "YamlBuilder: plan-level configs" {
-    const testing = std.testing;
-    var builder = YamlBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    _ = builder.workflow("plan-config-test", "1.0.0");
-    _ = builder.plans()
-        .plan("resilient", "health-weighted")
-        .executor("primary", "@actions/primary", 100)
-        .health(.{ .window_ms = 300000, .decay = "0.9", .min_samples = 10 })
-        .cache(.{
-            .ttl_ms = 3600000,
-            .key = "charge:{input.customer_id}",
-            .invalidate_on = &.{ "payment.refunded", "customer.deleted" },
-        })
-        .fallback(.{ .value = "{\"status\":\"unavailable\"}", .condition = "exhausted" })
-        .errors(.{
-            .retryable = &.{ "timeout", "rate_limited" },
-            .fatal = &.{ "invalid_card", "fraud_detected" },
-        })
-        .done()
-        .done();
-
-    const yaml = try builder.build();
-    defer testing.allocator.free(yaml);
-
-    try testing.expect(std.mem.indexOf(u8, yaml, "health:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "window_ms: 300000") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "decay: 0.9") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "cache:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "ttl_ms: 3600000") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "invalidate_on:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "- \"payment.refunded\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "fallback:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "condition: exhausted") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "errors:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "retryable:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "- \"timeout\"") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "fatal:") != null);
-    try testing.expect(std.mem.indexOf(u8, yaml, "- \"invalid_card\"") != null);
 }
