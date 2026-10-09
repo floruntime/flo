@@ -683,7 +683,7 @@ fn findFreePort() !u16 {
 }
 
 /// Find the flo binary path
-fn findFloBinary(allocator: Allocator) ![]const u8 {
+pub fn findFloBinary(allocator: Allocator) ![]const u8 {
     // Try relative path from workspace root
     const paths_to_try = [_][]const u8{
         "zig-out/bin/flo",
