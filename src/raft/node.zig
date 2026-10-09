@@ -511,6 +511,12 @@ pub const RaftNode = struct {
     /// A config entry in the log, for the term check: what the owner
     /// replays at boot, and every one appended after.
     pub fn recordConfig(self: *RaftNode, index: u64, term: u64, members: []const NodeId) void {
+        // Recorded once, in index order: applying a committed config
+        // records it again, and boot replay records earlier ones.
+        for (self.config_records[0..self.config_record_count]) |rec| {
+            if (rec.index == index) return;
+        }
+        if (self.config_record_count > 0 and index < self.config_records[self.config_record_count - 1].index) return;
         if (self.config_record_count == self.config_records.len) {
             std.mem.copyForwards(ConfigRecord, self.config_records[0 .. self.config_records.len - 1], self.config_records[1..]);
             self.config_record_count -= 1;
@@ -523,11 +529,22 @@ pub const RaftNode = struct {
         self.config_record_count += 1;
     }
 
+    /// A truncation cut the config entry the membership came from: the
+    /// membership is the newest config the log still holds, or, with none
+    /// recorded, the committed one. Falling back to the committed set alone
+    /// would leave a node whose owner has not yet applied a committed
+    /// config with no members at all, never campaigning.
     fn truncatedBelowMembership(self: *RaftNode, after_index: u64) void {
         while (self.config_record_count > 0 and self.config_records[self.config_record_count - 1].index > after_index) {
             self.config_record_count -= 1;
         }
         if (self.membership_index == 0 or self.membership_index <= after_index) return;
+        if (self.config_record_count > 0) {
+            const rec = self.config_records[self.config_record_count - 1];
+            self.setMembership(rec.members.slice(), rec.index);
+            self.membership_term = rec.term;
+            return;
+        }
         var ids: [MAX_PEERS + 1]NodeId = undefined;
         const n = self.committed_member_count;
         @memcpy(ids[0..n], self.committed_member_ids[0..n]);
@@ -3254,4 +3271,27 @@ test "raft node: an empty-log node checks the committed config it caught up to, 
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     node.handleTermCheckResponse(checkAnswer(3, 3, 3, 3, &.{ 1, 2, 3, 4 }));
     try testing.expectEqual(LostLog.none, node.lost_log);
+}
+
+test "raft node: a truncated config falls back to the newest one the log still holds, applied or not" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.timer_enabled = false;
+    var a: [membership.MAX_SIZE]u8 = undefined;
+    var b: [membership.MAX_SIZE]u8 = undefined;
+    // {1,2,3} at 2 from leader 1 (term 1), not yet applied by the owner;
+    // {1,2,3,4} at 3, uncommitted.
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2, 3 }, &a)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 3, 0, membership.encode(&.{ 1, 2, 3, 4 }, &b)),
+    };
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
+    try testing.expectEqual(@as(u8, 3), node.peer_count);
+    // Leader 3 of term 2 never had the config at 3: it is cut.
+    var noop2 = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 2, 3, 0, "");
+    _ = try node.handleAppendEntries(.{ .term = 2, .leader_id = 3, .prev_log_index = 2, .prev_log_term = 1, .entries = (&noop2)[0..1], .leader_commit = 2 });
+    var ids: [MAX_PEERS + 1]NodeId = undefined;
+    try testing.expectEqualSlices(NodeId, &.{ 2, 1, 3 }, node.memberIds(&ids));
+    try testing.expect(node.timer_enabled);
 }

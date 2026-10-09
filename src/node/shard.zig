@@ -4730,6 +4730,10 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     const members = membership.decode(entry.payload, &ids) orelse return;
     raft.commitMembership(members);
+    // At boot, replay applies the committed configs before the group comes
+    // up: a node that lost its hard state checks the committed set even
+    // when its latest config is not.
+    raft.recordConfig(entry.header.index, entry.header.term, members);
     log.info("Raft: membership committed: {any} (config index {d})", .{ members, entry.header.index });
 }
 

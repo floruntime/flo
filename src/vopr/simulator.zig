@@ -486,6 +486,7 @@ pub const Simulator = struct {
             for (self.nodes, 0..) |_, j| {
                 if (i != j) node.raft.addPeer(@intCast(j + 1));
             }
+            self.commitAllMembers(node);
         }
         // Hooks attach after (empty) replay, mirroring production wiring.
         for (self.nodes) |*node| self.attachDisk(node);
@@ -611,6 +612,7 @@ pub const Simulator = struct {
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
+        self.commitAllMembers(node);
         // Replay the durable log before attaching the hook, exactly as
         // production wires persistence after segment replay — a hook
         // active during replay would re-feed the disk.
@@ -625,6 +627,11 @@ pub const Simulator = struct {
             );
             entry.header.crc32c = entry.computeCrc();
             _ = node.raft.log.append(&entry) catch @panic("sim replay append");
+            // The configs the log holds, as production's boot records them.
+            if (e.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+                var ids: [membership.MAX_MEMBERS]NodeId = undefined;
+                if (membership.decode(e.payload, &ids)) |members| node.raft.recordConfig(@intCast(idx), e.term, members);
+            }
         }
         // What the sink persisted is what comes back — nothing in volatile
         // mode, so such a node restarts at term 0.
@@ -781,6 +788,14 @@ pub const Simulator = struct {
                 node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
             },
         }
+    }
+
+    /// Every node is a member from the start: the committed membership a
+    /// truncation can fall back to, as production's founding config is.
+    fn commitAllMembers(self: *Simulator, node: *SimNode) void {
+        var ids: [network_mod.MAX_NODES]NodeId = undefined;
+        for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
+        node.raft.commitMembership(ids[0..self.scenario.node_count]);
     }
 
     /// The first leader writes a config naming every node, as production's
@@ -968,6 +983,15 @@ pub const Simulator = struct {
                 // but carry no workload op.
                 const is_op = e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_noop) and e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config);
                 self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
+                // A config applied is committed, as production's applier
+                // records it.
+                if (e.header.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+                    var ids: [membership.MAX_MEMBERS]NodeId = undefined;
+                    if (membership.decode(e.payload, &ids)) |members| {
+                        node.raft.commitMembership(members);
+                        node.raft.recordConfig(idx, e.header.term, members);
+                    }
+                }
                 node.raft.last_applied = idx;
             }
         }
@@ -1781,4 +1805,20 @@ test "vopr sim: a guarded node's refused vote moves it past a stale leader's ter
     try runTicks(&sim, 300);
     try testing.expect(lead.raft.role != .leader);
     try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: a truncated uncommitted config leaves the node with the members the log still names" {
+    // Default seed 165: seven nodes, no crashes. A deposed leader's config
+    // is truncated; without a recorded membership to fall back to, three
+    // nodes were left with none and the group stopped electing.
+    var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(165), .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    if (!s.ok) {
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        sim.printViolations(&w) catch {};
+        std.debug.print("{s}\n", .{w.buffered()});
+    }
+    try testing.expect(s.ok);
 }
