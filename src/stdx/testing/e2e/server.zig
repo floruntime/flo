@@ -784,12 +784,16 @@ fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: 
     var buf: [4096]u8 = undefined;
     var open_count: usize = 2;
 
+    // Once asked to stop, drain for at most a second: whatever still holds
+    // the pipe (a grandchild), quiet or writing, must not keep the harness
+    // waiting.
+    var stop_at: ?i64 = null;
     while (open_count > 0) {
+        if (stop_at == null and stop.load(.acquire)) stop_at = stdx.time.milliTimestamp();
+        if (stop_at) |t| if (stdx.time.milliTimestamp() - t > 1000) break;
         const ready = std.posix.poll(&fds, 100) catch break;
         if (ready == 0) {
-            // Quiet after the server was reaped: whatever still holds the
-            // pipe (a grandchild) must not keep the harness waiting.
-            if (stop.load(.acquire)) break;
+            if (stop_at != null) break;
             continue;
         }
 
