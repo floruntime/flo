@@ -1008,6 +1008,17 @@ pub const RaftNode = struct {
         if (std.mem.indexOfNone(NodeId, members, &.{self.id}) == null) _ = self.confirmTerm();
     }
 
+    /// Answers that must meet every quorum a vote of this node could have
+    /// counted in, at a member other than this node: a quorum holds at
+    /// least ⌊n/2⌋ others, so n − ⌊n/2⌋ of the n − 1 others always overlap
+    /// it. Not named, its vote counted in no quorum of this set, and a
+    /// plain majority answers.
+    fn pollAnswersNeeded(self: *const RaftNode) u8 {
+        const members = self.poll.members[0..self.poll.member_count];
+        const n = self.poll.member_count;
+        return if (std.mem.indexOfScalar(NodeId, members, self.id) != null) n - n / 2 else n / 2 + 1;
+    }
+
     /// The term is confirmed. A vote recorded for itself in this term means
     /// it grants none in it, here or after a restart. False when that
     /// cannot be made durable; the poll goes on.
@@ -1094,7 +1105,7 @@ pub const RaftNode = struct {
         if (self.poll.answered[i]) return;
         self.poll.answered[i] = true;
         self.poll.answers += 1;
-        if (self.poll.answers < self.poll.member_count / 2 + 1) return;
+        if (self.poll.answers < self.pollAnswersNeeded()) return;
         if (!self.confirmTerm()) {
             self.poll.answered[i] = false;
             self.poll.answers -= 1;
@@ -2903,4 +2914,23 @@ test "raft node: a group of one has no other vote to wait for" {
     try node.enterLostVote();
     try testing.expectEqual(LostLog.none, node.lost_log);
     try testing.expect(!rec.lost_log);
+}
+
+test "raft node: a lost-log node in a group of two confirms with the other member's answer" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.timer_enabled = false;
+    try node.enterLostLog();
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf)),
+    };
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2, .leader_last_index = 2 });
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    // Any quorum that counted this node's vote also held node 1.
+    node.handleTermPollResponse(pollAnswer(1, 1, 2, 1, &.{ 1, 2 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
 }
