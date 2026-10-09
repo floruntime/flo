@@ -3828,11 +3828,12 @@ pub const Shard = struct {
         shard.sendOkResponse(conn, req.header.request_id, &buf);
     }
 
+    /// A refusal is always sent: one too long for its frame is cut, never
+    /// dropped (a dropped one left the client the no-answer fallback).
     pub fn sendErrorResponse(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, msg: []const u8) void {
         _ = self;
-        var buf: [512]u8 = undefined;
-        const serialized = proto.Response.serializeNew(status, request_id, msg, &buf) catch return;
-        _ = conn.queueWrite(serialized);
+        var buf: [1024]u8 = undefined;
+        _ = conn.queueWrite(proto.Response.serializeError(status, request_id, msg, &buf));
     }
 
     /// Deliver an already-serialized answer to wherever `reply_to` says.
@@ -8635,4 +8636,39 @@ test "Shard: a handler answering its own request as deferred is caught, and answ
     try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
     try std.testing.expectEqualStrings("only-answer", one[0].data);
     try std.testing.expectEqual(@as(u64, 1), shard.answered_as_deferred);
+}
+
+test "Shard: a refusal longer than its frame is sent cut, under its id, and alone" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    // A handler refusing with a 2000-byte message, as a long echoed name
+    // or a nested parse path can make one. It used to send nothing.
+    const Long = struct {
+        fn handle(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
+            const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+            sh.sendErrorResponse(conn, req.header.request_id, .bad_request, "€" ** 666 ++ "xx");
+        }
+    };
+    shard.dispatcher.register(.queue_touch, Long.handle);
+
+    const frame = try testRequest(.queue_touch, 11, "q", "");
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    var one: [1]proto.Response = undefined;
+    var buf: [2048]u8 = undefined;
+    try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 11), one[0].header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(one[0].data));
+    try std.testing.expect(std.mem.endsWith(u8, one[0].data, proto.Response.TRUNCATED_MARKER));
+    try std.testing.expect(one[0].data.len > 900);
 }

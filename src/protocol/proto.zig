@@ -1005,6 +1005,28 @@ pub const Response = struct {
         return resp.serialize(buffer);
     }
 
+    /// Marks a refusal message cut to fit its frame.
+    pub const TRUNCATED_MARKER = " …[truncated]";
+
+    /// Serialize a refusal whatever its message's length: one that doesn't
+    /// fit `buffer` is cut at a UTF-8 code-point boundary and marked, so a
+    /// client always gets its answer and the text stays valid.
+    pub fn serializeError(status: StatusCode, request_id: u64, msg: []const u8, buffer: []u8) []const u8 {
+        const room = buffer.len - @sizeOf(ResponseHeader);
+        std.debug.assert(room >= 64);
+        if (msg.len <= room) return serializeNew(status, request_id, msg, buffer) catch unreachable;
+        var cut = room - TRUNCATED_MARKER.len;
+        // Step back over continuation bytes to the start of a code point.
+        while (cut > 0 and msg[cut] & 0b1100_0000 == 0b1000_0000) cut -= 1;
+        var text: [4096]u8 = undefined;
+        std.debug.assert(room <= text.len);
+        @memcpy(text[0..cut], msg[0..cut]);
+        @memcpy(text[cut..][0..TRUNCATED_MARKER.len], TRUNCATED_MARKER);
+        const out = text[0 .. cut + TRUNCATED_MARKER.len];
+        std.debug.assert(std.unicode.utf8ValidateSlice(out) or !std.unicode.utf8ValidateSlice(msg));
+        return serializeNew(status, request_id, out, buffer) catch unreachable;
+    }
+
     pub fn parse(data: []const u8) !Response {
         const header_size = @sizeOf(ResponseHeader);
         if (data.len < header_size) {
@@ -1193,4 +1215,32 @@ test "Response with prefix_u64 serialization" {
 
     const value = parsed.data[8..];
     try std.testing.expectEqualStrings("hello", value);
+}
+
+test "Response.serializeError: a message too long for its frame is cut at a code point and marked" {
+    var buf: [@sizeOf(ResponseHeader) + 64]u8 = undefined;
+    const room = 64;
+
+    // Exactly the room: sent whole.
+    const exact = "a" ** room;
+    var r = try Response.parse(Response.serializeError(.bad_request, 7, exact, &buf));
+    try std.testing.expectEqualStrings(exact, r.data);
+    try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
+
+    // One over: cut and marked.
+    r = try Response.parse(Response.serializeError(.bad_request, 7, "a" ** (room + 1), &buf));
+    try std.testing.expect(std.mem.endsWith(u8, r.data, Response.TRUNCATED_MARKER));
+    try std.testing.expect(r.data.len <= room);
+
+    // A cut that would land inside a 2-, 3- or 4-byte code point backs up to
+    // its start, so the text stays valid UTF-8.
+    inline for (.{ "é", "€", "𝄞" }) |cp| {
+        inline for (0..4) |shift| {
+            const msg = "a" ** shift ++ cp ** 40;
+            r = try Response.parse(Response.serializeError(.bad_request, 7, msg, &buf));
+            try std.testing.expect(std.unicode.utf8ValidateSlice(r.data));
+            try std.testing.expect(std.mem.endsWith(u8, r.data, Response.TRUNCATED_MARKER));
+            try std.testing.expect(std.mem.startsWith(u8, msg, r.data[0 .. r.data.len - Response.TRUNCATED_MARKER.len]));
+        }
+    }
 }
