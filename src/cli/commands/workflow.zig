@@ -232,9 +232,9 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
     // Client-side pre-validation — catch errors before the server round-trip
     prevalidate: {
-        var def = wf_parser.parseWorkflow(ctx.allocator, definition) catch {
-            ctx.printErr("Error: invalid workflow definition (failed to parse)\n", .{});
-            ctx.printErr("Hint: run 'flo validate workflow -f {s}' for detailed diagnostics\n", .{file_path});
+        var diag: wf_parser.Diagnostic = .{};
+        var def = wf_parser.parseWorkflow(ctx.allocator, definition, &diag) catch |err| {
+            ctx.printErr("Error: {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
             return error.CommandFailed;
         };
         defer def.deinit(ctx.allocator);

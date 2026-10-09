@@ -45,6 +45,7 @@ test {
     _ = @import("node/shard_manifest.zig");
     _ = @import("storage/persistence.zig");
     _ = @import("util/time_units.zig");
+    _ = @import("util/definition_diag.zig");
     _ = @import("storage/ual/entry.zig");
     _ = @import("storage/ual/ual.zig");
     _ = @import("storage/ual/segment.zig");

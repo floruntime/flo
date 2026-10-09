@@ -533,8 +533,13 @@ pub const WorkflowHandler = struct {
         }
 
         // Parse the YAML/JSON definition
-        var def = parser.parseWorkflow(self.allocator, yaml) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid workflow definition");
+        var diag: parser.Diagnostic = .{};
+        var def = parser.parseWorkflow(self.allocator, yaml, &diag) catch |err| {
+            if (err == error.OutOfMemory) {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
+            } else {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, diag.message());
+            }
             return null;
         };
         defer def.deinit(self.allocator);
@@ -1528,7 +1533,7 @@ pub const WorkflowHandler = struct {
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
         // Parse the definition to access the step graph
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
         defer def.deinit(self.allocator);
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
@@ -2109,7 +2114,7 @@ pub const WorkflowHandler = struct {
 
     /// Apply `poll:` semantics to a step outcome. When an action returns the
     /// `pending` business outcome and the step has a `poll:` block, the run is
-    /// parked for a backoff delay and re-invoked later (up to `maxAttempts`).
+    /// parked for a backoff delay and re-invoked later (up to `max_attempts`).
     /// On exhaustion the effective outcome becomes `timeout` so the caller follows
     /// the documented `timeout:` transition. Non-pending outcomes pass through.
     fn applyPollPolicy(self: *WorkflowHandler, run: *RunRecord, run_step: definition.RunStep, outcome: []const u8, step_label: []const u8, now_ms: i64) PollDecision {
@@ -2335,7 +2340,7 @@ pub const WorkflowHandler = struct {
         const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
         defer self.allocator.free(def_ns_key);
         const def_record = self.definitions.get(def_ns_key) orelse return;
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
         defer def.deinit(self.allocator);
 
         const step: definition.Step = if (run.current_step_name_owned) |sn|
@@ -2419,7 +2424,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(def_ns_key);
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
         defer def.deinit(self.allocator);
 
         const step: definition.Step = if (run.current_step_name_owned) |sn|
@@ -2552,7 +2557,7 @@ pub const WorkflowHandler = struct {
             defer self.allocator.free(def_ns_key);
             const def_record = self.definitions.get(def_ns_key) orelse return;
 
-            var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch return;
+            var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch return;
             defer def.deinit(self.allocator);
 
             // Check if timeout target is a terminal (builtin or custom)
@@ -2660,7 +2665,7 @@ pub const WorkflowHandler = struct {
         self.persistComplete(shard, run_ns_key, run, status, now_ms);
     }
 
-    /// Resolve the workflow's `output` mapping (same format as step inputMapping).
+    /// Resolve the workflow's `output` mapping (same format as a step's input_mapping).
     /// Looks up the definition, parses the YAML, and if `output:` is declared,
     /// resolves the JSON mapping via PathResolver and stores it on the run.
     ///
@@ -2679,7 +2684,7 @@ pub const WorkflowHandler = struct {
         const def_record = self.definitions.get(def_ns_key) orelse return;
 
         // Parse definition to access the output mapping
-        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned) catch |err| {
+        var def = parser.parseWorkflow(self.allocator, def_record.yaml_owned, null) catch |err| {
             log.warn("Failed to parse workflow definition for output resolution: {}", .{err});
             return;
         };
@@ -2730,7 +2735,7 @@ pub const WorkflowHandler = struct {
     /// or null if the definition has no search attributes.
     fn buildSearchTags(self: *WorkflowHandler, def_ns_key: []const u8, run: *RunRecord) ?[]const u8 {
         const def_rec = self.definitions.get(def_ns_key) orelse return null;
-        var def = parser.parseWorkflow(self.allocator, def_rec.yaml_owned) catch return null;
+        var def = parser.parseWorkflow(self.allocator, def_rec.yaml_owned, null) catch return null;
         defer def.deinit(self.allocator);
         if (def.search_attributes.len == 0) return null;
 
@@ -3521,7 +3526,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(old.value.yaml_owned);
         }
 
-        var def = parser.parseWorkflow(self.allocator, yaml) catch {
+        var def = parser.parseWorkflow(self.allocator, yaml, null) catch {
             self.allocator.free(ns_key);
             return;
         };
@@ -3974,27 +3979,27 @@ const test_workflow_json =
 const test_wait_workflow_json =
     \\{"kind":"Workflow","name":"wait-wf","version":"1.0.0",
     \\"start":{"run":"@actions/init","transitions":{"success":"wait_approval"}},
-    \\"steps":{"wait_approval":{"waitForSignal":{"type":"approval"},"transitions":{"success":"flo.Completed"}}}}
+    \\"steps":{"wait_approval":{"wait_for_signal":{"type":"approval"},"transitions":{"success":"flo.Completed"}}}}
 ;
 
 /// Workflow with input mapping
 const test_input_mapping_json =
     \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
-    \\"start":{"run":"@actions/step-a","inputMapping":"{\"user\":\"$.input.name\"}","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    \\"start":{"run":"@actions/step-a","input_mapping":"{\"user\":\"$.input.name\"}","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
 ;
 
 /// Workflow with retry policy
 const test_retry_workflow_json =
     \\{"kind":"Workflow","name":"retry-wf","version":"1.0.0",
-    \\"start":{"run":"@actions/flaky","retry":{"maxAttempts":3},"transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    \\"start":{"run":"@actions/flaky","retry":{"max_attempts":3},"transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
 ;
 
 // Poll workflow: action returns `pending`; the engine should re-arm a backoff
-// poll (delays 0 for test speed) and follow `timeout` after maxAttempts=2.
+// poll (delays 0 for test speed) and follow `timeout` after max_attempts=2.
 const test_poll_workflow_json =
     \\{"kind":"Workflow","name":"poll-wf","version":"1.0.0",
     \\"start":{"run":"@actions/poller",
-    \\"poll":{"maxAttempts":2,"initialDelayMs":0,"baseDelayMs":0,"maxDelayMs":0,"backoff":"constant"},
+    \\"poll":{"max_attempts":2,"initial_delay_ms":0,"base_delay_ms":0,"max_delay_ms":0,"backoff":"constant"},
     \\"transitions":{"success":"flo.Completed","failure":"flo.Failed","timeout":"flo.TimedOut"}}}
 ;
 
@@ -4583,7 +4588,7 @@ test "step executor: retry on failure" {
     handler.advanceWorkflow(&shard, "default:run-7", "default");
     _ = shard.applyCommitted();
 
-    // Drive attempts: 1 original + 3 retries (maxAttempts=3) = 4 total
+    // Drive attempts: 1 original + 3 retries (max_attempts=3) = 4 total
     // Each iteration: complete current action with "failure", checkPendingActions
     // (which either retries→re-parks, or exhausts retries→flo.Failed)
     var attempt: u32 = 0;
@@ -4610,10 +4615,10 @@ test "step executor: retry on failure" {
 }
 
 // An action that returns the `pending` business outcome on a `poll:` step must
-// re-arm a backoff poll (not fail with "no transition"), and after maxAttempts
+// re-arm a backoff poll (not fail with "no transition"), and after max_attempts
 // is exceeded must follow the `timeout` transition. Driven at the handler layer
 // because the worker CLI cannot emit a `pending` outcome.
-test "step executor: poll re-arms on pending and times out after maxAttempts" {
+test "step executor: poll re-arms on pending and times out after max_attempts" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -4648,7 +4653,7 @@ test "step executor: poll re-arms on pending and times out after maxAttempts" {
 
     // Drive remaining poll cycles: each tick either fires the due poll timer
     // (re-invoking the action) or processes the re-invoked action's `pending`
-    // completion (re-arming). maxAttempts=2 → exhausted → `timeout` → flo.TimedOut.
+    // completion (re-arming). max_attempts=2 → exhausted → `timeout` → flo.TimedOut.
     var i: u32 = 0;
     while (i < 12) : (i += 1) {
         const run = handler.runs.getPtr("default:run-poll").?;

@@ -152,7 +152,7 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
                     try obj.boolField("enabled", !is_disabled);
 
                     // Parse YAML to extract step metadata
-                    if (wf_parser.parseWorkflow(allocator, rec.yaml_owned)) |parsed| {
+                    if (wf_parser.parseWorkflow(allocator, rec.yaml_owned, null)) |parsed| {
                         var def = parsed;
                         defer def.deinit(allocator);
                         try def.writeJsonMeta(&obj);
@@ -800,7 +800,7 @@ fn emitSearchAttributes(
     const def_yaml = yaml orelse return;
 
     // Parse definition to get search_attributes
-    var def = wf_parser.parseWorkflow(allocator, def_yaml) catch return;
+    var def = wf_parser.parseWorkflow(allocator, def_yaml, null) catch return;
     defer def.deinit(allocator);
 
     if (def.search_attributes.len == 0) return;

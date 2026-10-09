@@ -7412,7 +7412,7 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     const conn = try shard.addConnection(pair[0]);
     const def =
         \\{"kind":"Workflow","name":"gate","version":"1.0.0",
-        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
     ;
     try ParkTest.send(&shard, conn, .workflow_create, 20, "gate", def);
     try ParkTest.ack(&shard);
@@ -7447,7 +7447,7 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
 
     const def =
         \\{"kind":"Workflow","name":"gate","version":"1.0.0",
-        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
     ;
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 80, "a", "gate", def, ""));
     shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 81, "b", "gate", def, ""));
@@ -7525,7 +7525,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
 
     const def =
         \\{"kind":"Workflow","name":"gate","version":"1.0.0",
-        \\"start":{"waitForSignal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
     ;
     try ParkTest.send(&shard, conn, .workflow_create, 70, "gate", def);
     try ParkTest.ack(&shard);
