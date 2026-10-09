@@ -242,7 +242,7 @@ fn routeNamespace(allocator: Allocator, rest: []const u8, _: ?[]const u8, ctx: *
 /// Route /streams/:name[/messages|/trim|/groups/:group[/pending|/members]]
 ///   GET    /streams/:name                  — detail
 ///   DELETE /streams/:name                  — delete stream (?force=true)
-///   POST   /streams/:name/trim             — trim (?max_len|max_age_s|max_bytes|dry_run)
+///   POST   /streams/:name/trim             — trim (?max_len|max_age_s|dry_run)
 ///   GET    /streams/:name/messages         — messages
 ///   GET    /streams/:name/groups/:group    — group detail
 ///   DELETE /streams/:name/groups/:group    — delete consumer group

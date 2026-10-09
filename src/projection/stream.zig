@@ -298,17 +298,28 @@ pub const StreamState = struct {
         return self.total_bytes;
     }
 
-    /// Trim records with IDs <= up_to_id. Returns count trimmed.
+    /// What a trim to `up_to_id` would remove: the leading entries with
+    /// id <= up_to_id, and the logical records they hold.
+    pub fn trimExtent(self: *const StreamState, up_to_id: StreamID) struct { entries: usize, records: u64 } {
+        const items = self.records.items;
+        var cut: usize = 0;
+        var records: u64 = 0;
+        while (cut < items.len) : (cut += 1) {
+            if (items[cut].id.greaterThan(up_to_id)) break;
+            records += items[cut].record_count;
+        }
+        return .{ .entries = cut, .records = records };
+    }
+
+    /// Trim records with IDs <= up_to_id. Returns the logical records removed,
+    /// the same number `trimExtent` predicts.
     pub fn trim(self: *StreamState, allocator: Allocator, up_to_id: StreamID) u64 {
         _ = allocator;
         const items = self.records.items;
         if (items.len == 0) return 0;
 
-        // Find the first record that is strictly greater than up_to_id
-        var cut: usize = 0;
-        while (cut < items.len) : (cut += 1) {
-            if (items[cut].id.greaterThan(up_to_id)) break;
-        }
+        const extent = self.trimExtent(up_to_id);
+        const cut = extent.entries;
 
         if (cut == 0) {
             self.trim_id = up_to_id;
@@ -337,7 +348,7 @@ pub const StreamState = struct {
             self.total_records = 0;
             self.total_bytes = 0;
         }
-        return @intCast(cut);
+        return extent.records;
     }
 
     /// Binary search: find first index where record.id >= target.
@@ -1054,18 +1065,18 @@ pub const StreamProjection = struct {
         return trimmed;
     }
 
-    /// Trim the first `count` records from a named stream.
-    /// Returns the number of records actually removed.
-    pub fn trimStreamByCount(self: *StreamProjection, name_hash: u64, count: u64) u64 {
+    /// The logical records a trim to `up_to_id` would remove, removing none.
+    pub fn trimCount(self: *const StreamProjection, name_hash: u64, up_to_id: StreamID) u64 {
         const ss = self.streams.getPtr(name_hash) orelse return 0;
-        const records = ss.records.items;
-        if (records.len == 0 or count == 0) return 0;
-        // Find the ID of the Nth record (or last if count >= len)
-        const idx = @min(count, records.len) - 1;
-        const up_to_id = records[idx].id;
-        const trimmed = ss.trim(self.allocator, up_to_id);
-        self.stats.trimmed += trimmed;
-        return trimmed;
+        return ss.trimExtent(up_to_id).records;
+    }
+
+    /// The first id left after a trim to `up_to_id`; MIN when none would be.
+    pub fn firstIdAfterTrim(self: *const StreamProjection, name_hash: u64, up_to_id: StreamID) StreamID {
+        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+        const cut = ss.trimExtent(up_to_id).entries;
+        if (cut >= ss.records.items.len) return StreamID.MIN;
+        return ss.records.items[cut].id;
     }
 
     /// Resolve the StreamID of the Nth record in a stream (1-indexed).
@@ -2525,4 +2536,28 @@ test "stream: a snapshot with any one byte corrupted is refused or loaded, never
         var s2 = StreamProjection.init(arena.allocator());
         s2.deserialize(bad) catch {};
     }
+}
+
+test "stream: trimCount predicts trim in records, not batches" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+
+    const hash: u64 = 45;
+    const ts: u64 = 1_700_000_000_000;
+
+    const b1 = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
+    const b2 = try s.appendToStreamAt(hash, 11, 0, ts + 1, 2, 14);
+    _ = try s.appendToStreamAt(hash, 12, 0, ts + 2, 4, 30);
+
+    const through: StreamID = .{ .timestamp_ms = ts + 1, .sequence = b2.sequence + 1 };
+    try testing.expectEqual(@as(u64, 5), s.trimCount(hash, through));
+    const left = s.firstIdAfterTrim(hash, through);
+    try testing.expectEqual(@as(u64, 9), s.streamLogicalCount(hash));
+
+    try testing.expectEqual(@as(u64, 5), s.trimStream(hash, through));
+    try testing.expect(s.streamFirstId(hash).eql(left));
+    try testing.expectEqual(@as(u64, 4), s.streamLogicalCount(hash));
+
+    // A boundary before every record removes nothing.
+    try testing.expectEqual(@as(u64, 0), s.trimCount(hash, .{ .timestamp_ms = b1.timestamp_ms - 1, .sequence = 0 }));
 }

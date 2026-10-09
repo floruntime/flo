@@ -169,6 +169,57 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
     return null;
 }
 
+/// Why a route refuses its query string: a parameter not in `allowed`, one
+/// given twice, or one with no value; null when there's none. Written into
+/// `buf`. Checked first, so the route's own reads see each name at most once.
+pub fn queryRefusal(buf: []u8, query_string: ?[]const u8, comptime allowed: []const []const u8) ?[]const u8 {
+    const qs = query_string orelse return null;
+    var seen = [_]bool{false} ** allowed.len;
+    var pairs = std.mem.splitScalar(u8, qs, '&');
+    next: while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=');
+        const k = if (eq) |e| pair[0..e] else pair;
+        inline for (allowed, 0..) |a, i| if (std.mem.eql(u8, k, a)) {
+            if (eq == null or eq.? + 1 == pair.len) return std.fmt.bufPrint(buf, "'{s}' needs a value", .{k}) catch "a parameter needs a value";
+            if (seen[i]) return std.fmt.bufPrint(buf, "'{s}' is given more than once", .{k}) catch "a parameter is given more than once";
+            seen[i] = true;
+            continue :next;
+        };
+        return std.fmt.bufPrint(buf, "unknown parameter '{s}'", .{k}) catch "unknown parameter";
+    }
+    return null;
+}
+
+/// A boolean query parameter: absent is false; true/1 and false/0 are the
+/// only values, so a typo isn't read as false.
+pub fn boolQueryParam(query_string: ?[]const u8, key: []const u8) error{InvalidBool}!bool {
+    const v = parseQueryParam([]const u8, query_string, key) orelse return false;
+    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "0")) return false;
+    return error.InvalidBool;
+}
+
+test "queryRefusal names an unknown, repeated or empty parameter" {
+    const allowed: []const []const u8 = &.{ "namespace", "max_len", "dry_run" };
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), queryRefusal(&buf, "namespace=a&max_len=3", allowed));
+    try std.testing.expectEqual(@as(?[]const u8, null), queryRefusal(&buf, null, allowed));
+    try std.testing.expectEqualStrings("unknown parameter 'max_bytes'", queryRefusal(&buf, "max_len=3&max_bytes=10", allowed).?);
+    try std.testing.expectEqualStrings("'max_len' is given more than once", queryRefusal(&buf, "max_len=1&max_len=abc", allowed).?);
+    try std.testing.expectEqualStrings("'dry_run' needs a value", queryRefusal(&buf, "max_len=1&dry_run", allowed).?);
+    try std.testing.expectEqualStrings("'max_len' needs a value", queryRefusal(&buf, "max_len=", allowed).?);
+}
+
+test "boolQueryParam takes only true/false/1/0" {
+    try std.testing.expect(try boolQueryParam("dry_run=true", "dry_run"));
+    try std.testing.expect(try boolQueryParam("dry_run=1", "dry_run"));
+    try std.testing.expect(!try boolQueryParam("dry_run=0", "dry_run"));
+    try std.testing.expect(!try boolQueryParam(null, "dry_run"));
+    try std.testing.expectError(error.InvalidBool, boolQueryParam("dry_run=yes", "dry_run"));
+    try std.testing.expectError(error.InvalidBool, boolQueryParam("dry_run=True", "dry_run"));
+}
+
 // =============================================================================
 // JSON Error Response
 // =============================================================================

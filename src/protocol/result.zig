@@ -137,7 +137,8 @@ pub const CommandResult = union(enum) {
     },
 
     /// Stream trim response
-    /// Wire format: [deleted_count:u64][first_seq:u64] (new first sequence after trim)
+    /// Wire format: [deleted_count:u64][first_seq:u64]: logical records removed
+    /// (or, for a dry run, that would be) and the first sequence left.
     stream_trimmed: struct {
         deleted_count: u64,
         first_seq: u64,

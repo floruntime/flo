@@ -134,7 +134,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("before", 0, "", "Remove records before this StreamID (timestamp-sequence)")
                 .uint64Flag("maxlen", 0, 0, "Keep only this many records")
                 .uint64Flag("maxage", 0, 0, "Remove records older than this (seconds)")
-                .uint64Flag("maxbytes", 0, 0, "Trim to this size in bytes")
                 .boolFlag("dry-run", 'd', "Show what would be trimmed without trimming")
                 .action(wrapHandler(runTrim)),
         )
@@ -973,9 +972,8 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
 
     const before_str = ctx.getString("before");
-    const maxlen = ctx.getUint64("maxlen");
-    const maxage = ctx.getUint64("maxage");
-    const maxbytes = ctx.getUint64("maxbytes");
+    const maxlen = ctx.getChangedUint64("maxlen");
+    const maxage = ctx.getChangedUint64("maxage");
     const dry_run = ctx.getBool("dry-run");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
@@ -993,8 +991,8 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
         }
     }
 
-    if (maxlen == null and min_id == null and maxage == null and maxbytes == null) {
-        ctx.printErr("Error: Specify at least one of --before, --maxlen, --maxage, or --maxbytes\n", .{});
+    if (maxlen == null and min_id == null and maxage == null) {
+        ctx.printErr("Error: Specify one of --before, --maxlen or --maxage\n", .{});
         return;
     }
 
@@ -1006,8 +1004,7 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    // trim(client, namespace, stream, max_len, min_id, max_age_seconds, max_bytes, dry_run)
-    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_id, maxage, maxbytes, dry_run) catch |err| {
+    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_id, maxage, dry_run) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };
@@ -1018,27 +1015,16 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
+    const t = client_mod.stream.parseTrimmed(response) orelse {
+        ctx.printErr("Error: malformed trim response\n", .{});
+        return error.CommandFailed;
+    };
     if (json_output) {
-        if (dry_run) {
-            ctx.print("{{\"status\":\"dry_run\",\"message\":\"would trim\"}}\n", .{});
-        } else {
-            // Try to parse trimmed_to from response
-            if (before_str) |bs| {
-                ctx.print("{{\"status\":\"ok\",\"trimmed_to\":\"{s}\"}}\n", .{bs});
-            } else {
-                ctx.print("{{\"status\":\"ok\"}}\n", .{});
-            }
-        }
+        ctx.print("{{\"status\":\"{s}\",\"trimmed\":{d},\"first_seq\":{d}}}\n", .{ if (dry_run) "dry_run" else "ok", t.removed, t.first_seq });
+    } else if (dry_run) {
+        ctx.print("Would trim {d} records (dry run)\n", .{t.removed});
     } else {
-        if (dry_run) {
-            ctx.print("(dry run) OK\n", .{});
-        } else {
-            if (before_str) |bs| {
-                ctx.print("Trimmed to {s}\n", .{bs});
-            } else {
-                ctx.print("OK\n", .{});
-            }
-        }
+        ctx.print("Trimmed {d} records\n", .{t.removed});
     }
 }
 

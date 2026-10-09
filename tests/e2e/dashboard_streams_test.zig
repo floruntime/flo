@@ -57,10 +57,72 @@ test "e2e/dashboard: POST stream trim hits the real write path" {
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
 
+    // A dry run reports the count and removes nothing.
+    var dry = try http.post("/api/v1/streams/dash-trim/trim?max_len=2&dry_run=true", "");
+    defer dry.deinit();
+    try testing.expectEqual(@as(u16, 200), dry.status);
+    try testing.expect(std.mem.indexOf(u8, dry.body, "\"dry_run\":true,\"trimmed\":3") != null);
+    var r1 = try ctx.cli.run(&.{ "stream", "read", "dash-trim", "--limit", "10", "-o", "json" });
+    defer r1.deinit();
+    try testing.expectEqual(@as(usize, 5), r1.stdoutCount("\"data\":\"m"));
+
     var resp = try http.post("/api/v1/streams/dash-trim/trim?max_len=2", "");
     defer resp.deinit();
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"dry_run\":false,\"trimmed\":3") != null);
+    var r2 = try ctx.cli.run(&.{ "stream", "read", "dash-trim", "--limit", "10", "-o", "json" });
+    defer r2.deinit();
+    try testing.expectEqual(@as(usize, 2), r2.stdoutCount("\"data\":\"m"));
+}
+
+test "e2e/dashboard: trim refuses parameters it doesn't take" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "dash-trim-params", "x" });
+    try ctx.exec(&.{ "stream", "append", "dash-trim-params", "y" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+
+    var b = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=1&max_bytes=10", "");
+    defer b.deinit();
+    try testing.expect(std.mem.indexOf(u8, b.body, "max_bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, b.body, "\"error\"") != null);
+
+    var n = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=abc", "");
+    defer n.deinit();
+    try testing.expect(std.mem.indexOf(u8, n.body, "max_len must be a whole number") != null);
+
+    var both = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=1&max_age_s=60", "");
+    defer both.deinit();
+    try testing.expect(std.mem.indexOf(u8, both.body, "only one of") != null);
+
+    var zero = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=0", "");
+    defer zero.deinit();
+    try testing.expect(std.mem.indexOf(u8, zero.body, "max_len must be > 0") != null);
+
+    // A dry_run that isn't true/false/1/0 is refused, never read as a real trim.
+    for ([_][]const u8{ "dry_run=yes", "dry_run=True", "dry_run" }) |d| {
+        var path: [96]u8 = undefined;
+        var r = try http.post(std.fmt.bufPrint(&path, "/api/v1/streams/dash-trim-params/trim?max_len=1&{s}", .{d}) catch unreachable, "");
+        defer r.deinit();
+        try testing.expect(std.mem.indexOf(u8, r.body, "\"error\"") != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, "dry_run") != null);
+    }
+
+    // Repeated and empty parameters are refused by name.
+    var rep = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=1&max_len=abc", "");
+    defer rep.deinit();
+    try testing.expect(std.mem.indexOf(u8, rep.body, "'max_len' is given more than once") != null);
+    var empty = try http.post("/api/v1/streams/dash-trim-params/trim?max_len=2&max_age_s=", "");
+    defer empty.deinit();
+    try testing.expect(std.mem.indexOf(u8, empty.body, "'max_age_s' needs a value") != null);
+
+    var r = try ctx.cli.run(&.{ "stream", "read", "dash-trim-params", "--limit", "10", "-o", "json" });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.stdoutCount("\"data\":"));
 }
 
 test "e2e/dashboard: trim without a bound is rejected" {
