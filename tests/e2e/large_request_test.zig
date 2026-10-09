@@ -12,9 +12,13 @@ test "e2e/read: a request larger than the read buffer is answered" {
 
     // Over 64 KiB in one frame: an append the log refuses as too large,
     // which only an answer can say.
+    // One record, framed as a batch so it gets past the batch check.
     const value = try testing.allocator.alloc(u8, 70_000);
     defer testing.allocator.free(value);
-    @memset(value, 'v');
+    std.mem.writeInt(u32, value[0..4], 1, .little);
+    std.mem.writeInt(u32, value[4..8], @intCast(value.len - 10), .little);
+    @memset(value[8 .. value.len - 2], 'v');
+    std.mem.writeInt(u16, value[value.len - 2 ..][0..2], 0, .little);
     var header: proto.RequestHeader = undefined;
     @memset(std.mem.asBytes(&header), 0);
     header.magic = proto.MAGIC;
