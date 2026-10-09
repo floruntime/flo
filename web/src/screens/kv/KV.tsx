@@ -11,6 +11,9 @@ import { TrashIcon, XIcon } from '@/lib/icons'
 import { KVNewKey } from './KVNewKey'
 import { KVTouch } from './KVTouch'
 
+/** The dialogs work in seconds; the API takes milliseconds. */
+const secondsToMs = (s: number | null) => (s == null ? null : s * 1000)
+
 const isCounter = (v?: string) => !!v && /^-?\d+$/.test(v.trim())
 
 function ttlLabel(ttl_ms?: number | null): string {
@@ -62,7 +65,7 @@ export function KV() {
 
   const doDelete = () => del.mutate(sel!, { onSuccess: () => { setDelOpen(false); setSel(null) } })
   const setTTL = (ttlSeconds: number | null) =>
-    put.mutate({ key: sel!, body: { value, ttl_seconds: ttlSeconds } }, { onSuccess: () => setTouchOpen(false) })
+    put.mutate({ key: sel!, body: { value, ttl_ms: secondsToMs(ttlSeconds) } }, { onSuccess: () => setTouchOpen(false) })
 
   return (
     <div className="wrap fade">
@@ -213,14 +216,14 @@ export function KV() {
         <KVNewKey
           existingKeys={keys.map((k) => k.key)}
           onClose={() => setNewOpen(false)}
-          onSave={(p) => put.mutate({ key: p.key, body: { value: p.value, ttl_seconds: p.ttlSeconds, nx: p.nx } }, { onSuccess: () => { setNewOpen(false); setSel(p.key) } })}
+          onSave={(p) => put.mutate({ key: p.key, body: { value: p.value, ttl_ms: secondsToMs(p.ttlSeconds), nx: p.nx } }, { onSuccess: () => { setNewOpen(false); setSel(p.key) } })}
         />
       )}
       {editOpen && detail?.found && (
         <KVNewKey
           initial={{ key: sel!, value }}
           onClose={() => setEditOpen(false)}
-          onSave={(p) => put.mutate({ key: sel!, body: { value: p.value, ttl_seconds: p.ttlSeconds } }, { onSuccess: () => setEditOpen(false) })}
+          onSave={(p) => put.mutate({ key: sel!, body: { value: p.value, ttl_ms: secondsToMs(p.ttlSeconds) } }, { onSuccess: () => setEditOpen(false) })}
         />
       )}
       {touchOpen && <KVTouch keyName={sel!} onClose={() => setTouchOpen(false)} onSave={setTTL} />}

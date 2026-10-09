@@ -295,7 +295,7 @@ pub const StatusCode = enum(u8) {
 /// Organized by feature area to allow extensibility
 pub const OptionTag = enum(u8) {
     // KV Options (0x01 - 0x0F)
-    ttl_seconds = 0x01, // u64: Time-to-live in seconds (0 = no expiration)
+    ttl_ms = 0x01, // u64: Time-to-live in milliseconds (0 = no expiration)
     cas_version = 0x02, // u64: Expected version for compare-and-swap
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
@@ -836,12 +836,11 @@ pub const Request = struct {
         return iter.find(tag);
     }
 
-    /// Get TTL option if present (convenience method)
-    pub fn getTtlSeconds(self: Request) ?u64 {
-        if (self.findOption(.ttl_seconds)) |opt| {
-            return opt.asU64();
-        }
-        return null;
+    /// The TTL option in milliseconds, if present. One of another width is
+    /// an error, not absent: read as absent, the key would never expire.
+    pub fn getTtlMs(self: Request) error{TtlNot8Bytes}!?u64 {
+        const opt = self.findOption(.ttl_ms) orelse return null;
+        return opt.asU64() orelse error.TtlNot8Bytes;
     }
 
     /// Get CAS version option if present (convenience method)
@@ -1083,7 +1082,7 @@ test "TLV OptionsBuilder and Iterator" {
     var builder = OptionsBuilder.init(&buffer);
 
     // Build some options
-    try builder.addU64(.ttl_seconds, 3600);
+    try builder.addU64(.ttl_ms, 3600);
     try builder.addU8(.priority, 5);
     try builder.addString(.dedup_key, "abc123");
     try builder.addFlag(.if_not_exists);
@@ -1095,7 +1094,7 @@ test "TLV OptionsBuilder and Iterator" {
 
     // TTL
     const ttl_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.ttl_seconds, ttl_opt.tag);
+    try std.testing.expectEqual(OptionTag.ttl_ms, ttl_opt.tag);
     try std.testing.expectEqual(@as(u64, 3600), ttl_opt.asU64().?);
 
     // Priority
@@ -1121,7 +1120,7 @@ test "TLV OptionsIterator find" {
     var buffer: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&buffer);
 
-    try builder.addU64(.ttl_seconds, 7200);
+    try builder.addU64(.ttl_ms, 7200);
     try builder.addU8(.priority, 10);
 
     const options = builder.getOptions();
@@ -1132,7 +1131,7 @@ test "TLV OptionsIterator find" {
     try std.testing.expectEqual(@as(u8, 10), priority.asU8().?);
 
     // Find TTL (after reset by find)
-    const ttl = iter.find(.ttl_seconds).?;
+    const ttl = iter.find(.ttl_ms).?;
     try std.testing.expectEqual(@as(u64, 7200), ttl.asU64().?);
 
     // Find non-existent
@@ -1142,7 +1141,7 @@ test "TLV OptionsIterator find" {
 test "Request with TLV options serialization" {
     var options_buf: [32]u8 = undefined;
     var builder = OptionsBuilder.init(&options_buf);
-    try builder.addU64(.ttl_seconds, 86400); // 1 day
+    try builder.addU64(.ttl_ms, 86400); // 1 day
 
     const request = Request{
         .header = .{
@@ -1170,7 +1169,7 @@ test "Request with TLV options serialization" {
     try std.testing.expectEqualStrings("test", parsed.namespace);
     try std.testing.expectEqualStrings("mykey", parsed.key);
     try std.testing.expectEqualStrings("myvalue", parsed.value);
-    try std.testing.expectEqual(@as(u64, 86400), parsed.getTtlSeconds().?);
+    try std.testing.expectEqual(@as(?u64, 86400), try parsed.getTtlMs());
 }
 
 test "Response with prefix_u64 serialization" {

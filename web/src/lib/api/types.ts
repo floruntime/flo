@@ -107,7 +107,8 @@ export interface KVHistoryResponse {
 }
 export interface KVPutBody {
   value: string
-  ttl_seconds?: number | null
+  /** Milliseconds from now; null or 0 for no expiry. */
+  ttl_ms?: number | null
   nx?: boolean
 }
 

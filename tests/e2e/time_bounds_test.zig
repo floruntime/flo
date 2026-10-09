@@ -67,7 +67,7 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
 
     var out: [4096]u8 = undefined;
     var obuf: [32]u8 = undefined;
-    const huge = try option(&obuf, .ttl_seconds, u64, std.math.maxInt(u64));
+    const huge = try option(&obuf, .ttl_ms, u64, std.math.maxInt(u64));
     try expectRefused(try rawCall(ctx, .kv_put, "k", "v2", huge, &out), "ttl too large");
     var ttl: [8]u8 = undefined;
     std.mem.writeInt(u64, &ttl, std.math.maxInt(u64), .little);

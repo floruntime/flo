@@ -90,6 +90,9 @@ const DEFAULT_SCAN_LIMIT: u32 = 100;
 // KVHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// A TTL option of another width is refused rather than read as none.
+const TTL_WIDTH = "ttl_ms must be 8 bytes (a u64 of milliseconds)";
+
 pub const KVHandler = struct {
     // ── Fields ──────────────────────────────────────────────────────────
 
@@ -282,10 +285,14 @@ pub const KVHandler = struct {
 
         // Compute absolute expiry_ns for any TTL the request carries.
         var put_expiry_ns: u64 = 0;
-        if (req.getTtlSeconds()) |ttl_secs| {
-            if (ttl_secs > 0) {
+        const put_ttl = req.getTtlMs() catch {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } });
+            return;
+        };
+        if (put_ttl) |ttl_ms| {
+            if (ttl_ms > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                put_expiry_ns = time_units.expiryNs(now_ns, ttl_secs) orelse {
+                put_expiry_ns = time_units.expiryNs(now_ns, ttl_ms) orelse {
                     sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
                     return;
                 };
@@ -320,6 +327,7 @@ pub const KVHandler = struct {
 
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
         if (err == error.TtlTooLarge) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+        if (err == error.TtlNot8Bytes) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } });
         shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
     }
 
@@ -443,7 +451,7 @@ pub const KVHandler = struct {
     }
 
     /// TOUCH — update TTL of an existing key.
-    /// Wire format: value = 8-byte u64 LE ttl_seconds (0 = clear / PERSIST).
+    /// Wire format: value = 8-byte u64 LE TTL in milliseconds (0 = clear / PERSIST).
     fn dispatchTouch(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         touchOrPersist(shard_ptr, conn_ptr, req, false);
     }
@@ -489,19 +497,19 @@ pub const KVHandler = struct {
             }
         }
 
-        // Compute absolute expiry_ns from ttl_seconds, or 0 to clear.
+        // Compute absolute expiry_ns from ttl_ms, or 0 to clear.
         var expiry_ns: u64 = 0;
         if (!force_persist) {
-            var ttl_seconds: u64 = 0;
+            var ttl_ms: u64 = 0;
             if (req.value.len == 8) {
-                ttl_seconds = std.mem.readInt(u64, req.value[0..8], .little);
+                ttl_ms = std.mem.readInt(u64, req.value[0..8], .little);
             } else if (req.value.len != 0) {
                 sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "touch: value must be empty or 8-byte u64 LE" } });
                 return;
             }
-            if (ttl_seconds > 0) {
+            if (ttl_ms > 0) {
                 const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                expiry_ns = time_units.expiryNs(now_ns, ttl_seconds) orelse {
+                expiry_ns = time_units.expiryNs(now_ns, ttl_ms) orelse {
                     sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
                     return;
                 };
@@ -972,11 +980,11 @@ pub const KVHandler = struct {
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
         if (entry_type == .kv_put) {
-            if (req.getTtlSeconds()) |ttl_secs| {
-                if (ttl_secs > 0) {
+            if (req.getTtlMs() catch return error.TtlNot8Bytes) |ttl_ms| {
+                if (ttl_ms > 0) {
                     flags |= entry_mod.Flags.HAS_TTL;
                     // JSON set/delete reach here without dispatchPut's check.
-                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_secs) orelse return error.TtlTooLarge;
+                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_ms) orelse return error.TtlTooLarge;
                     std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
                     payload_len += 8;
                 }
@@ -1330,9 +1338,10 @@ pub const KVHandler = struct {
 
         const lsn = self.nextLsn();
         const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const expiry_ns: u64 = if (req.getTtlSeconds()) |ttl_secs| blk: {
-            if (ttl_secs == 0) break :blk 0;
-            break :blk time_units.expiryNs(timestamp, ttl_secs) orelse
+        const ttl = req.getTtlMs() catch return .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } };
+        const expiry_ns: u64 = if (ttl) |ttl_ms| blk: {
+            if (ttl_ms == 0) break :blk 0;
+            break :blk time_units.expiryNs(timestamp, ttl_ms) orelse
                 return .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } };
         } else 0;
 
@@ -2235,6 +2244,22 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
     try testing.expectEqualStrings("k", b_keys[0]);
 }
 
+test "kv handler: a TTL option that isn't 8 bytes is refused, not read as no TTL" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    var handler = KVHandler.init(allocator, &kv);
+
+    var obuf: [32]u8 = undefined;
+    var b = proto.OptionsBuilder.init(&obuf);
+    try b.addString(.ttl_ms, "abcd");
+    switch (handler.handleCommand(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings(TTL_WIDTH, e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(kv.get("k") == null);
+}
+
 test "kv handler: a TTL too large to represent is refused" {
     const allocator = testing.allocator;
     var kv = KVProjection.init(allocator, 0);
@@ -2243,7 +2268,7 @@ test "kv handler: a TTL too large to represent is refused" {
 
     var obuf: [32]u8 = undefined;
     var b = proto.OptionsBuilder.init(&obuf);
-    try b.addU64(.ttl_seconds, std.math.maxInt(u64));
+    try b.addU64(.ttl_ms, std.math.maxInt(u64));
     switch (handler.handleCommand(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
         .err => |e| try testing.expectEqualStrings("ttl too large", e.message),
         else => return error.TestUnexpectedResult,

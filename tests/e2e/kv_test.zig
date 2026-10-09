@@ -404,8 +404,8 @@ test "e2e/kv: set with TTL expires after timeout" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set ttl_key ttl_value --ttl 1 (1 second)
-    try ctx.exec(&.{ "kv", "set", "ttl_key", "ttl_value", "--ttl", "1" });
+    // flo kv set ttl_key ttl_value --ttl 1s
+    try ctx.exec(&.{ "kv", "set", "ttl_key", "ttl_value", "--ttl", "1s" });
 
     // Immediately readable
     const before = try ctx.execCapture(&.{ "kv", "get", "ttl_key" });
@@ -418,6 +418,36 @@ test "e2e/kv: set with TTL expires after timeout" {
     var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--output", "table" });
     defer after.deinit();
     try stdx.testing.assertContains(after, "(nil)");
+}
+
+test "e2e/kv: a TTL in milliseconds expires the key; --ttl needs a unit, and touch --ttl 0 clears" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl", "500ms" });
+    var early = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
+    defer early.deinit();
+    try testing.expect(early.stdoutContains("ms_value"));
+    @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
+    var late = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
+    defer late.deinit();
+    try stdx.testing.assertContains(late, "(nil)");
+
+    // "3600" could mean seconds or milliseconds: refused, and nothing set.
+    var bare = try ctx.cli.run(&.{ "kv", "set", "bare_key", "v", "--ttl", "3600" });
+    defer bare.deinit();
+    try testing.expect(bare.contains("not a duration"));
+    var unset = try ctx.cli.run(&.{ "kv", "get", "bare_key", "--output", "table" });
+    defer unset.deinit();
+    try stdx.testing.assertContains(unset, "(nil)");
+
+    // 0 is the one bare number: it clears.
+    try ctx.exec(&.{ "kv", "set", "cleared_key", "kept", "--ttl", "1s" });
+    try ctx.exec(&.{ "kv", "touch", "cleared_key", "--ttl", "0" });
+    @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
+    var kept = try ctx.cli.run(&.{ "kv", "get", "cleared_key", "--output", "table" });
+    defer kept.deinit();
+    try testing.expect(kept.stdoutContains("kept"));
 }
 
 test "e2e/kv: set with TTL 0 means no expiration" {
@@ -440,7 +470,7 @@ test "e2e/kv: overwrite resets TTL" {
     defer ctx.deinit();
 
     // Set with short TTL
-    try ctx.exec(&.{ "kv", "set", "ttl_reset_key", "initial", "--ttl", "1" });
+    try ctx.exec(&.{ "kv", "set", "ttl_reset_key", "initial", "--ttl", "1s" });
 
     // Overwrite with no TTL (should persist)
     try ctx.exec(&.{ "kv", "set", "ttl_reset_key", "updated" });
@@ -457,15 +487,15 @@ test "e2e/kv: TTL with conditional --nx" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set ttl_nx_key value --ttl 2 --nx
-    try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "first", "--ttl", "2", "--nx" });
+    // flo kv set ttl_nx_key value --ttl 2s --nx
+    try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "first", "--ttl", "2s", "--nx" });
 
     // Verify value exists
     const v1 = try ctx.execCapture(&.{ "kv", "get", "ttl_nx_key" });
     try testing.expect(std.mem.indexOf(u8, v1, "first") != null);
 
     // Try to set again with --nx (should fail)
-    var result = try ctx.cli.run(&.{ "kv", "set", "ttl_nx_key", "second", "--ttl", "2", "--nx" });
+    var result = try ctx.cli.run(&.{ "kv", "set", "ttl_nx_key", "second", "--ttl", "2s", "--nx" });
     defer result.deinit();
     try stdx.testing.assertFailed(result);
 
@@ -473,7 +503,7 @@ test "e2e/kv: TTL with conditional --nx" {
     @import("stdx").time.sleep(2500 * std.time.ns_per_ms);
 
     // Now should be able to set with --nx
-    try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "third", "--ttl", "2", "--nx" });
+    try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "third", "--ttl", "2s", "--nx" });
 
     const v3 = try ctx.execCapture(&.{ "kv", "get", "ttl_nx_key" });
     try testing.expect(std.mem.indexOf(u8, v3, "third") != null);
@@ -1681,7 +1711,7 @@ test "e2e/kv: touch sets ttl, persist clears it" {
     try ctx.exec(&.{ "kv", "set", "session", "active" });
 
     // touch with --ttl 3600 (server-side; we don't sleep — just verify ack).
-    var touch_ok = try ctx.cli.run(&.{ "kv", "touch", "session", "--ttl", "3600" });
+    var touch_ok = try ctx.cli.run(&.{ "kv", "touch", "session", "--ttl", "1h" });
     defer touch_ok.deinit();
     try stdx.testing.assertSucceeded(touch_ok);
     try stdx.testing.assertStdoutContains(touch_ok, "OK");
@@ -1701,7 +1731,7 @@ test "e2e/kv: touch on missing key fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    var result = try ctx.cli.run(&.{ "kv", "touch", "nosuch", "--ttl", "60" });
+    var result = try ctx.cli.run(&.{ "kv", "touch", "nosuch", "--ttl", "1m" });
     defer result.deinit();
     try stdx.testing.assertFailed(result);
 }

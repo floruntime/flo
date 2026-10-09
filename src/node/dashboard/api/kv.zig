@@ -268,7 +268,7 @@ pub fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod
 }
 
 /// PUT /kv/namespaces/:ns/keys/:key - Set a key's value
-/// Body: { "value": "<bytes>", "ttl_seconds": <int|null>, "nx": <bool> }
+/// Body: { "value": "<bytes>", "ttl_ms": <int|null>, "nx": <bool> }
 pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     if (body.len == 0) return try h.jsonError(allocator, "Empty request body");
 
@@ -284,11 +284,16 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
         else => {},
     };
     var opts = client_mod.kv.SetOptions{};
-    if (obj_in.get("ttl_seconds")) |t| switch (t) {
+    // A TTL that can't be read is refused: ignored, the key would never
+    // expire.
+    if (obj_in.get("ttl_seconds") != null) return try h.jsonError(allocator, "ttl_seconds is gone; send ttl_ms (milliseconds)");
+    if (obj_in.get("ttl_ms")) |t| switch (t) {
         .integer => |i| {
-            if (i > 0) opts.ttl_seconds = @intCast(i);
+            if (i < 0) return try h.jsonError(allocator, "ttl_ms must not be negative");
+            if (i > 0) opts.ttl_ms = @intCast(i);
         },
-        else => {},
+        .null => {},
+        else => return try h.jsonError(allocator, "ttl_ms must be a whole number of milliseconds"),
     };
     if (obj_in.get("nx")) |n| switch (n) {
         .bool => |b| opts.if_not_exists = b,
