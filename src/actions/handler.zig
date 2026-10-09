@@ -1821,8 +1821,10 @@ fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task
     shard.deliverDeferredResponse(reply_to, request_id, .ok, body);
 }
 
-/// Largest invoke entry value; every run, and so every task, is built from one.
-const MAX_INVOKE_VALUE = 64 * 1024;
+/// Largest invoke entry value; every run, and so every task, is built from
+/// one. An invoke is a log entry, so it can be no larger than an entry's
+/// payload, whichever path proposed it.
+const MAX_INVOKE_VALUE = persistence.MAX_PERSIST_PAYLOAD;
 
 const TASK_NOT_SENT = "internal error: the task could not be sent; it is pending again";
 
