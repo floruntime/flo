@@ -401,7 +401,7 @@ pub const ActionsHandler = struct {
             const target = resolveActionShard(shard, namespace, name);
             if (target.actions_handler.claimPendingRun(namespace, name, worker_labels, worker_id)) |task| {
                 shard.worker_handler.recordTaskAssigned(namespace, worker_id);
-                sendTaskAssignment(shard, conn.replyTo(), req.header.request_id, task);
+                answerTaskAssignment(shard, conn, req.header.request_id, task);
                 return true;
             }
         }
@@ -445,6 +445,8 @@ pub const ActionsHandler = struct {
 
     /// Claimed task info returned by claimPendingRun.
     const ClaimedTask = struct {
+        /// The handler holding the run, which `releaseClaim` puts back.
+        owner: *ActionsHandler,
         run_id: []const u8,
         action_name: []const u8,
         input: ?[]const u8,
@@ -484,9 +486,28 @@ pub const ActionsHandler = struct {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned, .attempt = run.attempt };
+            return .{ .owner = self, .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned, .attempt = run.attempt };
         }
         return null;
+    }
+
+    /// Put a claimed run back to pending, as if never claimed: its task
+    /// couldn't be sent, and a running run with no worker never expires.
+    fn releaseClaim(self: *ActionsHandler, run_id: []const u8) void {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+        var it = self.runs.iterator();
+        while (it.next()) |entry| {
+            const run = entry.value_ptr;
+            if (!std.mem.eql(u8, run.run_id_owned, run_id)) continue;
+            if (run.status != .running) return;
+            run.status = .pending;
+            run.started_at_ms = 0;
+            run.attempt -|= 1;
+            if (run.worker_id_owned) |w| self.allocator.free(w);
+            run.worker_id_owned = null;
+            return;
+        }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -1710,7 +1731,7 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
 
     // Try to claim a pending run for the primary action name — hash-routed O(1)
     if (claimFromTargetShard(shard, namespace, action_name, worker_labels, worker_id)) |task| {
-        sendTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
+        deliverTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
         return true;
     }
 
@@ -1721,7 +1742,7 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
             // Skip the primary name we already tried
             if (std.mem.eql(u8, process.name_owned, action_name)) continue;
             if (claimFromTargetShard(shard, namespace, process.name_owned, worker_labels, worker_id)) |task| {
-                sendTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
+                deliverTaskAssignment(shard, waiter.reply_to, waiter.request_id, task);
                 return true;
             }
         }
@@ -1737,38 +1758,31 @@ fn claimFromTargetShard(shard: *Shard, namespace: []const u8, action_name: []con
     return target.actions_handler.claimPendingRun(namespace, action_name, worker_labels, worker_id);
 }
 
-/// Send a task assignment response in the full wire format:
-///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
-fn sendTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+/// A task assignment's body:
+///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32]
+///   [has_caller:u8]([caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf])?[payload]
+/// Sized exactly and allocated, so an assignment is sent whole or not at all.
+fn encodeTaskAssignment(allocator: std.mem.Allocator, task: ActionsHandler.ClaimedTask) ![]u8 {
     const payload = task.input orelse "";
     const caller_run_id = task.caller_run_id orelse "";
     const caller_wf_name = task.caller_workflow_name orelse "";
     const has_caller: u8 = if (task.caller_run_id != null) 1 else 0;
     const caller_extra: usize = if (has_caller == 1) (2 + caller_run_id.len + 2 + caller_wf_name.len) else 0;
-    var buf: [8192]u8 = undefined;
-    const total = 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len;
-    if (total > buf.len) {
-        shard.deliverDeferredResponse(reply_to, request_id, .ok, task.run_id);
-        return;
-    }
+    const buf = try allocator.alloc(u8, 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len);
     var pos: usize = 0;
-    // task_id
     std.mem.writeInt(u16, buf[pos..][0..2], @intCast(task.run_id.len), .little);
     pos += 2;
     @memcpy(buf[pos .. pos + task.run_id.len], task.run_id);
     pos += task.run_id.len;
-    // task_type (action name)
     std.mem.writeInt(u16, buf[pos..][0..2], @intCast(task.action_name.len), .little);
     pos += 2;
     @memcpy(buf[pos .. pos + task.action_name.len], task.action_name);
     pos += task.action_name.len;
-    // created_at
     std.mem.writeInt(i64, buf[pos..][0..8], task.created_at_ms, .little);
     pos += 8;
     // attempt (tracked across retries)
     std.mem.writeInt(u32, buf[pos..][0..4], task.attempt, .little);
     pos += 4;
-    // has_caller flag + optional caller block
     buf[pos] = has_caller;
     pos += 1;
     if (has_caller == 1) {
@@ -1781,11 +1795,48 @@ fn sendTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: A
         @memcpy(buf[pos .. pos + caller_wf_name.len], caller_wf_name);
         pos += caller_wf_name.len;
     }
-    // payload
-    if (payload.len > 0) {
-        @memcpy(buf[pos .. pos + payload.len], payload);
+    @memcpy(buf[pos..], payload);
+    return buf;
+}
+
+/// Answer the await being dispatched with its task. It goes through the
+/// connection like any answer: delivering it as deferred as well would let
+/// the dispatcher, seeing no answer, send a second one under the same id.
+fn answerTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+    const body = encodeForAnswer(shard, task) orelse {
+        shard.sendErrorResponse(conn, request_id, .internal_error, TASK_NOT_SENT);
+        return;
+    };
+    defer shard.allocator.free(body);
+    shard.sendOkResponse(conn, request_id, body);
+}
+
+/// Deliver a task to a parked await, whose request was answered as deferred.
+fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: ActionsHandler.ClaimedTask) void {
+    const body = encodeForAnswer(shard, task) orelse {
+        shard.deliverDeferredResponse(reply_to, request_id, .internal_error, TASK_NOT_SENT);
+        return;
+    };
+    defer shard.allocator.free(body);
+    shard.deliverDeferredResponse(reply_to, request_id, .ok, body);
+}
+
+const TASK_NOT_SENT = "internal error: the task could not be sent; it is pending again";
+
+/// The task's answer body, or null with the claim released when it can't
+/// be built or wouldn't fit one answer.
+fn encodeForAnswer(shard: *Shard, task: ActionsHandler.ClaimedTask) ?[]u8 {
+    const body = encodeTaskAssignment(shard.allocator, task) catch {
+        task.owner.releaseClaim(task.run_id);
+        return null;
+    };
+    if (body.len > shard_mod.MAX_REQUEST_SIZE) {
+        log.err("actions: run {s}'s task is {d} bytes, over one answer; left pending", .{ task.run_id, body.len });
+        shard.allocator.free(body);
+        task.owner.releaseClaim(task.run_id);
+        return null;
     }
-    shard.deliverDeferredResponse(reply_to, request_id, .ok, buf[0..total]);
+    return body;
 }
 
 /// Extract the first task type (action name) from the action_await value.
@@ -2364,4 +2415,35 @@ test "actions: an action name holding a NUL has no registry key" {
     var buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
     try std.testing.expectEqualStrings("x", ActionsHandler.defKey(&buf, "default", "x").?);
     try std.testing.expect(ActionsHandler.defKey(&buf, "", "b\x00x") == null);
+}
+
+test "encodeTaskAssignment: a large input is encoded whole, caller block included" {
+    // Past the old 8 KiB buffer, which sent the run id alone as the body.
+    const input = try std.testing.allocator.alloc(u8, 65_536);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*b, i| b.* = @truncate(i);
+    const body = try encodeTaskAssignment(std.testing.allocator, .{
+        .owner = undefined,
+        .run_id = "run-1",
+        .action_name = "act",
+        .input = input,
+        .created_at_ms = 7,
+        .caller_run_id = "wf-run",
+        .caller_workflow_name = "wf",
+        .attempt = 2,
+    });
+    defer std.testing.allocator.free(body);
+
+    var pos: usize = 0;
+    try std.testing.expectEqualStrings("run-1", body[2..][0..std.mem.readInt(u16, body[0..2], .little)]);
+    pos = 2 + 5;
+    try std.testing.expectEqualStrings("act", body[pos + 2 ..][0..std.mem.readInt(u16, body[pos..][0..2], .little)]);
+    pos += 2 + 3;
+    try std.testing.expectEqual(@as(i64, 7), std.mem.readInt(i64, body[pos..][0..8], .little));
+    pos += 8;
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, body[pos..][0..4], .little));
+    pos += 4;
+    try std.testing.expectEqual(@as(u8, 1), body[pos]);
+    pos += 1 + 2 + "wf-run".len + 2 + "wf".len;
+    try std.testing.expectEqualSlices(u8, input, body[pos..]);
 }
