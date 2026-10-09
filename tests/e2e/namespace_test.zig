@@ -207,6 +207,16 @@ test "e2e/namespace: create survives server restart" {
     try testing.expect(std.mem.indexOf(u8, val, "myval") != null);
 }
 
+test "e2e/namespace: the CLI has no way to set a namespace setting" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "cfg_ns" });
+    var result = try ctx.cli.run(&.{ "ns", "config", "cfg_ns", "--set", "stream_retention_s=86400" });
+    defer result.deinit();
+    try stdx.testing.assertStderrContains(result, "unknown flag --set");
+}
+
 test "e2e/namespace: delete is refused, with or without --force, and the namespace and its data stay" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

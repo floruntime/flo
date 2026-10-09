@@ -7630,6 +7630,36 @@ test "Shard: park answers from its own entry when a later one has already commit
     try std.testing.expect(!Seen.id.?.eql(shard.stream_handler.stream.streamLastId(hash)));
 }
 
+test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    const last = shard.raft_node.log.lastIndex();
+    // A well-formed block that the old settings format would have applied.
+    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }, 0..) |op, i| {
+        try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, one[0].data);
+    }
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+}
+
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);

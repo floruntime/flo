@@ -100,6 +100,7 @@ pub const EntryType = enum(u8) {
     // ── Namespace ──
     namespace_create = 0x60,
     namespace_delete = 0x61,
+    /// Not written: namespace settings aren't supported, and replay logs and skips one.
     namespace_config = 0x62,
 
     // ── Actions ──

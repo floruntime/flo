@@ -196,7 +196,6 @@ test {
 
 // Cluster
 test {
-    _ = @import("namespace/config.zig");
 }
 
 // Auth

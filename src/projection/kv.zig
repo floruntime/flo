@@ -72,8 +72,7 @@ pub const ScanEntry = struct {
 // KV Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Default version chain length when no namespace setting is configured.
-/// Acts as a sensible default; the memory controller is the true backstop.
+/// Version chain length per key; nothing overrides it yet.
 pub const DEFAULT_VERSION_CHAIN_LEN: usize = 64;
 
 /// A historical version entry — stores previous value and metadata.
@@ -98,8 +97,7 @@ pub const KVProjection = struct {
     memory_used: usize,
     /// Last applied UAL index.
     applied_index: u64,
-    /// Max versions per key in the hot chain. Configurable via namespace settings.
-    /// 0 = unlimited (memory controller is the backstop).
+    /// Max versions per key in the hot chain. 0 = unlimited.
     max_version_chain_len: usize,
 
     /// Stats.
@@ -436,7 +434,7 @@ pub const KVProjection = struct {
         }
         var chain = gop.value_ptr;
 
-        // Evict oldest if at capacity (0 = unlimited, memory controller is backstop)
+        // Evict oldest if at capacity (0 = unlimited)
         if (self.max_version_chain_len > 0 and chain.items.len >= self.max_version_chain_len) {
             const oldest = chain.orderedRemove(0);
             if (oldest.value.len > 0) {
