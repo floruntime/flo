@@ -277,6 +277,16 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
     defer parsed.deinit();
     if (parsed.value != .object) return try h.jsonError(allocator, "Body must be a JSON object");
     const obj_in = parsed.value.object;
+    // A misnamed field would be ignored, and its option silently dropped.
+    for (obj_in.keys()) |name| {
+        for ([_][]const u8{ "value", "ttl_ms", "nx" }) |known| {
+            if (std.mem.eql(u8, name, known)) break;
+        } else {
+            const msg = try std.fmt.allocPrint(allocator, "unknown field \"{s}\"", .{name});
+            defer allocator.free(msg);
+            return try h.jsonError(allocator, msg);
+        }
+    }
 
     var value: []const u8 = "";
     if (obj_in.get("value")) |v| switch (v) {
@@ -286,7 +296,6 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
     var opts = client_mod.kv.SetOptions{};
     // A TTL that can't be read is refused: ignored, the key would never
     // expire.
-    if (obj_in.get("ttl_seconds") != null) return try h.jsonError(allocator, "ttl_seconds is gone; send ttl_ms (milliseconds)");
     if (obj_in.get("ttl_ms")) |t| switch (t) {
         .integer => |i| {
             if (i < 0) return try h.jsonError(allocator, "ttl_ms must not be negative");

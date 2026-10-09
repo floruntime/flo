@@ -120,7 +120,7 @@ test "e2e/time: the dashboard's KV put takes ttl_ms in milliseconds and refuses 
     const path = "/api/v1/kv/namespaces/default/keys/k";
 
     for ([_][2][]const u8{
-        .{ "{\"value\":\"v\",\"ttl_seconds\":60}", "ttl_seconds is gone; send ttl_ms (milliseconds)" },
+        .{ "{\"value\":\"v\",\"ttl_seconds\":60}", "unknown field \\\"ttl_seconds\\\"" },
         .{ "{\"value\":\"v\",\"ttl_ms\":1.5}", "ttl_ms must be a whole number of milliseconds" },
         .{ "{\"value\":\"v\",\"ttl_ms\":\"60s\"}", "ttl_ms must be a whole number of milliseconds" },
         .{ "{\"value\":\"v\",\"ttl_ms\":-1}", "ttl_ms must not be negative" },
