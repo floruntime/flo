@@ -987,6 +987,14 @@ pub const RaftNode = struct {
         if (!self.persistHardState()) return error.HardStateNotDurable;
     }
 
+    /// This node kept its log but lost its hard state: the log is real, so
+    /// there is nothing to catch up, but the vote it cast in the current
+    /// term is gone. It confirms the term before it votes again.
+    pub fn enterLostVote(self: *RaftNode) !void {
+        self.startTermPoll();
+        if (!self.persistHardState()) return error.HardStateNotDurable;
+    }
+
     /// Caught up: poll the members of the latest config this log holds.
     fn startTermPoll(self: *RaftNode) void {
         var ids: [MAX_PEERS + 1]NodeId = undefined;
@@ -995,7 +1003,25 @@ pub const RaftNode = struct {
         self.lost_log = .confirming;
         self.poll = .{ .config_index = self.membership_index, .config_term = self.membership_term };
         self.setPollMembers(members);
-        log.info("Raft: lost-log node {d} caught up at index {d} (term {d}); confirming the term with members {any}", .{ self.id, self.log.lastIndex(), self.current_term, members });
+        log.info("Raft: lost-log node {d} at index {d} (term {d}); confirming the term with members {any}", .{ self.id, self.log.lastIndex(), self.current_term, members });
+        // A group of one has no other vote to have counted.
+        if (std.mem.indexOfNone(NodeId, members, &.{self.id}) == null) _ = self.confirmTerm();
+    }
+
+    /// The term is confirmed. A vote recorded for itself in this term means
+    /// it grants none in it, here or after a restart. False when that
+    /// cannot be made durable; the poll goes on.
+    fn confirmTerm(self: *RaftNode) bool {
+        self.lost_log = .none;
+        self.voted_for = self.id;
+        if (!self.persistHardState()) {
+            self.lost_log = .confirming;
+            self.voted_for = NO_VOTE;
+            return false;
+        }
+        self.rearmElectionTimer();
+        log.info("Raft: lost-log node {d} confirmed term {d} with {d} of {d} members; it votes from term {d} on", .{ self.id, self.current_term, self.poll.answers, self.poll.member_count, self.current_term + 1 });
+        return true;
     }
 
     fn setPollMembers(self: *RaftNode, members: []const NodeId) void {
@@ -1069,20 +1095,10 @@ pub const RaftNode = struct {
         self.poll.answered[i] = true;
         self.poll.answers += 1;
         if (self.poll.answers < self.poll.member_count / 2 + 1) return;
-
-        // Confirmed. A vote recorded for itself in this term means it
-        // grants none in it, here or after a restart.
-        self.lost_log = .none;
-        self.voted_for = self.id;
-        if (!self.persistHardState()) {
-            self.lost_log = .confirming;
-            self.voted_for = NO_VOTE;
+        if (!self.confirmTerm()) {
             self.poll.answered[i] = false;
             self.poll.answers -= 1;
-            return;
         }
-        self.rearmElectionTimer();
-        log.info("Raft: lost-log node {d} confirmed term {d} with {d} of {d} members; it votes from term {d} on", .{ self.id, self.current_term, self.poll.answers, self.poll.member_count, self.current_term + 1 });
     }
 
     // ── Internal ────────────────────────────────────────────────────────
@@ -2841,4 +2857,50 @@ test "raft node: a newer term in a poll answer sends a lost-log node back to cat
     try testing.expectEqual(@as(u64, 6), node.current_term);
     try testing.expect(rec.lost_log);
     try testing.expect(!node.handleVoteRequest(.{ .term = 7, .candidate_id = 3, .last_log_index = 9, .last_log_term = 6 }).vote_granted);
+}
+
+test "raft node: a node that kept its log but lost its hard state confirms the term before it votes again" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    // The log a leader of term 3 gave it, kept on disk.
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
+    };
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2, .leader_last_index = 2 });
+    // Restarted without HARDSTATE: term 0, no vote on record.
+    node.current_term = 0;
+    node.voted_for = NO_VOTE;
+    node.leader_id = NO_VOTE;
+    try node.enterLostVote();
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    try testing.expect(rec.lost_log);
+    node.current_time_ms = 10_000_000;
+    try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
+
+    // The members are at term 3: it follows that term's leader first.
+    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    try testing.expectEqual(LostLog.catching_up, node.lost_log);
+    _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 2, .prev_log_term = 3, .entries = &.{}, .leader_commit = 2, .leader_last_index = 2 });
+    try testing.expectEqual(LostLog.confirming, node.lost_log);
+    node.handleTermPollResponse(pollAnswer(1, 3, 2, 3, &.{ 1, 2, 3 }));
+    node.handleTermPollResponse(pollAnswer(3, 3, 2, 3, &.{ 1, 2, 3 }));
+    try testing.expectEqual(LostLog.none, node.lost_log);
+    node.current_time_ms = 20_000_000;
+    try testing.expect(!node.handleVoteRequest(.{ .term = 3, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
+    try testing.expect(node.handleVoteRequest(.{ .term = 4, .candidate_id = 3, .last_log_index = 2, .last_log_term = 3 }).vote_granted);
+}
+
+test "raft node: a group of one has no other vote to wait for" {
+    var rec = SinkRecorder{};
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.hard_state_sink = rec.sink();
+    node.setMembership(&.{2}, 1);
+    try node.enterLostVote();
+    try testing.expectEqual(LostLog.none, node.lost_log);
+    try testing.expect(!rec.lost_log);
 }

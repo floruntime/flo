@@ -196,6 +196,11 @@ const SimNode = struct {
     max_term_seen: u64,
     /// Its disk was wiped while down: it restarts as a lost-log node.
     wiped: bool = false,
+    /// Only its hard state was lost: it restarts with its log, and must
+    /// confirm the term before it votes.
+    lost_hard_state: bool = false,
+    /// A lost-log node the convergence phase waits on to finish its guard.
+    guard_watched: bool = false,
     // Pump state, parallel to raft.peer_ids.
     sent_at: [MAX_PEERS]u64,
     last_heartbeat: [MAX_PEERS]u64,
@@ -376,8 +381,10 @@ pub const Summary = struct {
     elections_won: u64,
     crashes: u64,
     restarts: u64,
-    /// Crashes that also lost the disk.
+    /// Crashes that also lost the disk, or its hard state.
     wipes: u64,
+    /// Guarded nodes the convergence phase waited on to finish.
+    guards_watched: u64,
     messages_delivered: u64,
     messages_dropped: u64,
     apply_stalls: u64,
@@ -561,10 +568,24 @@ pub const Simulator = struct {
 
     /// A node is wiped and down, or back but still guarded. One at a time:
     /// losing a majority's disks loses committed data whatever Raft does.
+    /// Only the hard state is gone: the term and vote, not the log.
+    fn wipeHardState(self: *Simulator, node: *SimNode) void {
+        self.crashNode(node);
+        node.disk.term = 0;
+        node.disk.voted_for = 0;
+        node.disk.lost_log = false;
+        node.lost_hard_state = true;
+        node.max_term_seen = 0;
+        self.wipes += 1;
+    }
+
+    fn isLost(node: *const SimNode) bool {
+        return node.wiped or node.lost_hard_state or node.disk.lost_log or (node.up and node.raft.lost_log != .none);
+    }
+
     fn anyLostLog(self: *const Simulator) bool {
         for (self.nodes) |*node| {
-            if (node.wiped or node.disk.lost_log) return true;
-            if (node.up and node.raft.lost_log != .none) return true;
+            if (isLost(node)) return true;
         }
         return false;
     }
@@ -607,6 +628,10 @@ pub const Simulator = struct {
             node.wiped = false;
             if (!self.options.no_lost_log_guard) node.raft.enterLostLog() catch unreachable;
         }
+        if (node.lost_hard_state) {
+            node.lost_hard_state = false;
+            if (!self.options.no_lost_log_guard) node.raft.enterLostVote() catch unreachable;
+        }
         node.up = true;
         node.sent_at = @splat(0);
         node.last_heartbeat = @splat(0);
@@ -629,7 +654,7 @@ pub const Simulator = struct {
             if (node.up) {
                 if (r.uintLessThan(u16, 1000) < self.scenario.crash_permille) {
                     if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and !self.anyLostLog()) {
-                        self.wipeNode(node);
+                        if (r.boolean()) self.wipeNode(node) else self.wipeHardState(node);
                     } else {
                         self.crashNode(node);
                     }
@@ -950,14 +975,13 @@ pub const Simulator = struct {
         // caught it up, so a bare majority holding one would wait forever.
         var whole: u8 = 0;
         for (self.nodes) |*node| {
-            if (!(node.wiped or node.disk.lost_log or (node.up and node.raft.lost_log != .none))) whole += 1;
+            if (!isLost(node)) whole += 1;
         }
         var chosen: u8 = 0;
         while (chosen < quorum) {
             const pick = r.uintLessThan(u8, n);
             const p = &self.nodes[pick];
-            const lost = p.wiped or p.disk.lost_log or (p.up and p.raft.lost_log != .none);
-            if (lost and whole >= quorum) continue;
+            if (isLost(p) and whole >= quorum) continue;
             if (!self.core[pick]) {
                 self.core[pick] = true;
                 chosen += 1;
@@ -968,6 +992,12 @@ pub const Simulator = struct {
         self.net.core = self.core;
         for (self.nodes, 0..) |*node, i| {
             if (self.core[i]) {
+                if (!node.up) try self.restartNode(node);
+            } else if (isLost(node)) {
+                // Not isolated: once the core has a leader, a guarded node
+                // must finish its guard, or the guard never completes and
+                // every seed would still pass.
+                node.guard_watched = true;
                 if (!node.up) try self.restartNode(node);
             } else {
                 // Permanent isolation, not frozen fault rates: a live
@@ -989,6 +1019,9 @@ pub const Simulator = struct {
     fn converged(self: *Simulator) bool {
         // Every acked op applied by every core node.
         const target = self.max_acked_index;
+        for (self.nodes) |*node| {
+            if (node.guard_watched and (!node.up or node.raft.lost_log != .none)) return false;
+        }
         for (self.nodes, 0..) |*node, i| {
             if (!self.core[i]) continue;
             if (!node.up) return false;
@@ -1135,6 +1168,11 @@ pub const Simulator = struct {
             .crashes = self.crashes,
             .restarts = self.restarts,
             .wipes = self.wipes,
+            .guards_watched = blk: {
+                var n: u64 = 0;
+                for (self.nodes) |*node| n += @intFromBool(node.guard_watched);
+                break :blk n;
+            },
             .messages_delivered = self.net.delivered,
             .messages_dropped = self.net.dropped,
             .apply_stalls = self.apply_stalls,
@@ -1370,8 +1408,9 @@ test "vopr sim: with two of three wiped no leader is elected, and force-members 
 
 test "vopr sim: swarms with wiped disks keep every invariant" {
     var wipes: u64 = 0;
+    var watched: u64 = 0;
     var seed: u64 = 1;
-    while (seed <= 12) : (seed += 1) {
+    while (seed <= 24) : (seed += 1) {
         var scenario = Scenario.fromSeed(seed);
         scenario.wipe_permille = 500;
         scenario.crash_permille = @max(scenario.crash_permille, 2);
@@ -1387,6 +1426,10 @@ test "vopr sim: swarms with wiped disks keep every invariant" {
         }
         try testing.expect(s.ok);
         wipes += s.wipes;
+        watched += s.guards_watched;
     }
-    try testing.expect(wipes >= 6);
+    try testing.expect(wipes >= 12);
+    // Some runs end with a node still guarded, and convergence waited for
+    // it to finish.
+    try testing.expect(watched >= 1);
 }
