@@ -29,6 +29,7 @@
 //! and adds it to the pool.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const log = @import("stdx").log;
 const reactor_mod = @import("reactor.zig");
@@ -110,7 +111,7 @@ const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
-const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
+pub const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
 /// A read buffer grows to hold one whole request (and the start of the next).
 const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 
@@ -138,6 +139,12 @@ pub const Shard = struct {
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
     replies_dropped: u64 = 0,
+    /// The request being dispatched, which its handler answers through its
+    /// connection; see `deliverDeferred`.
+    dispatching: ?Dispatching = null,
+    /// Requests answered as deferred without being parked; see
+    /// `answeredAsDeferred`.
+    answered_as_deferred: u64 = 0,
     /// Client requests refused before reaching another shard, and when that
     /// was last said; when unanswered slots are next swept.
     forwards_refused: u64 = 0,
@@ -1343,6 +1350,31 @@ pub const Shard = struct {
         return self.forwardWait(conn, to);
     }
 
+    pub const Dispatching = struct { reply_to: ReplyTo, request_id: u64, answered_deferred: bool = false };
+
+    /// Run `req` on `conn` (`local`: skip `dispatchRequest`'s checks), noting
+    /// it as the request being dispatched while it runs. Returns whether it
+    /// was answered through `deliverDeferred` meanwhile; see
+    /// `answeredAsDeferred`.
+    fn dispatchNoted(self: *Shard, conn: *Connection, req: proto.Request, comptime local: bool) bool {
+        const prev = self.dispatching;
+        self.dispatching = .{ .reply_to = conn.replyTo(), .request_id = req.header.request_id };
+        defer self.dispatching = prev;
+        if (local) self.dispatchLocal(conn, req) else self.dispatchRequest(conn, req);
+        return self.dispatching.?.answered_deferred;
+    }
+
+    /// A request that left nothing on its connection and wasn't parked, yet
+    /// was answered through `deliverDeferred` while it ran: its handler
+    /// answered it as deferred without saying so. It has its answer, so the
+    /// no-answer fallback is skipped rather than sending a second under the
+    /// same id, which would put the client's reads a frame behind.
+    fn answeredAsDeferred(self: *Shard, req: proto.Request) void {
+        self.answered_as_deferred += 1;
+        log.err("shard {d}: request {d} (op 0x{x}) was answered as deferred without being parked. This is a bug", .{ self.id, req.header.request_id, req.header.op_code });
+        if (builtin.mode == .Debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
+    }
+
     /// Run a request on this shard — unless it writes and this shard's
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
@@ -1746,7 +1778,7 @@ pub const Shard = struct {
         proxy.protocol = .binary;
 
         proxy.recordRequest();
-        self.dispatchLocal(proxy, req);
+        const answered_deferred = self.dispatchNoted(proxy, req, true);
         // As after a client's own request: what it proposed on its own
         // account applies before the next.
         _ = self.applyCommitted();
@@ -1759,6 +1791,8 @@ pub const Shard = struct {
         if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
             self.deliverDeferred(reply_to, answer.bytes());
+        } else if (!proxy.response_deferred and answered_deferred) {
+            self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
             // Handler produced nothing — report not_implemented like the
             // owner-side processRequests would.
@@ -2148,11 +2182,13 @@ pub const Shard = struct {
         };
         const proxy = self.respond_proxy;
         loadProxy(proxy, reply_to);
-        self.dispatchLocal(proxy, req);
+        const answered_deferred = self.dispatchNoted(proxy, req, true);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
             self.deliverDeferred(reply_to, answer.bytes());
+        } else if (!proxy.response_deferred and answered_deferred) {
+            self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
             self.deliverDeferredResponse(reply_to, request_id, .internal_error, "no response");
         }
@@ -2211,11 +2247,13 @@ pub const Shard = struct {
         loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
         proxy.protocol = .binary;
         proxy.recordRequest();
-        self.dispatchLocal(proxy, req);
+        const answered_deferred = self.dispatchNoted(proxy, req, true);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
             self.sendForwardReply(frame.source_node, id, answer.bytes());
+        } else if (!proxy.response_deferred and answered_deferred) {
+            self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
             const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, "not implemented", &err_buf) catch return;
             self.sendForwardReply(frame.source_node, id, serialized);
@@ -3377,7 +3415,8 @@ pub const Shard = struct {
             // Dispatch request, detecting if the handler sent a response
             const pending_before = conn.write_buf.readable();
             const forwards_before = conn.forwards_in_flight;
-            if (held) |w| self.refuseWaited(conn, req, w, waited) else self.dispatchRequest(conn, req);
+            var answered_deferred = false;
+            if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, false);
             // Parked here as a blocking read: one more toward its cap.
             if (held == null and conn.response_deferred and conn.forwards_in_flight == forwards_before and blockingWait(req) != null) conn.local_reads +|= 1;
             // Its wait is spent (counted into its deadline if it went to
@@ -3387,14 +3426,15 @@ pub const Shard = struct {
             conn.has_turn = false;
 
             // If handler didn't queue any response, check if it was deferred
-            if (conn.write_buf.readable() == pending_before) {
-                if (conn.response_deferred) {
-                    // Handler intentionally deferred the response (e.g. blocking GET)
-                    conn.response_deferred = false;
+            if (conn.write_buf.readable() == pending_before and !conn.response_deferred) {
+                if (answered_deferred) {
+                    self.answeredAsDeferred(req);
                 } else {
                     self.sendErrorResponse(conn, req.header.request_id, .internal_error, "not implemented");
                 }
             }
+            // Each request says for itself whether it parked.
+            conn.response_deferred = false;
 
             // Try to flush writes immediately
             self.flushToClient(fd);
@@ -3821,6 +3861,11 @@ pub const Shard = struct {
     /// before writing, so that fd reuse (close + accept at the same fd)
     /// cannot misdirect a stale answer to the wrong client.
     pub fn deliverDeferred(self: *Shard, reply_to: ReplyTo, bytes: []const u8) void {
+        // Noted for `dispatchNoted`, which checks the request was parked.
+        if (self.dispatching) |*d| if (bytes.len >= @sizeOf(proto.ResponseHeader)) {
+            const id = std.mem.readInt(u64, bytes[@offsetOf(proto.ResponseHeader, "request_id")..][0..8], .little);
+            if (id == d.request_id and std.meta.eql(reply_to, d.reply_to)) d.answered_deferred = true;
+        };
         const my_id: u16 = @intCast(self.id);
         const to = switch (reply_to) {
             .remote => |r| return self.sendForwardReply(r.node, r.forward_id, bytes),
@@ -8475,4 +8520,133 @@ test "shard: a forwarded request parsed without its options trailer re-serialize
     try std.testing.expectEqualStrings("k0", again.key);
     try std.testing.expectEqual(@as(u64, 5), again.header.request_id);
     try std.testing.expectEqual(@as(usize, 0), again.options.len);
+}
+
+test "Shard: an await that claims a pending run at once gets exactly one answer, carrying the run" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    // Register the action, then invoke it: one pending run.
+    // invoke value: [priority:u8][delay_ms:i64][has_caller:u8][has_idem:u8][has_labels:u8][input]
+    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job-input";
+    for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
+        .{ .op = .action_register, .id = 1, .value = "" },
+        .{ .op = .action_invoke, .id = 2, .value = invoke_value },
+    }) |r| {
+        const frame = try testRequest(r.op, r.id, "act", r.value);
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+        _ = shard.applyCommitted();
+        const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+        const resp = try proto.Response.parse(out[0..n]);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
+
+    // The await claims it while dispatched: one ok frame with the task, and
+    // nothing after it (it used to be followed by "not implemented").
+    // await value: [count:u32][type_len:u16][type]
+    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 3, 0 } ++ "act";
+    const frame = try testRequest(.action_await, 3, "worker-1", await_value);
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job-input"));
+    // [task_id_len:u16][task_id][task_type_len:u16]"act"…
+    const id_len = std.mem.readInt(u16, resp.data[0..2], .little);
+    try std.testing.expectEqualStrings("act", resp.data[2 + id_len + 2 ..][0..3]);
+    try std.testing.expectEqual(n, @sizeOf(proto.ResponseHeader) + resp.data.len);
+    shard.flushToClient(c.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
+}
+
+test "Shard: a parked await and an invoke reusing its request id each get one answer" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    const reg = try testRequest(.action_register, 1, "act", "");
+    defer std.testing.allocator.free(reg);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, reg);
+    _ = shard.applyCommitted();
+    _ = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+
+    // The await parks: nothing is pending yet.
+    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 3, 0 } ++ "act";
+    const aw = try testRequest(.action_await, 7, "worker-1", await_value);
+    defer std.testing.allocator.free(aw);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, aw);
+    shard.flushToClient(c.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
+
+    // An invoke under the same id wakes it while being dispatched: the
+    // await's task is a deferred answer to "request 7", which isn't this
+    // request's own.
+    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job";
+    const inv = try testRequest(.action_invoke, 7, "act", invoke_value);
+    defer std.testing.allocator.free(inv);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, inv);
+    _ = shard.applyCommitted();
+    shard.flushToClient(c.conn.fd);
+
+    var rs: [2]proto.Response = undefined;
+    var buf: [4096]u8 = undefined;
+    try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &rs);
+    var tasks: usize = 0;
+    for (rs) |r| {
+        try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.header.status);
+        if (std.mem.endsWith(u8, r.data, "job")) tasks += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), tasks);
+    try std.testing.expectEqual(@as(u64, 0), shard.answered_as_deferred);
+}
+
+test "Shard: a handler answering its own request as deferred is caught, and answered once" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    // The shape the immediate await had: deliver as deferred, park nothing.
+    const SelfDeferred = struct {
+        fn handle(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
+            const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+            sh.deliverDeferredResponse(conn.replyTo(), req.header.request_id, .ok, "only-answer");
+        }
+    };
+    shard.dispatcher.register(.queue_touch, SelfDeferred.handle);
+
+    const frame = try testRequest(.queue_touch, 9, "q", "");
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    var one: [1]proto.Response = undefined;
+    var buf: [1024]u8 = undefined;
+    try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
+    try std.testing.expectEqualStrings("only-answer", one[0].data);
+    try std.testing.expectEqual(@as(u64, 1), shard.answered_as_deferred);
 }

@@ -1182,3 +1182,69 @@ test "e2e/action/blocking: worker await blocks until task arrives" {
         return error.TestFailed;
     }
 }
+
+// =============================================================================
+// Await answered once
+// =============================================================================
+
+const proto = @import("src").protocol.proto;
+
+/// Reads one whole response frame from `fd`, or null if none arrives in
+/// `wait_ms`.
+fn readFrame(fd: std.c.fd_t, buf: []u8, wait_ms: u32) !?proto.Response {
+    var got: usize = 0;
+    var waited: u32 = 0;
+    while (waited < wait_ms) : (waited += 10) {
+        const rc = std.c.recv(fd, buf[got..].ptr, buf.len - got, std.c.MSG.DONTWAIT);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) return error.Closed;
+        // A partial frame waits for the rest.
+        if (proto.Response.parse(buf[0..got])) |r| {
+            // Exactly one frame: anything past it is a second answer.
+            try testing.expectEqual(got, @sizeOf(proto.ResponseHeader) + r.data.len);
+            return r;
+        } else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return null;
+}
+
+test "e2e/action: each await on one connection gets its own task and nothing else" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "once" });
+    try ctx.exec(&.{ "action", "invoke", "once", "first-input" });
+    try ctx.exec(&.{ "action", "invoke", "once", "second-input" });
+
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+
+    // await value: [count:u32][type_len:u16][type]
+    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 4, 0 } ++ "once";
+    var inputs: [2][]const u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    var copies: [2][64]u8 = undefined;
+    for (0..2) |i| {
+        var h: proto.RequestHeader = undefined;
+        @memset(std.mem.asBytes(&h), 0);
+        h.magic = proto.MAGIC;
+        h.version = proto.VERSION;
+        h.op_code = @intFromEnum(proto.OpCode.action_await);
+        h.request_id = 100 + i;
+        const req: proto.Request = .{ .header = h, .namespace = "", .key = "worker-1", .value = await_value, .options = "" };
+        var frame_buf: [256]u8 = undefined;
+        const frame = try req.serialize(&frame_buf);
+        if (std.c.write(fd, frame.ptr, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
+
+        const r = (try readFrame(fd, &buf, 3000)) orelse return error.NoAnswer;
+        try testing.expectEqual(@as(u64, 100 + i), r.header.request_id);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.header.status);
+        // The input closes the assignment body.
+        const input = if (std.mem.endsWith(u8, r.data, "first-input")) "first-input" else if (std.mem.endsWith(u8, r.data, "second-input")) "second-input" else return error.NoTask;
+        @memcpy(copies[i][0..input.len], input);
+        inputs[i] = copies[i][0..input.len];
+    }
+    try testing.expect(!std.mem.eql(u8, inputs[0], inputs[1]));
+    // No stray frame follows either answer.
+    try testing.expectEqual(@as(?proto.Response, null), try readFrame(fd, &buf, 300));
+}
