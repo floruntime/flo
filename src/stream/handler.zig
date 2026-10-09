@@ -604,20 +604,21 @@ pub const StreamHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
 
+        if (req.value.len > 0) {
+            return .{ .err = .{ .code = .invalid_request, .message = "stream trim takes no value; give --before, --maxlen or --maxage" } };
+        }
+        if (req.findOption(.max_bytes) != null) {
+            return .{ .err = .{ .code = .invalid_request, .message = "byte-based trim (max_bytes) is not supported; use --before, --maxlen or --maxage" } };
+        }
+        const dry_run = req.findOption(.dry_run) != null;
+
         // Resolve the trim boundary into a StreamID. Records with id <= the
-        // boundary are removed (trim is inclusive — see `trimStream`). The
-        // boundary may come from any of the options `client.stream.trim` sends
-        // (--before / --maxlen / --maxage); whichever is present wins, checked
-        // most-specific first. `.max_bytes` is not yet supported here.
-        //
-        // Historically this only read `.stream_end` + a bare-integer value, but
-        // the client sends `.stream_start` / `.limit` / `.max_age_seconds` with
-        // an empty value, so every trim returned "trim offset is required". Now
-        // the wire contract and handler agree.
+        // boundary are removed (trim is inclusive — see `trimStream`).
+        // Whichever bound is present wins, checked most-specific first.
         var trim_id = StreamID.MIN;
 
-        // Explicit boundary id: `--before <id>` (.stream_start) or the legacy
-        // `.stream_end`. Remove everything up to and including this id.
+        // `--before <id>` (.stream_start) or `.stream_end`: remove everything
+        // up to and including this id.
         const boundary_opt = req.findOption(.stream_start) orelse req.findOption(.stream_end);
         if (boundary_opt) |opt| {
             if (opt.asStreamId()) |sid| {
@@ -635,8 +636,10 @@ pub const StreamHandler = struct {
             if (req.findOption(.limit)) |opt| {
                 if (opt.asU64()) |keep| {
                     if (keep > 0) {
-                        const total = self.stream.streamRecordCount(name_hash);
-                        if (total <= keep) return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
+                        // Logical records: counting entries would read a
+                        // batched stream as far shorter than it is.
+                        const total = self.stream.streamLogicalCount(name_hash);
+                        if (total <= keep) return trimmed(name_hash, 0, self.stream);
                         trim_id = self.stream.resolveNthRecordId(name_hash, total - keep);
                     }
                 }
@@ -652,29 +655,26 @@ pub const StreamHandler = struct {
                         // Saturates: an age older than the clock trims nothing.
                         const age_ms = age_s *| 1000;
                         const cutoff_ms = if (now_ms > age_ms) now_ms - age_ms else 0;
-                        if (cutoff_ms == 0) return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
+                        if (cutoff_ms == 0) return trimmed(name_hash, 0, self.stream);
                         trim_id = StreamID.fromTimestamp(cutoff_ms);
                     }
                 }
             }
         }
 
-        // Bare-integer value fallback: trim the first N records (back-compat).
-        if (trim_id.eql(StreamID.MIN) and req.value.len > 0) {
-            const count = std.fmt.parseInt(u64, req.value, 10) catch 0;
-            if (count > 0) {
-                trim_id = self.stream.resolveNthRecordId(name_hash, count);
-                if (trim_id.eql(StreamID.MIN)) {
-                    return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = 0 } };
-                }
-            }
+        if (trim_id.eql(StreamID.MIN)) {
+            return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
         }
 
-        if (trim_id.eql(StreamID.MIN)) {
-            if (req.findOption(.max_bytes) != null) {
-                return .{ .err = .{ .code = .invalid_request, .message = "byte-based trim (max_bytes) is not supported yet; use max_len, max_age, or before" } };
-            }
-            return .{ .err = .{ .code = .invalid_request, .message = "trim offset is required" } };
+        // A dry run answers from the projection on the owning shard: what the
+        // trim would remove and the first record it would leave, with no
+        // proposal and no log entry.
+        if (dry_run) {
+            const first_id = self.stream.firstIdAfterTrim(name_hash, trim_id);
+            return .{ .stream_trimmed = .{
+                .deleted_count = self.stream.trimCount(name_hash, trim_id),
+                .first_seq = if (first_id.eql(StreamID.MIN)) 0 else first_id.sequence,
+            } };
         }
 
         if (self.shard_ptr) |sptr| {
@@ -2531,12 +2531,61 @@ test "stream handler: trim" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbd, "d"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbe, "e"), ""));
 
-    // Trim first 3 records (bare value = count-based trim)
-    const result = handler.handleCommand(makeRequest(.stream_trim, "s1", "3", ""));
-    switch (result) {
+    const s1_hash = router.nameHash(router.namespaceHash("default"), "s1");
+
+    // Keep the newest 2: a dry run counts the 3 it would remove and removes none.
+    var dry_buf: [32]u8 = undefined;
+    var dry = OptionsBuilder.init(&dry_buf);
+    try dry.addU64(.limit, 2);
+    try dry.addFlag(.dry_run);
+    const dry_first_seq = switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", dry.getOptions()))) {
+        .stream_trimmed => |t| blk: {
+            try testing.expectEqual(@as(u64, 3), t.deleted_count);
+            break :blk t.first_seq;
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u64, 5), handler.stream.streamLogicalCount(s1_hash));
+
+    // The real trim removes the number the dry run reported.
+    var real_buf: [32]u8 = undefined;
+    var real = OptionsBuilder.init(&real_buf);
+    try real.addU64(.limit, 2);
+    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", real.getOptions()))) {
         .stream_trimmed => |t| {
             try testing.expectEqual(@as(u64, 3), t.deleted_count);
+            try testing.expectEqual(dry_first_seq, t.first_seq);
+            try testing.expectEqual(handler.stream.streamFirstId(s1_hash).sequence, t.first_seq);
         },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(s1_hash));
+}
+
+test "stream handler: trim refuses a value and max_bytes" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "a"), ""));
+
+    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "3", ""))) {
+        .err => |e| try testing.expectEqual(@as(@TypeOf(e.code), .invalid_request), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // max_bytes alongside a bound it would otherwise be ignored next to.
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.limit, 1);
+    try b.addU64(.max_bytes, 10);
+    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", b.getOptions()))) {
+        .err => |e| try testing.expectEqual(@as(@TypeOf(e.code), .invalid_request), e.code),
         else => return error.TestUnexpectedResult,
     }
 }

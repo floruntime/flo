@@ -234,25 +234,25 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /streams/:name/trim - trim a stream by count/age/bytes (loopback write).
-/// Query: ?namespace= &max_len= &max_age_s= &max_bytes= &dry_run=
+/// POST /streams/:name/trim - trim a stream by count or age (loopback write).
+/// Query: ?namespace= &max_len= &max_age_s= &dry_run=
 pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const max_len = h.parseQueryParam(u64, query_string, "max_len");
     const max_age_s = h.parseQueryParam(u64, query_string, "max_age_s");
-    const max_bytes = h.parseQueryParam(u64, query_string, "max_bytes");
     const dry_run = boolParam(query_string, "dry_run");
 
-    if (max_len == null and max_age_s == null and max_bytes == null) {
-        return try h.jsonError(allocator, "trim requires one of max_len, max_age_s, or max_bytes");
+    if (max_len == null and max_age_s == null) {
+        return try h.jsonError(allocator, "trim requires one of max_len or max_age_s");
     }
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.stream.trim(&client, ns_q, stream_name, max_len, null, max_age_s, max_bytes, dry_run) catch
+    var resp = client_mod.stream.trim(&client, ns_q, stream_name, max_len, null, max_age_s, dry_run) catch
         return try h.jsonError(allocator, "Trim failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+    const t = client_mod.stream.parseTrimmed(resp) orelse return try h.jsonError(allocator, "Malformed trim response");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -262,6 +262,7 @@ pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?
     try obj.boolField("ok", true);
     try obj.stringField("stream", stream_name);
     try obj.boolField("dry_run", dry_run);
+    try obj.intField("trimmed", t.removed);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

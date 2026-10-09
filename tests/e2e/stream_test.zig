@@ -467,37 +467,103 @@ test "e2e/stream: trim with --maxlen" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Create stream with several messages
     for (0..10) |i| {
         var buf: [32]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "trim-msg-{d}", .{i}) catch unreachable;
         try ctx.exec(&.{ "stream", "append", "trim-test", msg });
     }
 
-    // JSON output so success is unambiguous: an isError() prints to stderr and
-    // the CLI still exits 0, so asserting on stdout content (not exit code) is
-    // what actually proves the trim worked. (Regression guard for the handler
-    // option-mismatch bug where every trim returned "trim offset is required".)
-    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-test", "--maxlen", "5", "--output", "json" });
+    // The CLI exits 0 on a refusal, so the count in stdout is what proves it.
+    var result = try ctx.cli.run(&.{ "stream", "trim", "trim-test", "--maxlen", "4", "--output", "json" });
     defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expect(result.stdoutContains("\"status\":\"ok\",\"trimmed\":6,"));
 
-    try testing.expect(result.contains("\"status\":\"ok\""));
-    try testing.expect(!result.contains("required"));
+    var read = try ctx.cli.run(&.{ "stream", "read", "trim-test", "--limit", "100", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 4), read.stdoutCount("trim-msg-"));
+    for (6..10) |i| {
+        var buf: [32]u8 = undefined;
+        try testing.expect(read.stdoutContains(std.fmt.bufPrint(&buf, "trim-msg-{d}", .{i}) catch unreachable));
+    }
 }
 
-test "e2e/stream: trim with --dry-run" {
+test "e2e/stream: trim --dry-run counts and removes nothing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    for (0..5) |_| {
-        try ctx.exec(&.{ "stream", "append", "dryrun-test", "message" });
+    for (0..10) |i| {
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "dry-msg-{d}", .{i}) catch unreachable;
+        try ctx.exec(&.{ "stream", "append", "dryrun-test", msg });
     }
 
-    var result = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--maxlen", "2", "--dry-run", "--output", "json" });
-    defer result.deinit();
+    var dry = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--maxlen", "4", "--dry-run", "--output", "json" });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u8, 0), dry.exit_code);
+    try testing.expect(dry.stdoutContains("\"status\":\"dry_run\",\"trimmed\":6,"));
 
-    try testing.expect(result.contains("dry_run"));
-    try testing.expect(!result.contains("required"));
+    // Every record is still there, in order.
+    var read = try ctx.cli.run(&.{ "stream", "read", "dryrun-test", "--limit", "100", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 10), read.stdoutCount("dry-msg-"));
+    var prev: usize = 0;
+    for (0..10) |i| {
+        var buf: [32]u8 = undefined;
+        const at = std.mem.indexOf(u8, read.stdout, std.fmt.bufPrint(&buf, "dry-msg-{d}", .{i}) catch unreachable) orelse return error.RecordMissing;
+        try testing.expect(at >= prev);
+        prev = at;
+    }
+
+    // A dry run by --before also removes nothing.
+    var before = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--before", "99999999999999-0", "--dry-run", "--output", "json" });
+    defer before.deinit();
+    try testing.expect(before.stdoutContains("\"status\":\"dry_run\",\"trimmed\":10,"));
+    // A young stream has nothing older than an hour.
+    var age = try ctx.cli.run(&.{ "stream", "trim", "dryrun-test", "--maxage", "3600", "--dry-run", "--output", "json" });
+    defer age.deinit();
+    try testing.expect(age.stdoutContains("\"status\":\"dry_run\",\"trimmed\":0,"));
+
+    var after = try ctx.cli.run(&.{ "stream", "read", "dryrun-test", "--limit", "100", "-o", "json" });
+    defer after.deinit();
+    try testing.expectEqual(@as(usize, 10), after.stdoutCount("dry-msg-"));
+}
+
+test "e2e/stream: trim --dry-run on batches reports what the trim removes" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Three batches of three. Trim cuts whole batches, so --maxlen 4 removes one
+    // batch and keeps six records rather than four: the dry run must report the
+    // count the real trim removes, not total - maxlen.
+    for (0..3) |b| {
+        var b0: [16]u8 = undefined;
+        var b1: [16]u8 = undefined;
+        var b2: [16]u8 = undefined;
+        try ctx.exec(&.{
+            "stream",                                                       "append", "dryrun-batch",
+            std.fmt.bufPrint(&b0, "bm-{d}-0", .{b}) catch unreachable,
+            std.fmt.bufPrint(&b1, "bm-{d}-1", .{b}) catch unreachable,
+            std.fmt.bufPrint(&b2, "bm-{d}-2", .{b}) catch unreachable,
+        });
+    }
+
+    var dry = try ctx.cli.run(&.{ "stream", "trim", "dryrun-batch", "--maxlen", "4", "--dry-run", "--output", "json" });
+    defer dry.deinit();
+    try testing.expect(dry.stdoutContains("\"status\":\"dry_run\",\"trimmed\":3,"));
+
+    var read = try ctx.cli.run(&.{ "stream", "read", "dryrun-batch", "--limit", "100", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 9), read.stdoutCount("bm-"));
+
+    var real = try ctx.cli.run(&.{ "stream", "trim", "dryrun-batch", "--maxlen", "4", "--output", "json" });
+    defer real.deinit();
+    try testing.expect(real.stdoutContains("\"status\":\"ok\",\"trimmed\":3,"));
+
+    var after = try ctx.cli.run(&.{ "stream", "read", "dryrun-batch", "--limit", "100", "-o", "json" });
+    defer after.deinit();
+    try testing.expectEqual(@as(usize, 6), after.stdoutCount("bm-"));
+    try testing.expect(!after.stdoutContains("bm-0-"));
 }
 
 test "e2e/stream: delete removes a stream" {

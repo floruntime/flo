@@ -197,7 +197,8 @@ pub fn info(
 }
 
 /// Trim stream using retention policies
-/// Supports: max_len (count), min_id (StreamID), max_age_seconds, max_bytes, dry_run
+/// Supports: max_len (count), min_id (StreamID), max_age_seconds, dry_run.
+/// A dry run removes nothing and answers what the trim would remove.
 pub fn trim(
     client: *Client,
     namespace: []const u8,
@@ -205,7 +206,6 @@ pub fn trim(
     max_len: ?u64,
     min_id: ?StreamID,
     max_age_seconds: ?u64,
-    max_bytes: ?u64,
     dry_run: bool,
 ) !Response {
     var options_buf: [64]u8 = undefined;
@@ -223,15 +223,24 @@ pub fn trim(
         try builder.addU64(.max_age_seconds, age);
     }
 
-    if (max_bytes) |bytes| {
-        try builder.addU64(.max_bytes, bytes);
-    }
-
     if (dry_run) {
         try builder.addFlag(.dry_run);
     }
 
     return client.sendRequestWithOptions(.stream_trim, namespace, stream, "", builder.getOptions());
+}
+
+/// A trim answer: the records removed (or, for a dry run, that would be) and
+/// the first sequence left.
+pub const Trimmed = struct { removed: u64, first_seq: u64 };
+
+pub fn parseTrimmed(response: Response) ?Trimmed {
+    const data = response.asRawData() orelse return null;
+    if (data.len != 16) return null;
+    return .{
+        .removed = std.mem.readInt(u64, data[0..8], .little),
+        .first_seq = std.mem.readInt(u64, data[8..16], .little),
+    };
 }
 
 /// Delete a stream entirely (records + metadata + name registry). Consumer
