@@ -186,9 +186,9 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
                 const ts_ms = @as(i64, @intCast(entry.timestamp_ns / std.time.ns_per_ms));
                 try obj.intField("updated_at", ts_ms);
                 if (entry.expiry_ns > 0) {
-                    try obj.intField("ttl_ms", @as(i64, @intCast(entry.expiry_ns / std.time.ns_per_ms)));
+                    try obj.intField("expires_at_ms", @as(i64, @intCast(entry.expiry_ns / std.time.ns_per_ms)));
                 } else {
-                    try obj.nullField("ttl_ms");
+                    try obj.nullField("expires_at_ms");
                 }
                 break;
             }
@@ -268,7 +268,7 @@ pub fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod
 }
 
 /// PUT /kv/namespaces/:ns/keys/:key - Set a key's value
-/// Body: { "value": "<bytes>", "ttl_seconds": <int|null>, "nx": <bool> }
+/// Body: { "value": "<bytes>", "ttl_ms": <int|null>, "nx": <bool> }
 pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     if (body.len == 0) return try h.jsonError(allocator, "Empty request body");
 
@@ -277,6 +277,16 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
     defer parsed.deinit();
     if (parsed.value != .object) return try h.jsonError(allocator, "Body must be a JSON object");
     const obj_in = parsed.value.object;
+    // A misnamed field would be ignored, and its option silently dropped.
+    for (obj_in.keys()) |name| {
+        for ([_][]const u8{ "value", "ttl_ms", "nx" }) |known| {
+            if (std.mem.eql(u8, name, known)) break;
+        } else {
+            const msg = try std.fmt.allocPrint(allocator, "unknown field \"{s}\"", .{name});
+            defer allocator.free(msg);
+            return try h.jsonError(allocator, msg);
+        }
+    }
 
     var value: []const u8 = "";
     if (obj_in.get("value")) |v| switch (v) {
@@ -284,11 +294,15 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
         else => {},
     };
     var opts = client_mod.kv.SetOptions{};
-    if (obj_in.get("ttl_seconds")) |t| switch (t) {
+    // A TTL that can't be read is refused: ignored, the key would never
+    // expire.
+    if (obj_in.get("ttl_ms")) |t| switch (t) {
         .integer => |i| {
-            if (i > 0) opts.ttl_seconds = @intCast(i);
+            if (i < 0) return try h.jsonError(allocator, "ttl_ms must not be negative");
+            if (i > 0) opts.ttl_ms = @intCast(i);
         },
-        else => {},
+        .null => {},
+        else => return try h.jsonError(allocator, "ttl_ms must be a whole number of milliseconds"),
     };
     if (obj_in.get("nx")) |n| switch (n) {
         .bool => |b| opts.if_not_exists = b,

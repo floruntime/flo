@@ -1576,3 +1576,30 @@ test "e2e/ts: a delete and a retention trim stay done across a restart" {
     try testing.expect(aged.contains(" 33.000000"));
     try testing.expect(!aged.contains(" 22.000000"));
 }
+
+test "e2e/ts: a delete with tags removes only the matching series, and stays done across a restart" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ts", "write", "temp", "--tags", "sensor=A1,site=x", "--value", "11" });
+    try ctx.exec(&.{ "ts", "write", "temp", "--tags", "sensor=B2,site=x", "--value", "22" });
+    try ctx.exec(&.{ "ts", "write", "temp", "--value", "33" });
+
+    // Dropping a part that isn't a pair would widen the filter to every series.
+    var bad = try ctx.cli.run(&.{ "ts", "delete", "temp", "--tags", "sensor", "--confirm" });
+    defer bad.deinit();
+    try testing.expect(bad.contains("'sensor' is not key=value"));
+    var none = try ctx.cli.run(&.{ "ts", "delete", "temp", "--tags", "sensor=Z9", "--confirm" });
+    defer none.deinit();
+    try testing.expect(none.contains("nothing deleted"));
+
+    try ctx.exec(&.{ "ts", "delete", "temp", "--tags", "sensor=A1", "--confirm" });
+    for (0..2) |pass| {
+        if (pass == 1) try ctx.restartServer();
+        var r = try ctx.cli.run(&.{ "ts", "read", "temp", "--from", "0", "--output", "raw", "--limit", "100" });
+        defer r.deinit();
+        try testing.expect(!r.contains(" 11.000000"));
+        try testing.expect(r.contains(" 22.000000"));
+        try testing.expect(r.contains(" 33.000000"));
+    }
+}

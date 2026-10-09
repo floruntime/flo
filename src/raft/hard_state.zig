@@ -1,10 +1,11 @@
 //! Raft hard state — what a node must not forget across a crash.
 //!
 //! `HARDSTATE` in each shard directory holds the node's identity, its current
-//! term and the vote it cast in that term. It is rewritten (tmp → fsync →
-//! rename → directory fsync) before the node grants a vote, and whenever it
-//! adopts a term, so a restarted node can neither vote twice in one term nor
-//! re-enter a term it already left.
+//! term, the vote it cast in that term, and whether its lost-log guard is on.
+//! It is rewritten (tmp → fsync → rename → directory fsync) before the node
+//! grants a vote, whenever it adopts a term, and when the guard starts or
+//! ends, so a restarted node can neither vote twice in one term, re-enter a
+//! term it already left, nor drop a guard it has not finished.
 //! Terms change per election, not per write, so the fsync never sits on the
 //! write path.
 //!
@@ -13,7 +14,9 @@
 //! ```
 //! magic:      u32   0x0A10_4853
 //! version:    u8    1
-//! reserved:   [3]u8 zero
+//! flags:      u8    bit 0: lost-log (the node has not yet re-established
+//!                   what it lost; see `raft.node.LostLog`)
+//! reserved:   [2]u8 zero
 //! node_id:    u32
 //! term:       u64
 //! voted_for:  u32
@@ -35,11 +38,13 @@ pub const HardState = struct {
     node_id: u32 = 0,
     term: u64 = 0,
     voted_for: u32 = 0,
+    lost_log: bool = false,
 
     pub fn encode(self: HardState, buf: *[SIZE]u8) void {
         std.mem.writeInt(u32, buf[0..4], MAGIC, .little);
         buf[4] = VERSION;
-        @memset(buf[5..8], 0);
+        buf[5] = @intFromBool(self.lost_log);
+        @memset(buf[6..8], 0);
         std.mem.writeInt(u32, buf[8..12], self.node_id, .little);
         std.mem.writeInt(u64, buf[12..20], self.term, .little);
         std.mem.writeInt(u32, buf[20..24], self.voted_for, .little);
@@ -54,6 +59,7 @@ pub const HardState = struct {
             .node_id = std.mem.readInt(u32, buf[8..12], .little),
             .term = std.mem.readInt(u64, buf[12..20], .little),
             .voted_for = std.mem.readInt(u32, buf[20..24], .little),
+            .lost_log = buf[5] & 1 != 0,
         };
     }
 };

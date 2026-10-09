@@ -2769,6 +2769,43 @@ test "e2e/processing: kv sink writes records to KV" {
     try testing.expect(found); // KV sink must persist the record.
 }
 
+// A sub-second ttl_ms used to reach KV as 0 seconds: no expiry at all.
+test "e2e/processing: a kv sink's sub-second ttl_ms expires the keys it writes" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "ns", "create", "proc_kvttl" });
+    try ctx.exec(&.{ "stream", "append", "kvttl-input", "{\"user_id\":\"u1\",\"name\":\"alice\"}", "-n", "proc_kvttl" });
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvsink-ttl
+        \\namespace: proc_kvttl
+        \\sources.[0].stream.name: kvttl-input
+        \\operators.[0].type: keyby
+        \\operators.[0].name: by-user
+        \\operators.[0].key_expression: $.user_id
+        \\sinks.[0].kv.namespace: proc_kvttl
+        \\sinks.[0].kv.key_prefix: user
+        \\sinks.[0].kv.write_mode: upsert
+        \\sinks.[0].kv.ttl_ms: 900
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvsink-ttl.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_kvttl" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    const written = try kvGetBlocking(ctx, "user:u1", "proc_kvttl", "alice", 6000);
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_kvttl" });
+    try testing.expect(written);
+    @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
+    var gone = try ctx.cli.run(&.{ "kv", "get", "user:u1", "-n", "proc_kvttl", "--output", "table" });
+    defer gone.deinit();
+    try stdx.testing.assertContains(gone, "(nil)");
+}
+
 // Regression: the queue sink used to be a silent no-op.
 // Docs advertise the Queue sink with a full example.
 test "e2e/processing: queue sink enqueues records" {

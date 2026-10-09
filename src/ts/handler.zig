@@ -59,6 +59,11 @@ pub const TSHandler = struct {
     /// Set after init by Shard.wireHandlerShardPtrs(). Required to propose Raft entries.
     shard_ptr: ?*anyopaque,
 
+    /// Holds a refusal that names the request's own input. The next
+    /// request overwrites it, so a refusal from it is sent at once, never
+    /// parked.
+    why_buf: [512]u8 = undefined,
+
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
         return .{
             .ts = ts,
@@ -553,15 +558,30 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "measurement name is required" } };
         }
 
+        // With tags, only the series whose tags include every given pair.
+        const raw = if (req.findOption(.ts_tags)) |opt| opt.asString() else "";
+        var canon_buf: [ts_mod.MAX_TAG_STRING]u8 = undefined;
+        var preds_buf: [ts_mod.MAX_TAGS]ts_mod.TagPredicate = undefined;
+        const filter = switch (ts_mod.parseTagFilter(raw, &canon_buf, &preds_buf)) {
+            .ok => |f| f,
+            .not_pair => |part| return self.refuse(.invalid_request, "tag filter part '{s}' is not key=value", .{part}, "a tag filter part is not key=value"),
+            .too_many => return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("a tag filter takes at most {d} tags", .{ts_mod.MAX_TAGS}) } },
+            .too_long => return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("a tag filter is at most {d} bytes", .{ts_mod.MAX_TAG_STRING}) } },
+        };
+        const ns_hash = router.namespaceHash(req.namespace);
+        if (filter.preds.len > 0 and !self.ts.hasSeries(ns_hash, req.key, filter.preds)) {
+            return self.refuse(.not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ req.key, filter.canonical }, "no series has those tags; nothing deleted");
+        }
+
         // Through the log, so the delete survives a restart and every
         // replica applies it. Without a shard (unit tests), applied here.
         if (self.shard_ptr) |sptr| {
-            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_delete, entry_mod.Flags.NONE, req.namespace, req.key, "") catch |err| {
+            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_delete, entry_mod.Flags.NONE, req.namespace, req.key, filter.canonical) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts delete not persisted") } };
             };
             return .{ .parked = proposed };
         }
-        _ = self.ts.deleteMeasurement(router.namespaceHash(req.namespace), req.key);
+        _ = self.ts.deleteSeries(ns_hash, req.key, filter.preds);
         return .ok;
     }
 
@@ -630,6 +650,12 @@ pub const TSHandler = struct {
     }
 
     // ── Helpers ─────────────────────────────────────────────
+
+    /// A refusal naming the request's input, or `fallback` if that doesn't fit.
+    fn refuse(self: *TSHandler, code: CommandResult.ErrorCode, comptime fmt: []const u8, args: anytype, comptime fallback: []const u8) CommandResult {
+        const msg = std.fmt.bufPrint(&self.why_buf, fmt, args) catch fallback;
+        return .{ .err = .{ .code = code, .message = msg } };
+    }
 
     /// Cast opaque shard pointer to Shard for proposing entries.
     fn shardFromPtr(ptr: *anyopaque) *Shard {

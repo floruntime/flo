@@ -89,8 +89,8 @@ export interface KVKeyValue {
   version?: number
   size?: number
   updated_at?: number
-  /** Expiry timestamp in ms, or null for no expiry. */
-  ttl_ms?: number | null
+  /** Absolute expiry, epoch ms, or null for no expiry. */
+  expires_at_ms?: number | null
 }
 export interface KVHistoryEntry {
   version: number
@@ -107,7 +107,8 @@ export interface KVHistoryResponse {
 }
 export interface KVPutBody {
   value: string
-  ttl_seconds?: number | null
+  /** Milliseconds from now; null or 0 for no expiry. */
+  ttl_ms?: number | null
   nx?: boolean
 }
 

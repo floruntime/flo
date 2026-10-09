@@ -15,6 +15,8 @@
 //!        [--mode=volatile|persisted] hard-state model (persisted is the default)
 //!        [--small-ring]             shrink the ring so eviction outruns
 //!                                   replication and repairs read below it
+//!        [--wipes]                  crashes often lose a disk or its hard
+//!                                   state, up to two nodes at once
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -35,6 +37,7 @@ const Args = struct {
     seed_timeout_s: u64 = 300,
     volatile_mode: bool = false,
     small_ring: bool = false,
+    wipes: bool = false,
     scenario_out: ?[]const u8 = null,
     scenario_in: ?[]const u8 = null,
     verbose: bool = false,
@@ -49,7 +52,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--mode=volatile|persisted] [--small-ring] " ++
+            "[--mode=volatile|persisted] [--small-ring] [--wipes] " ++
             "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -70,6 +73,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.volatile_mode = false;
         } else if (std.mem.eql(u8, arg, "--small-ring")) {
             args.small_ring = true;
+        } else if (std.mem.eql(u8, arg, "--wipes")) {
+            args.wipes = true;
         } else if (std.mem.startsWith(u8, arg, "--scenario-out=")) {
             args.scenario_out = arg["--scenario-out=".len..];
         } else if (std.mem.startsWith(u8, arg, "--scenario-in=")) {
@@ -115,6 +120,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         try loadScenario(allocator, path)
     else if (args.small_ring)
         Scenario.smallRing(seed)
+    else if (args.wipes)
+        Scenario.wipes(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
@@ -142,7 +149,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -153,6 +160,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.max_committed,
             s.elections_won,
             s.crashes,
+            s.wipes,
             s.restarts,
             s.messages_delivered,
             s.messages_dropped,
@@ -174,9 +182,10 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}\n", .{
                 s.seed,
                 if (args.small_ring) " --small-ring" else "",
+                if (args.wipes) " --wipes" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
@@ -206,6 +215,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     try argv.appendSlice(allocator, &.{ args.self_exe, seed_arg, log_arg });
     if (args.volatile_mode) try argv.append(allocator, "--mode=volatile");
     if (args.small_ring) try argv.append(allocator, "--small-ring");
+    if (args.wipes) try argv.append(allocator, "--wipes");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -382,8 +392,13 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring (the pin carries both)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes (the pin carries them)\n", .{});
+        std.process.exit(2);
+    }
+
+    if (args.small_ring and args.wipes) {
+        std.debug.print("--small-ring and --wipes are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 

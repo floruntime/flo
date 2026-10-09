@@ -28,6 +28,7 @@ test {
 test {
     _ = @import("node/reactor.zig");
     _ = @import("node/runtime.zig");
+    _ = @import("node/offline.zig");
     _ = @import("node/inbox.zig");
     _ = @import("node/mailbox.zig");
     _ = @import("node/reply_to.zig");
@@ -195,8 +196,6 @@ test {
 
 // Cluster
 test {
-    _ = @import("cluster/coordinator.zig");
-    _ = @import("cluster/partition_table.zig");
 }
 
 // Auth

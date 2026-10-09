@@ -22,6 +22,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
+const membership = @import("../raft/membership.zig");
 
 const Allocator = std.mem.Allocator;
 const RaftNode = raft_node.RaftNode;
@@ -79,6 +80,7 @@ const SimDisk = struct {
     allocator: Allocator,
     term: u64 = 0,
     voted_for: u32 = 0,
+    lost_log: bool = false,
     entries: std.ArrayListUnmanaged(DiskEntry) = .empty,
     /// entries[0..durable_len] survive a crash.
     durable_len: usize = 0,
@@ -150,13 +152,26 @@ const SimDisk = struct {
         return n;
     }
 
-    /// RaftNode persists through this before granting a vote or adopting a
-    /// term. The sim disk never fails a write.
-    fn persistHardState(ctx: *anyopaque, term: u64, voted_for: u32) bool {
+    /// RaftNode persists through this before granting a vote, adopting a
+    /// term, or starting or ending its lost-log guard. The sim disk never
+    /// fails a write.
+    fn persistHardState(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool) bool {
         const self: *SimDisk = @ptrCast(@alignCast(ctx));
         self.term = term;
         self.voted_for = voted_for;
+        self.lost_log = lost_log;
         return true;
+    }
+
+    /// The disk is gone: log and hard state alike, as a replaced volume.
+    fn wipe(self: *SimDisk) void {
+        for (self.entries.items) |e| self.allocator.free(e.payload);
+        self.entries.clearRetainingCapacity();
+        self.durable_len = 0;
+        self.last_flush = 0;
+        self.term = 0;
+        self.voted_for = 0;
+        self.lost_log = false;
     }
 
     fn crash(self: *SimDisk) void {
@@ -181,6 +196,13 @@ const SimNode = struct {
     /// term-monotonicity violation (fires only for a node without a
     /// hard-state sink: volatile mode).
     max_term_seen: u64,
+    /// Its disk was wiped while down: it restarts as a lost-log node.
+    wiped: bool = false,
+    /// Only its hard state was lost: it restarts with its log, and must
+    /// confirm the term before it votes.
+    lost_hard_state: bool = false,
+    /// A lost-log node the convergence phase waits on to finish its guard.
+    guard_watched: bool = false,
     // Pump state, parallel to raft.peer_ids.
     sent_at: [MAX_PEERS]u64,
     last_heartbeat: [MAX_PEERS]u64,
@@ -279,11 +301,12 @@ const Checker = struct {
         idx: u64,
         term: u64,
         payload: []const u8,
+        is_op: bool,
         tick: u64,
         latest_crash: u64,
     ) void {
         const hash = std.hash.Wyhash.hash(HASH_SEED, payload);
-        const op_id = Workload.opIdFromPayload(payload);
+        const op_id = if (is_op) Workload.opIdFromPayload(payload) else null;
         while (self.canonical.items.len < idx) {
             self.canonical.append(self.allocator, null) catch @panic("checker OOM");
         }
@@ -340,6 +363,12 @@ pub const Options = struct {
     /// Every restart then re-enters term 0 — the double-vote hazard the
     /// sink exists to close, kept here as the demonstrator of its absence.
     volatile_hard_state: bool = false,
+    /// Restart wiped nodes without the lost-log guard: the demonstrator
+    /// of what the guard prevents.
+    no_lost_log_guard: bool = false,
+    /// The guard without its boot wait: the demonstrator of the split vote
+    /// the wait prevents.
+    no_lost_log_wait: bool = false,
     /// Print per-phase progress.
     verbose: bool = false,
     /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
@@ -358,6 +387,10 @@ pub const Summary = struct {
     elections_won: u64,
     crashes: u64,
     restarts: u64,
+    /// Crashes that also lost the disk, or its hard state.
+    wipes: u64,
+    /// Guarded nodes the convergence phase waited on to finish.
+    guards_watched: u64,
     messages_delivered: u64,
     messages_dropped: u64,
     apply_stalls: u64,
@@ -403,6 +436,8 @@ pub const Simulator = struct {
 
     crashes: u64 = 0,
     restarts: u64 = 0,
+    wipes: u64 = 0,
+    config_written: bool = false,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
     catch_up_reads: u64 = 0,
@@ -451,6 +486,7 @@ pub const Simulator = struct {
             for (self.nodes, 0..) |_, j| {
                 if (i != j) node.raft.addPeer(@intCast(j + 1));
             }
+            self.commitAllMembers(node);
         }
         // Hooks attach after (empty) replay, mirroring production wiring.
         for (self.nodes) |*node| self.attachDisk(node);
@@ -528,6 +564,41 @@ pub const Simulator = struct {
         if (self.scenario.durability == .async_flush) self.checker.check_completeness = false;
     }
 
+    /// A crash that loses the disk too: log and hard state. The node comes
+    /// back with nothing, so its highest seen term starts over.
+    fn wipeNode(self: *Simulator, node: *SimNode) void {
+        self.crashNode(node);
+        node.disk.wipe();
+        node.wiped = true;
+        node.max_term_seen = 0;
+        self.wipes += 1;
+    }
+
+    /// Only the hard state is gone: the term and vote, not the log.
+    fn wipeHardState(self: *Simulator, node: *SimNode) void {
+        self.crashNode(node);
+        node.disk.term = 0;
+        node.disk.voted_for = 0;
+        node.disk.lost_log = false;
+        node.lost_hard_state = true;
+        node.max_term_seen = 0;
+        self.wipes += 1;
+    }
+
+    /// Wiped and down, or back but still guarded.
+    fn isLost(node: *const SimNode) bool {
+        return node.wiped or node.lost_hard_state or node.disk.lost_log or (node.up and node.raft.lost_log != .none);
+    }
+
+    /// No other node may be lost now: at most the scenario's `max_lost_nodes` at once,
+    /// since losing a majority's disks loses committed data whatever Raft
+    /// does.
+    fn anyLostLog(self: *const Simulator) bool {
+        var lost: u8 = 0;
+        for (self.nodes) |*node| lost += @intFromBool(isLost(node));
+        return lost >= self.scenario.max_lost_nodes;
+    }
+
     fn restartNode(self: *Simulator, node: *SimNode) !void {
         const prev_term = node.max_term_seen;
         node.raft.deinit();
@@ -541,6 +612,7 @@ pub const Simulator = struct {
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
+        self.commitAllMembers(node);
         // Replay the durable log before attaching the hook, exactly as
         // production wires persistence after segment replay — a hook
         // active during replay would re-feed the disk.
@@ -555,12 +627,30 @@ pub const Simulator = struct {
             );
             entry.header.crc32c = entry.computeCrc();
             _ = node.raft.log.append(&entry) catch @panic("sim replay append");
+            // The configs the log holds, as production's boot records them.
+            if (e.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+                var ids: [membership.MAX_MEMBERS]NodeId = undefined;
+                if (membership.decode(e.payload, &ids)) |members| node.raft.recordConfig(@intCast(idx), e.term, members);
+            }
         }
         // What the sink persisted is what comes back — nothing in volatile
         // mode, so such a node restarts at term 0.
-        node.raft.current_term = node.disk.term;
+        // The log is evidence of the term too, as in production's boot.
+        // Volatile mode keeps the demonstrator of a node with no hard state
+        // at all: it restarts at term 0.
+        node.raft.current_term = if (self.options.volatile_hard_state) node.disk.term else @max(node.disk.term, node.raft.log.lastTerm());
         node.raft.voted_for = node.disk.voted_for;
+        if (node.disk.lost_log) node.raft.resumeLostLog();
         self.attachDisk(node);
+        if (node.wiped) {
+            node.wiped = false;
+            if (!self.options.no_lost_log_guard) node.raft.enterLostLog() catch unreachable;
+        }
+        if (node.lost_hard_state) {
+            node.lost_hard_state = false;
+            if (!self.options.no_lost_log_guard) node.raft.enterLostVote() catch unreachable;
+        }
+        if (self.options.no_lost_log_wait) node.raft.hold_pending = false;
         node.up = true;
         node.sent_at = @splat(0);
         node.last_heartbeat = @splat(0);
@@ -582,7 +672,11 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             if (node.up) {
                 if (r.uintLessThan(u16, 1000) < self.scenario.crash_permille) {
-                    self.crashNode(node);
+                    if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and !self.anyLostLog()) {
+                        if (r.boolean()) self.wipeNode(node) else self.wipeHardState(node);
+                    } else {
+                        self.crashNode(node);
+                    }
                 }
             } else {
                 if (r.uintLessThan(u16, 1000) < self.scenario.restart_permille) {
@@ -621,6 +715,9 @@ pub const Simulator = struct {
     }
 
     fn handleMessage(self: *Simulator, node: *SimNode, msg: *const Message) !void {
+        // The clock before the message, as production observes it before
+        // draining its queue.
+        node.raft.observeTime(self.now);
         switch (msg.body) {
             .vote_req => |req| {
                 const resp = node.raft.handleVoteRequest(req);
@@ -632,6 +729,7 @@ pub const Simulator = struct {
                     .won => {
                         self.elections_won += 1;
                         self.checker.onLeader(node, self.now);
+                        self.writeConfig(node);
                         // Send first heartbeats immediately.
                         node.last_heartbeat = @splat(0);
                         node.sent_at = @splat(0);
@@ -682,7 +780,34 @@ pub const Simulator = struct {
             .append_resp => |resp| {
                 node.raft.handleAppendResponse(resp);
             },
+            .term_check => |req| {
+                try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .term_check_resp = node.raft.handleTermCheck(req) });
+            },
+            .term_check_resp => |resp| {
+                node.raft.handleTermCheckResponse(resp);
+                node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
+            },
         }
+    }
+
+    /// Every node is a member from the start: the committed membership a
+    /// truncation can fall back to, as production's founding config is.
+    fn commitAllMembers(self: *Simulator, node: *SimNode) void {
+        var ids: [network_mod.MAX_NODES]NodeId = undefined;
+        for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
+        node.raft.commitMembership(ids[0..self.scenario.node_count]);
+    }
+
+    /// The first leader writes a config naming every node, as production's
+    /// founder does: membership the logs carry, so a wiped node's term
+    /// check reads its committed config from the log it caught up to.
+    fn writeConfig(self: *Simulator, node: *SimNode) void {
+        if (self.config_written) return;
+        var ids: [network_mod.MAX_NODES]NodeId = undefined;
+        for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
+        var buf: [membership.MAX_SIZE]u8 = undefined;
+        _ = node.raft.propose(.raft_config, entry_mod.Flags.NONE, 0, membership.encode(ids[0..self.scenario.node_count], &buf)) catch return;
+        self.config_written = true;
     }
 
     // ── Node tick: elections + replication pump ────────────────────────
@@ -697,6 +822,12 @@ pub const Simulator = struct {
                 node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
                 for (0..node.raft.peer_count) |i| {
                     try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
+                }
+            }
+            if (result.send_term_check) {
+                var ids: [MAX_PEERS + 1]NodeId = undefined;
+                for (node.raft.termCheckTargets(&ids)) |peer| {
+                    try self.net.send(&self.prng, &self.scenario, self.now, node.id, peer, .{ .term_check = node.raft.termCheckRequest() });
                 }
             }
             if (node.raft.role == .leader) try self.pump(node);
@@ -848,7 +979,19 @@ pub const Simulator = struct {
                     self.apply_stalls += 1;
                     break;
                 };
-                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, self.now, self.latest_crash_at);
+                // The group's own entries (noops, configs) are history too,
+                // but carry no workload op.
+                const is_op = e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_noop) and e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config);
+                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
+                // A config applied is committed, as production's applier
+                // records it.
+                if (e.header.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+                    var ids: [membership.MAX_MEMBERS]NodeId = undefined;
+                    if (membership.decode(e.payload, &ids)) |members| {
+                        node.raft.commitMembership(members);
+                        node.raft.recordConfig(idx, e.header.term, members);
+                    }
+                }
                 node.raft.last_applied = idx;
             }
         }
@@ -880,10 +1023,18 @@ pub const Simulator = struct {
         const r = self.prng.random();
         const n = self.scenario.node_count;
         const quorum = n / 2 + 1;
-        // Random quorum-sized core.
+        // Random quorum-sized core, of nodes with their logs when there are
+        // enough: a lost-log node helps elect no one until a leader has
+        // caught it up, so a bare majority holding one would wait forever.
+        var whole: u8 = 0;
+        for (self.nodes) |*node| {
+            if (!isLost(node)) whole += 1;
+        }
         var chosen: u8 = 0;
         while (chosen < quorum) {
             const pick = r.uintLessThan(u8, n);
+            const p = &self.nodes[pick];
+            if (isLost(p) and whole >= quorum) continue;
             if (!self.core[pick]) {
                 self.core[pick] = true;
                 chosen += 1;
@@ -894,6 +1045,13 @@ pub const Simulator = struct {
         self.net.core = self.core;
         for (self.nodes, 0..) |*node, i| {
             if (self.core[i]) {
+                if (!node.up) try self.restartNode(node);
+            } else if (isLost(node)) {
+                // Connected and watched: the run converges only once every
+                // guarded node has finished its guard with the core's
+                // leader. Isolated, a guard that never completes would pass
+                // every seed.
+                node.guard_watched = true;
                 if (!node.up) try self.restartNode(node);
             } else {
                 // Permanent isolation, not frozen fault rates: a live
@@ -915,6 +1073,9 @@ pub const Simulator = struct {
     fn converged(self: *Simulator) bool {
         // Every acked op applied by every core node.
         const target = self.max_acked_index;
+        for (self.nodes) |*node| {
+            if (node.guard_watched and (!node.up or node.raft.lost_log != .none)) return false;
+        }
         for (self.nodes, 0..) |*node, i| {
             if (!self.core[i]) continue;
             if (!node.up) return false;
@@ -1060,6 +1221,12 @@ pub const Simulator = struct {
             .elections_won = self.elections_won,
             .crashes = self.crashes,
             .restarts = self.restarts,
+            .wipes = self.wipes,
+            .guards_watched = blk: {
+                var n: u64 = 0;
+                for (self.nodes) |*node| n += @intFromBool(node.guard_watched);
+                break :blk n;
+            },
             .messages_delivered = self.net.delivered,
             .messages_dropped = self.net.dropped,
             .apply_stalls = self.apply_stalls,
@@ -1198,4 +1365,460 @@ test "vopr sim: crashes with sync durability still converge" {
     try testing.expect(s.ok);
     try testing.expect(s.crashes > 0);
     try testing.expect(s.restarts > 0);
+}
+
+fn runTicks(sim: *Simulator, n: u64) !void {
+    for (0..n) |_| try sim.tick();
+}
+
+fn leaderOf(sim: *Simulator) ?NodeId {
+    for (sim.nodes) |*node| {
+        if (node.up and node.raft.role == .leader) return node.id;
+    }
+    return null;
+}
+
+fn hasViolation(sim: *const Simulator, invariant: Invariant) bool {
+    for (sim.checker.violations.items) |v| {
+        if (v.invariant == invariant) return true;
+    }
+    return false;
+}
+
+/// Three nodes. The leader commits entries while node y is down; then the
+/// leader goes down, node x loses its disk, and both come back. Returns the
+/// old leader's id.
+fn wipeAVoterBesideAStaleNode(sim: *Simulator) !NodeId {
+    try runTicks(sim, 2000);
+    const l = leaderOf(sim) orelse return error.NoLeader;
+    const x: NodeId = if (l == 1) 2 else 1;
+    const y: NodeId = 6 - l - x;
+    sim.crashNode(sim.node_(y));
+    const committed = sim.node_(l).raft.commit_index;
+    try runTicks(sim, 2000);
+    if (sim.node_(l).raft.commit_index <= committed) return error.NoProgress;
+    sim.crashNode(sim.node_(l));
+    sim.wipeNode(sim.node_(x));
+    try sim.restartNode(sim.node_(x));
+    try sim.restartNode(sim.node_(y));
+    try runTicks(sim, 4000);
+    return l;
+}
+
+test "vopr sim: a wiped voter without the guard elects a node missing committed entries" {
+    var scenario = Scenario.calm(7);
+    scenario.restart_permille = 0;
+    var sim = try Simulator.init(testing.allocator, scenario, .{ .no_lost_log_guard = true });
+    defer sim.deinit();
+    _ = try wipeAVoterBesideAStaleNode(&sim);
+    try testing.expect(hasViolation(&sim, .leader_completeness));
+}
+
+test "vopr sim: a wiped voter grants no vote until caught up, and rejoins once the leader is back" {
+    var scenario = Scenario.calm(7);
+    scenario.restart_permille = 0;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    const l = try wipeAVoterBesideAStaleNode(&sim);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+    try testing.expectEqual(@as(?NodeId, null), leaderOf(&sim));
+
+    try sim.restartNode(sim.node_(l));
+    try runTicks(&sim, 6000);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+    for (sim.nodes) |*node| try testing.expectEqual(raft_node.LostLog.none, node.raft.lost_log);
+    try testing.expect(leaderOf(&sim) != null);
+}
+
+test "vopr sim: with two of three wiped no leader is elected, and force-members on the survivor brings the group back" {
+    var scenario = Scenario.calm(11);
+    scenario.restart_permille = 0;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    try runTicks(&sim, 2000);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    for (sim.nodes) |*node| {
+        if (node.id == l) sim.crashNode(node) else sim.wipeNode(node);
+    }
+    for (sim.nodes) |*node| try sim.restartNode(node);
+    try runTicks(&sim, 5000);
+    // The survivor needs a vote, and a lost-log node grants none.
+    try testing.expectEqual(@as(?NodeId, null), leaderOf(&sim));
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+
+    // force-members: the survivor's config names only it, and the nodes
+    // left out cannot reach it (in production, the retired secret).
+    const s = sim.node_(l);
+    s.raft.setMembership(&.{l}, s.raft.log.lastIndex());
+    for (sim.nodes) |*node| {
+        if (node.id != l) sim.net.isolate(node.id);
+    }
+    const committed = s.raft.commit_index;
+    try runTicks(&sim, 3000);
+    try testing.expectEqual(@as(?NodeId, l), leaderOf(&sim));
+    try testing.expect(s.raft.commit_index > committed);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: swarms with wiped disks keep every invariant" {
+    var wipes: u64 = 0;
+    var watched: u64 = 0;
+    var seed: u64 = 1;
+    while (seed <= 24) : (seed += 1) {
+        var scenario = Scenario.fromSeed(seed);
+        scenario.wipe_permille = 500;
+        scenario.crash_permille = @max(scenario.crash_permille, 2);
+        scenario.ticks_safety = 8_000;
+        var sim = try Simulator.init(testing.allocator, scenario, .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        if (!s.ok) {
+            var buf: [8192]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            sim.printViolations(&w) catch {};
+            std.debug.print("seed {d} (wipes={d}):\n{s}\n", .{ seed, s.wipes, w.buffered() });
+        }
+        try testing.expect(s.ok);
+        wipes += s.wipes;
+        watched += s.guards_watched;
+    }
+    try testing.expect(wipes >= 12);
+    // Some runs end with a node still guarded, and convergence waited for
+    // it to finish.
+    try testing.expect(watched >= 1);
+}
+
+/// Seven nodes. A and B stand in one term t, cut off from the rest; X votes
+/// for A, loses its disk, restarts, catches up from the old leader L and
+/// polls. The moment X's guard is done, the votes are split: X, L and P
+/// to A (X's from before the wipe), and X, Q and R to B. Two leaders in t
+/// unless every candidacy in t has given up by then.
+fn splitVoteAcrossAWipe(sim: *Simulator, stall_candidates: bool) !void {
+    try runTicks(sim, 10_000);
+    // No new writes, so every log is the same and each candidate's is
+    // up to date for every voter.
+    sim.scenario.request_percent = 0;
+    try runTicks(sim, 2_000);
+    const l = leaderOf(sim) orelse return error.NoLeader;
+    var rest: [6]NodeId = undefined;
+    var n: usize = 0;
+    for (sim.nodes) |*node| {
+        if (node.id == l) continue;
+        rest[n] = node.id;
+        n += 1;
+    }
+    const a = sim.node_(rest[0]);
+    const b = sim.node_(rest[1]);
+    const x = sim.node_(rest[2]);
+    const p = sim.node_(rest[3]);
+    const q = sim.node_(rest[4]);
+    const r = sim.node_(rest[5]);
+    sim.net.isolate(a.id);
+    sim.net.isolate(b.id);
+    const req_a = a.raft.startElectionNow().?;
+    const req_b = b.raft.startElectionNow().?;
+    try testing.expectEqual(req_a.term, req_b.term);
+    // X had lost touch with L too when A asked.
+    x.raft.last_leader_contact_ms = 0;
+    const x_for_a = x.raft.handleVoteRequest(req_a);
+    try testing.expect(x_for_a.vote_granted);
+    // Stalled, A and B do not tick: only their deadline, checked against
+    // the clock when they handle a vote, ends their candidacies.
+    if (stall_candidates) {
+        a.up = false;
+        b.up = false;
+    }
+
+    sim.wipeNode(x);
+    try sim.restartNode(x);
+    var guard_ticks: u64 = 0;
+    while (x.raft.lost_log != .none) : (guard_ticks += 1) {
+        if (guard_ticks > 20_000) return error.GuardNeverDone;
+        try sim.tick();
+    }
+
+    if (stall_candidates) {
+        a.up = true;
+        b.up = true;
+    }
+    a.raft.observeTime(sim.now);
+    b.raft.observeTime(sim.now);
+    // L is gone from here on, as far as X, P, Q and R can tell.
+    for ([_]*SimNode{ x, p, q, r }) |node| node.raft.last_leader_contact_ms = 0;
+    const x_for_b = x.raft.handleVoteRequest(req_b);
+    const votes_a = [_]raft_node.VoteResponse{ x_for_a, sim.node_(l).raft.handleVoteRequest(req_a), p.raft.handleVoteRequest(req_a) };
+    const votes_b = [_]raft_node.VoteResponse{ x_for_b, q.raft.handleVoteRequest(req_b), r.raft.handleVoteRequest(req_b) };
+    for (votes_a) |v| if (a.raft.handleVoteResponse(v) == .won) sim.checker.onLeader(a, sim.now);
+    for (votes_b) |v| if (b.raft.handleVoteResponse(v) == .won) sim.checker.onLeader(b, sim.now);
+}
+
+fn splitVoteScenario() Scenario {
+    var scenario = Scenario.calm(21);
+    scenario.node_count = 7;
+    scenario.restart_permille = 0;
+    // Long candidacies, so one is still collecting votes when a guard
+    // without the wait finishes.
+    scenario.election_timeout_min_ms = 2000;
+    scenario.election_timeout_max_ms = 3000;
+    scenario.heartbeat_interval_ms = 50;
+    return scenario;
+}
+
+test "vopr sim: a wiped voter's guard without the boot wait lets a split vote elect two leaders in one term" {
+    var sim = try Simulator.init(testing.allocator, splitVoteScenario(), .{ .no_lost_log_wait = true });
+    defer sim.deinit();
+    try splitVoteAcrossAWipe(&sim, false);
+    try testing.expect(hasViolation(&sim, .election_safety));
+}
+
+test "vopr sim: with the boot wait, a split vote across a wipe elects no second leader" {
+    var sim = try Simulator.init(testing.allocator, splitVoteScenario(), .{});
+    defer sim.deinit();
+    try splitVoteAcrossAWipe(&sim, false);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: a wiped voter's acks to a stale leader count toward no commit" {
+    var scenario = Scenario.calm(7);
+    scenario.restart_permille = 0;
+    scenario.election_timeout_min_ms = 1000;
+    scenario.election_timeout_max_ms = 2000;
+    scenario.heartbeat_interval_ms = 50;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    sim.scenario.request_percent = 2;
+    try runTicks(&sim, 6000);
+    sim.scenario.request_percent = 0;
+    try runTicks(&sim, 500);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    const x: NodeId = if (l == 1) 2 else 1;
+    const c: NodeId = 6 - l - x;
+    const lead = sim.node_(l);
+    const wiped = sim.node_(x);
+    const other = sim.node_(c);
+    // L is cut off; C wins the next term with X's vote and commits
+    // through X.
+    sim.net.isolate(l);
+    wiped.raft.last_leader_contact_ms = 0;
+    other.raft.last_leader_contact_ms = 0;
+    const req = other.raft.startElectionNow().?;
+    const v = wiped.raft.handleVoteRequest(req);
+    try testing.expect(v.vote_granted);
+    try testing.expect(other.raft.handleVoteResponse(v) == .won);
+    sim.checker.onLeader(other, sim.now);
+    try runTicks(&sim, 200);
+    try testing.expect(other.raft.commit_index >= other.raft.log.lastIndex());
+
+    // X loses its disk and restarts; C is cut off, and L, still leading
+    // the older term inside its check-quorum window, reaches X.
+    sim.wipeNode(wiped);
+    try sim.restartNode(wiped);
+    sim.net.isolate(c);
+    sim.net.isolated[l - 1] = false;
+    try testing.expect(lead.raft.role == .leader);
+    const op = try sim.workload.nextOp();
+    const res = try lead.raft.propose(op.entry_type, 0, 0, op.payload);
+    var i: usize = 0;
+    while (i < 20 and lead.raft.commit_index < res.index) : (i += 1) try runTicks(&sim, 300);
+    // X's acks are guarded, so L commits nothing over C's history.
+    try testing.expect(lead.raft.commit_index < res.index);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: swarms with two nodes lost at once keep every invariant" {
+    var wipes: u64 = 0;
+    var seed: u64 = 100;
+    while (seed < 112) : (seed += 1) {
+        var scenario = Scenario.fromSeed(seed);
+        scenario.node_count = 7;
+        scenario.wipe_permille = 700;
+        scenario.crash_permille = @max(scenario.crash_permille, 3);
+        scenario.ticks_safety = 8_000;
+        scenario.max_lost_nodes = 2;
+        var sim = try Simulator.init(testing.allocator, scenario, .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        if (!s.ok) {
+            var buf: [8192]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            sim.printViolations(&w) catch {};
+            std.debug.print("seed {d} (wipes={d}):\n{s}\n", .{ seed, s.wipes, w.buffered() });
+        }
+        try testing.expect(s.ok);
+        wipes += s.wipes;
+    }
+    try testing.expect(wipes >= 12);
+}
+
+test "vopr sim: a wiped voter does not catch up to a new leader's commit index that lags what it acked" {
+    var scenario = Scenario.calm(7);
+    scenario.restart_permille = 0;
+    scenario.election_timeout_min_ms = 1000;
+    scenario.election_timeout_max_ms = 2000;
+    scenario.heartbeat_interval_ms = 50;
+    scenario.msg_delay_min_ms = 40;
+    scenario.msg_delay_max_ms = 50;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    sim.scenario.request_percent = 60;
+    try runTicks(&sim, 4000);
+    const p = leaderOf(&sim) orelse return error.NoLeader;
+    const x: NodeId = if (p == 1) 2 else 1;
+    const d: NodeId = 6 - p - x;
+    const lead = sim.node_(p);
+    const wiped = sim.node_(x);
+    const behind = sim.node_(d);
+    // D catches up fully and crashes; P commits more with X alone.
+    sim.scenario.request_percent = 0;
+    try runTicks(&sim, 1500);
+    sim.crashNode(behind);
+    sim.scenario.request_percent = 60;
+    try runTicks(&sim, 300);
+    sim.scenario.request_percent = 0;
+    try runTicks(&sim, 300);
+    try testing.expect(lead.raft.commit_index > behind.disk.entries.items.len);
+    // P crashes and X loses its disk; P and D come back and P wins the
+    // next term with D's vote. P's commit index starts at 0.
+    sim.crashNode(lead);
+    sim.wipeNode(wiped);
+    try sim.restartNode(lead);
+    try sim.restartNode(behind);
+    behind.raft.last_leader_contact_ms = 0;
+    const req = lead.raft.startElectionNow().?;
+    const v = behind.raft.handleVoteRequest(req);
+    try testing.expect(v.vote_granted);
+    try testing.expect(lead.raft.handleVoteResponse(v) == .won);
+    sim.checker.onLeader(lead, sim.now);
+    // A partial partition: P and D cannot talk; X reaches both.
+    sim.net.cutPair(p, d);
+    try sim.restartNode(wiped);
+    var ticks: u64 = 0;
+    while (wiped.raft.lost_log != .none and ticks < 20_000) : (ticks += 1) try sim.tick();
+    // P goes down; D and X are left. X must not vote D in while D lacks
+    // what P committed with X.
+    sim.crashNode(lead);
+    try runTicks(&sim, 6000);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: stalled candidates past their deadline count no late vote, so a wiped voter's split vote elects no one" {
+    var sim = try Simulator.init(testing.allocator, splitVoteScenario(), .{});
+    defer sim.deinit();
+    try splitVoteAcrossAWipe(&sim, true);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+// Five nodes. Y wins term t+1 with X's and B's votes while A, the term-t
+// leader, and Z are cut off; then X and Y lose their disks, B is cut off,
+// and A, still leading t, keeps X and Y as guarded followers. A guarded
+// node's answer is no evidence: X may count only A, Z and B, and B is
+// gone, so X must stay guarded and A cannot win t+1 with X.
+test "vopr sim: a guarded member's term check answer counts for nothing" {
+    var scenario = Scenario.calm(31);
+    scenario.node_count = 5;
+    scenario.restart_permille = 0;
+    scenario.election_timeout_min_ms = 1000;
+    scenario.election_timeout_max_ms = 2000;
+    scenario.heartbeat_interval_ms = 50;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    sim.scenario.request_percent = 2;
+    try runTicks(&sim, 6000);
+    sim.scenario.request_percent = 0;
+    try runTicks(&sim, 1000);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    var rest: [4]NodeId = undefined;
+    var n: usize = 0;
+    for (sim.nodes) |*node| {
+        if (node.id == l) continue;
+        rest[n] = node.id;
+        n += 1;
+    }
+    const a = sim.node_(l);
+    const b = sim.node_(rest[0]);
+    const x = sim.node_(rest[1]);
+    const y = sim.node_(rest[2]);
+    const z = sim.node_(rest[3]);
+    for ([_]NodeId{ b.id, x.id, y.id }) |id| {
+        sim.net.cutPair(a.id, id);
+        sim.net.cutPair(z.id, id);
+    }
+    for ([_]*SimNode{ b, x, y }) |node| node.raft.last_leader_contact_ms = 0;
+    const req_y = y.raft.startElectionNow().?;
+    for ([_]*SimNode{ x, b }) |voter| {
+        if (y.raft.handleVoteResponse(voter.raft.handleVoteRequest(req_y)) == .won) sim.checker.onLeader(y, sim.now);
+    }
+    try testing.expectEqual(raft_node.Role.leader, y.raft.role);
+
+    sim.wipeNode(x);
+    sim.wipeNode(y);
+    try sim.restartNode(x);
+    try sim.restartNode(y);
+    sim.net.isolate(b.id);
+    for ([_]NodeId{ x.id, y.id }) |id| {
+        for ([_]NodeId{ a.id, z.id }) |other| {
+            sim.net.pair_cut[id - 1][other - 1] = false;
+            sim.net.pair_cut[other - 1][id - 1] = false;
+        }
+    }
+    try runTicks(&sim, 6000);
+    try testing.expect(x.raft.lost_log != .none);
+
+    // A stands for t+1 with Z and X.
+    a.raft.observeTime(sim.now);
+    for ([_]*SimNode{ x, z }) |node| node.raft.last_leader_contact_ms = 0;
+    const req_a = a.raft.startElectionNow().?;
+    for ([_]*SimNode{ x, z }) |voter| {
+        if (a.raft.handleVoteResponse(voter.raft.handleVoteRequest(req_a)) == .won) sim.checker.onLeader(a, sim.now);
+    }
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+// A guarded node refuses a newer candidate's vote but takes its term, so
+// the stale leader it was following hears that term from it and steps
+// down rather than keep it as a follower.
+test "vopr sim: a guarded node's refused vote moves it past a stale leader's term" {
+    var scenario = Scenario.calm(41);
+    scenario.restart_permille = 0;
+    scenario.election_timeout_min_ms = 1000;
+    scenario.election_timeout_max_ms = 2000;
+    scenario.heartbeat_interval_ms = 50;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    try runTicks(&sim, 5000);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    const x: NodeId = if (l == 1) 2 else 1;
+    const c: NodeId = 6 - l - x;
+    const lead = sim.node_(l);
+    const wiped = sim.node_(x);
+    const other = sim.node_(c);
+    sim.net.cutPair(l, c);
+    sim.wipeNode(wiped);
+    try sim.restartNode(wiped);
+    try runTicks(&sim, 300);
+    try testing.expect(wiped.raft.lost_log != .none);
+    try testing.expectEqual(raft_node.Role.leader, lead.raft.role);
+    // C stands; the guarded X refuses but takes C's term.
+    other.raft.last_leader_contact_ms = 0;
+    const req = other.raft.startElectionNow().?;
+    try testing.expect(!wiped.raft.handleVoteRequest(req).vote_granted);
+    try runTicks(&sim, 300);
+    try testing.expect(lead.raft.role != .leader);
+    try testing.expectEqual(@as(usize, 0), sim.checker.violations.items.len);
+}
+
+test "vopr sim: a truncated uncommitted config leaves the node with the members the log still names" {
+    // Default seed 165: seven nodes, no crashes. A deposed leader's config
+    // is truncated; without a recorded membership to fall back to, three
+    // nodes were left with none and the group stopped electing.
+    var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(165), .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    if (!s.ok) {
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        sim.printViolations(&w) catch {};
+        std.debug.print("{s}\n", .{w.buffered()});
+    }
+    try testing.expect(s.ok);
 }

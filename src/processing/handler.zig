@@ -1714,7 +1714,7 @@ pub const ProcessingHandler = struct {
 
         var opt_buf: [64]u8 = undefined;
         var ob = proto.OptionsBuilder.init(&opt_buf);
-        if (snk.kv_ttl_ms) |ttl_ms| ob.addU64(.ttl_seconds, ttl_ms / 1000) catch {};
+        if (snk.kv_ttl_ms) |ttl_ms| ob.addU64(.ttl_ms, ttl_ms) catch {};
         if (std.mem.eql(u8, snk.kv_write_mode, "if_absent")) ob.addFlag(.if_not_exists) catch {};
 
         const req = proto.Request{

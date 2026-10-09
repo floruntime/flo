@@ -44,8 +44,6 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
-const coordinator_mod = @import("../cluster/coordinator.zig");
-const Coordinator = coordinator_mod.Coordinator;
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
@@ -555,11 +553,6 @@ pub const NamespaceHandler = struct {
             .collision => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, COLLISION_MESSAGE),
             .full => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, LIMIT_MESSAGE),
             .failed => return shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace not registered: out of memory"),
-        }
-        // Also propagate to coordinator if wired (cluster metadata)
-        if (shard.coordinator) |coord| {
-            _ = coord.proposeCreateNamespace(req.key, 32, 1) catch {};
-            _ = coord.applyCommitted() catch {};
         }
         shard.sendOkResponse(conn, req.header.request_id, "");
     }

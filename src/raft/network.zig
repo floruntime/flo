@@ -1346,7 +1346,7 @@ pub const RaftNetwork = struct {
 
     fn handleFrame(self: *RaftNetwork, p: *PeerState, frame: framer_mod.Frame) void {
         switch (frame.msg_type) {
-            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .forward_write, .forward_reply, .join_request => self.deliver(p, frame),
+            .append_entries, .append_entries_response, .request_vote, .request_vote_response, .install_snapshot, .forward_write, .forward_reply, .join_request, .term_check, .term_check_response => self.deliver(p, frame),
             .peer_info => {
                 if (frame.payload.len < PEER_INFO_SIZE) return;
                 const info = PeerInfo.decode(frame.payload[0..PEER_INFO_SIZE]);

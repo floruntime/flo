@@ -104,7 +104,6 @@ const ReplayRegistry = persistence_mod.ReplayRegistry;
 const snapshot_mod = @import("../storage/snapshot.zig");
 const shard_manifest = @import("shard_manifest.zig");
 const ShardManifest = shard_manifest.ShardManifest;
-const Coordinator = @import("../cluster/coordinator.zig").Coordinator;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
@@ -288,6 +287,9 @@ pub const Shard = struct {
     join_warned_ms: u64,
     join_refused_warn_ms: u64,
     stranger_warn_ms: u64,
+    /// Last "lost-log guard" line: a node waiting on a leader or a quorum
+    /// that never comes says so, and names the way out.
+    lost_log_warn_ms: u64 = 0,
     frame_warn_ms: u64,
     late_apply_warn_ms: u64,
     forward_reply_warn_ms: u64 = 0,
@@ -328,10 +330,6 @@ pub const Shard = struct {
     /// Reused sequentially — safe because each shard's reactor is single-
     /// threaded and `drainInbox` processes one message at a time.
     forward_proxy: *Connection,
-
-    /// Controller Raft coordinator (set on Shard 0 — routes namespace
-    /// create/delete through Raft for multi-node consistency).
-    coordinator: ?*Coordinator,
 
     /// Replay registry — maps EntryType → handler apply callback for the
     /// entry types no projection owns. Used by the one applier, whether the
@@ -540,6 +538,8 @@ pub const Shard = struct {
 
         var shard_data_dir: ?[]const u8 = null;
         var hard_state_store: ?*HardStateStore = null;
+        // A node with no data dir has no hard state to lose.
+        var had_hard_state = true;
         errdefer if (hard_state_store) |store| allocator.destroy(store);
         var durable_log: ?*DurableLog = null;
         errdefer if (durable_log) |dl| {
@@ -603,6 +603,7 @@ pub const Shard = struct {
                 log.err("shard {d}: cannot read {s}/{s}: {s}", .{ shard_id, shard_dir, hard_state_mod.FILENAME, @errorName(err) });
                 return err;
             };
+            had_hard_state = loaded != null;
             if (loaded) |hs| {
                 if (hs.node_id != node_id) {
                     log.err("shard {d}: {s}/HARDSTATE belongs to node {d}, this node is {d}; the shard directories come from different nodes", .{ shard_id, shard_dir, hs.node_id, node_id });
@@ -610,6 +611,7 @@ pub const Shard = struct {
                 }
                 raft_node.current_term = hs.term;
                 raft_node.voted_for = hs.voted_for;
+                if (hs.lost_log) raft_node.resumeLostLog();
             }
             const store = try allocator.create(HardStateStore);
             store.* = .{ .dir = shard_dir, .node_id = node_id, .shard_id = shard_id };
@@ -711,7 +713,7 @@ pub const Shard = struct {
             raft_node.log.on_truncate_ctx = @ptrCast(dl);
             raft_node.log.on_truncate = durableTruncate;
         }
-        try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id);
+        try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id, had_hard_state);
 
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
@@ -809,7 +811,6 @@ pub const Shard = struct {
             .peer_shards = null,
             .peer_mailboxes = null,
             .forward_proxy = forward_proxy,
-            .coordinator = null,
             .replay_registry = replay_registry,
             .apply_buf = apply_buf,
             .applying = false,
@@ -819,14 +820,6 @@ pub const Shard = struct {
             .run_id_gen = .{ .shard = @intCast(shard_id) },
             .metrics_registry = null,
         };
-    }
-
-    // ─── Cluster wiring ──────────────────────────────────────────────────
-
-    /// Wire the Controller Raft coordinator (enables Raft-replicated namespace ops).
-    /// Should only be called on Shard 0.
-    pub fn setCoordinator(self: *Shard, coord: *Coordinator) void {
-        self.coordinator = coord;
     }
 
     /// Namespace resolver wired into the queue and stream projections: hash →
@@ -1914,6 +1907,10 @@ pub const Shard = struct {
         const q = self.raft_queue orelse return;
         while (q.pop()) |frame| {
             defer self.allocator.free(frame.payload);
+            // The clock before each message: a vote that arrives past the
+            // candidacy's deadline is not counted on an older clock, even
+            // after a stall part way through the queue.
+            self.raft_node.observeTime(nowMs());
             self.handleRaftFrame(frame);
         }
     }
@@ -2399,6 +2396,20 @@ pub const Shard = struct {
                     },
                 }
             },
+            .term_check => {
+                const req = transport.deserializeTermCheck(frame.payload) orelse return self.badFrame(frame);
+                if (req.from != frame.source_node) return self.impostorFrame(frame, req.from);
+                var buf: [transport.TERM_CHECK_RESP_MAX]u8 = undefined;
+                const n = transport.serializeTermCheckResponse(raft.handleTermCheck(req), &buf) orelse return;
+                self.sendRaft(frame.source_node, .term_check_response, buf[0..n]);
+            },
+            .term_check_response => {
+                const resp = transport.deserializeTermCheckResponse(frame.payload) orelse return self.badFrame(frame);
+                if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
+                const was = raft.lost_log;
+                raft.handleTermCheckResponse(resp);
+                if (was != .none and raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term + 1 });
+            },
             .join_request => self.handleJoinRequest(frame.source_node),
             .forward_write => self.runForwardedWrite(frame),
             .forward_reply => self.takeForwardReply(frame),
@@ -2449,7 +2460,7 @@ pub const Shard = struct {
     fn markDiverged(self: *Shard, leader: u32, term: u64) void {
         if (self.diverged) return;
         self.diverged = true;
-        log.err("shard {d}: node {d} (term {d}) disagrees with history this node committed and applied; this node's data can no longer be trusted and it has stopped taking part in the group. Stop it, delete its data directory, and start it again with --join <a live member> (not --cluster)", .{ self.id, leader, term });
+        log.err("shard {d}: node {d} (term {d}) disagrees with history this node committed and applied; this node's data can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member> (not --cluster): it rejoins with no log and votes only once it has caught up and a quorum has confirmed the term", .{ self.id, leader, term });
         // Only a member that broke one-leader-per-term reaches this on a
         // leader; still, a diverged node leads nothing.
         if (self.raft_node.role == .leader) {
@@ -2505,10 +2516,44 @@ pub const Shard = struct {
                 }
             }
         }
+        if (r.send_term_check) {
+            var buf: [transport.TERM_CHECK_SIZE]u8 = undefined;
+            const n = transport.serializeTermCheck(raft.termCheckRequest(), &buf).?;
+            var ids: [raft_node_mod.MAX_PEERS + 1]u32 = undefined;
+            for (raft.termCheckTargets(&ids)) |peer| self.sendRaft(peer, .term_check, buf[0..n]);
+        }
+        if (raft.lost_log != .none) self.warnLostLog(now);
         if (r.step_down) self.leadershipLost("no contact with a majority");
         if (raft.role == .leader) self.pump(now);
         if (self.joinWanted(now)) self.askToJoin(now);
         if (self.forward_count > 0) self.sweepForwards(now);
+    }
+
+    /// A guarded node that stays guarded says where it is waiting: with no
+    /// leader (a majority lost its data too) or not enough members
+    /// answering, it waits forever, and the operator needs the way out.
+    fn warnLostLog(self: *Shard, now: u64) void {
+        if (now -| self.lost_log_warn_ms < WARN_INTERVAL_MS) return;
+        // The first line waits one warn interval: catching up usually
+        // takes less.
+        if (self.lost_log_warn_ms == 0) {
+            self.lost_log_warn_ms = now;
+            return;
+        }
+        self.lost_log_warn_ms = now;
+        const raft = self.raft_node;
+        switch (raft.lost_log) {
+            .none => {},
+            .catching_up => if (raft.leader_id == 0) {
+                log.warn("shard {d}: lost-log guard: catching up — no leader heard yet; this node votes only once a leader has caught it up and the members have confirmed the term. If a majority lost their data, see flo server inspect / force-members", .{self.id});
+            } else {
+                log.warn("shard {d}: lost-log guard: catching up with leader {d} (term {d}, at index {d}); no votes until caught up and confirmed", .{ self.id, raft.leader_id, raft.current_term, raft.log.lastIndex() });
+            },
+            .confirming => {
+                const st = raft.checkStatus();
+                log.warn("shard {d}: lost-log guard: confirming term {d}; {d} member(s) have answered and {d} more answer(s) are needed. If a majority lost their data, see flo server inspect / force-members", .{ self.id, raft.current_term, st.answers, st.missing });
+            },
+        }
     }
 
     /// A node the log has never named asks to be added; so does one whose
@@ -3706,7 +3751,8 @@ pub const Shard = struct {
     /// `cluster_status` — this node's identity, role and group. A node
     /// running alone is the leader of a one-member group. States: 0
     /// follower, 1 electing, 2 leader, 3 joining (no seat yet), 4
-    /// diverged.
+    /// diverged, 5 and 6 guarded (no log or no hard state of its own, new
+    /// or lost): catching up, then confirming the term.
     fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -3714,6 +3760,10 @@ pub const Shard = struct {
         const raft = shard.raft_node;
         const state: u8 = if (shard.diverged)
             4
+        else if (raft.lost_log == .catching_up)
+            5
+        else if (raft.lost_log == .confirming)
+            6
         else if (shard.raft_network != null and !raft.timer_enabled)
             3
         else switch (raft.role) {
@@ -4472,9 +4522,9 @@ const HardStateStore = struct {
     node_id: u32,
     shard_id: u16,
 
-    fn persist(ctx: *anyopaque, term: u64, voted_for: u32) bool {
+    fn persist(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool) bool {
         const self: *HardStateStore = @ptrCast(@alignCast(ctx));
-        hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for }) catch |err| {
+        hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for, .lost_log = lost_log }) catch |err| {
             log.err("shard {d}: cannot write {s}/{s}: {s}; this node will not vote until it can", .{ self.shard_id, self.dir, hard_state_mod.FILENAME, @errorName(err) });
             return false;
         };
@@ -4574,7 +4624,7 @@ const JOIN_ASK_INTERVAL_MS: u64 = 1000;
 
 /// Membership at boot comes from the log's latest config entry; a single
 /// node and a first member with nothing in the log lead at once.
-fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32) !void {
+fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32, had_hard_state: bool) !void {
     // Everything replay put in the log came from disk.
     raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
@@ -4592,12 +4642,19 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 return error.MembershipUnreadable;
             };
             if (members.len > 1 or !membership.names(members, node_id)) {
-                log.err("shard {d}: this data directory belonged to a group of {d} (members {any}); start with --join to rejoin them, or delete it to start alone", .{ shard_id, members.len, members });
+                log.err("shard {d}: this data directory belonged to a group of {d} (members {any}); start with --join to rejoin them, or point --data-dir at an empty directory to start alone", .{ shard_id, members.len, members });
                 return error.DataDirWasClustered;
             }
         }
+        // Alone, nothing was lost that another node could vote against;
+        // bootstrap writes the cleared flag with its new term.
+        raft.lost_log = .none;
         return raft.bootstrap();
     }
+    const empty = raft.log.lastIndex() == 0;
+    // The log is evidence of the term too: a hard state that is missing,
+    // or behind it, never lets the node act in a term it already left.
+    raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (cfg_index > 0) {
         const e = raft.log.getEntryCopy(cfg_index, buf) orelse {
             log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess the membership", .{ shard_id, cfg_index });
@@ -4609,25 +4666,45 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
             return error.MembershipUnreadable;
         };
         raft.setMembership(members, cfg_index);
+        raft.membership_term = e.header.term;
+        raft.recordConfig(cfg_index, e.header.term, members);
         if (cfg_index <= raft.last_applied) raft.commitMembership(members);
         // What the segments flushed under a commit watermark is committed;
         // the rest of the log waits for a leader to say so.
         raft.commit_index = raft.last_applied;
         log.info("shard {d}: members {any} from the log (config index {d}); following until a leader speaks{s}", .{ shard_id, members, cfg_index, if (raft.timer_enabled) "" else " (this node is not a member)" });
+        // The log survived but the hard state did not: the vote cast in
+        // the current term is gone, so the term is confirmed first.
+        if (!had_hard_state and raft.lost_log == .none) {
+            try raft.enterLostVote();
+            log.warn("shard {d}: this node has a log but no {s}; it votes only once the members have confirmed the term", .{ shard_id, hard_state_mod.FILENAME });
+        }
         return;
     }
     switch (role) {
         .single => unreachable,
         .bootstrap => {
+            // Hard state without a log is a member whose log is gone, not
+            // a first boot: founding would start a second cluster.
+            if (empty and (raft.lost_log != .none or raft.current_term > 0)) {
+                log.err("shard {d}: this node has no log but has hard state from a cluster (term {d}); it was a member and lost its log. Restart it with --join <a live member>, not --cluster", .{ shard_id, raft.current_term });
+                return error.LostLogFounding;
+            }
             try raft.bootstrap();
             var cfg: [membership.MAX_SIZE]u8 = undefined;
             _ = try raft.propose(.raft_config, entry_mod.Flags.NONE, 0, membership.encode(&.{node_id}, &cfg));
-            log.info("shard {d}: first member; leading a group of one", .{shard_id});
+            if (empty) log.warn("shard {d}: founding a new cluster at term 1; if this node was a member of an existing cluster, stop it and restart with --join", .{shard_id}) else log.info("shard {d}: first member; leading a group of one", .{shard_id});
         },
         .join => {
             raft.commit_index = raft.last_applied;
             raft.timer_enabled = false;
-            log.info("shard {d}: joining; following until a config entry names this node", .{shard_id});
+            // No log, or a log with no config and no hard state: a new node
+            // and one that lost its disk look the same, and whatever the
+            // latter voted for or acked is gone. Durable before it answers
+            // anyone.
+            const guard = empty or !had_hard_state;
+            if (guard) try raft.enterLostLog();
+            log.info("shard {d}: joining{s}; following until a config entry names this node", .{ shard_id, if (guard) " with nothing in the log and no hard state to vote from; voting only once caught up and the term is confirmed" else "" });
         },
     }
 }
@@ -4639,6 +4716,10 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     const members = membership.decode(entry.payload, &ids) orelse return;
     raft.commitMembership(members);
+    // At boot, replay applies the committed configs before the group comes
+    // up: a node that lost its hard state checks the committed set even
+    // when its latest config is not.
+    raft.recordConfig(entry.header.index, entry.header.term, members);
     log.info("Raft: membership committed: {any} (config index {d})", .{ members, entry.header.index });
 }
 
@@ -6889,6 +6970,109 @@ test "Shard: a data directory that belonged to a group refuses to run alone, and
     try std.testing.expect(member.raft_node.timer_enabled);
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, member.raft_node.memberIds(&ids));
+}
+
+test "Shard: a member with no log starts guarded, durably, and one with hard state but no log does not found a cluster" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    {
+        var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+        defer joiner.deinit();
+        try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, joiner.raft_node.lost_log);
+    }
+    // On disk before the shard answers anything, so a restart keeps it.
+    try std.testing.expect((try hard_state_mod.load(shard_dir)).?.lost_log);
+    {
+        var again = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+        defer again.deinit();
+        try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, again.raft_node.lost_log);
+    }
+    try std.testing.expectError(error.LostLogFounding, Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}));
+
+    // Restarted part way through catching up: a log, and still guarded.
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/segs", .{shard_dir});
+    defer std.testing.allocator.free(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf));
+    cfg.header.crc32c = cfg.computeCrc();
+    try w.addEntry(&cfg);
+    w.commit_index_at_seal = 2;
+    try w.writeToFile(segs);
+    var midway = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    defer midway.deinit();
+    try std.testing.expectEqual(@as(u64, 2), midway.raft_node.log.lastIndex());
+    try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, midway.raft_node.lost_log);
+}
+
+test "Shard: a member that kept its log but lost its hard state confirms the term before it votes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/segs", .{shard_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf));
+    cfg.header.crc32c = cfg.computeCrc();
+    try w.addEntry(&cfg);
+    w.commit_index_at_seal = 2;
+    try w.writeToFile(segs);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var member = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    defer member.deinit();
+    try std.testing.expectEqual(raft_node_mod.LostLog.confirming, member.raft_node.lost_log);
+    try std.testing.expect((try hard_state_mod.load(shard_dir)).?.lost_log);
+    // The log's last term, not term 0: the hard state that is gone held at
+    // least that.
+    try std.testing.expectEqual(@as(u64, 1), member.raft_node.current_term);
+}
+
+test "Shard: --join with a log but no config entry and no hard state is guarded too" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    defer w.deinit();
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 2, 1, 0, "");
+    noop.header.crc32c = noop.computeCrc();
+    try w.addEntry(&noop);
+    w.commit_index_at_seal = 1;
+    try w.writeToFile(segs);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    defer joiner.deinit();
+    try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, joiner.raft_node.lost_log);
 }
 
 /// Writes parked behind a second member's ack, driven over a socket pair

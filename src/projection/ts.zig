@@ -213,7 +213,7 @@ const NS_PREFIX = 4;
 const TAG_SUFFIX = 8;
 
 /// Maximum `key=value` pairs considered when canonicalizing a tag set.
-const MAX_TAGS = 32;
+pub const MAX_TAGS = 32;
 
 /// Upper bound on a canonical tag string.
 pub const MAX_TAG_STRING = 1024;
@@ -328,6 +328,43 @@ pub fn tagsMatch(canonical_tags: []const u8, preds: []const TagPredicate) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+/// A delete's tag filter: every `key=value` in it must be among a series'
+/// tags for the series to match. Empty matches every series.
+pub const TagFilter = union(enum) {
+    ok: struct { canonical: []const u8, preds: []const TagPredicate },
+    /// A part that isn't `key=value` with both sides non-empty.
+    not_pair: []const u8,
+    too_many,
+    too_long,
+};
+
+/// Parse a tag filter strictly: a part that isn't a pair is refused rather
+/// than dropped, since dropping it would widen what the filter matches.
+/// The canonical form and the predicates point into `canon_buf`.
+pub fn parseTagFilter(tags: []const u8, canon_buf: *[MAX_TAG_STRING]u8, preds_buf: *[MAX_TAGS]TagPredicate) TagFilter {
+    if (tags.len > MAX_TAG_STRING) return .too_long;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, tags, ',');
+    while (it.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " \t");
+        if (part.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse return .{ .not_pair = part };
+        if (eq == 0 or eq == part.len - 1) return .{ .not_pair = part };
+        if (n == MAX_TAGS) return .too_many;
+        n += 1;
+    }
+    const canonical = canonicalTagString(tags, canon_buf);
+    var m: usize = 0;
+    var cit = std.mem.splitScalar(u8, canonical, ',');
+    while (cit.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=').?;
+        preds_buf[m] = .{ .key = pair[0..eq], .op = .eq, .value = pair[eq + 1 ..] };
+        m += 1;
+    }
+    return .{ .ok = .{ .canonical = canonical, .preds = preds_buf[0..m] } };
 }
 
 /// A single tag as key/value, for callers that hold structured tags rather than
@@ -888,13 +925,35 @@ pub const TSProjection = struct {
     /// Delete all data for a measurement (all fields).
     /// Returns the number of series removed.
     pub fn deleteMeasurement(self: *TSProjection, namespace_hash: u32, measurement: []const u8) usize {
+        return self.deleteSeries(namespace_hash, measurement, &.{});
+    }
+
+    /// Whether `key` is a series of `measurement` in the namespace whose
+    /// tags satisfy every predicate.
+    fn seriesMatches(self: *const TSProjection, key: []const u8, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) bool {
+        return inMeasurement(key, namespace_hash, measurement) and tagsMatch(self.tagsForHash(keyTagHash(key)), preds);
+    }
+
+    /// Whether any series of `measurement` in the namespace matches.
+    pub fn hasSeries(self: *const TSProjection, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) bool {
+        var bit = self.buffers.keyIterator();
+        while (bit.next()) |k| if (self.seriesMatches(k.*, namespace_hash, measurement, preds)) return true;
+        var blit = self.blocks.keyIterator();
+        while (blit.next()) |k| if (self.seriesMatches(k.*, namespace_hash, measurement, preds)) return true;
+        return false;
+    }
+
+    /// Delete the series of `measurement`, in one namespace, whose tags
+    /// satisfy every predicate (all of them, when there are none).
+    /// Returns the number of series removed.
+    pub fn deleteSeries(self: *TSProjection, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) usize {
         var removed: usize = 0;
 
         // Delete matching write buffers (this namespace + measurement only)
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (inMeasurement(key, namespace_hash, measurement)) {
+            if (self.seriesMatches(key, namespace_hash, measurement, preds)) {
                 kv.value_ptr.deinit();
                 self.allocator.free(@constCast(key));
                 self.buffers.removeByPtr(kv.key_ptr);
@@ -906,7 +965,7 @@ pub const TSProjection = struct {
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (inMeasurement(key, namespace_hash, measurement)) {
+            if (self.seriesMatches(key, namespace_hash, measurement, preds)) {
                 kv.value_ptr.deinit(self.allocator);
                 self.allocator.free(@constCast(key));
                 self.blocks.removeByPtr(kv.key_ptr);
@@ -983,9 +1042,16 @@ pub const TSProjection = struct {
                     }
                 }
             },
+            // The value is the canonical tag filter; empty deletes the
+            // whole measurement.
             .ts_delete => {
                 if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    _ = self.deleteMeasurement(cmd.namespace_hash, cmd.key);
+                    var canon_buf: [MAX_TAG_STRING]u8 = undefined;
+                    var preds_buf: [MAX_TAGS]TagPredicate = undefined;
+                    switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
+                        .ok => |f| _ = self.deleteSeries(cmd.namespace_hash, cmd.key, f.preds),
+                        else => log.err("ts delete entry index={d} has a malformed tag filter; skipped, so nothing is deleted", .{ual_entry.header.index}),
+                    }
                 } else {
                     log.err("ts delete entry index={d} is malformed; skipped, so the measurement stays", .{ual_entry.header.index});
                 }
@@ -1874,4 +1940,55 @@ test "ts: retention spares other measurements' flushed blocks" {
     _ = ts.applyRetention(1, "a", 2000);
     try testing.expectEqual(@as(usize, 2), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).blocks_matched);
     try testing.expectEqual(@as(usize, 0), (try ts.queryRange(1, "a", "value", null, 0, 10000, &buf)).blocks_matched);
+}
+
+test "ts: a tag filter is parsed strictly and canonically" {
+    var canon: [MAX_TAG_STRING]u8 = undefined;
+    var preds: [MAX_TAGS]TagPredicate = undefined;
+    const f = parseTagFilter(" site=x , sensor=A1", &canon, &preds).ok;
+    try testing.expectEqualStrings("sensor=A1,site=x", f.canonical);
+    try testing.expectEqual(@as(usize, 2), f.preds.len);
+    try testing.expectEqualStrings("sensor", f.preds[0].key);
+    try testing.expectEqualStrings("A1", f.preds[0].value);
+    try testing.expectEqual(@as(usize, 0), parseTagFilter("", &canon, &preds).ok.preds.len);
+
+    for ([_][]const u8{ "sensor", "=A1", "sensor=", "site=x,sensor" }) |bad| {
+        try testing.expect(parseTagFilter(bad, &canon, &preds) == .not_pair);
+    }
+    try testing.expectEqualStrings("sensor", parseTagFilter("site=x,sensor", &canon, &preds).not_pair);
+
+    var many: [MAX_TAGS * 4 + 4]u8 = undefined;
+    var n: usize = 0;
+    for (0..MAX_TAGS + 1) |i| n += (std.fmt.bufPrint(many[n..], "{c}=v,", .{@as(u8, @intCast('A' + i))}) catch unreachable).len;
+    try testing.expect(parseTagFilter(many[0..n], &canon, &preds) == .too_many);
+    const long = [_]u8{'a'} ** (MAX_TAG_STRING + 1);
+    try testing.expect(parseTagFilter(&long, &canon, &preds) == .too_long);
+}
+
+test "ts: a delete with a tag filter removes only the series whose tags include it" {
+    // Buffered and flushed series alike.
+    for ([_]usize{ 100, 1 }) |capacity| {
+        var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = capacity });
+        defer ts.deinit();
+        try ts.insert(1, "temp", "value", 1.0, 1000, 1, "sensor=A1,site=x");
+        try ts.insert(1, "temp", "value", 2.0, 1000, 2, "sensor=B2,site=x");
+        try ts.insert(1, "temp", "value", 3.0, 1000, 3, "");
+        try ts.insert(2, "temp", "value", 4.0, 1000, 4, "sensor=A1,site=x");
+
+        var canon: [MAX_TAG_STRING]u8 = undefined;
+        var preds: [MAX_TAGS]TagPredicate = undefined;
+        const a1 = parseTagFilter("sensor=A1", &canon, &preds).ok.preds;
+        try testing.expect(ts.hasSeries(1, "temp", a1));
+        _ = ts.deleteSeries(1, "temp", a1);
+        try testing.expect(!ts.hasSeries(1, "temp", a1));
+        // The other series, the untagged one, and the same series in
+        // another namespace remain.
+        var canon2: [MAX_TAG_STRING]u8 = undefined;
+        var preds2: [MAX_TAGS]TagPredicate = undefined;
+        try testing.expect(ts.hasSeries(1, "temp", parseTagFilter("sensor=B2", &canon2, &preds2).ok.preds));
+        try testing.expect(ts.hasSeries(2, "temp", a1));
+        var buf: [10]StoredPoint = undefined;
+        const untagged = try ts.queryRange(1, "temp", "value", 0, 0, 10000, &buf);
+        try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
+    }
 }

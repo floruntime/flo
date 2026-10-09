@@ -35,6 +35,7 @@ const RaftNodeConfig = @import("../raft/node.zig").Config;
 const RaftQueue = @import("../raft/raft_queue.zig").RaftQueue;
 const RAFT_QUEUE_CAPACITY = @import("../raft/network.zig").RAFT_QUEUE_CAPACITY;
 const cluster_config = @import("../config/cluster.zig");
+const offline = @import("offline.zig");
 const raft_hard_state = @import("../raft/hard_state.zig");
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
@@ -157,6 +158,24 @@ pub const LOCK_FILENAME = "flo.lock";
 /// is the OS's (flock), so it goes when the holder exits, however it exits.
 pub fn lockDataDir(data_dir: []const u8) !stdx.fs.File {
     try stdx.fs.makePath(data_dir);
+    return lockMade(data_dir);
+}
+
+/// The same lock for an offline tool, which must not create a data dir a
+/// mistyped path names.
+pub fn lockExistingDataDir(data_dir: []const u8) !stdx.fs.File {
+    const dir = stdx.fs.openDir(data_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            log.err("data dir {s} does not exist", .{data_dir});
+            return error.DataDirMissing;
+        },
+        else => return err,
+    };
+    stdx.fs.closeDir(dir);
+    return lockMade(data_dir);
+}
+
+fn lockMade(data_dir: []const u8) !stdx.fs.File {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME });
     return stdx.fs.createFile(path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
@@ -414,7 +433,7 @@ pub const Runtime = struct {
         const configured: ?u32 = if (self.config.cluster_node_id > 0) self.config.cluster_node_id else null;
 
         if (stored != null and configured != null and stored.? != configured.?) {
-            log.err("cluster: data dir {s} belongs to node {d} but [cluster] node_id = {d}; remove node_id from the config to keep this data, or point data_dir at an empty directory to start a new node", .{ data_dir, stored.?, configured.? });
+            log.err("cluster: data dir {s} belongs to node {d} but [cluster] node_id = {d}; `flo server inspect --data-dir {s}` shows what it holds. Remove node_id from the config to keep this data, or point data_dir at an empty directory to start a new node", .{ data_dir, stored.?, configured.?, data_dir });
             return error.NodeIdMismatch;
         }
         if (stored) |id| return .{ .id = id, .source = .stored };
@@ -633,6 +652,13 @@ pub const Runtime = struct {
             if (!cluster_config.secretWellFormed(secret)) {
                 log.err("cluster: [cluster] secret is not one `flo server secret` made; run it once and give every member its output (in [cluster] secret, secret_file or FLO_CLUSTER_SECRET)", .{});
                 return error.ClusterSecretMalformed;
+            }
+            // After force-members the old secret must never link again: the
+            // members it left out still hold it.
+            if (try offline.retiredAt(self.allocator, data_dir, secret)) |when| {
+                var date: [10]u8 = undefined;
+                log.err("cluster: this node's cluster secret was retired by force-members on {s}; give every node a new secret (flo server secret)", .{offline.formatDate(&date, when)});
+                return error.ClusterSecretRetired;
             }
 
             const q = try self.allocator.create(RaftQueue);

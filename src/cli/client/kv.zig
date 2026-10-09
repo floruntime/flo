@@ -46,7 +46,8 @@ pub fn get(client: *Client, namespace: []const u8, key: []const u8, wait_ms: ?u3
 
 /// Options for SET command
 pub const SetOptions = struct {
-    ttl_seconds: ?u64 = null,
+    /// Milliseconds; 0 or null is no expiry.
+    ttl_ms: ?u64 = null,
     if_not_exists: bool = false,
     if_exists: bool = false,
     cas_version: ?u64 = null,
@@ -59,8 +60,8 @@ pub fn set(client: *Client, namespace: []const u8, key: []const u8, value: []con
     var options_buf: [128]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
-    if (opts.ttl_seconds) |ttl| {
-        builder.addU64(.ttl_seconds, ttl) catch return error.OptionsBufferTooSmall;
+    if (opts.ttl_ms) |ttl| {
+        builder.addU64(.ttl_ms, ttl) catch return error.OptionsBufferTooSmall;
     }
 
     if (opts.if_not_exists) {
@@ -179,10 +180,11 @@ pub fn incr(client: *Client, namespace: []const u8, key: []const u8, delta: i64,
     return client.sendRequest(.kv_incr, namespace, key, &val_buf);
 }
 
-/// TOUCH — update an existing key's TTL. ttl_seconds=0 clears the TTL (same as PERSIST).
-pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_seconds: u64, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
+/// TOUCH — update an existing key's TTL, in milliseconds. 0 clears the TTL
+/// (same as PERSIST).
+pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_ms: u64, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
     var val_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &val_buf, ttl_seconds, .little);
+    std.mem.writeInt(u64, &val_buf, ttl_ms, .little);
 
     if (routing_key != null or txn_id != null or cas_version != null) {
         var options_buf: [96]u8 = undefined;

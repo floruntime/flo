@@ -12,6 +12,8 @@ const commander = @import("../commander/mod.zig");
 const server_config = @import("../../config/mod.zig").server;
 const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
+const runtime_mod = @import("../../node/runtime.zig");
+const offline = @import("../../node/offline.zig");
 const RuntimeConfig = @import("../../node/runtime.zig").RuntimeConfig;
 const posix = std.posix;
 
@@ -53,6 +55,10 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\  Neither flag:  a single node; nothing to configure
                     \\  --cluster:     the first member; it leads alone until others join
                     \\  --join host:port[,...]: joins the members it can reach and is added by the leader
+                    \\  Restart a member with --join, never --cluster: a member that lost its
+                    \\  data and starts with --cluster founds a second cluster. With --join it
+                    \\  rejoins and votes only once it has caught up; if a majority lost theirs,
+                    \\  see `flo server inspect` and `flo server force-members`.
                     \\  Every member proves the same shared secret at the peer port:
                     \\  make one with `flo server secret`, then set it in [cluster] secret,
                     \\  [cluster] secret_file (mode 600) or FLO_CLUSTER_SECRET.
@@ -106,6 +112,50 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     "flo server secret > /etc/flo/cluster.secret && chmod 600 /etc/flo/cluster.secret",
                 })
                 .action(wrapHandler(runSecret)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("inspect")
+                .about("Show a stopped node's log, term and members")
+                .longAbout(
+                    \\Read the cluster group's log and hard state from a stopped node's
+                    \\data directory: last index and term, what is committed, the latest
+                    \\member list, and whether its lost-log guard is still on. Writes
+                    \\nothing. When a majority has lost its data, run it on each survivor
+                    \\and pick the most up-to-date log for force-members: the highest last
+                    \\term, then the highest last index.
+                )
+                .examples(&.{
+                    "flo server inspect --data-dir /var/lib/flo",
+                })
+                .stringFlag("config", 'c', "", "Config file naming the data directory")
+                .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
+                .action(wrapHandler(runInspect)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("force-members")
+                .about("Make a stopped node the cluster's only voter")
+                .longAbout(
+                    \\For when a majority of the cluster has lost its data and no leader
+                    \\can be elected. Run on the stopped survivor with the most up-to-date
+                    \\log (see inspect: the highest last term, then the highest last
+                    \\index). It writes a member list naming only this node and retires
+                    \\this node's cluster secret, so the server refuses to start with it.
+                    \\Then restart this node with a new secret (flo server secret): the new
+                    \\secret is what keeps the nodes left out from linking. Reset the
+                    \\other nodes' data before they rejoin with --join and that secret.
+                    \\
+                    \\Without --yes it prints what it would change and stops.
+                )
+                .examples(&.{
+                    "flo server force-members --data-dir /var/lib/flo",
+                    "flo server force-members --data-dir /var/lib/flo --yes",
+                })
+                .stringFlag("config", 'c', "", "Config file naming the data directory and the secret")
+                .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
+                .boolFlag("yes", 0, "Make the change")
+                .action(wrapHandler(runForceMembers)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -282,6 +332,32 @@ fn runSecret(ctx: *commander.Context) commander.Error!void {
     ctx.print("{s}\n", .{&out});
 }
 
+/// The peer secret, from whichever one source names it: [cluster] secret,
+/// [cluster] secret_file, or FLO_CLUSTER_SECRET. A container often has no
+/// config file to keep it in. Two sources are refused: the second would be
+/// silently ignored.
+fn resolveSecret(ctx: *commander.Context, config: *server_config.ServerConfig) commander.Error!void {
+    const allocator = ctx.allocator;
+    const env_secret: ?[]const u8 = if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| (if (s.len > 0) s else null) else null;
+    const sources = @as(u8, @intFromBool(config.cluster.secret != null)) + @intFromBool(config.cluster.secret_file != null) + @intFromBool(env_secret != null);
+    if (sources > 1) {
+        ctx.printErr("Error: the cluster secret is set more than once ([cluster] secret, [cluster] secret_file, FLO_CLUSTER_SECRET); keep one\n", .{});
+        return error.CommandFailed;
+    }
+    if (config.cluster.secret_file) |path| {
+        const s = cluster_config.readSecretFile(allocator, path) catch {
+            ctx.printErr("Error: [cluster] secret_file {s} could not be used (see the log line above)\n", .{path});
+            return error.CommandFailed;
+        };
+        defer {
+            std.crypto.secureZero(u8, s);
+            allocator.free(s);
+        }
+        config.cluster.secret = try config.dupeString(s);
+    }
+    if (env_secret) |s| config.cluster.secret = try config.dupeString(s);
+}
+
 fn runStart(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
 
@@ -356,27 +432,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         config.dashboard.enabled = false;
     }
 
-    // The peer secret may come from a file, or the environment: a container
-    // often has no config file to keep it in.
-    // One source only: a second one would be silently ignored.
-    const env_secret: ?[]const u8 = if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| (if (s.len > 0) s else null) else null;
-    const sources = @as(u8, @intFromBool(config.cluster.secret != null)) + @intFromBool(config.cluster.secret_file != null) + @intFromBool(env_secret != null);
-    if (sources > 1) {
-        ctx.printErr("Error: the cluster secret is set more than once ([cluster] secret, [cluster] secret_file, FLO_CLUSTER_SECRET); keep one\n", .{});
-        return error.CommandFailed;
-    }
-    if (config.cluster.secret_file) |path| {
-        const s = cluster_config.readSecretFile(allocator, path) catch {
-            ctx.printErr("Error: [cluster] secret_file {s} could not be used (see the log line above)\n", .{path});
-            return error.CommandFailed;
-        };
-        defer {
-            std.crypto.secureZero(u8, s);
-            allocator.free(s);
-        }
-        config.cluster.secret = try config.dupeString(s);
-    }
-    if (env_secret) |s| config.cluster.secret = try config.dupeString(s);
+    try resolveSecret(ctx, &config);
 
     // --join flag overrides seeds from config
     var join_seeds_list: std.ArrayList([]const u8) = .empty;
@@ -536,6 +592,115 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     runtime.stop();
 
     ctx.print("Server stopped.\n", .{});
+}
+
+/// The config an offline command reads: the file named, or the defaults,
+/// with --data-dir over its data_dir.
+fn offlineConfig(ctx: *commander.Context) commander.Error!server_config.ServerConfig {
+    const config_path = ctx.getString("config");
+    const data_dir = ctx.getString("data-dir");
+    return server_config.loadWithOverrides(ctx.allocator, stdx.nullIfEmpty(u8, config_path), null, stdx.nullIfEmpty(u8, data_dir), null, null, null, null, null) catch |err| {
+        switch (err) {
+            error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
+            else => ctx.printErr("Error loading configuration: {}\n", .{err}),
+        }
+        return error.CommandFailed;
+    };
+}
+
+/// Lock the data dir and read its cluster group, printing what it holds.
+fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.File) commander.Error!offline.Summary {
+    lock.* = runtime_mod.lockExistingDataDir(data_dir) catch |err| {
+        switch (err) {
+            error.DataDirMissing => ctx.printErr("Error: data directory {s} does not exist\n", .{data_dir}),
+            error.DataDirInUse => ctx.printErr("Error: data directory {s} is in use by a running flo server; stop it first\n", .{data_dir}),
+            else => ctx.printErr("Error: cannot lock data directory {s}: {}\n", .{ data_dir, err }),
+        }
+        return error.CommandFailed;
+    };
+    const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
+        stdx.fs.closeFile(lock.*);
+        ctx.printErr("Error: cannot read the cluster group in {s}: {}\n", .{ data_dir, err });
+        return error.CommandFailed;
+    };
+    ctx.print("data dir:    {s} (cluster group)\n", .{data_dir});
+    if (sum.hard_state) |hs| {
+        ctx.print("hard state:  node {d}, term {d}, voted for {d}{s}\n", .{ hs.node_id, hs.term, hs.voted_for, if (hs.lost_log) "; lost-log guard on, not voting yet" else "" });
+    } else {
+        ctx.print("hard state:  none (never written, or lost)\n", .{});
+    }
+    if (sum.last_index == 0) {
+        ctx.print("log:         empty\n", .{});
+    } else {
+        ctx.print("log:         indices {d}..{d}, last term {d}\n", .{ sum.first_index, sum.last_index, sum.last_term });
+        ctx.print("committed:   through {d} (as last flushed)\n", .{sum.commit});
+    }
+    if (sum.member_count > 0) {
+        ctx.print("members:     {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config_index, sum.config_term });
+    } else {
+        ctx.print("members:     no member list in the log\n", .{});
+    }
+    ctx.print("snapshot:    {s}\n", .{sum.snapshot orelse "none"});
+    if (sum.truncation_pending) ctx.print("note:        a log truncation is pending; the server finishes it at its next start\n", .{});
+    return sum;
+}
+
+fn runInspect(ctx: *commander.Context) commander.Error!void {
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch return error.CommandFailed;
+    defer ctx.allocator.free(data_dir);
+    var lock: stdx.fs.File = undefined;
+    var sum = try openOffline(ctx, data_dir, &lock);
+    defer stdx.fs.closeFile(lock);
+    defer sum.deinit(ctx.allocator);
+}
+
+fn runForceMembers(ctx: *commander.Context) commander.Error!void {
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    try resolveSecret(ctx, &config);
+    const secret = config.cluster.secret orelse {
+        ctx.printErr("Error: force-members retires this node's cluster secret, and none is set; set it as the server does ([cluster] secret, secret_file or FLO_CLUSTER_SECRET)\n", .{});
+        return error.CommandFailed;
+    };
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch return error.CommandFailed;
+    defer ctx.allocator.free(data_dir);
+    var lock: stdx.fs.File = undefined;
+    var sum = try openOffline(ctx, data_dir, &lock);
+    defer stdx.fs.closeFile(lock);
+    defer sum.deinit(ctx.allocator);
+
+    if (sum.last_index == 0) {
+        ctx.printErr("Error: this node has no log; there is nothing to recover from. Run force-members on a node that has one (see inspect)\n", .{});
+        return error.CommandFailed;
+    }
+    const hs = sum.hard_state orelse {
+        ctx.printErr("Error: this node has a log but no hard state, so its node id is not on disk and force-members cannot name it. Start it once with --join and --node-id set to its id from the member list above (it writes its hard state and waits guarded), stop it, then run force-members again\n", .{});
+        return error.CommandFailed;
+    };
+    if (sum.truncation_pending) {
+        ctx.printErr("Error: a log truncation is pending; start and stop the server once to finish it, then run force-members again\n", .{});
+        return error.CommandFailed;
+    }
+    if (!ctx.getBool("yes")) {
+        if (hs.lost_log) ctx.print("\nWarning: this node's lost-log guard never finished; its log may be behind what the group committed. Prefer a survivor whose guard is off.\n", .{});
+        ctx.print("\nWould make node {d} the only voter (a member list at index {d}, everything through it committed) and retire this node's cluster secret. Run again with --yes to do it.\n", .{ hs.node_id, sum.last_index + 1 });
+        return;
+    }
+    // Retired first: a crash after the member list is written must not
+    // leave the old secret usable.
+    offline.retire(ctx.allocator, data_dir, secret, @intCast(@divFloor(@max(0, stdx.time.milliTimestamp()), 1000))) catch |err| {
+        ctx.printErr("Error: cannot record the retired secret in {s}: {}\n", .{ data_dir, err });
+        return error.CommandFailed;
+    };
+    offline.forceMembers(ctx.allocator, data_dir, &sum) catch |err| {
+        ctx.printErr("Error: cannot write the member list: {}. This node's secret is already retired and its members are unchanged, which fails safe: fix the cause and run force-members again\n", .{err});
+        return error.CommandFailed;
+    };
+    ctx.print("\nNode {d} is now the only voter (member list at index {d}).\n", .{ hs.node_id, sum.last_index + 1 });
+    ctx.print("Restart it with a new [cluster] secret (flo server secret); with it the nodes left out cannot link.\n", .{});
+    ctx.print("Reset the other nodes' data before they rejoin with --join and the new secret.\n", .{});
 }
 
 fn getDataDir(ctx: *commander.Context) []const u8 {
