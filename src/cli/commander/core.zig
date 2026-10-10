@@ -257,7 +257,12 @@ pub const Error = error{
     MissingRequiredArg,
     TooManyArgs,
     InvalidArgs,
-    CommandFailed,
+    // A command's outcome, one per exit code; cli/outcome.zig maps them.
+    NotFound,
+    Usage,
+    Refused,
+    Retryable,
+    Transport,
     HelpRequested,
     VersionRequested,
     OutOfMemory,
@@ -397,7 +402,7 @@ pub const Context = struct {
         const val = value orelse return null;
         return std.math.cast(u16, val) orelse {
             self.printErr("Error: --{s} {d} is not a port; use 1 to 65535, or 0 for the default\n", .{ name, val });
-            return error.CommandFailed;
+            return error.Usage;
         };
     }
 
@@ -1042,6 +1047,17 @@ pub const Command = struct {
             try target.validateArgs(positional_args);
         }
 
+        // A command takes the arguments it declares and no more, unless
+        // its last one is variadic.
+        if (target.run_fn != null and target.args_validator == null) {
+            const items = target.positional_args.items;
+            const variadic = items.len > 0 and items[items.len - 1].variadic;
+            if (!variadic and positional_args.len > items.len) {
+                target.printErrf("Error: unexpected argument '{s}'\n", .{positional_args[items.len]});
+                return error.TooManyArgs;
+            }
+        }
+
         // Then run custom validator if provided
         if (target.args_validator) |validator| {
             try validator(@ptrCast(target), positional_args);
@@ -1050,11 +1066,18 @@ pub const Command = struct {
         // If no run function and has subcommands, show help
         if (target.run_fn == null) {
             if (target.commands.items.len > 0) {
+                // Left-over words here name no subcommand.
+                if (positional_args.len > 0) {
+                    const path = try target.commandPath(self.allocator);
+                    defer self.allocator.free(path);
+                    target.printErrf("Error: '{s}' is not a command of '{s}'; see '{s} --help'\n", .{ positional_args[0], path, path });
+                    return error.UnknownCommand;
+                }
                 target.printHelp();
                 return;
             }
             target.printErrf("Error: '{s}' is not runnable\n", .{target.name});
-            return error.CommandFailed;
+            return error.Usage;
         }
 
         // Build context
@@ -1632,9 +1655,9 @@ test "flag parsing" {
                 ptr.* = true;
 
                 // Verify flag values through context
-                if (!ctx.getBool("verbose")) return error.CommandFailed;
-                if ((ctx.getInt("port") orelse 0) != 8080) return error.CommandFailed;
-                if (!std.mem.eql(u8, ctx.getString("name") orelse "", "hello")) return error.CommandFailed;
+                if (!ctx.getBool("verbose")) return error.Refused;
+                if ((ctx.getInt("port") orelse 0) != 8080) return error.Refused;
+                if (!std.mem.eql(u8, ctx.getString("name") orelse "", "hello")) return error.Refused;
             }
         }.run),
         .user_data = @ptrCast(&run_called),
@@ -1739,7 +1762,7 @@ test "port flag past 65535 is refused with the flag named" {
             try std.testing.expectEqual(case.port, result.port);
             try std.testing.expectEqual(case.changed_port, result.changed_port);
         } else {
-            try std.testing.expectEqual(@as(?Error, error.CommandFailed), result.err);
+            try std.testing.expectEqual(@as(?Error, error.Usage), result.err);
         }
     }
 }

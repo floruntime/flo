@@ -15,7 +15,6 @@ pub const namespace = @import("namespace.zig");
 pub const workflow = @import("workflow.zig");
 pub const processing = @import("processing.zig");
 pub const ts = @import("ts.zig");
-pub const auth = @import("auth.zig");
 pub const validate = @import("validate.zig");
 
 // Re-export convenience functions
@@ -32,7 +31,6 @@ pub const createNamespaceCommand = namespace.createNamespaceCommand;
 pub const createWorkflowCommand = workflow.createWorkflowCommand;
 pub const createProcessingCommand = processing.createProcessingCommand;
 pub const createTsCommand = ts.createTsCommand;
-pub const createAuthCommand = auth.createAuthCommand;
 pub const createValidateCommand = validate.createValidateCommand;
 
 // ==================== Testing ====================
@@ -50,6 +48,5 @@ test "all command modules" {
     _ = workflow;
     _ = processing;
     _ = ts;
-    _ = auth;
     _ = validate;
 }

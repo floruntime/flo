@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
+const wire = @import("../../util/wire.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
@@ -176,8 +178,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
 fn runCreate(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
     if (file_path.len == 0) {
-        ctx.printErr("Error: --file is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--file is required", .{});
     }
 
     const namespace = ctx.getString("namespace") orelse "default";
@@ -194,37 +195,31 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
         while (total_read < stdin_buf.len) {
             const bytes_read = std.posix.read(std.posix.STDIN_FILENO, stdin_buf[total_read..]) catch |err| {
-                ctx.printErr("Failed to read stdin: {}\n", .{err});
-                return error.CommandFailed;
+                return outcome.usage(ctx, "failed to read stdin: {}", .{err});
             };
             if (bytes_read == 0) break;
             total_read += bytes_read;
         }
 
         if (total_read == 0) {
-            ctx.printErr("Error: No input provided on stdin\n", .{});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "No input provided on stdin", .{});
         }
 
         // Copy to allocated memory
-        const buf = ctx.allocator.alloc(u8, total_read) catch |err| {
-            ctx.printErr("Failed to allocate memory: {}\n", .{err});
-            return error.CommandFailed;
-        };
+        const buf = try ctx.allocator.alloc(u8, total_read);
         @memcpy(buf, stdin_buf[0..total_read]);
         definition = buf;
         owned = true;
     } else {
         // Read from file
         const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {
-            ctx.printErr("Failed to open file '{s}': {}\n", .{ file_path, err });
-            return error.CommandFailed;
+            return outcome.usage(ctx, "failed to open file '{s}': {}", .{ file_path, err });
         };
         defer @import("stdx").fs.closeFile(file);
 
         definition = @import("stdx").fs.readToEndAlloc(file, ctx.allocator, 1024 * 1024) catch |err| {
-            ctx.printErr("Failed to read file: {}\n", .{err});
-            return error.CommandFailed;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return outcome.usage(ctx, "failed to read file '{s}': {}", .{ file_path, err });
         };
         owned = true;
     }
@@ -234,8 +229,8 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     prevalidate: {
         var diag: wf_parser.Diagnostic = .{};
         var def = wf_parser.parseWorkflow(ctx.allocator, definition, &diag) catch |err| {
-            ctx.printErr("Error: {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
-            return error.CommandFailed;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return outcome.usage(ctx, "{s}", .{diag.message()});
         };
         defer def.deinit(ctx.allocator);
 
@@ -253,7 +248,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
                 }
             }
             ctx.printErr("Hint: run 'flo validate workflow -f {s}' for full diagnostics\n", .{file_path});
-            return error.CommandFailed;
+            return error.Usage;
         }
     }
 
@@ -265,21 +260,12 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.create(&client, namespace, wf_name, definition) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.create(&client, namespace, wf_name, definition) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (result.asRawData()) |data| {
         ctx.print("Created workflow: {s}\n", .{data});
@@ -290,8 +276,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 
 fn runStart(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name") orelse {
-        ctx.printErr("Error: workflow name is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "workflow name is required", .{});
     };
     const input = ctx.getPositional("input") orelse "{}";
 
@@ -308,43 +293,30 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.start(&client, namespace, name, version, input, idem_key, rid) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.start(&client, namespace, name, version, input, idem_key, rid) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    if (result.asRawData()) |data| {
-        switch (output.getFormat(ctx)) {
-            .json => ctx.print("{{\"run_id\":\"{s}\"}}\n", .{data}),
-            .raw => ctx.print("{s}\n", .{data}),
-            .table => ctx.print("Started workflow run: {s}\n", .{data}),
-        }
-    } else {
-        ctx.print("Workflow started\n", .{});
+    // The answer is the run id.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "start response (no run id)");
+    switch (output.getFormat(ctx)) {
+        .json => ctx.print("{{\"run_id\":\"{s}\"}}\n", .{data}),
+        .raw => ctx.print("{s}\n", .{data}),
+        .table => ctx.print("Started workflow run: {s}\n", .{data}),
     }
 }
 
 fn runSignal(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id") orelse {
-        ctx.printErr("Error: run_id is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "run_id is required", .{});
     };
 
     const signal_type = ctx.getString("type") orelse "";
     if (signal_type.len == 0) {
-        ctx.printErr("Error: --type is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--type is required", .{});
     }
 
     const payload = ctx.getString("payload");
@@ -356,29 +328,19 @@ fn runSignal(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.signal(&client, namespace, run_id, signal_type, payload_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.signal(&client, namespace, run_id, signal_type, payload_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Signal '{s}' sent to workflow {s}\n", .{ signal_type, run_id });
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id") orelse {
-        ctx.printErr("Error: run_id is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "run_id is required", .{});
     };
 
     const namespace = ctx.getString("namespace") orelse "default";
@@ -387,59 +349,52 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.status(&client, namespace, run_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.status(&client, namespace, run_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Workflow run not found: {s}\n", .{run_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    if (result.asRawData()) |data| {
-        printWorkflowRunStatus(ctx, run_id, data);
-    }
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "workflow run status (empty)");
+    const st = parseRunStatus(data) catch return outcome.malformed(ctx, "workflow run status");
+
+    ctx.print("Run:      {s}\n", .{run_id});
+    ctx.print("Workflow: {s} ({s})\n", .{ st.workflow, st.version });
+    ctx.print("Status:   {s}\n", .{st.status});
+    ctx.print("Step:     {s}\n", .{st.current_step});
+    ctx.print("Input:    {s}\n", .{st.input});
+    ctx.print("Created:  {d}ms\n", .{st.created_at});
+    if (st.started_at) |v| ctx.print("Started:  {d}ms\n", .{v});
+    if (st.completed_at) |v| ctx.print("Completed:{d}ms\n", .{v});
+    if (st.wait_signal) |sig| ctx.print("Waiting:  signal={s}\n", .{sig});
 }
 
-fn printWorkflowRunStatus(ctx: *commander.Context, run_id: []const u8, data: []const u8) void {
-    var off: usize = 0;
+const RunStatus = struct {
+    workflow: []const u8,
+    version: []const u8,
+    status: []const u8,
+    current_step: []const u8,
+    input: []const u8,
+    created_at: i64,
+    started_at: ?i64,
+    completed_at: ?i64,
+    wait_signal: ?[]const u8,
+};
 
-    // skip run_id field (already have it)
-    if (off + 2 > data.len) return;
-    const rid_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2 + rid_len;
-
-    // workflow name
-    if (off + 2 > data.len) return;
-    const wf_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2;
-    if (off + wf_len > data.len) return;
-    const workflow = data[off .. off + wf_len];
-    off += wf_len;
-
-    // version
-    if (off + 2 > data.len) return;
-    const ver_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2;
-    if (off + ver_len > data.len) return;
-    const version = data[off .. off + ver_len];
-    off += ver_len;
-
-    // status
-    if (off >= data.len) return;
-    const status_str: []const u8 = switch (data[off]) {
+/// `[run_id:u16][workflow:u16][version:u16][status:u8][step:u16][input:u32]
+/// [created:i64][has:u8][started:i64]?[has:u8][completed:i64]?[has:u8][signal:u16]?`;
+/// what follows (the run's output) isn't shown.
+fn parseRunStatus(data: []const u8) error{Truncated}!RunStatus {
+    var r = wire.WireReader.init(data);
+    _ = r.readLengthPrefixed(u16) orelse return error.Truncated; // run_id
+    const workflow = r.readLengthPrefixed(u16) orelse return error.Truncated;
+    const version = r.readLengthPrefixed(u16) orelse return error.Truncated;
+    const status: []const u8 = switch (r.readU8() orelse return error.Truncated) {
         0 => "pending",
         1 => "running",
         2 => "waiting",
@@ -449,81 +404,36 @@ fn printWorkflowRunStatus(ctx: *commander.Context, run_id: []const u8, data: []c
         6 => "timed_out",
         else => "unknown",
     };
-    off += 1;
+    const current_step = r.readLengthPrefixed(u16) orelse return error.Truncated;
+    const input = r.readLengthPrefixed(u32) orelse return error.Truncated;
+    const created_at = r.readI64() orelse return error.Truncated;
+    const started_at = try optionalI64(&r);
+    const completed_at = try optionalI64(&r);
+    const has_wait = r.readU8() orelse return error.Truncated;
+    const wait_signal: ?[]const u8 = if (has_wait == 1) r.readLengthPrefixed(u16) orelse return error.Truncated else null;
+    return .{
+        .workflow = workflow,
+        .version = version,
+        .status = status,
+        .current_step = current_step,
+        .input = input,
+        .created_at = created_at,
+        .started_at = started_at,
+        .completed_at = completed_at,
+        .wait_signal = wait_signal,
+    };
+}
 
-    // current_step
-    if (off + 2 > data.len) return;
-    const step_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2;
-    if (off + step_len > data.len) return;
-    const current_step = data[off .. off + step_len];
-    off += step_len;
-
-    // input (u32-prefixed)
-    if (off + 4 > data.len) return;
-    const input_len = std.mem.readInt(u32, data[off..][0..4], .little);
-    off += 4;
-    if (off + input_len > data.len) return;
-    const input = data[off .. off + input_len];
-    off += input_len;
-
-    // created_at
-    if (off + 8 > data.len) return;
-    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
-    off += 8;
-
-    // started_at (optional)
-    var started_at: ?i64 = null;
-    if (off < data.len) {
-        if (data[off] == 1 and off + 9 <= data.len) {
-            off += 1;
-            started_at = std.mem.readInt(i64, data[off..][0..8], .little);
-            off += 8;
-        } else {
-            off += 1;
-        }
-    }
-
-    // completed_at (optional)
-    var completed_at: ?i64 = null;
-    if (off < data.len) {
-        if (data[off] == 1 and off + 9 <= data.len) {
-            off += 1;
-            completed_at = std.mem.readInt(i64, data[off..][0..8], .little);
-            off += 8;
-        } else {
-            off += 1;
-        }
-    }
-
-    // wait_signal (optional)
-    var wait_signal: ?[]const u8 = null;
-    if (off < data.len and data[off] == 1) {
-        off += 1;
-        if (off + 2 <= data.len) {
-            const wsig_len = std.mem.readInt(u16, data[off..][0..2], .little);
-            off += 2;
-            if (off + wsig_len <= data.len) {
-                wait_signal = data[off .. off + wsig_len];
-            }
-        }
-    }
-
-    ctx.print("Run:      {s}\n", .{run_id});
-    ctx.print("Workflow: {s} ({s})\n", .{ workflow, version });
-    ctx.print("Status:   {s}\n", .{status_str});
-    ctx.print("Step:     {s}\n", .{current_step});
-    ctx.print("Input:    {s}\n", .{input});
-    ctx.print("Created:  {d}ms\n", .{created_at});
-    if (started_at) |v| ctx.print("Started:  {d}ms\n", .{v});
-    if (completed_at) |v| ctx.print("Completed:{d}ms\n", .{v});
-    if (wait_signal) |sig| ctx.print("Waiting:  signal={s}\n", .{sig});
+/// `[has:u8][value:i64]?`.
+fn optionalI64(r: *wire.WireReader) error{Truncated}!?i64 {
+    const has = r.readU8() orelse return error.Truncated;
+    if (has == 0) return null;
+    return r.readI64() orelse return error.Truncated;
 }
 
 fn runHistory(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id") orelse {
-        ctx.printErr("Error: run_id is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "run_id is required", .{});
     };
 
     const limit = ctx.getUint("limit") orelse 100;
@@ -533,37 +443,25 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.history(&client, namespace, run_id, @intCast(limit)) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.history(&client, namespace, run_id, @intCast(limit)) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Workflow run not found: {s}\n", .{run_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
+    // A run with no events still answers with a count of 0.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "history response (empty)");
     ctx.print("History for run: {s}\n", .{run_id});
-    if (result.asRawData()) |data| {
-        output.printWireList(ctx, data, "(no events)", &.{
-            .{ .field = "type", .header = "TYPE", .field_type = .str_u16, .alignment = .left },
-            .{ .field = "detail", .header = "DETAIL", .field_type = .str_u16, .alignment = .left },
-            .{ .field = "timestamp", .header = "", .field_type = .int_i64 },
-        });
-    } else {
-        ctx.print("(no events)\n", .{});
-    }
+    output.printWireList(ctx, data, "(no events)", &.{
+        .{ .field = "type", .header = "TYPE", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "detail", .header = "DETAIL", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "timestamp", .header = "", .field_type = .int_i64 },
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 fn runListRuns(ctx: *commander.Context) commander.Error!void {
@@ -578,8 +476,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 
     // Require at least one filter
     if (name.len == 0 and search_val == null and status_val == null) {
-        ctx.printErr("Error: specify --workflow, --status, or --search to list runs\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "specify --workflow, --status, or --search to list runs", .{});
     }
 
     const limit = ctx.getUint("limit") orelse 100;
@@ -589,43 +486,31 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit), status_val, null, search_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit), status_val, null, search_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
+    // No matching runs still answers with a count of 0.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
     if (name.len > 0) {
         ctx.print("Runs for workflow: {s}\n", .{name});
     } else {
         ctx.print("Runs across all workflows:\n", .{});
     }
-    if (result.asRawData()) |data| {
-        output.printWireList(ctx, data, "(no runs)", &.{
-            .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
-            .{ .field = "workflow", .header = "WORKFLOW", .field_type = .str_u16, .alignment = .left },
-            .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
-            .{ .field = "created_at", .header = "", .field_type = .int_i64 },
-        });
-    } else {
-        ctx.print("(no runs)\n", .{});
-    }
+    output.printWireList(ctx, data, "(no runs)", &.{
+        .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "workflow", .header = "WORKFLOW", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
+        .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 fn runCancel(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id") orelse {
-        ctx.printErr("Error: run_id is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "run_id is required", .{});
     };
 
     const reason = ctx.getString("reason");
@@ -637,34 +522,23 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.cancel(&client, namespace, run_id, reason_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.cancel(&client, namespace, run_id, reason_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Workflow run not found: {s}\n", .{run_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Workflow run not found: {s}", .{run_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Workflow {s} cancelled\n", .{run_id});
 }
 
 fn runGetDefinition(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name") orelse {
-        ctx.printErr("Error: workflow name is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "workflow name is required", .{});
     };
 
     const version = ctx.getString("version");
@@ -676,42 +550,25 @@ fn runGetDefinition(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.getDefinition(&client, namespace, name, version_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.getDefinition(&client, namespace, name, version_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Workflow not found: {s}\n", .{name});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Workflow not found: {s}", .{name});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    if (result.asRawData()) |data| {
-        if (data.len > 0) {
-            ctx.print("{s}\n", .{data});
-        } else {
-            ctx.print("(no definition)\n", .{});
-        }
-    } else {
-        ctx.print("(no definition)\n", .{});
-    }
+    // The answer is the stored definition; an absent one is not_found.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "definition response (empty)");
+    ctx.print("{s}\n", .{data});
 }
 
 fn runDisable(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name") orelse {
-        ctx.printErr("Error: workflow name is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "workflow name is required", .{});
     };
 
     const version = ctx.getString("version");
@@ -723,21 +580,12 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.disable(&client, namespace, name, version_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.disable(&client, namespace, name, version_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (version_val) |v| {
         ctx.print("Workflow '{s}' v{s} disabled\n", .{ name, v });
@@ -748,8 +596,7 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
 
 fn runEnable(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name") orelse {
-        ctx.printErr("Error: workflow name is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "workflow name is required", .{});
     };
 
     const version = ctx.getString("version");
@@ -761,21 +608,12 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.enable(&client, namespace, name, version_val) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.enable(&client, namespace, name, version_val) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (version_val) |v| {
         ctx.print("Workflow '{s}' v{s} enabled\n", .{ name, v });
@@ -791,32 +629,21 @@ fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.listDefinitions(&client, namespace) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.workflow.listDefinitions(&client, namespace) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    const data = result.asRawData() orelse {
-        ctx.print("(no workflows)\n", .{});
-        return;
-    };
+    // No definitions still answers with a count of 0.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "list response (empty)");
 
     output.printWireList(ctx, data, "(no workflows)", &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
         .{ .field = "version", .header = "VERSION", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at", .header = "", .field_type = .int_i64 },
-    });
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 // =============================================================================
@@ -883,4 +710,17 @@ fn extractWorkflowName(content: []const u8) ?[]const u8 {
         i = pos + 4;
     }
     return null;
+}
+
+test "workflow: a run status parses, and a cut-short one is Truncated" {
+    const answer = "\x02\x00r1" ++ "\x02\x00wf" ++ "\x01\x00" ++ "1" ++ "\x02" ++ "\x01\x00s" ++
+        "\x02\x00\x00\x00{}" ++ "\x0a" ++ "\x00" ** 7 ++ "\x01" ++ "\x0b" ++ "\x00" ** 7 ++ "\x00" ++
+        "\x01" ++ "\x02\x00go";
+    const st = try parseRunStatus(answer);
+    try std.testing.expectEqualStrings("wf", st.workflow);
+    try std.testing.expectEqualStrings("waiting", st.status);
+    try std.testing.expectEqual(@as(?i64, 11), st.started_at);
+    try std.testing.expectEqual(@as(?i64, null), st.completed_at);
+    try std.testing.expectEqualStrings("go", st.wait_signal.?);
+    for (0..answer.len) |n| try std.testing.expectError(error.Truncated, parseRunStatus(answer[0..n]));
 }

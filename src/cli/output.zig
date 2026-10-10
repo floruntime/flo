@@ -296,19 +296,18 @@ const FieldValue = union(enum) {
 ///
 /// Only the count and per-entry fields are consumed. The has_more/cursor
 /// trailer (if present) is left unread — callers needing pagination should
-/// inspect `data` themselves after this function returns.
+/// inspect `data` themselves after this function returns. An answer without
+/// a count, or with fewer whole entries than it says, is Truncated.
 pub fn printWireList(
     ctx: *Context,
     data: []const u8,
     empty_message: []const u8,
     columns: []const WireColumn,
-) void {
+) error{Truncated}!void {
+    // Checked whole before anything prints, so a cut answer prints nothing.
+    const count = try checkWireList(data, columns);
     var reader = WireReader.init(data);
-
-    const count = reader.readU32() orelse {
-        ctx.print("{s}\n", .{empty_message});
-        return;
-    };
+    _ = reader.readU32();
     if (count == 0) {
         ctx.print("{s}\n", .{empty_message});
         return;
@@ -341,37 +340,48 @@ fn readFieldValue(reader: *WireReader, col: WireColumn) ?FieldValue {
             break :blk .{ .optional_string = if (has == 1) (reader.readLengthPrefixed(u16) orelse return null) else null };
         },
         .skip_counted_records_u16 => blk: {
-            skipField(reader, col);
+            skipField(reader, col) catch return null;
             break :blk .skipped;
         },
     };
 }
 
 /// Advance the reader past a single wire field (used for skipping).
-fn skipField(reader: *WireReader, col: WireColumn) void {
+fn skipField(reader: *WireReader, col: WireColumn) error{Truncated}!void {
+    const T = error.Truncated;
     switch (col.field_type) {
-        .str_u16 => _ = reader.readLengthPrefixed(u16),
-        .str_u32 => _ = reader.readLengthPrefixed(u32),
-        .uint_u32 => _ = reader.readU32(),
-        .uint_u64 => _ = reader.readU64(),
-        .int_i64, .timestamp_i64 => _ = reader.readI64(),
-        .enum_u8 => _ = reader.readU8(),
+        .str_u16 => _ = reader.readLengthPrefixed(u16) orelse return T,
+        .str_u32 => _ = reader.readLengthPrefixed(u32) orelse return T,
+        .uint_u32 => _ = reader.readU32() orelse return T,
+        .uint_u64 => _ = reader.readU64() orelse return T,
+        .int_i64, .timestamp_i64 => _ = reader.readI64() orelse return T,
+        .enum_u8 => _ = reader.readU8() orelse return T,
         .optional_timestamp_i64 => {
-            const has = reader.readU8() orelse return;
-            if (has == 1) _ = reader.readI64();
+            const has = reader.readU8() orelse return T;
+            if (has == 1) _ = reader.readI64() orelse return T;
         },
         .optional_str_u16 => {
-            const has = reader.readU8() orelse return;
-            if (has == 1) _ = reader.readLengthPrefixed(u16);
+            const has = reader.readU8() orelse return T;
+            if (has == 1) _ = reader.readLengthPrefixed(u16) orelse return T;
         },
         .skip_counted_records_u16 => {
-            const cnt = reader.readU16() orelse return;
+            const cnt = reader.readU16() orelse return T;
             var j: u16 = 0;
             while (j < cnt) : (j += 1) {
-                for (col.sub_columns orelse return) |sc| skipField(reader, sc);
+                for (col.sub_columns orelse &.{}) |sc| try skipField(reader, sc);
             }
         },
     }
+}
+
+/// Checks that `data` holds a count and that many whole entries.
+fn checkWireList(data: []const u8, columns: []const WireColumn) error{Truncated}!u32 {
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse return error.Truncated;
+    for (0..count) |_| {
+        for (columns) |col| try skipField(&reader, col);
+    }
+    return count;
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────
@@ -745,4 +755,29 @@ test "format duration" {
 
     const result2 = formatDuration(3661);
     try std.testing.expect(std.mem.startsWith(u8, &result2, "1h"));
+}
+
+test "output: a wire list cut short is Truncated before anything prints" {
+    const cols = [_]WireColumn{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+        .{ .field = "n", .header = "N", .field_type = .uint_u32 },
+    };
+    const entry = [_]u8{ 1, 0 } ++ "a".* ++ [_]u8{ 7, 0, 0, 0 };
+    const data = [_]u8{ 2, 0, 0, 0 } ++ entry ++ entry;
+    try std.testing.expectEqual(@as(u32, 2), try checkWireList(&data, &cols));
+    for (0..data.len) |n| try std.testing.expectError(error.Truncated, checkWireList(data[0..n], &cols));
+}
+
+test "output: printWireList refuses a cut answer before printing anything" {
+    const outcome = @import("outcome.zig");
+    var q = try outcome.QuietContext.init(std.testing.allocator);
+    defer q.deinit();
+    const cols = [_]WireColumn{
+        .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+        .{ .field = "n", .header = "N", .field_type = .uint_u32 },
+    };
+    const entry = [_]u8{ 1, 0 } ++ "a".* ++ [_]u8{ 7, 0, 0, 0 };
+    const data = [_]u8{ 2, 0, 0, 0 } ++ entry ++ entry;
+    try printWireList(&q.ctx, &data, "(none)", &cols);
+    for (0..data.len) |n| try std.testing.expectError(error.Truncated, printWireList(&q.ctx, data[0..n], "(none)", &cols));
 }

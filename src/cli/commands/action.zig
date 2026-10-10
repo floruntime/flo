@@ -10,6 +10,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_output = @import("../output.zig");
@@ -96,7 +97,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .about("Delete an action")
                 .aliases(&.{"rm"})
                 .arg("name", "Action name to delete")
-                .boolFlag("force", 'f', "Force delete even if running")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runDelete)),
@@ -135,7 +135,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                     "flo worker register gpu-worker-1 render --labels '{\"gpu\":true,\"vram_gb\":24}'",
                 })
                 .arg("worker_id", "Worker identifier")
-                .arg("task_types", "Task types to handle")
+                .variadicArg("task_types", "Task types to handle, one or more")
                 .stringFlag("labels", 'l', "", "Worker labels (JSON, e.g. '{\"gpu\":true}')")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
@@ -145,7 +145,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
             commander.newBuilder(allocator)
                 .name("await")
                 .about("Wait for tasks")
-                .arg("task_types", "Task types to wait for")
+                .variadicArg("task_types", "Task types to wait for, one or more")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .uintFlag("block", 'b', 5000, "Block for tasks (ms, at most 300000; 0 = don't wait)")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
@@ -239,22 +239,13 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // register(client, namespace, action_name, action_type, owner, timeout_ms, max_retries, retry_delay_ms, wasm_bytes)
-    var result = client_mod.action.register(&client, namespace, name, 0, owner, @intCast(timeout), @intCast(retries), null, null) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return;
-    };
+    var result = client_mod.action.register(&client, namespace, name, 0, owner, @intCast(timeout), @intCast(retries), null, null) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Registered action: {s}\n", .{name});
 }
@@ -271,21 +262,12 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.invoke(&client, namespace, name, input, required_labels) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.invoke(&client, namespace, name, input, required_labels) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     // Response wire format: [run_id_len:u16][run_id][has_output:u8][output_len:u32]?[output]?
     if (result.asRawData()) |data| {
@@ -322,31 +304,21 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // status(client, namespace, run_id)
-    var result = client_mod.action.status(&client, namespace, run_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.status(&client, namespace, run_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Run not found: {s}\n", .{run_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Run not found: {s}", .{run_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Run: {s}\n", .{run_id});
     if (result.asRawData()) |data| {
-        printActionRunStatus(ctx, data);
+        try printActionRunStatus(ctx, data);
     }
 }
 
@@ -355,21 +327,16 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 ///         [has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
 ///         [has_output:u8][output_len?:u32][output?][has_error:u8][error_len?:u32][error?]
 ///         [retry_count:u32]
-fn printActionRunStatus(ctx: *commander.Context, data: []const u8) void {
+fn printActionRunStatus(ctx: *commander.Context, data: []const u8) commander.Error!void {
+    printRunFields(ctx, data) catch return outcome.malformed(ctx, "action run status");
+}
+
+fn printRunFields(ctx: *commander.Context, data: []const u8) error{Truncated}!void {
     var off: usize = 0;
+    _ = try readSlice(data, &off); // run_id, already printed by the caller
 
-    // run_id
-    const rid = readSlice(data, &off) orelse {
-        ctx.print("{s}\n", .{data});
-        return;
-    };
-    _ = rid; // already printed by caller as "Run: <run_id>"
-
-    // status
-    if (off >= data.len) return;
-    const status_byte = data[off];
-    off += 1;
-    const status_str: []const u8 = switch (status_byte) {
+    if (off >= data.len) return error.Truncated;
+    const status_str: []const u8 = switch (data[off]) {
         0 => "pending",
         1 => "running",
         2 => "completed",
@@ -378,70 +345,50 @@ fn printActionRunStatus(ctx: *commander.Context, data: []const u8) void {
         5 => "timed_out",
         else => "unknown",
     };
+    off += 1;
     ctx.print("status: {s}\n", .{status_str});
 
-    // created_at
-    if (off + 8 > data.len) return;
-    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
+    if (off + 8 > data.len) return error.Truncated;
+    ctx.print("created_at: {d}\n", .{std.mem.readInt(i64, data[off..][0..8], .little)});
     off += 8;
-    ctx.print("created_at: {d}\n", .{created_at});
 
-    // started_at (optional)
-    if (readOptionalI64(data, &off)) |started| {
-        ctx.print("started_at: {d}\n", .{started});
-    }
+    if (try readOptionalI64(data, &off)) |started| ctx.print("started_at: {d}\n", .{started});
+    if (try readOptionalI64(data, &off)) |completed| ctx.print("completed_at: {d}\n", .{completed});
+    if (try readOptionalSlice(data, &off)) |output| ctx.print("output: {s}\n", .{output});
+    if (try readOptionalSlice(data, &off)) |err_msg| ctx.print("error: {s}\n", .{err_msg});
 
-    // completed_at (optional)
-    if (readOptionalI64(data, &off)) |completed| {
-        ctx.print("completed_at: {d}\n", .{completed});
-    }
-
-    // output (optional slice)
-    if (readOptionalSlice(data, &off)) |output| {
-        ctx.print("output: {s}\n", .{output});
-    }
-
-    // error_message (optional slice)
-    if (readOptionalSlice(data, &off)) |err_msg| {
-        ctx.print("error: {s}\n", .{err_msg});
-    }
-
-    // retry_count
-    if (off + 4 <= data.len) {
-        const retries = std.mem.readInt(u32, data[off..][0..4], .little);
-        if (retries > 0) {
-            ctx.print("retry_count: {d}\n", .{retries});
-        }
-    }
+    if (off + 4 > data.len) return error.Truncated;
+    const retries = std.mem.readInt(u32, data[off..][0..4], .little);
+    if (retries > 0) ctx.print("retry_count: {d}\n", .{retries});
 }
 
-fn readSlice(data: []const u8, off: *usize) ?[]const u8 {
-    if (off.* + 4 > data.len) return null;
+fn readSlice(data: []const u8, off: *usize) error{Truncated}![]const u8 {
+    if (off.* + 4 > data.len) return error.Truncated;
     const len = std.mem.readInt(u32, data[off.*..][0..4], .little);
     off.* += 4;
-    if (off.* + len > data.len) return null;
+    if (off.* + len > data.len) return error.Truncated;
     const slice = data[off.* .. off.* + len];
     off.* += len;
     return slice;
 }
 
-fn readOptionalI64(data: []const u8, off: *usize) ?i64 {
-    if (off.* >= data.len) return null;
+fn readOptionalI64(data: []const u8, off: *usize) error{Truncated}!?i64 {
+    if (off.* >= data.len) return error.Truncated;
     const has = data[off.*];
     off.* += 1;
     if (has == 0) return null;
-    if (off.* + 8 > data.len) return null;
+    if (off.* + 8 > data.len) return error.Truncated;
     const val = std.mem.readInt(i64, data[off.*..][0..8], .little);
     off.* += 8;
     return val;
 }
 
-fn readOptionalSlice(data: []const u8, off: *usize) ?[]const u8 {
-    if (off.* >= data.len) return null;
+fn readOptionalSlice(data: []const u8, off: *usize) error{Truncated}!?[]const u8 {
+    if (off.* >= data.len) return error.Truncated;
     const has = data[off.*];
     off.* += 1;
     if (has == 0) return null;
-    return readSlice(data, off);
+    return try readSlice(data, off);
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
@@ -452,10 +399,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Collect all action names across shards using cursor-based shard walking
     var all_names: std.ArrayList([]const u8) = .empty;
@@ -472,33 +416,27 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Walk all shards until no more data
     while (all_names.items.len < limit) {
-        var result = client_mod.action.list(&client, namespace, null, cursor) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return;
-        };
+        var result = client_mod.action.list(&client, namespace, null, cursor) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
 
-        if (result.isError()) {
-            ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-            return;
-        }
+        try outcome.check(ctx, result);
 
         // action_list returns scan format:
         // [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16][cursor]?
-        const data = result.asRawData() orelse break;
-        if (data.len < 4) break;
+        const what = "action list";
+        var reader = WireReader.init(result.data);
+        const count = reader.readU32() orelse return outcome.malformed(ctx, what);
 
-        var reader = WireReader.init(data);
-        const count = reader.readU32() orelse break;
-
-        // Parse entries
+        // Read the whole page, so its trailer is read from the right place
+        // even when the limit is reached partway.
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            const key_len = reader.readU16() orelse break;
-            const key = reader.readSlice(key_len) orelse break;
-            // Skip value (keys_only but value field still present)
-            const val_len = reader.readU32() orelse break;
-            _ = reader.readSlice(val_len);
+            const key_len = reader.readU16() orelse return outcome.malformed(ctx, what);
+            const key = reader.readSlice(key_len) orelse return outcome.malformed(ctx, what);
+            // keys_only, but the value field is still present
+            const val_len = reader.readU32() orelse return outcome.malformed(ctx, what);
+            _ = reader.readSlice(val_len) orelse return outcome.malformed(ctx, what);
+            if (all_names.items.len >= limit) continue;
 
             // Extract action name from key (format: _action:{name})
             const name = if (std.mem.startsWith(u8, key, "_action:"))
@@ -506,21 +444,16 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             else
                 key;
 
-            const name_copy = ctx.allocator.dupe(u8, name) catch break;
-            all_names.append(ctx.allocator, name_copy) catch {
+            const name_copy = try ctx.allocator.dupe(u8, name);
+            all_names.append(ctx.allocator, name_copy) catch |err| {
                 ctx.allocator.free(name_copy);
-                break;
+                return err;
             };
-
-            if (all_names.items.len >= limit) break;
         }
 
-        // Read has_more flag
-        const has_more = (reader.readU8() orelse 0) != 0;
-
-        // Read next cursor
-        const cursor_len = reader.readU16() orelse 0;
-        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
+        const has_more = (reader.readU8() orelse return outcome.malformed(ctx, what)) != 0;
+        const cursor_len = reader.readU16() orelse return outcome.malformed(ctx, what);
+        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) orelse return outcome.malformed(ctx, what) else null;
 
         // Free previous cursor and copy new one
         if (cursor_owned) |c| ctx.allocator.free(c);
@@ -529,7 +462,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         if (!has_more or next_cursor == null) break;
 
         // Copy cursor for next iteration
-        cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
+        cursor_owned = try ctx.allocator.dupe(u8, next_cursor.?);
         cursor = cursor_owned;
     }
 
@@ -548,27 +481,17 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
     const namespace = ctx.getString("namespace") orelse "default";
     const endpoint = cli_config.getEndpoint(ctx);
-    _ = ctx.getBool("force"); // Not yet used
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // delete(client, namespace, action_name)
-    var result = client_mod.action.delete(&client, namespace, name) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return;
-    };
+    var result = client_mod.action.delete(&client, namespace, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Deleted action: {s}\n", .{name});
 }
@@ -582,21 +505,12 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.listRuns(&client, namespace, name, limit) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.listRuns(&client, namespace, name, limit) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse {
         ctx.print("(no runs)\n", .{});
@@ -612,14 +526,15 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
         .{ .field = "created", .header = "CREATED", .field_type = .timestamp_i64 },
         .{ .field = "started", .header = "STARTED", .field_type = .optional_timestamp_i64 },
         .{ .field = "completed", .header = "COMPLETED", .field_type = .optional_timestamp_i64 },
-    });
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 // Worker handlers
 
 fn runWorkerRegister(ctx: *commander.Context) commander.Error!void {
     const worker_id = ctx.getPositional("worker_id").?; // validated by commander
-    const task_types_str = ctx.getPositional("task_types").?; // validated by commander
+    const task_types = ctx.getVariadicArgs("task_types") orelse &.{};
+    if (task_types.len == 0) return outcome.usage(ctx, "give at least one task type", .{});
 
     const namespace = ctx.getString("namespace") orelse "default";
     const labels_str = ctx.getString("labels") orelse "";
@@ -629,32 +544,22 @@ fn runWorkerRegister(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    const task_types = &[_][]const u8{task_types_str};
-    var result = client_mod.action.workerRegister(&client, namespace, worker_id, task_types, labels) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return;
-    };
+    var result = client_mod.action.workerRegister(&client, namespace, worker_id, task_types, labels) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Registered worker: {s}\n", .{worker_id});
 }
 
 fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
-    const task_types_str = ctx.getPositional("task_types").?; // validated by commander
+    const task_types = ctx.getVariadicArgs("task_types") orelse &.{};
+    if (task_types.len == 0) return outcome.usage(ctx, "give at least one task type", .{});
 
     const worker_id = ctx.getString("worker-id") orelse {
-        ctx.printErr("Error: Missing --worker-id\n", .{});
-        return;
+        return outcome.usage(ctx, "Missing --worker-id", .{});
     };
 
     const block = ctx.getUint("block") orelse 5000;
@@ -664,22 +569,12 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    const task_types = &[_][]const u8{task_types_str};
-    var result = client_mod.action.workerAwait(&client, namespace, worker_id, task_types, @intCast(block)) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerAwait(&client, namespace, worker_id, task_types, @intCast(block)) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     // A task assignment answer:
     //   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
@@ -701,8 +596,7 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
         const task_id_len = std.mem.readInt(u16, data[0..2], .little);
         pos += 2;
         if (data.len < pos + task_id_len) {
-            ctx.printErr("Error: Invalid task assignment format\n", .{});
-            return error.CommandFailed;
+            return outcome.malformed(ctx, "task assignment");
         }
 
         const task_id = data[pos..][0..task_id_len];
@@ -743,8 +637,7 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
     const task_id = ctx.getPositional("task_id").?; // validated by commander
 
     const worker_id = ctx.getString("worker-id") orelse {
-        ctx.printErr("Error: Missing --worker-id\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Missing --worker-id", .{});
     };
 
     const action_name = ctx.getString("action") orelse "";
@@ -755,22 +648,13 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // workerComplete(client, namespace, worker_id, action_name, task_id, result)
-    var result = client_mod.action.workerComplete(&client, namespace, worker_id, action_name, task_id, result_payload) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerComplete(&client, namespace, worker_id, action_name, task_id, result_payload) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -779,8 +663,7 @@ fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
     const task_id = ctx.getPositional("task_id").?; // validated by commander
 
     const worker_id = ctx.getString("worker-id") orelse {
-        ctx.printErr("Error: Missing --worker-id\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Missing --worker-id", .{});
     };
 
     const action_name = ctx.getString("action") orelse "";
@@ -792,21 +675,12 @@ fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
     // workerFail(client, namespace, worker_id, action_name, task_id, error_message, retry)
-    var result = client_mod.action.workerFail(&client, namespace, worker_id, action_name, task_id, error_msg, allow_retry) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerFail(&client, namespace, worker_id, action_name, task_id, error_msg, allow_retry) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -815,8 +689,7 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
     const task_id = ctx.getPositional("task_id").?; // validated by commander
 
     const worker_id = ctx.getString("worker-id") orelse {
-        ctx.printErr("Error: Missing --worker-id\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Missing --worker-id", .{});
     };
 
     const action_name = ctx.getString("action") orelse "";
@@ -827,22 +700,13 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // workerTouch(client, namespace, worker_id, action_name, task_id, extend_ms)
-    var result = client_mod.action.workerTouch(&client, namespace, worker_id, action_name, task_id, @intCast(extend)) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerTouch(&client, namespace, worker_id, action_name, task_id, @intCast(extend)) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -854,21 +718,12 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.workerList(&client, namespace, 100, null) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return;
-    };
+    var result = client_mod.action.workerList(&client, namespace, 100, null) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, result);
 
     // Wire format: [count:u32](worker_record)*[has_more:u8][cursor_len:u16]
     const data = result.asRawData() orelse {
@@ -903,7 +758,7 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         },
         .{ .field = "", .header = "", .field_type = .optional_str_u16 }, // metadata (skip)
         .{ .field = "machine", .header = "MACHINE", .field_type = .optional_str_u16 },
-    });
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
@@ -914,21 +769,12 @@ fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.workerDrain(&client, namespace, worker_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerDrain(&client, namespace, worker_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Draining worker: {s}\n", .{worker_id});
 }
@@ -941,39 +787,29 @@ fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.workerInfo(&client, namespace, worker_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.action.workerInfo(&client, namespace, worker_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse {
-        ctx.printErr("No data returned\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "worker record (empty response)");
     };
 
     // Parse worker_record wire format
     var reader = WireReader.init(data);
-    const id_len = reader.readU16() orelse return;
-    const id = reader.readSlice(id_len) orelse return;
-    const wtype = reader.readU8() orelse return;
-    const wstatus = reader.readU8() orelse return;
-    const tasks_completed = reader.readU64() orelse return;
-    const tasks_failed = reader.readU64() orelse return;
-    const current_load = reader.readU32() orelse return;
-    const max_concurrency = reader.readU32() orelse return;
-    const registered_at = reader.readI64() orelse return;
-    const last_heartbeat = reader.readI64() orelse return;
+    const id_len = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
+    const id = reader.readSlice(id_len) orelse return outcome.malformed(ctx, "worker record");
+    const wtype = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
+    const wstatus = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
+    const tasks_completed = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
+    const tasks_failed = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
+    const current_load = reader.readU32() orelse return outcome.malformed(ctx, "worker record");
+    const max_concurrency = reader.readU32() orelse return outcome.malformed(ctx, "worker record");
+    const registered_at = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
+    const last_heartbeat = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
 
     const type_str: []const u8 = if (wtype == 0) "action" else "stream";
     const status_str: []const u8 = switch (wstatus) {
@@ -994,17 +830,17 @@ fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
     ctx.print("Last Heartbeat:  {d}\n", .{last_heartbeat});
 
     // Processes
-    const proc_count = reader.readU16() orelse return;
+    const proc_count = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
     if (proc_count > 0) {
         ctx.print("\nProcesses ({d}):\n", .{proc_count});
         var pi: u16 = 0;
         while (pi < proc_count) : (pi += 1) {
-            const nlen = reader.readU16() orelse break;
-            const name = reader.readSlice(nlen) orelse break;
-            const kind = reader.readU8() orelse break;
-            const run_count = reader.readU64() orelse break;
-            const fail_count = reader.readU64() orelse break;
-            const last_run = reader.readI64() orelse break;
+            const nlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
+            const name = reader.readSlice(nlen) orelse return outcome.malformed(ctx, "worker record");
+            const kind = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
+            const run_count = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
+            const fail_count = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
+            const last_run = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
             const kind_str: []const u8 = if (kind == 0) "action" else "stream_consumer";
             ctx.print("  {s} ({s}) — runs: {d}, fails: {d}, last_run: {d}\n", .{
                 name, kind_str, run_count, fail_count, last_run,
@@ -1013,18 +849,18 @@ fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
     }
 
     // Metadata
-    const has_meta = reader.readU8() orelse return;
+    const has_meta = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
     if (has_meta == 1) {
-        const mlen = reader.readU16() orelse return;
-        const meta = reader.readSlice(mlen) orelse return;
+        const mlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
+        const meta = reader.readSlice(mlen) orelse return outcome.malformed(ctx, "worker record");
         ctx.print("Metadata:        {s}\n", .{meta});
     }
 
     // Machine ID
-    const has_mid = reader.readU8() orelse return;
+    const has_mid = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
     if (has_mid == 1) {
-        const midlen = reader.readU16() orelse return;
-        const mid = reader.readSlice(midlen) orelse return;
+        const midlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
+        const mid = reader.readSlice(midlen) orelse return outcome.malformed(ctx, "worker record");
         ctx.print("Machine ID:      {s}\n", .{mid});
     }
 }
@@ -1049,4 +885,16 @@ test "create worker command" {
 
     try std.testing.expectEqualStrings("worker", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 3);
+}
+
+test "action status: a run status cut short is Truncated" {
+    var q = try outcome.QuietContext.init(std.testing.allocator);
+    defer q.deinit();
+    // [run_id_len:u32][run_id][status:u8][created_at:i64][has_started:u8][has_completed:u8]
+    // [has_output:u8][has_error:u8][retry_count:u32]
+    const answer = [_]u8{ 1, 0, 0, 0 } ++ "r".* ++ [_]u8{2} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{0} ** 4;
+    try printRunFields(&q.ctx, &answer);
+    for (0..answer.len) |n| {
+        try std.testing.expectError(error.Truncated, printRunFields(&q.ctx, answer[0..n]));
+    }
 }

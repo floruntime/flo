@@ -131,12 +131,12 @@ test "e2e/ts: write refuses a value that is not a finite number" {
     for ([_][]const u8{ "abc", "nan", "inf", "1.5x" }) |v| {
         var r = try ctx.cli.run(&.{ "ts", "write", "bad_value", "--value", v });
         defer r.deinit();
-        try testing.expect(r.exit_code != 0);
+        try testing.expectEqual(@as(u8, 2), r.exit_code);
         try testing.expect(r.stderrContains(v));
     }
     var f = try ctx.cli.run(&.{ "ts", "write", "bad_value", "--fields", "a=1,b=nope" });
     defer f.deinit();
-    try testing.expect(f.exit_code != 0);
+    try testing.expectEqual(@as(u8, 2), f.exit_code);
     try testing.expect(f.stderrContains("nope"));
 
     // Nothing was written, not even field a.
@@ -265,7 +265,8 @@ test "e2e/ts: write batch reports a bad line and stores the rest" {
 
     var w = try ctx.cli.run(&.{ "ts", "write", "--batch", "--file", tmp_path });
     defer w.deinit();
-    try testing.expect(w.exit_code != 0);
+    // The first failed line couldn't be parsed: the command's input.
+    try testing.expectEqual(@as(u8, 2), w.exit_code);
     // Blank and comment lines are counted, so the bad line is number 4.
     try testing.expect(w.stderrContains("line 4: "));
     // A line with one bad field writes none of its fields.
@@ -276,7 +277,8 @@ test "e2e/ts: write batch reports a bad line and stores the rest" {
     try testing.expect(w.stderrContains("line 10: tag key 'host' is given more than once"));
     try testing.expect(w.stderrContains("line 11: field 'rx' is given more than once"));
     try testing.expect(w.stderrContains("line 12: integer '9007199254740993i' is past 2^53"));
-    try testing.expect(w.stdoutContains("Wrote 2 points (8 lines failed)"));
+    try testing.expect(w.stdoutContains("Wrote 2 points"));
+    try testing.expect(w.stderrContains("8 of 10 lines failed"));
 
     var r = try ctx.cli.run(&.{ "ts", "read", "net", "--tags", "host=a", "--field", "rx", "--from", "1708700000000", "-o", "raw" });
     defer r.deinit();
@@ -326,7 +328,7 @@ test "e2e/ts: write refuses flags --batch would ignore, and bad timestamps and f
     for (cases) |c| {
         var r = try ctx.cli.run(c.args);
         defer r.deinit();
-        try testing.expect(r.exit_code != 0);
+        try testing.expectEqual(@as(u8, 2), r.exit_code);
         try testing.expect(r.stderrContains(c.why));
     }
 
@@ -1650,11 +1652,12 @@ test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsampl
 
     var missing = try ctx.cli.run(&.{ "ts", "retention", "cpu" });
     defer missing.deinit();
+    try testing.expectEqual(@as(u8, 2), missing.exit_code);
     try testing.expect(missing.contains("--raw-ttl is required"));
     for ([_][]const u8{ "--show", "--downsample" }) |flag| {
         var r = try ctx.cli.run(&.{ "ts", "retention", "cpu", "--raw-ttl", "7d", flag, "1m:avg:30d" });
         defer r.deinit();
-        try testing.expect(!r.succeeded());
+        try testing.expectEqual(@as(u8, 2), r.exit_code);
     }
 
     // An older client's rule is refused, not ignored.

@@ -118,6 +118,8 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addOptions("test_root", unit_root.options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Some tests read source files (the CLI lint), by paths from the root.
+    run_unit_tests.setCwd(b.path("."));
 
     // stdx is its own module, and module dependencies contribute no tests to
     // a test root — everything in stdx (PRNG, log, helpers) was invisible to

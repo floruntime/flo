@@ -265,8 +265,8 @@ test "e2e/action: status on invalid run_id" {
     });
     defer result.deinit();
 
-    // Should fail with error (not crash)
-    try testing.expect(!result.succeeded());
+    // An unknown run is not found.
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 test "e2e/worker: complete non-existent task" {
@@ -284,8 +284,8 @@ test "e2e/worker: complete non-existent task" {
     });
     defer result.deinit();
 
-    // Should fail gracefully
-    try testing.expect(!result.succeeded());
+    // The task names no run: not found.
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 test "e2e/worker: fail non-existent task" {
@@ -303,8 +303,8 @@ test "e2e/worker: fail non-existent task" {
     });
     defer result.deinit();
 
-    // Should fail gracefully
-    try testing.expect(!result.succeeded());
+    // The task names no run: not found.
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 // =============================================================================
@@ -482,9 +482,9 @@ test "e2e/action/worker: worker fails task with retry" {
     });
     defer await_result.deinit();
 
-    if (!await_result.succeeded()) return; // Skip if server error
-    const await_out = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
-    if (await_out.len == 0 or std.mem.eql(u8, await_out, "(no tasks)")) return; // No task yet
+    // The invoke has applied, so the task is there to take.
+    try testing.expectEqual(@as(u8, 0), await_result.exit_code);
+    try testing.expect(await_result.stdoutContains(run_id));
 
     // 5. Worker fails the task (with retry enabled)
     var fail_result = try ctx.cli.run(&.{
@@ -534,9 +534,9 @@ test "e2e/action/worker: worker fails task permanently" {
     });
     defer await_result.deinit();
 
-    if (!await_result.succeeded()) return; // Skip if server error
-    const await_out = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
-    if (await_out.len == 0 or std.mem.eql(u8, await_out, "(no tasks)")) return; // No task yet
+    // The invoke has applied, so the task is there to take.
+    try testing.expectEqual(@as(u8, 0), await_result.exit_code);
+    try testing.expect(await_result.stdoutContains(run_id));
 
     // 5. Worker fails the task (NO retry - permanent failure)
     var fail_result = try ctx.cli.run(&.{

@@ -132,6 +132,7 @@ pub const Client = struct {
     /// `error.ServerError`, which a caller has no response to read it from.
     server_error_buf: [256]u8 = undefined,
     server_error_len: usize = 0,
+    server_error_status: proto.StatusCode = .ok,
 
     const Self = @This();
 
@@ -139,6 +140,7 @@ pub const Client = struct {
         const msg = response.errorMessage();
         self.server_error_len = @min(msg.len, self.server_error_buf.len);
         @memcpy(self.server_error_buf[0..self.server_error_len], msg[0..self.server_error_len]);
+        self.server_error_status = response.status;
     }
 
     pub fn serverError(self: *const Self) []const u8 {
