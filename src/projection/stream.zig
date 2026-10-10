@@ -24,6 +24,58 @@ const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const CommandPayload = entry_mod.CommandPayload;
 pub const StreamID = stream_id_mod.StreamID;
+
+/// What a trim removes: every record up to a boundary id, or every record
+/// older than an age. An age is resolved where the trim applies, against
+/// its entry's stamp, so the cut is the log's and the same on every replica.
+pub const TrimBound = union(enum) {
+    id: StreamID,
+    age_ms: u64,
+
+    const BY_ID: u8 = 0;
+    const BY_AGE: u8 = 1;
+    pub const MAX_SIZE = 17;
+
+    /// The boundary id at `stamp_ns`, or null when nothing is that old (an
+    /// age past the stamp trims nothing, never everything).
+    pub fn resolve(self: TrimBound, stamp_ns: u64) ?StreamID {
+        return switch (self) {
+            .id => |id| id,
+            .age_ms => |age| {
+                const cutoff_ms = (stamp_ns / std.time.ns_per_ms) -| age;
+                if (cutoff_ms == 0) return null;
+                // Strictly older than the cutoff.
+                return StreamID.fromTimestampMax(cutoff_ms - 1);
+            },
+        };
+    }
+
+    /// `[kind:u8]` then `[ts:u64][seq:u64]` for an id or `[age_ms:u64]`.
+    pub fn encode(self: TrimBound, buf: *[MAX_SIZE]u8) []const u8 {
+        switch (self) {
+            .id => |id| {
+                buf[0] = BY_ID;
+                std.mem.writeInt(u64, buf[1..9], id.timestamp_ms, .little);
+                std.mem.writeInt(u64, buf[9..17], id.sequence, .little);
+                return buf[0..17];
+            },
+            .age_ms => |age| {
+                buf[0] = BY_AGE;
+                std.mem.writeInt(u64, buf[1..9], age, .little);
+                return buf[0..9];
+            },
+        }
+    }
+
+    pub fn decode(key: []const u8) ?TrimBound {
+        if (key.len == 17 and key[0] == BY_ID) return .{ .id = .{
+            .timestamp_ms = std.mem.readInt(u64, key[1..9], .little),
+            .sequence = std.mem.readInt(u64, key[9..17], .little),
+        } };
+        if (key.len == 9 and key[0] == BY_AGE) return .{ .age_ms = std.mem.readInt(u64, key[1..9], .little) };
+        return null;
+    }
+};
 pub const StreamIdGenerator = stream_id_mod.StreamIdGenerator;
 
 /// Default consumer-group ack timeout: a delivered-but-unacked entry idle this
@@ -953,9 +1005,6 @@ pub const StreamProjection = struct {
     /// Per-stream state — each stream has its own StreamID space.
     streams: std.AutoHashMap(u64, StreamState),
 
-    /// Last applied UAL index.
-    applied_index: u64,
-
     /// Stats.
     stats: Stats,
 
@@ -983,7 +1032,6 @@ pub const StreamProjection = struct {
             .stream_names = std.StringHashMap(void).init(allocator),
             .stream_metadata = std.StringHashMap(StreamMetadata).init(allocator),
             .streams = std.AutoHashMap(u64, StreamState).init(allocator),
-            .applied_index = 0,
             .stats = .{},
         };
     }
@@ -1042,7 +1090,6 @@ pub const StreamProjection = struct {
             self.allocator.free(@constCast(key.*));
         }
         self.stream_metadata.clearAndFree();
-        self.applied_index = 0;
         self.stats = .{};
     }
 
@@ -1477,93 +1524,6 @@ pub const StreamProjection = struct {
         return self.stream_names.count();
     }
 
-    // ─── UAL Entry application ─────────────────────────────────────────────
-
-    pub fn applyEntry(self: *StreamProjection, ual_entry: *const Entry) !void {
-        const entry_type: EntryType = @enumFromInt(ual_entry.header.entry_type);
-
-        switch (entry_type) {
-            .stream_append => {
-                var name_hash: u64 = 0;
-                var partition_index: u32 = 0;
-                var record_count: u32 = 1;
-                var byte_len: u32 = 0;
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                    // Recover the user partition from the value prefix.
-                    const av = decodeAppendValue(cmd.value);
-                    partition_index = av.partition_index;
-                    // Recover the batch size so replay rebuilds the same counts
-                    // and reserves the same ID range as the live apply.
-                    record_count = batchRecordCount(av.payload);
-                    byte_len = @intCast(av.payload.len);
-                }
-                // Anchor to the entry timestamp for deterministic replay.
-                _ = try self.appendToStreamAt(name_hash, ual_entry.header.index, partition_index, ual_entry.header.timestamp_ns / 1_000_000, record_count, byte_len);
-            },
-            .stream_trim => {
-                // Trim target encoded as StreamID (timestamp_ms + sequence) in command payload key
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len >= 16) {
-                        const ts = std.mem.readInt(u64, cmd.key[0..8], .little);
-                        const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
-                        const name_hash = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
-                        _ = self.trimStream(name_hash, .{ .timestamp_ms = ts, .sequence = seq });
-                    }
-                }
-            },
-            .stream_delete => {
-                // key = raw stream name, value = namespace-qualified name.
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len > 0) {
-                        const name_hash = std.hash.Wyhash.hash(@as(u64, cmd.namespace_hash), cmd.key);
-                        _ = self.deleteStream(name_hash, cmd.key, cmd.value);
-                    }
-                }
-            },
-            .cg_create => {
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len > 0) {
-                        self.createGroup(cmd.key, ual_entry.header.timestamp_ns) catch |err| {
-                            if (err != error.AlreadyExists) return err;
-                        };
-                    }
-                }
-            },
-            .cg_delete => {
-                if (CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (cmd.key.len > 0) {
-                        _ = self.deleteGroup(cmd.key);
-                    }
-                }
-            },
-            else => {},
-        }
-
-        self.applied_index = ual_entry.header.index;
-    }
-
-    /// ProjectionVTable implementation.
-    pub fn projectionHandle(self: *StreamProjection) router_mod.ProjectionHandle {
-        return .{
-            .ctx = @ptrCast(self),
-            .vtable = .{
-                .applyFn = vtableApply,
-                .memoryUsageFn = vtableMemory,
-            },
-        };
-    }
-
-    fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry) router_mod.ApplyError!void {
-        const self: *StreamProjection = @ptrCast(@alignCast(ctx));
-        self.applyEntry(ual_entry) catch return error.OutOfMemory;
-    }
-
-    fn vtableMemory(ctx: *anyopaque) usize {
-        const self: *StreamProjection = @ptrCast(@alignCast(ctx));
-        return self.memoryUsage();
-    }
-
     pub fn memoryUsage(self: *const StreamProjection) usize {
         var mem: usize = @sizeOf(StreamProjection);
 
@@ -1918,27 +1878,6 @@ test "stream: memory usage estimate" {
     try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);
-}
-
-test "stream: projection handle with router" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    // Stream projection doesn't register with router currently
-    // (stream_append routes to .none in the current router).
-    // Test the vtable wiring directly:
-    const handle = s.projectionHandle();
-    try testing.expect(handle.memoryUsage() > 0);
-}
-
-test "stream: apply entry for stream_append" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const ual_entry = entry_mod.buildEntry(.stream_append, 0, 1, 1, 1000, "data");
-    try s.applyEntry(&ual_entry);
-
-    try testing.expectEqual(@as(u64, 1), s.stats.appended);
 }
 
 test "stream: serialize/deserialize round-trip" {

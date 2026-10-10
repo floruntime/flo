@@ -102,7 +102,7 @@ pub const WorkflowHandler = struct {
     /// for the delivery-leases work and the state-machine contract to settle.
     completion_retries: std.ArrayListUnmanaged(PendingCompletion) = .empty,
     /// Logs a completion record. A seam so a test can make the log refuse.
-    propose: *const fn (shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void = proposeCompletion,
+    propose: *const fn (shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 = proposeCompletion,
 
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
@@ -2717,10 +2717,12 @@ pub const WorkflowHandler = struct {
         const limit = completionLimit(run_ns_key);
         const parts: Completion = .{
             .status = status,
-            .completed_at_ms = now_ms,
             .output = output,
             .steps = if (run.step_outputs) |so| so.entries else &.{},
             .history = run.history.items,
+            // History events record steps and signals taken on the leader,
+            // off the log, so they keep the leader's clock until steps are
+            // logged. The run's completion time is the entry's stamp.
             .last = .{ .event_type = terminalEventType(status), .detail = detail, .timestamp_ms = now_ms },
             .tags = tags,
         };
@@ -2730,13 +2732,14 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(value);
 
-        self.propose(shard, namespace, run_ns_key, value) catch |err| {
+        const stamp_ns = self.propose(shard, namespace, run_ns_key, value) catch |err| {
             log.err("workflow run {s}: completion not persisted: {s}", .{ run_ns_key, @errorName(err) });
             return err;
         };
-        // The applier applies the same record again at commit; it replaces
-        // the terminal state wholesale, so a second apply is a no-op.
-        self.applyComplete(run, value);
+        // The applier applies the same record again at commit, at the same
+        // stamp; it replaces the terminal state wholesale, so a second
+        // apply is a no-op.
+        self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms));
 
         // Every terminal transition passes through here, so this is the one
         // place the outcome counters need to be recorded.
@@ -2749,8 +2752,9 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    fn proposeCompletion(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void {
-        _ = try persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, run_ns_key, value);
+    /// Propose a completion; returns its entry's stamp.
+    fn proposeCompletion(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 {
+        return (try persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, run_ns_key, value)).timestamp_ns;
     }
 
     /// A completion the log was too busy to take, retried from the run's
@@ -3476,7 +3480,7 @@ pub const WorkflowHandler = struct {
         var ns_key_buf: [600]u8 = undefined;
         const ns_key = try std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id });
         const idem = idempotency_key orelse "";
-        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + 2 + event_type.len + 2 + idem.len + input.len;
+        const value_len = 2 + wf_name.len + 2 + version.len + 1 + 2 + event_type.len + 2 + idem.len + input.len;
         // Checked whole first, so each length below fits u16.
         if (value_len > 65000) return error.PayloadTooLarge;
         var value_buf: [65536]u8 = undefined;
@@ -3489,10 +3493,9 @@ pub const WorkflowHandler = struct {
         off += 2;
         @memcpy(value_buf[off .. off + version.len], version);
         off += version.len;
+        // The run is created at the entry's stamp, by the applier.
         value_buf[off] = @intFromEnum(RunStatus.running);
         off += 1;
-        std.mem.writeInt(i64, value_buf[off..][0..8], @import("stdx").time.milliTimestamp(), .little);
-        off += 8;
         std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(event_type.len), .little);
         off += 2;
         @memcpy(value_buf[off .. off + event_type.len], event_type);
@@ -3507,9 +3510,9 @@ pub const WorkflowHandler = struct {
     }
 
     /// A run's completion record, gathered without touching the run.
+    /// The run completes at its entry's stamp, which the applier sets.
     const Completion = struct {
         status: RunStatus,
-        completed_at_ms: i64,
         output: ?[]const u8,
         steps: []const wf_types.StepOutput,
         /// Events before `last`, oldest first.
@@ -3528,7 +3531,7 @@ pub const WorkflowHandler = struct {
         /// Encoded size. Every length field fits when this is at most a log
         /// entry, which is under 64 KiB.
         fn size(c: Completion, marker_detail: []const u8) usize {
-            var n: usize = 1 + 8 + 1 + 2 + 2 + 2;
+            var n: usize = 1 + 1 + 2 + 2 + 2;
             if (c.output) |o| n += 4 + o.len;
             for (c.steps) |e| n += 2 + e.step_name.len + 2 + e.outcome.len + 4 + e.output.len;
             if (c.dropped > 0) n += eventSize(MARKER_EVENT, marker_detail);
@@ -3553,7 +3556,7 @@ pub const WorkflowHandler = struct {
     /// The bytes a run's completion record takes for what it holds now:
     /// its step outputs and history, before the final event, output and tags.
     fn completionBase(run: *const RunRecord) usize {
-        var n: usize = 1 + 8 + 1 + 2 + 2 + 2;
+        var n: usize = 1 + 1 + 2 + 2 + 2;
         if (run.step_outputs) |so| for (so.entries) |e| {
             n += 2 + e.step_name.len + 2 + e.outcome.len + 4 + e.output.len;
         };
@@ -3574,7 +3577,6 @@ pub const WorkflowHandler = struct {
         const buf = try allocator.alloc(u8, total);
         var w: std.Io.Writer = .fixed(buf);
         w.writeByte(@intFromEnum(c.status)) catch unreachable;
-        w.writeInt(i64, c.completed_at_ms, .little) catch unreachable;
         if (c.output) |o| {
             w.writeByte(1) catch unreachable;
             w.writeInt(u32, @intCast(o.len), .little) catch unreachable;
@@ -3633,7 +3635,6 @@ pub const WorkflowHandler = struct {
             std.fmt.bufPrint(&detail_buf, "completion record too large: {d} bytes > {d}", .{ full_size, limit }) catch unreachable;
         var c: Completion = .{
             .status = if (cancelled) .cancelled else .failed,
-            .completed_at_ms = full.completed_at_ms,
             .output = null,
             .steps = &.{},
             .history = full.history,
@@ -3655,17 +3656,18 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// Sets the run's terminal state from a workflow_complete value; the
-    /// producer and replay both apply it here. A value cut short, or an
-    /// allocation that fails, leaves the run as it was.
-    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8) void {
+    /// Sets the run's terminal state from a workflow_complete value stamped
+    /// `completed_at_ms`; the producer and replay both apply it here. A
+    /// value cut short, or an allocation that fails, leaves the run as it
+    /// was.
+    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) void {
         const entry = CompleteEntry.parse(value) orelse return;
         const built = self.buildComplete(&entry) catch return;
 
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
         run.status = entry.status;
-        run.completed_at_ms = entry.completed_at_ms;
+        run.completed_at_ms = completed_at_ms;
         if (run.output_owned) |o| self.allocator.free(o);
         run.output_owned = built.output;
         if (run.step_outputs) |*so| {
@@ -3713,8 +3715,8 @@ pub const WorkflowHandler = struct {
 
         switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000)),
-            .workflow_start => self.replayStart(cmd.key, cmd.value),
-            .workflow_complete => self.replayComplete(cmd.key, cmd.value),
+            .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
+            .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             else => {},
         }
     }
@@ -3787,7 +3789,7 @@ pub const WorkflowHandler = struct {
     }
 
     /// Apply a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
-    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
+    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64) void {
         // "namespace:run_id"
         const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
         const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
@@ -3811,10 +3813,6 @@ pub const WorkflowHandler = struct {
         if (off + 1 > value.len) return;
         const status = std.enums.fromInt(RunStatus, value[off]) orelse return;
         off += 1;
-
-        if (off + 8 > value.len) return;
-        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
-        off += 8;
 
         if (off + 2 > value.len) return;
         const evt_len = std.mem.readInt(u16, value[off..][0..2], .little);
@@ -3917,24 +3915,23 @@ pub const WorkflowHandler = struct {
 
     /// Apply a workflow_complete entry. Updates the run's terminal status,
     /// output, step_outputs, and history events.
-    /// Value format: [status:u8][completed_at_ms:i64]
+    /// Value format: [status:u8]
     ///   [has_output:u8][output_len:u32][output]?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
+    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) void {
         const run = self.runs.getPtr(ns_key_raw) orelse return;
-        self.applyComplete(run, value);
+        self.applyComplete(run, value, completed_at_ms);
     }
 
     /// A workflow_complete value, checked against its length:
-    ///   [status:u8][completed_at_ms:i64]
+    ///   [status:u8]
     ///   [has_output:u8]([output_len:u32][output])?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
     ///   [tags_len:u16][search_tags]
     const CompleteEntry = struct {
         status: RunStatus,
-        completed_at_ms: i64,
         output: ?[]const u8,
         step_count: u16,
         steps: Cursor,
@@ -3945,7 +3942,6 @@ pub const WorkflowHandler = struct {
         fn parse(value: []const u8) ?CompleteEntry {
             var c = Cursor{ .bytes = value };
             const status = std.enums.fromInt(RunStatus, (c.take(1) orelse return null)[0]) orelse return null;
-            const completed_at_ms = c.int(i64) orelse return null;
             const has_output = (c.take(1) orelse return null)[0];
             const output: ?[]const u8 = if (has_output == 1) c.take(c.int(u32) orelse return null) orelse return null else null;
             const step_count = c.int(u16) orelse return null;
@@ -3964,7 +3960,7 @@ pub const WorkflowHandler = struct {
             }
             const tags_len = c.int(u16) orelse return null;
             const tags: ?[]const u8 = if (tags_len > 0) c.take(tags_len) orelse return null else null;
-            return .{ .status = status, .completed_at_ms = completed_at_ms, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags };
+            return .{ .status = status, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags };
         }
     };
 
@@ -5065,20 +5061,41 @@ test "workflow replay: an unknown status, or a complete entry without its output
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
 
-    // [wf_len][wf][ver_len][ver][status][created_at][evt_len][idem_len]
-    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
+    // [wf_len][wf][ver_len][ver][status][evt_len][idem_len]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var bad_status = start;
     bad_status[7] = 0xee;
-    handler.replayStart("default:r0", &bad_status);
+    handler.replayStart("default:r0", &bad_status, 1);
     try testing.expectEqual(@as(usize, 0), handler.runCount());
 
-    handler.replayStart("default:r1", &start);
+    handler.replayStart("default:r1", &start, 1);
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 
     // Missing has_output byte; then an unknown status. Neither may change the run.
-    handler.replayComplete("default:r1", &([_]u8{3} ++ [_]u8{0} ** 8));
-    handler.replayComplete("default:r1", &([_]u8{0xee} ++ [_]u8{0} ** 9));
+    handler.replayComplete("default:r1", &[_]u8{3}, 2);
+    handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2);
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
+}
+
+test "workflow replay: a run starts and completes at its entries' stamps, not the host's clock" {
+    const host_ms = @import("stdx").time.milliTimestamp();
+    // One stamp far behind the host's clock and one a day ahead: an applier
+    // reading the clock misses one or the other.
+    for ([_]i64{ 1_000, host_ms + std.time.ms_per_day }) |stamp_ms| {
+        var handler = WorkflowHandler.init(testing.allocator);
+        defer handler.deinit();
+        const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+        const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
+        var pbuf: [128]u8 = undefined;
+        // Through `replayEntry`, as the log applies them.
+        handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?);
+        try testing.expectEqual(stamp_ms, handler.runs.get("default:r1").?.created_at_ms);
+        // completed, no output, no steps, no history, no tags
+        handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?);
+        const run = handler.runs.get("default:r1").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+        try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
+    }
 }
 
 test "workflow replay: a complete entry cut short leaves the run as it was, and a whole one replaces it" {
@@ -5086,11 +5103,11 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
 
-    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
-    handler.replayStart("default:r1", &start);
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    handler.replayStart("default:r1", &start, 1);
 
-    // completed, ts 0, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
-    const whole = [_]u8{3} ++ [_]u8{0} ** 8 ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
+    // completed, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
+    const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
         [_]u8{ 1, 0, 1, 0, 's', 4, 0, 'd', 'o', 'n', 'e', 1, 0, 0, 0, 'x' } ++
         [_]u8{ 1, 0, 1, 0, 'e', 1, 0, 'd', 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 't' };
 
@@ -5105,14 +5122,14 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     const history_before = handler.runs.get("default:r1").?.history.items.len;
     try testing.expectEqual(@as(usize, 1), history_before);
     for (1..whole.len - 3) |n| {
-        handler.replayComplete("default:r1", whole[0..n]);
+        handler.replayComplete("default:r1", whole[0..n], 2);
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
         try testing.expectEqual(history_before, run.history.items.len);
     }
 
-    handler.replayComplete("default:r1", &whole);
+    handler.replayComplete("default:r1", &whole, 2);
     const run = handler.runs.get("default:r1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
@@ -5145,7 +5162,6 @@ test "a completion too large to log fails the run with a trimmed record that rep
     const limit = WorkflowHandler.completionLimit("default:big");
     const full: WorkflowHandler.Completion = .{
         .status = .completed,
-        .completed_at_ms = 99,
         .output = null,
         .steps = &.{},
         .history = run.history.items,
@@ -5175,7 +5191,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
     var follower = WorkflowHandler.init(allocator);
     defer follower.deinit();
     createTestRun(&follower, "default:big", "big", "test-wf");
-    follower.replayComplete("default:big", record);
+    follower.replayComplete("default:big", record, 2);
     const f = follower.runs.get("default:big").?;
     try testing.expectEqual(done.status, f.status);
     try testing.expectEqual(done.history.items.len, f.history.items.len);
@@ -5217,7 +5233,6 @@ test "a completion record that fits round-trips through replay" {
 
     const c: WorkflowHandler.Completion = .{
         .status = .cancelled,
-        .completed_at_ms = 7,
         .output = "out",
         .steps = &.{},
         .history = run.history.items,
@@ -5226,7 +5241,7 @@ test "a completion record that fits round-trips through replay" {
     };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit("default:r"));
     defer allocator.free(record);
-    handler.applyComplete(run, record);
+    handler.applyComplete(run, record, 7);
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     try testing.expectEqualStrings("out", run.output_owned.?);
     try testing.expectEqualStrings("{\"a\":1}", run.search_tags_owned.?);
@@ -5275,14 +5290,14 @@ test "a signal that would leave the completion no headroom is refused, holding n
 }
 
 var fake_propose_refusals: u32 = 0;
-fn refuseThenPropose(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void {
+fn refuseThenPropose(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 {
     if (fake_propose_refusals > 0) {
         fake_propose_refusals -= 1;
         return error.Overloaded;
     }
     return WorkflowHandler.proposeCompletion(shard, namespace, run_ns_key, value);
 }
-fn notLeading(_: *Shard, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+fn notLeading(_: *Shard, _: []const u8, _: []const u8, _: []const u8) anyerror!u64 {
     return error.NotLeader;
 }
 
@@ -5342,7 +5357,6 @@ test "a trimmed record leaves out the output, step outputs and tags" {
     const steps = [_]wf_types.StepOutput{.{ .step_name = "a", .output = "{\"x\":1}", .outcome = "success" }};
     const full: WorkflowHandler.Completion = .{
         .status = .completed,
-        .completed_at_ms = 1,
         .output = "{\"done\":true}",
         .steps = &steps,
         .history = run.history.items,
@@ -5375,7 +5389,7 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
         createTestRun(&handler, key, &run_id, "test-wf");
         const run = handler.runs.getPtr(key).?;
         const limit = WorkflowHandler.completionLimit(key);
-        const fixed = 1 + 8 + 1 + 2 + 2 + 2 + WorkflowHandler.Completion.eventSize("workflow_completed", "flo.Completed");
+        const fixed = 1 + 1 + 2 + 2 + 2 + WorkflowHandler.Completion.eventSize("workflow_completed", "flo.Completed");
         const detail = try allocator.alloc(u8, limit + over - fixed - WorkflowHandler.Completion.eventSize("pad", ""));
         defer allocator.free(detail);
         @memset(detail, 'p');
@@ -5383,6 +5397,9 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
 
         handler.completeRun(&shard, key, run, .completed, "flo.Completed", 3);
         try testing.expectEqual(if (over == 0) WorkflowHandler.RunStatus.completed else .failed, run.status);
+        // Completed at its entry's stamp, not at the leader's `now_ms`.
+        const stamp_ms: i64 = @intCast(shard.raft_node.log.last_stamp / std.time.ns_per_ms);
+        try testing.expectEqual(@as(?i64, stamp_ms), run.completed_at_ms);
     }
 }
 
@@ -5390,7 +5407,6 @@ test "a completion record cut inside its tags is refused, not read without them"
     const allocator = testing.allocator;
     const c: WorkflowHandler.Completion = .{
         .status = .completed,
-        .completed_at_ms = 1,
         .output = null,
         .steps = &.{},
         .history = &.{},

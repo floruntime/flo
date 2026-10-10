@@ -29,6 +29,7 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.ts_projection);
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
+const time_units = @import("../util/time_units.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -135,6 +136,12 @@ pub const WriteBuffer = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Series Key — measurement + field name
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Points older than this go under a retention of `age_ms` applied at
+/// `stamp_ns`. Saturates: a duration past the stamp trims nothing.
+pub fn retentionCutoffNs(stamp_ns: u64, age_ms: u64) u64 {
+    return stamp_ns -| time_units.msToNsSat(age_ms);
+}
 
 /// UAL payload layout for a `ts_write` command value (the measurement travels
 /// in the command key):
@@ -1056,12 +1063,13 @@ pub const TSProjection = struct {
                     log.err("ts delete entry index={d} is malformed; skipped, so the measurement stays", .{ual_entry.header.index});
                 }
             },
-            // The cutoff was taken once, where the entry was proposed, so
-            // every replica trims the same points.
+            // The entry carries the duration; the cutoff is its stamp less
+            // that, so every replica trims the same points.
             .ts_retention => {
                 const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload);
                 if (cmd != null and cmd.?.value.len == 8) {
-                    _ = self.applyRetention(cmd.?.namespace_hash, cmd.?.key, std.mem.readInt(u64, cmd.?.value[0..8], .little));
+                    const age_ms = std.mem.readInt(u64, cmd.?.value[0..8], .little);
+                    _ = self.applyRetention(cmd.?.namespace_hash, cmd.?.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
                 } else {
                     log.err("ts retention entry index={d} is malformed; skipped, so nothing is trimmed", .{ual_entry.header.index});
                 }
@@ -1921,6 +1929,31 @@ test "ts: retention evicts only its own measurement in its own namespace" {
     try testing.expectEqual(@as(f64, 2.0), buf[0].field_value);
     try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).points_in_buffer);
     try testing.expectEqual(@as(usize, 1), (try ts.queryRange(2, "a", "value", null, 0, 10000, &buf)).points_in_buffer);
+}
+
+test "ts: a retention entry cuts at its stamp less its duration, not at the host's clock" {
+    const s_ns = std.time.ns_per_s;
+    const host_ns: u64 = @intCast(@import("stdx").time.nanoTimestamp());
+    // One stamp far behind the host's clock and one a day ahead: a cut by
+    // the host's clock removes all three points or none.
+    for ([_]u64{ 1_000 * s_ns, host_ns + std.time.ns_per_day }) |stamp| {
+        var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+        defer ts.deinit();
+        for ([_]u64{ 10, 5, 1 }, 1..) |age_s, i| try ts.insert(1, "m", "value", 1.0, stamp - age_s * s_ns, i, "");
+
+        var age: [8]u8 = undefined;
+        var pbuf: [64]u8 = undefined;
+        // Older than 3 s at the stamp: the 10 s and 5 s old points.
+        std.mem.writeInt(u64, &age, 3_000, .little);
+        try ts.applyEntry(&entry_mod.buildCommandEntry(.ts_retention, 0, 1, 10, stamp, 1, "m", &age, &pbuf).?);
+        var buf: [10]StoredPoint = undefined;
+        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
+
+        // A duration past the stamp trims nothing, never everything.
+        std.mem.writeInt(u64, &age, stamp / std.time.ns_per_ms + 1, .little);
+        try ts.applyEntry(&entry_mod.buildCommandEntry(.ts_retention, 0, 1, 11, stamp, 1, "m", &age, &pbuf).?);
+        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
+    }
 }
 
 test "ts: retention spares other measurements' flushed blocks" {
