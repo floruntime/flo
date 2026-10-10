@@ -803,8 +803,8 @@ test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps
     const too_long = [_]u8{'r'} ** 1025;
     var refused = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &too_long });
     defer refused.deinit();
-    try testing.expect(refused.exit_code != 0);
-    try testing.expect(refused.stderrContains("a cancel reason is at most 1024 bytes, not 1025"));
+    try testing.expectEqual(@as(u8, 3), refused.exit_code);
+    try testing.expectEqualStrings("Error: a cancel reason is at most 1024 bytes, not 1025 [bad_request]", std.mem.trimEnd(u8, refused.stderr, "\n"));
 
     var still = try ctx.cli.run(&.{ "workflow", "status", "cancel-reason-run" });
     defer still.deinit();
