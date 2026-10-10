@@ -13,6 +13,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
+const wire = @import("../../util/wire.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
@@ -139,29 +141,20 @@ fn runSubmit(ctx: *commander.Context) commander.Error!void {
 
     // Read the YAML file
     const yaml = @import("stdx").fs.readFileAlloc(ctx.allocator, file_path, 1024 * 1024) catch |err| {
-        ctx.printErr("Failed to read file '{s}': {}\n", .{ file_path, err });
-        return error.CommandFailed;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return outcome.usage(ctx, "failed to read file '{s}': {}", .{ file_path, err });
     };
     defer ctx.allocator.free(yaml);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.submit(&client, namespace, yaml) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.submit(&client, namespace, yaml) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (result.asRawData()) |job_id| {
         ctx.print("Job submitted: {s}\n", .{job_id});
@@ -178,26 +171,16 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.stop(&client, namespace, job_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.stop(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job not found: {s}\n", .{job_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Job stopped: {s}\n", .{job_id});
 }
@@ -210,26 +193,16 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.cancel(&client, namespace, job_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.cancel(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job not found: {s}\n", .{job_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Job cancelled: {s}\n", .{job_id});
 }
@@ -242,54 +215,28 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.status(&client, namespace, job_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.status(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job not found: {s}\n", .{job_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (result.asRawData()) |data| {
-        printProcessingJobStatus(ctx, data);
+        try printProcessingJobStatus(ctx, data);
     }
 }
 
-fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) void {
-    var off: usize = 0;
-
-    // job_id
-    if (off + 2 > data.len) return;
-    const id_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2;
-    if (off + id_len > data.len) return;
-    const job_id = data[off .. off + id_len];
-    off += id_len;
-
-    // name
-    if (off + 2 > data.len) return;
-    const name_len = std.mem.readInt(u16, data[off..][0..2], .little);
-    off += 2;
-    if (off + name_len > data.len) return;
-    const name = data[off .. off + name_len];
-    off += name_len;
-
-    // status
-    if (off >= data.len) return;
-    const status_str: []const u8 = switch (data[off]) {
+fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander.Error!void {
+    var r = wire.WireReader.init(data);
+    const what = "processing job status";
+    const job_id = r.readLengthPrefixed(u16) orelse return outcome.malformed(ctx, what);
+    const name = r.readLengthPrefixed(u16) orelse return outcome.malformed(ctx, what);
+    const status_str: []const u8 = switch (r.readU8() orelse return outcome.malformed(ctx, what)) {
         0 => "RUNNING",
         1 => "STOPPED",
         2 => "CANCELLED",
@@ -297,23 +244,10 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) void {
         4 => "COMPLETED",
         else => "UNKNOWN",
     };
-    off += 1;
-
-    // parallelism, batch_size
-    if (off + 8 > data.len) return;
-    const parallelism = std.mem.readInt(u32, data[off..][0..4], .little);
-    off += 4;
-    const batch_size = std.mem.readInt(u32, data[off..][0..4], .little);
-    off += 4;
-
-    // records_processed
-    if (off + 8 > data.len) return;
-    const records = std.mem.readInt(u64, data[off..][0..8], .little);
-    off += 8;
-
-    // created_at
-    if (off + 8 > data.len) return;
-    const created_at = std.mem.readInt(i64, data[off..][0..8], .little);
+    const parallelism = r.readU32() orelse return outcome.malformed(ctx, what);
+    const batch_size = r.readU32() orelse return outcome.malformed(ctx, what);
+    const records = r.readU64() orelse return outcome.malformed(ctx, what);
+    const created_at = r.readI64() orelse return outcome.malformed(ctx, what);
 
     ctx.print("Job:        {s}\n", .{job_id});
     ctx.print("Name:       {s}\n", .{name});
@@ -331,21 +265,12 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.list(&client, namespace, null) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.list(&client, namespace, null) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse {
         ctx.print("(no processing jobs)\n", .{});
@@ -358,7 +283,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
         .{ .field = "parallelism", .header = "", .field_type = .uint_u32 },
         .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
-    });
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 fn runSavepoint(ctx: *commander.Context) commander.Error!void {
@@ -369,26 +294,16 @@ fn runSavepoint(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.savepoint(&client, namespace, job_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.savepoint(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job not found: {s}\n", .{job_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (result.asRawData()) |sp_id| {
         ctx.print("Savepoint created: {s}\n", .{sp_id});
@@ -406,26 +321,16 @@ fn runRestore(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.restore(&client, namespace, job_id, savepoint_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.restore(&client, namespace, job_id, savepoint_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job or savepoint not found\n", .{});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "job {s} or savepoint {s} not found", .{ job_id, savepoint_id });
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Job {s} restored from savepoint {s}\n", .{ job_id, savepoint_id });
 }
@@ -437,38 +342,26 @@ fn runRescale(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
 
     const parallelism = std.fmt.parseInt(u32, parallelism_str, 10) catch {
-        ctx.printErr("Invalid parallelism: {s} (must be a positive integer)\n", .{parallelism_str});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "invalid parallelism: {s} (must be a positive integer)", .{parallelism_str});
     };
 
     if (parallelism == 0) {
-        ctx.printErr("Parallelism must be at least 1\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "parallelism must be at least 1", .{});
     }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.rescale(&client, namespace, job_id, parallelism) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.processing.rescale(&client, namespace, job_id, parallelism) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
-        ctx.printErr("Job not found: {s}\n", .{job_id});
-        return error.CommandFailed;
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Job {s} rescaled to parallelism {d}\n", .{ job_id, parallelism });
 }

@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
@@ -216,31 +217,22 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
-
     if (is_batch) {
         // Line protocol carries its own measurement, tags, fields and time.
         if (ctx.getPositional("measurement") != null) {
-            ctx.printErr("Error: --batch takes no measurement; each line names its own\n", .{});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "--batch takes no measurement; each line names its own", .{});
         }
         inline for (.{ "tags", "value", "fields", "timestamp" }) |flag| {
             const given: []const u8 = ctx.getString(flag) orelse "";
             if (given.len > 0) {
-                ctx.printErr("Error: --batch can't be combined with --" ++ flag ++ "; each line carries its own\n", .{});
-                return error.CommandFailed;
+                return outcome.usage(ctx, "--batch can't be combined with --" ++ flag ++ "; each line carries its own", .{});
             }
         }
         return runWriteBatch(ctx, &client, namespace);
     }
 
     const measurement = ctx.getPositional("measurement") orelse {
-        ctx.printErr("Error: measurement name required (or use --batch)\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "measurement name required (or use --batch)", .{});
     };
     const tags = ctx.getString("tags") orelse "";
     const value_flag = ctx.getString("value") orelse "";
@@ -250,45 +242,33 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     var timestamp_ms: ?i64 = null;
     if (ts_str.len > 0) {
         timestamp_ms = std.fmt.parseInt(i64, ts_str, 10) catch {
-            ctx.printErr("Error: --timestamp '{s}' is not a whole number of milliseconds\n", .{ts_str});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "--timestamp '{s}' is not a whole number of milliseconds", .{ts_str});
         };
         if (timestamp_ms.? <= 0) {
-            ctx.printErr("Error: --timestamp must be > 0 ms, not {s}\n", .{ts_str});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "--timestamp must be > 0 ms, not {s}", .{ts_str});
         }
     }
 
     if (value_flag.len > 0 and fields_flag.len > 0) {
-        ctx.printErr("Error: use --value or --fields, not both.\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "use --value or --fields, not both.", .{});
     }
 
     if (value_flag.len > 0) {
-        const value = parseValue(ctx, "--value", value_flag) orelse return error.CommandFailed;
-        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ms) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return error.CommandFailed;
-        };
+        const value = parseValue(ctx, "--value", value_flag) orelse return error.Usage;
+        client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+        var result = client_mod.ts.write(&client, namespace, measurement, null, value, tags, timestamp_ms) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
-        if (result.isError()) {
-            ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-            return error.CommandFailed;
-        }
+        try outcome.check(ctx, result);
         // [series_hash:u64][timestamp_ms:i64][sequence:u64]
-        if (result.asRawData()) |data| {
-            if (data.len >= 24) {
-                ctx.print("OK ({d}-{d})\n", .{ std.mem.readInt(i64, data[8..16], .little), std.mem.readInt(u64, data[16..24], .little) });
-                return;
-            }
-        }
-        ctx.print("OK\n", .{});
+        const data = result.asRawData() orelse return outcome.malformed(ctx, "write response (empty)");
+        if (data.len != 24) return outcome.malformed(ctx, "write response");
+        ctx.print("OK ({d}-{d})\n", .{ std.mem.readInt(i64, data[8..16], .little), std.mem.readInt(u64, data[16..24], .little) });
         return;
     }
 
     if (fields_flag.len == 0) {
         ctx.printErr("Error: --value or --fields is required.\n  Usage: flo ts write <measurement> --value <n> [--tags k=v,...]\n     or: flo ts write <measurement> --fields k=v,... [--tags k=v,...]\n", .{});
-        return error.CommandFailed;
+        return error.Usage;
     }
 
     // Each field is its own write; every field is checked before any is sent.
@@ -298,42 +278,39 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
     var it = std.mem.splitScalar(u8, fields_flag, ',');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
-            ctx.printErr("Error: field '{s}' is not name=value\n", .{pair});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "field '{s}' is not name=value", .{pair});
         };
         const name = pair[0..eq];
         if (name.len == 0) {
-            ctx.printErr("Error: field '{s}' has no name\n", .{pair});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "field '{s}' has no name", .{pair});
         }
         if (std.mem.trim(u8, name, " \t").len != name.len) {
-            ctx.printErr("Error: field name '{s}' has surrounding spaces\n", .{name});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "field name '{s}' has surrounding spaces", .{name});
         }
         for (names[0..n]) |seen| if (std.mem.eql(u8, seen, name)) {
-            ctx.printErr("Error: field '{s}' is given more than once\n", .{name});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "field '{s}' is given more than once", .{name});
         };
         if (n == names.len) {
-            ctx.printErr("Error: at most {d} fields\n", .{names.len});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "at most {d} fields", .{names.len});
         }
         names[n] = name;
-        values[n] = parseValue(ctx, name, pair[eq + 1 ..]) orelse return error.CommandFailed;
+        values[n] = parseValue(ctx, name, pair[eq + 1 ..]) orelse return error.Usage;
         n += 1;
     }
+
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // One timestamp for every field, so they read back as one point.
     const ts = timestamp_ms orelse @import("stdx").time.milliTimestamp();
     for (names[0..n], values[0..n], 0..) |name, value, written| {
         var result = client_mod.ts.write(&client, namespace, measurement, name, value, tags, ts) catch |err| {
-            ctx.printErr("Error: field {s}: request failed: {} ({d} of {d} fields written)\n", .{ name, err, written, n });
-            return error.CommandFailed;
+            const failed = outcome.requestFailed(ctx, err);
+            ctx.printErr("  (field {s}; {d} of {d} fields written)\n", .{ name, written, n });
+            return failed;
         };
         defer result.deinit();
         if (result.isError()) {
-            ctx.printErr("Error: field {s}: {s} ({d} of {d} fields written)\n", .{ name, result.errorMessage(), written, n });
-            return error.CommandFailed;
+            return outcome.refusal(ctx, result.status, result.errorMessage(), "field {s} ({d} of {d} fields written): ", .{ name, written, n });
         }
     }
     ctx.print("OK ({d} fields at {d})\n", .{ n, ts });
@@ -375,49 +352,44 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
     const file_path = ctx.getString("file") orelse "";
     const precision_str = ctx.getString("precision") orelse "ms";
     const precision = line_protocol.Precision.fromString(precision_str) orelse {
-        ctx.printErr("Error: --precision '{s}' must be ns, us, ms or s\n", .{precision_str});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--precision '{s}' must be ns, us, ms or s", .{precision_str});
     };
 
     var line_data: []u8 = undefined;
-    var needs_free = false;
 
     if (file_path.len > 0) {
         const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {
-            ctx.printErr("Cannot open file '{s}': {}\n", .{ file_path, err });
-            return error.CommandFailed;
+            return outcome.usage(ctx, "cannot open file '{s}': {}", .{ file_path, err });
         };
         defer @import("stdx").fs.closeFile(file);
 
         line_data = @import("stdx").fs.readToEndAlloc(file, ctx.allocator, 10 * 1024 * 1024) catch |err| {
-            ctx.printErr("Failed to read file: {}\n", .{err});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "failed to read file '{s}': {}", .{ file_path, err });
         };
-        needs_free = true;
     } else {
         var stdin_buf: std.ArrayList(u8) = .empty;
         defer stdin_buf.deinit(ctx.allocator);
         var read_buf: [4096]u8 = undefined;
         while (true) {
             const n = std.posix.read(std.posix.STDIN_FILENO, &read_buf) catch |err| {
-                ctx.printErr("Failed to read stdin: {}\n", .{err});
-                return error.CommandFailed;
+                return outcome.usage(ctx, "failed to read stdin: {}", .{err});
             };
             if (n == 0) break;
-            stdin_buf.appendSlice(ctx.allocator, read_buf[0..n]) catch |err| {
-                ctx.printErr("Failed to buffer stdin: {}\n", .{err});
-                return error.CommandFailed;
-            };
+            try stdin_buf.appendSlice(ctx.allocator, read_buf[0..n]);
         }
-        line_data = stdin_buf.toOwnedSlice(ctx.allocator) catch return error.CommandFailed;
-        needs_free = true;
+        line_data = try stdin_buf.toOwnedSlice(ctx.allocator);
     }
-    defer if (needs_free) ctx.allocator.free(line_data);
+    defer ctx.allocator.free(line_data);
+
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Each field of each line is one write. A bad line is reported by number
-    // and the rest still go; any failure fails the command.
+    // and the rest still go; the command ends with the first failed line's
+    // outcome.
     var points: u32 = 0;
+    var lines_total: u32 = 0;
     var lines_failed: u32 = 0;
+    var first_failure: ?commander.Error = null;
     var diag_buf: [192]u8 = undefined;
     var line_no: u32 = 0;
     var line_iter = std.mem.splitScalar(u8, line_data, '\n');
@@ -425,49 +397,52 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
         line_no += 1;
         const line = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t', '\r' });
         if (line.len == 0 or line[0] == '#') continue;
+        lines_total += 1;
 
-        var diag: line_protocol.Diagnostic = .{};
-        const parsed = line_protocol.parseLineDiagnosed(line, precision, ctx.allocator, &diag) catch |err| {
-            ctx.printErr("line {d}: {s}\n", .{ line_no, lineError(&diag_buf, err, diag.token) });
-            lines_failed += 1;
-            continue;
-        };
-        defer line_protocol.freeParsedLine(parsed, ctx.allocator);
+        const failure: commander.Error = blk: {
+            var diag: line_protocol.Diagnostic = .{};
+            const parsed = line_protocol.parseLineDiagnosed(line, precision, ctx.allocator, &diag) catch |err| {
+                ctx.printErr("line {d}: {s}\n", .{ line_no, lineError(&diag_buf, err, diag.token) });
+                break :blk error.Usage;
+            };
+            defer line_protocol.freeParsedLine(parsed, ctx.allocator);
 
-        var tags_buf: [1024]u8 = undefined;
-        var tags_w = std.Io.Writer.fixed(&tags_buf);
-        for (parsed.tags, 0..) |tag, i| {
-            tags_w.print("{s}{s}={s}", .{ if (i > 0) "," else "", tag.key, tag.value }) catch break;
-        } else {
+            var tags_buf: [1024]u8 = undefined;
+            var tags_w = std.Io.Writer.fixed(&tags_buf);
+            for (parsed.tags, 0..) |tag, i| {
+                tags_w.print("{s}{s}={s}", .{ if (i > 0) "," else "", tag.key, tag.value }) catch {
+                    ctx.printErr("line {d}: tags too long\n", .{line_no});
+                    break :blk error.Usage;
+                };
+            }
+
             // The parser checked every field, so a line is written whole
             // unless the server refuses part of it. A line without a
             // timestamp is stamped once, so its fields agree.
             const ts = if (parsed.timestamp_ms != 0) parsed.timestamp_ms else @import("stdx").time.milliTimestamp();
             for (parsed.fields, 0..) |field, written| {
                 var result = client_mod.ts.write(client, namespace, parsed.measurement, field.name, field.value, tags_w.buffered(), ts) catch |err| {
-                    ctx.printErr("line {d}: request failed: {} ({d} of {d} fields written)\n", .{ line_no, err, written, parsed.fields.len });
-                    lines_failed += 1;
-                    break;
+                    const failed = outcome.requestFailed(ctx, err);
+                    ctx.printErr("  (line {d}; {d} of {d} fields written)\n", .{ line_no, written, parsed.fields.len });
+                    break :blk failed;
                 };
                 defer result.deinit();
                 if (result.isError()) {
-                    ctx.printErr("line {d}: field {s}: {s} ({d} of {d} fields written)\n", .{ line_no, field.name, result.errorMessage(), written, parsed.fields.len });
-                    lines_failed += 1;
-                    break;
+                    break :blk outcome.refusal(ctx, result.status, result.errorMessage(), "line {d}: field {s} ({d} of {d} fields written): ", .{ line_no, field.name, written, parsed.fields.len });
                 }
                 points += 1;
             }
             continue;
-        }
-        ctx.printErr("line {d}: tags too long\n", .{line_no});
+        };
         lines_failed += 1;
+        if (first_failure == null) first_failure = failure;
     }
 
-    if (lines_failed > 0) {
-        ctx.print("Wrote {d} points ({d} lines failed)\n", .{ points, lines_failed });
-        return error.CommandFailed;
-    }
     ctx.print("Wrote {d} points\n", .{points});
+    if (first_failure) |failure| {
+        ctx.printErr("Error: {d} of {d} lines failed\n", .{ lines_failed, lines_total });
+        return failure;
+    }
 }
 
 fn runRead(ctx: *commander.Context) commander.Error!void {
@@ -491,10 +466,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     var result = client_mod.ts.read(&client, namespace, measurement, .{
         .tags = tags,
@@ -502,37 +474,23 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
         .from_ms = from_ms,
         .to_ms = to_ms,
         .limit = @intCast(limit),
-    }) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
+    // An existing series with no points in range answers ok and empty (0);
+    // not_found means the measurement itself is absent.
     if (result.isNotFound()) {
         ctx.print("(no data)\n", .{});
-        return;
+        return error.NotFound;
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    // Parse read response: [count:u32] ([timestamp_ms:i64][value:f64])...
-    const data = result.asRawData() orelse {
-        ctx.print("(no data)\n", .{});
-        return;
-    };
+    // An empty range still answers with a count of 0.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "read response (empty)");
+    const points = parsePoints(data) catch return outcome.malformed(ctx, "read response");
 
-    if (data.len < 4) {
-        ctx.print("(no data)\n", .{});
-        return;
-    }
-
-    var reader = WireReader.init(data);
-    const count = reader.readU32() orelse 0;
-
-    if (count == 0) {
+    if (points.len() == 0) {
         ctx.print("(no data)\n", .{});
         return;
     }
@@ -544,42 +502,29 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
             try table.addColumn("TIMESTAMP", .left);
             try table.addColumn("VALUE", .right);
 
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const ts_ms = reader.readI64() orelse break;
-                const val_bytes = reader.readSlice(8) orelse break;
-                const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
+            for (0..points.len()) |i| {
+                const p = points.at(i);
                 var ts_buf: [32]u8 = undefined;
-                const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{ts_ms}) catch "";
+                const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms}) catch "";
                 var val_buf: [32]u8 = undefined;
-                const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{val}) catch "";
-
-                table.addRow(&.{ ts_str, val_str }) catch break;
+                const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "";
+                table.addRow(&.{ ts_str, val_str }) catch return error.OutOfMemory;
             }
             table.print(ctx);
         },
         .json => {
             ctx.print("[\n", .{});
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const ts_ms = reader.readI64() orelse break;
-                const val_bytes = reader.readSlice(8) orelse break;
-                const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
+            for (0..points.len()) |i| {
+                const p = points.at(i);
                 if (i > 0) ctx.print(",\n", .{});
-                ctx.print("  {{\"timestamp_ms\": {d}, \"value\": {d:.6}}}", .{ ts_ms, val });
+                ctx.print("  {{\"timestamp_ms\": {d}, \"value\": {d:.6}}}", .{ p.ms, p.value });
             }
             ctx.print("\n]\n", .{});
         },
         .raw => {
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const ts_ms = reader.readI64() orelse break;
-                const val_bytes = reader.readSlice(8) orelse break;
-                const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
-                ctx.print("{d} {d:.6}\n", .{ ts_ms, val });
+            for (0..points.len()) |i| {
+                const p = points.at(i);
+                ctx.print("{d} {d:.6}\n", .{ p.ms, p.value });
             }
         },
     }
@@ -604,10 +549,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     var result = client_mod.ts.query(&client, namespace, measurement, .{
         .tags = tags,
@@ -616,41 +558,28 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
         .to_ms = to_ms,
         .window_ms = window_ms,
         .aggregation = agg,
-    }) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
+    // An existing series with no points in range answers ok and empty (0);
+    // not_found means the measurement itself is absent.
     if (result.isNotFound()) {
         ctx.print("(no data)\n", .{});
-        return;
+        return error.NotFound;
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    // Query response bytes, produced by serializeQueryResult() in ts/handler.zig.
-    // Format: [series_count:u32] per series: [key_len:u32][key][bucket_count:u32]
-    //         then per bucket: [start_ms:i64][value:f64]
-    // NB: this used to read a [hash:u64] here that no encoder ever wrote, which
-    // misaligned the stream so every aggregate rendered as an empty table.
-    const data = result.asRawData() orelse {
-        ctx.print("(no data)\n", .{});
-        return;
+    // Produced by serializeQueryResult in ts/handler.zig; an empty range
+    // answers with a series count of 0.
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "query response (empty)");
+    const series = parseSeriesSet(ctx.allocator, data, .query) catch |err| switch (err) {
+        error.Truncated => return outcome.malformed(ctx, "query response"),
+        error.OutOfMemory => return error.OutOfMemory,
     };
+    defer ctx.allocator.free(series);
 
-    if (data.len < 4) {
-        ctx.print("(no data)\n", .{});
-        return;
-    }
-
-    var reader = WireReader.init(data);
-    const series_count = reader.readU32() orelse 0;
-
-    if (series_count == 0) {
+    if (series.len == 0) {
         ctx.print("(no data)\n", .{});
         return;
     }
@@ -665,63 +594,37 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
             const upper_agg = std.ascii.upperString(upper_buf[0..upper_len], agg[0..upper_len]);
             try table.addColumn(upper_agg, .right);
 
-            var s: u32 = 0;
-            while (s < series_count) : (s += 1) {
-                const key_len = reader.readU32() orelse break;
-                _ = reader.readSlice(key_len) orelse break; // series key
-                const bucket_count = reader.readU32() orelse break;
-                var b: u32 = 0;
-                while (b < bucket_count) : (b += 1) {
-                    const bucket_ms = reader.readI64() orelse break;
-                    const val_bytes = reader.readSlice(8) orelse break;
-                    const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
+            for (series) |sr| {
+                for (0..sr.points.len()) |b| {
+                    const p = sr.points.at(b);
                     var ts_buf: [32]u8 = undefined;
-                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{bucket_ms}) catch "";
+                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.ms}) catch "";
                     var val_buf: [32]u8 = undefined;
-                    const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{val}) catch "";
-
-                    table.addRow(&.{ ts_str, val_str }) catch break;
+                    const val_str = std.fmt.bufPrint(&val_buf, "{d:.4}", .{p.value}) catch "";
+                    table.addRow(&.{ ts_str, val_str }) catch return error.OutOfMemory;
                 }
             }
             table.print(ctx);
         },
         .json => {
             ctx.print("{{\n  \"series\": [\n", .{});
-            var s: u32 = 0;
-            while (s < series_count) : (s += 1) {
-                const key_len = reader.readU32() orelse break;
-                const key = reader.readSlice(key_len) orelse break;
-                const bucket_count = reader.readU32() orelse break;
-
+            for (series, 0..) |sr, s| {
                 if (s > 0) ctx.print(",\n", .{});
-                ctx.print("    {{\"series\": \"{s}\", \"buckets\": [\n", .{key});
-
-                var b: u32 = 0;
-                while (b < bucket_count) : (b += 1) {
-                    const bucket_ms = reader.readI64() orelse break;
-                    const val_bytes = reader.readSlice(8) orelse break;
-                    const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
+                ctx.print("    {{\"series\": \"{s}\", \"buckets\": [\n", .{sr.key});
+                for (0..sr.points.len()) |b| {
+                    const p = sr.points.at(b);
                     if (b > 0) ctx.print(",\n", .{});
-                    ctx.print("      {{\"start_ms\": {d}, \"value\": {d:.6}}}", .{ bucket_ms, val });
+                    ctx.print("      {{\"start_ms\": {d}, \"value\": {d:.6}}}", .{ p.ms, p.value });
                 }
                 ctx.print("\n    ]}}", .{});
             }
             ctx.print("\n  ]\n}}\n", .{});
         },
         .raw => {
-            var s: u32 = 0;
-            while (s < series_count) : (s += 1) {
-                _ = reader.readU64() orelse break;
-                const bucket_count = reader.readU32() orelse break;
-                var b: u32 = 0;
-                while (b < bucket_count) : (b += 1) {
-                    const bucket_ms = reader.readI64() orelse break;
-                    const val_bytes = reader.readSlice(8) orelse break;
-                    const val = @as(f64, @bitCast(std.mem.readInt(u64, val_bytes[0..8], .little)));
-
-                    ctx.print("{d} {d:.6}\n", .{ bucket_ms, val });
+            for (series) |sr| {
+                for (0..sr.points.len()) |b| {
+                    const p = sr.points.at(b);
+                    ctx.print("{d} {d:.6}\n", .{ p.ms, p.value });
                 }
             }
         },
@@ -737,10 +640,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Client-side pagination: fetch pages until we have `limit` names or
     // the server signals no more data.
@@ -763,49 +663,20 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             namespace,
             per_page,
             if (cursor) |c| c[0..] else null,
-        ) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return error.CommandFailed;
-        };
+        ) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
 
-        if (result.isError()) {
-            ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-            return error.CommandFailed;
-        }
+        try outcome.check(ctx, result);
 
-        const data = result.asRawData() orelse break;
-        if (data.len < 7) break; // minimum: count(4) + has_more(1) + cursor_len(2)
+        const data = result.asRawData() orelse return outcome.malformed(ctx, "list response (empty)");
+        const next = parseNamePage(ctx.allocator, data, &all_names, limit) catch |err| switch (err) {
+            error.Truncated => return outcome.malformed(ctx, "list response"),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
 
-        // Parse binary response:
-        //   [count:u32] ([name_len:u16][name])* [has_more:u8] [cursor_len:u16][cursor]?
-        var reader = WireReader.init(data);
-        const count = reader.readU32() orelse break;
-        if (count == 0) break;
-
-        for (0..count) |_| {
-            if (all_names.items.len >= limit) break;
-            const name = reader.readLengthPrefixed(u16) orelse break;
-            if (name.len > 0) {
-                const owned = ctx.allocator.dupe(u8, name) catch break;
-                all_names.append(ctx.allocator, owned) catch {
-                    ctx.allocator.free(owned);
-                    break;
-                };
-            }
-        }
-
-        // tail: has_more + cursor
-        const has_more_byte = reader.readU8() orelse break;
-        const has_more = has_more_byte != 0;
-        const next_cursor = reader.readLengthPrefixed(u16) orelse null;
-
-        // Free old cursor
         if (cursor) |c| ctx.allocator.free(c);
         cursor = null;
-
-        if (!has_more or next_cursor == null or next_cursor.?.len == 0) break;
-        cursor = ctx.allocator.dupe(u8, next_cursor.?) catch break;
+        cursor = try ctx.allocator.dupe(u8, next orelse break);
     }
 
     if (all_names.items.len == 0) {
@@ -842,27 +713,18 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     if (!confirm) {
         ctx.printErr("Error: --confirm flag required to delete time-series data\n", .{});
         ctx.printErr("This will permanently delete series data for '{s}'\n", .{measurement});
-        return error.CommandFailed;
+        return error.Usage;
     }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.ts.delete(&client, namespace, measurement, tags) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.ts.delete(&client, namespace, measurement, tags) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -873,28 +735,18 @@ fn runRetention(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
     const raw_ttl = ctx.getString("raw-ttl") orelse "";
     if (raw_ttl.len == 0) {
-        ctx.printErr("Error: --raw-ttl is required (e.g. --raw-ttl 7d)\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--raw-ttl is required (e.g. --raw-ttl 7d)", .{});
     }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.ts.retention(&client, namespace, measurement, raw_ttl) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.ts.retention(&client, namespace, measurement, raw_ttl) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -908,60 +760,118 @@ fn runFloql(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
 
     const query_str = ctx.getPositional("query") orelse {
-        ctx.printErr("Error: query argument is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "query argument is required", .{});
     };
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.ts.floql(&client, namespace, query_str) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.ts.floql(&client, namespace, query_str) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    // Decode SeriesSet wire format and print
-    const data = result.data;
-    if (data.len < 4) {
-        ctx.print("(empty result)\n", .{});
-        return;
-    }
+    // An encoded SeriesSet (ts/floql/series_set.zig); no match is a count of 0.
+    if (result.data.len == 0) return outcome.malformed(ctx, "floql response (empty)");
+    const series = parseSeriesSet(ctx.allocator, result.data, .floql) catch |err| switch (err) {
+        error.Truncated => return outcome.malformed(ctx, "floql response"),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer ctx.allocator.free(series);
 
-    var reader = WireReader.init(data);
-    const series_count = reader.readU32() orelse 0;
-
-    if (series_count == 0) {
+    if (series.len == 0) {
         ctx.print("(no series)\n", .{});
         return;
     }
 
-    var si: u32 = 0;
-    while (si < series_count) : (si += 1) {
-        const key = reader.readLengthPrefixed(u32) orelse break;
-        const field = reader.readLengthPrefixed(u32) orelse break;
-        const point_count = reader.readU32() orelse break;
-
-        ctx.print("--- {s} ({s}) [{d} points] ---\n", .{ key, field, point_count });
-
-        var pi: u32 = 0;
-        while (pi < point_count) : (pi += 1) {
-            const ts = reader.readI64() orelse break;
-            const val_bytes = reader.readBytes(8) orelse break;
-            const value: f64 = @bitCast(std.mem.readInt(u64, val_bytes, .little));
-            ctx.print("  {d}: {d:.4}\n", .{ ts, value });
+    for (series) |sr| {
+        ctx.print("--- {s} ({s}) [{d} points] ---\n", .{ sr.key, sr.field, sr.points.len() });
+        for (0..sr.points.len()) |i| {
+            const p = sr.points.at(i);
+            ctx.print("  {d}: {d:.4}\n", .{ p.ms, p.value });
         }
     }
+}
+
+// ========================================================================
+// Response parsing
+// ========================================================================
+
+const Point = struct { ms: i64, value: f64 };
+
+/// `n` points of `[ms:i64][value:f64]`, read in place.
+const Points = struct {
+    bytes: []const u8,
+
+    fn len(self: Points) usize {
+        return self.bytes.len / 16;
+    }
+
+    fn at(self: Points, i: usize) Point {
+        const p = self.bytes[i * 16 ..][0..16];
+        return .{
+            .ms = std.mem.readInt(i64, p[0..8], .little),
+            .value = @bitCast(std.mem.readInt(u64, p[8..16], .little)),
+        };
+    }
+};
+
+fn readPoints(reader: *WireReader) error{Truncated}!Points {
+    const count = reader.readU32() orelse return error.Truncated;
+    const n = std.math.mul(usize, count, 16) catch return error.Truncated;
+    return .{ .bytes = reader.readSlice(n) orelse return error.Truncated };
+}
+
+/// A read answer: `[count:u32]([ms:i64][value:f64])*`.
+fn parsePoints(data: []const u8) error{Truncated}!Points {
+    var reader = WireReader.init(data);
+    return readPoints(&reader);
+}
+
+const Series = struct { key: []const u8, field: []const u8, points: Points };
+
+/// `[series_count:u32]` then per series `[key_len:u32][key]`, for floql
+/// `[field_len:u32][field]`, then the points. Slices point into `data`.
+fn parseSeriesSet(
+    allocator: Allocator,
+    data: []const u8,
+    comptime shape: enum { query, floql },
+) error{ Truncated, OutOfMemory }![]Series {
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse return error.Truncated;
+    var series: std.ArrayList(Series) = .empty;
+    errdefer series.deinit(allocator);
+    for (0..count) |_| {
+        const key = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+        const field = if (shape == .floql) reader.readLengthPrefixed(u32) orelse return error.Truncated else "";
+        try series.append(allocator, .{ .key = key, .field = field, .points = try readPoints(&reader) });
+    }
+    return series.toOwnedSlice(allocator);
+}
+
+/// One page of a list: `[count:u32]([name_len:u16][name])*[has_more:u8]
+/// [cursor_len:u16][cursor]`. Appends copies of its names to `names` until it
+/// holds `limit`, and returns the next page's cursor, or null on the last.
+fn parseNamePage(
+    allocator: Allocator,
+    data: []const u8,
+    names: *std.ArrayList([]const u8),
+    limit: usize,
+) error{ Truncated, OutOfMemory }!?[]const u8 {
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse return error.Truncated;
+    for (0..count) |_| {
+        const name = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        if (name.len == 0 or names.items.len >= limit) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try names.append(allocator, owned);
+    }
+    const has_more = (reader.readU8() orelse return error.Truncated) != 0;
+    const next = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+    return if (has_more and next.len > 0) next else null;
 }
 
 // ==================== Testing ====================
@@ -1001,4 +911,54 @@ test "parseDuration" {
     try std.testing.expectEqual(@as(i64, 3600000), parseDuration("1h").?);
     try std.testing.expectEqual(@as(i64, 86400000), parseDuration("1d").?);
     try std.testing.expectEqual(@as(i64, 30000), parseDuration("30s").?);
+}
+
+test "ts: a read answer parses, and a cut-short one is Truncated" {
+    const answer = "\x02\x00\x00\x00" ++ "\x05" ++ "\x00" ** 7 ++ "\x00" ** 6 ++ "\xf0\x3f" ++
+        "\x06" ++ "\x00" ** 7 ++ "\x00" ** 8;
+    const points = try parsePoints(answer);
+    try std.testing.expectEqual(@as(usize, 2), points.len());
+    try std.testing.expectEqual(@as(i64, 5), points.at(0).ms);
+    try std.testing.expectEqual(@as(f64, 1.0), points.at(0).value);
+    try std.testing.expectEqual(@as(usize, 0), (try parsePoints("\x00\x00\x00\x00")).len());
+    for (0..answer.len) |n| try std.testing.expectError(error.Truncated, parsePoints(answer[0..n]));
+}
+
+test "ts: query and floql answers parse, and cut-short ones are Truncated" {
+    const a = std.testing.allocator;
+    const point = "\x09" ++ "\x00" ** 7 ++ "\x00" ** 8;
+    const query = "\x01\x00\x00\x00" ++ "\x03\x00\x00\x00cpu" ++ "\x01\x00\x00\x00" ++ point;
+    const floql = "\x01\x00\x00\x00" ++ "\x03\x00\x00\x00cpu" ++ "\x05\x00\x00\x00value" ++ "\x01\x00\x00\x00" ++ point;
+
+    const q = try parseSeriesSet(a, query, .query);
+    defer a.free(q);
+    try std.testing.expectEqualStrings("cpu", q[0].key);
+    try std.testing.expectEqual(@as(i64, 9), q[0].points.at(0).ms);
+
+    const f = try parseSeriesSet(a, floql, .floql);
+    defer a.free(f);
+    try std.testing.expectEqualStrings("value", f[0].field);
+    try std.testing.expectEqual(@as(usize, 1), f[0].points.len());
+
+    for (0..query.len) |n| try std.testing.expectError(error.Truncated, parseSeriesSet(a, query[0..n], .query));
+    for (0..floql.len) |n| try std.testing.expectError(error.Truncated, parseSeriesSet(a, floql[0..n], .floql));
+}
+
+test "ts: a list page parses, and a cut-short one is Truncated" {
+    const a = std.testing.allocator;
+    const page = "\x02\x00\x00\x00" ++ "\x03\x00cpu" ++ "\x03\x00mem" ++ "\x01" ++ "\x02\x00c1";
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| a.free(n);
+        names.deinit(a);
+    }
+    try std.testing.expectEqualStrings("c1", (try parseNamePage(a, page, &names, 1)).?);
+    try std.testing.expectEqual(@as(usize, 1), names.items.len);
+    try std.testing.expectEqualStrings("cpu", names.items[0]);
+
+    for (1..page.len) |n| {
+        for (names.items) |x| a.free(x);
+        names.clearRetainingCapacity();
+        try std.testing.expectError(error.Truncated, parseNamePage(a, page[0..n], &names, 100));
+    }
 }

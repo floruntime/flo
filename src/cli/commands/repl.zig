@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 
@@ -49,6 +50,7 @@ pub fn createReplCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
+/// Exits 0 whatever its lines do, so scripts must not read its exit code as a command's.
 fn runRepl(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
 
@@ -65,11 +67,7 @@ fn runRepl(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Print welcome banner
     ctx.print("\n", .{});
@@ -108,7 +106,7 @@ fn runRepl(ctx: *commander.Context) commander.Error!void {
                 ctx.print("\n", .{});
                 break;
             }
-            return error.CommandFailed;
+            return outcome.usage(ctx, "can't read stdin: {s}", .{@errorName(err)});
         };
 
         // Trim whitespace

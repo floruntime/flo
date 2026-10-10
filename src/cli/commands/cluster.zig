@@ -12,7 +12,8 @@ const commander = @import("../commander/mod.zig");
 const proto = @import("../../protocol/proto.zig");
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
-const net = @import("stdx").net;
+const outcome = @import("../outcome.zig");
+const client_mod = @import("../client/mod.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -67,6 +68,7 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\leader makes up to three voters on its own; past that, promote a
                     \\replica here. Odd numbers of voters tolerate more failures.
                 )
+                .variadicArg("ids", "Ids of the replicas to promote")
                 .examples(&.{
                     "flo cluster promote 4",
                     "flo cluster promote 4 5",
@@ -82,6 +84,7 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\the leader works: it hands over after the change commits. A
                     \\removal that leaves an even number of voters, or two, needs --yes.
                 )
+                .arg("id", "Id of the member to remove")
                 .boolFlag("yes", 0, "Remove even when it leaves an even number of voters, or two")
                 .examples(&.{
                     "flo cluster remove 3",
@@ -90,15 +93,6 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runRemove)),
         )
         .build();
-}
-
-/// Parse endpoint string into host and port
-fn parseEndpoint(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
-    const colon_pos = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse {
-        return .{ .host = endpoint, .port = 9000 };
-    };
-    const port = std.fmt.parseInt(u16, endpoint[colon_pos + 1 ..], 10) catch 9000;
-    return .{ .host = endpoint[0..colon_pos], .port = port };
 }
 
 /// Format a node ID as a human-readable name.
@@ -110,128 +104,31 @@ fn formatNodeId(buf: *[11]u8, node_id: u32) []const u8 {
     return buf[0..10];
 }
 
-/// Response with owned buffer
-const OwnedResponse = struct {
-    response: proto.Response,
-    buffer: []u8,
-    allocator: Allocator,
-
-    pub fn deinit(self: *OwnedResponse) void {
-        self.allocator.free(self.buffer);
-    }
-};
-
-/// Send a Flo protocol request and receive response
-fn sendRequest(
-    allocator: Allocator,
-    host: []const u8,
-    port: u16,
-    op_code: proto.OpCode,
-    value: []const u8,
-) !OwnedResponse {
-    // Connect to server
-    const stream = try net.tcpConnectToHost(allocator, host, port);
-    defer stream.close();
-
-    // Build request
-    const request = proto.Request{
-        .header = .{
-            .magic = proto.MAGIC,
-            .version = proto.VERSION,
-            .op_code = @intFromEnum(op_code),
-            .flags = 0,
-            .reserved = .{0} ** 8,
-            .payload_length = 0, // Will be set during serialization
-            .request_id = 1, // Simple request ID for CLI
-            .crc32 = 0, // Will be computed during serialization
-        },
-        .namespace = "", // Cluster ops don't need namespace
-        .key = "",
-        .value = value,
-        .options = "",
+/// Sends one request to the endpoint and returns its ok answer; the caller
+/// frees it.
+fn ask(ctx: *commander.Context, op: proto.OpCode, value: []const u8) commander.Error!client_mod.Response {
+    const endpoint = cli_config.getEndpoint(ctx);
+    var client = client_mod.Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, endpoint);
+    var response = client.sendRequest(op, "", "", value) catch |err| return outcome.requestFailed(ctx, err);
+    outcome.check(ctx, response) catch |err| {
+        response.deinit();
+        return err;
     };
-
-    // Serialize and send
-    var send_buf: [1024]u8 = undefined;
-    const serialized = try request.serialize(&send_buf);
-    try stream.writeAll(serialized);
-
-    // Read response header
-    var header_buf: [@sizeOf(proto.ResponseHeader)]u8 = undefined;
-    const header_bytes = try stream.readAtLeast(&header_buf, @sizeOf(proto.ResponseHeader));
-    if (header_bytes < @sizeOf(proto.ResponseHeader)) {
-        return error.IncompleteResponse;
-    }
-
-    const header = @as(*align(1) const proto.ResponseHeader, @ptrCast(&header_buf)).*;
-    try header.validate();
-
-    // Read response body
-    if (header.data_len > 64 * 1024) {
-        return error.ResponseTooLarge;
-    }
-
-    const resp_buf = try allocator.alloc(u8, @sizeOf(proto.ResponseHeader) + header.data_len);
-    errdefer allocator.free(resp_buf);
-
-    @memcpy(resp_buf[0..@sizeOf(proto.ResponseHeader)], &header_buf);
-
-    if (header.data_len > 0) {
-        const body_bytes = try stream.readAtLeast(resp_buf[@sizeOf(proto.ResponseHeader)..], header.data_len);
-        if (body_bytes < header.data_len) {
-            return error.IncompleteResponse;
-        }
-    }
-
-    const response = try proto.Response.parse(resp_buf[0 .. @sizeOf(proto.ResponseHeader) + header.data_len]);
-
-    return OwnedResponse{
-        .response = response,
-        .buffer = resp_buf,
-        .allocator = allocator,
-    };
+    return response;
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    const ep = parseEndpoint(endpoint) catch {
-        ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});
-        return error.CommandFailed;
-    };
-
-    // Send cluster_status request
-    var owned = sendRequest(
-        ctx.allocator,
-        ep.host,
-        ep.port,
-        .cluster_status,
-        "", // No payload needed
-    ) catch |err| {
-        ctx.printErr("Failed to query cluster status: {}\n", .{err});
-        return error.CommandFailed;
-    };
-    defer owned.deinit();
-
-    const response = owned.response;
-
-    if (response.getStatus() != .ok) {
-        // Error message is in response.data
-        if (response.data.len > 0) {
-            ctx.printErr("Error: {s}\n", .{response.data});
-        } else {
-            ctx.printErr("Server returned error: {}\n", .{response.getStatus()});
-        }
-        return error.CommandFailed;
-    }
+    var response = try ask(ctx, .cluster_status, "");
+    defer response.deinit();
 
     // Parse response data
     // Expected format: [node_id: u32][leader_id: u32][term: u64][state: u8][member_count: u32]
-    if (response.data.len < 21) {
-        ctx.printErr("Invalid response format\n", .{});
-        return error.CommandFailed;
-    }
+    if (response.data.len < 21) return outcome.malformed(ctx, "cluster status");
 
     const node_id = std.mem.readInt(u32, response.data[0..4], .little);
     const leader_id = std.mem.readInt(u32, response.data[4..8], .little);
@@ -262,10 +159,9 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     const leader_json = if (leader_id == 0) "null" else leader_name;
 
     if (json_output) {
-        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}:{d}\",\"leader_id\":{s}{s}{s},\"term\":{d},\"role\":\"{s}\",\"members\":{d}}}\n", .{
+        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}\",\"leader_id\":{s}{s}{s},\"term\":{d},\"role\":\"{s}\",\"members\":{d}}}\n", .{
             node_name,
-            ep.host,
-            ep.port,
+            endpoint,
             if (leader_id == 0) "" else "\"",
             leader_json,
             if (leader_id == 0) "" else "\"",
@@ -277,7 +173,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         ctx.print("\nCluster Status\n", .{});
         ctx.print("──────────────\n", .{});
         ctx.print("Node ID:    {s}\n", .{node_name});
-        ctx.print("Address:    {s}:{d}\n", .{ ep.host, ep.port });
+        ctx.print("Address:    {s}\n", .{endpoint});
         ctx.print("Role:       {s}\n", .{role_str});
         ctx.print("Leader:     {s}\n", .{leader_shown});
         ctx.print("Term:       {d}\n", .{term});
@@ -289,64 +185,33 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runMembers(ctx: *commander.Context) commander.Error!void {
-    const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    const ep = parseEndpoint(endpoint) catch {
-        ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});
-        return error.CommandFailed;
-    };
-
-    // Send cluster_members request
-    var owned = sendRequest(
-        ctx.allocator,
-        ep.host,
-        ep.port,
-        .cluster_members,
-        "", // No payload needed
-    ) catch |err| {
-        ctx.printErr("Failed to query cluster members: {}\n", .{err});
-        return error.CommandFailed;
-    };
-    defer owned.deinit();
-
-    const response = owned.response;
-
-    if (response.getStatus() != .ok) {
-        // Error message is in response.data
-        if (response.data.len > 0) {
-            ctx.printErr("Error: {s}\n", .{response.data});
-        } else {
-            ctx.printErr("Server returned error: {}\n", .{response.getStatus()});
-        }
-        return error.CommandFailed;
-    }
+    var response = try ask(ctx, .cluster_members, "");
+    defer response.deinit();
 
     // [leader:u32][commit:u64][members:u8], per member
     // [id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64],
     // then [removed:u8], per removed id [id:u32][when_ms:u64].
     const data = response.data;
     if (data.len < 13) {
-        ctx.printErr("Invalid response format\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "member list");
     }
     const leader_id = std.mem.readInt(u32, data[0..4], .little);
     const commit = std.mem.readInt(u64, data[4..12], .little);
     const count = data[12];
     if (data.len < 13 + @as(usize, count) * 23 + 1) {
-        ctx.printErr("Invalid response format\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "member list");
     }
     const removed_count = data[13 + @as(usize, count) * 23];
     if (data.len != 14 + @as(usize, count) * 23 + @as(usize, removed_count) * 12) {
-        ctx.printErr("Invalid response format\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "member list");
     }
 
     var table = output.Table.init(ctx.allocator);
     defer table.deinit();
     if (!json_output) {
-        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG" }) |col| table.addColumn(col, .left) catch return error.CommandFailed;
+        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG" }) |col| table.addColumn(col, .left) catch return error.OutOfMemory;
     } else {
         ctx.print("{{\"leader\":{d},\"members\":[", .{leader_id});
     }
@@ -374,7 +239,7 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
             if (match != std.math.maxInt(u64)) ctx.print(",\"lag\":{d}", .{commit -| match});
             ctx.print("}}", .{});
         } else {
-            table.addRow(&.{ id_s, role, address, contact_s, lag_s }) catch return error.CommandFailed;
+            table.addRow(&.{ id_s, role, address, contact_s, lag_s }) catch return error.OutOfMemory;
         }
     }
     const removed_at = 14 + @as(usize, count) * 23;
@@ -391,7 +256,7 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
     for (0..removed_count) |i| {
         const rm = data[removed_at + i * 12 ..][0..12];
         const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{std.mem.readInt(u32, rm[0..4], .little)}) catch "?";
-        table.addRow(&.{ id_s, "removed", "-", "-", "-" }) catch return error.CommandFailed;
+        table.addRow(&.{ id_s, "removed", "-", "-", "-" }) catch return error.OutOfMemory;
     }
     ctx.print("\n", .{});
     table.print(ctx);
@@ -401,15 +266,11 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
 
 fn runPromote(ctx: *commander.Context) commander.Error!void {
     if (ctx.args.len == 0) {
-        ctx.printErr("Error: give the id of a replica to promote: flo cluster promote <id>...\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "give the id of a replica to promote: flo cluster promote <id>...", .{});
     }
     // One change at a time: each waits until the one before has committed.
     for (ctx.args) |arg| {
-        const id = std.fmt.parseInt(u32, arg, 10) catch {
-            ctx.printErr("Error: {s} is not a node id\n", .{arg});
-            return error.CommandFailed;
-        };
+        const id = std.fmt.parseInt(u32, arg, 10) catch return outcome.usage(ctx, "{s} is not a node id", .{arg});
         var value: [4]u8 = undefined;
         std.mem.writeInt(u32, &value, id, .little);
         try sendChange(ctx, .cluster_promote, &value);
@@ -419,13 +280,9 @@ fn runPromote(ctx: *commander.Context) commander.Error!void {
 
 fn runRemove(ctx: *commander.Context) commander.Error!void {
     if (ctx.args.len != 1) {
-        ctx.printErr("Error: give one node id: flo cluster remove <id> [--yes]\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "give one node id: flo cluster remove <id> [--yes]", .{});
     }
-    const id = std.fmt.parseInt(u32, ctx.args[0], 10) catch {
-        ctx.printErr("Error: {s} is not a node id\n", .{ctx.args[0]});
-        return error.CommandFailed;
-    };
+    const id = std.fmt.parseInt(u32, ctx.args[0], 10) catch return outcome.usage(ctx, "{s} is not a node id", .{ctx.args[0]});
     var value: [5]u8 = undefined;
     std.mem.writeInt(u32, value[0..4], id, .little);
     value[4] = @intFromBool(ctx.getBool("yes"));
@@ -435,20 +292,8 @@ fn runRemove(ctx: *commander.Context) commander.Error!void {
 
 /// Send a membership change; it is answered once it commits.
 fn sendChange(ctx: *commander.Context, op: proto.OpCode, value: []const u8) commander.Error!void {
-    const endpoint = cli_config.getEndpoint(ctx);
-    const ep = parseEndpoint(endpoint) catch {
-        ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});
-        return error.CommandFailed;
-    };
-    var owned = sendRequest(ctx.allocator, ep.host, ep.port, op, value) catch |err| {
-        ctx.printErr("Error: could not reach {s}: {}\n", .{ endpoint, err });
-        return error.CommandFailed;
-    };
-    defer owned.deinit();
-    if (owned.response.getStatus() != .ok) {
-        ctx.printErr("Error: {s}\n", .{if (owned.response.data.len > 0) owned.response.data else @tagName(owned.response.getStatus())});
-        return error.CommandFailed;
-    }
+    var response = try ask(ctx, op, value);
+    response.deinit();
 }
 
 // ==================== Testing ====================
@@ -461,14 +306,4 @@ test "create cluster command" {
 
     try std.testing.expectEqualStrings("cluster", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 2);
-}
-
-test "parseEndpoint" {
-    const ep1 = try parseEndpoint("localhost:9000");
-    try std.testing.expectEqualStrings("localhost", ep1.host);
-    try std.testing.expectEqual(@as(u16, 9000), ep1.port);
-
-    const ep2 = try parseEndpoint("192.168.1.10:4445");
-    try std.testing.expectEqualStrings("192.168.1.10", ep2.host);
-    try std.testing.expectEqual(@as(u16, 4445), ep2.port);
 }

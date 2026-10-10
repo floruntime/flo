@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
@@ -270,7 +271,7 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
         ctx.printErr("Error: Cannot use both --wait and --block\n", .{});
         ctx.printErr("  --wait: returns immediately if key exists, else waits for creation\n", .{});
         ctx.printErr("  --block: blocks for changes (waits for NEXT version even if key exists)\n", .{});
-        return error.CommandFailed;
+        return error.Usage;
     }
 
     const format = output.getFormat(ctx);
@@ -284,32 +285,21 @@ fn runGet(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.kv.get(&client, namespace, key, wait_ms, block_ms, routing_key, txn_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.get(&client, namespace, key, wait_ms, block_ms, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
         try outputKvResult(ctx, format, key, null, null);
-        return error.CommandFailed;
+        return error.NotFound;
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    // Response data is the raw value (wire format: [version: u64][value: bytes])
-    const value = result.asString();
-    const version = result.getVersion();
-    try outputKvResult(ctx, format, key, value, version);
+    // [version:u64][value]; an empty value is still 8 bytes.
+    if (result.data.len < 8) return outcome.malformed(ctx, "get response");
+    try outputKvResult(ctx, format, key, result.data[8..], result.getVersion());
 }
 
 fn runSet(ctx: *commander.Context) commander.Error!void {
@@ -329,13 +319,11 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     };
 
     if (nx and xx) {
-        ctx.printErr("Error: Cannot use both --nx and --xx\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Cannot use both --nx and --xx", .{});
     }
 
     if (cas != null and nx) {
-        ctx.printErr("Error: Cannot use --cas with --nx\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Cannot use --cas with --nx", .{});
     }
 
     const endpoint = cli_config.getEndpoint(ctx);
@@ -347,10 +335,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     const ttl_val: ?u64 = if (ttl) |t| if (t > 0) t else null else null;
 
@@ -361,10 +346,7 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
         .cas_version = cas,
         .routing_key = routing_key,
         .txn_id = optionalTxnId(ctx),
-    }) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    }) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isConflict()) {
@@ -373,13 +355,10 @@ fn runSet(ctx: *commander.Context) commander.Error!void {
         } else {
             ctx.printErr("Condition not met (key {s})\n", .{if (nx) "already exists" else "does not exist"});
         }
-        return error.CommandFailed;
+        return error.Refused;
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -401,26 +380,17 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.kv.delete(&client, namespace, key, routing_key, txn_id, cas) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.delete(&client, namespace, key, routing_key, txn_id, cas) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (cas != null and result.isConflict()) {
         ctx.printErr("Version mismatch\n", .{});
-        return error.CommandFailed;
+        return error.Refused;
     }
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("OK\n", .{});
 }
@@ -434,10 +404,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Collect all keys across shards using cursor-based shard walking
     var all_keys: std.ArrayList([]const u8) = .empty;
@@ -454,65 +421,21 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Walk all shards until no more data
     while (all_keys.items.len < limit) {
-        var result = client_mod.kv.scan(&client, namespace, prefix, cursor, @intCast(limit)) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return error.CommandFailed;
-        };
+        var result = client_mod.kv.scan(&client, namespace, prefix, cursor, @intCast(limit)) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
 
-        if (result.isError()) {
-            ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-            return error.CommandFailed;
-        }
+        try outcome.check(ctx, result);
 
-        // Parse scan response wire format:
-        // [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16][cursor]?
-        // Note: scan response does NOT have version prefix, use asRawData
-        const data = result.asRawData() orelse {
-            break; // No data
+        const data = result.asRawData() orelse return outcome.malformed(ctx, "scan response (empty)");
+        const next = parseScanPage(ctx.allocator, data, &all_keys, limit) catch |err| switch (err) {
+            error.Truncated => return outcome.malformed(ctx, "scan response"),
+            error.OutOfMemory => return error.OutOfMemory,
         };
 
-        if (data.len < 4) break; // Need at least count field
-
-        var reader = WireReader.init(data);
-        const count = reader.readU32() orelse break;
-
-        // Read keys
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            const key_len = reader.readU16() orelse break;
-            const key = reader.readSlice(key_len) orelse break;
-            // Skip value (we're keys_only but value is still present as empty)
-            const value_len = reader.readU32() orelse break;
-            _ = reader.readSlice(value_len);
-
-            // Store key
-            const key_copy = ctx.allocator.dupe(u8, key) catch break;
-            all_keys.append(ctx.allocator, key_copy) catch {
-                ctx.allocator.free(key_copy);
-                break;
-            };
-
-            if (all_keys.items.len >= limit) break;
-        }
-
-        // Read has_more flag
-        const has_more = (reader.readU8() orelse 0) != 0;
-
-        // Read next cursor
-        const cursor_len = reader.readU16() orelse 0;
-        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
-
-        // Free previous cursor and copy new one
         if (cursor_owned) |c| ctx.allocator.free(c);
         cursor_owned = null;
-
-        if (!has_more or next_cursor == null) {
-            break; // Done walking shards
-        }
-
-        // Copy cursor for next iteration
-        cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
+        const next_cursor = next orelse break;
+        cursor_owned = try ctx.allocator.dupe(u8, next_cursor);
         cursor = cursor_owned;
     }
 
@@ -536,21 +459,12 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.kv.history(&client, namespace, key, @intCast(limit)) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.history(&client, namespace, key, @intCast(limit)) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("History for key: {s}\n", .{key});
     // Output raw history data (no version prefix for history responses)
@@ -563,18 +477,15 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
 fn runMget(ctx: *commander.Context) commander.Error!void {
     const keys = ctx.getVariadicArgs("keys") orelse {
-        ctx.printErr("Error: at least one key is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "at least one key is required", .{});
     };
 
     if (keys.len == 0) {
-        ctx.printErr("Error: at least one key is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "at least one key is required", .{});
     }
 
     if (keys.len > 256) {
-        ctx.printErr("Error: max 256 keys per request\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "max 256 keys per request", .{});
     }
 
     const namespace = cli_config.getNamespace(ctx);
@@ -588,104 +499,108 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.kv.mget(&client, namespace, keys) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.mget(&client, namespace, keys) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    // Parse batch GET response: [count:u32]([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
-    const data = result.asRawData() orelse {
-        ctx.printErr("Error: empty response\n", .{});
-        return error.CommandFailed;
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "mget response (empty)");
+    const entries = parseMget(ctx.allocator, data) catch |err| switch (err) {
+        error.Truncated => return outcome.malformed(ctx, "mget response"),
+        error.OutOfMemory => return error.OutOfMemory,
     };
-
-    if (data.len < 4) {
-        ctx.printErr("Error: malformed response\n", .{});
-        return error.CommandFailed;
-    }
-
-    var reader = WireReader.init(data);
-    const count = reader.readU32() orelse {
-        ctx.printErr("Error: malformed response\n", .{});
-        return error.CommandFailed;
-    };
+    defer ctx.allocator.free(entries);
 
     switch (format) {
         .json => {
             ctx.print("[", .{});
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const status = reader.readU8() orelse break;
-                const key_len = reader.readU16() orelse break;
-                const key = reader.readSlice(key_len) orelse break;
-                const version = reader.readU64() orelse break;
-                const value_len = reader.readU32() orelse break;
-                const value = reader.readSlice(value_len) orelse break;
-
+            for (entries, 0..) |e, i| {
                 if (i > 0) ctx.print(",", .{});
-                if (status == 0) {
-                    ctx.print("{{\"key\":\"{s}\",\"value\":\"{s}\",\"version\":{d}}}", .{ key, value, version });
+                if (e.found) {
+                    ctx.print("{{\"key\":\"{s}\",\"value\":\"{s}\",\"version\":{d}}}", .{ e.key, e.value, e.version });
                 } else {
-                    ctx.print("{{\"key\":\"{s}\",\"value\":null}}", .{key});
+                    ctx.print("{{\"key\":\"{s}\",\"value\":null}}", .{e.key});
                 }
             }
             ctx.print("]\n", .{});
         },
         .table => {
-            // Print as aligned table
             ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ "KEY", "VALUE", "VERSION" });
             ctx.print("{s:-<30} {s:-<40} {s:-<10}\n", .{ "", "", "" });
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const status = reader.readU8() orelse break;
-                const key_len = reader.readU16() orelse break;
-                const key = reader.readSlice(key_len) orelse break;
-                const version = reader.readU64() orelse break;
-                const value_len = reader.readU32() orelse break;
-                const value = reader.readSlice(value_len) orelse break;
-
-                if (status == 0) {
+            for (entries) |e| {
+                if (e.found) {
                     var ver_buf: [32]u8 = undefined;
-                    const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{version}) catch "";
-                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ key, value, ver_str });
+                    const ver_str = std.fmt.bufPrint(&ver_buf, "{d}", .{e.version}) catch "";
+                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ e.key, e.value, ver_str });
                 } else {
-                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ key, "(nil)", "" });
+                    ctx.print("{s:<30} {s:<40} {s:>10}\n", .{ e.key, "(nil)", "" });
                 }
             }
         },
         .raw => {
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const status = reader.readU8() orelse break;
-                const key_len = reader.readU16() orelse break;
-                const key = reader.readSlice(key_len) orelse break;
-                _ = reader.readU64() orelse break; // skip version
-                const value_len = reader.readU32() orelse break;
-                const value = reader.readSlice(value_len) orelse break;
-
-                if (status == 0) {
-                    ctx.print("{s}\t{s}\n", .{ key, value });
+            for (entries) |e| {
+                if (e.found) {
+                    ctx.print("{s}\t{s}\n", .{ e.key, e.value });
                 } else {
-                    ctx.print("{s}\t(nil)\n", .{key});
+                    ctx.print("{s}\t(nil)\n", .{e.key});
                 }
             }
         },
     }
 }
 
-fn outputKvResult(ctx: *commander.Context, format: output.Format, key: []const u8, value: ?[]const u8, version: ?u64) !void {
+/// One page of a scan: `[count:u32]([key_len:u16][key][value_len:u32][value])*
+/// [has_more:u8][cursor_len:u16][cursor]`. Appends copies of its keys to
+/// `keys` until it holds `limit`, and returns the cursor of the next page,
+/// or null when this is the last.
+fn parseScanPage(
+    allocator: Allocator,
+    data: []const u8,
+    keys: *std.ArrayList([]const u8),
+    limit: usize,
+) error{ Truncated, OutOfMemory }!?[]const u8 {
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse return error.Truncated;
+    for (0..count) |_| {
+        const key = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        _ = reader.readLengthPrefixed(u32) orelse return error.Truncated; // value
+        if (keys.items.len >= limit) continue;
+        const owned = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned);
+        try keys.append(allocator, owned);
+    }
+    const has_more = (reader.readU8() orelse return error.Truncated) != 0;
+    const next = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+    return if (has_more and next.len > 0) next else null;
+}
+
+const MgetEntry = struct {
+    found: bool,
+    key: []const u8,
+    value: []const u8,
+    version: u64,
+};
+
+/// `[count:u32]([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*`;
+/// status 0 is found. The entries' slices point into `data`.
+fn parseMget(allocator: Allocator, data: []const u8) error{ Truncated, OutOfMemory }![]MgetEntry {
+    var reader = WireReader.init(data);
+    const count = reader.readU32() orelse return error.Truncated;
+    var entries: std.ArrayList(MgetEntry) = .empty;
+    errdefer entries.deinit(allocator);
+    for (0..count) |_| {
+        const status = reader.readU8() orelse return error.Truncated;
+        const key = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        const version = reader.readU64() orelse return error.Truncated;
+        const value = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+        try entries.append(allocator, .{ .found = status == 0, .key = key, .value = value, .version = version });
+    }
+    return entries.toOwnedSlice(allocator);
+}
+
+fn outputKvResult(ctx: *commander.Context, format: output.Format, key: []const u8, value: ?[]const u8, version: ?u64) commander.Error!void {
     switch (format) {
         .json => {
             // Use the output.Json helper for clean JSON
@@ -710,10 +625,11 @@ fn outputKvResult(ctx: *commander.Context, format: output.Format, key: []const u
             var ver_buf: [32]u8 = undefined;
             const ver_str = if (version) |v| std.fmt.bufPrint(&ver_buf, "{d}", .{v}) catch "" else "";
 
+            // The column count matches by construction, so only allocation can fail.
             if (version != null) {
-                table.addRow(&.{ key, value orelse "(nil)", ver_str }) catch return;
+                table.addRow(&.{ key, value orelse "(nil)", ver_str }) catch return error.OutOfMemory;
             } else {
-                table.addRow(&.{ key, value orelse "(nil)" }) catch return;
+                table.addRow(&.{ key, value orelse "(nil)" }) catch return error.OutOfMemory;
             }
             table.print(ctx);
         },
@@ -733,10 +649,8 @@ fn dialClient(ctx: *commander.Context) commander.Error!Client {
     const endpoint = cli_config.getEndpoint(ctx);
     var client = Client.init(ctx.allocator, endpoint);
     client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        client.deinit();
-        return error.CommandFailed;
+        defer client.deinit();
+        return outcome.connectFailed(ctx, err, endpoint);
     };
     return client;
 }
@@ -763,24 +677,16 @@ fn runIncr(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.incr(&client, namespace, key, delta, routing_key, txn_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.incr(&client, namespace, key, delta, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const value = result.asString() orelse {
-        ctx.printErr("Error: empty counter response\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "counter response (empty)");
     };
     if (value.len != 8) {
-        ctx.printErr("Error: malformed counter response\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "counter response");
     }
     const counter = std.mem.readInt(i64, value[0..8], .little);
     ctx.print("{d}\n", .{counter});
@@ -792,8 +698,7 @@ fn ttlFlag(ctx: *commander.Context) commander.Error!?u64 {
     const text = ctx.getString("ttl") orelse return null;
     if (text.len == 0) return null;
     return time_units.parseDurationMs(text) orelse {
-        ctx.printErr("Error: --ttl {s} is not a duration; give a number and a unit (500ms, 30s, 5m, 1h, 1d), or 0\n", .{text});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--ttl {s} is not a duration; give a number and a unit (500ms, 30s, 5m, 1h, 1d), or 0", .{text});
     };
 }
 
@@ -808,24 +713,18 @@ fn runTouch(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key, txn_id, cas) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.touch(&client, namespace, key, ttl, routing_key, txn_id, cas) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (cas != null and result.isConflict()) {
         ctx.printErr("Version mismatch\n", .{});
-        return error.CommandFailed;
+        return error.Refused;
     }
     if (result.isNotFound()) {
         ctx.printErr("Key not found\n", .{});
-        return error.CommandFailed;
+        return error.NotFound;
     }
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
 }
 
@@ -839,24 +738,18 @@ fn runPersist(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.persist(&client, namespace, key, routing_key, txn_id, cas) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.persist(&client, namespace, key, routing_key, txn_id, cas) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (cas != null and result.isConflict()) {
         ctx.printErr("Version mismatch\n", .{});
-        return error.CommandFailed;
+        return error.Refused;
     }
     if (result.isNotFound()) {
         ctx.printErr("Key not found\n", .{});
-        return error.CommandFailed;
+        return error.NotFound;
     }
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
 }
 
@@ -869,24 +762,20 @@ fn runExists(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.exists(&client, namespace, key, routing_key, txn_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.exists(&client, namespace, key, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
-    const value = result.asString() orelse "";
-    const present = value.len == 1 and value[0] == 1;
+    // [version:u64][present:u8], present 0 or 1.
+    const value = result.asString() orelse return outcome.malformed(ctx, "exists response (empty)");
+    if (value.len != 1) return outcome.malformed(ctx, "exists response");
+    const present = value[0] == 1;
     if (present) {
         ctx.print("1\n", .{});
     } else {
         ctx.print("0\n", .{});
-        return error.CommandFailed; // exit 1 — useful for shell `if`
+        return error.NotFound; // exit 1, for shell `if`
     }
 }
 
@@ -899,21 +788,17 @@ fn runJsonGet(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.jsonGet(&client, namespace, key, path, routing_key) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.jsonGet(&client, namespace, key, path, routing_key) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
         ctx.printErr("Not found\n", .{});
-        return error.CommandFailed;
+        return error.NotFound;
     }
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
-    ctx.print("{s}\n", .{result.asString() orelse ""});
+    try outcome.check(ctx, result);
+    // [version:u64][json]
+    if (result.data.len < 8) return outcome.malformed(ctx, "json get response");
+    ctx.print("{s}\n", .{result.data[8..]});
 }
 
 fn runJsonSet(ctx: *commander.Context) commander.Error!void {
@@ -926,20 +811,14 @@ fn runJsonSet(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.jsonSet(&client, namespace, key, path, value, routing_key) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.jsonSet(&client, namespace, key, path, value, routing_key) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
         ctx.printErr("Path not found\n", .{});
-        return error.CommandFailed;
+        return error.NotFound;
     }
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
 }
 
@@ -952,20 +831,14 @@ fn runJsonDel(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.jsonDel(&client, namespace, key, path, routing_key) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.jsonDel(&client, namespace, key, path, routing_key) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     if (result.isNotFound()) {
         ctx.printErr("Path not found\n", .{});
-        return error.CommandFailed;
+        return error.NotFound;
     }
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
 }
 
@@ -981,13 +854,55 @@ test "create kv command" {
     try std.testing.expect(cmd.commands.items.len >= 4);
 }
 
+test "kv: a scan page parses, and a cut-short one is Truncated" {
+    const a = std.testing.allocator;
+    // Two keys, has_more=1, cursor "c1".
+    const page = "\x02\x00\x00\x00" ++ "\x01\x00a" ++ "\x00\x00\x00\x00" ++
+        "\x02\x00bb" ++ "\x01\x00\x00\x00v" ++ "\x01" ++ "\x02\x00c1";
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| a.free(k);
+        keys.deinit(a);
+    }
+    try std.testing.expectEqualStrings("c1", (try parseScanPage(a, page, &keys, 100)).?);
+    try std.testing.expectEqual(@as(usize, 2), keys.items.len);
+    try std.testing.expectEqualStrings("bb", keys.items[1]);
+
+    // A limit below the page still reads the trailer.
+    for (keys.items) |k| a.free(k);
+    keys.clearRetainingCapacity();
+    try std.testing.expectEqualStrings("c1", (try parseScanPage(a, page, &keys, 1)).?);
+    try std.testing.expectEqual(@as(usize, 1), keys.items.len);
+
+    for (1..page.len) |n| {
+        for (keys.items) |k| a.free(k);
+        keys.clearRetainingCapacity();
+        try std.testing.expectError(error.Truncated, parseScanPage(a, page[0..n], &keys, 100));
+    }
+}
+
+test "kv: an mget answer parses, and a cut-short one is Truncated" {
+    const a = std.testing.allocator;
+    const answer = "\x02\x00\x00\x00" ++
+        "\x00" ++ "\x01\x00k" ++ "\x07\x00\x00\x00\x00\x00\x00\x00" ++ "\x02\x00\x00\x00hi" ++
+        "\x02" ++ "\x01\x00m" ++ "\x00" ** 8 ++ "\x00\x00\x00\x00";
+    const entries = try parseMget(a, answer);
+    defer a.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expect(entries[0].found);
+    try std.testing.expectEqualStrings("hi", entries[0].value);
+    try std.testing.expectEqual(@as(u64, 7), entries[0].version);
+    try std.testing.expect(!entries[1].found);
+
+    for (1..answer.len) |n| try std.testing.expectError(error.Truncated, parseMget(a, answer[0..n]));
+}
+
 // ── Per-Shard Transaction Subcommands ────────────────────────────────────
 
 fn requireRoutingKey(ctx: *commander.Context) commander.Error![]const u8 {
     const rk = ctx.getString("routing-key") orelse "";
     if (rk.len == 0) {
-        ctx.printErr("Error: --routing-key is required for transaction commands\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--routing-key is required for transaction commands", .{});
     }
     return rk;
 }
@@ -999,20 +914,13 @@ fn runTxnBegin(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.beginTxn(&client, namespace, routing_key) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.beginTxn(&client, namespace, routing_key) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const begin = result.getTxnBeginResult() orelse {
-        ctx.printErr("Error: malformed begin response\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "begin response");
     };
     ctx.print("txn_id={d} pinned_hash={d}\n", .{ begin.txn_id, begin.pinned_hash });
 }
@@ -1022,27 +930,19 @@ fn runTxnCommit(ctx: *commander.Context) commander.Error!void {
     const routing_key = try requireRoutingKey(ctx);
     const txn_str = ctx.getPositional("txn-id").?;
     const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
-        ctx.printErr("Error: invalid txn-id '{s}'\n", .{txn_str});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "invalid txn-id '{s}'", .{txn_str});
     };
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.commitTxn(&client, namespace, routing_key, txn_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.commitTxn(&client, namespace, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     const commit = result.getTxnCommitResult() orelse {
-        ctx.printErr("Error: malformed commit response\n", .{});
-        return error.CommandFailed;
+        return outcome.malformed(ctx, "commit response");
     };
     ctx.print("OK ops={d} commit_index={d}\n", .{ commit.op_count, commit.commit_index });
 }
@@ -1052,22 +952,15 @@ fn runTxnRollback(ctx: *commander.Context) commander.Error!void {
     const routing_key = try requireRoutingKey(ctx);
     const txn_str = ctx.getPositional("txn-id").?;
     const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
-        ctx.printErr("Error: invalid txn-id '{s}'\n", .{txn_str});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "invalid txn-id '{s}'", .{txn_str});
     };
 
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.rollbackTxn(&client, namespace, routing_key, txn_id) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.kv.rollbackTxn(&client, namespace, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
 }

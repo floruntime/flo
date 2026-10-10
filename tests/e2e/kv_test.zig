@@ -1137,8 +1137,9 @@ test "e2e/kv: blocking get times out when key not set" {
     var result = try ctx.cli.run(&.{ "kv", "get", key, "--wait", "500" });
     defer result.deinit();
 
-    // Should return (nil) after timeout, not an error
-    try testing.expect(result.stdoutContains("(nil)") or result.stderrContains("timed out") or !result.succeeded());
+    // The wait ends with the key still absent: (nil), not found.
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try testing.expect(result.stdoutContains("(nil)"));
 }
 
 // =============================================================================
@@ -1367,8 +1368,7 @@ test "e2e/kv: history for non-existent key fails" {
     var result = try ctx.cli.run(&.{ "kv", "history", "no_such_key" });
     defer result.deinit();
 
-    // Non-existent key should produce an error
-    try testing.expect(!result.succeeded());
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 test "e2e/kv: history after delete preserves prior versions" {

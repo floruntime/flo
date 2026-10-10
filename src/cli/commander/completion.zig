@@ -365,7 +365,7 @@ pub fn completionCommand(allocator: Allocator, root_cmd: *Command) !*Command {
                 const root = ctx.command.root();
                 const script = generate(ctx.allocator, root, shell) catch {
                     ctx.printErr("Error generating completion script\n", .{});
-                    return error.CommandFailed;
+                    return error.OutOfMemory;
                 };
                 defer ctx.allocator.free(script);
 

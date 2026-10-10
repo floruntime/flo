@@ -13,6 +13,7 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const cli_config = @import("../config.zig");
 const output = @import("../output.zig");
+const outcome = @import("../outcome.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -38,7 +39,10 @@ pub fn createStatusCommand(allocator: Allocator) !*commander.Command {
             \\
             \\Exit codes:
             \\  0 - Server is healthy
-            \\  1 - Server is not responding or unhealthy
+            \\  2 - The endpoint is not host:port
+            \\  3 - Server answered the ping with an error
+            \\  4 - Server is overloaded or unavailable
+            \\  5 - Server is unreachable or not responding
         )
         .examples(&.{
             "flo status",
@@ -65,9 +69,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
             ctx.print("{{\"status\":\"down\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
         } else {
             ctx.printErr("✗ Server at {s} is DOWN\n", .{endpoint});
-            ctx.printErr("  Connection failed: {}\n", .{err});
         }
-        return error.CommandFailed;
+        return outcome.connectFailed(ctx, err, endpoint);
     };
 
     var result = client.sendRequest(.ping, "", "", "") catch |err| {
@@ -75,20 +78,18 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
             ctx.print("{{\"status\":\"error\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
         } else {
             ctx.printErr("✗ Server at {s} is not responding\n", .{endpoint});
-            ctx.printErr("  Request failed: {}\n", .{err});
         }
-        return error.CommandFailed;
+        return outcome.requestFailed(ctx, err);
     };
     defer result.deinit();
 
-    if (result.isError()) {
-        const err_msg = result.errorMessage();
+    if (result.status != .ok) {
         if (json_output) {
-            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":\"{s}\",\"error\":\"{s}\"}}\n", .{ endpoint, err_msg });
+            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":\"{s}\",\"error\":\"{s}\"}}\n", .{ endpoint, result.errorMessage() });
         } else {
-            ctx.printErr("✗ Server is UNHEALTHY: {s}\n", .{err_msg});
+            ctx.printErr("✗ Server is UNHEALTHY\n", .{});
         }
-        return error.CommandFailed;
+        return outcome.refused(ctx, result);
     }
 
     if (json_output) {
