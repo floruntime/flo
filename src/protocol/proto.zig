@@ -26,6 +26,9 @@ pub const MAX_STREAM_READ_RECORDS: u32 = 1000;
 /// Most data one answer frame carries.
 pub const MAX_ANSWER_BYTES: usize = 256 * 1024;
 
+/// The largest request frame, header included, that a server reads.
+pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
+
 comptime {
     std.debug.assert(MAX_STREAM_BATCH_RECORDS <= MAX_STREAM_READ_RECORDS);
 }

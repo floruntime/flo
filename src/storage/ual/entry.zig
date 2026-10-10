@@ -187,7 +187,7 @@ pub const Header = extern struct {
 
 /// Common payload prefix for key-value command entries.
 /// Fixed 10-byte prefix: namespace_hash(4) + key_length(2) + value_length(4)
-pub const COMMAND_PREFIX_SIZE: usize = 10;
+pub const COMMAND_PREFIX_SIZE: usize = @import("../../protocol/limits.zig").COMMAND_PREFIX_SIZE;
 
 pub const CommandPayload = struct {
     namespace_hash: u32,
@@ -211,9 +211,9 @@ pub const CommandPayload = struct {
         std.mem.writeInt(u32, buf[6..10], self.value_length, .little);
 
         if (self.key.len > 0) {
-            @memcpy(buf[10 .. 10 + self.key.len], self.key);
+            @memcpy(buf[COMMAND_PREFIX_SIZE .. COMMAND_PREFIX_SIZE + self.key.len], self.key);
         }
-        const value_start = 10 + self.key.len;
+        const value_start = COMMAND_PREFIX_SIZE + self.key.len;
         if (self.value.len > 0) {
             @memcpy(buf[value_start .. value_start + self.value.len], self.value);
         }
@@ -226,7 +226,7 @@ pub const CommandPayload = struct {
         if (data.len < COMMAND_PREFIX_SIZE) return null;
 
         const ns_hash = std.mem.readInt(u32, data[0..4], .little);
-        // usize: `10 + key_len` overflows u16 for keys near the limit.
+        // usize: `COMMAND_PREFIX_SIZE + key_len` overflows u16 for keys near the limit.
         const key_len: usize = std.mem.readInt(u16, data[4..6], .little);
         const val_len: usize = std.mem.readInt(u32, data[6..10], .little);
 
@@ -237,8 +237,8 @@ pub const CommandPayload = struct {
             .namespace_hash = ns_hash,
             .key_length = @intCast(key_len),
             .value_length = @intCast(val_len),
-            .key = data[10 .. 10 + key_len],
-            .value = data[10 + key_len .. 10 + key_len + val_len],
+            .key = data[COMMAND_PREFIX_SIZE .. COMMAND_PREFIX_SIZE + key_len],
+            .value = data[COMMAND_PREFIX_SIZE + key_len .. COMMAND_PREFIX_SIZE + key_len + val_len],
         };
     }
 };

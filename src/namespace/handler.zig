@@ -65,7 +65,7 @@ const Connection = connection_mod.Connection;
 pub const MAX_NAMESPACE_LEN: usize = 128;
 
 /// The longest namespace name.
-pub const MAX_NAME_LEN: usize = 63;
+pub const MAX_NAME_LEN: usize = @import("../protocol/limits.zig").MAX_NAMESPACE_NAME;
 
 /// Why `name` cannot name a namespace, or null if it can: 1–63 of
 /// `[a-z0-9_-]`, starting with a letter or digit and not ending in `-`; a
@@ -76,7 +76,7 @@ pub const MAX_NAME_LEN: usize = 63;
 /// replicated state: loosening it later is safe, tightening it is not.
 pub fn nameRefusal(name: []const u8) ?[]const u8 {
     if (name.len == 0) return "namespace name is required";
-    if (name.len > MAX_NAME_LEN) return "namespace name too long (at most 63 bytes)";
+    if (name.len > MAX_NAME_LEN) return std.fmt.comptimePrint("namespace name too long (at most {d} bytes)", .{MAX_NAME_LEN});
     if (name[0] == '_') return "reserved namespace name: a leading '_' is the system's";
     for (name) |c| switch (c) {
         'a'...'z', '0'...'9', '-', '_' => {},
@@ -96,7 +96,7 @@ pub fn nameRefusal(name: []const u8) ?[]const u8 {
 /// pathological — they bloat Raft log entries, dominate stack frames, and
 /// degrade hash table performance. All subsystems should validate against
 /// `MAX_KEY_LENGTH` at the dispatch layer.
-pub const MAX_QUALIFIED_KEY: usize = 4096;
+pub const MAX_QUALIFIED_KEY: usize = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 
 /// Maximum raw key length that a user can create (accounting for namespace
 /// prefix overhead). This is the limit to validate at key creation time so
@@ -211,7 +211,7 @@ pub fn validateKeySize(ns: []const u8, key: []const u8) ?[]const u8 {
             return "key too large for namespace (max 3967 bytes with namespace prefix)";
     } else {
         if (key.len > MAX_QUALIFIED_KEY)
-            return "key too large (max 4096 bytes)";
+            return std.fmt.comptimePrint("key too large (max {d} bytes)", .{MAX_QUALIFIED_KEY});
     }
     return null;
 }
