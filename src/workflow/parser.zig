@@ -217,8 +217,8 @@ pub fn parseWorkflow(allocator: Allocator, content: []const u8, diag: ?*Diagnost
 fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue, d: D) ParseError!WorkflowDefinition {
     if (root != .object) return d.fail(ParseError.InvalidFormat, "a workflow definition must be a map, not {s}", .{kindName(root)});
     try checkKeys(d, root, &.{
-        "kind",     "name",     "version",  "description", "idempotency", "search_attributes",
-        "plans",    "start",    "steps",    "terminals",   "schedule",    "trigger",
+        "kind",   "name",  "version", "description", "idempotency", "search_attributes",
+        "plans",  "start", "steps",   "terminals",   "schedule",    "trigger",
         "output",
     });
 
@@ -377,8 +377,8 @@ fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue, d: D)
     try checkKeys(d, obj, &.{ "selection", "errors", "executors", "health", "cache", "fallback" });
 
     const selection = try oneOf(SelectionStrategy, d, "selection", try optString(d, obj, "selection") orelse "static-order", &.{
-        .{ "static-order", .static_order },       .{ "round-robin", .round_robin },
-        .{ "random", .random },                   .{ "health-weighted", .health_weighted },
+        .{ "static-order", .static_order }, .{ "round-robin", .round_robin },
+        .{ "random", .random },             .{ "health-weighted", .health_weighted },
     }, ParseError.InvalidSelectionStrategy);
 
     const error_classification = try parseErrorClassification(allocator, obj, d);
@@ -879,7 +879,6 @@ fn parseFallbackConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?
     };
 }
 
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1011,7 +1010,6 @@ test "parseWorkflow: with custom terminals" {
 
     try testing.expectEqual(@as(usize, 2), def.terminals.len);
 }
-
 
 test "parseWorkflow: YAML with inline plans" {
     const testing = std.testing;
@@ -1166,7 +1164,6 @@ test "parseWorkflow: a count or delay that doesn't fit its field is refused" {
     }
 }
 
-
 /// The diagnostic a definition is refused with.
 fn expectRefused(content: []const u8, expected: ParseError, message: []const u8) !void {
     var diag: Diagnostic = .{};
@@ -1178,9 +1175,9 @@ fn wrap(comptime start_extra: []const u8, comptime top_extra: []const u8) []cons
     return
     \\{ "kind": "Workflow", "name": "w", "version": "1",
     ++ top_extra ++
-    \\  "start": { "run": "@actions/x",
+        \\  "start": { "run": "@actions/x",
     ++ start_extra ++
-    \\    "transitions": { "success": "flo.Completed" } } }
+        \\    "transitions": { "success": "flo.Completed" } } }
     ;
 }
 

@@ -63,10 +63,10 @@ jobs:
           name: dashboard-dist
           path: src/node/dashboard/dist
 
-      # No `zig fmt --check` gate yet: 12 files on dev are already unformatted,
-      # so it would fail every PR on day one. Reformatting them is a separate
-      # cleanup, best landed when no PRs are in flight — two of those files are
-      # touched by open PRs right now.
+      # Before the build, which generates the gitignored dashboard assets.
+      - name: Format
+        run: zig fmt --check src tests build.zig
+
       - name: Build
         run: zig build
 
