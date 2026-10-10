@@ -44,6 +44,9 @@ const Connection = connection_mod.Connection;
 const CommandResult = result_mod.CommandResult;
 const StreamProjection = stream_mod.StreamProjection;
 const StreamID = stream_mod.StreamID;
+const time_units = @import("../util/time_units.zig");
+
+pub const TrimBound = stream_mod.TrimBound;
 const StreamRecord = stream_mod.StreamRecord;
 const PendingEntry = stream_mod.PendingEntry;
 const Dispatcher = dispatcher_mod.Dispatcher;
@@ -663,14 +666,15 @@ pub const StreamHandler = struct {
         if (bounds == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give one of before, maxlen or maxage" } };
         if (bounds > 1) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: give only one of before, maxlen or maxage" } };
 
-        // The boundary: records with id <= it are removed (see `trimStream`).
-        var trim_id: StreamID = undefined;
+        // What goes: records up to a boundary id (see `trimStream`), or
+        // records older than an age at the trim entry's stamp.
+        var bound: TrimBound = undefined;
         if (before) |opt| {
             const sid = opt.asStreamId() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: before must be a stream id" } };
             if (sid.timestamp_ms > 0) {
-                trim_id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence };
+                bound = .{ .id = .{ .timestamp_ms = sid.timestamp_ms, .sequence = sid.sequence } };
             } else if (sid.sequence > 0) {
-                trim_id = StreamID.fromSeq(sid.sequence);
+                bound = .{ .id = StreamID.fromSeq(sid.sequence) };
             } else {
                 return .{ .err = .{ .code = .invalid_request, .message = "stream trim: before must be after 0-0" } };
             }
@@ -682,26 +686,26 @@ pub const StreamHandler = struct {
             // as far shorter than it is.
             const total = self.stream.streamLogicalCount(name_hash);
             if (total <= keep) return trimmed(name_hash, 0, self.stream);
-            trim_id = self.stream.resolveNthRecordId(name_hash, total - keep);
+            const nth = self.stream.resolveNthRecordId(name_hash, total - keep);
             // Trim cuts whole batches; when the cut falls inside the first
             // one, nothing can go without dropping records inside the window.
-            if (trim_id.eql(StreamID.MIN)) return trimmed(name_hash, 0, self.stream);
+            if (nth.eql(StreamID.MIN)) return trimmed(name_hash, 0, self.stream);
+            bound = .{ .id = nth };
         } else if (maxage) |opt| {
-            // Remove records older than now - S.
+            // Remove records older than S seconds, by the trim entry's stamp.
             const age_s = opt.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage must be a u64" } };
             if (age_s == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage must be > 0" } };
-            const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-            // Saturates: an age older than the clock trims nothing.
-            const age_ms = age_s *| 1000;
-            const cutoff_ms = if (now_ms > age_ms) now_ms - age_ms else 0;
-            if (cutoff_ms == 0) return trimmed(name_hash, 0, self.stream);
-            trim_id = StreamID.fromTimestamp(cutoff_ms);
+            if (age_s > time_units.MAX_AGE_MS / std.time.ms_per_s) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage is over 100 years" } };
+            bound = .{ .age_ms = age_s * std.time.ms_per_s };
+            // Nothing that old by this node's time: no entry to propose.
+            if (bound.resolve(self.nowNs()) == null) return trimmed(name_hash, 0, self.stream);
         } else unreachable;
 
         // A dry run answers from the projection on the owning shard: what the
         // trim would remove and the first record it would leave, with no
         // proposal and no log entry.
         if (dry_run) {
+            const trim_id = bound.resolve(self.nowNs()) orelse return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = firstSeq(self.stream, name_hash) } };
             const first_id = self.stream.firstIdAfterTrim(name_hash, trim_id);
             return .{ .stream_trimmed = .{
                 .deleted_count = self.stream.trimCount(name_hash, trim_id),
@@ -710,11 +714,12 @@ pub const StreamHandler = struct {
         }
 
         if (self.shard_ptr) |sptr| {
-            const proposed = self.proposeTrim(shardFromPtr(sptr), req.namespace, name_hash, trim_id) catch |err| {
+            const proposed = self.proposeTrim(shardFromPtr(sptr), req.namespace, name_hash, bound) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "trim not persisted") } };
             };
             return .{ .parked = proposed };
         }
+        const trim_id = bound.resolve(self.nowNs()) orelse return trimmed(name_hash, 0, self.stream);
         return trimmed(name_hash, self.stream.trimStream(name_hash, trim_id), self.stream);
     }
 
@@ -811,6 +816,7 @@ pub const StreamHandler = struct {
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
         if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
+        if (retentionAgeRefusal(req)) |refused| return refused;
         // Register the stream name for listing (namespace-qualified)
         if (req.key.len > 0) {
             var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -863,8 +869,8 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         };
 
-        // Parse retention options from TLV
         if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
+        if (retentionAgeRefusal(req)) |refused| return refused;
         const retention = parseRetentionOptions(req);
 
         // Merge: keep existing partition_count and name_hash, update retention
@@ -882,6 +888,14 @@ pub const StreamHandler = struct {
     /// Retention enforces age and count only; a byte bound would be stored
     /// and never applied.
     const BYTE_RETENTION_REFUSAL: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream retention by bytes is not supported; use retention_age or retention_count" } };
+
+    /// A retention age past 100 years is a mistake, not a policy: refused
+    /// rather than left to trim nothing.
+    fn retentionAgeRefusal(req: Request) ?CommandResult {
+        const age_s = parseRetentionOptions(req).age_s;
+        if (age_s > time_units.MAX_AGE_MS / std.time.ms_per_s) return .{ .err = .{ .code = .invalid_request, .message = "stream retention age is over 100 years" } };
+        return null;
+    }
 
     /// Parse retention TLV options from a request.
     fn parseRetentionOptions(req: Request) struct { age_s: u64, count: u64, bytes: u64 } {
@@ -1738,11 +1752,15 @@ pub const StreamHandler = struct {
         if (etype == .stream_trim) {
             self.last_trim_count = 0;
             if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                if (cmd.key.len >= 16) {
-                    const ts = std.mem.readInt(u64, cmd.key[0..8], .little);
-                    const seq = std.mem.readInt(u64, cmd.key[8..16], .little);
-                    const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
-                    self.last_trim_count = self.stream.trimStream(nh, .{ .timestamp_ms = ts, .sequence = seq });
+                const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
+                if (TrimBound.decode(cmd.key)) |bound| {
+                    // An age resolves against this entry's stamp, so every
+                    // replica cuts at the same place.
+                    if (bound.resolve(entry.header.timestamp_ns)) |trim_id| {
+                        self.last_trim_count = self.stream.trimStream(nh, trim_id);
+                    }
+                } else {
+                    log.err("stream trim entry index={d} is malformed; skipped, so nothing is trimmed", .{entry.header.index});
                 }
             }
         }
@@ -1782,15 +1800,14 @@ pub const StreamHandler = struct {
 
     // ── Trim Persistence ────────────────────────────────────────────────
 
-    /// A trim entry: key = the boundary id, value = the stream hash.
-    fn proposeTrim(self: *StreamHandler, shard: *Shard, namespace: []const u8, name_hash: u64, trim_id: StreamID) !persistence_mod.ProposeResult {
+    /// A trim entry: key = the bound (`TrimBound.encode`), value = the
+    /// stream hash.
+    fn proposeTrim(self: *StreamHandler, shard: *Shard, namespace: []const u8, name_hash: u64, bound: TrimBound) !persistence_mod.ProposeResult {
         _ = self;
-        var key_buf: [16]u8 = undefined;
-        std.mem.writeInt(u64, key_buf[0..8], trim_id.timestamp_ms, .little);
-        std.mem.writeInt(u64, key_buf[8..16], trim_id.sequence, .little);
+        var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, val_buf[0..8], name_hash, .little);
-        return persistence_mod.proposeEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, &key_buf, &val_buf);
+        return persistence_mod.proposeEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, bound.encode(&key_buf), &val_buf);
     }
 
     /// A delete entry: key = raw stream name, value = namespace-qualified
@@ -1805,9 +1822,12 @@ pub const StreamHandler = struct {
 
     /// Retention's trims: proposed; the trim applies when it commits.
     /// Whether it was proposed (without a shard, applied here).
-    pub fn persistTrim(self: *StreamHandler, name_hash: u64, trim_id: StreamID) bool {
-        const sptr = self.shard_ptr orelse return self.stream.trimStream(name_hash, trim_id) > 0;
-        _ = self.proposeTrim(shardFromPtr(sptr), "", name_hash, trim_id) catch |err| {
+    pub fn persistTrim(self: *StreamHandler, name_hash: u64, bound: TrimBound) bool {
+        const sptr = self.shard_ptr orelse {
+            const trim_id = bound.resolve(self.nowNs()) orelse return false;
+            return self.stream.trimStream(name_hash, trim_id) > 0;
+        };
+        _ = self.proposeTrim(shardFromPtr(sptr), "", name_hash, bound) catch |err| {
             log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
             return false;
         };
@@ -1815,6 +1835,18 @@ pub const StreamHandler = struct {
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
+
+    /// This node's time, as its Raft node keeps it (the wall clock with no
+    /// shard), for a leader deciding whether a trim would remove anything.
+    fn nowNs(self: *const StreamHandler) u64 {
+        if (self.shard_ptr) |sptr| return shardFromPtr(sptr).raft_node.now();
+        return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
+    }
+
+    fn firstSeq(stream: *StreamProjection, name_hash: u64) u64 {
+        const first_id = stream.streamFirstId(name_hash);
+        return if (first_id.eql(StreamID.MIN)) 0 else first_id.sequence;
+    }
 
     /// Cast opaque shard pointer to a Shard-like type for proposing entries.
     /// Uses anytype to avoid circular import.
@@ -2726,8 +2758,103 @@ test "stream handler: trim refuses what it would otherwise ignore" {
     try za.addU64(.max_age_seconds, 0);
     try expectTrimRefused(&handler, "", za.getOptions(), "stream trim: maxage must be > 0");
 
+    // Past 100 years an age is a mistake, refused rather than saturated.
+    var big_buf: [16]u8 = undefined;
+    var big = OptionsBuilder.init(&big_buf);
+    try big.addU64(.max_age_seconds, time_units.MAX_AGE_MS / std.time.ms_per_s + 1);
+    try expectTrimRefused(&handler, "", big.getOptions(), "stream trim: maxage is over 100 years");
+
     // Nothing was trimmed by any of them.
     try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
+}
+
+test "stream handler: a trim by age cuts at its entry's stamp, not the host's clock" {
+    const allocator = testing.allocator;
+    const host_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+    // One stamp far behind the host's clock and one a day ahead: a trim
+    // cut by the host's clock removes all three records or none.
+    for ([_]u64{ 1_000_000, host_ms + std.time.ms_per_day }) |stamp_ms| {
+        var partition = try Partition.init(allocator, 0, 4096, 0);
+        defer partition.deinit();
+        partition.wireProjections();
+        var handler = StreamHandler.init(allocator, &partition);
+        defer handler.deinit();
+
+        const h = router.nameHash(router.namespaceHash("default"), "aged");
+        // 3 s old exactly is not older than 3 s: it stays.
+        for ([_]u64{ 10_000, 5_000, 3_000, 1_000 }, 1..) |age, i| {
+            _ = try handler.stream.appendToStreamAt(h, i, 0, stamp_ms - age, 1, 10);
+        }
+        var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
+        var val: [8]u8 = undefined;
+        std.mem.writeInt(u64, &val, h, .little);
+        var pbuf: [128]u8 = undefined;
+        // Older than 3 s at the stamp: the 10 s and 5 s old records.
+        const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
+        StreamHandler.replayEntry(&handler, &trim);
+        try testing.expectEqual(@as(u64, 2), handler.last_trim_count);
+        try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
+
+        // An age past the stamp trims nothing, never everything.
+        const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
+        StreamHandler.replayEntry(&handler, &past);
+        try testing.expectEqual(@as(u64, 0), handler.last_trim_count);
+        try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
+    }
+}
+
+test "stream handler: --maxage counts in seconds" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+    _ = try handler.stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
+    _ = try handler.stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
+    // Older than 5 seconds: the 10 s old record, not the 1 s old one.
+    var ob: [16]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.max_age_seconds, 5);
+    switch (handler.handleCommand(makeRequest(.stream_trim, "s1", "", b.getOptions()))) {
+        .stream_trimmed => |t| try testing.expectEqual(@as(u64, 1), t.deleted_count),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u64, 1), handler.stream.streamLogicalCount(h));
+}
+
+test "stream handler: a trim bound round-trips, and a key of any other shape is refused" {
+    var buf: [TrimBound.MAX_SIZE]u8 = undefined;
+    const id: TrimBound = .{ .id = .{ .timestamp_ms = 7, .sequence = 9 } };
+    try testing.expectEqual(id, TrimBound.decode(id.encode(&buf)).?);
+    const age: TrimBound = .{ .age_ms = 60_000 };
+    try testing.expectEqual(age, TrimBound.decode(age.encode(&buf)).?);
+    try testing.expect(TrimBound.decode(&[_]u8{0} ** 16) == null);
+    try testing.expect(TrimBound.decode(&([_]u8{2} ++ [_]u8{0} ** 8)) == null);
+}
+
+test "stream handler: a retention age past 100 years is refused at create and alter" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // Alter needs a stream to alter.
+    try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_create, "aged", "", "")));
+    var ob: [16]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.retention_age, time_units.MAX_AGE_MS / std.time.ms_per_s + 1);
+    for ([_]OpCode{ .stream_create, .stream_alter }) |op| {
+        switch (handler.handleCommand(makeRequest(op, "aged", "", b.getOptions()))) {
+            .err => |e| try testing.expectEqualStrings("stream retention age is over 100 years", e.message),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "stream handler: --maxlen cutting inside the first batch trims nothing" {

@@ -148,6 +148,9 @@ test "e2e/time: the dashboard's KV put takes ttl_ms in milliseconds and refuses 
     try stdx.testing.assertContains(gone, "(nil)");
 }
 
+/// 90 years: older than the clock, and under the 100-year limit on ages.
+const AGE_PAST_CLOCK_S: u64 = 90 * 365 * 24 * 3600;
+
 test "e2e/time: a lower bound past the clock matches nothing, and an age past it trims nothing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -156,8 +159,11 @@ test "e2e/time: a lower bound past the clock matches nothing, and an age past it
 
     var out: [4096]u8 = undefined;
     var obuf: [32]u8 = undefined;
-    const trim = try rawCall(ctx, .stream_trim, "s", "", try option(&obuf, .max_age_seconds, u64, std.math.maxInt(u64)), &out);
+    const trim = try rawCall(ctx, .stream_trim, "s", "", try option(&obuf, .max_age_seconds, u64, AGE_PAST_CLOCK_S), &out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), trim.status);
+    // An age no clock could reach is a mistake, refused rather than saturated.
+    const absurd = try rawCall(ctx, .stream_trim, "s", "", try option(&obuf, .max_age_seconds, u64, std.math.maxInt(u64)), &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), absurd.status);
 
     // The point is there from zero; from past the clock, nothing is.
     try testing.expectEqual(@as(u32, 1), try leadingCount(try rawCall(ctx, .ts_read, "m", "", try option(&obuf, .ts_from_ms, i64, 1), &out)));
@@ -213,7 +219,9 @@ test "e2e/time: a stream retention age past the clock trims nothing when the swe
     var obuf: [32]u8 = undefined;
     var partitions: [4]u8 = undefined;
     std.mem.writeInt(u32, &partitions, 1, .little);
-    const created = try rawCall(ctx, .stream_create, "aged", &partitions, try option(&obuf, .retention_age, u64, std.math.maxInt(u64)), &out);
+    const absurd = try rawCall(ctx, .stream_create, "aged", &partitions, try option(&obuf, .retention_age, u64, std.math.maxInt(u64)), &out);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), absurd.status);
+    const created = try rawCall(ctx, .stream_create, "aged", &partitions, try option(&obuf, .retention_age, u64, AGE_PAST_CLOCK_S), &out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created.status);
     try ctx.exec(&.{ "stream", "append", "aged", "kept" });
 

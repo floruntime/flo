@@ -3380,7 +3380,7 @@ pub const Shard = struct {
         // Trims are proposals: only the leader makes them.
         if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
-        const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
+        const now_ns = self.raft_node.now();
         var trims_proposed: u64 = 0;
 
         var it = proj.stream_metadata.iterator();
@@ -3390,15 +3390,15 @@ pub const Shard = struct {
             const name_hash = meta.name_hash;
             if (name_hash == 0) continue;
 
-            // Age-based retention: compute cutoff StreamID, persist trim through Raft
+            // Age-based retention: the trim carries the age, and each replica
+            // cuts at its entry's stamp; this node's time only decides
+            // whether anything is old enough to propose one.
             if (meta.retention_age_s > 0) {
-                const cutoff_ms = now_ms -| (meta.retention_age_s *| 1000);
-                if (cutoff_ms > 0) {
-                    const cutoff_id = StreamID{ .timestamp_ms = cutoff_ms, .sequence = std.math.maxInt(u64) };
-                    // Only trim if there are records to remove
+                const bound: stream_handler_mod.TrimBound = .{ .age_ms = meta.retention_age_s *| std.time.ms_per_s };
+                if (bound.resolve(now_ns)) |cutoff_id| {
                     const first_id = proj.streamFirstId(name_hash);
                     if (!first_id.eql(StreamID.MIN) and !first_id.greaterThan(cutoff_id)) {
-                        if (self.stream_handler.persistTrim(name_hash, cutoff_id)) trims_proposed += 1;
+                        if (self.stream_handler.persistTrim(name_hash, bound)) trims_proposed += 1;
                     }
                 }
             }
@@ -3411,7 +3411,7 @@ pub const Shard = struct {
                     const excess = count - meta.retention_count;
                     const trim_id = proj.resolveNthRecordId(name_hash, excess);
                     if (!trim_id.eql(StreamID.MIN)) {
-                        if (self.stream_handler.persistTrim(name_hash, trim_id)) trims_proposed += 1;
+                        if (self.stream_handler.persistTrim(name_hash, .{ .id = trim_id })) trims_proposed += 1;
                     }
                 }
             }
@@ -7768,8 +7768,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     var one: [1]proto.Response = undefined;
 
     // An action workers take, and a workflow whose first step invokes it.
-    const reg: [8]u8 = .{0} ** 8;
-    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", &reg);
+    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", "");
     const def =
         \\{"kind":"Workflow","name":"flow","version":"1.0.0",
         \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
@@ -7864,8 +7863,7 @@ test "Shard: what the tick's workflow steps propose is sent to the followers in 
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
-    const reg: [8]u8 = .{0} ** 8;
-    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", &reg);
+    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", "");
     const def =
         \\{"kind":"Workflow","name":"flow","version":"1.0.0",
         \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
@@ -9551,4 +9549,25 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
     try std.testing.expectEqual(@as(u64, 14), resp.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
     try std.testing.expect(!dispatcher_mod.takeScanShort());
+}
+
+test "a stream's retention age counts in seconds when the sweeper trims by it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    const stream = shard.stream_handler.stream;
+    const h = node_router.nameHash(node_router.namespaceHash("default"), "aged");
+    try stream.registerStreamMetadata("aged", .{ .name_hash = h, .retention_age_s = 5 });
+    const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
+    _ = try stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
+    _ = try stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
+    // Older than 5 seconds: the 10 s old record goes, the 1 s old one stays.
+    try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard), 0));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(u64, 1), stream.streamLogicalCount(h));
 }

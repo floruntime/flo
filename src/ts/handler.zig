@@ -602,22 +602,21 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "invalid retention duration" } };
         };
 
-        const now_ms = @import("stdx").time.milliTimestamp();
-        const cutoff_ms = now_ms - duration_ms;
-        const cutoff_ns: u64 = if (cutoff_ms > 0)
-            time_units.msToNsSat(@intCast(cutoff_ms))
-        else
-            0;
+        const age_ms: u64 = @intCast(duration_ms);
+        if (age_ms > time_units.MAX_AGE_MS) {
+            return .{ .err = .{ .code = .invalid_request, .message = "retention duration is over 100 years" } };
+        }
 
+        // The entry carries the duration; each replica cuts at its stamp.
         if (self.shard_ptr) |sptr| {
-            var cutoff: [8]u8 = undefined;
-            std.mem.writeInt(u64, &cutoff, cutoff_ns, .little);
-            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_retention, entry_mod.Flags.NONE, req.namespace, req.key, &cutoff) catch |err| {
+            var age: [8]u8 = undefined;
+            std.mem.writeInt(u64, &age, age_ms, .little);
+            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_retention, entry_mod.Flags.NONE, req.namespace, req.key, &age) catch |err| {
                 return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts retention not persisted") } };
             };
             return .{ .parked = proposed };
         }
-        _ = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, cutoff_ns);
+        _ = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, ts_mod.retentionCutoffNs(serverTimestampNs(), age_ms));
         return .ok;
     }
 
@@ -1367,6 +1366,19 @@ test "ts handler: retention empty duration" {
     const result = handler.handleCommand(makeRequest(.ts_retention, "", "", ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: a retention duration past 100 years is refused" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+
+    // 36,700 days is just past 100 years of 366.
+    switch (handler.handleCommand(makeRequest(.ts_retention, "m", "36700d", ""))) {
+        .err => |e| try testing.expectEqualStrings("retention duration is over 100 years", e.message),
         else => return error.TestUnexpectedResult,
     }
 }
