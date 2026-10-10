@@ -395,6 +395,10 @@ pub fn groupReadWithOptions(
     return client.sendRequestWithOptions(.stream_group_read, namespace, stream, writer.bytes(), builder.getOptions());
 }
 
+/// Room for one read's worth of ids (a read carries at most
+/// MAX_STREAM_BATCH_RECORDS records, as whole appends) plus group and consumer.
+const ID_LIST_BYTES = 2 + 1024 + 2 + 1024 + 4 + 16 * @as(usize, @import("../../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS);
+
 /// Acknowledge messages in a consumer group
 pub fn groupAck(
     client: *Client,
@@ -405,7 +409,7 @@ pub fn groupAck(
     ids: []const StreamID,
 ) !Response {
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(4096).init();
+    var writer = FixedWireWriter(ID_LIST_BYTES).init();
     try writer.writeLengthPrefixed(u16, group);
     try writer.writeLengthPrefixed(u16, consumer);
     try writer.writeU32(@intCast(ids.len));
@@ -455,7 +459,7 @@ pub fn groupNackWithDelay(
     redelivery_delay_ms: ?u32,
 ) !Response {
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(4096).init();
+    var writer = FixedWireWriter(ID_LIST_BYTES).init();
     try writer.writeLengthPrefixed(u16, group);
     try writer.writeLengthPrefixed(u16, consumer);
     try writer.writeU32(@intCast(ids.len));
@@ -640,7 +644,7 @@ pub fn groupTouch(
     extend_ms: ?u32,
 ) !TouchResult {
     // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(4096).init();
+    var writer = FixedWireWriter(ID_LIST_BYTES).init();
     try writer.writePair(u16, u16, group, consumer);
     try writer.writeU32(@intCast(ids.len));
     for (ids) |id| {

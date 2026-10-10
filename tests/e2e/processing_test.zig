@@ -3003,3 +3003,57 @@ test "e2e/processing: kv sink routes to the owning shard (multi-shard)" {
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "xshard" });
 }
+
+test "e2e/processing: a source reads every record of a batch over 100" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_big" });
+
+    var bufs: [150][16]u8 = undefined;
+    var args: [5 + 150][]const u8 = undefined;
+    args[0] = "stream";
+    args[1] = "append";
+    args[2] = "big-input";
+    args[3] = "-n";
+    args[4] = "proc_big";
+    for (0..150) |i| args[5 + i] = std.fmt.bufPrint(&bufs[i], "pb-{d:0>3}", .{i}) catch unreachable;
+    try ctx.exec(&args);
+
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-big-batch
+        \\namespace: proc_big
+        \\sources.[0].stream.name: big-input
+        \\sinks.[0].stream.name: big-output
+        \\parallelism: 1
+        \\batch_size: 100
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-big-batch.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_big" });
+    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
+
+    // Every record arrives, in order, once.
+    var n: usize = 0;
+    var waited: usize = 0;
+    while (waited < 100) : (waited += 1) {
+        var r = try ctx.cli.run(&.{ "stream", "read", "big-output", "-n", "proc_big", "--start", "0-0", "--limit", "1000", "-o", "json" });
+        defer r.deinit();
+        n = r.stdoutCount("pb-");
+        if (n >= 150) {
+            var prev: usize = 0;
+            for (0..150) |i| {
+                var b: [16]u8 = undefined;
+                const needle = std.fmt.bufPrint(&b, "\"pb-{d:0>3}\"", .{i}) catch unreachable;
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stdout, needle));
+                const at = std.mem.indexOf(u8, r.stdout, needle).?;
+                try testing.expect(at >= prev);
+                prev = at;
+            }
+            break;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 150), n);
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_big" });
+}

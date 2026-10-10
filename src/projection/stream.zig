@@ -135,6 +135,119 @@ pub fn decodeAppendValue(value: []const u8) AppendValue {
     };
 }
 
+/// Most records one append may carry. Reads return whole appends, so this is
+/// also the most a single append adds to one read.
+pub const MAX_BATCH_RECORDS: u32 = proto_limits.MAX_STREAM_BATCH_RECORDS;
+const proto_limits = @import("../protocol/proto.zig");
+/// Most records one read returns (whole appends, at least one).
+pub const MAX_READ_RECORDS: u32 = proto_limits.MAX_STREAM_READ_RECORDS;
+
+/// One record of a batch blob: its payload and its stored header bytes,
+/// `([key_len:u16][key][val_len:u16][val])*`.
+pub const BatchRecord = struct {
+    payload: []const u8,
+    headers_raw: []const u8,
+    header_count: u16,
+};
+
+/// The records of a batch blob:
+/// `[count:u32]([payload_len:u32][payload][header_count:u16]([klen:u16][k][vlen:u16][v])*)*`.
+/// `init` checks the whole blob, so `next` never meets a malformed record.
+pub const BatchIterator = struct {
+    blob: []const u8,
+    pos: usize = 4,
+    left: u32,
+    count: u32,
+
+    pub const Error = error{ Malformed, TooManyRecords };
+
+    pub fn init(blob: []const u8) Error!BatchIterator {
+        if (blob.len < 4) return error.Malformed;
+        const count = std.mem.readInt(u32, blob[0..4], .little);
+        if (count == 0) return error.Malformed;
+        // Each record takes at least 6 bytes; a count the blob can't hold
+        // means it isn't a batch at all.
+        if (count > (blob.len - 4) / 6) return error.Malformed;
+        if (count > MAX_BATCH_RECORDS) return error.TooManyRecords;
+        const it: BatchIterator = .{ .blob = blob, .left = count, .count = count };
+        var walk = it;
+        while (walk.left > 0) : (walk.left -= 1) {
+            _ = walk.step() orelse return error.Malformed;
+        }
+        if (walk.pos != blob.len) return error.Malformed;
+        return it;
+    }
+
+    /// The record count a blob claims, without checking the rest; for
+    /// naming it in a refusal.
+    pub fn claimedCount(blob: []const u8) u32 {
+        if (blob.len < 4) return 0;
+        return std.mem.readInt(u32, blob[0..4], .little);
+    }
+
+    pub fn next(self: *BatchIterator) ?BatchRecord {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.step().?;
+    }
+
+    fn step(self: *BatchIterator) ?BatchRecord {
+        const b = self.blob;
+        var pos = self.pos;
+        if (b.len - pos < 4) return null;
+        const payload_len = std.mem.readInt(u32, b[pos..][0..4], .little);
+        pos += 4;
+        if (b.len - pos < payload_len) return null;
+        const payload = b[pos .. pos + payload_len];
+        pos += payload_len;
+        if (b.len - pos < 2) return null;
+        const header_count = std.mem.readInt(u16, b[pos..][0..2], .little);
+        pos += 2;
+        const headers_start = pos;
+        var h: u16 = 0;
+        while (h < header_count) : (h += 1) {
+            inline for (0..2) |_| {
+                if (b.len - pos < 2) return null;
+                const len = std.mem.readInt(u16, b[pos..][0..2], .little);
+                pos += 2;
+                if (b.len - pos < len) return null;
+                pos += len;
+            }
+        }
+        self.pos = pos;
+        return .{ .payload = payload, .headers_raw = b[headers_start..pos], .header_count = header_count };
+    }
+};
+
+/// The id of an entry's last record: a cursor past the whole append.
+pub fn lastRecordOf(rec: StreamRecord) StreamID {
+    return .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
+}
+
+/// An upper bound on an append's bytes in a read answer. A record's answer
+/// framing is 30 bytes against the 6 its stored form has (payload length,
+/// header count), so 24 more; widening its header lengths from 2 to 4 bytes
+/// at most doubles its stored header bytes. Twice the stored size covers the
+/// headers, and 28 per record the framing.
+pub fn answerBound(rec: StreamRecord) usize {
+    return 2 * @as(usize, rec.byte_len) + 28 * @as(usize, rec.record_count);
+}
+
+/// How many of `records` (whole appends, in order) fit a budget of `limit`
+/// logical records and one answer frame. The first always counts, so a read
+/// makes progress even when one append holds more than `limit`; one append
+/// always fits a frame (checked where appends are bounded).
+pub fn wholeEntriesWithin(records: []const StreamRecord, limit: usize) usize {
+    var total: usize = 0;
+    var bytes: usize = 4; // the record count
+    for (records, 0..) |rec, i| {
+        total += rec.record_count;
+        bytes += answerBound(rec);
+        if (i > 0 and (total > limit or bytes > proto_limits.MAX_ANSWER_BYTES)) return i;
+    }
+    return records.len;
+}
+
 /// Number of logical records packed into a batch blob. Every append is stored
 /// batch-wrapped as `[count:u32][...]`, so the count is a fixed-offset read —
 /// no payload scan and no UAL re-read. Malformed/empty blobs count as one.
@@ -217,17 +330,18 @@ pub const StreamState = struct {
 
     /// Read records with IDs in (after_id, to_id]: the start is a cursor,
     /// exclusive like `readAfter`, the end inclusive.
+    /// Entries are whole: one starting at or before `to_id` is returned
+    /// entire, records past `to_id` included.
     pub fn readRange(self: *const StreamState, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
-        const start_idx = self.lowerBound(after_id);
+        const start_idx = self.firstAfter(after_id);
         if (start_idx >= items.len) return 0;
         var n: usize = 0;
         var i = start_idx;
         while (i < items.len and n < buf.len) : (i += 1) {
             const rec = &items[i];
             if (rec.id.greaterThan(to_id)) break;
-            if (!rec.id.greaterThan(after_id)) continue;
             if (filter_partition) |fp| {
                 if (rec.partition_index != fp) continue;
             }
@@ -237,14 +351,22 @@ pub const StreamState = struct {
         return n;
     }
 
-    /// Read records after a given ID (exclusive).
+    /// The first entry holding a record after `after_id`. That can be the
+    /// entry holding `after_id` itself, so a cursor inside an append resumes
+    /// with the rest of it; readers skip its records up to the cursor.
+    fn firstAfter(self: *const StreamState, after_id: StreamID) usize {
+        const items = self.records.items;
+        var i = self.lowerBound(after_id);
+        if (i > 0 and lastRecordOf(items[i - 1]).greaterThan(after_id)) i -= 1;
+        while (i < items.len and !lastRecordOf(items[i]).greaterThan(after_id)) : (i += 1) {}
+        return i;
+    }
+
+    /// Read the entries holding records after `after_id` (exclusive).
     pub fn readAfter(self: *const StreamState, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
-        // Find first record strictly after after_id
-        var start_idx = self.lowerBound(after_id);
-        // Skip records equal to after_id
-        while (start_idx < items.len and items[start_idx].id.eql(after_id)) : (start_idx += 1) {}
+        const start_idx = self.firstAfter(after_id);
         if (start_idx >= items.len) return 0;
         var n: usize = 0;
         var i = start_idx;
@@ -531,9 +653,10 @@ pub const ConsumerGroup = struct {
                 }
             }
         }
-        // Advance last_delivered_id
+        // Advance last_delivered_id past the whole last append, so the next
+        // read starts after it.
         if (records.len > 0) {
-            const last = records[records.len - 1].id;
+            const last = lastRecordOf(records[records.len - 1]);
             if (last.greaterThan(self.last_delivered_id)) {
                 self.last_delivered_id = last;
             }
@@ -1183,14 +1306,29 @@ pub const StreamProjection = struct {
     /// Deliver records from a named stream to a consumer group.
     /// Reads `count` records after the group's last_delivered_id, adds to PEL.
     /// Returns the StreamRecords delivered (fills buf, returns count).
-    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+    /// The whole appends a group read of `count` records would deliver,
+    /// delivering none: the reply is built from these before the pending
+    /// list takes them.
+    pub fn groupPeek(self: *StreamProjection, group_name: []const u8, name_hash: u64, count: usize, buf: []StreamRecord) !usize {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const read_n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
+        return wholeEntriesWithin(buf[0..read_n], count);
+    }
 
-        const n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
-        if (n > 0) {
-            _ = try group.deliver(consumer_id, buf[0..n], now_ms);
-        }
+    /// Put `records` (from `groupPeek`) on the group's pending list, and
+    /// move its cursor to `through` (the last record peeked), which may pass
+    /// appends left off the list.
+    pub fn groupDeliverRecords(self: *StreamProjection, group_name: []const u8, consumer_id: []const u8, records: []const StreamRecord, through: StreamID, now_ms: u64) !void {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        if (records.len > 0) _ = try group.deliver(consumer_id, records, now_ms);
+        if (through.greaterThan(group.last_delivered_id)) group.last_delivered_id = through;
+    }
+
+    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+        const n = try self.groupPeek(group_name, name_hash, count, buf);
+        const through = if (n > 0) lastRecordOf(buf[n - 1]) else StreamID.MIN;
+        try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], through, now_ms);
         return n;
     }
 
@@ -2560,4 +2698,77 @@ test "stream: trimCount predicts trim in records, not batches" {
 
     // A boundary before every record removes nothing.
     try testing.expectEqual(@as(u64, 0), s.trimCount(hash, .{ .timestamp_ms = b1.timestamp_ms - 1, .sequence = 0 }));
+}
+
+fn testBatch(buf: []u8, payloads: []const []const u8) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], @intCast(payloads.len), .little);
+    var pos: usize = 4;
+    for (payloads) |p| {
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(p.len), .little);
+        pos += 4;
+        @memcpy(buf[pos .. pos + p.len], p);
+        pos += p.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
+        pos += 2;
+    }
+    return buf[0..pos];
+}
+
+test "BatchIterator: yields every record with its headers" {
+    // Two records; the second carries one header k=v.
+    const blob = "\x02\x00\x00\x00" ++ "\x01\x00\x00\x00a\x00\x00" ++ "\x02\x00\x00\x00bc\x01\x00\x01\x00k\x01\x00v";
+    var it = try BatchIterator.init(blob);
+    try testing.expectEqual(@as(u32, 2), it.count);
+    const r1 = it.next().?;
+    try testing.expectEqualStrings("a", r1.payload);
+    try testing.expectEqual(@as(u16, 0), r1.header_count);
+    const r2 = it.next().?;
+    try testing.expectEqualStrings("bc", r2.payload);
+    try testing.expectEqual(@as(u16, 1), r2.header_count);
+    try testing.expectEqualStrings("\x01\x00k\x01\x00v", r2.headers_raw);
+    try testing.expectEqual(@as(?BatchRecord, null), it.next());
+}
+
+test "BatchIterator: refuses malformed blobs and too many records" {
+    const bad = [_][]const u8{
+        "",
+        "\x01\x00\x00",
+        "\x00\x00\x00\x00", // no records
+        "\x01\x00\x00\x00\x05\x00\x00\x00ab\x00\x00", // payload runs past the end
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x00", // header count cut short
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x01\x00\x09\x00k", // header key runs past the end
+        "\x01\x00\x00\x00\x01\x00\x00\x00a\x00\x00X", // trailing byte
+        "\x02\x00\x00\x00\x01\x00\x00\x00a\x00\x00", // claims two, holds one
+        "a", // a raw payload, not a batch
+    };
+    for (bad) |b| try testing.expectError(error.Malformed, BatchIterator.init(b));
+
+    const payloads = [_][]const u8{"x"} ** (MAX_BATCH_RECORDS + 1);
+    var buf: [4 + (MAX_BATCH_RECORDS + 1) * 7]u8 = undefined;
+    const over = testBatch(&buf, &payloads);
+    try testing.expectError(error.TooManyRecords, BatchIterator.init(over));
+    try testing.expectEqual(MAX_BATCH_RECORDS + 1, BatchIterator.claimedCount(over));
+}
+
+test "BatchIterator: accepts exactly the record limit" {
+    const payloads = [_][]const u8{"x"} ** MAX_BATCH_RECORDS;
+    var buf: [4 + MAX_BATCH_RECORDS * 7]u8 = undefined;
+    var it = try BatchIterator.init(testBatch(&buf, &payloads));
+    var n: u32 = 0;
+    while (it.next()) |_| n += 1;
+    try testing.expectEqual(MAX_BATCH_RECORDS, n);
+}
+
+test "wholeEntriesWithin: whole appends within the record budget, at least one" {
+    const rec = struct {
+        fn of(n: u32) StreamRecord {
+            return .{ .id = StreamID.MIN, .ual_index = 0, .partition_index = 0, .record_count = n };
+        }
+    }.of;
+    const recs = [_]StreamRecord{ rec(400), rec(400), rec(400) };
+    try testing.expectEqual(@as(usize, 1), wholeEntriesWithin(&recs, 10)); // first alone exceeds
+    try testing.expectEqual(@as(usize, 1), wholeEntriesWithin(&recs, 799));
+    try testing.expectEqual(@as(usize, 2), wholeEntriesWithin(&recs, 800));
+    try testing.expectEqual(@as(usize, 3), wholeEntriesWithin(&recs, 1000 * 1000));
+    try testing.expectEqual(@as(usize, 0), wholeEntriesWithin(recs[0..0], 5));
 }

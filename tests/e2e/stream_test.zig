@@ -3377,3 +3377,171 @@ test "e2e/cluster: follower serves each stream record exactly once (no replicati
     defer testing.allocator.free(leader_out);
     try testing.expectEqual(total, jsonRecordCount(leader_out));
 }
+
+test "e2e/stream: a batch of 150 records reads back whole" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const n = 150;
+    var bufs: [n][16]u8 = undefined;
+    var args: [3 + n][]const u8 = undefined;
+    args[0] = "stream";
+    args[1] = "append";
+    args[2] = "big-batch";
+    for (0..n) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "bb-{d:0>3}", .{i}) catch unreachable;
+    var w = try ctx.cli.run(&args);
+    defer w.deinit();
+    try testing.expectEqual(@as(u8, 0), w.exit_code);
+
+    var r = try ctx.cli.run(&.{ "stream", "read", "big-batch", "--limit", "1000", "-o", "json" });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, n), r.stdoutCount("bb-"));
+    var prev: usize = 0;
+    for (0..n) |i| {
+        var b: [16]u8 = undefined;
+        const at = std.mem.indexOf(u8, r.stdout, std.fmt.bufPrint(&b, "bb-{d:0>3}", .{i}) catch unreachable) orelse return error.RecordMissing;
+        try testing.expect(at >= prev);
+        prev = at;
+    }
+}
+
+/// The id of the last record in a JSON read's output.
+fn lastJsonId(out: []const u8) ?[]const u8 {
+    const tag = "\"id\":\"";
+    const at = std.mem.lastIndexOf(u8, out, tag) orelse return null;
+    const start = at + tag.len;
+    const end = std.mem.indexOfScalarPos(u8, out, start, '"') orelse return null;
+    return out[start..end];
+}
+
+/// Appends three 400-record batches, payloads p<batch>-<nnn>.
+fn appendThreeBatches(ctx: *stdx.testing.TestContext, stream: []const u8) !void {
+    for (0..3) |b| {
+        var bufs: [400][16]u8 = undefined;
+        var args: [3 + 400][]const u8 = undefined;
+        args[0] = "stream";
+        args[1] = "append";
+        args[2] = stream;
+        for (0..400) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "p{d}-{d:0>3}", .{ b, i }) catch unreachable;
+        var w = try ctx.cli.run(&args);
+        defer w.deinit();
+        try testing.expectEqual(@as(u8, 0), w.exit_code);
+    }
+}
+
+/// Every payload of `appendThreeBatches` appears in `seen` exactly once.
+fn expectEachOnce(seen: []const u8) !void {
+    try testing.expectEqual(@as(usize, 1200), std.mem.count(u8, seen, "\"data\":\"p"));
+    for (0..3) |b| for (0..400) |i| {
+        var buf: [24]u8 = undefined;
+        const needle = std.fmt.bufPrint(&buf, "\"data\":\"p{d}-{d:0>3}\"", .{ b, i }) catch unreachable;
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, needle));
+    };
+}
+
+test "e2e/stream: paging through 400-record batches returns every record once" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try appendThreeBatches(ctx, "paged");
+
+    // --limit counts records; a read never splits an append, so 500 takes
+    // one 400-record batch at a time and the cursor never lands inside one.
+    for ([_][]const u8{ "500", "1000", "1" }) |limit| {
+        var seen: std.ArrayList(u8) = .empty;
+        defer seen.deinit(testing.allocator);
+        var cursor: [48]u8 = undefined;
+        var start: []const u8 = "0-0";
+        var pages: usize = 0;
+        while (pages < 10) : (pages += 1) {
+            var r = try ctx.cli.run(&.{ "stream", "read", "paged", "--start", start, "--limit", limit, "-o", "json" });
+            defer r.deinit();
+            const n = std.mem.count(u8, r.stdout, "\"data\":\"p");
+            if (n == 0) break;
+            // Whole 400-record appends: limit 500 or 1 takes one, 1000 takes two.
+            try testing.expectEqual(if (std.mem.eql(u8, limit, "1000")) @as(usize, if (pages == 0) 800 else 400) else 400, n);
+            try seen.appendSlice(testing.allocator, r.stdout);
+            const last = lastJsonId(r.stdout) orelse return error.NoCursor;
+            @memcpy(cursor[0..last.len], last);
+            start = cursor[0..last.len];
+        }
+        try expectEachOnce(seen.items);
+    }
+}
+
+test "e2e/stream: a group delivers 400-record batches once each" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try appendThreeBatches(ctx, "grouped");
+    try ctx.exec(&.{ "stream", "group", "create", "grouped", "--group", "g" });
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(testing.allocator);
+    var reads: usize = 0;
+    while (reads < 10) : (reads += 1) {
+        var r = try ctx.cli.run(&.{ "stream", "group", "read", "grouped", "--group", "g", "--consumer", "w", "--limit", "500", "-o", "json" });
+        defer r.deinit();
+        const n = std.mem.count(u8, r.stdout, "\"data\":\"p");
+        if (n == 0) break;
+        // Whole batches only: what is pending is exactly what was returned.
+        try testing.expectEqual(@as(usize, 400), n);
+        try seen.appendSlice(testing.allocator, r.stdout);
+
+        var ids: std.ArrayList(u8) = .empty;
+        defer ids.deinit(testing.allocator);
+        var it = std.mem.splitSequence(u8, r.stdout, "\"id\":\"");
+        _ = it.next();
+        while (it.next()) |rest| {
+            const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+            if (ids.items.len > 0) try ids.append(testing.allocator, ',');
+            try ids.appendSlice(testing.allocator, rest[0..end]);
+        }
+        try ctx.exec(&.{ "stream", "group", "ack", "grouped", "--group", "g", "--consumer", "w", "--ids", ids.items });
+    }
+    try expectEachOnce(seen.items);
+
+    var pending = try ctx.cli.run(&.{ "stream", "group", "pending", "grouped", "--group", "g", "-o", "json" });
+    defer pending.deinit();
+    try testing.expect(pending.stdoutContains("\"count\":0"));
+}
+
+test "e2e/stream: an append of more than 1000 records is refused and stores nothing" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var bufs: [1001][8]u8 = undefined;
+    var args: [3 + 1001][]const u8 = undefined;
+    args[0] = "stream";
+    args[1] = "append";
+    args[2] = "too-big";
+    for (0..1001) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "t{d}", .{i}) catch unreachable;
+    var w = try ctx.cli.run(&args);
+    defer w.deinit();
+    try testing.expect(w.exit_code != 0);
+    try testing.expect(w.stderrContains("a batch of 1001 records is over the limit of 1000"));
+
+    var r = try ctx.cli.run(&.{ "stream", "read", "too-big", "--limit", "10", "-o", "json" });
+    defer r.deinit();
+    try testing.expect(!r.stdoutContains("\"data\""));
+}
+
+test "e2e/stream: a read starting inside an append returns the rest of it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "append", "mid-append", "m0", "m1", "m2", "m3", "m4" });
+    var all = try ctx.cli.run(&.{ "stream", "read", "mid-append", "--limit", "10", "-o", "json" });
+    defer all.deinit();
+    // The id of m1, the second record.
+    const tag = "\"id\":\"";
+    const first = std.mem.indexOf(u8, all.stdout, tag) orelse return error.NoId;
+    const second = std.mem.indexOfPos(u8, all.stdout, first + 1, tag) orelse return error.NoId;
+    const start = second + tag.len;
+    const id = all.stdout[start..std.mem.indexOfScalarPos(u8, all.stdout, start, '"').?];
+
+    var rest = try ctx.cli.run(&.{ "stream", "read", "mid-append", "--start", id, "--limit", "10", "-o", "json" });
+    defer rest.deinit();
+    try testing.expectEqual(@as(usize, 3), rest.stdoutCount("\"data\":\"m"));
+    try testing.expect(!rest.stdoutContains("\"m1\""));
+    try testing.expect(rest.stdoutContains("\"m2\""));
+    try testing.expect(rest.stdoutContains("\"m4\""));
+}
