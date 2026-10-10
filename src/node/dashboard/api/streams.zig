@@ -118,8 +118,9 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getStreamProjection(ctx, i)) |sp| {
-            var name_buf: [1024][]const u8 = undefined;
-            const count = sp.scanStreamNames(&name_buf);
+            const name_buf = try allocator.alloc([]const u8, sp.stream_names.count());
+            defer allocator.free(name_buf);
+            const count = sp.scanStreamNames(name_buf);
 
             for (name_buf[0..count]) |name| {
                 // Apply namespace filtering

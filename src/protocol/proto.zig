@@ -232,19 +232,12 @@ pub const OptionTag = enum(u8) {
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
     limit = 0x05, // u32: Maximum number of results for scan/list operations
-    keys_only = 0x06, // u8: Skip values in scan response (0/1)
-    cursor = 0x07, // bytes: Pagination cursor (ShardWalker format)
     routing_key = 0x08, // string: Explicit routing key for shard co-location (overrides key-based routing)
     txn_id = 0x09, // u64: Per-shard transaction ID (returned by kv_begin_txn)
 
     // Queue Options (0x10 - 0x1F)
-    priority = 0x10, // u8: Message priority (0-255, higher = more urgent)
-    delay_ms = 0x11, // u64: Delay before message becomes visible
-    visibility_timeout_ms = 0x12, // u32: How long message is invisible after dequeue
-    dedup_key = 0x13, // string: Deduplication key
-    max_retries = 0x14, // u8: Maximum retry attempts before DLQ
+    priority = 0x10, // u8: Message priority (0-255; lower is taken first)
     count = 0x15, // u32: Number of messages to dequeue
-    send_to_dlq = 0x16, // u8: Whether to send failed messages to DLQ (0/1)
     block_ms = 0x17, // u32: Block timeout - wait until exists (at most 5 min; 0 = don't wait)
     wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (at most 5 min; 0 = don't wait)
 
@@ -267,27 +260,10 @@ pub const OptionTag = enum(u8) {
     // Consumer Group Options (0x30 - 0x3F)
     ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers (overrides default)
     max_deliver = 0x31, // u8: Max delivery attempts before DLQ (default: 10, 0=unlimited)
-    subscription_mode = 0x32, // u8: 0=shared, 1=exclusive, 2=key_shared
-    redelivery_delay_ms = 0x33, // u32: Delay before NACK'd message becomes visible again
-    consumer_timeout_ms = 0x34, // u32: Remove consumer from group if no activity (session timeout)
-    no_ack = 0x35, // void: Auto-ack on delivery (at-most-once semantics)
-    idle_timeout_ms = 0x36, // u64: Min idle time for claiming stuck messages (XCLAIM-style)
-    max_ack_pending = 0x37, // u32: Max unacked messages per consumer (backpressure)
-    extend_ack_ms = 0x38, // u32: Amount of time to extend ack deadline (for touch)
-    max_standbys = 0x39, // u16: Max standby consumers in exclusive mode (0=singleton, null=unlimited)
-    num_slots = 0x3A, // u16: Number of hash slots for key_shared mode (default: 256)
 
     // Worker/Action Options (0x40 - 0x4F)
-    worker_id = 0x40, // string: Worker identifier
-    extend_ms = 0x41, // u32: Lease extension time in milliseconds
-    max_tasks = 0x42, // u32: Maximum tasks to return in batch
-    retry = 0x43, // u8: Whether to retry on failure (0/1)
 
     // Workflow Options (0x50 - 0x5F)
-    timeout_ms = 0x50, // u64: Workflow/activity timeout
-    retry_policy = 0x51, // bytes: Serialized retry policy
-    correlation_id = 0x52, // string: Correlation ID for tracing
-    subscription_id = 0x53, // u64: Subscription ID for stream subscriptions
 
     // Time-Series Options (0x60 - 0x6F)
     ts_from_ms = 0x60, // i64: Start of time range (inclusive, unix ms)
@@ -797,50 +773,10 @@ pub const Request = struct {
         return null;
     }
 
-    /// Get visibility_timeout_ms option if present (convenience method)
-    pub fn getVisibilityTimeoutMs(self: Request) ?u32 {
-        if (self.findOption(.visibility_timeout_ms)) |opt| {
-            return opt.asU32();
-        }
-        return null;
-    }
-
-    /// Get keys_only option if present (convenience method)
-    pub fn getKeysOnly(self: Request) bool {
-        if (self.findOption(.keys_only)) |opt| {
-            if (opt.asU8()) |v| return v != 0;
-        }
-        return false;
-    }
-
-    /// Get send_to_dlq option if present (convenience method)
-    pub fn getSendToDlq(self: Request) bool {
-        if (self.findOption(.send_to_dlq)) |opt| {
-            if (opt.asU8()) |v| return v != 0;
-        }
-        return false;
-    }
-
     /// Get priority option if present (convenience method)
     pub fn getPriority(self: Request) ?u8 {
         if (self.findOption(.priority)) |opt| {
             return opt.asU8();
-        }
-        return null;
-    }
-
-    /// Get delay_ms option if present (convenience method)
-    pub fn getDelayMs(self: Request) ?u64 {
-        if (self.findOption(.delay_ms)) |opt| {
-            return opt.asU64();
-        }
-        return null;
-    }
-
-    /// Get dedup_key option if present (convenience method)
-    pub fn getDedupKey(self: Request) ?[]const u8 {
-        if (self.findOption(.dedup_key)) |opt| {
-            return opt.asString();
         }
         return null;
     }
@@ -1036,7 +972,7 @@ test "TLV OptionsBuilder and Iterator" {
     // Build some options
     try builder.addU64(.ttl_ms, 3600);
     try builder.addU8(.priority, 5);
-    try builder.addString(.dedup_key, "abc123");
+    try builder.addString(.routing_key, "abc123");
     try builder.addFlag(.if_not_exists);
 
     const options = builder.getOptions();
@@ -1056,7 +992,7 @@ test "TLV OptionsBuilder and Iterator" {
 
     // Dedup key
     const dedup_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.dedup_key, dedup_opt.tag);
+    try std.testing.expectEqual(OptionTag.routing_key, dedup_opt.tag);
     try std.testing.expectEqualStrings("abc123", dedup_opt.asString());
 
     // Flag

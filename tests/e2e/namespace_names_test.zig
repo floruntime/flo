@@ -152,7 +152,7 @@ test "e2e/namespace: a write that brings no data, to a namespace never seen, cre
     defer ctx.deinit();
     var del = try ctx.cli.run(&.{ "kv", "delete", "k", "-n", "typo-a" });
     defer del.deinit();
-    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "q", "-n", "typo-b", "--timeout", "100" });
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "q", "-n", "typo-b" });
     defer deq.deinit();
     try stdx.testing.assertContains(deq, "(no messages)");
     var empty_key = try ctx.cli.run(&.{ "kv", "set", "", "v", "-n", "typo-c" });

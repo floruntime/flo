@@ -298,6 +298,20 @@ fn readExact(stream: @import("stdx").net.Stream, buf: []u8) !void {
 /// a @import("stdx").net.Address suitable for tcpConnectToAddress. This is split out to
 /// make it easy to unit test the hostname handling logic without opening a
 /// network socket.
+/// Room for a list request's value: a limit and the longest cursor the
+/// server hands back.
+pub const WALK_VALUE_MAX = 4 + 1024;
+
+/// A list request's value, as every list op reads it: `[limit:u32][cursor]`.
+/// A null limit is 0, the server's default.
+pub fn walkValue(buf: *[WALK_VALUE_MAX]u8, limit: ?u32, cursor: ?[]const u8) ![]const u8 {
+    const c = cursor orelse "";
+    if (c.len > buf.len - 4) return error.CursorTooLong;
+    std.mem.writeInt(u32, buf[0..4], limit orelse 0, .little);
+    @memcpy(buf[4..][0..c.len], c);
+    return buf[0 .. 4 + c.len];
+}
+
 pub fn resolveEndpointAddress(host: []const u8, port: u16) !@import("stdx").net.Address {
     // First try numeric parsing (IPv4 / IPv6 literal)
     const parse_result = @import("stdx").net.Address.parseIp(host, port) catch {

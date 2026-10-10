@@ -450,26 +450,24 @@ pub const WorkflowHandler = struct {
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
         handler.mu.lock();
         defer handler.mu.unlock();
-
-        const S = struct {
-            threadlocal var name_buf: [256][]const u8 = undefined;
-        };
+        // Sized under the lock, so an insert can't outgrow it mid-scan.
+        const name_buf = dispatcher_mod.scanScratch(handler.definitions.count());
 
         var count: usize = 0;
         var dit = handler.definitions.iterator();
         while (dit.next()) |entry| {
-            if (count >= S.name_buf.len) break;
+            if (count >= name_buf.len) break;
             if (namespace.len > 0) {
                 const map_key = entry.key_ptr.*;
                 // map_key format is "namespace:name"
                 if (!std.mem.startsWith(u8, map_key, namespace)) continue;
                 if (map_key.len <= namespace.len or map_key[namespace.len] != ':') continue;
             }
-            S.name_buf[count] = entry.value_ptr.name_owned;
+            name_buf[count] = entry.value_ptr.name_owned;
             count += 1;
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

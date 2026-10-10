@@ -18,24 +18,10 @@ pub fn enqueue(
     queue: []const u8,
     payload: []const u8,
     priority: u8,
-    delay_ms: ?u64,
-    dedup_key: ?[]const u8,
 ) !Response {
-    var options_buf: [64]u8 = undefined;
+    var options_buf: [8]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-
-    // Add priority
     try builder.addU8(.priority, priority);
-
-    // Add delay if specified
-    if (delay_ms) |delay| {
-        try builder.addU64(.delay_ms, delay);
-    }
-
-    // Add dedup_key if specified
-    if (dedup_key) |key| {
-        try builder.addBytes(.dedup_key, key);
-    }
 
     return client.sendRequestWithOptions(.queue_enqueue, namespace, queue, payload, builder.getOptions());
 }
@@ -48,12 +34,11 @@ pub fn purge(client: *Client, namespace: []const u8, queue: []const u8) !Respons
 
 /// Dequeue messages from a queue
 /// block_ms: null or 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
-pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count: u32, timeout_ms: u32, block_ms: ?u32) !Response {
+pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count: u32, block_ms: ?u32) !Response {
     var options_buf: [48]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
     try builder.addU32(.count, count);
-    try builder.addU32(.visibility_timeout_ms, timeout_ms);
 
     // Only add block_ms option if blocking is requested
     if (block_ms) |ms| {
@@ -75,27 +60,18 @@ pub fn ack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []co
 }
 
 /// Negative acknowledge (return to queue or send to DLQ)
-pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64, to_dlq: bool) !Response {
-    var options_buf: [8]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    try builder.addU8(.send_to_dlq, if (to_dlq) 1 else 0);
-
+pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64) !Response {
     // Format: [count:u32][seq:u64]*
     var writer = FixedWireWriter(4096).init();
     try writer.writeU64ArrayWithCount(seqs);
 
-    return client.sendRequestWithOptions(.queue_fail, namespace, queue, writer.bytes(), builder.getOptions());
+    return client.sendRequest(.queue_fail, namespace, queue, writer.bytes());
 }
 
-/// List DLQ messages
-pub fn dlqList(client: *Client, namespace: []const u8, queue: []const u8, limit: u32) !Response {
-    var options_buf: [16]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    try builder.addU32(.limit, limit);
-
-    return client.sendRequestWithOptions(.queue_dlq_list, namespace, queue, "", builder.getOptions());
+/// A queue's dead-letter count; listing the messages themselves isn't
+/// supported yet.
+pub fn dlqList(client: *Client, namespace: []const u8, queue: []const u8) !Response {
+    return client.sendRequest(.queue_dlq_list, namespace, queue, "");
 }
 
 /// Requeue messages from DLQ
@@ -121,16 +97,6 @@ pub fn peek(client: *Client, namespace: []const u8, queue: []const u8, count: u3
 /// Returns pre-serialized wire format:
 /// [count:u32] ([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])* [has_more:u8] [cursor_len:u16][cursor]
 pub fn list(client: *Client, namespace: []const u8, limit: ?u32, cursor: ?[]const u8) !Response {
-    var options_buf: [64]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (limit) |l| {
-        try builder.addU32(.limit, l);
-    }
-
-    if (cursor) |c| {
-        try builder.addBytes(.cursor, c);
-    }
-
-    return client.sendRequestWithOptions(.queue_list, namespace, "", "", builder.getOptions());
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.queue_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }

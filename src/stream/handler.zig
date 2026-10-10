@@ -173,33 +173,33 @@ pub const StreamHandler = struct {
     ) dispatcher_mod.NameWalker.ScanResult {
         const stream: *StreamProjection = @ptrCast(@alignCast(ctx));
         const S = struct {
-            threadlocal var name_buf: [1024][]const u8 = undefined;
             threadlocal var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         };
+        const name_buf = dispatcher_mod.scanScratch(stream.stream_names.count());
 
         // Build namespace prefix for filtering
         const ns_prefix = ns_keys.namespacePrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
 
         // Scan all qualified names
-        const raw_count = stream.scanStreamNames(&S.name_buf);
+        const raw_count = stream.scanStreamNames(name_buf);
 
         // Filter by namespace and strip prefix
         var count: usize = 0;
-        for (S.name_buf[0..raw_count]) |name| {
+        for (name_buf[0..raw_count]) |name| {
             if (ns_prefix.len == 0) {
                 // Default namespace — only include bare names (no NUL separator)
                 if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) == null) {
-                    S.name_buf[count] = name;
+                    name_buf[count] = name;
                     count += 1;
                 }
             } else if (std.mem.startsWith(u8, name, ns_prefix)) {
                 // Non-default namespace — strip prefix
-                S.name_buf[count] = name[ns_prefix.len..];
+                name_buf[count] = name[ns_prefix.len..];
                 count += 1;
             }
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     // ── Dispatch Wrappers ───────────────────────────────────────────────
@@ -416,7 +416,6 @@ pub const StreamHandler = struct {
             .stream_read => self.handleRead(req),
             .stream_trim => self.handleTrim(req),
             .stream_info => self.handleInfo(req),
-            .stream_list => self.handleList(req),
             .stream_create => self.handleCreate(req),
             .stream_alter => self.handleAlter(req),
             .stream_delete => self.handleDelete(req),
@@ -797,41 +796,6 @@ pub const StreamHandler = struct {
         } };
     }
 
-    // ── LIST ────────────────────────────────────────────────────────────
-
-    fn handleList(self: *StreamHandler, req: Request) CommandResult {
-        // Single-shard fallback — ShardWalker handles the cross-shard case.
-        // Build a namespace-filtered name-list response.
-        var name_buf: [1024][]const u8 = undefined;
-        const raw_count = self.stream.scanStreamNames(&name_buf);
-
-        // Filter by namespace prefix and strip
-        var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_prefix = ns_keys.namespacePrefix(&ns_buf, req.namespace) catch
-            return .{ .err = .{ .code = .invalid_request, .message = "namespace name too long" } };
-
-        var filtered: [1024][]const u8 = undefined;
-        var filtered_count: usize = 0;
-        for (name_buf[0..raw_count]) |name| {
-            if (ns_prefix.len == 0) {
-                // Default namespace — only bare names (no NUL separator)
-                if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) == null) {
-                    filtered[filtered_count] = name;
-                    filtered_count += 1;
-                }
-            } else if (std.mem.startsWith(u8, name, ns_prefix)) {
-                filtered[filtered_count] = name[ns_prefix.len..];
-                filtered_count += 1;
-            }
-        }
-
-        const data = serializeNameList(self.allocator, filtered[0..filtered_count], self.stream, req.namespace) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
-        };
-
-        return .{ .group_pending = .{ .data = data } };
-    }
-
     // ── CREATE ──────────────────────────────────────────────────────────
 
     /// Namespace-qualified stream name for metadata lookups.
@@ -846,6 +810,7 @@ pub const StreamHandler = struct {
     }
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
+        if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
         // Register the stream name for listing (namespace-qualified)
         if (req.key.len > 0) {
             var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -899,6 +864,7 @@ pub const StreamHandler = struct {
         };
 
         // Parse retention options from TLV
+        if (req.findOption(.retention_bytes) != null) return BYTE_RETENTION_REFUSAL;
         const retention = parseRetentionOptions(req);
 
         // Merge: keep existing partition_count and name_hash, update retention
@@ -912,6 +878,10 @@ pub const StreamHandler = struct {
 
         return .ok;
     }
+
+    /// Retention enforces age and count only; a byte bound would be stored
+    /// and never applied.
+    const BYTE_RETENTION_REFUSAL: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream retention by bytes is not supported; use retention_age or retention_count" } };
 
     /// Parse retention TLV options from a request.
     fn parseRetentionOptions(req: Request) struct { age_s: u64, count: u64, bytes: u64 } {
@@ -1934,47 +1904,6 @@ fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, 
     return ns_keys.qualifyGroupKey(buf, namespace, stream, raw_name) catch null;
 }
 
-/// Serialize a list of names in the standard walk wire format.
-/// Wire format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
-/// `names` are namespace-STRIPPED for the wire, but metadata is keyed by the
-/// qualified name, so `ns` is needed to look each one back up.
-fn serializeNameList(allocator: Allocator, names: []const []const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
-    // Stream list wire format (matches CLI expectations):
-    // [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16]
-    var total: usize = 4; // count
-    for (names) |name| {
-        total += 4 + name.len + 4; // name_len:u32 + name + partition_count:u32
-    }
-    total += 1 + 2; // has_more:u8 + cursor_len:u16
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    var pos: usize = 0;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(names.len), .little);
-    pos += 4;
-
-    for (names) |name| {
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(name.len), .little);
-        pos += 4;
-        @memcpy(buf[pos..][0..name.len], name);
-        pos += name.len;
-        // partition_count from stream metadata, keyed by the qualified name
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const pc = if (ns_keys.qualifyKey(&qbuf, ns, name)) |q| stream.getPartitionCount(q) else |_| 1;
-        std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
-        pos += 4;
-    }
-
-    // has_more = 0, cursor_len = 0
-    buf[pos] = 0;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], 0, .little);
-    pos += 2;
-
-    return buf;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Response Serialization — CommandResult → Wire Response
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2867,6 +2796,30 @@ test "stream handler: create is ok (implicit)" {
     const result = handler.handleCommand(makeRequest(.stream_create, "new_stream", "", ""));
     switch (result) {
         .ok => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "stream handler: byte retention is refused, and a refused create registers nothing" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU64(.retention_bytes, 1024);
+    switch (handler.handleCommand(makeRequest(.stream_create, "sized", "", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(handler.stream.stream_metadata.get("sized") == null);
+
+    _ = handler.handleCommand(makeRequest(.stream_create, "sized", "", ""));
+    switch (handler.handleCommand(makeRequest(.stream_alter, "sized", "", b.getOptions()))) {
+        .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
         else => return error.TestUnexpectedResult,
     }
 }

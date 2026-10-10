@@ -51,38 +51,22 @@ pub fn register(
 
 /// Invoke an action
 /// Wire format in value:
-///   [priority:u8][delay_ms:i64][has_caller:u8]...[input...]
+///   [priority:u8][delay_ms:i64][has_caller:u8][has_idem:u8][has_labels:u8]...[input...]
+/// The server reads only the labels and input, so the bytes before them
+/// are sent as zeros.
 /// key = action_name
 pub fn invoke(
     client: *Client,
     namespace: []const u8,
     action_name: []const u8,
     input: []const u8,
-    priority: ?u8,
-    idempotency_key: ?[]const u8,
     required_labels: ?[]const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&value_buf);
     const writer = &fbs;
 
-    // Write priority
-    try writer.writeByte(priority orelse 10);
-
-    // Write delay_ms (i64, default 0)
-    try writer.writeInt(i64, 0, .little);
-
-    // Write caller_id (optional, none)
-    try writer.writeByte(0);
-
-    // Write idempotency_key (optional)
-    if (idempotency_key) |key| {
-        try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(key.len), .little);
-        try writer.writeAll(key);
-    } else {
-        try writer.writeByte(0);
-    }
+    try writer.writeAll(&([_]u8{0} ** (1 + 8 + 1 + 1)));
 
     // Write required_labels (optional)
     if (required_labels) |labels| {
@@ -106,16 +90,16 @@ pub fn status(client: *Client, namespace: []const u8, run_id: []const u8) !Respo
     return client.sendRequest(.action_status, namespace, run_id, "");
 }
 
-/// List registered actions
-/// key = prefix (or empty)
-/// value = cursor bytes (empty on first call)
+/// List registered actions. key = prefix (or empty); value [limit:u32][cursor]
+/// like every list op.
 pub fn list(
     client: *Client,
     namespace: []const u8,
     prefix: ?[]const u8,
     cursor: ?[]const u8,
 ) !Response {
-    return client.sendRequest(.action_list, namespace, prefix orelse "", cursor orelse "");
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.action_list, namespace, prefix orelse "", try base.walkValue(&value_buf, null, cursor));
 }
 
 /// Delete an action
@@ -182,7 +166,7 @@ pub fn workerRegister(
 
 /// Await task (blocking)
 /// key = worker_id
-/// value = [count:u32][task_types...] + options for block_ms, timeout_ms
+/// value = [count:u32][task_types...] + the block_ms option
 /// block_ms: null = the server's 30 s default, 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
 pub fn workerAwait(
     client: *Client,
@@ -190,8 +174,6 @@ pub fn workerAwait(
     worker_id: []const u8,
     task_types: []const []const u8,
     block_ms: ?u32,
-    timeout_ms: ?u32,
-    _: ?u32, // max_tasks - not used
 ) !Response {
     var value_buf: [4096]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&value_buf);
@@ -208,7 +190,7 @@ pub fn workerAwait(
 
     const value = fbs.buffered();
 
-    // Build options for block_ms and timeout_ms
+    // Build options for block_ms
     var options_buf: [32]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
 
@@ -216,10 +198,6 @@ pub fn workerAwait(
         try builder.addU32(.block_ms, b);
         // Read for as long as the server waits, plus 5 s; 0 does not wait.
         if (b > 0) client.setReadTimeoutSec(b / 1000 + 5);
-    }
-
-    if (timeout_ms) |t| {
-        try builder.addU32(.timeout_ms, t);
     }
 
     return client.sendRequestWithOptions(.action_await, namespace, worker_id, value, builder.getOptions());

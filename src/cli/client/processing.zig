@@ -69,17 +69,14 @@ pub fn status(
     return client.sendRequest(.processing_status, namespace, job_id, "");
 }
 
-/// List processing jobs
-/// Wire format:
-///   - namespace: req.namespace
-///   - key: (unused)
-///   - value: cursor bytes (empty on first call)
+/// List processing jobs; value [limit:u32][cursor] like every list op.
 pub fn list(
     client: *Client,
     namespace: []const u8,
     cursor: ?[]const u8,
 ) !Response {
-    return client.sendRequest(.processing_list, namespace, "", cursor orelse "");
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.processing_list, namespace, "", try base.walkValue(&value_buf, null, cursor));
 }
 
 /// Trigger a savepoint for a processing job

@@ -739,9 +739,9 @@ pub const KVHandler = struct {
     ) dispatcher_mod.NameWalker.ScanResult {
         const kv: *KVProjection = @ptrCast(@alignCast(ctx));
         const S = struct {
-            threadlocal var key_buf: [1024][]const u8 = undefined;
             threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
         };
+        const key_buf = dispatcher_mod.scanScratch(kv.map.count());
 
         // In "default" the filter is the whole scan prefix, so one holding a NUL would select another namespace's keys.
         if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
@@ -754,23 +754,23 @@ pub const KVHandler = struct {
         }
 
         // Scan qualified key names from projection (filtered by prefix)
-        const raw_count = kv.scanKeyNames(scan_prefix, &S.key_buf);
+        const raw_count = kv.scanKeyNames(scan_prefix, key_buf);
 
         // Strip namespace prefix and filter reserved keys in-place
         var count: usize = 0;
-        const cap: usize = if (limit > 0) @intCast(limit) else S.key_buf.len;
-        for (S.key_buf[0..raw_count]) |key| {
+        const cap: usize = if (limit > 0) @intCast(limit) else key_buf.len;
+        for (key_buf[0..raw_count]) |key| {
             if (count >= cap) break;
             const stripped = stripNsPrefix(key, namespace);
             // A default scan has no prefix, so it also sees other namespaces' "ns\x00key" entries.
             if (std.mem.indexOfScalar(u8, stripped, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
             if (!isReservedKey(stripped)) {
-                S.key_buf[count] = stripped;
+                key_buf[count] = stripped;
                 count += 1;
             }
         }
 
-        return .{ .items = S.key_buf[0..count], .next_cursor = null };
+        return .{ .items = key_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchScan(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -1400,7 +1400,10 @@ pub const KVHandler = struct {
     // ── SCAN ────────────────────────────────────────────────────────────
 
     fn handleScan(self: *KVHandler, req: Request) CommandResult {
-        const limit = req.getLimit() orelse DEFAULT_SCAN_LIMIT;
+        // [limit:u32][cursor], as the walk that serves scans in a running
+        // node reads it.
+        const asked: u32 = if (req.value.len >= 4) std.mem.readInt(u32, req.value[0..4], .little) else 0;
+        const limit = if (asked > 0) asked else DEFAULT_SCAN_LIMIT;
         const capped_limit = @min(limit, MAX_SCAN_LIMIT);
 
         // Namespace-qualify prefix for scanning using centralized namespace utilities.
@@ -1442,10 +1445,8 @@ pub const KVHandler = struct {
             }
         }
 
-        const keys_only = req.getKeysOnly();
-
         // Serialize scan results
-        const data = serializeScanResults(self.allocator, scan_buf[0..filtered_count], keys_only) catch {
+        const data = serializeScanResults(self.allocator, scan_buf[0..filtered_count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "scan serialization failed" } };
         };
 
@@ -1470,9 +1471,12 @@ pub const KVHandler = struct {
 
         // Fetch version history from projection
         var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
-        const n = self.kv.getHistory(qkey, &hist_buf);
+        const found = self.kv.getHistory(qkey, &hist_buf);
 
-        if (n == 0) return .kv_not_found;
+        if (found == 0) return .kv_not_found;
+        // The newest `limit` versions; absent or 0 is all of them.
+        const limit = req.getLimit() orelse 0;
+        const n = if (limit > 0) @min(found, limit) else found;
 
         // Serialize: [count:u32] ([value_len:u32][value][version:u64])*
         var total_size: usize = 4; // count header
@@ -1651,19 +1655,9 @@ fn isReservedKey(key: []const u8) bool {
 
 /// Serialize scan results to binary format.
 /// Wire format: [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8]
-/// When keys_only=true, value_len is 0 and value is empty (field is still present).
-fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry, keys_only: bool) ![]u8 {
-    // Calculate total size
+fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry) ![]u8 {
     var total: usize = 4; // count header
-    for (entries) |entry| {
-        total += 2 + entry.key.len; // key_len + key
-        // Always include value_len field; when keys_only, value_len=0
-        if (keys_only) {
-            total += 4; // value_len only (0)
-        } else {
-            total += 4 + entry.value.len; // value_len + value
-        }
-    }
+    for (entries) |entry| total += 2 + entry.key.len + 4 + entry.value.len;
     total += 1; // has_more flag
 
     const buf = try allocator.alloc(u8, total);
@@ -1676,22 +1670,14 @@ fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry, keys_o
     offset += 4;
 
     for (entries) |entry| {
-        // Key
         std.mem.writeInt(u16, buf[offset..][0..2], @intCast(entry.key.len), .little);
         offset += 2;
         @memcpy(buf[offset..][0..entry.key.len], entry.key);
         offset += entry.key.len;
-
-        // Value — always present; empty when keys_only
-        if (keys_only) {
-            std.mem.writeInt(u32, buf[offset..][0..4], 0, .little);
-            offset += 4;
-        } else {
-            std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.value.len), .little);
-            offset += 4;
-            @memcpy(buf[offset..][0..entry.value.len], entry.value);
-            offset += entry.value.len;
-        }
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(entry.value.len), .little);
+        offset += 4;
+        @memcpy(buf[offset..][0..entry.value.len], entry.value);
+        offset += entry.value.len;
     }
 
     // has_more — always false for now (no cursor pagination yet)
@@ -2019,18 +2005,16 @@ test "kv handler: scan with limit" {
     _ = handler.handleCommand(makeRequest(.kv_put, "d", "4", ""));
     _ = handler.handleCommand(makeRequest(.kv_put, "e", "5", ""));
 
-    // Scan with limit 2
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU32(.limit, 2);
-    const opts = builder.getOptions();
+    // Scan with limit 2, carried in the value as [limit:u32][cursor]
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, 2, .little);
 
-    const result = handler.handleCommand(makeRequest(.kv_scan, "", "", opts));
+    const result = handler.handleCommand(makeRequest(.kv_scan, "", &value, ""));
     switch (result) {
         .kv_scan_result => |r| {
             defer handler.freeResult(result);
             const count = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expect(count <= 2);
+            try testing.expectEqual(@as(u32, 2), count);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2124,6 +2108,30 @@ test "kv handler: history returns not found for missing key" {
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_history, "k", "", ""));
     try testing.expectEqual(CommandResult.kv_not_found, result);
+}
+
+test "kv handler: history returns the newest limit versions" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    try kv.put("k", "v1", 1, 1, 100, 0);
+    try kv.put("k", "v2", 2, 1, 200, 0);
+    try kv.put("k", "v3", 3, 1, 300, 0);
+
+    var handler = KVHandler.init(allocator, &kv);
+    var opts_buf: [16]u8 = undefined;
+    var builder = OptionsBuilder.init(&opts_buf);
+    try builder.addU32(.limit, 2);
+    const result = handler.handleCommand(makeRequest(.kv_history, "k", "", builder.getOptions()));
+    defer handler.freeResult(result);
+    switch (result) {
+        .kv_history_result => |hist| {
+            try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, hist.data[0..4], .little));
+            const first_len = std.mem.readInt(u32, hist.data[4..8], .little);
+            try testing.expectEqualSlices(u8, "v3", hist.data[8..][0..first_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "kv handler: history returns versions" {

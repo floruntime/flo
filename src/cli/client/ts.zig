@@ -132,25 +132,15 @@ pub const QueryOptions = struct {
     aggregation: []const u8 = "avg",
 };
 
-/// List measurements or series for a measurement.
-/// Server returns a structured binary page; pass an opaque cursor from a
-/// previous response to fetch the next page.
+/// List measurements, one page; value [limit:u32][cursor] like every list op.
 pub fn list(
     client: *Client,
     namespace: []const u8,
-    measurement: []const u8,
     limit: ?u32,
     cursor: ?[]const u8,
 ) !Response {
-    var options_buf: [64]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (limit) |l| {
-        builder.addU32(.limit, l) catch return error.OptionsBufferTooSmall;
-    }
-
-    const options = builder.getOptions();
-    return client.sendRequestWithOptions(.ts_list, namespace, measurement, cursor orelse "", options);
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.ts_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }
 
 /// Delete a series

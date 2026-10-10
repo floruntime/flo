@@ -120,26 +120,6 @@ test "e2e/namespace: kv isolation between namespaces" {
 // Internal Namespaces (--all flag)
 // =============================================================================
 
-test "e2e/namespace: --all shows system namespaces" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Create a user namespace to ensure there's activity
-    try ctx.exec(&.{ "ns", "create", "user_ns" });
-
-    // Regular list
-    const regular = try ctx.execCapture(&.{ "ns", "ls" });
-
-    // List with --all
-    const all = try ctx.execCapture(&.{ "ns", "ls", "--all" });
-
-    // Both should have user_ns
-    try testing.expect(std.mem.indexOf(u8, regular, "user_ns") != null);
-    try testing.expect(std.mem.indexOf(u8, all, "user_ns") != null);
-
-    // Note: --all may show more, but user namespaces should appear in both
-}
-
 // =============================================================================
 // Cluster Tests (Multi-Node)
 //
@@ -235,5 +215,5 @@ test "e2e/namespace: delete is refused, with or without --force, and the namespa
     try testing.expect(std.mem.indexOf(u8, list, ns) != null);
     try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "kv", "get", "k", "-n", ns }), "v") != null);
     try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "stream", "info", "orders", "-n", ns }), "Records: 1") != null);
-    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "queue", "dequeue", "jobs", "-n", ns, "--timeout", "100" }), "job-1") != null);
+    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "queue", "dequeue", "jobs", "-n", ns }), "job-1") != null);
 }

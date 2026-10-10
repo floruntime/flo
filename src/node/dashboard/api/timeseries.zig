@@ -104,8 +104,9 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
     const n = shardCount(ctx);
     for (0..n) |i| {
         if (getTSProjection(ctx, i)) |ts| {
-            var buf: [256][]const u8 = undefined;
-            const count = ts.scanMeasurementNames(ns_hash, &buf);
+            const buf = try allocator.alloc([]const u8, ts.buffers.count());
+            defer allocator.free(buf);
+            const count = ts.scanMeasurementNames(ns_hash, buf);
             for (buf[0..count]) |meas_name| {
                 const gop = try seen.getOrPut(meas_name);
                 if (gop.found_existing) continue;

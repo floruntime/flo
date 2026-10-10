@@ -97,21 +97,19 @@ pub const QueueHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var name_buf: [256][]const u8 = undefined;
-        };
+        const name_buf = dispatcher_mod.scanScratch(handler.queue.known_queues.count());
 
         var count: usize = 0;
         var it = handler.queue.known_queues.iterator();
         while (it.next()) |entry| {
-            if (count >= S.name_buf.len) break;
+            if (count >= name_buf.len) break;
             const meta = entry.value_ptr;
             if (namespace.len > 0 and !std.mem.eql(u8, meta.namespace, namespace)) continue;
-            S.name_buf[count] = meta.name;
+            name_buf[count] = meta.name;
             count += 1;
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────

@@ -337,15 +337,17 @@ pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, query_string: ?[
 }
 
 /// POST /queues/:name — enqueue a message (loopback write). Body is the payload;
-/// `?priority=` & `?delay_ms=` optional.
+/// `?priority=` optional.
 pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const priority: u8 = @intCast(@min(h.parseQueryParam(u64, query_string, "priority") orelse 0, 255));
-    const delay_ms = h.parseQueryParam(u64, query_string, "delay_ms");
+    // Queues have no delayed delivery; a delay asked for is refused, not dropped.
+    if (h.parseQueryParam([]const u8, query_string, "delay_ms") != null)
+        return try h.jsonError(allocator, "delay_ms is not supported: queues have no delayed delivery");
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority, delay_ms, null) catch
+    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority) catch
         return try h.jsonError(allocator, "Enqueue failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

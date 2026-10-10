@@ -484,19 +484,17 @@ pub const NamespaceHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var name_buf: [256][]const u8 = undefined;
-        };
+        const name_buf = dispatcher_mod.scanScratch(handler.namespaces.count());
 
         var count: usize = 0;
         var it = handler.namespaces.iterator();
         while (it.next()) |entry| {
-            if (count >= S.name_buf.len) break;
-            S.name_buf[count] = entry.key_ptr.*;
+            if (count >= name_buf.len) break;
+            name_buf[count] = entry.key_ptr.*;
             count += 1;
         }
 
-        return .{ .items = S.name_buf[0..count], .next_cursor = null };
+        return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -665,10 +663,7 @@ pub const NamespaceHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *NamespaceHandler, req: Request) CommandResult {
-        // Check if system namespaces should be included
-        const include_system = req.value.len > 0 and req.value[0] != 0;
-        _ = include_system;
-
+        _ = req;
         const data = self.serializeNamespaceList() catch {
             return .{ .err = .{ .code = .internal_error, .message = "namespace list serialization failed" } };
         };

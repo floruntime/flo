@@ -279,8 +279,7 @@ fn executeDel(client: *Client, ctx: *commander.Context, namespace: []const u8, k
 }
 
 fn executeKeys(client: *Client, ctx: *commander.Context, namespace: []const u8) void {
-    // scan(client, namespace, prefix, cursor, limit, keys_only)
-    var result = client_mod.kv.scan(client, namespace, "", null, 100, true) catch |err| {
+    var result = client_mod.kv.scan(client, namespace, "", null, 100) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };

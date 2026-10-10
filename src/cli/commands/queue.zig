@@ -1,12 +1,12 @@
 //! Queue commands for Flo CLI using Commander framework
 //!
 //! Usage:
-//!   flo queue enqueue <queue> <payload> [--priority <0-255>] [--delay <ms>]
-//!   flo queue dequeue <queue> [--count <n>] [--timeout <ms>]
+//!   flo queue enqueue <queue> <payload> [--priority <0-255>]
+//!   flo queue dequeue <queue> [--count <n>] [--block <ms>]
 //!   flo queue watch <queue>              - Continuously watch for messages
 //!   flo queue peek <queue> [--count <n>]
 //!   flo queue ack <queue> <seq>...
-//!   flo queue nack <queue> <seq>... [--dlq]
+//!   flo queue nack <queue> <seq>...
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -48,12 +48,10 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo queue enqueue myqueue 'Hello, World!'",
                     "flo queue enqueue tasks '{\"id\":1}' --priority 10",
-                    "flo queue enqueue jobs payload --delay 5000",
                 })
                 .arg("queue", "Queue name")
                 .arg("payload", "Message payload")
-                .uintFlag("priority", 'p', 0, "Priority (0-255, higher=more urgent)")
-                .uintFlag("delay", 'd', 0, "Delay before visible (ms)")
+                .uintFlag("priority", 'p', 0, "Priority (0-255; lower is taken first)")
                 .action(wrapHandler(runEnqueue)),
         )
         .subcommand(
@@ -64,11 +62,10 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo queue dequeue myqueue",
                     "flo queue dequeue myqueue --count 10",
-                    "flo queue dequeue myqueue --timeout 5000",
+                    "flo queue dequeue myqueue --block 5000",
                 })
                 .arg("queue", "Queue name")
                 .uintFlag("count", 'c', 1, "Number of messages to dequeue")
-                .uintFlag("timeout", 't', 30000, "Visibility timeout (ms)")
                 .uintFlag("block", 'b', 0, "Block for messages (ms, at most 300000; 0 = don't wait)")
                 .action(wrapHandler(runDequeue)),
         )
@@ -103,7 +100,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"fail"})
                 .arg("queue", "Queue name")
                 .arg("seq", "Sequence number(s)")
-                .boolFlag("dlq", 0, "Send to dead-letter queue")
                 .action(wrapHandler(runNack)),
         )
         .subcommand(
@@ -113,9 +109,8 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("list")
-                        .about("List DLQ messages")
+                        .about("Show a queue's dead-letter count")
                         .arg("queue", "Queue name")
-                        .uintFlag("limit", 'l', 100, "Maximum messages")
                         .action(wrapHandler(runDlqList)),
                 )
                 .subcommand(
@@ -144,7 +139,6 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
 
     const priority_val = ctx.getUint("priority") orelse 0;
     const priority: u8 = if (priority_val > 255) 255 else @intCast(priority_val);
-    const delay = ctx.getUint("delay");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -156,8 +150,7 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    // enqueue(client, namespace, queue, payload, priority, delay_ms, dedup_key)
-    var result = client_mod.queue.enqueue(&client, namespace, queue, payload, priority, if (delay) |d| @as(u64, d) else null, null) catch |err| {
+    var result = client_mod.queue.enqueue(&client, namespace, queue, payload, priority) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -182,7 +175,6 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
     const count = ctx.getUint("count") orelse 1;
-    const timeout = ctx.getUint("timeout") orelse 30000;
     const block = ctx.getChangedUint("block");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
@@ -195,8 +187,7 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    // dequeue(client, namespace, queue, count, timeout_ms, block_ms)
-    var result = client_mod.queue.dequeue(&client, namespace, queue, @intCast(count), @intCast(timeout), if (block) |b| @as(u32, @intCast(b)) else null) catch |err| {
+    var result = client_mod.queue.dequeue(&client, namespace, queue, @intCast(count), if (block) |b| @as(u32, @intCast(b)) else null) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };
@@ -256,7 +247,7 @@ fn runWatch(ctx: *commander.Context) commander.Error!void {
 
     while (true) {
         // Block for messages with 1 second timeout
-        var result = client_mod.queue.dequeue(&client, namespace, queue, 1, 30000, 1000) catch |err| {
+        var result = client_mod.queue.dequeue(&client, namespace, queue, 1, 1000) catch |err| {
             ctx.printErr("Request failed: {}\n", .{err});
             @import("stdx").time.sleep(1 * std.time.ns_per_s);
             continue;
@@ -363,7 +354,6 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    const to_dlq = ctx.getBool("dlq");
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -375,7 +365,7 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.queue.nack(&client, namespace, queue, &[_]u64{seq}, to_dlq) catch |err| {
+    var result = client_mod.queue.nack(&client, namespace, queue, &[_]u64{seq}) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
@@ -391,8 +381,6 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
 
 fn runDlqList(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
-
-    const limit = ctx.getUint("limit") orelse 100;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -404,7 +392,7 @@ fn runDlqList(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    var result = client_mod.queue.dlqList(&client, namespace, queue, @intCast(limit)) catch |err| {
+    var result = client_mod.queue.dlqList(&client, namespace, queue) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };

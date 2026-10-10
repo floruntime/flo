@@ -292,10 +292,6 @@ pub const SinkSpec = struct {
 
     /// Message priority (0 = default)
     priority: u8,
-    /// Delay before message becomes visible, in ms (null = immediate)
-    delay_ms: ?u64,
-    /// Use record key as dedup_key for idempotent delivery (default: true)
-    use_key_as_dedup: bool,
 
     // -- TS-specific options --
 
