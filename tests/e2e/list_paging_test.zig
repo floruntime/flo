@@ -58,12 +58,7 @@ fn listPageOn(fd: std.c.fd_t, op: proto.OpCode, limit: u32, cursor: []const u8, 
 
 /// Sends one request on `fd` and returns the data of its ok answer.
 fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, out: []u8) ![]const u8 {
-    var h: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&h), 0);
-    h.magic = proto.MAGIC;
-    h.version = proto.VERSION;
-    h.op_code = @intFromEnum(op);
-    h.request_id = 1;
+    const h = proto.RequestHeader.init(op, 1);
     const req: proto.Request = .{ .header = h, .namespace = "default", .key = key, .value = value, .options = "" };
     var frame_buf: [1024]u8 = undefined;
     const frame = try req.serialize(&frame_buf);

@@ -9,12 +9,7 @@ const proto = @import("src").protocol.proto;
 const Reply = struct { status: u8, data: []const u8 };
 
 fn rawCall(ctx: *stdx.testing.TestContext, op: proto.OpCode, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !Reply {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(op);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(op, 7);
     const req: proto.Request = .{ .header = header, .namespace = namespace, .key = key, .value = value, .options = "" };
     const buf = try testing.allocator.alloc(u8, @sizeOf(proto.RequestHeader) + 10 + namespace.len + key.len + value.len);
     defer testing.allocator.free(buf);

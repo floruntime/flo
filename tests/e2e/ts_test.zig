@@ -1664,12 +1664,7 @@ test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsampl
 
     // An older client's rule is refused, not ignored.
     const proto = @import("src").protocol.proto;
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.ts_retention);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(.ts_retention, 7);
     var obuf: [64]u8 = undefined;
     var b = proto.OptionsBuilder.init(&obuf);
     try b.addString(.ts_raw_ttl, "7d");

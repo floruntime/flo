@@ -26,12 +26,7 @@ fn send(ctx: *stdx.testing.TestContext, frame: []const u8, out: []u8) !Reply {
 }
 
 fn header(op: proto.OpCode) proto.RequestHeader {
-    var h: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&h), 0);
-    h.magic = proto.MAGIC;
-    h.version = proto.VERSION;
-    h.op_code = @intFromEnum(op);
-    h.request_id = 7;
+    const h = proto.RequestHeader.init(op, 7);
     return h;
 }
 

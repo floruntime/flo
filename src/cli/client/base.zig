@@ -122,6 +122,11 @@ pub const Response = struct {
     }
 };
 
+/// The version and table hash a server answered with when they weren't this
+/// build's (`error.TableMismatch`), for the CLI to name: the error alone
+/// can't carry them.
+pub var foreign_server: ?struct { version: u8, table_hash: u64 } = null;
+
 /// Flo Protocol Client
 pub const Client = struct {
     allocator: Allocator,
@@ -259,7 +264,14 @@ pub const Client = struct {
         try readExact(stream, &header_buf);
 
         const response_header = @as(*align(1) const proto.ResponseHeader, @ptrCast(&header_buf)).*;
-        try response_header.validate();
+        response_header.validate() catch |err| {
+            // The body's layout is unknown, so it is left unread and the
+            // connection closed: nothing after it on the socket can be read.
+            if (err == error.TableMismatch) foreign_server = .{ .version = response_header.version, .table_hash = response_header.table_hash };
+            stream.close();
+            self.stream = null;
+            return err;
+        };
 
         // Read response data
         // Normalize type to mutable slice always; allocate 0 bytes for empty payload

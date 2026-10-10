@@ -448,6 +448,17 @@ pub fn sysLocalIp4(fd: posix.socket_t) SocketError!struct { ip4: [4]u8, port: u1
     return .{ .ip4 = @bitCast(sin.addr), .port = std.mem.bigToNative(u16, sin.port) };
 }
 
+/// The IPv4 address and port a connected socket's peer is at; an error for
+/// any other kind of socket.
+pub fn sysPeerIp4(fd: posix.socket_t) SocketError!struct { ip4: [4]u8, port: u16 } {
+    var ss: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (std.c.getpeername(fd, @ptrCast(&ss), &len) != 0) return error.Unexpected;
+    const ip4 = ip4FromSockaddr(@ptrCast(&ss)) orelse return error.Unexpected;
+    const sin: *const posix.sockaddr.in = @ptrCast(@alignCast(&ss));
+    return .{ .ip4 = ip4, .port = std.mem.bigToNative(u16, sin.port) };
+}
+
 test "net: parseIp4Bind accepts dotted quads and localhost, rejects the rest" {
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, try parseIp4Bind("0.0.0.0"));
     try std.testing.expectEqual([4]u8{ 10, 0, 1, 12 }, try parseIp4Bind("10.0.1.12"));

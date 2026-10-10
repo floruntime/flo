@@ -8,8 +8,6 @@ const Allocator = std.mem.Allocator;
 const proto = @import("proto.zig");
 const Request = proto.Request;
 const OpCode = proto.OpCode;
-const MAGIC = proto.MAGIC;
-const VERSION = proto.VERSION;
 
 /// Helper to build requests easily
 pub const RequestBuilder = struct {
@@ -45,16 +43,7 @@ pub const RequestBuilder = struct {
         const request_id = self.nextId();
 
         return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(op_code),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
+            .header = proto.RequestHeader.init(op_code, request_id),
             .namespace = namespace,
             .key = key,
             .value = value,
@@ -97,16 +86,7 @@ pub const RequestBuilder = struct {
         const request_id = self.nextId();
 
         return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_get),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
+            .header = proto.RequestHeader.init(.kv_get, request_id),
             .namespace = namespace,
             .key = key,
             .value = &[_]u8{},
@@ -117,16 +97,7 @@ pub const RequestBuilder = struct {
         const request_id = self.nextId();
 
         return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_put),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
+            .header = proto.RequestHeader.init(.kv_put, request_id),
             .namespace = namespace,
             .key = key,
             .value = value,
@@ -137,16 +108,7 @@ pub const RequestBuilder = struct {
         const request_id = self.nextId();
 
         return Request{
-            .header = .{
-                .magic = MAGIC,
-                .version = VERSION,
-                .op_code = @intFromEnum(OpCode.kv_delete),
-                .flags = 0,
-                .reserved = .{0} ** 8,
-                .payload_length = 0,
-                .request_id = request_id,
-                .crc32 = 0,
-            },
+            .header = proto.RequestHeader.init(.kv_delete, request_id),
             .namespace = namespace,
             .key = key,
             .value = &[_]u8{},

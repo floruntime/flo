@@ -2,19 +2,20 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// Flo Protocol
-/// Binary wire protocol with 24-byte header, CRC32 validation, and namespace support
+/// Binary wire protocol: a 32-byte header carrying the protocol version and
+/// the op table's hash, CRC32 over header and payload.
 ///
-/// Design decisions:
-/// - Magic: "FLO\0" (0x004F4C46) - null-terminated string, recognizable in hex dumps
-/// - Header: 24 bytes - aligned, efficient, with version field + CRC32 for validation
-/// - Namespace support - critical for multi-tenancy and partition routing
-/// - Full opcode space defined (0x00-0x4F) - implement incrementally without breaking changes
 /// Protocol magic number: "FLO\0" (0x004F4C46 in little-endian)
 /// Null-terminated string representation for clean identification
 pub const MAGIC: u32 = 0x004F4C46;
 
-/// Protocol version (for future evolution)
-pub const VERSION: u8 = 0x01;
+/// The frame layout's version. Its byte's offset never moves, so a client
+/// from any version can read a refusal answered in its own version byte.
+pub const VERSION: u8 = 0x02;
+
+/// The hash of the op and entry tables this build serves. Every request and
+/// answer header carries it; a server refuses a request carrying another.
+pub const TABLE_HASH: u64 = @import("table.zig").HASH;
 
 /// Most records one stream append may carry; the server refuses more.
 pub const MAX_STREAM_BATCH_RECORDS: u32 = 1000;
@@ -474,14 +475,6 @@ pub const OptionsIterator = struct {
     }
 };
 
-/// Protocol flags (u8 is sufficient)
-pub const Flags = packed struct(u8) {
-    compressed: bool = false, // Payload is LZ4 compressed
-    streaming: bool = false, // Part of multi-frame response
-    no_ack: bool = false, // Fire-and-forget (no response expected)
-    _reserved: u5 = 0,
-};
-
 /// Request header (32 bytes total)
 /// Fields ordered to avoid padding: 8-byte aligned first, then 4-byte, then 2-byte, then 1-byte
 pub const RequestHeader = extern struct {
@@ -491,18 +484,39 @@ pub const RequestHeader = extern struct {
     crc32: u32, // 16-19 (4 bytes)
     op_code: u16, // 20-21 (2 bytes)
     version: u8, // 22 (1 byte)
-    flags: u8, // 23 (1 byte)
-    reserved: [8]u8, // 24-31 (8 bytes) - must be zeros, future expansion
+    flags: u8, // 23 (1 byte) - none defined; any bit set is refused
+    table_hash: u64, // 24-31 (8 bytes) - the client's TABLE_HASH
+
+    /// A request header for this build: its version and table hash, no
+    /// flags. Length and CRC are filled in when the request is serialized.
+    pub fn init(op: OpCode, request_id: u64) RequestHeader {
+        return .{
+            .magic = MAGIC,
+            .payload_length = 0,
+            .request_id = request_id,
+            .crc32 = 0,
+            .op_code = @intFromEnum(op),
+            .version = VERSION,
+            .flags = 0,
+            .table_hash = TABLE_HASH,
+        };
+    }
+
+    /// Whether this header was built from another protocol version or
+    /// table: such a request is refused before its payload is read.
+    pub fn foreign(self: RequestHeader) bool {
+        return self.version != VERSION or self.table_hash != TABLE_HASH;
+    }
 
     pub fn validate(self: RequestHeader) !void {
         if (self.magic != MAGIC) {
             return error.InvalidMagic;
         }
-        if (self.version != VERSION) {
-            return error.UnsupportedVersion;
+        if (self.foreign()) {
+            return error.TableMismatch;
         }
-        if (!std.mem.eql(u8, &self.reserved, &[_]u8{0} ** 8)) {
-            return error.InvalidReservedField;
+        if (self.flags != 0) {
+            return error.UnknownFlag;
         }
         // Validate reasonable sizes (prevent DoS)
         if (self.payload_length > 100 * 1024 * 1024) { // 100MB max
@@ -519,7 +533,7 @@ pub const RequestHeader = extern struct {
         // Hash bytes 0-15 (magic, payload_length, request_id)
         hasher.update(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
-        // Hash bytes 20-31 (op_code, version, flags, reserved)
+        // Hash bytes 20-31 (op_code, version, flags, table_hash)
         hasher.update(header_bytes[20..32]);
 
         // Hash payload
@@ -539,14 +553,16 @@ pub const ResponseHeader = extern struct {
     status: u8, // 21 (1 byte)
     flags: u8, // 22 (1 byte)
     _pad: u8, // 23 (1 byte) - structural padding
-    reserved: [8]u8, // 24-31 (8 bytes) - must be zeros, future expansion
+    table_hash: u64, // 24-31 (8 bytes) - the server's TABLE_HASH
 
+    /// An answer from a server built from another protocol version or
+    /// table: its body is not read, since its layout is unknown.
     pub fn validate(self: ResponseHeader) !void {
         if (self.magic != MAGIC) {
             return error.InvalidMagic;
         }
-        if (self.version != VERSION) {
-            return error.UnsupportedVersion;
+        if (self.version != VERSION or self.table_hash != TABLE_HASH) {
+            return error.TableMismatch;
         }
     }
 
@@ -558,7 +574,7 @@ pub const ResponseHeader = extern struct {
         // Hash bytes 0-15 (magic, data_len, request_id)
         hasher.update(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
-        // Hash bytes 20-31 (version, status, flags, pad, reserved)
+        // Hash bytes 20-31 (version, status, flags, pad, table_hash)
         hasher.update(header_bytes[20..32]);
 
         hasher.update(data);
@@ -728,10 +744,6 @@ pub const Request = struct {
 
     pub fn getOpCode(self: Request) OpCode {
         return @enumFromInt(self.header.op_code);
-    }
-
-    pub fn getFlags(self: Request) Flags {
-        return @bitCast(self.header.flags);
     }
 
     /// Get an iterator over the TLV options
@@ -928,7 +940,7 @@ pub const Response = struct {
         return @enumFromInt(self.header.status);
     }
 
-    // Backwards-compatible init methods (for tests written before V2)
+    /// Every answer this server sends is built here, carrying its table hash.
     pub fn init(request_id: u64, status: StatusCode, data: []const u8) Response {
         return Response{
             .header = .{
@@ -937,7 +949,7 @@ pub const Response = struct {
                 .status = @intFromEnum(status),
                 .flags = 0,
                 ._pad = 0,
-                .reserved = .{0} ** 8,
+                .table_hash = TABLE_HASH,
                 .data_len = @intCast(data.len),
                 .request_id = request_id,
                 .crc32 = 0, // Will be computed during serialization
@@ -1035,16 +1047,7 @@ test "Request with TLV options serialization" {
     try builder.addU64(.ttl_ms, 86400); // 1 day
 
     const request = Request{
-        .header = .{
-            .magic = MAGIC,
-            .version = VERSION,
-            .op_code = @intFromEnum(OpCode.kv_put),
-            .flags = 0,
-            .reserved = .{0} ** 8,
-            .payload_length = 0,
-            .request_id = 42,
-            .crc32 = 0,
-        },
+        .header = RequestHeader.init(.kv_put, 42),
         .namespace = "test",
         .key = "mykey",
         .value = "myvalue",

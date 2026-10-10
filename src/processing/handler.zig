@@ -1770,12 +1770,8 @@ pub const ProcessingHandler = struct {
     }
 
     /// Build a minimal in-process request header carrying just the opcode.
-    /// `handleCommand` reads only `op_code` and the options TLV — magic/crc/version
-    /// are validated on wire parse, not here.
     fn makeSinkHeader(op: proto.OpCode) proto.RequestHeader {
-        var h = std.mem.zeroes(proto.RequestHeader);
-        h.op_code = @intFromEnum(op);
-        return h;
+        return proto.RequestHeader.init(op, 0);
     }
 
     /// Iterates serialized flat pairs (`a\0b\0c\0d\0`) as (key, value) tuples.

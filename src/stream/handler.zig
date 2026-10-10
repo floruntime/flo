@@ -2097,16 +2097,7 @@ fn groupMemberWire(comptime group: []const u8, comptime member: []const u8) []co
 /// Helper to build a test request.
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
     return .{
-        .header = .{
-            .magic = proto.MAGIC,
-            .payload_length = 0,
-            .request_id = 1,
-            .crc32 = 0,
-            .version = proto.VERSION,
-            .op_code = @intFromEnum(op),
-            .flags = 0,
-            .reserved = .{0} ** 8,
-        },
+        .header = proto.RequestHeader.init(op, 1),
         .namespace = "default",
         .key = key,
         .value = value,

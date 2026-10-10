@@ -1183,12 +1183,7 @@ test "e2e/action: each await on one connection gets its own task and nothing els
     var buf: [4096]u8 = undefined;
     var copies: [2][64]u8 = undefined;
     for (0..2) |i| {
-        var h: proto.RequestHeader = undefined;
-        @memset(std.mem.asBytes(&h), 0);
-        h.magic = proto.MAGIC;
-        h.version = proto.VERSION;
-        h.op_code = @intFromEnum(proto.OpCode.action_await);
-        h.request_id = 100 + i;
+        const h = proto.RequestHeader.init(.action_await, 100 + i);
         const req: proto.Request = .{ .header = h, .namespace = "", .key = "worker-1", .value = await_value, .options = "" };
         var frame_buf: [256]u8 = undefined;
         const frame = try req.serialize(&frame_buf);
@@ -1213,12 +1208,7 @@ test "e2e/action: each await on one connection gets its own task and nothing els
 
 /// Sends one request on `fd` and returns its answer.
 fn rawCall(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, buf: []u8) !proto.Response {
-    var h: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&h), 0);
-    h.magic = proto.MAGIC;
-    h.version = proto.VERSION;
-    h.op_code = @intFromEnum(op);
-    h.request_id = 1;
+    const h = proto.RequestHeader.init(op, 1);
     const req: proto.Request = .{ .header = h, .namespace = "", .key = key, .value = value, .options = "" };
     var frame_buf: [512]u8 = undefined;
     const frame = try req.serialize(&frame_buf);

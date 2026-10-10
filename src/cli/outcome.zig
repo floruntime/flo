@@ -94,11 +94,27 @@ pub fn connectFailed(ctx: *Context, err: anyerror, endpoint: []const u8) Error {
 /// A request that failed before an answer came back. An encoding failure is
 /// the command's input; anything else is the connection.
 pub fn requestFailed(ctx: *Context, err: anyerror) Error {
+    if (err == error.TableMismatch) return tableMismatch(ctx);
     if (isLocal(err)) {
         ctx.printErr("Error: the request can't be built: {s}\n", .{@errorName(err)});
         return error.Usage;
     }
     ctx.printErr("Error: the request failed: {s}\n", .{@errorName(err)});
+    return error.Transport;
+}
+
+/// The server was built from another protocol version or op table, so
+/// neither can read the other: the remedy is upgrading one of them.
+fn tableMismatch(ctx: *Context) Error {
+    const server = base.foreign_server orelse {
+        ctx.printErr("Error: the server is built from another protocol version or op table: upgrade the client\n", .{});
+        return error.Transport;
+    };
+    if (server.version == proto.VERSION) {
+        ctx.printErr("Error: server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client\n", .{ server.table_hash, proto.TABLE_HASH });
+    } else {
+        ctx.printErr("Error: server protocol {d}, client protocol {d}: upgrade the client\n", .{ server.version, proto.VERSION });
+    }
     return error.Transport;
 }
 
@@ -162,9 +178,16 @@ pub const FakeServer = struct {
     port: u16,
     status: proto.StatusCode,
     body: []const u8,
+    /// The table hash its answers carry.
+    table_hash: u64 = proto.TABLE_HASH,
     thread: std.Thread = undefined,
 
     pub fn start(status: proto.StatusCode, body: []const u8) !*FakeServer {
+        return startWithTable(status, body, proto.TABLE_HASH);
+    }
+
+    /// A server built from another table: its answers carry `table_hash`.
+    pub fn startWithTable(status: proto.StatusCode, body: []const u8, table_hash: u64) !*FakeServer {
         const net = @import("stdx").net;
         const fd = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer net.sysClose(fd);
@@ -173,7 +196,7 @@ pub const FakeServer = struct {
         try net.sysListen(fd, 1);
         const local = try net.sysLocalIp4(fd);
         const self = try std.heap.page_allocator.create(FakeServer);
-        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body };
+        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body, .table_hash = table_hash };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
     }
@@ -200,7 +223,11 @@ pub const FakeServer = struct {
                 if (n == 0) return;
                 left -= n;
             }
-            const frame = if (self.status == .ok)
+            const frame = if (self.table_hash != proto.TABLE_HASH) foreign: {
+                var answer = proto.Response.init(header.request_id, self.status, self.body);
+                answer.header.table_hash = self.table_hash;
+                break :foreign answer.serialize(&out) catch return;
+            } else if (self.status == .ok)
                 proto.Response.serializeNew(.ok, header.request_id, self.body, &out) catch return
             else
                 proto.Response.serializeError(self.status, header.request_id, self.body, &out);
@@ -302,6 +329,22 @@ test "outcome: each status has its exit code" {
     try std.testing.expectEqual(@as(u8, 2), exitCode(error.UnknownFlag));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.Transport));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.OutOfMemory));
+}
+
+test "outcome: an answer from another op table is refused unread, exit 5" {
+    const allocator = std.testing.allocator;
+    const kv = @import("commands/kv.zig");
+    // An ok answer whose body would read as a value: refused all the same.
+    const server = try FakeServer.startWithTable(.ok, "\x01\x00\x00\x00\x00\x00\x00\x00v", proto.TABLE_HASH +% 1);
+    defer server.stop();
+    var ep: [32]u8 = undefined;
+    const root = try testRoot(allocator, try kv.createKvCommand(allocator));
+    defer root.deinit();
+    base.foreign_server = null;
+    const result = root.executeSlice(&.{ "flo", "kv", "get", "k", "--endpoint", server.endpoint(&ep) });
+    try std.testing.expectError(error.Transport, result);
+    try std.testing.expectEqual(@as(u8, 5), exitCode(result));
+    try std.testing.expectEqual(proto.TABLE_HASH +% 1, base.foreign_server.?.table_hash);
 }
 
 /// The first error print in `source` after which the command can still

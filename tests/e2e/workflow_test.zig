@@ -3103,12 +3103,7 @@ test "e2e/workflow: a stream trigger survives restart and resumes at its cursor"
 /// Sends a hand-built request; the CLI client can't encode a malformed value.
 fn rawCall(ctx: *stdx.testing.TestContext, op: @import("src").protocol.proto.OpCode, namespace: []const u8, key: []const u8, value: []const u8, out: []u8) !struct { status: u8, data: []const u8 } {
     const proto = @import("src").protocol.proto;
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(op);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(op, 7);
     const req: proto.Request = .{ .header = header, .namespace = namespace, .key = key, .value = value, .options = "" };
     var buf: [1024]u8 = undefined;
     const bytes = try req.serialize(&buf);
