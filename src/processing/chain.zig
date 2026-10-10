@@ -325,7 +325,7 @@ test "Chain with filter + passthrough" {
     var snk = CollectingSink.init(allocator, "snk");
     defer snk.deinit();
 
-    var filter_op = ExprFilterOperator.init("keep-important", "value_contains:important");
+    var filter_op = try ExprFilterOperator.init("keep-important", "value_contains:important");
     var pass_op = PassthroughOperator.init("pass");
 
     var topo = Topology.init(allocator, "filter-pass");

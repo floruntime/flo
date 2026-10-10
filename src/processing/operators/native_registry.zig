@@ -184,8 +184,12 @@ fn createExprFilter(allocator: Allocator, spec: *const OperatorSpec) CreateError
     const owned_condition = allocator.dupe(u8, condition) catch return CreateError.OutOfMemory;
     errdefer allocator.free(owned_condition);
 
+    const filter = ExprFilterOperator.init(owned_name, owned_condition) catch {
+        log.err("Native operator '{s}' (type=filter) condition \"{s}\": {s}", .{ spec.name, condition, ExprFilterOperator.check(condition) orelse "invalid" });
+        return CreateError.MissingConfig;
+    };
     const ptr = allocator.create(ExprFilterOperator) catch return CreateError.OutOfMemory;
-    ptr.* = ExprFilterOperator.init(owned_name, owned_condition);
+    ptr.* = filter;
 
     return .{
         .op = ptr.operator(),
@@ -366,6 +370,7 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
     errdefer allocator.free(owned_name);
 
     var idx: usize = 0;
+    errdefer for (rules[0..idx]) |*r| allocator.free(r.condition.condition);
     for (0..rule_count) |i| {
         // Build key strings for lookup
         var cond_key_buf: [32]u8 = undefined;
@@ -392,14 +397,15 @@ fn createClassify(allocator: Allocator, spec: *const OperatorSpec, tag_registry:
         // Dupe the condition string — the spec config is freed after pipeline creation.
         // ExprFilterOperator.init parses sub-slices into this string, so the dupe
         // must outlive the operator.
-        const owned_condition = allocator.dupe(u8, condition) catch {
-            // Free conditions already duped for previous rules
-            for (rules[0..idx]) |*r| allocator.free(r.condition.condition);
-            return CreateError.OutOfMemory;
+        const owned_condition = allocator.dupe(u8, condition) catch return CreateError.OutOfMemory;
+        const parsed = ExprFilterOperator.init(owned_name, owned_condition) catch {
+            log.err("Native operator '{s}' (type=classify) rule {d} condition \"{s}\": {s}", .{ spec.name, i, condition, ExprFilterOperator.check(condition) orelse "invalid" });
+            allocator.free(owned_condition);
+            return CreateError.MissingConfig;
         };
 
         rules[idx] = .{
-            .condition = ExprFilterOperator.init(owned_name, owned_condition),
+            .condition = parsed,
             .tag_bit = tag_bit,
         };
         idx += 1;
