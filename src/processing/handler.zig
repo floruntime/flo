@@ -610,18 +610,25 @@ pub const ProcessingHandler = struct {
             // Binary wire format:
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
-            var buf: [4096]u8 = undefined;
-            var fbs: std.Io.Writer = .fixed(&buf);
+            // Sized to the job. The id is 32 bytes and the name came from a
+            // submit entry under 64 KiB, so both lengths fit u16.
+            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 4 + 8 + 8;
+            const buf = self.allocator.alloc(u8, size) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
+                return;
+            };
+            defer self.allocator.free(buf);
+            var fbs: std.Io.Writer = .fixed(buf);
             const w = &fbs;
-            w.writeInt(u16, @intCast(job.job_id_owned.len), .little) catch return;
-            w.writeAll(job.job_id_owned) catch return;
-            w.writeInt(u16, @intCast(job.name_owned.len), .little) catch return;
-            w.writeAll(job.name_owned) catch return;
-            w.writeByte(@intFromEnum(job.status)) catch return;
-            w.writeInt(u32, job.parallelism, .little) catch return;
-            w.writeInt(u32, job.batch_size, .little) catch return;
-            w.writeInt(u64, job.records_processed, .little) catch return;
-            w.writeInt(i64, job.created_at_ms, .little) catch return;
+            w.writeInt(u16, @intCast(job.job_id_owned.len), .little) catch unreachable;
+            w.writeAll(job.job_id_owned) catch unreachable;
+            w.writeInt(u16, @intCast(job.name_owned.len), .little) catch unreachable;
+            w.writeAll(job.name_owned) catch unreachable;
+            w.writeByte(@intFromEnum(job.status)) catch unreachable;
+            w.writeInt(u32, job.parallelism, .little) catch unreachable;
+            w.writeInt(u32, job.batch_size, .little) catch unreachable;
+            w.writeInt(u64, job.records_processed, .little) catch unreachable;
+            w.writeInt(i64, job.created_at_ms, .little) catch unreachable;
             shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
@@ -681,6 +688,8 @@ pub const ProcessingHandler = struct {
         };
         defer self.allocator.free(buf);
 
+        // At most `limit` (u32) jobs; ids are 32 bytes, names came from a
+        // submit entry under 64 KiB, statuses are literals.
         std.mem.writeInt(u32, buf[0..4], @intCast(jobs.items.len), .little);
         var pos: usize = 4;
         for (jobs.items) |j| {
@@ -827,6 +836,7 @@ pub const ProcessingHandler = struct {
         // Embed the effective namespace so the applier does not depend on
         // re-parsing quirks.
         const ns = job_namespace;
+        // A request's namespace, whose length is a u16 on the wire.
         const ns_len: u16 = @intCast(ns.len);
         std.mem.writeInt(u16, value_buf[off..][0..2], ns_len, .little);
         off += 2;
@@ -858,6 +868,7 @@ pub const ProcessingHandler = struct {
         var value_buf: [512]u8 = undefined;
         var off: usize = 0;
 
+        // An owned job's id: 32 bytes.
         std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(job_id.len), .little);
         off += 2;
         @memcpy(value_buf[off .. off + job_id.len], job_id);
