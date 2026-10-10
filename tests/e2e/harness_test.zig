@@ -46,3 +46,39 @@ test "harness: a server that never becomes ready fails within a bound" {
     if (!gone) _ = std.c.kill(pid, .KILL);
     try testing.expect(gone);
 }
+
+test "harness: only an exit the harness caused is normal" {
+    var server = try stdx.testing.ServerProcess.init(testing.allocator);
+    defer server.deinit();
+    var buf: [160]u8 = undefined;
+    const sig = struct {
+        fn n(s: std.posix.SIG) c_int {
+            return @intCast(@intFromEnum(s));
+        }
+    };
+
+    const cases = [_]struct { status: c_int, term: bool, kill: bool, why: ?[]const u8 }{
+        .{ .status = 0, .term = true, .kill = false, .why = null },
+        .{ .status = 3 << 8, .term = true, .kill = false, .why = "exited with code 3" },
+        .{ .status = sig.n(.TERM), .term = true, .kill = false, .why = null },
+        .{ .status = sig.n(.KILL), .term = true, .kill = true, .why = null },
+        .{ .status = sig.n(.KILL), .term = false, .kill = false, .why = "killed by a SIGKILL the harness didn't send (memory pressure, or another run's cleanup?)" },
+        .{ .status = sig.n(.ABRT), .term = true, .kill = false, .why = null },
+        .{ .status = sig.n(.SEGV), .term = true, .kill = true, .why = null },
+    };
+    for (cases) |c| {
+        server.exit_status = c.status;
+        server.sent_term = c.term;
+        server.sent_kill = c.kill;
+        const got = server.abnormalExit(&buf);
+        if (c.why) |want| {
+            try testing.expectEqualStrings(want, got.?);
+        } else if (c.status == sig.n(.ABRT) or c.status == sig.n(.SEGV)) {
+            var want_buf: [32]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "died of signal {d}", .{c.status}), got.?);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), got);
+        }
+    }
+    server.exit_status = null;
+}
