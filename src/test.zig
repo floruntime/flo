@@ -191,6 +191,11 @@ test {
     _ = @import("metrics/http_server.zig");
 }
 
+// CLI
+test {
+    _ = @import("cli/commander/core.zig");
+}
+
 // Config
 test {
     _ = @import("config/server.zig");

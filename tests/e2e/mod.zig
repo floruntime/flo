@@ -46,6 +46,7 @@ pub const dashboard_processing_test = @import("dashboard_processing_test.zig");
 pub const dashboard_workflows_test = @import("dashboard_workflows_test.zig");
 pub const dashboard_floql_test = @import("dashboard_floql_test.zig");
 pub const dashboard_request_checks_test = @import("dashboard_request_checks_test.zig");
+pub const server_flags_test = @import("server_flags_test.zig");
 
 // Future test modules:
 // pub const cluster_test = @import("cluster_test.zig");

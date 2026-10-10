@@ -381,20 +381,24 @@ pub const Context = struct {
         return null;
     }
 
-    /// Get uint16 flag value (cast from uint)
-    pub fn getUint16(self: *Context, name: []const u8) ?u16 {
-        if (self.getUint(name)) |val| {
-            return @intCast(val);
-        }
-        return null;
+    /// Get a port flag. A value past u16 is refused with an error naming the
+    /// flag; a bare @intCast would panic in safe builds. 0 is left to the
+    /// caller, which treats it as "use the default".
+    pub fn getPort(self: *Context, name: []const u8) Error!?u16 {
+        return self.narrowPort(name, self.getUint(name));
     }
 
-    /// Get changed uint16 flag value (cast from uint)
-    pub fn getChangedUint16(self: *Context, name: []const u8) ?u16 {
-        if (self.getChangedUint(name)) |val| {
-            return @intCast(val);
-        }
-        return null;
+    /// Get a changed port flag; refuses out-of-range like `getPort`.
+    pub fn getChangedPort(self: *Context, name: []const u8) Error!?u16 {
+        return self.narrowPort(name, self.getChangedUint(name));
+    }
+
+    fn narrowPort(self: *Context, name: []const u8, value: ?u32) Error!?u16 {
+        const val = value orelse return null;
+        return std.math.cast(u16, val) orelse {
+            self.printErr("Error: --{s} {d} is not a port; use 1 to 65535, or 0 for the default\n", .{ name, val });
+            return error.CommandFailed;
+        };
     }
 
     /// Get changed uint64 flag value
@@ -1672,4 +1676,70 @@ test "subcommands" {
     try root_cmd.executeSlice(args);
 
     try std.testing.expect(executed);
+}
+
+test "port flag past 65535 is refused with the flag named" {
+    const allocator = std.testing.allocator;
+
+    const Result = struct {
+        port: ?u16 = null,
+        changed_port: ?u16 = null,
+        err: ?Error = null,
+    };
+
+    const cmd = Command.init(allocator, .{
+        .name = "test",
+        .run = wrapTestRun(struct {
+            fn run(ctx: *Context) Error!void {
+                const r: *Result = @ptrCast(@alignCast(ctx.user_data.?));
+                r.port = ctx.getPort("port") catch |err| {
+                    r.err = err;
+                    return;
+                };
+                r.changed_port = ctx.getChangedPort("metrics-port") catch |err| {
+                    r.err = err;
+                    return;
+                };
+            }
+        }.run),
+    });
+    defer cmd.deinit();
+    try cmd.uintFlag("port", 'p', 0, "Port");
+    try cmd.uintFlag("metrics-port", 0, 0, "Metrics port");
+
+    const cases = [_]struct { args: []const []const u8, msg: []const u8, port: ?u16 = null, changed_port: ?u16 = null }{
+        .{ .args = &.{ "test", "--port", "65535", "--metrics-port", "65535" }, .msg = "", .port = 65535, .changed_port = 65535 },
+        .{ .args = &.{ "test", "--port", "70000" }, .msg = "Error: --port 70000 is not a port; use 1 to 65535, or 0 for the default\n" },
+        .{ .args = &.{ "test", "--metrics-port", "65536" }, .msg = "Error: --metrics-port 65536 is not a port; use 1 to 65535, or 0 for the default\n" },
+    };
+    for (cases) |case| {
+        // Flags keep their parsed value across executions; without a reset the
+        // previous case's --port would fail first.
+        for (cmd.flags.items) |*flag| {
+            flag.value = flag.default;
+            flag.changed = false;
+        }
+        const fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(fds[0]);
+        cmd.setErr(fds[1]);
+        var result: Result = .{};
+        cmd.user_data = @ptrCast(&result);
+        const ran = cmd.executeSlice(case.args);
+        // Close the write end so the read below sees EOF rather than blocking
+        // when nothing was printed.
+        _ = std.c.close(fds[1]);
+        try ran;
+
+        var buf: [256]u8 = undefined;
+        const n = std.c.read(fds[0], &buf, buf.len);
+        try std.testing.expect(n >= 0);
+        try std.testing.expectEqualStrings(case.msg, buf[0..@intCast(n)]);
+        if (case.msg.len == 0) {
+            try std.testing.expectEqual(@as(?Error, null), result.err);
+            try std.testing.expectEqual(case.port, result.port);
+            try std.testing.expectEqual(case.changed_port, result.changed_port);
+        } else {
+            try std.testing.expectEqual(@as(?Error, error.CommandFailed), result.err);
+        }
+    }
 }

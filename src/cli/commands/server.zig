@@ -364,7 +364,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 
     // Get flag values (convert to appropriate types)
     const config_path = ctx.getString("config");
-    const port = stdx.nullIfZero(u16, ctx.getUint16("port"));
+    const port = stdx.nullIfZero(u16, try ctx.getPort("port"));
     const data_dir = ctx.getString("data-dir");
     // Read wide so an out-of-range count is refused by the config check,
     // not truncated on the way in.
@@ -380,11 +380,11 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const cluster_first = ctx.getBool("cluster");
     const join_addrs = ctx.getString("join");
     const node_id_override = ctx.getChangedUint("node-id");
-    const raft_port_override = ctx.getChangedUint16("raft-port");
+    const raft_port_override = try ctx.getChangedPort("raft-port");
 
     // Metrics and dashboard flags
-    const metrics_port_override = ctx.getChangedUint16("metrics-port");
-    const dashboard_port_override = ctx.getChangedUint16("dashboard-port");
+    const metrics_port_override = try ctx.getChangedPort("metrics-port");
+    const dashboard_port_override = try ctx.getChangedPort("dashboard-port");
     const no_metrics = ctx.getBool("no-metrics");
     const no_dashboard = ctx.getBool("no-dashboard");
 
