@@ -782,6 +782,44 @@ test "e2e/workflow: cancel running workflow" {
     try stdx.testing.assertSucceeded(cancel_result);
 }
 
+test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps going" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const workflow_def =
+        \\kind: Workflow
+        \\name: cancel-reason-wf
+        \\version: 1.0.0
+        \\start.wait_for_signal.type: proceed
+        \\start.wait_for_signal.timeout_ms: 300000
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.timeout: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "cancel-reason.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try ctx.exec(&.{ "workflow", "start", "cancel-reason-wf", "{}", "--run-id", "cancel-reason-run" });
+
+    const too_long = [_]u8{'r'} ** 1025;
+    var refused = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &too_long });
+    defer refused.deinit();
+    try testing.expect(refused.exit_code != 0);
+    try testing.expect(refused.stderrContains("a cancel reason is at most 1024 bytes, not 1025"));
+
+    var still = try ctx.cli.run(&.{ "workflow", "status", "cancel-reason-run" });
+    defer still.deinit();
+    try testing.expectEqual(@as(u8, 0), still.exit_code);
+    try testing.expect(still.stdoutContains("Status:   waiting"));
+
+    const longest = [_]u8{'r'} ** 1024;
+    var ok = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &longest });
+    defer ok.deinit();
+    try testing.expectEqual(@as(u8, 0), ok.exit_code);
+    var done = try ctx.cli.run(&.{ "workflow", "status", "cancel-reason-run" });
+    defer done.deinit();
+    try testing.expect(done.stdoutContains("Status:   cancelled"));
+}
+
 // =============================================================================
 // Full Integration Test: Workflow -> Action -> Worker -> Result
 // =============================================================================

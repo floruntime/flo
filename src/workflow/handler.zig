@@ -93,6 +93,17 @@ pub const WorkflowHandler = struct {
     /// module's work.
     started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
 
+    /// Completions a busy log refused, retried by the tick (`retryCompletions`).
+    /// It drains only while this node leads; after a step-down and
+    /// re-election the entries fire against the run's local state, and a run
+    /// that turned terminal meanwhile is skipped. A completion refused with
+    /// NotLeader or WritesStopped isn't kept here: the run stays non-terminal
+    /// on this node until replay. Leader-only run state across failover is
+    /// for the delivery-leases work and the state-machine contract to settle.
+    completion_retries: std.ArrayListUnmanaged(PendingCompletion) = .empty,
+    /// Logs a completion record. A seam so a test can make the log refuse.
+    propose: *const fn (shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void = proposeCompletion,
+
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
     definitions: std.StringHashMap(DefinitionRecord),
@@ -308,6 +319,11 @@ pub const WorkflowHandler = struct {
     }
 
     pub fn deinit(self: *WorkflowHandler) void {
+        for (self.completion_retries.items) |p| {
+            self.allocator.free(p.run_ns_key);
+            self.allocator.free(p.detail);
+        }
+        self.completion_retries.deinit(self.allocator);
         // Free all definition records (ns-qualified key + record fields)
         var dit = self.definitions.iterator();
         while (dit.next()) |entry| {
@@ -911,6 +927,12 @@ pub const WorkflowHandler = struct {
             return;
         };
 
+        // A finished run's history is its logged completion record.
+        if (run.status.isTerminal()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
+            return;
+        }
+
         // Parse signal: [signal_len:u16][signal_type][payload...]
         if (req.value.len < 2) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "signal type is required");
@@ -925,6 +947,14 @@ pub const WorkflowHandler = struct {
 
         const signal_type = req.value[2 .. 2 + sig_len];
         const payload_data = if (2 + sig_len < req.value.len) req.value[2 + sig_len ..] else null;
+
+        // A signal adds up to two history events. Refused once they'd leave
+        // the completion record no room for its final event, output and tags.
+        const history_after = completionBase(run) + 2 * Completion.eventSize("signal_received", signal_type);
+        if (history_after + COMPLETION_HEADROOM > completionLimit(run_ns_key)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run history is full");
+            return;
+        }
 
         // Store signal
         const owned_sig_type = self.allocator.dupe(u8, signal_type) catch {
@@ -1004,9 +1034,26 @@ pub const WorkflowHandler = struct {
             return;
         };
 
+        if (run.status.isTerminal()) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
+            return;
+        }
+        if (req.value.len > MAX_CANCEL_REASON) {
+            var msg: [96]u8 = undefined;
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&msg, "a cancel reason is at most {d} bytes, not {d}", .{ MAX_CANCEL_REASON, req.value.len }) catch "cancel reason too long");
+            return;
+        }
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
-        self.completeRun(shard, run_ns_key, run, .cancelled, reason, now_ms);
+        self.tryComplete(shard, run_ns_key, run, .cancelled, reason, now_ms) catch |err| {
+            const status: proto.StatusCode, const text: []const u8 = switch (err) {
+                error.OutOfMemory => .{ .internal_error, "out of memory" },
+                error.BadKey => .{ .internal_error, "internal error: a run key without its namespace" },
+                else => .{ persistence_mod.failureCode(err).toStatus(), persistence_mod.failureMessage(err, "the cancel was not persisted") },
+            };
+            shard.sendErrorResponse(conn, req.header.request_id, status, text);
+            return;
+        };
 
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
@@ -1038,48 +1085,53 @@ pub const WorkflowHandler = struct {
         // [created_at:i64][has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
         // [has_wait_signal:u8][wait_signal_len:u16][wait_signal]?
         const current_step = run.current_step_name_owned orelse "start";
-        var wire_buf: [16384]u8 = undefined;
-        var fbs: std.Io.Writer = .fixed(&wire_buf);
+        // Sized to the run. Each field is bounded where the run was made: the
+        // start entry (key < 600 bytes, value <= 65000) and the completion
+        // record (under 64 KiB) hold every one, so each length fits its field.
+        const size = 2 + run.run_id_owned.len + 2 + run.workflow_name_owned.len + 2 + run.workflow_version_owned.len +
+            1 + 2 + current_step.len + 4 + run.input_owned.len + 8 +
+            1 + (if (run.started_at_ms != null) @as(usize, 8) else 0) + 1 + (if (run.completed_at_ms != null) @as(usize, 8) else 0) +
+            1 + (if (run.wait_signal_type_owned) |sig| 2 + sig.len else 0) +
+            1 + (if (run.output_owned) |o| 4 + o.len else 0);
+        const wire_buf = self.allocator.alloc(u8, size) catch {
+            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
+            return;
+        };
+        defer self.allocator.free(wire_buf);
+        var fbs: std.Io.Writer = .fixed(wire_buf);
         const w = &fbs;
-        w.writeInt(u16, @intCast(run.run_id_owned.len), .little) catch return;
-        w.writeAll(run.run_id_owned) catch return;
-        w.writeInt(u16, @intCast(run.workflow_name_owned.len), .little) catch return;
-        w.writeAll(run.workflow_name_owned) catch return;
-        w.writeInt(u16, @intCast(run.workflow_version_owned.len), .little) catch return;
-        w.writeAll(run.workflow_version_owned) catch return;
-        w.writeByte(@intFromEnum(run.status)) catch return;
-        w.writeInt(u16, @intCast(current_step.len), .little) catch return;
-        w.writeAll(current_step) catch return;
-        w.writeInt(u32, @intCast(run.input_owned.len), .little) catch return;
-        w.writeAll(run.input_owned) catch return;
-        w.writeInt(i64, run.created_at_ms, .little) catch return;
-        if (run.started_at_ms) |v| {
-            w.writeByte(1) catch return;
-            w.writeInt(i64, v, .little) catch return;
-        } else {
-            w.writeByte(0) catch return;
-        }
-        if (run.completed_at_ms) |v| {
-            w.writeByte(1) catch return;
-            w.writeInt(i64, v, .little) catch return;
-        } else {
-            w.writeByte(0) catch return;
+        w.writeInt(u16, @intCast(run.run_id_owned.len), .little) catch unreachable;
+        w.writeAll(run.run_id_owned) catch unreachable;
+        w.writeInt(u16, @intCast(run.workflow_name_owned.len), .little) catch unreachable;
+        w.writeAll(run.workflow_name_owned) catch unreachable;
+        w.writeInt(u16, @intCast(run.workflow_version_owned.len), .little) catch unreachable;
+        w.writeAll(run.workflow_version_owned) catch unreachable;
+        w.writeByte(@intFromEnum(run.status)) catch unreachable;
+        w.writeInt(u16, @intCast(current_step.len), .little) catch unreachable;
+        w.writeAll(current_step) catch unreachable;
+        w.writeInt(u32, @intCast(run.input_owned.len), .little) catch unreachable;
+        w.writeAll(run.input_owned) catch unreachable;
+        w.writeInt(i64, run.created_at_ms, .little) catch unreachable;
+        for ([_]?i64{ run.started_at_ms, run.completed_at_ms }) |at| {
+            w.writeByte(@intFromBool(at != null)) catch unreachable;
+            if (at) |v| w.writeInt(i64, v, .little) catch unreachable;
         }
         if (run.wait_signal_type_owned) |sig| {
-            w.writeByte(1) catch return;
-            w.writeInt(u16, @intCast(sig.len), .little) catch return;
-            w.writeAll(sig) catch return;
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u16, @intCast(sig.len), .little) catch unreachable;
+            w.writeAll(sig) catch unreachable;
         } else {
-            w.writeByte(0) catch return;
+            w.writeByte(0) catch unreachable;
         }
         // Optional: output (composed from definition's output mapping)
         if (run.output_owned) |output| {
-            w.writeByte(1) catch return;
-            w.writeInt(u32, @intCast(output.len), .little) catch return;
-            w.writeAll(output) catch return;
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u32, @intCast(output.len), .little) catch unreachable;
+            w.writeAll(output) catch unreachable;
         } else {
-            w.writeByte(0) catch return;
+            w.writeByte(0) catch unreachable;
         }
+        std.debug.assert(fbs.end == size);
 
         shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
     }
@@ -1114,6 +1166,10 @@ pub const WorkflowHandler = struct {
         // Serialize to binary wire format:
         // [count:u32]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
         // [has_more:u8][cursor_len:u16]
+        // Event types are literals; details are a signal type (u16 on the
+        // wire), a cancel reason (MAX_CANCEL_REASON), step or terminal names
+        // from a definition under 64 KiB, or, once complete, the completion
+        // record's, itself under 64 KiB. So each length fits u16.
         const events = run.history.items;
         const count: u32 = @intCast(@min(events.len, limit));
 
@@ -1326,6 +1382,8 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(buf);
 
+        // A page is at most `limit` (u32) runs; run ids are under 600 bytes and
+        // workflow names under 65000 (the start entry), statuses literals.
         std.mem.writeInt(u32, buf[0..4], @intCast(page.len), .little);
         var pos: usize = 4;
         for (page) |r| {
@@ -1491,6 +1549,8 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(buf);
 
+        // Fewer definitions than a hash map counts (u32); each name and
+        // version came from a create entry under 64 KiB.
         std.mem.writeInt(u32, buf[0..4], @intCast(defs.items.len), .little);
         var pos: usize = 4;
         for (defs.items) |d| {
@@ -2154,6 +2214,7 @@ pub const WorkflowHandler = struct {
     pub fn checkPendingActions(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.retryCompletions(shard, @import("stdx").time.milliTimestamp());
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
@@ -2591,12 +2652,10 @@ pub const WorkflowHandler = struct {
             self.advanceWorkflow(shard, key_copy, namespace);
         } else {
             // No timeout target configured — just time out the run
-            run.status = .timed_out;
-            run.completed_at_ms = now_ms;
             if (run.wait_signal_type_owned) |s| self.allocator.free(s);
             run.wait_signal_type_owned = null;
             run.wait_timeout_at_ms = 0;
-            self.addHistoryEvent(run, "workflow_timed_out", "signal timeout", now_ms);
+            self.completeRun(shard, run_ns_key, run, .timed_out, "signal timeout", now_ms);
         }
     }
 
@@ -2628,50 +2687,135 @@ pub const WorkflowHandler = struct {
         return null;
     }
 
-    /// Transition the run to a terminal status and persist to UAL.
+    /// Ends a run. The completion record is built and logged first, then
+    /// applied to the run the way replay applies it, so the leader's run
+    /// and the log can't disagree. A record too large to log is trimmed to
+    /// fit (see encodeTrimmed). A log too busy to take it is retried from
+    /// the run's state on a later tick; on a node that isn't leading,
+    /// nothing changes and the new leader owns the run.
     fn completeRun(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
-        run.status = status;
-        run.completed_at_ms = now_ms;
+        self.tryComplete(shard, run_ns_key, run, status, detail, now_ms) catch |err| switch (err) {
+            error.Overloaded => self.retryCompletionLater(run_ns_key, status, detail, now_ms, 0),
+            else => {},
+        };
+    }
+
+    fn tryComplete(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) !void {
+        const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return error.BadKey;
+        const namespace = run_ns_key[0..sep];
+
+        const output: ?[]const u8 = if (status == .completed) self.workflowOutput(run, namespace) else null;
+        defer if (output) |o| self.allocator.free(o);
+        // Search tags re-computed now that $.steps.* and $.flo.* are available.
+        const tags: ?[]const u8 = blk: {
+            const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse break :blk null;
+            defer self.allocator.free(def_ns_key);
+            break :blk self.buildSearchTags(def_ns_key, run);
+        };
+        defer if (tags) |t| self.allocator.free(t);
+
+        const limit = completionLimit(run_ns_key);
+        const parts: Completion = .{
+            .status = status,
+            .completed_at_ms = now_ms,
+            .output = output,
+            .steps = if (run.step_outputs) |so| so.entries else &.{},
+            .history = run.history.items,
+            .last = .{ .event_type = terminalEventType(status), .detail = detail, .timestamp_ms = now_ms },
+            .tags = tags,
+        };
+        const value = encodeCompletion(self.allocator, parts, limit) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.TooLarge => try encodeTrimmed(self.allocator, parts, limit),
+        };
+        defer self.allocator.free(value);
+
+        self.propose(shard, namespace, run_ns_key, value) catch |err| {
+            log.err("workflow run {s}: completion not persisted: {s}", .{ run_ns_key, @errorName(err) });
+            return err;
+        };
+        // The applier applies the same record again at commit; it replaces
+        // the terminal state wholesale, so a second apply is a no-op.
+        self.applyComplete(run, value);
 
         // Every terminal transition passes through here, so this is the one
         // place the outcome counters need to be recorded.
-        if (shard.metrics_registry) |m| switch (status) {
+        if (shard.metrics_registry) |m| switch (run.status) {
             .completed => m.workflow.recordCompleted(),
             .failed => m.workflow.recordFailed(),
             .cancelled => m.workflow.recordCancelled(),
             .timed_out => m.workflow.recordTimedOut(),
             else => {},
         };
+    }
 
-        // Resolve explicit output mapping from definition (if declared)
-        if (status == .completed) {
-            self.resolveWorkflowOutput(run, run_ns_key);
-        }
+    fn proposeCompletion(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void {
+        _ = try persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, run_ns_key, value);
+    }
 
-        // Re-compute search tags now that $.steps.* and $.flo.* are available
-        {
-            const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
-            const namespace = run_ns_key[0..sep];
-            const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
-            defer self.allocator.free(def_ns_key);
-            if (self.buildSearchTags(def_ns_key, run)) |tags| {
-                if (run.search_tags_owned) |old| self.allocator.free(old);
-                run.search_tags_owned = tags;
+    /// A completion the log was too busy to take, retried from the run's
+    /// state once `due_ms` passes.
+    const PendingCompletion = struct {
+        run_ns_key: []const u8,
+        status: RunStatus,
+        detail: []const u8,
+        attempt: u32,
+        due_ms: i64,
+    };
+
+    fn retryCompletionLater(self: *WorkflowHandler, run_ns_key: []const u8, status: RunStatus, detail: []const u8, now_ms: i64, attempt: u32) void {
+        const due_ms = now_ms + completionBackoff(attempt);
+        for (self.completion_retries.items) |*p| if (std.mem.eql(u8, p.run_ns_key, run_ns_key)) {
+            p.attempt = attempt;
+            p.due_ms = due_ms;
+            return;
+        };
+        const key = self.allocator.dupe(u8, run_ns_key) catch return log.err("workflow run {s}: completion dropped: out of memory", .{run_ns_key});
+        const owned_detail = self.allocator.dupe(u8, detail) catch {
+            self.allocator.free(key);
+            return log.err("workflow run {s}: completion dropped: out of memory", .{run_ns_key});
+        };
+        self.completion_retries.append(self.allocator, .{ .run_ns_key = key, .status = status, .detail = owned_detail, .attempt = attempt, .due_ms = due_ms }) catch {
+            self.allocator.free(key);
+            self.allocator.free(owned_detail);
+            log.err("workflow run {s}: completion dropped: out of memory", .{run_ns_key});
+        };
+    }
+
+    /// 100 ms doubling to 5 s.
+    fn completionBackoff(attempt: u32) i64 {
+        return @min(@as(i64, 100) << @intCast(@min(attempt, 6)), 5000);
+    }
+
+    /// Completes the runs whose retry is due, encoding each from its state now.
+    fn retryCompletions(self: *WorkflowHandler, shard: *Shard, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.completion_retries.items.len) {
+            const p = self.completion_retries.items[i];
+            if (p.due_ms > now_ms) {
+                i += 1;
+                continue;
             }
+            _ = self.completion_retries.swapRemove(i);
+            defer self.allocator.free(p.run_ns_key);
+            defer self.allocator.free(p.detail);
+            const run = self.runs.getPtr(p.run_ns_key) orelse continue;
+            if (run.status.isTerminal()) continue;
+            self.tryComplete(shard, p.run_ns_key, run, p.status, p.detail, now_ms) catch |err| switch (err) {
+                error.Overloaded => self.retryCompletionLater(p.run_ns_key, p.status, p.detail, now_ms, p.attempt +| 1),
+                else => {},
+            };
         }
+    }
 
-        const event_type = switch (status) {
+    fn terminalEventType(status: RunStatus) []const u8 {
+        return switch (status) {
             .completed => "workflow_completed",
             .failed => "workflow_failed",
             .cancelled => "workflow_cancelled",
             .timed_out => "workflow_timed_out",
             else => "workflow_ended",
         };
-        self.addHistoryEvent(run, event_type, detail, now_ms);
-        // completeRun mutates the run first because persistComplete
-        // serializes it; the applier then rebuilds the same state from the
-        // entry.
-        self.persistComplete(shard, run_ns_key, run, status, now_ms);
     }
 
     /// Resolve the workflow's `output` mapping (same format as a step's input_mapping).
@@ -2682,24 +2826,20 @@ pub const WorkflowHandler = struct {
     ///  1. `output: "$.steps.ship.output"` → direct path passthrough (raw bytes).
     ///  2. `output: '{"key": "$.path"}'` → JSON mapping with interpolation.
     /// If `output` is not declared, workflow output remains null.
-    fn resolveWorkflowOutput(self: *WorkflowHandler, run: *RunRecord, run_ns_key: []const u8) void {
-        // Extract namespace from run_ns_key ("namespace:run_id")
-        const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return;
-        const namespace = run_ns_key[0..sep];
-
+    fn workflowOutput(self: *WorkflowHandler, run: *RunRecord, namespace: []const u8) ?[]const u8 {
         // Look up the workflow definition
-        const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
+        const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return null;
         defer self.allocator.free(def_ns_key);
-        const def_record = self.definitions.get(def_ns_key) orelse return;
+        const def_record = self.definitions.get(def_ns_key) orelse return null;
 
         // Parse definition to access the output mapping
-        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return;
+        var def = self.parseStored(def_record.yaml_owned, def_ns_key) catch return null;
         defer def.deinit(self.allocator);
 
-        const output_expr = def.output orelse return;
+        const output_expr = def.output orelse return null;
 
         const trimmed = std.mem.trim(u8, output_expr, " \t");
-        if (trimmed.len < 2) return;
+        if (trimmed.len < 2) return null;
 
         // Mode 1: Direct path passthrough ("$.steps.ship.output" or "$.input")
         if (trimmed[0] == '$' and trimmed[1] == '.') {
@@ -2709,18 +2849,14 @@ pub const WorkflowHandler = struct {
                 if (run.step_outputs) |*so| so else null,
                 run.run_id_owned,
             );
-            const resolved = resolver.resolve(trimmed) catch |err| {
+            return resolver.resolve(trimmed) catch |err| {
                 log.warn("Workflow output path resolution failed for '{s}': {}", .{ trimmed, err });
-                return;
-            } orelse return;
-
-            if (run.output_owned) |old| self.allocator.free(old);
-            run.output_owned = resolved;
-            return;
+                return null;
+            };
         }
 
         // Mode 2: JSON mapping — resolve all $.path references within the object
-        const resolved = jsonpath.resolveInput(
+        return jsonpath.resolveInput(
             self.allocator,
             output_expr,
             run.input_owned,
@@ -2728,12 +2864,8 @@ pub const WorkflowHandler = struct {
             run.run_id_owned,
         ) catch |err| {
             log.warn("Workflow output mapping resolution failed: {}", .{err});
-            return;
+            return null;
         };
-
-        // Store on the run (free any previous output)
-        if (run.output_owned) |old| self.allocator.free(old);
-        run.output_owned = resolved;
     }
 
     /// Build pre-computed search attribute JSON from definition + run data.
@@ -3345,6 +3477,7 @@ pub const WorkflowHandler = struct {
         const ns_key = try std.fmt.bufPrint(&ns_key_buf, "{s}:{s}", .{ namespace, run_id });
         const idem = idempotency_key orelse "";
         const value_len = 2 + wf_name.len + 2 + version.len + 1 + 8 + 2 + event_type.len + 2 + idem.len + input.len;
+        // Checked whole first, so each length below fits u16.
         if (value_len > 65000) return error.PayloadTooLarge;
         var value_buf: [65536]u8 = undefined;
         var off: usize = 0;
@@ -3373,120 +3506,183 @@ pub const WorkflowHandler = struct {
         return persistence_mod.proposeEntry(shard, .workflow_start, entry_mod.Flags.NONE, namespace, ns_key, value_buf[0..off]);
     }
 
-    /// Persist a workflow_complete entry to the UAL so terminal state survives restarts.
-    /// Value format: [status:u8][completed_at_ms:i64]
-    ///   [has_output:u8][output_len:u32][output]?
-    ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-    ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    ///   [tags_len:u16][search_tags]?
-    fn persistComplete(
-        self: *WorkflowHandler,
-        shard: *Shard,
-        ns_key: []const u8,
-        run: *const RunRecord,
+    /// A run's completion record, gathered without touching the run.
+    const Completion = struct {
         status: RunStatus,
         completed_at_ms: i64,
-    ) void {
-        // Extract namespace from "namespace:run_id"
-        const colon = std.mem.indexOfScalar(u8, ns_key, ':') orelse return;
-        const namespace = ns_key[0..colon];
+        output: ?[]const u8,
+        steps: []const wf_types.StepOutput,
+        /// Events before `last`, oldest first.
+        history: []const HistoryEvent,
+        /// Earlier events left out to fit; recorded as one marker event.
+        dropped: usize = 0,
+        last: Event,
+        tags: ?[]const u8,
 
-        // Calculate total size needed
-        var total: usize = 9; // status + completed_at_ms
-        // Output
-        total += 1; // has_output flag
-        if (run.output_owned) |out| {
-            total += 4 + out.len; // output_len + output
-        }
-        // Step outputs
-        total += 2; // step_count
-        if (run.step_outputs) |so| {
-            for (so.entries) |entry| {
-                total += 2 + entry.step_name.len + 2 + entry.outcome.len + 4 + entry.output.len;
-            }
-        }
-        // History events
-        total += 2; // history_count
-        for (run.history.items) |ev| {
-            total += 2 + ev.event_type_owned.len + 2 + ev.detail_owned.len + 8;
-        }
-        // Search tags
-        const tags = run.search_tags_owned orelse "";
-        total += 2 + tags.len;
+        const Event = struct { event_type: []const u8, detail: []const u8, timestamp_ms: i64 };
 
-        const buf = self.allocator.alloc(u8, total) catch return;
-        defer self.allocator.free(buf);
-        var off: usize = 0;
-
-        // [status:u8][completed_at_ms:i64]
-        buf[off] = @intFromEnum(status);
-        off += 1;
-        std.mem.writeInt(i64, buf[off..][0..8], completed_at_ms, .little);
-        off += 8;
-
-        // [has_output:u8][output_len:u32][output]?
-        if (run.output_owned) |out| {
-            buf[off] = 1;
-            off += 1;
-            std.mem.writeInt(u32, buf[off..][0..4], @intCast(out.len), .little);
-            off += 4;
-            @memcpy(buf[off .. off + out.len], out);
-            off += out.len;
-        } else {
-            buf[off] = 0;
-            off += 1;
+        fn eventSize(event_type: []const u8, detail: []const u8) usize {
+            return 2 + event_type.len + 2 + detail.len + 8;
         }
 
-        // [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
-        const step_count: u16 = if (run.step_outputs) |so| @intCast(so.entries.len) else 0;
-        std.mem.writeInt(u16, buf[off..][0..2], step_count, .little);
-        off += 2;
-        if (run.step_outputs) |so| {
-            for (so.entries) |entry| {
-                std.mem.writeInt(u16, buf[off..][0..2], @intCast(entry.step_name.len), .little);
-                off += 2;
-                @memcpy(buf[off .. off + entry.step_name.len], entry.step_name);
-                off += entry.step_name.len;
-                std.mem.writeInt(u16, buf[off..][0..2], @intCast(entry.outcome.len), .little);
-                off += 2;
-                @memcpy(buf[off .. off + entry.outcome.len], entry.outcome);
-                off += entry.outcome.len;
-                std.mem.writeInt(u32, buf[off..][0..4], @intCast(entry.output.len), .little);
-                off += 4;
-                @memcpy(buf[off .. off + entry.output.len], entry.output);
-                off += entry.output.len;
-            }
+        /// Encoded size. Every length field fits when this is at most a log
+        /// entry, which is under 64 KiB.
+        fn size(c: Completion, marker_detail: []const u8) usize {
+            var n: usize = 1 + 8 + 1 + 2 + 2 + 2;
+            if (c.output) |o| n += 4 + o.len;
+            for (c.steps) |e| n += 2 + e.step_name.len + 2 + e.outcome.len + 4 + e.output.len;
+            if (c.dropped > 0) n += eventSize(MARKER_EVENT, marker_detail);
+            for (c.history) |e| n += eventSize(e.event_type_owned, e.detail_owned);
+            n += eventSize(c.last.event_type, c.last.detail);
+            if (c.tags) |t| n += t.len;
+            return n;
         }
+    };
 
-        // [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-        const hist_count: u16 = @intCast(run.history.items.len);
-        std.mem.writeInt(u16, buf[off..][0..2], hist_count, .little);
-        off += 2;
-        for (run.history.items) |ev| {
-            std.mem.writeInt(u16, buf[off..][0..2], @intCast(ev.event_type_owned.len), .little);
-            off += 2;
-            @memcpy(buf[off .. off + ev.event_type_owned.len], ev.event_type_owned);
-            off += ev.event_type_owned.len;
-            std.mem.writeInt(u16, buf[off..][0..2], @intCast(ev.detail_owned.len), .little);
-            off += 2;
-            @memcpy(buf[off .. off + ev.detail_owned.len], ev.detail_owned);
-            off += ev.detail_owned.len;
-            std.mem.writeInt(i64, buf[off..][0..8], ev.timestamp_ms, .little);
-            off += 8;
-        }
+    const MARKER_EVENT = "history_trimmed";
 
-        // [tags_len:u16][search_tags]?
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(tags.len), .little);
-        off += 2;
-        if (tags.len > 0) {
-            @memcpy(buf[off .. off + tags.len], tags);
-            off += tags.len;
-        }
+    /// A cancel reason goes into the run's history and its completion record.
+    const MAX_CANCEL_REASON: usize = 1024;
 
-        _ = persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, ns_key, buf[0..off]) catch |err| {
-            log.err("workflow run {s}: completion not persisted: {s}", .{ ns_key, @errorName(err) });
-            return;
+    /// The most a workflow_complete value for `run_ns_key` may hold: a log
+    /// entry less its command header and key.
+    fn completionLimit(run_ns_key: []const u8) usize {
+        return persistence_mod.MAX_PERSIST_PAYLOAD - entry_mod.COMMAND_PREFIX_SIZE - run_ns_key.len;
+    }
+
+    /// The bytes a run's completion record takes for what it holds now:
+    /// its step outputs and history, before the final event, output and tags.
+    fn completionBase(run: *const RunRecord) usize {
+        var n: usize = 1 + 8 + 1 + 2 + 2 + 2;
+        if (run.step_outputs) |so| for (so.entries) |e| {
+            n += 2 + e.step_name.len + 2 + e.outcome.len + 4 + e.output.len;
         };
+        for (run.history.items) |e| n += Completion.eventSize(e.event_type_owned, e.detail_owned);
+        return n;
+    }
+
+    /// Room kept for what a completion adds to a run's history: its final
+    /// event, output and tags. A signal that would leave less is refused.
+    const COMPLETION_HEADROOM: usize = 8 * 1024;
+
+    fn encodeCompletion(allocator: Allocator, c: Completion, limit: usize) error{ TooLarge, OutOfMemory }![]u8 {
+        var marker_buf: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, "{d} earlier events dropped", .{c.dropped}) catch unreachable;
+        const total = c.size(marker);
+        if (total > limit) return error.TooLarge;
+        // total <= limit < 64 KiB, so every length and count below fits its field.
+        const buf = try allocator.alloc(u8, total);
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@intFromEnum(c.status)) catch unreachable;
+        w.writeInt(i64, c.completed_at_ms, .little) catch unreachable;
+        if (c.output) |o| {
+            w.writeByte(1) catch unreachable;
+            w.writeInt(u32, @intCast(o.len), .little) catch unreachable;
+            w.writeAll(o) catch unreachable;
+        } else w.writeByte(0) catch unreachable;
+        w.writeInt(u16, @intCast(c.steps.len), .little) catch unreachable;
+        for (c.steps) |e| {
+            w.writeInt(u16, @intCast(e.step_name.len), .little) catch unreachable;
+            w.writeAll(e.step_name) catch unreachable;
+            w.writeInt(u16, @intCast(e.outcome.len), .little) catch unreachable;
+            w.writeAll(e.outcome) catch unreachable;
+            w.writeInt(u32, @intCast(e.output.len), .little) catch unreachable;
+            w.writeAll(e.output) catch unreachable;
+        }
+        const events = c.history.len + 1 + @intFromBool(c.dropped > 0);
+        w.writeInt(u16, @intCast(events), .little) catch unreachable;
+        const write = struct {
+            fn event(wr: *std.Io.Writer, t: []const u8, d: []const u8, ts: i64) void {
+                wr.writeInt(u16, @intCast(t.len), .little) catch unreachable;
+                wr.writeAll(t) catch unreachable;
+                wr.writeInt(u16, @intCast(d.len), .little) catch unreachable;
+                wr.writeAll(d) catch unreachable;
+                wr.writeInt(i64, ts, .little) catch unreachable;
+            }
+        };
+        if (c.dropped > 0) {
+            const ts = if (c.history.len > 0) c.history[0].timestamp_ms else c.last.timestamp_ms;
+            write.event(&w, MARKER_EVENT, marker, ts);
+        }
+        for (c.history) |e| write.event(&w, e.event_type_owned, e.detail_owned, e.timestamp_ms);
+        write.event(&w, c.last.event_type, c.last.detail, c.last.timestamp_ms);
+        const t = c.tags orelse "";
+        w.writeInt(u16, @intCast(t.len), .little) catch unreachable;
+        w.writeAll(t) catch unreachable;
+        std.debug.assert(w.end == total);
+        return buf;
+    }
+
+    /// The record for a completion too large to log, without the run's
+    /// output, step outputs or tags, keeping the most recent history events
+    /// that fit and a marker for the rest. A cancel stays a cancel, its
+    /// reason kept; any other completion fails the run, saying why. Built
+    /// from the run alone, and replay applies these bytes, so every node
+    /// agrees.
+    fn encodeTrimmed(allocator: Allocator, full: Completion, limit: usize) error{OutOfMemory}![]u8 {
+        var marker_buf: [64]u8 = undefined;
+        const full_size = full.size(std.fmt.bufPrint(&marker_buf, "{d} earlier events dropped", .{full.dropped}) catch unreachable);
+        // A client's cancel reason is capped at MAX_CANCEL_REASON, a terminal
+        // name lower still; cut anything longer so this always fits.
+        var detail_buf: [MAX_CANCEL_REASON + 96]u8 = undefined;
+        const cancelled = full.status == .cancelled;
+        const reason = full.last.detail[0..@min(full.last.detail.len, MAX_CANCEL_REASON)];
+        const detail = if (cancelled)
+            std.fmt.bufPrint(&detail_buf, "{s} (completion record too large: {d} bytes > {d})", .{ reason, full_size, limit }) catch unreachable
+        else
+            std.fmt.bufPrint(&detail_buf, "completion record too large: {d} bytes > {d}", .{ full_size, limit }) catch unreachable;
+        var c: Completion = .{
+            .status = if (cancelled) .cancelled else .failed,
+            .completed_at_ms = full.completed_at_ms,
+            .output = null,
+            .steps = &.{},
+            .history = full.history,
+            .last = .{ .event_type = terminalEventType(if (cancelled) .cancelled else .failed), .detail = detail, .timestamp_ms = full.last.timestamp_ms },
+            .tags = null,
+        };
+        // Drop the oldest events until the rest fit.
+        while (true) {
+            return encodeCompletion(allocator, c, limit) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooLarge => {
+                    // A run's key and the fixed parts always fit; only history can be too long.
+                    std.debug.assert(c.history.len > 0);
+                    c.history = c.history[1..];
+                    c.dropped += 1;
+                    continue;
+                },
+            };
+        }
+    }
+
+    /// Sets the run's terminal state from a workflow_complete value; the
+    /// producer and replay both apply it here. A value cut short, or an
+    /// allocation that fails, leaves the run as it was.
+    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8) void {
+        const entry = CompleteEntry.parse(value) orelse return;
+        const built = self.buildComplete(&entry) catch return;
+
+        // The entry carries the whole terminal state; whatever the run held
+        // (the live producer's copy, or an earlier apply) is replaced.
+        run.status = entry.status;
+        run.completed_at_ms = entry.completed_at_ms;
+        if (run.output_owned) |o| self.allocator.free(o);
+        run.output_owned = built.output;
+        if (run.step_outputs) |*so| {
+            var mutable = so.*;
+            mutable.deinit(self.allocator);
+        }
+        run.step_outputs = built.steps;
+        for (run.history.items) |evt| {
+            self.allocator.free(evt.event_type_owned);
+            self.allocator.free(evt.detail_owned);
+        }
+        run.history.deinit(self.allocator);
+        run.history = built.history;
+        if (built.tags) |t| {
+            if (run.search_tags_owned) |old| self.allocator.free(old);
+            run.search_tags_owned = t;
+        }
     }
 
     /// Register this handler's entry types with the shared ReplayRegistry.
@@ -3726,33 +3922,8 @@ pub const WorkflowHandler = struct {
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
     fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8) void {
-        // Checked whole before the run is touched: an entry cut short or
-        // with a bad field is skipped, not half applied.
-        const entry = CompleteEntry.parse(value) orelse return;
         const run = self.runs.getPtr(ns_key_raw) orelse return;
-        const built = self.buildComplete(&entry) catch return;
-
-        // The entry carries the whole terminal state; whatever the run held
-        // (the live producer's copy, or an earlier apply) is replaced.
-        run.status = entry.status;
-        run.completed_at_ms = entry.completed_at_ms;
-        if (run.output_owned) |o| self.allocator.free(o);
-        run.output_owned = built.output;
-        if (run.step_outputs) |*so| {
-            var mutable = so.*;
-            mutable.deinit(self.allocator);
-        }
-        run.step_outputs = built.steps;
-        for (run.history.items) |evt| {
-            self.allocator.free(evt.event_type_owned);
-            self.allocator.free(evt.detail_owned);
-        }
-        run.history.deinit(self.allocator);
-        run.history = built.history;
-        if (built.tags) |t| {
-            if (run.search_tags_owned) |old| self.allocator.free(old);
-            run.search_tags_owned = t;
-        }
+        self.applyComplete(run, value);
     }
 
     /// A workflow_complete value, checked against its length:
@@ -3760,7 +3931,7 @@ pub const WorkflowHandler = struct {
     ///   [has_output:u8]([output_len:u32][output])?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    ///   ([tags_len:u16][search_tags])?
+    ///   [tags_len:u16][search_tags]
     const CompleteEntry = struct {
         status: RunStatus,
         completed_at_ms: i64,
@@ -3791,8 +3962,8 @@ pub const WorkflowHandler = struct {
                 _ = c.take(c.int(u16) orelse return null) orelse return null;
                 _ = c.int(i64) orelse return null;
             }
-            // Optional; older entries end before it.
-            const tags: ?[]const u8 = if (c.int(u16)) |n| (if (n > 0) c.take(n) else null) else null;
+            const tags_len = c.int(u16) orelse return null;
+            const tags: ?[]const u8 = if (tags_len > 0) c.take(tags_len) orelse return null else null;
             return .{ .status = status, .completed_at_ms = completed_at_ms, .output = output, .step_count = step_count, .steps = steps, .history_count = history_count, .history = history, .tags = tags };
         }
     };
@@ -4138,7 +4309,8 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.metrics_registry = null;
     shard.shard_metrics = null;
     const raft_node = try std.testing.allocator.create(RaftNode);
-    raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 64 * 1024, .{});
+    // Room for an entry at the payload limit, which a 64 KiB ring can't hold.
+    raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 256 * 1024, .{});
     try raft_node.bootstrap();
     shard.raft_node = raft_node;
     shard.raft_network = null;
@@ -4946,4 +5118,412 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     try testing.expectEqualStrings("ok", run.output_owned.?);
     try testing.expectEqual(@as(usize, 1), run.history.items.len);
     try testing.expectEqualStrings("t", run.search_tags_owned.?);
+}
+
+/// Fills a run's history past what a completion record holds.
+fn overfillHistory(handler: *WorkflowHandler, run: *WorkflowHandler.RunRecord) !void {
+    const detail = [_]u8{'d'} ** 2000;
+    for (0..40) |i| handler.addHistoryEvent(run, "signal_received", &detail, @intCast(i));
+}
+
+test "a completion too large to log fails the run with a trimmed record that replay applies the same way" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:big", "big", "test-wf");
+    const run = handler.runs.getPtr("default:big").?;
+    try overfillHistory(&handler, run);
+    const before = run.history.items.len;
+
+    // What the producer would encode, kept to apply on a second handler as replay would.
+    const limit = WorkflowHandler.completionLimit("default:big");
+    const full: WorkflowHandler.Completion = .{
+        .status = .completed,
+        .completed_at_ms = 99,
+        .output = null,
+        .steps = &.{},
+        .history = run.history.items,
+        .last = .{ .event_type = "workflow_completed", .detail = "flo.Completed", .timestamp_ms = 99 },
+        .tags = null,
+    };
+    try testing.expectError(error.TooLarge, WorkflowHandler.encodeCompletion(allocator, full, limit));
+    const record = try WorkflowHandler.encodeTrimmed(allocator, full, limit);
+    defer allocator.free(record);
+    try testing.expect(record.len <= limit);
+
+    handler.completeRun(&shard, "default:big", run, .completed, "flo.Completed", 99);
+    _ = shard.applyCommitted();
+
+    const done = handler.runs.getPtr("default:big").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, done.status);
+    try testing.expectEqual(@as(?[]const u8, null), done.output_owned);
+    const events = done.history.items;
+    try testing.expectEqualStrings("history_trimmed", events[0].event_type_owned);
+    const kept = events.len - 2; // less the marker and the final event
+    var want_marker: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want_marker, "{d} earlier events dropped", .{before - kept}), events[0].detail_owned);
+    try testing.expectEqualStrings("workflow_failed", events[events.len - 1].event_type_owned);
+    try testing.expect(std.mem.startsWith(u8, events[events.len - 1].detail_owned, "completion record too large: "));
+
+    // A follower applies the same bytes and ends in the same state.
+    var follower = WorkflowHandler.init(allocator);
+    defer follower.deinit();
+    createTestRun(&follower, "default:big", "big", "test-wf");
+    follower.replayComplete("default:big", record);
+    const f = follower.runs.get("default:big").?;
+    try testing.expectEqual(done.status, f.status);
+    try testing.expectEqual(done.history.items.len, f.history.items.len);
+    for (done.history.items, f.history.items) |a, b| {
+        try testing.expectEqualStrings(a.event_type_owned, b.event_type_owned);
+        try testing.expectEqualStrings(a.detail_owned, b.detail_owned);
+    }
+}
+
+test "a cancel whose completion record is too large stays a cancel, trimmed to fit" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:big", "big", "test-wf");
+    const run = handler.runs.getPtr("default:big").?;
+    try overfillHistory(&handler, run);
+
+    try handler.tryComplete(&shard, "default:big", run, .cancelled, "stop", 5);
+    try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    const events = run.history.items;
+    try testing.expectEqualStrings("history_trimmed", events[0].event_type_owned);
+    try testing.expectEqualStrings("workflow_cancelled", events[events.len - 1].event_type_owned);
+    try testing.expect(std.mem.startsWith(u8, events[events.len - 1].detail_owned, "stop (completion record too large: "));
+}
+
+test "a completion record that fits round-trips through replay" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    handler.addHistoryEvent(run, "signal_received", "go", 1);
+
+    const c: WorkflowHandler.Completion = .{
+        .status = .cancelled,
+        .completed_at_ms = 7,
+        .output = "out",
+        .steps = &.{},
+        .history = run.history.items,
+        .last = .{ .event_type = "workflow_cancelled", .detail = "stop", .timestamp_ms = 7 },
+        .tags = "{\"a\":1}",
+    };
+    const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit("default:r"));
+    defer allocator.free(record);
+    handler.applyComplete(run, record);
+    try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    try testing.expectEqualStrings("out", run.output_owned.?);
+    try testing.expectEqualStrings("{\"a\":1}", run.search_tags_owned.?);
+    try testing.expectEqual(@as(usize, 2), run.history.items.len);
+    try testing.expectEqualStrings("stop", run.history.items[1].detail_owned);
+}
+
+/// The answer a handler queued on `conn`.
+fn queuedAnswer(conn: *Connection) !proto.Response {
+    return proto.Response.parse(conn.write_buf.peek());
+}
+
+test "a signal that would leave the completion no headroom is refused, holding nothing" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+
+    createTestRun(&handler, "default:s", "s", "test-wf");
+    const run = handler.runs.getPtr("default:s").?;
+    // Leave less than the headroom but more than two signal events: refused
+    // only while the headroom is kept.
+    const limit = WorkflowHandler.completionLimit("default:s");
+    // 4 KiB short of the limit: far more than two signal events, less than the headroom.
+    const want = limit - 4096;
+    const base = WorkflowHandler.completionBase(run);
+    const pad = want - base - WorkflowHandler.Completion.eventSize("pad", "");
+    const detail = try allocator.alloc(u8, pad);
+    defer allocator.free(detail);
+    @memset(detail, 'p');
+    handler.addHistoryEvent(run, "pad", detail, 0);
+    const events = run.history.items.len;
+
+    const value = [_]u8{ 2, 0 } ++ "go".* ++ "payload".*;
+    handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "s", &value));
+    const answer = try queuedAnswer(&conn);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqualStrings("run history is full", answer.data);
+    try testing.expectEqual(@as(usize, 0), run.signals.items.len);
+    try testing.expectEqual(events, run.history.items.len);
+}
+
+var fake_propose_refusals: u32 = 0;
+fn refuseThenPropose(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!void {
+    if (fake_propose_refusals > 0) {
+        fake_propose_refusals -= 1;
+        return error.Overloaded;
+    }
+    return WorkflowHandler.proposeCompletion(shard, namespace, run_ns_key, value);
+}
+fn notLeading(_: *Shard, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+    return error.NotLeader;
+}
+
+test "a completion the log is too busy for is retried from the run's state, and applies only once logged" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    const status = run.status;
+
+    handler.propose = refuseThenPropose;
+    fake_propose_refusals = 1;
+    handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 10);
+    try testing.expectEqual(status, run.status); // not applied: not logged
+    try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
+
+    handler.retryCompletions(&shard, 10); // not yet due
+    try testing.expectEqual(status, run.status);
+    handler.retryCompletions(&shard, 10 + 60_000);
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
+}
+
+test "a completion on a node that isn't leading changes nothing and isn't retried" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    const status = run.status;
+    handler.addHistoryEvent(run, "step_started", "a", 1);
+
+    handler.propose = notLeading;
+    handler.completeRun(&shard, "default:r", run, .failed, "x", 10);
+    try testing.expectEqual(status, run.status);
+    try testing.expectEqual(@as(usize, 1), run.history.items.len);
+    try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
+}
+
+test "a trimmed record leaves out the output, step outputs and tags" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    createTestRun(&handler, "default:big", "big", "test-wf");
+    const run = handler.runs.getPtr("default:big").?;
+    try overfillHistory(&handler, run);
+    const steps = [_]wf_types.StepOutput{.{ .step_name = "a", .output = "{\"x\":1}", .outcome = "success" }};
+    const full: WorkflowHandler.Completion = .{
+        .status = .completed,
+        .completed_at_ms = 1,
+        .output = "{\"done\":true}",
+        .steps = &steps,
+        .history = run.history.items,
+        .last = .{ .event_type = "workflow_completed", .detail = "flo.Completed", .timestamp_ms = 1 },
+        .tags = "{\"t\":1}",
+    };
+    const record = try WorkflowHandler.encodeTrimmed(allocator, full, WorkflowHandler.completionLimit("default:big"));
+    defer allocator.free(record);
+    const entry = WorkflowHandler.CompleteEntry.parse(record).?;
+    try testing.expectEqual(@as(?[]const u8, null), entry.output);
+    try testing.expectEqual(@as(u16, 0), entry.step_count);
+    try testing.expectEqual(@as(?[]const u8, null), entry.tags);
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, entry.status);
+}
+
+test "the completion limit counts the run's key: one byte over it is trimmed, exactly at it completes" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    // A long key, so a limit that forgot it would let through a record the log refuses.
+    const run_id = [_]u8{'k'} ** 3000;
+    const key = "default:" ++ run_id;
+    for ([_]usize{ 0, 1 }) |over| {
+        var handler = WorkflowHandler.init(allocator);
+        defer handler.deinit();
+        createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+        createTestRun(&handler, key, &run_id, "test-wf");
+        const run = handler.runs.getPtr(key).?;
+        const limit = WorkflowHandler.completionLimit(key);
+        const fixed = 1 + 8 + 1 + 2 + 2 + 2 + WorkflowHandler.Completion.eventSize("workflow_completed", "flo.Completed");
+        const detail = try allocator.alloc(u8, limit + over - fixed - WorkflowHandler.Completion.eventSize("pad", ""));
+        defer allocator.free(detail);
+        @memset(detail, 'p');
+        handler.addHistoryEvent(run, "pad", detail, 0);
+
+        handler.completeRun(&shard, key, run, .completed, "flo.Completed", 3);
+        try testing.expectEqual(if (over == 0) WorkflowHandler.RunStatus.completed else .failed, run.status);
+    }
+}
+
+test "a completion record cut inside its tags is refused, not read without them" {
+    const allocator = testing.allocator;
+    const c: WorkflowHandler.Completion = .{
+        .status = .completed,
+        .completed_at_ms = 1,
+        .output = null,
+        .steps = &.{},
+        .history = &.{},
+        .last = .{ .event_type = "workflow_completed", .detail = "", .timestamp_ms = 1 },
+        .tags = "{\"t\":1}",
+    };
+    const record = try WorkflowHandler.encodeCompletion(allocator, c, 1 << 15);
+    defer allocator.free(record);
+    try testing.expect(WorkflowHandler.CompleteEntry.parse(record) != null);
+    try testing.expectEqual(@as(?WorkflowHandler.CompleteEntry, null), WorkflowHandler.CompleteEntry.parse(record[0 .. record.len - 1]));
+    // Cut before the tags' length too: the field is required.
+    try testing.expectEqual(@as(?WorkflowHandler.CompleteEntry, null), WorkflowHandler.CompleteEntry.parse(record[0 .. record.len - 2 - 7]));
+}
+
+test "cancelling a run that already finished is refused and keeps its result" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 3);
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    const events = run.history.items.len;
+
+    handler.handleCancel(&shard, &conn, makeRequest(.workflow_cancel, "r", ""));
+    const answer = try queuedAnswer(&conn);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqualStrings("run already finished", answer.data);
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try testing.expectEqual(events, run.history.items.len);
+}
+
+test "an engine-reached cancel with a detail past the cancel-reason cap is trimmed, not a crash" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:big", "big", "test-wf");
+    const run = handler.runs.getPtr("default:big").?;
+    try overfillHistory(&handler, run);
+
+    const detail = [_]u8{'t'} ** 2000;
+    handler.completeRun(&shard, "default:big", run, .cancelled, &detail, 5);
+    try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    const last = run.history.items[run.history.items.len - 1].detail_owned;
+    try testing.expect(std.mem.startsWith(u8, last, detail[0..WorkflowHandler.MAX_CANCEL_REASON] ++ " (completion record too large: "));
+}
+
+test "a retry pending when the run is cancelled doesn't undo the cancel" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+
+    handler.propose = refuseThenPropose;
+    fake_propose_refusals = 1;
+    handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 10);
+    try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
+
+    try handler.tryComplete(&shard, "default:r", run, .cancelled, "stop", 11);
+    try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+
+    handler.retryCompletions(&shard, 10 + 60_000);
+    try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
+}
+
+test "a wait that times out with no target ends the run through the log" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    for ([_]bool{ false, true }) |leading| {
+        var handler = WorkflowHandler.init(allocator);
+        defer handler.deinit();
+        createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+        createTestRun(&handler, "default:w", "w", "test-wf");
+        const run = handler.runs.getPtr("default:w").?;
+        run.status = .waiting;
+        run.wait_signal_type_owned = try allocator.dupe(u8, "go");
+        run.wait_timeout_at_ms = 1;
+        if (!leading) handler.propose = notLeading;
+
+        handler.handleWaitTimeout(&shard, "default:w", 2);
+        if (leading) {
+            try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, run.status);
+        } else {
+            // Not logged, so not applied.
+            try testing.expect(!run.status.isTerminal());
+        }
+    }
+}
+
+test "a signal to a finished run is refused and leaves its history alone" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    var conn = try Connection.init(allocator, -1, 0, 0);
+    defer conn.deinit();
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 3);
+    const events = run.history.items.len;
+
+    const value = [_]u8{ 2, 0 } ++ "go".*;
+    handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value));
+    const answer = try queuedAnswer(&conn);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqualStrings("run already finished", answer.data);
+    try testing.expectEqual(events, run.history.items.len);
+    try testing.expectEqual(@as(usize, 0), run.signals.items.len);
 }
