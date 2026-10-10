@@ -198,8 +198,7 @@ test {
 }
 
 // Cluster
-test {
-}
+test {}
 
 // Auth
 test {

@@ -541,7 +541,9 @@ test "e2e/stream: trim --dry-run on batches reports what the trim removes" {
         var b1: [16]u8 = undefined;
         var b2: [16]u8 = undefined;
         try ctx.exec(&.{
-            "stream",                                                       "append", "dryrun-batch",
+            "stream",
+            "append",
+            "dryrun-batch",
             std.fmt.bufPrint(&b0, "bm-{d}-0", .{b}) catch unreachable,
             std.fmt.bufPrint(&b1, "bm-{d}-1", .{b}) catch unreachable,
             std.fmt.bufPrint(&b2, "bm-{d}-2", .{b}) catch unreachable,

@@ -177,8 +177,8 @@ pub fn parseJobDefinitionWithNamespace(allocator: Allocator, content: []const u8
 fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_namespace: ?[]const u8, d: D) ParseError!JobDefinition {
     if (root != .object) return d.fail(ParseError.InvalidFormat, "a job definition must be a map, not {s}", .{kindName(root)});
     try checkKeys(d, root, &.{
-        "kind",       "name",    "description", "namespace", "parallelism", "batch_size",
-        "sources",    "sinks",   "operators",   "checkpointing",
+        "kind",    "name",  "description", "namespace",     "parallelism", "batch_size",
+        "sources", "sinks", "operators",   "checkpointing",
     });
 
     const kind = try reqString(d, root, "kind", ParseError.MissingRequiredField);
@@ -2174,12 +2174,12 @@ fn job(comptime extra: []const u8, comptime source: []const u8, comptime sink: [
     return
     \\{ "kind": "Processing", "name": "j",
     ++ extra ++
-    \\  "sources": [ { "stream": { "name": "in"
+        \\  "sources": [ { "stream": { "name": "in"
     ++ source ++
-    \\ } } ],
-    \\  "sinks": [ { "stream": { "name": "out" }
+        \\ } } ],
+        \\  "sinks": [ { "stream": { "name": "out" }
     ++ sink ++
-    \\ } ] }
+        \\ } ] }
     ;
 }
 

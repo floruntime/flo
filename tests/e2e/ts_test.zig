@@ -88,8 +88,8 @@ test "e2e/ts: write multiple fields stores each field at one timestamp" {
     defer ctx.deinit();
 
     var w = try ctx.cli.run(&.{
-        "ts",          "write",    "cpu",                            "--tags",
-        "host=web-01", "--fields", "user=72.5,system=7.4,idle=20.1", "--timestamp",
+        "ts",            "write",    "cpu",                            "--tags",
+        "host=web-01",   "--fields", "user=72.5,system=7.4,idle=20.1", "--timestamp",
         "1708700400000",
     });
     defer w.deinit();
@@ -103,8 +103,8 @@ test "e2e/ts: write multiple fields stores each field at one timestamp" {
     };
     for (expected) |e| {
         var r = try ctx.cli.run(&.{
-            "ts",      "read", "cpu",    "--tags", "host=web-01",   "--field",
-            e[0],      "--from", "1708700000000", "-o", "raw",
+            "ts", "read",   "cpu",           "--tags", "host=web-01", "--field",
+            e[0], "--from", "1708700000000", "-o",     "raw",
         });
         defer r.deinit();
         try testing.expectEqualStrings(e[1], r.stdout);
