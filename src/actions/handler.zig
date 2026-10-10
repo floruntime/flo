@@ -2025,8 +2025,7 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, fbs.buffered());
         },
         .action_run_status => |s| {
-            // Serialize run status fields into a buffer using the same wire
-            // format as CommandResult.serialize (result.zig).
+            // The run status answer, field by field.
             var buf: [4096]u8 = undefined;
             var fbs: std.Io.Writer = .fixed(&buf);
             const writer = &fbs;

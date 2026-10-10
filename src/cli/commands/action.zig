@@ -692,7 +692,7 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    // task_assignment response format:
+    // A task assignment answer:
     //   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32][payload]
     // Empty data means no tasks
     if (result.asRawData()) |data| {

@@ -117,23 +117,6 @@ pub fn peek(client: *Client, namespace: []const u8, queue: []const u8, count: u3
     return client.sendRequestWithOptions(.queue_peek, namespace, queue, "", builder.getOptions());
 }
 
-/// Touch (renew lease) for messages to prevent timeout
-/// extend_ms: 0 = reset to original timeout, >0 = extend by N ms
-pub fn touch(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64, extend_ms: u32) !Response {
-    // Format: [count:u32][seq:u64]*
-    var writer = FixedWireWriter(4096).init();
-    try writer.writeU64ArrayWithCount(seqs);
-
-    if (extend_ms > 0) {
-        var options_buf: [16]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        try builder.addU32(.extend_ms, extend_ms);
-        return client.sendRequestWithOptions(.queue_touch, namespace, queue, writer.bytes(), builder.getOptions());
-    } else {
-        return client.sendRequest(.queue_touch, namespace, queue, writer.bytes());
-    }
-}
-
 /// List queues in a namespace
 /// Returns pre-serialized wire format:
 /// [count:u32] ([name_len:u32][name][ns_len:u32][ns][pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])* [has_more:u8] [cursor_len:u16][cursor]

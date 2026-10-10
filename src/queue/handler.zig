@@ -3,20 +3,15 @@
 //! Read operations (peek, stats, dlq_list) query the QueueProjection directly.
 //! Write operations (enqueue, ack, nack, purge) persist an entry through
 //! Raft; the projection router applies it to the QueueProjection under
-//! `Shard.applyCommitted()`. Dequeue is a projection-local lease whose ack
-//! is persisted the same way.
-//!
-//! ## Opcode Range
-//!
-//!   Commands:  0x40–0x4F (enqueue, dequeue, complete, fail, dlq ops, stats, peek, purge)
-//!   Responses: 0x50–0x59
-//!   List:      0x58
+//! `Shard.applyCommitted()`. A dequeue proposes an ack for each message it
+//! hands out, so delivery is at-most-once.
 //!
 //! ## Queue Semantics
 //!
 //! - Messages are dequeued by priority (lowest first), then by sequence.
-//! - Dequeued messages become leased with a visibility timeout.
-//! - Complete (ack) removes the message; fail (nack) requeues or moves to DLQ.
+//! - A dequeue consumes its messages: it acks each one as it hands it out,
+//!   so delivery is at-most-once and complete (ack) and fail (nack) find
+//!   nothing left to act on.
 //! - DLQ messages can be listed, requeued, or deleted.
 
 const std = @import("std");

@@ -8676,9 +8676,9 @@ test "Shard: a handler answering its own request as deferred is caught, and answ
             sh.deliverDeferredResponse(conn.replyTo(), req.header.request_id, .ok, "only-answer");
         }
     };
-    shard.dispatcher.register(.queue_touch, SelfDeferred.handle);
+    shard.dispatcher.register(.queue_peek, SelfDeferred.handle);
 
-    const frame = try testRequest(.queue_touch, 9, "q", "");
+    const frame = try testRequest(.queue_peek, 9, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;
@@ -8708,9 +8708,9 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
             sh.sendErrorResponse(conn, req.header.request_id, .bad_request, "€" ** 666 ++ "xx");
         }
     };
-    shard.dispatcher.register(.queue_touch, Long.handle);
+    shard.dispatcher.register(.queue_peek, Long.handle);
 
-    const frame = try testRequest(.queue_touch, 11, "q", "");
+    const frame = try testRequest(.queue_peek, 11, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;
@@ -8740,9 +8740,9 @@ test "Shard: a request whose handler answers nothing is answered internal_error 
     const Silent = struct {
         fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
     };
-    shard.dispatcher.register(.queue_touch, Silent.handle);
+    shard.dispatcher.register(.queue_peek, Silent.handle);
 
-    const frame = try testRequest(.queue_touch, 12, "q", "");
+    const frame = try testRequest(.queue_peek, 12, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;

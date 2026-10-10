@@ -18,7 +18,6 @@ pub const VERSION: u8 = 0x01;
 
 /// Maximum number of opcodes supported by the dispatch table.
 /// Layout: Infra(0x0__) + Data(0x1__–0x2__) + Compute(0x3__)
-/// See docs/architecture/OPCODE_LAYOUT.md for full rationale.
 pub const MAX_OPCODES: u16 = 1024;
 
 /// Operation codes — three-layer layout:
@@ -33,11 +32,6 @@ pub const OpCode = enum(u16) {
 
     // ── System (0x000 – 0x00F) ───────────────────────────────────────────────
     ping = 0x000,
-    pong = 0x001,
-    error_response = 0x002,
-    auth = 0x003,
-    set_durability = 0x004,
-    ok = 0x005,
 
     // ── Namespace (0x010 – 0x02F) ────────────────────────────────────────────
     namespace_create = 0x010,
@@ -47,10 +41,6 @@ pub const OpCode = enum(u16) {
     /// Refused: no namespace setting is supported yet.
     namespace_config_set = 0x014,
     namespace_config_get = 0x015,
-    namespace_create_response = 0x020,
-    namespace_delete_response = 0x021,
-    namespace_list_response = 0x022,
-    namespace_info_response = 0x023,
 
     // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
     cluster_status = 0x030,
@@ -60,9 +50,6 @@ pub const OpCode = enum(u16) {
     cluster_transfer_leader = 0x034,
     cluster_add_node = 0x035,
     cluster_remove_node = 0x036,
-    cluster_status_response = 0x040,
-    cluster_members_response = 0x041,
-    cluster_join_response = 0x042,
 
     // 0x050–0x0FF: infra reserve (auth, rate-limit, telemetry, audit)
 
@@ -77,11 +64,6 @@ pub const OpCode = enum(u16) {
     kv_delete = 0x103,
     kv_scan = 0x104,
     kv_history = 0x105,
-    kv_get_response = 0x106,
-    kv_mget_response = 0x107,
-    kv_put_response = 0x108,
-    kv_scan_response = 0x109,
-    kv_history_response = 0x10A,
     // ── KV Extended (atomic counters, JSON ops) ─────────────────────────
     kv_incr = 0x10B,
     kv_json_get = 0x10C,
@@ -99,27 +81,14 @@ pub const OpCode = enum(u16) {
     kv_touch = 0x113,
     kv_persist = 0x114,
     kv_exists = 0x115,
-    kv_incr_response = 0x116,
-    kv_json_response = 0x117,
-    kv_exists_response = 0x118,
-    kv_txn_response = 0x119, // BEGIN reply (carries txn_id + pinned_hash); COMMIT/ROLLBACK reply (status only)
 
     // ── Streams (0x130 – 0x14F) ──────────────────────────────────────────────
     stream_append = 0x130,
     stream_read = 0x131,
     stream_trim = 0x132,
     stream_info = 0x133,
-    stream_append_response = 0x134,
-    stream_read_response = 0x135,
-    stream_event = 0x136,
-    stream_subscribe = 0x137,
-    stream_unsubscribe = 0x138,
-    stream_subscribed = 0x139,
-    stream_unsubscribed = 0x13A,
     stream_list = 0x13B,
-    stream_list_response = 0x13C,
     stream_create = 0x13D,
-    stream_create_response = 0x13E,
     stream_alter = 0x13F,
     stream_delete = 0x140,
 
@@ -132,7 +101,6 @@ pub const OpCode = enum(u16) {
     stream_group_claim = 0x155,
     stream_group_pending = 0x156,
     stream_group_configure_sweeper = 0x157,
-    stream_group_read_response = 0x158,
     stream_group_nack = 0x159,
     stream_group_touch = 0x15A,
     stream_group_info = 0x15B,
@@ -142,30 +110,15 @@ pub const OpCode = enum(u16) {
     queue_enqueue = 0x170,
     queue_dequeue = 0x171,
     queue_complete = 0x172,
-    queue_extend_lease = 0x173,
     queue_fail = 0x174,
-    queue_fail_auto = 0x175,
     queue_dlq_list = 0x176,
     queue_dlq_delete = 0x177,
     queue_dlq_requeue = 0x178,
-    queue_dlq_stats = 0x179,
-    queue_promote_due = 0x17A,
     queue_stats = 0x17B,
     queue_peek = 0x17C,
-    queue_touch = 0x17D,
-    queue_batch_enqueue = 0x17E,
     queue_purge = 0x17F,
 
-    queue_enqueue_response = 0x190,
-    queue_dequeue_response = 0x191,
-    queue_dlq_list_response = 0x192,
-    queue_stats_response = 0x193,
-    queue_peek_response = 0x194,
-    queue_touch_response = 0x195,
-    queue_batch_enqueue_response = 0x196,
-    queue_purge_response = 0x197,
     queue_list = 0x198,
-    queue_list_response = 0x199,
 
     // ── Time-Series (0x1A0 – 0x1BF) ─────────────────────────────────────────
     ts_write = 0x1A0,
@@ -175,13 +128,6 @@ pub const OpCode = enum(u16) {
     ts_list = 0x1A4,
     ts_delete = 0x1A5,
     ts_retention = 0x1A6,
-    ts_write_response = 0x1A7,
-    ts_read_response = 0x1A8,
-    ts_query_response = 0x1A9,
-    ts_floql_response = 0x1AA,
-    ts_list_response = 0x1AB,
-    ts_delete_response = 0x1AC,
-    ts_retention_response = 0x1AD,
 
     // 0x1C0–0x2FF: data reserve (vectors, documents, geospatial, counters)
 
@@ -200,12 +146,6 @@ pub const OpCode = enum(u16) {
     action_complete = 0x307,
     action_fail = 0x308,
     action_touch = 0x309,
-    action_register_response = 0x310,
-    action_invoke_response = 0x311,
-    action_status_response = 0x312,
-    action_list_response = 0x313,
-    action_list_runs_response = 0x314,
-    action_task_assignment = 0x315,
 
     // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
     worker_register = 0x320,
@@ -214,10 +154,6 @@ pub const OpCode = enum(u16) {
     worker_list = 0x323,
     worker_info = 0x324,
     worker_drain = 0x325,
-    worker_register_response = 0x330,
-    worker_list_response = 0x331,
-    worker_info_response = 0x332,
-    worker_drain_response = 0x333,
 
     // ── Workflows (0x340 – 0x35F) ────────────────────────────────────────────
     workflow_create = 0x340,
@@ -231,15 +167,6 @@ pub const OpCode = enum(u16) {
     workflow_disable = 0x348,
     workflow_enable = 0x349,
     workflow_list_definitions = 0x34A,
-    workflow_create_response = 0x350,
-    workflow_start_response = 0x351,
-    workflow_status_response = 0x352,
-    workflow_history_response = 0x353,
-    workflow_list_runs_response = 0x354,
-    workflow_get_definition_response = 0x355,
-    workflow_disable_response = 0x356,
-    workflow_enable_response = 0x357,
-    workflow_list_definitions_response = 0x358,
 
     // ── Processing (0x360 – 0x37F) ───────────────────────────────────────────
     processing_submit = 0x360,
@@ -250,14 +177,6 @@ pub const OpCode = enum(u16) {
     processing_savepoint = 0x365,
     processing_restore = 0x366,
     processing_rescale = 0x367,
-    processing_submit_response = 0x370,
-    processing_stop_response = 0x371,
-    processing_cancel_response = 0x372,
-    processing_status_response = 0x373,
-    processing_list_response = 0x374,
-    processing_savepoint_response = 0x375,
-    processing_restore_response = 0x376,
-    processing_rescale_response = 0x377,
 
     // 0x380–0x3FF: compute reserve (emit, future compute — 128 slots)
 

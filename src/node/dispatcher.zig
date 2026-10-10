@@ -78,7 +78,7 @@ pub fn opWrites(op: proto.OpCode) bool {
         .kv_put, .kv_delete, .kv_incr, .kv_json_set, .kv_json_del, .kv_begin_txn, .kv_commit_txn, .kv_rollback_txn, .kv_touch, .kv_persist => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
-        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_extend_lease, .queue_fail, .queue_fail_auto, .queue_dlq_delete, .queue_dlq_requeue, .queue_promote_due, .queue_touch, .queue_batch_enqueue, .queue_purge => true,
+        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,
         .worker_register, .worker_heartbeat, .worker_deregister, .worker_drain => true,
@@ -95,7 +95,7 @@ pub fn opCreates(op: proto.OpCode) bool {
     return switch (op) {
         .kv_put, .kv_incr, .kv_json_set, .kv_begin_txn => true,
         .stream_append, .stream_create, .stream_group_create => true,
-        .queue_enqueue, .queue_batch_enqueue => true,
+        .queue_enqueue => true,
         .ts_write => true,
         .action_register, .action_invoke => true,
         .worker_register => true,

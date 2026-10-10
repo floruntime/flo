@@ -667,7 +667,7 @@ pub const NamespaceHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "namespace list serialization failed" } };
         };
 
-        return .{ .namespace_list = .{ .data = data, .allocated = true } };
+        return .{ .namespace_list = .{ .data = data } };
     }
 
     // ── INFO ────────────────────────────────────────────────────────────
@@ -691,7 +691,6 @@ pub const NamespaceHandler = struct {
         return .{ .namespace_info = .{
             .exists = exists,
             .name = owned_name,
-            .allocated = true,
         } };
     }
 
@@ -732,10 +731,10 @@ pub const NamespaceHandler = struct {
     pub fn freeResult(self: *NamespaceHandler, cmd_result: CommandResult) void {
         switch (cmd_result) {
             .namespace_list => |r| {
-                if (r.allocated) self.allocator.free(r.data);
+                self.allocator.free(r.data);
             },
             .namespace_info => |r| {
-                if (r.allocated) self.allocator.free(r.name);
+                self.allocator.free(r.name);
             },
             else => {},
         }
@@ -929,7 +928,6 @@ test "namespace handler: list" {
     switch (result) {
         .namespace_list => |r| {
             defer handler.freeResult(result);
-            try testing.expect(r.allocated);
             const count_ns = std.mem.readInt(u32, r.data[0..4], .little);
             try testing.expectEqual(@as(u32, 3), count_ns);
         },
