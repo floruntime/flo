@@ -441,14 +441,16 @@ test "e2e/ts: read with --limit caps results" {
         });
     }
 
-    // Read with limit 2
+    // A limit keeps the earliest points, oldest first.
     var result = try ctx.cli.run(&.{
         "ts",     "read",          "limit_test", "--tags", "host=x",
-        "--from", "1708700000000", "--limit",    "2",
+        "--from", "1708700000000", "--limit",    "2",      "-o",
+        "raw",
     });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expectEqualStrings("1708700400000 1.000000\n1708700401000 2.000000\n", result.stdout);
 }
 
 test "e2e/ts: read with time range" {

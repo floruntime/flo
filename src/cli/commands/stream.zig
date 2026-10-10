@@ -87,7 +87,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .uintFlag("limit", 'l', 10, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
                 .boolFlag("follow", 'f', "Follow mode - continuously tail for new records (like tail -f)")
                 .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait). Single read unlike --follow.")
-                .uintFlag("partition", 'P', 0, "Partition to read from (default: 0)")
+                .uintFlag("partition", 'P', 0, "Read only this partition (default: every partition)")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing (reads from same partition as append)")
                 .action(wrapHandler(runRead)),
         )
