@@ -242,8 +242,10 @@ pub const ExprFilterOperator = struct {
         if (has_or and has_and) return fail(why, "AND and OR can't be mixed in one condition");
         if (has_or) return .{ .or_expr = try parseCompound(cond, " OR ", why) };
         if (has_and) return .{ .and_expr = try parseCompound(cond, " AND ", why) };
-        return .{ .single = try parseSingleCondition(std.mem.trim(u8, cond, " "), why) };
+        return .{ .single = try parseSingleCondition(std.mem.trim(u8, cond, whitespace), why) };
     }
+
+    const whitespace = " \t\r\n";
 
     fn fail(why: *[]const u8, reason: []const u8) ConditionError {
         why.* = reason;
@@ -255,7 +257,7 @@ pub const ExprFilterOperator = struct {
         var compound = Compound{};
         var parts = std.mem.splitSequence(u8, cond, sep);
         while (parts.next()) |raw| {
-            const part = std.mem.trim(u8, raw, " ");
+            const part = std.mem.trim(u8, raw, whitespace);
             if (part.len == 0) return fail(why, "an AND or OR has nothing on one side");
             if (compound.len >= MAX_COMPOUND) return fail(why, "more than 8 conditions joined by AND or OR");
             compound.items[compound.len] = try parseSingleCondition(part, why);
@@ -275,6 +277,12 @@ pub const ExprFilterOperator = struct {
         const parts = splitOnce(cond, ':') orelse return fail(why, "unknown condition");
         const prefix = parts[0];
         const arg = parts[1];
+        const known = for ([_][]const u8{ "value_contains", "key_contains", "key_equals", "key_prefix", "value_prefix", "min_length" }) |k| {
+            if (std.mem.eql(u8, prefix, k)) break true;
+        } else false;
+        if (!known) return fail(why, "unknown condition");
+        // An empty argument would match every record (every value contains "").
+        if (arg.len == 0) return fail(why, "needs a value after the colon");
         if (std.mem.eql(u8, prefix, "value_contains")) return .{ .value_contains = arg };
         if (std.mem.eql(u8, prefix, "key_contains")) return .{ .key_contains = arg };
         if (std.mem.eql(u8, prefix, "key_equals")) return .{ .key_equals = arg };
@@ -301,6 +309,8 @@ pub const ExprFilterOperator = struct {
 
         const path = expr[0..i];
         const rest = expr[i..];
+        if (std.mem.indexOfAny(u8, path, whitespace) != null) return fail(why, "a json: condition has no spaces around its operator");
+        if (std.mem.indexOfScalar(u8, path, '[') != null) return fail(why, "a json: path can't index an array; use $.a.b");
 
         // Match operators longest-first to avoid ambiguity
         const ops = [_]struct { text: []const u8, op: JsonOp }{
@@ -320,9 +330,12 @@ pub const ExprFilterOperator = struct {
             if (std.mem.startsWith(u8, rest, entry.text)) {
                 const value = rest[entry.text.len..];
                 if (value.len == 0) return fail(why, "a json: condition needs a value after its operator");
+                if (std.mem.indexOfScalar(u8, whitespace, value[0]) != null) return fail(why, "a json: condition has no spaces around its operator");
+                if (value[0] == '=') return fail(why, "a json: condition compares with =, not ==");
+                if (value.len >= 2 and (value[0] == '"' or value[0] == '\'') and value[value.len - 1] == value[0])
+                    return fail(why, "a json: value is written without quotes");
                 switch (entry.op) {
-                    .gt, .gte, .lt, .lte => _ = std.fmt.parseFloat(f64, value) catch
-                        return fail(why, "a json: >, >=, < or <= needs a number"),
+                    .gt, .gte, .lt, .lte => if (!isPlainNumber(value)) return fail(why, "a json: >, >=, < or <= needs a finite decimal number"),
                     else => {},
                 }
                 return .{ .path = path, .op = entry.op, .value = value };
@@ -330,6 +343,17 @@ pub const ExprFilterOperator = struct {
         }
 
         return fail(why, "a json: condition needs an operator (= != ^= *= !^= !*= > >= < <=)");
+    }
+
+    /// A finite decimal number: digits, an optional sign, point and exponent;
+    /// not hex, not `_`-separated, not nan or inf, and not too big for f64.
+    fn isPlainNumber(value: []const u8) bool {
+        for (value) |c| switch (c) {
+            '0'...'9', '-', '+', '.', 'e', 'E' => {},
+            else => return false,
+        };
+        const n = std.fmt.parseFloat(f64, value) catch return false;
+        return std.math.isFinite(n);
     }
 
     /// Split a string on the first occurrence of `sep`. Returns [before, after] or null.
@@ -482,17 +506,45 @@ test "ExprFilterOperator — a condition it doesn't understand is refused, not r
         .{ .cond = "json:amount", .why = "a json: condition needs an operator (= != ^= *= !^= !*= > >= < <=)" },
         .{ .cond = "json:=x", .why = "a json: condition needs a field before its operator" },
         .{ .cond = "json:amount>", .why = "a json: condition needs a value after its operator" },
-        .{ .cond = "json:amount>lots", .why = "a json: >, >=, < or <= needs a number" },
+        .{ .cond = "json:amount>lots", .why = "a json: >, >=, < or <= needs a finite decimal number" },
         .{ .cond = "not_empty AND valeu_contains:x", .why = "unknown condition" },
         .{ .cond = "not_empty OR key_not_empty AND not_empty", .why = "AND and OR can't be mixed in one condition" },
         .{ .cond = "not_empty AND  AND key_not_empty", .why = "an AND or OR has nothing on one side" },
         .{ .cond = "not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty", .why = "more than 8 conditions joined by AND or OR" },
+        .{ .cond = "value_contains:", .why = "needs a value after the colon" },
+        .{ .cond = "value_prefix:", .why = "needs a value after the colon" },
+        .{ .cond = "key_prefix:", .why = "needs a value after the colon" },
+        .{ .cond = "key_contains:", .why = "needs a value after the colon" },
+        .{ .cond = "key_equals:", .why = "needs a value after the colon" },
+        .{ .cond = "min_length:", .why = "needs a value after the colon" },
+        .{ .cond = "json:status = done", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:x >5", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:x> 5", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:status=\"done\"", .why = "a json: value is written without quotes" },
+        .{ .cond = "json:status='done'", .why = "a json: value is written without quotes" },
+        .{ .cond = "json:x==5", .why = "a json: condition compares with =, not ==" },
+        .{ .cond = "json:items[0].id=5", .why = "a json: path can't index an array; use $.a.b" },
+        .{ .cond = "json:x>nan", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x<inf", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>=1e400", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>0x10", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>1_000", .why = "a json: >, >=, < or <= needs a finite decimal number" },
     };
     for (cases) |c| {
         try std.testing.expectError(error.InvalidCondition, ExprFilterOperator.init("bad", c.cond));
         try std.testing.expectEqualStrings(c.why, ExprFilterOperator.check(c.cond).?);
     }
     try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("json:$.amount>=10.5 AND key_prefix:o-"));
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("json:x>-1.5e3"));
+    // A YAML block scalar leaves a newline; tabs and newlines trim like spaces.
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("\tvalue_contains:a\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("not_empty AND key_not_empty\n"));
+}
+
+test "ExprFilterOperator — exactly 8 joined conditions are allowed" {
+    var op = try ExprFilterOperator.init("eight", "value_contains:a OR value_contains:b OR value_contains:c OR value_contains:d OR value_contains:e OR value_contains:f OR value_contains:g OR value_contains:h");
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "h", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "z", 0)));
 }
 
 test "ExprFilterOperator — a JSON condition matches only a present, comparable field" {

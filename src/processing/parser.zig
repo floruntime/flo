@@ -2264,5 +2264,5 @@ test "parser: an operator missing what it needs, or with an unknown mode, is ref
 test "parser: a filter or classify condition the operator can't evaluate is refused at parse" {
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"valeu_contains:x\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"valeu_contains:x\": unknown condition at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"\": the condition is empty at operators[0]");
-    try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"not_empty\", \"tag\": \"a\" }, { \"condition\": \"json:amount>lots\", \"tag\": \"b\" } ] } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"json:amount>lots\": a json: >, >=, < or <= needs a number at operators[0].rules[1]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"not_empty\", \"tag\": \"a\" }, { \"condition\": \"json:amount>lots\", \"tag\": \"b\" } ] } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"json:amount>lots\": a json: >, >=, < or <= needs a finite decimal number at operators[0].rules[1]");
 }

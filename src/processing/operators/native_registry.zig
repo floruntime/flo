@@ -791,3 +791,23 @@ test "NativeOperatorRegistry — classify no rules" {
     const result = create(allocator, &spec, null);
     try std.testing.expectError(CreateError.MissingConfig, result);
 }
+
+test "NativeOperatorRegistry — classify with a bad rule is refused and frees the rules before it" {
+    // The testing allocator fails the test on a leak, so this also pins the
+    // cleanup of the rules already built when a later one is refused.
+    const allocator = std.testing.allocator;
+    const bad_condition = [_]OperatorSpec.ConfigEntry{
+        .{ .key = "condition_0", .value = "value_contains:error" },
+        .{ .key = "tag_0", .value = "0" },
+        .{ .key = "condition_1", .value = "valeu_contains:x" },
+        .{ .key = "tag_1", .value = "1" },
+    };
+    try std.testing.expectError(CreateError.MissingConfig, create(allocator, &.{ .type_name = "classify", .name = "c", .config = &bad_condition }, null));
+
+    const bad_default = [_]OperatorSpec.ConfigEntry{
+        .{ .key = "condition_0", .value = "value_contains:error" },
+        .{ .key = "tag_0", .value = "0" },
+        .{ .key = "default_tag", .value = "not-a-bit" },
+    };
+    try std.testing.expectError(CreateError.MissingConfig, create(allocator, &.{ .type_name = "classify", .name = "c", .config = &bad_default }, null));
+}
