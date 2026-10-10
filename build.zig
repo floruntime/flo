@@ -96,9 +96,16 @@ pub fn build(b: *std.Build) void {
 
     // ── Unit Tests ──
 
+    // Each test root is generated from a walk of its directory, so a file
+    // with tests can't be left out of a hand-kept list and never run.
+    const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filter != null);
+    const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filter != null);
+    const e2e_root = generateTestRoot(b, "tests/e2e", &.{}, test_filter != null);
+    const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filter != null);
+
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test.zig"),
+            .root_source_file = b.path(unit_root.path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -108,12 +115,14 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("src", src_module);
     unit_tests.root_module.addImport("stdx", stdx_module);
     unit_tests.root_module.addOptions("build_options", build_options);
+    unit_tests.root_module.addOptions("test_root", unit_root.options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // stdx is its own module, and module dependencies contribute no tests to
     // a test root — everything in stdx (PRNG, log, helpers) was invisible to
     // the src test runner and had never run. Compile stdx as its own root.
+    stdx_module.addOptions("test_root", stdx_root.options);
     const stdx_tests = b.addTest(.{
         .root_module = stdx_module,
         .filters = if (test_filter) |f| &.{f} else &.{},
@@ -124,7 +133,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/e2e/mod.zig"),
+            .root_source_file = b.path(e2e_root.path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -134,6 +143,7 @@ pub fn build(b: *std.Build) void {
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
     e2e_tests.root_module.addOptions("build_options", build_options);
+    e2e_tests.root_module.addOptions("test_root", e2e_root.options);
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
@@ -142,7 +152,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/integration/mod.zig"),
+            .root_source_file = b.path(integration_root.path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -152,6 +162,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.addImport("src", src_module);
     integration_tests.root_module.addImport("stdx", stdx_module);
     integration_tests.root_module.addOptions("build_options", build_options);
+    integration_tests.root_module.addOptions("test_root", integration_root.options);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
@@ -241,6 +252,113 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&install_docs.step);
 }
 
+// ── Test Roots ──
+
+const TestRoot = struct {
+    /// The generated root, relative to the build root.
+    path: []const u8,
+    /// `declared` (top-level test declarations the walk found) and
+    /// `filtered`, for the root's check that every one of them was compiled.
+    options: *std.Build.Step.Options,
+};
+
+/// Write `<dir>/all_tests.zig`, a test root importing every .zig file under
+/// `dir` (sorted, skipping `skip` subdirectories and build output) that
+/// declares a top-level test, plus a test that fails if fewer tests were
+/// compiled than declared — so a broken walk can't quietly run nothing.
+/// Called at configure time, like the dashboard assets; the file is
+/// gitignored.
+fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filtered: bool) TestRoot {
+    const io = buildIo();
+    const out_name = "all_tests.zig";
+    var root_dir = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |err|
+        std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err });
+    defer root_dir.close(io);
+
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var declared: usize = 0;
+    var walker = root_dir.walkSelectively(b.allocator) catch @panic("out of memory");
+    defer walker.deinit();
+    while (walker.next(io) catch |err| std.debug.panic("cannot walk {s}: {t}", .{ dir, err })) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const name = entry.basename;
+                const skipped = name[0] == '.' or std.mem.eql(u8, name, "zig-out") or
+                    (std.mem.indexOfScalar(u8, entry.path, '/') == null and for (skip) |s| {
+                        if (std.mem.eql(u8, name, s)) break true;
+                    } else false);
+                if (!skipped) walker.enter(io, entry) catch |err|
+                    std.debug.panic("cannot open {s}/{s}: {t}", .{ dir, entry.path, err });
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+                if (std.mem.eql(u8, entry.path, out_name)) continue;
+                const content = root_dir.readFileAlloc(io, entry.path, b.allocator, .unlimited) catch |err|
+                    std.debug.panic("cannot read {s}/{s} to find its tests: {t}", .{ dir, entry.path, err });
+                const n = countTestDecls(content);
+                if (n == 0) continue;
+                declared += n;
+                files.append(b.allocator, b.dupe(entry.path)) catch @panic("out of memory");
+            },
+            else => {},
+        }
+    }
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+
+    var aw: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &aw.writer;
+    w.writeAll(
+        \\// AUTO-GENERATED by build.zig from every file under this directory that
+        \\// declares a test. Do not edit; it is rewritten on every build.
+        \\
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\const test_root = @import("test_root");
+        \\
+        \\test {
+        \\
+    ) catch @panic("out of memory");
+    for (files.items) |f| w.print("    _ = @import(\"{s}\");\n", .{f}) catch @panic("out of memory");
+    w.writeAll(
+        \\}
+        \\
+        \\test "every test declared under this directory is compiled" {
+        \\    if (test_root.filtered) return error.SkipZigTest;
+        \\    try std.testing.expect(builtin.test_functions.len >= test_root.declared);
+        \\}
+        \\
+    ) catch @panic("out of memory");
+
+    var file = root_dir.createFile(io, out_name, .{}) catch |err|
+        std.debug.panic("cannot write {s}/{s}: {t}", .{ dir, out_name, err });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    fw.interface.writeAll(aw.written()) catch |err| std.debug.panic("cannot write {s}/{s}: {t}", .{ dir, out_name, err });
+    fw.interface.flush() catch |err| std.debug.panic("cannot write {s}/{s}: {t}", .{ dir, out_name, err });
+
+    const options = b.addOptions();
+    options.addOption(usize, "declared", declared);
+    options.addOption(bool, "filtered", filtered);
+    return .{ .path = b.fmt("{s}/{s}", .{ dir, out_name }), .options = options };
+}
+
+/// Top-level test declarations in `content`: lines starting `test "` or
+/// `test {`. A test nested in a container isn't counted, so the count is a
+/// lower bound on what the file compiles.
+fn countTestDecls(content: []const u8) usize {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "test \"") or std.mem.startsWith(u8, line, "test {")) n += 1;
+    }
+    return n;
+}
+
 // ── Dashboard Asset Embedding ──
 
 /// Generate a Zig module that embeds all files from src/node/dashboard/dist.
@@ -280,6 +398,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
             \\    _ = path;
             \\    return null;
             \\}
+            \\
         ) catch unreachable;
         writeAssetsFile(aw.written());
         return b.createModule(.{ .root_source_file = b.path("src/node/dashboard/assets.zig") });

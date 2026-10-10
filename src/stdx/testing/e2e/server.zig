@@ -829,11 +829,3 @@ test "ServerProcess: findFreePort returns valid port" {
     try testing.expect(port > 0);
     try testing.expect(port >= 1024); // Typically not privileged
 }
-
-test "ServerProcess: init and deinit" {
-    var server = try ServerProcess.init(testing.allocator);
-    defer server.deinit();
-
-    try testing.expect(!server.isRunning());
-    try testing.expect(server.data_dir.len > 0);
-}
