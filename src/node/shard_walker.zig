@@ -493,7 +493,6 @@ test "ShardWalker: a page filled exactly at a shard's end continues at the next 
     try std.testing.expectEqual(@as(?[]const u8, null), second.next_cursor);
 }
 
-
 /// A scan that ignores its cursor and limit and returns everything.
 fn mockScanAll(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
@@ -525,7 +524,6 @@ test "ShardWalker: a scan returning more than fits resumes by offset, losing not
     }
     for (1..6) |i| try std.testing.expectEqual(@as(usize, 1), seen[i]);
 }
-
 
 /// A scan that stops at its limit and returns no cursor.
 fn mockScanCapped(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
