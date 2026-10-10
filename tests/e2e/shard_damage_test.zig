@@ -70,6 +70,18 @@ test "e2e/damage: a corrupted segment takes its shard offline, and the other sha
     try testing.expect(served > 0);
     try testing.expect(refused > 0);
     try testing.expect(try ctx.serverLogsContain("shard 1 is offline on this node"));
+
+    // A list reads every shard, so it is refused rather than answered
+    // without shard 1's part.
+    for ([_][]const []const u8{ &.{ "kv", "list" }, &.{ "stream", "list" } }) |argv| {
+        var r = try ctx.cli.run(argv);
+        defer r.deinit();
+        const said = std.mem.indexOf(u8, r.stderr, "shard 1 is offline on this node: segment") != null or r.stdoutContains("shard 1 is offline on this node: segment");
+        if (!said or r.stdoutContains("key-")) {
+            std.debug.print("{s} {s} with shard 1 offline:\n  stdout: {s}\n  stderr: {s}\n", .{ argv[0], argv[1], r.stdout, r.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "e2e/damage: a server killed mid-writes restarts with every shard serving" {

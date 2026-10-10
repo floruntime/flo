@@ -298,6 +298,10 @@ pub const Shard = struct {
     /// On a lone node, damage this shard's data holds. The shard answers
     /// every request with it and applies nothing; the other shards serve.
     offline: ?silent_loss.Damage,
+    /// `offline != null`, for other shards' threads. Set after `offline`,
+    /// which never changes once set, so a reader that sees it true may read
+    /// `offline`.
+    offline_published: std.atomic.Value(bool),
     /// Entries and segments lost without anyone being told, by path.
     losses: silent_loss.Counts,
     conflicts_seen: u64,
@@ -843,6 +847,7 @@ pub const Shard = struct {
             .next_forward_id = FORWARD_ID_FIRST,
             .diverged = boot_damage != null and cluster_role != .single,
             .offline = if (cluster_role == .single) boot_damage else null,
+            .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
             .conflicts_seen = 0,
             .join_first_asked_ms = 0,
@@ -1644,6 +1649,13 @@ pub const Shard = struct {
             self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
             return;
         };
+        // A walk reads every shard's projections: one offline would leave
+        // its part missing or half-built in an answer that looks whole.
+        if (self.offlineShard()) |down| {
+            var buf: [320]u8 = undefined;
+            self.sendErrorResponse(conn, req.header.request_id, .unavailable, down.offlineMessage(&buf));
+            return;
+        }
 
         // Drive ShardWalker — sequential shard scan with cursor pagination
         const walker = NameWalker.init(scan_fn, @intCast(contexts.len));
@@ -2724,6 +2736,7 @@ pub const Shard = struct {
         self.losses.note(damage.path, nowMs(), self.id, "{s}", .{damage.reason()});
         if (self.raft_network == null) {
             self.offline = damage;
+            self.offline_published.store(true, .release);
             log.err("shard {d} is offline on this node: {s}. Its requests are refused; the other shards serve. A restart may help if the cause was memory; otherwise the data directory needs repair", .{ self.id, damage.reason() });
             var buf: [320]u8 = undefined;
             self.stopTakingPart(self.offlineMessage(&buf));
@@ -2732,6 +2745,13 @@ pub const Shard = struct {
         self.diverged = true;
         log.err("shard {d}: {s}. This node's copy can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member>", .{ self.id, damage.reason() });
         self.stopTakingPart(DIVERGED_MESSAGE);
+    }
+
+    /// A shard on this node that is offline, if any.
+    fn offlineShard(self: *const Shard) ?*const Shard {
+        const shards = self.peer_shards orelse return if (self.offline != null) self else null;
+        for (shards) |s| if (s.offline_published.load(.acquire)) return s;
+        return null;
     }
 
     /// What an offline shard answers every request with.
@@ -9989,16 +10009,18 @@ test "a committed entry this node cannot read back takes its shard offline, and 
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
-    // Committed past what the log holds: the next index cannot be read.
+    // Committed past what the log holds: the next index cannot be read,
+    // and the loop stops there rather than walking on past it.
     const missing = shard.raft_node.log.lastIndex() + 1;
-    shard.raft_node.commit_index = missing;
+    shard.raft_node.commit_index = missing + 2;
     try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(missing, shard.raft_node.last_applied);
     const damage = shard.offline orelse return error.ShardNotOffline;
     try std.testing.expectEqual(silent_loss.Path.unreadable_committed, damage.path);
     try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.unreadable_committed));
     try std.testing.expect(shard.raft_node.role != .leader);
     // Offline: no further apply is attempted.
-    shard.raft_node.commit_index = missing + 1;
+    shard.raft_node.commit_index = missing + 3;
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expectEqual(missing, shard.raft_node.last_applied);
 
@@ -10013,6 +10035,77 @@ test "a committed entry this node cannot read back takes its shard offline, and 
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), one[0].header.status);
     try std.testing.expect(std.mem.indexOf(u8, one[0].data, "shard 0 is offline on this node: committed entry") != null);
+}
+
+/// A client write whose entry nothing applies, parked as a handler parks
+/// one; its responder would answer ok.
+const UnappliedWrite = struct {
+    fn handle(sh: *anyopaque, c: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(sh));
+        const proposed = shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "") catch @panic("propose failed");
+        shard.park(@ptrCast(@alignCast(c)), req, proposed, answerOk);
+    }
+
+    fn answerOk(sh: *anyopaque, c: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(sh));
+        shard.sendOkResponse(@ptrCast(@alignCast(c)), req.header.request_id, "applied");
+    }
+
+    /// The one answer `conn` got: committed, not applied.
+    fn expectToldNotApplied(sh: *Shard, conn: *Connection, fd: std.posix.fd_t) !void {
+        var one: [1]proto.Response = undefined;
+        var buf: [512]u8 = undefined;
+        try ParkTest.responses(sh, conn, fd, &buf, &one);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+        try std.testing.expectEqualStrings(persistence_mod.COMMITTED_NOT_APPLIED, one[0].data);
+    }
+};
+
+test "a client write whose entry does not apply is told so, whether it commits at once or after a peer's ack" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var pair: [2]std.posix.fd_t = undefined;
+
+    // Alone, the entry commits as it is proposed and applies inside `park`.
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        shard.dispatcher.register(.kv_put, UnappliedWrite.handle);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        try ParkTest.send(&shard, conn, .kv_put, 1, "k", "v");
+        try UnappliedWrite.expectToldNotApplied(&shard, conn, pair[1]);
+        try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
+    }
+
+    // With a peer, it waits for the ack and is answered as it applies.
+    {
+        var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        defer rn.deinit();
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        defer shard.deinit();
+        shard.raft_network = &rn;
+        shard.wireHandlerShardPtrs();
+        try ParkTest.joinPeer(&shard);
+        shard.dispatcher.register(.kv_put, UnappliedWrite.handle);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        try ParkTest.send(&shard, conn, .kv_put, 2, "k", "v");
+        try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+        const r = shard.raft_node;
+        const last = r.log.lastIndex();
+        r.peers[0].sent_up_to = last;
+        r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = 2 });
+        try std.testing.expect(!shard.applyCommitted());
+        try UnappliedWrite.expectToldNotApplied(&shard, conn, pair[1]);
+        try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
+    }
 }
 
 test "an entry that cannot apply at boot is counted, and replay carries on past it" {

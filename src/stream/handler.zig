@@ -1745,7 +1745,10 @@ pub const StreamHandler = struct {
                 // A name that cannot be qualified is not listed rather than
                 // listed bare, where it could pass for another namespace's.
                 if (ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key)) |ns_name| {
-                    self.stream.registerStream(ns_name) catch {};
+                    self.stream.registerStream(ns_name) catch |err| {
+                        log.err("stream '{s}': name not registered, so lists miss it: {s}", .{ cmd.key, @errorName(err) });
+                        return .failed;
+                    };
                 } else |_| {}
             }
             return if (self.last_append == null) .failed else .applied;
@@ -2588,6 +2591,31 @@ test "stream handler: partition_index survives restart/replay" {
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 0));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 1));
     try testing.expectEqual(@as(u32, 1), try readPartitionCount(&handler, "s1", 2));
+}
+
+test "stream handler: an append that runs out of memory fails, rather than apply unlisted" {
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var partition = try Partition.init(fa.allocator(), 0, 4096, 0);
+        defer partition.deinit();
+        partition.wireProjections();
+        var handler = StreamHandler.init(fa.allocator(), &partition);
+        defer handler.deinit();
+        var vbuf: [64]u8 = undefined;
+        _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbuf, "a"), ""));
+        const entry = partition.ual.read(1) orelse return error.EntryMissing;
+
+        // Replayed from scratch, each allocation failed in turn.
+        handler.stream.reset();
+        fa.fail_index = fa.alloc_index + fail_at;
+        const outcome = StreamHandler.replayEntry(&handler, &entry);
+        if (outcome == .applied) try testing.expect(handler.stream.stream_names.contains("s1"));
+        if (!fa.has_induced_failure) {
+            try testing.expectEqual(persistence_mod.ApplyOutcome.applied, outcome);
+            break;
+        }
+    }
 }
 
 test "stream handler: delete removes one stream, leaves siblings + --force gating" {

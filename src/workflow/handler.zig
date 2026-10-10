@@ -3889,7 +3889,14 @@ pub const WorkflowHandler = struct {
             self.allocator.free(ns_key);
             return .failed;
         };
-        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch null else null;
+        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch {
+            self.allocator.free(run.run_id_owned);
+            self.allocator.free(run.workflow_name_owned);
+            self.allocator.free(run.workflow_version_owned);
+            self.allocator.free(run.input_owned);
+            self.allocator.free(ns_key);
+            return .failed;
+        } else null;
         // The run's first history event, as the start path recorded it.
         if (event_type.len > 0) self.addHistoryEvent(&run, event_type, input, created_at_ms);
         if (idem) |k| {
@@ -4308,6 +4315,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.metrics_registry = null;
     shard.shard_metrics = null;
     shard.offline = null;
+    shard.offline_published = .init(false);
     shard.losses = .{};
     const raft_node = try std.testing.allocator.create(RaftNode);
     // Room for an entry at the payload limit, which a 64 KiB ring can't hold.
@@ -5059,6 +5067,30 @@ test "list-runs query: a length that overruns the value is refused" {
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }) == null);
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 }) == null);
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 'a', 'b' }) == null);
+}
+
+test "workflow replay: a start that runs out of memory fails and creates nothing, and one that applies keeps its idempotency key" {
+    // [wf_len][wf][ver_len][ver][status][evt_len][idem_len][idem]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1, 0, 0, 3, 0, 'k', 'e', 'y' };
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var handler = WorkflowHandler.init(fa.allocator());
+        defer handler.deinit();
+        // Room for the run up front: a failed copy must not be masked by
+        // the map's insert failing after it.
+        try handler.runs.ensureTotalCapacity(1);
+        fa.fail_index = fa.alloc_index + fail_at;
+        const outcome = handler.replayStart("default:r1", &start, 1);
+        if (outcome == .failed) {
+            try testing.expect(fa.has_induced_failure);
+            try testing.expectEqual(@as(usize, 0), handler.runCount());
+            continue;
+        }
+        const run = handler.runs.get("default:r1") orelse return error.RunMissing;
+        try testing.expectEqualStrings("key", run.idempotency_key_owned orelse return error.IdempotencyKeyLost);
+        if (!fa.has_induced_failure) break;
+    }
 }
 
 test "workflow replay: an unknown status, or a complete entry without its output flag, is skipped" {
