@@ -130,6 +130,10 @@ pub const UAL = struct {
     pub fn append(self: *UAL, entry: *const Entry) !u64 {
         const total_size = entry.totalSize();
         if (total_size > self.capacity) return error.EntryTooLarge;
+        // The index map's room first: an allocation that fails after the
+        // ring was written would leave bytes the map does not know of.
+        // Failing here, nothing has changed.
+        try self.index_map.ensureUnusedCapacity(self.allocator, 1);
 
         // Evict until there's room
         while (self.available() < total_size) {
@@ -149,7 +153,7 @@ pub const UAL = struct {
         }
 
         // Record in index map
-        try self.index_map.put(self.allocator, entry.header.index, pos);
+        self.index_map.putAssumeCapacity(entry.header.index, pos);
 
         self.entry_count += 1;
         self.total_appended += 1;
@@ -736,4 +740,29 @@ test "UAL: truncateAfter at or above the tip is a no-op" {
     ual.truncateAfter(9);
     try testing.expectEqual(used_before, ual.used());
     try testing.expectEqual(@as(u64, 1), ual.entry_count);
+}
+
+test "UAL: an append whose index-map allocation fails leaves the ring as it was" {
+    // The ring buffer is the first allocation; the map's grow comes later.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var ual = try UAL.init(failing.allocator(), 4096, 0);
+    defer ual.deinit();
+    var appended: u64 = 0;
+    var i: u64 = 1;
+    while (i < 200) : (i += 1) {
+        var e = makeEntry(i, "payload");
+        const used_before = ual.used();
+        _ = ual.append(&e) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            // Not a byte of it was written.
+            try testing.expectEqual(used_before, ual.used());
+            break;
+        };
+        appended += 1;
+    }
+    try testing.expect(i < 200);
+    // What is there reads back, and the refused entry is not there.
+    try testing.expectEqual(@as(u64, ual.index_map.count()), ual.entry_count);
+    try testing.expect(ual.readHeader(i) == null);
+    try testing.expect(ual.readHeader(appended) != null);
 }

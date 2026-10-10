@@ -57,6 +57,7 @@ const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
+const silent_loss = @import("silent_loss.zig");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
 const stream_proj_mod = @import("../projection/stream.zig");
@@ -291,9 +292,14 @@ pub const Shard = struct {
     replies_held: u32,
     next_forward_id: u32,
     /// The leader disagreed with history this node had committed and
-    /// applied: its projections cannot be trusted, so it takes no part
-    /// until it is wiped and rejoined.
+    /// applied, or its own data is damaged: its projections cannot be
+    /// trusted, so it takes no part until it is wiped and rejoined.
     diverged: bool,
+    /// On a lone node, damage this shard's data holds. The shard answers
+    /// every request with it and applies nothing; the other shards serve.
+    offline: ?silent_loss.Damage,
+    /// Entries and segments lost without anyone being told, by path.
+    losses: silent_loss.Counts,
     conflicts_seen: u64,
     join_first_asked_ms: u64,
     join_warned_ms: u64,
@@ -567,6 +573,11 @@ pub const Shard = struct {
         var hard_state_store: ?*HardStateStore = null;
         // A node with no data dir has no hard state to lose.
         var had_hard_state = true;
+        // What boot found: losses counted along the way, and damage that
+        // stopped replay (that shard then serves nothing on a lone node, or
+        // takes no part in its group).
+        var losses: silent_loss.Counts = .{};
+        var boot_damage: ?silent_loss.Damage = null;
         errdefer if (hard_state_store) |store| allocator.destroy(store);
         var durable_log: ?*DurableLog = null;
         errdefer if (durable_log) |dl| {
@@ -587,7 +598,7 @@ pub const Shard = struct {
         actions_handler.registerReplay(&replay_registry);
         processing_handler.registerReplay(&replay_registry);
         stream_handler.registerReplay(&replay_registry);
-        try assertOneApplier(shard_id, &replay_registry);
+        try checkAppliers(shard_id, &replay_registry);
 
         const apply_buf = try allocator.alloc(u8, kv_handler_mod.MAX_APPLY_PAYLOAD);
         errdefer allocator.free(apply_buf);
@@ -651,6 +662,8 @@ pub const Shard = struct {
             //   - cold_segments: what's been archived to object storage
             var replay_from: u64 = 0;
 
+            // A MANIFEST or snapshot that will not load is damage: a full
+            // replay would land on whatever the snapshot half-restored.
             if (ShardManifest.load(allocator, shard_dir)) |maybe_sm| {
                 if (maybe_sm) |sm_val| {
                     var sm = sm_val;
@@ -658,21 +671,11 @@ pub const Shard = struct {
 
                     // Step 1: Load snapshot if referenced
                     if (sm.latest_snapshot) |snap_name| {
-                        if (@import("stdx").fs.openDir(snaps_dir_path, .{})) |snap_dir_handle| {
-                            const snap_dir = snap_dir_handle;
-                            defer @import("stdx").fs.closeDir(snap_dir);
-
-                            if (snapshot_mod.loadSnapshotByName(allocator, snap_dir, snap_name)) |maybe_snap| {
-                                if (maybe_snap) |snap| {
-                                    defer allocator.free(snap.data);
-                                    if (partition.recover(snap.data)) |snap_index| {
-                                        replay_from = snap_index;
-                                    } else |_| {
-                                        replay_from = 0;
-                                    }
-                                }
-                            } else |_| {}
-                        } else |_| {}
+                        if (restoreSnapshot(allocator, snaps_dir_path, snap_name, partition)) |snap_index| {
+                            replay_from = snap_index;
+                        } else |err| {
+                            boot_damage = silent_loss.Damage.init(.snapshot_unloadable, "snapshot {s} would not load ({s})", .{ snap_name, @errorName(err) });
+                        }
                     }
 
                     // Step 2: Load cold segment entries into partition
@@ -690,8 +693,8 @@ pub const Shard = struct {
                         }
                     }
                 }
-            } else |_| {
-                // MANIFEST load failed — fall back to full replay
+            } else |err| {
+                boot_damage = silent_loss.Damage.init(.snapshot_unloadable, "MANIFEST would not load ({s})", .{@errorName(err)});
             }
 
             // Replay existing segment files from segs/ into partition.
@@ -702,12 +705,26 @@ pub const Shard = struct {
             // Only entries at or below the segments' commit watermark reach
             // the projections; the rest is loaded into the log and drained
             // by `applyDeferredTail` (see `SegmentHeader.commit_index_at_seal`).
-            try durable_log.?.recoverTruncation();
-            const watermark = try durable_log.?.watermark();
-            try replaySegments(allocator, durable_log.?, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id);
-            // A snapshot covers its prefix already; draining from below it
-            // would apply those entries a second time.
-            raft_node.last_applied = @max(replay_from, @min(watermark, raft_node.log.lastIndex()));
+            //
+            // A `.flseg.tmp` is a flush a crash cut short: the normal torn
+            // tail, never part of the log. Any `.flseg` that will not read
+            // is damage, and replay stops there.
+            _ = durable_log.?.removeTornTail() catch |err| log.warn("shard {d}: could not remove a torn segment flush: {s}", .{ shard_id, @errorName(err) });
+            var watermark: u64 = 0;
+            if (boot_damage == null) {
+                const log_files = durable_log.?;
+                if (listDurable(log_files)) |files| {
+                    for (files) |f| watermark = @max(watermark, f.commit_index_at_seal);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id, &losses);
+                    boot_damage = replayed.damage;
+                    // A snapshot covers its prefix already; draining from
+                    // below it would apply those entries a second time.
+                    raft_node.last_applied = @max(replay_from, replayed.applied_through);
+                } else |err| {
+                    if (log_files.badHeaderSegment().len == 0) return err;
+                    boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
+                }
+            }
             if (watermark == 0 and !raft_node.log.isEmpty()) {
                 log.warn("shard {d}: no segment carries a commit watermark; everything above the snapshot is applied at boot through the log instead of replay", .{shard_id});
             }
@@ -744,7 +761,16 @@ pub const Shard = struct {
             raft_node.log.on_truncate_ctx = @ptrCast(dl);
             raft_node.log.on_truncate = durableTruncate;
         }
-        try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id, had_hard_state);
+        if (boot_damage) |*damage| {
+            losses.note(damage.path, nowMs(), shard_id, "{s}", .{damage.reason()});
+            if (cluster_role == .single) {
+                log.err("shard {d} is offline on this node: {s}. Its requests are refused; the other shards serve. A restart may help if the cause was memory; otherwise the data directory needs repair", .{ shard_id, damage.reason() });
+            } else {
+                log.err("shard {d}: {s}. This node's copy can no longer be trusted and it takes no part in the group. Stop it, move its data directory aside, and start it again with --join <a live member>", .{ shard_id, damage.reason() });
+            }
+        } else {
+            try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id, had_hard_state);
+        }
 
         // Build dispatcher and register all handlers
         var dispatcher = Dispatcher.init();
@@ -815,7 +841,9 @@ pub const Shard = struct {
             .forward_count = 0,
             .replies_held = 0,
             .next_forward_id = FORWARD_ID_FIRST,
-            .diverged = false,
+            .diverged = boot_damage != null and cluster_role != .single,
+            .offline = if (cluster_role == .single) boot_damage else null,
+            .losses = losses,
             .conflicts_seen = 0,
             .join_first_asked_ms = 0,
             .join_warned_ms = 0,
@@ -1406,8 +1434,14 @@ pub const Shard = struct {
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
     fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request) void {
-        if (self.removed_at_ms != null and req.header.op_code != @intFromEnum(proto.OpCode.cluster_status) and req.header.op_code != @intFromEnum(proto.OpCode.cluster_members)) {
+        const status_op = req.header.op_code == @intFromEnum(proto.OpCode.cluster_status) or req.header.op_code == @intFromEnum(proto.OpCode.cluster_members);
+        if (self.removed_at_ms != null and !status_op) {
             self.sendErrorResponse(conn, req.header.request_id, .unavailable, self.removed_message);
+            return;
+        }
+        if (self.offline != null and !status_op) {
+            var buf: [320]u8 = undefined;
+            self.sendErrorResponse(conn, req.header.request_id, .unavailable, self.offlineMessage(&buf));
             return;
         }
         if (self.raft_network != null and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and (self.diverged or self.raft_node.role != .leader)) {
@@ -2678,13 +2712,44 @@ pub const Shard = struct {
         if (self.diverged) return;
         self.diverged = true;
         log.err("shard {d}: node {d} (term {d}) disagrees with history this node committed and applied; this node's data can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member> (not --cluster): it rejoins with no log and votes only once it has caught up and a quorum has confirmed the term", .{ self.id, leader, term });
-        // Only a member that broke one-leader-per-term reaches this on a
-        // leader; still, a diverged node leads nothing.
+        self.stopTakingPart(DIVERGED_MESSAGE);
+    }
+
+    /// This node's own data is damaged: the projections are missing what
+    /// `damage` names and cannot be rebuilt here. On a lone node the shard
+    /// goes offline and the others serve; a member stops taking part in
+    /// its group, as a diverged one does.
+    fn damaged(self: *Shard, damage: silent_loss.Damage) void {
+        if (self.offline != null or self.diverged) return;
+        self.losses.note(damage.path, nowMs(), self.id, "{s}", .{damage.reason()});
+        if (self.raft_network == null) {
+            self.offline = damage;
+            log.err("shard {d} is offline on this node: {s}. Its requests are refused; the other shards serve. A restart may help if the cause was memory; otherwise the data directory needs repair", .{ self.id, damage.reason() });
+            var buf: [320]u8 = undefined;
+            self.stopTakingPart(self.offlineMessage(&buf));
+            return;
+        }
+        self.diverged = true;
+        log.err("shard {d}: {s}. This node's copy can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member>", .{ self.id, damage.reason() });
+        self.stopTakingPart(DIVERGED_MESSAGE);
+    }
+
+    /// What an offline shard answers every request with.
+    fn offlineMessage(self: *const Shard, buf: []u8) []const u8 {
+        const damage = &(self.offline orelse return "unavailable: shard is offline on this node");
+        return std.fmt.bufPrint(buf, "unavailable: shard {d} is offline on this node: {s}; a restart may help if the cause was memory", .{ self.id, damage.reason() }) catch "unavailable: shard is offline on this node";
+    }
+
+    /// Lead nothing, and answer what was in flight with `message`.
+    fn stopTakingPart(self: *Shard, message: []const u8) void {
+        // A diverged member is rarely the leader (only one that broke
+        // one-leader-per-term); a damaged lone node is. Either way it
+        // leads nothing now.
         if (self.raft_node.role == .leader) {
             self.raft_node.role = .follower;
             self.raft_node.leader_id = 0;
         }
-        self.stoppedLeading(DIVERGED_MESSAGE);
+        self.stoppedLeading(message);
         // An answer already held is the leader's, and the write it
         // answers committed; the client gets it.
         for (self.forwards) |*f| {
@@ -2693,7 +2758,7 @@ pub const Shard = struct {
                 self.deliverDeferred(f.reply_to, reply);
                 self.dropForward(f);
             } else {
-                self.finishForward(f, .unavailable, DIVERGED_MESSAGE);
+                self.finishForward(f, .unavailable, message);
             }
         }
     }
@@ -3003,8 +3068,13 @@ pub const Shard = struct {
     /// core (`applyEntryCoreWith`), so the three can never disagree about
     /// what an entry means; only the live paths notify. False when the
     /// partition refused the entry.
+    /// Apply one committed entry and tell its waiters. False, counted and
+    /// logged, when the projections are missing it; its client, if any, is
+    /// told the write committed but did not apply.
     pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry) bool {
-        if (!applyEntryCore(self.defaultPartition(), &self.replay_registry, entry)) return false;
+        const result = applyEntryCore(self.defaultPartition(), &self.replay_registry, entry);
+        noteApply(&self.losses, self.id, nowMs(), entry, result);
+        if (result != .applied) return false;
         self.notifyApplied(entry);
         return true;
     }
@@ -3031,7 +3101,9 @@ pub const Shard = struct {
 
     /// `applyCommitted`, stopping after index `limit`.
     fn applyThrough(self: *Shard, limit: u64) bool {
-        if (self.applying) return true;
+        // An offline shard's projections are missing an entry: nothing
+        // after it may apply over the hole.
+        if (self.applying or self.offline != null) return true;
         // With sync durability a leader's writes commit only once on disk:
         // flushing first lets what that commits apply now.
         self.syncFlushIfNeeded();
@@ -3042,7 +3114,7 @@ pub const Shard = struct {
 
         const raft = self.raft_node;
         var all_applied = true;
-        while (true) {
+        drain: while (true) {
             while (raft.last_applied < @min(raft.commit_index, limit)) {
                 const next_idx = raft.last_applied + 1;
                 // Advanced before the apply: whatever a notification does, this
@@ -3059,10 +3131,11 @@ pub const Shard = struct {
                     self.answerPending(next_idx, 0, 0, false);
                     // A committed index is always within the log, in the ring
                     // or below it in the durable log, and the buffer fits every
-                    // entry; an unreadable one is a bug or a damaged segment.
-                    // Said out loud, because the write was already acked.
-                    log.err("shard {d}: committed entry index={d} could not be read for apply; projections are missing it", .{ self.id, next_idx });
+                    // entry; an unreadable one is a bug or a damaged segment,
+                    // and nothing after it may apply over the hole.
+                    self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read back to apply", .{next_idx}));
                     all_applied = false;
+                    break :drain;
                 }
             }
             // Applying can propose (a workflow's next step); flushing that
@@ -3204,6 +3277,7 @@ pub const Shard = struct {
         self.drainRaftQueue();
         self.tickRaft();
         self.reportStampSkew();
+        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.offline != null);
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
@@ -3215,7 +3289,7 @@ pub const Shard = struct {
         // Drive processing pipelines (poll sources → write sinks)
         // Producers run only where this shard leads: a follower that also
         // proposed would write the same facts twice, in two logs.
-        const leads = self.raft_node.role == .leader;
+        const leads = self.raft_node.role == .leader and self.offline == null;
         if (leads) self.processing_handler.tickPipelines(self);
 
         // Drive workflow stream triggers (poll streams → start runs)
@@ -4981,6 +5055,7 @@ pub const RAFT_RING_MIN: usize = 2 * 1024 * 1024;
 
 comptime {
     std.debug.assert(@import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE <= RAFT_RING_MIN);
+    std.debug.assert(@import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE <= @import("../config/tiered_log.zig").MIN_HOT_BUFFER);
 }
 
 /// How a shard's Raft group comes up.
@@ -5155,9 +5230,9 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
 
 /// The config entry committed: what it names is the membership a
 /// truncation falls back to.
-fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
     const raft: *RaftNode = @ptrCast(@alignCast(ctx));
-    const cfg = membership.decode(entry.payload) orelse return;
+    const cfg = membership.decode(entry.payload) orelse return .failed;
     raft.commitMembership(&cfg);
     // At boot, replay applies the committed configs before the group comes
     // up: a node that lost its hard state checks the committed set even
@@ -5166,56 +5241,127 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     var voters: [membership.MAX_MEMBERS]u32 = undefined;
     log.info("Raft: membership committed: {any}, voters {any} (config index {d})", .{ cfg.ids(&ids), cfg.voterIds(&voters), entry.header.index });
+    return .applied;
 }
 
 pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
     return @max(RAFT_RING_MIN, @min(hot_buffer_capacity / 4, RAFT_RING_MAX));
 }
 
-/// The one apply path: the partition (hot ring plus the projections the
-/// router owns — KV, queue, TS) and then the registry appliers for every
-/// other entry type. Returns false when the entry could not enter the ring,
-/// in which case nothing else sees it either.
-pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry) bool {
-    _ = partition.apply(entry) catch |err| {
-        log.err("shard {d}: entry index={d} type={s} rejected by the partition: {s}; projections are missing it", .{ partition.id, entry.header.index, @tagName(@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type))), @errorName(err) });
-        return false;
-    };
-    _ = registry.dispatch(entry);
-    return true;
+/// What `applyEntryCore` made of an entry. Anything but `applied` is an
+/// entry the projections are missing, counted on its own path.
+pub const ApplyResult = union(enum) {
+    applied,
+    /// The partition refused it; nothing else saw it.
+    partition_reject: anyerror,
+    /// The projection the router owns failed to apply it.
+    router_error,
+    /// Its registry applier could not apply it.
+    applier_failed,
+    /// No applier owns its type.
+    no_applier,
+};
+
+/// Entry types with nothing to apply: the term's no-op.
+const APPLIES_NOTHING = [_]entry_mod.EntryType{.raft_noop};
+/// Entry types nothing writes today. One that arrives anyway is counted as
+/// having no applier.
+const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot, .checkpoint };
+
+fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
+    return std.mem.indexOfScalar(entry_mod.EntryType, list, etype) != null;
 }
 
-/// Every entry type has exactly one applier: the projection router or a
-/// registry callback, never both. Two appliers is how a replayed entry gets
-/// inserted twice.
-fn assertOneApplier(shard_id: u16, registry: *const ReplayRegistry) !void {
+fn routedToProjection(etype: entry_mod.EntryType) bool {
+    return switch (projection_router.routeTarget(etype)) {
+        .kv, .queue, .ts => true,
+        .none, .snapshot => false,
+    };
+}
+
+/// The one apply path: the partition (hot ring plus the projections the
+/// router owns — KV, queue, TS) and then the registry appliers for every
+/// other entry type.
+pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry) ApplyResult {
+    const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+    const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
+    if (routedToProjection(etype)) return if (applied.route == .apply_error) .router_error else .applied;
+    const outcome = registry.dispatch(entry) orelse return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
+    return if (outcome == .failed) .applier_failed else .applied;
+}
+
+/// Count and say why an entry did not apply. Its applier, where it had one,
+/// has said what went wrong with the entry itself.
+fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *const entry_mod.Entry, result: ApplyResult) void {
+    const type_name = @tagName(@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type)));
+    const index = entry.header.index;
+    switch (result) {
+        .applied => {},
+        .partition_reject => |err| counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
+        .router_error => counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection; the projection is missing it", .{ index, type_name }),
+        .applier_failed => counts.note(.applier_failed, now_ms, shard_id, "entry index={d} type={s} could not be applied; its state is missing it", .{ index, type_name }),
+        .no_applier => counts.note(.no_applier, now_ms, shard_id, "entry index={d} type={s} has no applier on this build", .{ index, type_name }),
+    }
+}
+
+/// Every entry type has exactly one applier, the projection router or one
+/// registry callback, or is listed as needing none. Two appliers is how a
+/// replayed entry gets inserted twice; none, how it is dropped; a second
+/// registration, how one handler's applier never runs. Each is a bug in
+/// this build, not in the data directory.
+fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
+    if (registry.duplicate) |etype| {
+        log.err("shard {d}: entry type {s} was registered twice; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, @tagName(etype) });
+        return error.EntryTypeRegisteredTwice;
+    }
     inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
         const etype: entry_mod.EntryType = @enumFromInt(f.value);
-        const routed = switch (projection_router.routeTarget(etype)) {
-            .kv, .queue, .ts => true,
-            .none, .snapshot => false,
-        };
+        const routed = routedToProjection(etype);
         if (routed and registry.has(etype)) {
             log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
             return error.EntryTypeHasTwoAppliers;
         }
+        if (!routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
+            log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            return error.EntryTypeHasNoApplier;
+        }
     }
 }
 
+/// The sealed segments, after finishing any truncation a crash left
+/// half done. Fails on a segment whose header will not read; the log names
+/// it (`DurableLog.badHeaderSegment`).
+fn listDurable(dl: *DurableLog) ![]const durable_log_mod.SegmentFile {
+    try dl.recoverTruncation();
+    return dl.segments();
+}
+
+/// Restore the projections from snapshot `name` in `snaps_dir_path`.
+/// Returns the index it covers.
+fn restoreSnapshot(allocator: std.mem.Allocator, snaps_dir_path: []const u8, name: []const u8, partition: *Partition) !u64 {
+    const snap_dir = try @import("stdx").fs.openDir(snaps_dir_path, .{});
+    defer @import("stdx").fs.closeDir(snap_dir);
+    const snap = (try snapshot_mod.loadSnapshotByName(allocator, snap_dir, name)) orelse return error.SnapshotMissing;
+    defer allocator.free(snap.data);
+    return partition.recover(snap.data);
+}
+
 /// Feed a durable entry back into the Raft log at boot: the last index, the
-/// term index and the hot-ring tail all come from this pass. A hole in the
-/// durable history (an index no segment holds) is logged and the log
-/// restarts after it as if the prefix were compacted — nothing this node
-/// holds is lost, but no follower can be repaired from below the hole.
-fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) void {
+/// term index and the hot-ring tail all come from this pass. A hole below
+/// a snapshot is its compacted prefix, and the log continues past it. Any
+/// other hole is damage: an entry this node committed is gone.
+fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry, replay_from: u64) ?silent_loss.Damage {
     _ = raft_log.append(e) catch |err| switch (err) {
         error.IndexGap => {
             const tip = raft_log.lastIndex();
             if (e.header.index <= tip) {
                 log.err("shard {d}: segments hold index {d} twice (log tip {d}); the later copy is ignored", .{ shard_id, e.header.index, tip });
-                return;
+                return null;
             }
-            log.warn("shard {d}: no segment holds indices {d}..{d}; treating the prefix as compacted (recurs on every boot of this data dir)", .{ shard_id, tip + 1, e.header.index - 1 });
+            if (e.header.index - 1 > replay_from) {
+                return silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 });
+            }
+            log.info("shard {d}: no segment holds indices {d}..{d}, below the snapshot at {d}; the log continues from it", .{ shard_id, tip + 1, e.header.index - 1, replay_from });
             raft_log.resetToSnapshot(e.header.index - 1, raft_log.lastTerm());
             _ = raft_log.append(e) catch |again| {
                 log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(again) });
@@ -5223,35 +5369,47 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
         },
         else => log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) }),
     };
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Segment Replay — recover state from .flseg files on startup
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// What boot replay did: the last index it applied, and the damage it
+/// stopped at, if any.
+const ReplayOutcome = struct {
+    applied_through: u64 = 0,
+    damage: ?silent_loss.Damage = null,
+};
+
 /// Replay all .flseg segment files in `dir_path`: every entry is restored
 /// into the Raft log and applied through `applyEntryCore`, exactly as when
-/// it was first committed.
+/// it was first committed. Replay stops at the first damage: what follows
+/// it would apply over a hole.
 ///
 /// If `replay_from` > 0, entries with index <= replay_from are skipped
 /// (already restored from a snapshot). Entries above `watermark` are
 /// restored into the Raft log but not applied.
 fn replaySegments(
     allocator: std.mem.Allocator,
-    durable_log: *DurableLog,
+    files: []const durable_log_mod.SegmentFile,
     partition: *Partition,
     replay_registry: *const ReplayRegistry,
     replay_from: u64,
     watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
-) !void {
+    losses: *silent_loss.Counts,
+) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
     // guard does not skip lower-index entries.
-    const files = try durable_log.segments();
+    var out: ReplayOutcome = .{};
     for (files) |sf| {
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id);
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id, losses, &out);
+        if (out.damage != null) break;
     }
+    return out;
 }
 
 fn replaySegmentFile(
@@ -5263,25 +5421,42 @@ fn replaySegmentFile(
     watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
+    losses: *silent_loss.Counts,
+    out: *ReplayOutcome,
 ) void {
-    const result = SegmentReader.initFromFile(allocator, full_path) catch return;
-    defer allocator.free(result.buf);
+    const name = std.fs.path.basename(full_path);
+    // Sealed segments are written whole and renamed into place, so one
+    // that will not open, or fails its checksum, is damage, never a crash.
+    const opened = SegmentReader.initFromFile(allocator, full_path) catch |err| {
+        out.damage = silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+        return;
+    };
+    defer allocator.free(opened.buf);
 
     var offset: usize = 0;
-    const data_len = result.reader.data_end - result.reader.data_start;
+    const data_len = opened.reader.data_end - opened.reader.data_start;
     while (offset < data_len) {
-        const seg_entry = result.reader.readEntryAt(offset) orelse break;
+        // The checksum held, so an entry that will not parse was written
+        // that way: a writer or format bug.
+        const seg_entry = opened.reader.readEntryAt(offset) orelse {
+            out.damage = silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} that will not parse", .{ name, offset });
+            return;
+        };
         offset += seg_entry.totalSize();
 
         // Every durable entry is part of the Raft log, snapshot or not.
-        restoreRaftEntry(shard_id, raft_log, &seg_entry);
+        if (restoreRaftEntry(shard_id, raft_log, &seg_entry, replay_from)) |damage| {
+            out.damage = damage;
+            return;
+        }
 
         // Skip entries already covered by snapshot
         if (replay_from > 0 and seg_entry.header.index <= replay_from) continue;
         // Above the watermark: in the log, not yet in the projections.
         if (seg_entry.header.index > watermark) continue;
 
-        _ = applyEntryCore(partition, replay_registry, &seg_entry);
+        noteApply(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry));
+        out.applied_through = seg_entry.header.index;
     }
 }
 
@@ -8428,16 +8603,35 @@ test "the Raft ring floor holds the largest transaction batch" {
     try std.testing.expectEqual(@as(u64, 1), try log_inst.append(&e));
 }
 
-test "assertOneApplier refuses a registry callback for a router-owned type" {
+test "every entry type has exactly one applier, or is listed as needing none, or the shard refuses to start" {
     const Noop = struct {
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry) void {}
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+            return .applied;
+        }
     };
-    var registry: ReplayRegistry = .{};
     var ctx: u8 = 0;
-    registry.register(.stream_append, @ptrCast(&ctx), Noop.apply);
-    try assertOneApplier(0, &registry);
-    registry.register(.ts_write, @ptrCast(&ctx), Noop.apply);
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, assertOneApplier(0, &registry));
+    // Every type the router does not own and no list excuses.
+    var full: ReplayRegistry = .{};
+    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
+        const t: entry_mod.EntryType = @enumFromInt(f.value);
+        if (!routedToProjection(t) and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
+    }
+    try checkAppliers(0, &full);
+
+    // One of them missing: dropped at apply, so refused at boot.
+    var missing = full;
+    missing.callbacks[@intFromEnum(entry_mod.EntryType.stream_trim)] = null;
+    try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
+
+    // Registered twice: one handler's applier would never run.
+    var twice = full;
+    twice.register(.stream_trim, @ptrCast(&ctx), Noop.apply);
+    try std.testing.expectError(error.EntryTypeRegisteredTwice, checkAppliers(0, &twice));
+
+    // A router-owned type with a callback as well: applied twice.
+    var both = full;
+    both.register(.ts_write, @ptrCast(&ctx), Noop.apply);
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliers(0, &both));
 }
 
 test "applyCommitted: an applier that proposes does not re-enter the drain" {
@@ -8456,13 +8650,14 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
         var last_applied_seen: u64 = 0;
         var nested_saw_kv: bool = false;
         var calls: u32 = 0;
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry) void {
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
             calls += 1;
             const shard_inner = shard_ptr;
             last_applied_seen = shard_inner.raft_node.last_applied;
             _ = persistence_mod.proposeEntry(shard_inner, .kv_put, entry_mod.Flags.NONE, "", "nested", "v") catch unreachable;
             _ = shard_inner.applyCommitted();
             nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
+            return .applied;
         }
     };
     Probe.shard_ptr = &shard;
@@ -9570,4 +9765,285 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard), 0));
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expectEqual(@as(u64, 1), stream.streamLogicalCount(h));
+}
+
+// ── Silent loss and damage ──────────────────────────────────────────────
+
+/// A lone shard's data directory holding one sealed segment per queue
+/// enqueue, for the boot damage tests.
+const DamageTest = struct {
+    tmp: std.testing.TmpDir,
+    data_dir: []const u8,
+    segs: []const u8,
+    pipe_fds: [2]i32,
+
+    const ENQUEUES = 4;
+
+    fn init(self: *DamageTest) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        self.data_dir = try testDataDir(&self.tmp);
+        self.segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{self.data_dir});
+        self.pipe_fds = try @import("stdx").io.pipe();
+        var shard = try self.open();
+        defer shard.deinit();
+        for (0..ENQUEUES) |i| {
+            _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' + @as(u8, @intCast(i)) });
+            try std.testing.expect(shard.applyCommitted());
+            try shard.flushSegmentToDisk();
+        }
+    }
+
+    fn deinit(self: *DamageTest) void {
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.segs);
+        std.testing.allocator.free(self.data_dir);
+        self.tmp.cleanup();
+    }
+
+    fn open(self: *DamageTest) !Shard {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+        shard.wireHandlerShardPtrs();
+        return shard;
+    }
+
+    /// The path of the `n`th sealed segment, in index order (names sort so).
+    fn segment(self: *DamageTest, n: usize, buf: []u8) ![]const u8 {
+        var names: [16][64]u8 = undefined;
+        var lens: [16]usize = undefined;
+        var count: usize = 0;
+        var dir = try @import("stdx").fs.openDir(self.segs, .{ .iterate = true });
+        defer @import("stdx").fs.closeDir(dir);
+        var iter = dir.iterate();
+        while (try iter.next(@import("stdx").io.instance())) |de| {
+            if (!std.mem.endsWith(u8, de.name, ".flseg")) continue;
+            @memcpy(names[count][0..de.name.len], de.name);
+            lens[count] = de.name.len;
+            count += 1;
+        }
+        var order: [16]usize = undefined;
+        for (0..count) |i| order[i] = i;
+        const Ctx = struct {
+            names: *const [16][64]u8,
+            lens: *const [16]usize,
+            fn less(c: @This(), a: usize, b: usize) bool {
+                return std.mem.lessThan(u8, c.names[a][0..c.lens[a]], c.names[b][0..c.lens[b]]);
+            }
+        };
+        std.mem.sort(usize, order[0..count], Ctx{ .names = &names, .lens = &lens }, Ctx.less);
+        const i = order[n];
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.segs, names[i][0..lens[i]] });
+    }
+
+    fn readFile(path: []const u8) ![]u8 {
+        const f = try @import("stdx").fs.openFile(path, .{});
+        defer @import("stdx").fs.closeFile(f);
+        return @import("stdx").fs.readToEndAlloc(f, std.testing.allocator, 1 << 24);
+    }
+
+    fn writeFile(path: []const u8, bytes: []const u8) !void {
+        const f = try @import("stdx").fs.createFile(path, .{});
+        defer @import("stdx").fs.closeFile(f);
+        try @import("stdx").fs.writeAll(f, bytes);
+    }
+
+    fn queued(shard: *Shard) u64 {
+        return shard.queue_handler.queue.countQueue(node_router.nameHash(node_router.namespaceHash(""), "q"));
+    }
+
+    /// Reopen, and expect the shard offline for `path`, having applied the
+    /// segments before the damage and nothing after.
+    fn expectOffline(self: *DamageTest, path: silent_loss.Path, queued_before: u64) !void {
+        var shard = try self.open();
+        defer shard.deinit();
+        const damage = shard.offline orelse return error.ShardNotOffline;
+        try std.testing.expectEqual(path, damage.path);
+        try std.testing.expectEqual(@as(u64, 1), shard.losses.total(path));
+        try std.testing.expectEqual(queued_before, queued(&shard));
+        var buf: [320]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, shard.offlineMessage(&buf), "is offline on this node") != null);
+        // Nothing applies over the damage, and nothing proposes.
+        try std.testing.expect(shard.raft_node.role != .leader);
+        try std.testing.expect(shard.applyCommitted());
+    }
+};
+
+test "a segment flush a crash cut short is removed at boot, and the shard serves" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const torn = try std.fmt.bufPrint(&buf, "{s}/{d:0>20}.flseg.tmp", .{ t.segs, 99 });
+    try DamageTest.writeFile(torn, "half a segment");
+
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+    try std.testing.expectError(error.FileNotFound, @import("stdx").fs.openFile(torn, .{}));
+}
+
+test "a flipped byte in a sealed segment takes its shard offline, and replay stops before it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(2, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    bytes[bytes.len / 2] ^= 0xff;
+    try DamageTest.writeFile(path, bytes);
+    // The first segment holds the bootstrap no-op and one enqueue; the
+    // second, the next.
+    try t.expectOffline(.segment_unreadable, 2);
+}
+
+test "a missing middle segment takes its shard offline instead of being taken for compaction" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    try @import("stdx").fs.deleteFile(try t.segment(1, &buf));
+    try t.expectOffline(.index_hole, 1);
+}
+
+test "a segment whose header will not read takes its shard offline, not the node" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(1, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes[0..8], 0);
+    try DamageTest.writeFile(path, bytes);
+    // The listing fails before replay: nothing applies.
+    try t.expectOffline(.segment_header_unreadable, 0);
+}
+
+test "an entry that will not parse in a segment whose checksum holds takes its shard offline" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(1, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    // The first entry claims more payload than the segment holds; the file
+    // checksum is recomputed, as a writer bug would have written it.
+    const seg = @import("../storage/ual/segment.zig");
+    std.mem.writeInt(u32, bytes[seg.HEADER_SIZE + 32 ..][0..4], 0xffff_fff0, .little);
+    const footer_start = bytes.len - seg.FOOTER_SIZE;
+    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], @import("../util/checksum.zig").checksum(bytes[0..footer_start]), .little);
+    try DamageTest.writeFile(path, bytes);
+    try t.expectOffline(.segment_bad_entry, 1);
+}
+
+test "a MANIFEST naming a snapshot that will not load takes its shard offline, not a full replay" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try ShardManifest.setLatestSnapshot(std.testing.allocator, shard_dir, "0000000002-1.fsnap");
+    try t.expectOffline(.snapshot_unloadable, 0);
+}
+
+test "an entry no projection or applier can take is counted on its path, and its client told it did not apply" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // A 4 KiB partition ring: an 8 KiB entry cannot enter it.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, 4096, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    const Case = struct { entry_type: entry_mod.EntryType, payload: []const u8, path: silent_loss.Path };
+    const big = [_]u8{'x'} ** 8192;
+    for ([_]Case{
+        // The registry applier cannot decode it.
+        .{ .entry_type = .action_invoke, .payload = "not a command payload", .path = .applier_failed },
+        // The KV projection cannot decode it.
+        .{ .entry_type = .kv_put, .payload = "not a command payload", .path = .router_error },
+        // Nothing writes this type, and nothing applies it.
+        .{ .entry_type = .cg_create, .payload = "", .path = .no_applier },
+        // Larger than the partition ring.
+        .{ .entry_type = .stream_append, .payload = &big, .path = .partition_reject },
+    }) |c| {
+        const before = shard.losses.total(c.path);
+        _ = try shard.raft_node.propose(c.entry_type, entry_mod.Flags.NONE, c.payload);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(before + 1, shard.losses.total(c.path));
+        try std.testing.expect(!shard.last_entry_applied);
+        // Counted, not offline: replay and apply carry on.
+        try std.testing.expect(shard.offline == null);
+    }
+}
+
+test "a committed entry this node cannot read back takes its shard offline, and nothing applies after it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    // Committed past what the log holds: the next index cannot be read.
+    const missing = shard.raft_node.log.lastIndex() + 1;
+    shard.raft_node.commit_index = missing;
+    try std.testing.expect(!shard.applyCommitted());
+    const damage = shard.offline orelse return error.ShardNotOffline;
+    try std.testing.expectEqual(silent_loss.Path.unreadable_committed, damage.path);
+    try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.unreadable_committed));
+    try std.testing.expect(shard.raft_node.role != .leader);
+    // Offline: no further apply is attempted.
+    shard.raft_node.commit_index = missing + 1;
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(missing, shard.raft_node.last_applied);
+
+    // Every request, a read included, is answered with why.
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    try ParkTest.send(&shard, conn, .kv_get, 7, "k", "");
+    var one: [1]proto.Response = undefined;
+    var buf: [512]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "shard 0 is offline on this node: committed entry") != null);
+}
+
+test "an entry that cannot apply at boot is counted, and replay carries on past it" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Nothing applies a cg_create; then one more enqueue after it.
+        _ = try shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "");
+        _ = shard.applyCommitted();
+        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+        try std.testing.expect(shard.applyCommitted());
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
+}
+
+test "a MANIFEST that will not load takes its shard offline, not a full replay" {
+    for ([_][]const u8{ "not json", "[]" }) |content| {
+        var t: DamageTest = undefined;
+        try t.init();
+        defer t.deinit();
+        const manifest = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/MANIFEST", .{t.data_dir});
+        defer std.testing.allocator.free(manifest);
+        try DamageTest.writeFile(manifest, content);
+        try t.expectOffline(.snapshot_unloadable, 0);
+    }
 }

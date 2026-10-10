@@ -43,6 +43,9 @@ pub const DurableLog = struct {
     pending_cut: ?u64 = null,
     /// The sorted listing, valid until the next flush or truncation.
     listing: ?[]SegmentFile = null,
+    /// The segment whose header would not read, when listing failed on it.
+    bad_header: [128]u8 = undefined,
+    bad_header_len: usize = 0,
     /// The segment last read below the ring, kept open: a deferred tail
     /// reads one entry per call, and re-opening and CRC-checking the whole
     /// file each time is quadratic.
@@ -244,6 +247,9 @@ pub const DurableLog = struct {
             errdefer self.allocator.free(path);
             const hdr = readHeader(path) catch |err| {
                 log.err("durable log: cannot read the header of {s}: {s}", .{ path, @errorName(err) });
+                const kept = @min(de.name.len, self.bad_header.len);
+                @memcpy(self.bad_header[0..kept], de.name[0..kept]);
+                self.bad_header_len = kept;
                 return err;
             };
             try files.append(self.allocator, .{
@@ -264,6 +270,44 @@ pub const DurableLog = struct {
             }
         }
         return files.toOwnedSlice(self.allocator);
+    }
+
+    /// The segment `listSegments` stopped at because its header would not
+    /// read.
+    pub fn badHeaderSegment(self: *const DurableLog) []const u8 {
+        return self.bad_header[0..self.bad_header_len];
+    }
+
+    /// Delete the `.tmp` files flushes left behind. A segment is written to
+    /// `<name>.flseg.tmp` and renamed into place only once it is on disk,
+    /// so one still named `.tmp` is a flush a crash cut short: never part
+    /// of the log, and the normal tail of an unclean shutdown. Returns how
+    /// many went.
+    pub fn removeTornTail(self: *DurableLog) !usize {
+        const io = stdx.io.instance();
+        var removed: usize = 0;
+        // One per pass: a directory is not iterated while it changes.
+        while (true) {
+            var dir = stdx.fs.openDir(self.segs_path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => return removed,
+                else => return err,
+            };
+            defer stdx.fs.closeDir(dir);
+            var path_buf: [512]u8 = undefined;
+            var name_buf: [256]u8 = undefined;
+            var found: ?[]const u8 = null;
+            var iter = dir.iterate();
+            while (try iter.next(io)) |de| {
+                if (de.kind != .file or !std.mem.endsWith(u8, de.name, ".flseg.tmp")) continue;
+                found = std.fmt.bufPrint(&name_buf, "{s}", .{de.name}) catch return error.PathTooLong;
+                break;
+            }
+            const name = found orelse return removed;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.segs_path, name }) catch return error.PathTooLong;
+            try stdx.fs.deleteFile(path);
+            log.info("durable log: removed {s}, a segment flush an unclean shutdown cut short (never part of the log)", .{name});
+            removed += 1;
+        }
     }
 
     pub fn freeSegments(self: *DurableLog, files: []SegmentFile) void {

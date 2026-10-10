@@ -1687,7 +1687,7 @@ pub const StreamHandler = struct {
         ) orelse return error.PayloadTooLarge;
 
         _ = try self.partition.apply(&entry);
-        replayEntry(@ptrCast(self), &entry);
+        _ = replayEntry(@ptrCast(self), &entry);
         return self.last_append orelse error.AppendNotApplied;
     }
 
@@ -1709,13 +1709,14 @@ pub const StreamHandler = struct {
     /// commit, a replicated entry and boot replay alike. The partition has
     /// already appended the entry to the ring, so `entry.header.index` is
     /// the UAL index for stream lookups.
-    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
 
         if (etype == .stream_append) {
             self.last_append = null;
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
+            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+            {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
@@ -1747,33 +1748,33 @@ pub const StreamHandler = struct {
                     self.stream.registerStream(ns_name) catch {};
                 } else |_| {}
             }
+            return if (self.last_append == null) .failed else .applied;
         }
 
         if (etype == .stream_trim) {
             self.last_trim_count = 0;
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
-                if (TrimBound.decode(cmd.key)) |bound| {
-                    // An age resolves against this entry's stamp, so every
-                    // replica cuts at the same place.
-                    if (bound.resolve(entry.header.timestamp_ns)) |trim_id| {
-                        self.last_trim_count = self.stream.trimStream(nh, trim_id);
-                    }
-                } else {
-                    log.err("stream trim entry index={d} is malformed; skipped, so nothing is trimmed", .{entry.header.index});
-                }
+            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+            const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
+            const bound = TrimBound.decode(cmd.key) orelse {
+                log.err("stream trim entry index={d} is malformed; skipped, so nothing is trimmed", .{entry.header.index});
+                return .failed;
+            };
+            // An age resolves against this entry's stamp, so every replica
+            // cuts at the same place.
+            if (bound.resolve(entry.header.timestamp_ns)) |trim_id| {
+                self.last_trim_count = self.stream.trimStream(nh, trim_id);
             }
+            return .applied;
         }
 
         // Stream delete: key = raw stream name, value = qualified name.
         // Applied from the committed log everywhere, like stream_trim.
         if (etype == .stream_delete) {
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                if (cmd.key.len > 0) {
-                    const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
-                    _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
-                }
-            }
+            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+            if (cmd.key.len == 0) return .failed;
+            const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+            _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
+            return .applied;
         }
 
         // Consumer-group durability: cg_commit carries a group's
@@ -1782,20 +1783,23 @@ pub const StreamHandler = struct {
         // advance is monotonic (see StreamProjection.applyCommit), so this is
         // safe to run on the originating leader as well as on followers/replay.
         if (etype == .cg_commit) {
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                if (cmd.key.len > 0) {
-                    if (stream_mod.GroupCommit.decode(cmd.value)) |commit| {
-                        self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch {};
-                    }
-                }
-            }
+            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+            if (cmd.key.len == 0) return .failed;
+            const commit = stream_mod.GroupCommit.decode(cmd.value) orelse return .failed;
+            self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch |err| {
+                log.err("consumer group '{s}': commit at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
+                return .failed;
+            };
+            return .applied;
         }
 
         if (etype == .cg_delete) {
-            if (entry_mod.CommandPayload.deserialize(entry.payload)) |cmd| {
-                if (cmd.key.len > 0) _ = self.stream.deleteGroup(cmd.key);
-            }
+            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+            if (cmd.key.len == 0) return .failed;
+            _ = self.stream.deleteGroup(cmd.key);
+            return .applied;
         }
+        return .failed;
     }
 
     // ── Trim Persistence ────────────────────────────────────────────────
@@ -2575,7 +2579,7 @@ test "stream handler: partition_index survives restart/replay" {
     var idx: u64 = 1;
     while (idx <= partition.committed_index) : (idx += 1) {
         if (partition.ual.read(idx)) |entry| {
-            StreamHandler.replayEntry(&handler, &entry);
+            _ = StreamHandler.replayEntry(&handler, &entry);
         }
     }
 
@@ -2643,7 +2647,7 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
     const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
-    StreamHandler.replayEntry(&handler, &del);
+    try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &del));
     try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
 
@@ -2791,13 +2795,13 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         var pbuf: [128]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old records.
         const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
-        StreamHandler.replayEntry(&handler, &trim);
+        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &trim));
         try testing.expectEqual(@as(u64, 2), handler.last_trim_count);
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
 
         // An age past the stamp trims nothing, never everything.
         const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
-        StreamHandler.replayEntry(&handler, &past);
+        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &past));
         try testing.expectEqual(@as(u64, 0), handler.last_trim_count);
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
     }
