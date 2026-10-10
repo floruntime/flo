@@ -137,7 +137,7 @@ test "ClassifyOperator single rule match" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
+        .condition = try ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
@@ -173,7 +173,7 @@ test "ClassifyOperator no rules match — record still emitted" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
+        .condition = try ExprFilterOperator.init("rule0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
@@ -208,15 +208,15 @@ test "ClassifyOperator multiple rules compose" {
 
     var rules = try allocator.alloc(Rule, 3);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
+        .condition = try ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
     rules[1] = .{
-        .condition = ExprFilterOperator.init("r1", try allocator.dupe(u8, "value_contains:critical")),
+        .condition = try ExprFilterOperator.init("r1", try allocator.dupe(u8, "value_contains:critical")),
         .tag_bit = 1,
     };
     rules[2] = .{
-        .condition = ExprFilterOperator.init("r2", try allocator.dupe(u8, "not_empty")),
+        .condition = try ExprFilterOperator.init("r2", try allocator.dupe(u8, "not_empty")),
         .tag_bit = 2,
     };
 
@@ -260,7 +260,7 @@ test "ClassifyOperator default tag on unmatched records" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
+        .condition = try ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 
@@ -304,7 +304,7 @@ test "ClassifyOperator default tag null — unmatched gets no tags" {
 
     var rules = try allocator.alloc(Rule, 1);
     rules[0] = .{
-        .condition = ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
+        .condition = try ExprFilterOperator.init("r0", try allocator.dupe(u8, "value_contains:error")),
         .tag_bit = 0,
     };
 

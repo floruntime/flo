@@ -32,9 +32,14 @@
 //!   - `<cond> OR <cond> [OR ...]`   — any sub-condition matches
 //!   - `<cond> AND <cond> [AND ...]` — all sub-conditions match
 //!
-//!   Note: OR and AND cannot be mixed in a single expression.
-//!   OR is checked first (lower precedence). Use classify rules for
+//!   OR and AND cannot be mixed in one expression. Use classify rules for
 //!   complex routing instead of deeply nested boolean logic.
+//!
+//!   A condition this list doesn't describe is refused, never read as
+//!   "match everything". A JSON condition matches only a record whose value
+//!   is JSON with the field present and comparable: a missing field, a
+//!   non-JSON value, or a field of another type matches no operator, `!=`
+//!   and `!*=` included.
 //!
 //! YAML examples:
 //!   ```yaml
@@ -92,7 +97,6 @@ pub const ExprFilterOperator = struct {
         key_not_empty,
         json_expr: JsonExpr,
         min_length: usize,
-        always_true,
     };
 
     /// Fixed-size array of sub-conditions for compound expressions.
@@ -132,15 +136,25 @@ pub const ExprFilterOperator = struct {
         value: []const u8,
     };
 
+    pub const ConditionError = error{InvalidCondition};
+
     /// Create an expression-based filter operator.
     /// `condition` is the raw condition string from YAML (e.g., "value_contains:hello").
     /// Both `name` and `condition` must outlive the operator (typically allocated by parser).
-    pub fn init(name: []const u8, condition: []const u8) Self {
+    pub fn init(name: []const u8, condition: []const u8) ConditionError!Self {
+        var why: []const u8 = undefined;
         return .{
             .name = name,
             .condition = condition,
-            .parsed = parseCondition(condition),
+            .parsed = try parseCondition(condition, &why),
         };
+    }
+
+    /// Why `condition` is not one this filter understands, or null.
+    pub fn check(condition: []const u8) ?[]const u8 {
+        var why: []const u8 = undefined;
+        _ = parseCondition(condition, &why) catch return why;
+        return null;
     }
 
     /// Return an Operator interface backed by this ExprFilterOperator
@@ -215,7 +229,6 @@ pub const ExprFilterOperator = struct {
             .key_not_empty => rec.key.len > 0,
             .json_expr => |expr| evaluateJsonExpr(rec.value, expr),
             .min_length => |n| rec.value.len >= n,
-            .always_true => true,
         };
     }
 
@@ -223,87 +236,81 @@ pub const ExprFilterOperator = struct {
     // Condition parsing
     // =========================================================================
 
-    fn parseCondition(cond: []const u8) ParsedCondition {
-        // Compound: split on " OR " first (lower precedence), then " AND "
-        if (splitCompound(cond, " OR ")) |compound| return .{ .or_expr = compound };
-        if (splitCompound(cond, " AND ")) |compound| return .{ .and_expr = compound };
-
-        return .{ .single = parseSingleCondition(cond) };
+    fn parseCondition(cond: []const u8, why: *[]const u8) ConditionError!ParsedCondition {
+        const has_or = std.mem.indexOf(u8, cond, " OR ") != null;
+        const has_and = std.mem.indexOf(u8, cond, " AND ") != null;
+        if (has_or and has_and) return fail(why, "AND and OR can't be mixed in one condition");
+        if (has_or) return .{ .or_expr = try parseCompound(cond, " OR ", why) };
+        if (has_and) return .{ .and_expr = try parseCompound(cond, " AND ", why) };
+        return .{ .single = try parseSingleCondition(std.mem.trim(u8, cond, whitespace), why) };
     }
 
-    /// Try to split `cond` on `sep` (e.g. " OR "). Returns a Compound if
-    /// two or more branches are found, null if `sep` does not appear.
-    fn splitCompound(cond: []const u8, sep: []const u8) ?Compound {
-        // Quick check — if sep is not present at all, skip iteration.
-        if (std.mem.indexOf(u8, cond, sep) == null) return null;
+    const whitespace = " \t\r\n";
 
+    fn fail(why: *[]const u8, reason: []const u8) ConditionError {
+        why.* = reason;
+        return error.InvalidCondition;
+    }
+
+    /// The sub-conditions of `cond` joined by `sep`, each one checked.
+    fn parseCompound(cond: []const u8, sep: []const u8, why: *[]const u8) ConditionError!Compound {
         var compound = Compound{};
-        var rest: []const u8 = cond;
-        while (rest.len > 0) {
-            if (compound.len >= MAX_COMPOUND) break;
-            if (std.mem.indexOf(u8, rest, sep)) |pos| {
-                const part = std.mem.trim(u8, rest[0..pos], " ");
-                if (part.len > 0) {
-                    compound.items[compound.len] = parseSingleCondition(part);
-                    compound.len += 1;
-                }
-                rest = rest[pos + sep.len ..];
-            } else {
-                const part = std.mem.trim(u8, rest, " ");
-                if (part.len > 0) {
-                    compound.items[compound.len] = parseSingleCondition(part);
-                    compound.len += 1;
-                }
-                break;
-            }
+        var parts = std.mem.splitSequence(u8, cond, sep);
+        while (parts.next()) |raw| {
+            const part = std.mem.trim(u8, raw, whitespace);
+            if (part.len == 0) return fail(why, "an AND or OR has nothing on one side");
+            if (compound.len >= MAX_COMPOUND) return fail(why, "more than 8 conditions joined by AND or OR");
+            compound.items[compound.len] = try parseSingleCondition(part, why);
+            compound.len += 1;
         }
-        if (compound.len < 2) return null; // not actually compound
         return compound;
     }
 
     /// Parse a single (non-compound) condition expression.
-    fn parseSingleCondition(cond: []const u8) SingleCondition {
-        // Simple keyword conditions
+    fn parseSingleCondition(cond: []const u8, why: *[]const u8) ConditionError!SingleCondition {
+        if (cond.len == 0) return fail(why, "the condition is empty");
         if (std.mem.eql(u8, cond, "not_empty")) return .not_empty;
         if (std.mem.eql(u8, cond, "key_not_empty")) return .key_not_empty;
 
-        // JSON expression: json:<path><op><value> or json_field:<path><op><value> (legacy)
-        if (std.mem.startsWith(u8, cond, "json:")) {
-            if (parseJsonExpr(cond[5..])) |expr| return .{ .json_expr = expr };
+        if (std.mem.startsWith(u8, cond, "json:")) return .{ .json_expr = try parseJsonExpr(cond[5..], why) };
+
+        const parts = splitOnce(cond, ':') orelse return fail(why, "unknown condition");
+        const prefix = parts[0];
+        const arg = parts[1];
+        const known = for ([_][]const u8{ "value_contains", "key_contains", "key_equals", "key_prefix", "value_prefix", "min_length" }) |k| {
+            if (std.mem.eql(u8, prefix, k)) break true;
+        } else false;
+        if (!known) return fail(why, "unknown condition");
+        // An empty argument would match every record (every value contains "").
+        if (arg.len == 0) return fail(why, "needs a value after the colon");
+        if (std.mem.eql(u8, prefix, "value_contains")) return .{ .value_contains = arg };
+        if (std.mem.eql(u8, prefix, "key_contains")) return .{ .key_contains = arg };
+        if (std.mem.eql(u8, prefix, "key_equals")) return .{ .key_equals = arg };
+        if (std.mem.eql(u8, prefix, "key_prefix")) return .{ .key_prefix = arg };
+        if (std.mem.eql(u8, prefix, "value_prefix")) return .{ .value_prefix = arg };
+        if (std.mem.eql(u8, prefix, "min_length")) {
+            const n = std.fmt.parseInt(usize, arg, 10) catch return fail(why, "min_length needs a whole number");
+            return .{ .min_length = n };
         }
-
-        // Prefix:arg conditions
-        if (splitOnce(cond, ':')) |parts| {
-            const prefix = parts[0];
-            const arg = parts[1];
-
-            if (std.mem.eql(u8, prefix, "value_contains")) return .{ .value_contains = arg };
-            if (std.mem.eql(u8, prefix, "key_contains")) return .{ .key_contains = arg };
-            if (std.mem.eql(u8, prefix, "key_equals")) return .{ .key_equals = arg };
-            if (std.mem.eql(u8, prefix, "key_prefix")) return .{ .key_prefix = arg };
-            if (std.mem.eql(u8, prefix, "value_prefix")) return .{ .value_prefix = arg };
-            if (std.mem.eql(u8, prefix, "min_length")) {
-                const n = std.fmt.parseInt(usize, arg, 10) catch return .always_true;
-                return .{ .min_length = n };
-            }
-        }
-
-        return .always_true;
+        return fail(why, "unknown condition");
     }
 
     /// Parse a JSON expression after the `json:` prefix.
     /// Scans for the first operator character to split path from op+value.
-    fn parseJsonExpr(expr: []const u8) ?JsonExpr {
+    fn parseJsonExpr(expr: []const u8, why: *[]const u8) ConditionError!JsonExpr {
         // Find the start of the operator: first occurrence of = ! ^ * > <
         var i: usize = 0;
         while (i < expr.len) : (i += 1) {
             const c = expr[i];
             if (c == '=' or c == '!' or c == '^' or c == '*' or c == '>' or c == '<') break;
         }
-        if (i == 0 or i >= expr.len) return null;
+        if (i == 0) return fail(why, "a json: condition needs a field before its operator");
+        if (i >= expr.len) return fail(why, "a json: condition needs an operator (= != ^= *= !^= !*= > >= < <=)");
 
         const path = expr[0..i];
         const rest = expr[i..];
+        if (std.mem.indexOfAny(u8, path, whitespace) != null) return fail(why, "a json: condition has no spaces around its operator");
+        if (std.mem.indexOfScalar(u8, path, '[') != null) return fail(why, "a json: path can't index an array; use $.a.b");
 
         // Match operators longest-first to avoid ambiguity
         const ops = [_]struct { text: []const u8, op: JsonOp }{
@@ -322,12 +329,31 @@ pub const ExprFilterOperator = struct {
         for (ops) |entry| {
             if (std.mem.startsWith(u8, rest, entry.text)) {
                 const value = rest[entry.text.len..];
-                if (value.len == 0) return null; // operator with no value
+                if (value.len == 0) return fail(why, "a json: condition needs a value after its operator");
+                if (std.mem.indexOfScalar(u8, whitespace, value[0]) != null) return fail(why, "a json: condition has no spaces around its operator");
+                if (value[0] == '=') return fail(why, "a json: condition compares with =, not ==");
+                if (value.len >= 2 and (value[0] == '"' or value[0] == '\'') and value[value.len - 1] == value[0])
+                    return fail(why, "a json: value is written without quotes");
+                switch (entry.op) {
+                    .gt, .gte, .lt, .lte => if (!isPlainNumber(value)) return fail(why, "a json: >, >=, < or <= needs a finite decimal number"),
+                    else => {},
+                }
                 return .{ .path = path, .op = entry.op, .value = value };
             }
         }
 
-        return null;
+        return fail(why, "a json: condition needs an operator (= != ^= *= !^= !*= > >= < <=)");
+    }
+
+    /// A finite decimal number: digits, an optional sign, point and exponent;
+    /// not hex, not `_`-separated, not nan or inf, and not too big for f64.
+    fn isPlainNumber(value: []const u8) bool {
+        for (value) |c| switch (c) {
+            '0'...'9', '-', '+', '.', 'e', 'E' => {},
+            else => return false,
+        };
+        const n = std.fmt.parseFloat(f64, value) catch return false;
+        return std.math.isFinite(n);
     }
 
     /// Split a string on the first occurrence of `sep`. Returns [before, after] or null.
@@ -423,7 +449,7 @@ pub const ExprFilterOperator = struct {
 // =============================================================================
 
 test "ExprFilterOperator — value_contains" {
-    var op = ExprFilterOperator.init("test-filter", "value_contains:hello");
+    var op = try ExprFilterOperator.init("test-filter", "value_contains:hello");
     const rec_match = ProcessingRecord.init("k", "say hello world", 1000);
     const rec_miss = ProcessingRecord.init("k", "goodbye world", 1000);
 
@@ -436,7 +462,7 @@ test "ExprFilterOperator — value_contains" {
 }
 
 test "ExprFilterOperator — key_equals" {
-    var op = ExprFilterOperator.init("key-filter", "key_equals:user-42");
+    var op = try ExprFilterOperator.init("key-filter", "key_equals:user-42");
     const rec_match = ProcessingRecord.init("user-42", "data", 0);
     const rec_miss = ProcessingRecord.init("user-43", "data", 0);
 
@@ -445,7 +471,7 @@ test "ExprFilterOperator — key_equals" {
 }
 
 test "ExprFilterOperator — key_prefix" {
-    var op = ExprFilterOperator.init("prefix-filter", "key_prefix:order-");
+    var op = try ExprFilterOperator.init("prefix-filter", "key_prefix:order-");
     const rec_match = ProcessingRecord.init("order-123", "data", 0);
     const rec_miss = ProcessingRecord.init("user-123", "data", 0);
 
@@ -454,7 +480,7 @@ test "ExprFilterOperator — key_prefix" {
 }
 
 test "ExprFilterOperator — not_empty" {
-    var op = ExprFilterOperator.init("nonempty-filter", "not_empty");
+    var op = try ExprFilterOperator.init("nonempty-filter", "not_empty");
     const rec_match = ProcessingRecord.init("k", "some data", 0);
     const rec_empty = ProcessingRecord.init("k", "", 0);
 
@@ -463,7 +489,7 @@ test "ExprFilterOperator — not_empty" {
 }
 
 test "ExprFilterOperator — min_length" {
-    var op = ExprFilterOperator.init("min-len", "min_length:5");
+    var op = try ExprFilterOperator.init("min-len", "min_length:5");
     const rec_ok = ProcessingRecord.init("k", "abcde", 0);
     const rec_short = ProcessingRecord.init("k", "abc", 0);
 
@@ -471,14 +497,72 @@ test "ExprFilterOperator — min_length" {
     try std.testing.expect(!op.evaluate(rec_short));
 }
 
-test "ExprFilterOperator — always_true for unknown condition" {
-    var op = ExprFilterOperator.init("unknown", "something_weird");
-    const rec = ProcessingRecord.init("k", "v", 0);
-    try std.testing.expect(op.evaluate(rec));
+test "ExprFilterOperator — a condition it doesn't understand is refused, not read as match-all" {
+    const cases = [_]struct { cond: []const u8, why: []const u8 }{
+        .{ .cond = "something_weird", .why = "unknown condition" },
+        .{ .cond = "valeu_contains:x", .why = "unknown condition" },
+        .{ .cond = "", .why = "the condition is empty" },
+        .{ .cond = "min_length:five", .why = "min_length needs a whole number" },
+        .{ .cond = "json:amount", .why = "a json: condition needs an operator (= != ^= *= !^= !*= > >= < <=)" },
+        .{ .cond = "json:=x", .why = "a json: condition needs a field before its operator" },
+        .{ .cond = "json:amount>", .why = "a json: condition needs a value after its operator" },
+        .{ .cond = "json:amount>lots", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "not_empty AND valeu_contains:x", .why = "unknown condition" },
+        .{ .cond = "not_empty OR key_not_empty AND not_empty", .why = "AND and OR can't be mixed in one condition" },
+        .{ .cond = "not_empty AND  AND key_not_empty", .why = "an AND or OR has nothing on one side" },
+        .{ .cond = "not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty OR not_empty", .why = "more than 8 conditions joined by AND or OR" },
+        .{ .cond = "value_contains:", .why = "needs a value after the colon" },
+        .{ .cond = "value_prefix:", .why = "needs a value after the colon" },
+        .{ .cond = "key_prefix:", .why = "needs a value after the colon" },
+        .{ .cond = "key_contains:", .why = "needs a value after the colon" },
+        .{ .cond = "key_equals:", .why = "needs a value after the colon" },
+        .{ .cond = "min_length:", .why = "needs a value after the colon" },
+        .{ .cond = "json:status = done", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:x >5", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:x> 5", .why = "a json: condition has no spaces around its operator" },
+        .{ .cond = "json:status=\"done\"", .why = "a json: value is written without quotes" },
+        .{ .cond = "json:status='done'", .why = "a json: value is written without quotes" },
+        .{ .cond = "json:x==5", .why = "a json: condition compares with =, not ==" },
+        .{ .cond = "json:items[0].id=5", .why = "a json: path can't index an array; use $.a.b" },
+        .{ .cond = "json:x>nan", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x<inf", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>=1e400", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>0x10", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+        .{ .cond = "json:x>1_000", .why = "a json: >, >=, < or <= needs a finite decimal number" },
+    };
+    for (cases) |c| {
+        try std.testing.expectError(error.InvalidCondition, ExprFilterOperator.init("bad", c.cond));
+        try std.testing.expectEqualStrings(c.why, ExprFilterOperator.check(c.cond).?);
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("json:$.amount>=10.5 AND key_prefix:o-"));
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("json:x>-1.5e3"));
+    // A YAML block scalar leaves a newline; tabs and newlines trim like spaces.
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("\tvalue_contains:a\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), ExprFilterOperator.check("not_empty AND key_not_empty\n"));
+}
+
+test "ExprFilterOperator — exactly 8 joined conditions are allowed" {
+    var op = try ExprFilterOperator.init("eight", "value_contains:a OR value_contains:b OR value_contains:c OR value_contains:d OR value_contains:e OR value_contains:f OR value_contains:g OR value_contains:h");
+    try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "h", 0)));
+    try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "z", 0)));
+}
+
+test "ExprFilterOperator — a JSON condition matches only a present, comparable field" {
+    // The rule, decided rather than incidental: a missing field, a non-JSON
+    // value or a field of another type matches nothing, negations included.
+    const missing = ProcessingRecord.fromValue("{\"other\":1}", 0);
+    const not_json = ProcessingRecord.fromValue("plain text", 0);
+    const wrong_type = ProcessingRecord.fromValue("{\"type\":{\"nested\":true}}", 0);
+    for ([_][]const u8{ "json:type=refund", "json:type!=refund", "json:type!*=refund", "json:type!^=re", "json:type>1" }) |cond| {
+        var op = try ExprFilterOperator.init("rule", cond);
+        try std.testing.expect(!op.evaluate(missing));
+        try std.testing.expect(!op.evaluate(not_json));
+        try std.testing.expect(!op.evaluate(wrong_type));
+    }
 }
 
 test "ExprFilterOperator — value_prefix" {
-    var op = ExprFilterOperator.init("vp", "value_prefix:ERROR");
+    var op = try ExprFilterOperator.init("vp", "value_prefix:ERROR");
     const rec_match = ProcessingRecord.init("k", "ERROR: something broke", 0);
     const rec_miss = ProcessingRecord.init("k", "INFO: all good", 0);
 
@@ -487,7 +571,7 @@ test "ExprFilterOperator — value_prefix" {
 }
 
 test "ExprFilterOperator — json equals (new syntax)" {
-    var op = ExprFilterOperator.init("json-eq", "json:status=approved");
+    var op = try ExprFilterOperator.init("json-eq", "json:status=approved");
     const rec_match = ProcessingRecord.init("k", "{\"status\":\"approved\",\"amount\":100}", 0);
     const rec_miss = ProcessingRecord.init("k", "{\"status\":\"pending\",\"amount\":50}", 0);
     const rec_bad = ProcessingRecord.init("k", "not-json", 0);
@@ -498,7 +582,7 @@ test "ExprFilterOperator — json equals (new syntax)" {
 }
 
 test "ExprFilterOperator — json not equals" {
-    var op = ExprFilterOperator.init("jneq", "json:type!=refund");
+    var op = try ExprFilterOperator.init("jneq", "json:type!=refund");
     const rec_pass = ProcessingRecord.init("k", "{\"type\":\"payment\"}", 0);
     const rec_fail = ProcessingRecord.init("k", "{\"type\":\"refund\"}", 0);
 
@@ -507,7 +591,7 @@ test "ExprFilterOperator — json not equals" {
 }
 
 test "ExprFilterOperator — json prefix (^=)" {
-    var op = ExprFilterOperator.init("jpfx", "json:type^=payment");
+    var op = try ExprFilterOperator.init("jpfx", "json:type^=payment");
     const rec_match = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\",\"id\":\"x12345\"}", 0);
     const rec_exact = ProcessingRecord.init("k", "{\"type\":\"payment\",\"id\":\"x1\"}", 0);
     const rec_miss = ProcessingRecord.init("k", "{\"type\":\"refund.partial\",\"id\":\"x99\"}", 0);
@@ -522,7 +606,7 @@ test "ExprFilterOperator — json prefix (^=)" {
 }
 
 test "ExprFilterOperator — json contains (*=)" {
-    var op = ExprFilterOperator.init("jcnt", "json:type*=transfer");
+    var op = try ExprFilterOperator.init("jcnt", "json:type*=transfer");
     const rec_match = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\",\"id\":\"x12345\"}", 0);
     const rec_mid = ProcessingRecord.init("k", "{\"type\":\"bank_transfer_ach\",\"id\":\"b1\"}", 0);
     const rec_miss = ProcessingRecord.init("k", "{\"type\":\"payment.refund\",\"id\":\"r1\"}", 0);
@@ -535,7 +619,7 @@ test "ExprFilterOperator — json contains (*=)" {
 }
 
 test "ExprFilterOperator — json not prefix (!^=)" {
-    var op = ExprFilterOperator.init("jnpfx", "json:type!^=payment");
+    var op = try ExprFilterOperator.init("jnpfx", "json:type!^=payment");
     const rec_no = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\"}", 0);
     const rec_yes = ProcessingRecord.init("k", "{\"type\":\"refund.partial\"}", 0);
 
@@ -544,7 +628,7 @@ test "ExprFilterOperator — json not prefix (!^=)" {
 }
 
 test "ExprFilterOperator — json not contains (!*=)" {
-    var op = ExprFilterOperator.init("jncnt", "json:type!*=transfer");
+    var op = try ExprFilterOperator.init("jncnt", "json:type!*=transfer");
     const rec_has = ProcessingRecord.init("k", "{\"type\":\"payment.transfer\"}", 0);
     const rec_not = ProcessingRecord.init("k", "{\"type\":\"payment.refund\"}", 0);
 
@@ -554,23 +638,23 @@ test "ExprFilterOperator — json not contains (!*=)" {
 
 test "ExprFilterOperator — json numeric comparisons" {
     // greater than
-    var gt = ExprFilterOperator.init("gt", "json:amount>100");
+    var gt = try ExprFilterOperator.init("gt", "json:amount>100");
     try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":200}", 0)));
     try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
     try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":50}", 0)));
 
     // greater or equal
-    var gte = ExprFilterOperator.init("gte", "json:amount>=100");
+    var gte = try ExprFilterOperator.init("gte", "json:amount>=100");
     try std.testing.expect(gte.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
     try std.testing.expect(!gte.evaluate(ProcessingRecord.init("k", "{\"amount\":99}", 0)));
 
     // less than
-    var lt = ExprFilterOperator.init("lt", "json:amount<100");
+    var lt = try ExprFilterOperator.init("lt", "json:amount<100");
     try std.testing.expect(lt.evaluate(ProcessingRecord.init("k", "{\"amount\":50}", 0)));
     try std.testing.expect(!lt.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
 
     // less or equal
-    var lte = ExprFilterOperator.init("lte", "json:amount<=100");
+    var lte = try ExprFilterOperator.init("lte", "json:amount<=100");
     try std.testing.expect(lte.evaluate(ProcessingRecord.init("k", "{\"amount\":100}", 0)));
     try std.testing.expect(!lte.evaluate(ProcessingRecord.init("k", "{\"amount\":101}", 0)));
 
@@ -579,14 +663,14 @@ test "ExprFilterOperator — json numeric comparisons" {
 }
 
 test "ExprFilterOperator — json integer equality" {
-    var op = ExprFilterOperator.init("jeqi", "json:code=200");
+    var op = try ExprFilterOperator.init("jeqi", "json:code=200");
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"code\":200}", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"code\":404}", 0)));
 }
 
 test "ExprFilterOperator — json boolean equality" {
-    var op_t = ExprFilterOperator.init("jbt", "json:active=true");
-    var op_f = ExprFilterOperator.init("jbf", "json:active!=true");
+    var op_t = try ExprFilterOperator.init("jbt", "json:active=true");
+    var op_f = try ExprFilterOperator.init("jbf", "json:active!=true");
     const rec_true = ProcessingRecord.init("k", "{\"active\":true}", 0);
     const rec_false = ProcessingRecord.init("k", "{\"active\":false}", 0);
 
@@ -597,7 +681,7 @@ test "ExprFilterOperator — json boolean equality" {
 }
 
 test "ExprFilterOperator — json missing field" {
-    var op = ExprFilterOperator.init("miss", "json:nonexistent=x");
+    var op = try ExprFilterOperator.init("miss", "json:nonexistent=x");
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"other\":\"y\"}", 0)));
 }
 
@@ -606,7 +690,7 @@ test "ExprFilterOperator — json missing field" {
 // =========================================================================
 
 test "ExprFilterOperator — OR matches either sub-condition" {
-    var op = ExprFilterOperator.init("or-filter", "value_contains:payment OR value_contains:kyc");
+    var op = try ExprFilterOperator.init("or-filter", "value_contains:payment OR value_contains:kyc");
 
     // Matches first branch
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "payment.transfer", 0)));
@@ -619,7 +703,7 @@ test "ExprFilterOperator — OR matches either sub-condition" {
 }
 
 test "ExprFilterOperator — AND requires all sub-conditions" {
-    var op = ExprFilterOperator.init("and-filter", "value_contains:payment AND value_contains:approved");
+    var op = try ExprFilterOperator.init("and-filter", "value_contains:payment AND value_contains:approved");
 
     // Both match
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "payment approved", 0)));
@@ -632,7 +716,7 @@ test "ExprFilterOperator — AND requires all sub-conditions" {
 }
 
 test "ExprFilterOperator — OR with three branches" {
-    var op = ExprFilterOperator.init("or3", "value_contains:error OR value_contains:warn OR value_contains:fatal");
+    var op = try ExprFilterOperator.init("or3", "value_contains:error OR value_contains:warn OR value_contains:fatal");
 
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "error occurred", 0)));
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "warn: low disk", 0)));
@@ -641,7 +725,7 @@ test "ExprFilterOperator — OR with three branches" {
 }
 
 test "ExprFilterOperator — OR with json expressions" {
-    var op = ExprFilterOperator.init("or-json", "json:type^=payment OR json:type^=kyc");
+    var op = try ExprFilterOperator.init("or-json", "json:type^=payment OR json:type^=kyc");
 
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"type\":\"payment.deposit\"}", 0)));
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"type\":\"kyc.verified\"}", 0)));
@@ -649,7 +733,7 @@ test "ExprFilterOperator — OR with json expressions" {
 }
 
 test "ExprFilterOperator — AND with json expressions" {
-    var op = ExprFilterOperator.init("and-json", "json:amount>100 AND json:status=approved");
+    var op = try ExprFilterOperator.init("and-json", "json:amount>100 AND json:status=approved");
 
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"amount\":200,\"status\":\"approved\"}", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"amount\":50,\"status\":\"approved\"}", 0)));
@@ -658,32 +742,32 @@ test "ExprFilterOperator — AND with json expressions" {
 
 test "ExprFilterOperator — single condition with OR in value is not compound" {
     // "value_contains:OR" should NOT be treated as compound — "OR" is inside the arg
-    var op = ExprFilterOperator.init("not-compound", "value_contains:OR-gate");
+    var op = try ExprFilterOperator.init("not-compound", "value_contains:OR-gate");
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "OR-gate open", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "AND-gate open", 0)));
 }
 
 test "ExprFilterOperator — json:$. JSONPath-prefixed paths resolve (doc syntax)" {
     // The docs use `$.`-prefixed paths in conditions; they must behave like plain paths.
-    var eq = ExprFilterOperator.init("dollar-eq", "json:$.level=error");
+    var eq = try ExprFilterOperator.init("dollar-eq", "json:$.level=error");
     try std.testing.expect(eq.evaluate(ProcessingRecord.init("k", "{\"level\":\"error\"}", 0)));
     try std.testing.expect(!eq.evaluate(ProcessingRecord.init("k", "{\"level\":\"info\"}", 0)));
 
     // Numeric comparison with `$.` prefix, including float values.
-    var gt = ExprFilterOperator.init("dollar-gt", "json:$.amount>100");
+    var gt = try ExprFilterOperator.init("dollar-gt", "json:$.amount>100");
     try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":250}", 0)));
     try std.testing.expect(gt.evaluate(ProcessingRecord.init("k", "{\"amount\":72.5e1}", 0))); // 725.0 float
     try std.testing.expect(!gt.evaluate(ProcessingRecord.init("k", "{\"amount\":5}", 0)));
 
     // Nested dotted path under `$.`.
-    var nested = ExprFilterOperator.init("dollar-nested", "json:$.meta.region=us-east");
+    var nested = try ExprFilterOperator.init("dollar-nested", "json:$.meta.region=us-east");
     try std.testing.expect(nested.evaluate(ProcessingRecord.init("k", "{\"meta\":{\"region\":\"us-east\"}}", 0)));
     try std.testing.expect(!nested.evaluate(ProcessingRecord.init("k", "{\"meta\":{\"region\":\"eu-west\"}}", 0)));
 }
 
 test "ExprFilterOperator — plain float numeric comparison" {
     // Floats must compare numerically (previously `.float` fell through to false).
-    var op = ExprFilterOperator.init("float-gt", "json:latency_ms>5000");
+    var op = try ExprFilterOperator.init("float-gt", "json:latency_ms>5000");
     try std.testing.expect(op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":6000.5}", 0)));
     try std.testing.expect(!op.evaluate(ProcessingRecord.init("k", "{\"latency_ms\":10.0}", 0)));
 }

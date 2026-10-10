@@ -1120,6 +1120,14 @@ pub const ProcessingHandler = struct {
             }
         }
 
+        // A pipeline without one of its operators would run a different job
+        // (a dropped filter passes everything), so a job any of whose
+        // operators can't be built doesn't start at all.
+        if (self.operatorRefusal(def)) |name| {
+            log.err("processing job {s} not started: operator '{s}' can't be built", .{ job_id, name });
+            return;
+        }
+
         // Create pipeline execution state. For multi-source jobs, one pipeline
         // per source (all sinks per pipeline).
         for (def.sources.items, 0..) |*src, idx| {
@@ -1135,14 +1143,14 @@ pub const ProcessingHandler = struct {
         }
     }
 
-    /// The first native operator that can't be built, by name. Building
-    /// happens again when the job applies, where a failure skips the
-    /// operator and the job runs without it; refusing here is what stops that.
+    /// The first operator that can't be built, by name: checked at submit,
+    /// and again before a job's pipelines start, so a job never runs with an
+    /// operator missing.
     fn operatorRefusal(self: *ProcessingHandler, def: *const definition.JobDefinition) ?[]const u8 {
         var tags = definition.TagRegistry{};
         fillTagRegistry(&tags, def);
         for (def.operators.items) |*spec| {
-            if (!native_registry.isNativeType(spec.type_name)) continue;
+            if (!native_registry.isNativeType(spec.type_name)) return spec.name;
             const built = native_registry.create(self.allocator, spec, &tags) catch return spec.name;
             built.deinit(self.allocator);
         }
@@ -1184,22 +1192,15 @@ pub const ProcessingHandler = struct {
 
         // Instantiate operator chain from definition
         const op_specs = def.operators.items;
+        // Never fall back to a pipeline without its operators: that runs a
+        // different job.
         var ops = self.allocator.alloc(Operator, op_specs.len) catch {
-            // Fall through — pipeline will operate with no operators (passthrough)
-            var ps = makePipeState(self.allocator, src, sinks, tag_hash);
-            self.pipelines.put(job_id, ps) catch {
-                self.freePipelineState(&ps);
-                return;
-            };
+            log.err("processing job {s}: pipeline not started (out of memory)", .{job_id});
             return;
         };
         var backings = self.allocator.alloc(native_registry.CreateResult, op_specs.len) catch {
             self.allocator.free(ops);
-            var ps = makePipeState(self.allocator, src, sinks, tag_hash);
-            self.pipelines.put(job_id, ps) catch {
-                self.freePipelineState(&ps);
-                return;
-            };
+            log.err("processing job {s}: pipeline not started (out of memory)", .{job_id});
             return;
         };
 
@@ -1212,13 +1213,12 @@ pub const ProcessingHandler = struct {
                     log.info("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
                 }
             }
-            if (!native_registry.isNativeType(spec.type_name)) {
-                log.info("createPipeline: not native type '{s}', skipping", .{spec.type_name});
-                continue;
-            }
             const result = native_registry.create(self.allocator, spec, tag_registry) catch |err| {
-                log.err("createPipeline: native_registry.create failed for '{s}' type='{s}': {}", .{ spec.name, spec.type_name, err });
-                continue;
+                log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
+                for (backings[0..count]) |*b| b.deinit(self.allocator);
+                self.allocator.free(backings);
+                self.allocator.free(ops);
+                return;
             };
             // Wire kv_lookup operators to route across all shards' KV projections
             if (result.backing == .kv_lookup) {

@@ -38,6 +38,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const job_definition = @import("definition.zig");
+const ExprFilterOperator = @import("operators/expr_filter.zig").ExprFilterOperator;
 const yaml_to_json = @import("../util/yaml_to_json.zig");
 const definition_diag = @import("../util/definition_diag.zig");
 
@@ -337,6 +338,7 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
                 if (rule != .object) return d.fail(ParseError.InvalidFieldType, "a rule must be a map, not {s}", .{kindName(rule)});
                 try checkKeys(d, rule, &.{ "condition", "tag" });
                 const cond = try reqString(d, rule, "condition", ParseError.MissingRequiredField);
+                try checkCondition(d, cond);
                 const tag = try reqString(d, rule, "tag", ParseError.MissingRequiredField);
                 var key_buf: [32]u8 = undefined;
                 try appendConfig(allocator, &config, std.fmt.bufPrint(&key_buf, "condition_{d}", .{i}) catch unreachable, cond);
@@ -368,6 +370,12 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
     operators.append(allocator, .{ .type_name = type_d, .name = name_d, .config = config_s }) catch return ParseError.OutOfMemory;
 }
 
+/// A filter or classify condition the operator can't evaluate, refused here
+/// rather than at pipeline creation.
+fn checkCondition(d: D, cond: []const u8) ParseError!void {
+    if (ExprFilterOperator.check(cond)) |why| return d.fail(ParseError.InvalidFieldType, "bad condition \"{s}\": {s}", .{ cond, why });
+}
+
 /// The settings each operator type needs, and the values its enums take,
 /// refused here so `flo validate processing` refuses what submit refuses,
 /// with a place. Keys are checked against `operator_keys` separately.
@@ -391,6 +399,7 @@ fn checkOperatorSettings(d: D, item: JsonValue, op_type: []const u8) ParseError!
     };
     if (mem.eql(u8, op_type, "filter")) {
         try need.key(d, item, "condition");
+        if (try optString(d, item, "condition")) |cond| try checkCondition(d, cond);
     } else if (mem.eql(u8, op_type, "keyby")) {
         try need.key(d, item, "key_expression");
     } else if (mem.eql(u8, op_type, "flatmap")) {
@@ -2250,4 +2259,10 @@ test "parser: an operator missing what it needs, or with an unknown mode, is ref
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of tumbling|count, not \"sliding\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_size\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_size\" must be at least 1, not 0 at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"kv_lookup\", \"lookup_key\": \"k\", \"mode\": \"join\" } ],", "", ""), ParseError.InvalidFieldType, "\"mode\" must be one of filter|enrich, not \"join\" at operators[0]");
+}
+
+test "parser: a filter or classify condition the operator can't evaluate is refused at parse" {
+    try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"valeu_contains:x\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"valeu_contains:x\": unknown condition at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"\": the condition is empty at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"not_empty\", \"tag\": \"a\" }, { \"condition\": \"json:amount>lots\", \"tag\": \"b\" } ] } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"json:amount>lots\": a json: >, >=, < or <= needs a finite decimal number at operators[0].rules[1]");
 }

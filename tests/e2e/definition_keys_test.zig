@@ -139,3 +139,31 @@ test "definition keys: a pipeline with an unknown key is refused by name, raw an
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), unknown_op.status);
     try testing.expectEqualStrings("unknown operator type \"fliter\" (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify) at operators[0]", unknown_op.message());
 }
+
+const bad_condition =
+    \\kind: Processing
+    \\name: typo-filter
+    \\sources:
+    \\  - stream:
+    \\      name: in
+    \\operators:
+    \\  - type: filter
+    \\    condition: "valeu_contains:payment"
+    \\sinks:
+    \\  - stream:
+    \\      name: out
+;
+const bad_condition_message = "bad condition \"valeu_contains:payment\": unknown condition at operators[0]";
+
+test "definition keys: a filter condition the operator can't evaluate is refused, not run as match-all" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const raw = try sendRaw(ctx, .processing_submit, "", bad_condition);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
+    try testing.expectEqualStrings(bad_condition_message, raw.message());
+
+    const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_condition, "typo-filter.yaml");
+    defer testing.allocator.free(cli);
+    try testing.expectEqualStrings("Error: " ++ bad_condition_message, cli);
+}
