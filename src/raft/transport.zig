@@ -203,10 +203,10 @@ pub fn deserializeVoteRequest(data: []const u8) ?VoteRequest {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — VoteResponse (14 bytes)
+// Serialization — VoteResponse (22 bytes; the last 8 are the sender's clock)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const VOTE_RESP_SIZE: usize = 14;
+pub const VOTE_RESP_SIZE: usize = 22;
 
 pub fn serializeVoteResponse(resp: VoteResponse, buf: []u8) ?usize {
     if (buf.len < VOTE_RESP_SIZE) return null;
@@ -219,6 +219,8 @@ pub fn serializeVoteResponse(resp: VoteResponse, buf: []u8) ?usize {
     off += 4;
     buf[off] = if (resp.is_pre_vote) 1 else 0;
     off += 1;
+    std.mem.writeInt(u64, buf[off..][0..8], resp.clock_ns, .little);
+    off += 8;
     return off;
 }
 
@@ -232,19 +234,21 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
     const from = std.mem.readInt(u32, data[off..][0..4], .little);
     off += 4;
     const is_pre_vote = data[off] != 0;
+    off += 1;
     return .{
         .term = term,
         .vote_granted = granted,
         .from = from,
         .is_pre_vote = is_pre_vote,
+        .clock_ns = std.mem.readInt(u64, data[off..][0..8], .little),
     };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — AppendResponse (30 bytes; the last is the guarded flag)
+// Serialization — AppendResponse (46 bytes; the last 8 are the sender's clock)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 38;
+pub const APPEND_RESP_SIZE: usize = 46;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -262,6 +266,8 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     buf[off] = @intFromBool(resp.guarded);
     off += 1;
     std.mem.writeInt(u64, buf[off..][0..8], resp.leader_commit, .little);
+    off += 8;
+    std.mem.writeInt(u64, buf[off..][0..8], resp.clock_ns, .little);
     off += 8;
     return off;
 }
@@ -287,6 +293,7 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
         .hint_index = hint_index,
         .guarded = data[off] & 1 != 0,
         .leader_commit = std.mem.readInt(u64, data[off + 1 ..][0..8], .little),
+        .clock_ns = std.mem.readInt(u64, data[off + 9 ..][0..8], .little),
     };
 }
 
@@ -583,42 +590,32 @@ test "transport: VoteRequest roundtrip" {
     try testing.expectEqual(req.is_pre_vote, r.is_pre_vote);
 }
 
-test "transport: VoteResponse roundtrip" {
-    const resp = VoteResponse{
-        .term = 10,
-        .vote_granted = true,
-        .from = 3,
-    };
-
-    var buf: [32]u8 = undefined;
-    const written = serializeVoteResponse(resp, &buf);
-    try testing.expect(written != null);
-
-    const recovered = deserializeVoteResponse(&buf).?;
-    try testing.expectEqual(resp.term, recovered.term);
-    try testing.expectEqual(resp.vote_granted, recovered.vote_granted);
-    try testing.expectEqual(resp.from, recovered.from);
+/// A `T` with every field set away from its default, so a round trip
+/// that drops a field, one added later included, fails.
+fn everyFieldSet(comptime T: type) T {
+    var v: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
+        @field(v, f.name) = switch (@typeInfo(f.type)) {
+            .bool => true,
+            .int => @intCast(1000 + i * 7),
+            else => @compileError("everyFieldSet: add a case for " ++ @typeName(f.type)),
+        };
+    }
+    return v;
 }
 
-test "transport: AppendResponse roundtrip" {
-    const resp = AppendResponse{
-        .term = 55,
-        .success = false,
-        .match_index = 999,
-        .from = 2,
-        .leader_commit = 990,
-    };
+test "transport: VoteResponse roundtrip carries every field" {
+    const resp = everyFieldSet(VoteResponse);
+    var buf: [VOTE_RESP_SIZE]u8 = undefined;
+    try testing.expectEqual(@as(?usize, VOTE_RESP_SIZE), serializeVoteResponse(resp, &buf));
+    try testing.expectEqual(resp, deserializeVoteResponse(&buf).?);
+}
 
+test "transport: AppendResponse roundtrip carries every field" {
+    const resp = everyFieldSet(AppendResponse);
     var buf: [APPEND_RESP_SIZE]u8 = undefined;
-    const written = serializeAppendResponse(resp, &buf);
-    try testing.expect(written != null);
-
-    const recovered = deserializeAppendResponse(&buf).?;
-    try testing.expectEqual(resp.leader_commit, recovered.leader_commit);
-    try testing.expectEqual(resp.term, recovered.term);
-    try testing.expectEqual(resp.success, recovered.success);
-    try testing.expectEqual(resp.match_index, recovered.match_index);
-    try testing.expectEqual(resp.from, recovered.from);
+    try testing.expectEqual(@as(?usize, APPEND_RESP_SIZE), serializeAppendResponse(resp, &buf));
+    try testing.expectEqual(resp, deserializeAppendResponse(&buf).?);
 }
 
 test "transport: AppendRequest roundtrip with entries" {
@@ -705,7 +702,7 @@ test "transport: full message framing roundtrip" {
 }
 
 test "transport: CRC corruption detected" {
-    var payload_buf: [16]u8 = undefined;
+    var payload_buf: [VOTE_RESP_SIZE]u8 = undefined;
     const plen = serializeVoteResponse(.{
         .term = 1,
         .vote_granted = true,

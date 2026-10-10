@@ -226,6 +226,18 @@ pub const UAL = struct {
         return null;
     }
 
+    /// The header of the entry at `index`, while it is in the ring: always
+    /// whole, whatever the payload does at the ring's edge.
+    pub fn readHeader(self: *const UAL, index: u64) ?Header {
+        const pos = self.index_map.get(index) orelse return null;
+        if (pos < self.read_pos) return null;
+        var hdr_buf: [HEADER_SIZE]u8 = undefined;
+        self.readFromRing(pos, &hdr_buf);
+        const hdr: *const Header = @ptrCast(@alignCast(&hdr_buf));
+        if (hdr.magic != entry_mod.ENTRY_MAGIC) return null;
+        return hdr.*;
+    }
+
     /// Read an entry by index, copying payload into a caller-provided buffer.
     /// Works even if the payload wraps around the ring boundary.
     pub fn readCopy(self: *const UAL, index: u64, payload_buf: []u8) ?Entry {

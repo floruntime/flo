@@ -54,6 +54,9 @@ pub const Invariant = enum {
     /// committed before it: two in flight, or voters changed by more than
     /// one.
     config_safety,
+    /// A committed entry stamped no later than the one before it: the
+    /// leader's stamps must order the log whatever the clocks do.
+    stamp_order,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -220,6 +223,14 @@ const SimNode = struct {
     last_heartbeat: [network_mod.MAX_NODES + 1]u64,
     /// Its clock runs at 1 + this / 1e6 of the simulation's.
     clock_rate_ppm: i32 = 0,
+    /// Its wall clock's error, and the wall clock its Raft node reads,
+    /// set each tick.
+    wall_offset_ms: i64 = 0,
+    wall_ns: u64 = 0,
+    /// The stamp of the last entry it applied, and that entry's index, for
+    /// `stamp_order`.
+    applied_stamp: u64 = 0,
+    applied_stamp_index: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
 };
@@ -422,6 +433,9 @@ pub const Simulator = struct {
     scenario: Scenario,
     options: Options,
     prng: PRNG,
+    /// Clock skew and steps draw from their own stream, so a scenario
+    /// without skew replays as it did before skew existed.
+    clock_prng: PRNG,
     nodes: []SimNode,
     net: SimNetwork,
     workload: Workload,
@@ -471,6 +485,7 @@ pub const Simulator = struct {
             .scenario = scenario,
             .options = options,
             .prng = PRNG.init(scenario.seed ^ 0x51D0_2A7E),
+            .clock_prng = PRNG.init(scenario.seed ^ 0xC10C_5EED),
             .nodes = try allocator.alloc(SimNode, scenario.node_count),
             .net = SimNetwork.init(allocator),
             .workload = try Workload.init(allocator, &scenario),
@@ -508,6 +523,11 @@ pub const Simulator = struct {
                 const d: i32 = @intCast(scenario.clock_drift_ppm);
                 node.clock_rate_ppm = self.prng.random().intRangeAtMost(i32, -d, d);
             }
+            if (scenario.clock_skew_ms > 0) {
+                const k: i64 = scenario.clock_skew_ms;
+                node.wall_offset_ms = self.clock_prng.random().intRangeAtMost(i64, -k, k);
+            }
+            attachWall(node);
             for (self.nodes, 0..) |_, j| {
                 if (i != j) node.raft.addPeer(@intCast(j + 1));
             }
@@ -515,6 +535,7 @@ pub const Simulator = struct {
         }
         // Hooks attach after (empty) replay, mirroring production wiring.
         for (self.nodes) |*node| self.attachDisk(node);
+        self.setWallClocks();
         return self;
     }
 
@@ -661,6 +682,9 @@ pub const Simulator = struct {
             self.scenario.log_capacity,
             self.raftConfig(),
         );
+        attachWall(node);
+        node.applied_stamp = 0;
+        node.applied_stamp_index = 0;
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
@@ -925,6 +949,39 @@ pub const Simulator = struct {
         return outcome;
     }
 
+    /// Where the simulation's wall clock starts: far enough from 0 that no
+    /// skew takes a node's below it.
+    const WALL_EPOCH_MS: u64 = 1_700_000_000_000;
+
+    fn attachWall(node: *SimNode) void {
+        node.raft.wall_clock = .{ .ctx = &node.wall_ns, .now_ns = readWall };
+    }
+
+    fn readWall(ctx: ?*anyopaque) u64 {
+        const wall: *const u64 = @ptrCast(@alignCast(ctx.?));
+        return wall.*;
+    }
+
+    /// Each node's wall clock for this tick: its own drifting time, off by
+    /// its skew. Now and then one steps, mostly back, as a host's does when
+    /// NTP corrects it.
+    fn setWallClocks(self: *Simulator) void {
+        const k: i64 = self.scenario.clock_skew_ms;
+        if (k > 0) {
+            const r = self.clock_prng.random();
+            if (r.uintLessThan(u32, 2000) == 0) {
+                const node = &self.nodes[r.uintLessThan(usize, self.nodes.len)];
+                const step = r.intRangeAtMost(i64, 1, k);
+                node.wall_offset_ms += if (r.uintLessThan(u8, 4) == 0) step else -step;
+                node.wall_offset_ms = std.math.clamp(node.wall_offset_ms, -2 * k, 2 * k);
+            }
+        }
+        for (self.nodes) |*node| {
+            const ms = @as(i64, @intCast(WALL_EPOCH_MS + self.nodeNow(node))) + node.wall_offset_ms;
+            node.wall_ns = @as(u64, @intCast(ms)) * std.time.ns_per_ms;
+        }
+    }
+
     /// The node's own clock: the simulation's, run fast or slow by its
     /// drift, as a real host's is against another's.
     fn nodeNow(self: *const Simulator, node: *const SimNode) u64 {
@@ -1069,7 +1126,7 @@ pub const Simulator = struct {
         if (n == 0) return;
         const target = self.node_(leaders[r.uintLessThan(usize, n)]);
         const op = try self.workload.nextOp();
-        const res = target.raft.propose(op.entry_type, 0, 0, op.payload) catch return;
+        const res = target.raft.propose(op.entry_type, 0, op.payload) catch return;
         self.workload.recordProposal(op.id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, op.id);
     }
@@ -1113,6 +1170,14 @@ pub const Simulator = struct {
             if (!node.up) continue;
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
+                // Apply rewound (async flush lost committed history and the
+                // log took the leader's): the entry before is the log's now.
+                const stamp_before: ?u64 = if (idx == node.applied_stamp_index + 1)
+                    node.applied_stamp
+                else if (node.raft.log.getEntryCopy(idx - 1, self.apply_buf)) |prev|
+                    prev.header.timestamp_ns
+                else
+                    null;
                 // Never bare getEntry (the wrap-null trap). A restarted
                 // node's durable log can exceed its ring; the log reads the
                 // rest from the disk itself.
@@ -1123,6 +1188,16 @@ pub const Simulator = struct {
                 // The group's own entries (noops, configs) are history too,
                 // but carry no workload op.
                 const is_op = e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_noop) and e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config);
+                if (stamp_before != null and e.header.timestamp_ns <= stamp_before.?) self.checker.fail(.{
+                    .invariant = .stamp_order,
+                    .node = node.id,
+                    .index = idx,
+                    .tick = self.now,
+                    .detail = "committed entry stamped no later than the one before it",
+                });
+                node.applied_stamp = e.header.timestamp_ns;
+                node.applied_stamp_index = idx;
+                node.raft.noteApplied(e.header.timestamp_ns);
                 self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
                 // A config applied is committed, as production's applier
                 // records it.
@@ -1327,6 +1402,7 @@ pub const Simulator = struct {
     /// the guarantee stands.
     fn tick(self: *Simulator) !void {
         self.now += 1;
+        self.setWallClocks();
         try self.deliverAll();
         try self.tickNodes();
         try self.submitOps();
@@ -1811,7 +1887,7 @@ test "vopr sim: a wiped voter's acks to a stale leader count toward no commit" {
     sim.net.isolated[l - 1] = false;
     try testing.expect(lead.raft.role == .leader);
     const op = try sim.workload.nextOp();
-    const res = try lead.raft.propose(op.entry_type, 0, 0, op.payload);
+    const res = try lead.raft.propose(op.entry_type, 0, op.payload);
     var i: usize = 0;
     while (i < 20 and lead.raft.commit_index < res.index) : (i += 1) try runTicks(&sim, 300);
     // X's acks are guarded, so L commits nothing over C's history.

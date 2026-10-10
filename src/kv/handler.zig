@@ -283,24 +283,18 @@ pub const KVHandler = struct {
             return;
         }
 
-        // Compute absolute expiry_ns for any TTL the request carries.
-        var put_expiry_ns: u64 = 0;
-        const put_ttl = req.getTtlMs() catch {
+        // The TTL travels as given; apply counts it from the entry's stamp.
+        const put_ttl_ms = (req.getTtlMs() catch {
             sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } });
             return;
-        };
-        if (put_ttl) |ttl_ms| {
-            if (ttl_ms > 0) {
-                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                put_expiry_ns = time_units.expiryNs(now_ns, ttl_ms) orelse {
-                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
-                    return;
-                };
-            }
+        }) orelse 0;
+        if (time_units.msToNs(put_ttl_ms) == null) {
+            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+            return;
         }
 
         // Inside a transaction? Buffer instead of proposing.
-        if (tryHandleInTxn(shard, conn, req, qkey, .put, req.value, put_expiry_ns)) return;
+        if (tryHandleInTxn(shard, conn, req, qkey, .put, req.value, put_ttl_ms)) return;
 
         // Build CommandPayload and propose through Raft (uses qualified key)
         const proposed = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| return proposeFailed(shard, conn, req, err);
@@ -410,9 +404,10 @@ pub const KVHandler = struct {
             return;
         };
 
-        // Reject INCR against an existing non-counter value (string of != 8 bytes).
-        if (shard.kv_handler.*.kv.getRaw(qkey)) |existing| {
-            if (!existing.tombstone and existing.value.len != 8) {
+        // Reject INCR against a live non-counter value (string of != 8
+        // bytes). A key whose TTL has run out is absent, as apply treats it.
+        if (shard.kv_handler.*.kv.get(qkey)) |existing| {
+            if (existing.value.len != 8) {
                 sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "value is not a counter" } });
                 return;
             }
@@ -497,31 +492,27 @@ pub const KVHandler = struct {
             }
         }
 
-        // Compute absolute expiry_ns from ttl_ms, or 0 to clear.
-        var expiry_ns: u64 = 0;
+        // The TTL in ms, or 0 to clear; apply counts it from the entry's stamp.
+        var ttl_ms: u64 = 0;
         if (!force_persist) {
-            var ttl_ms: u64 = 0;
             if (req.value.len == 8) {
                 ttl_ms = std.mem.readInt(u64, req.value[0..8], .little);
             } else if (req.value.len != 0) {
                 sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "touch: value must be empty or 8-byte u64 LE" } });
                 return;
             }
-            if (ttl_ms > 0) {
-                const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-                expiry_ns = time_units.expiryNs(now_ns, ttl_ms) orelse {
-                    sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
-                    return;
-                };
+            if (time_units.msToNs(ttl_ms) == null) {
+                sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
+                return;
             }
         }
 
         var val_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &val_buf, expiry_ns, .little);
+        std.mem.writeInt(u64, &val_buf, ttl_ms, .little);
 
         // Inside a transaction? Buffer touch/persist.
         const txn_op_kind: txn_mod.TxnOpKind = if (force_persist) .persist else .touch;
-        if (tryHandleInTxn(shard, conn, req, qkey, txn_op_kind, &val_buf, expiry_ns)) return;
+        if (tryHandleInTxn(shard, conn, req, qkey, txn_op_kind, &val_buf, 0)) return;
 
         const proposed = proposeKVEntryWithValue(shard, .kv_touch, req, qkey, &val_buf) catch |err| return proposeFailed(shard, conn, req, err);
         shard.park(conn, req, proposed, respondOk);
@@ -952,7 +943,7 @@ pub const KVHandler = struct {
 
     /// Like `proposeKVEntry` but uses a caller-supplied value override instead
     /// of `req.value`. Used by INCR (8-byte i64 LE delta) and TOUCH/PERSIST
-    /// (8-byte u64 LE absolute expiry_ns).
+    /// (8-byte u64 LE TTL in ms).
     fn proposeKVEntryWithValue(
         shard: *Shard,
         entry_type: entry_mod.EntryType,
@@ -977,21 +968,19 @@ pub const KVHandler = struct {
             flags |= entry_mod.Flags.TOMBSTONE;
         }
 
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-
         if (entry_type == .kv_put) {
             if (req.getTtlMs() catch return error.TtlNot8Bytes) |ttl_ms| {
                 if (ttl_ms > 0) {
                     flags |= entry_mod.Flags.HAS_TTL;
                     // JSON set/delete reach here without dispatchPut's check.
-                    const expiry_ns = time_units.expiryNs(timestamp_ns, ttl_ms) orelse return error.TtlTooLarge;
-                    std.mem.writeInt(u64, payload_buf[payload_len..][0..8], expiry_ns, .little);
+                    if (time_units.msToNs(ttl_ms) == null) return error.TtlTooLarge;
+                    std.mem.writeInt(u64, payload_buf[payload_len..][0..8], ttl_ms, .little);
                     payload_len += 8;
                 }
             }
         }
 
-        return try shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
+        return try shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
     }
 
     // ── Per-Shard Transactions ─────────────────────────────────────────
@@ -1094,8 +1083,7 @@ pub const KVHandler = struct {
             return;
         };
 
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, timestamp_ns, payload_buf[0..written]) catch |err| return proposeFailed(shard, conn, req, err);
+        const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload_buf[0..written]) catch |err| return proposeFailed(shard, conn, req, err);
         // The transaction stays in the table until its batch applies; the
         // responder drops it.
         shard.park(conn, req, proposed, respondCommitTxn);
@@ -1174,7 +1162,7 @@ pub const KVHandler = struct {
         qkey: []const u8,
         op_kind: txn_mod.TxnOpKind,
         op_value: []const u8,
-        expiry_ns: u64,
+        ttl_ms: u64,
     ) bool {
         const txn_opt = req.findOption(.txn_id) orelse return false;
         const txn_id = txn_opt.asU64() orelse {
@@ -1202,7 +1190,7 @@ pub const KVHandler = struct {
         // For reads, op_kind is `.put` placeholder \u2014 caller will indicate via op_value.len?
         // We use a dedicated branch in the per-handler call sites instead.
 
-        txn_table.appendOp(txn_id, op_kind, qkey, op_value, expiry_ns) catch |err| {
+        txn_table.appendOp(txn_id, op_kind, qkey, op_value, ttl_ms) catch |err| {
             const result: CommandResult = switch (err) {
                 error.TxnTooLarge => .{ .err = .{ .code = .kv_txn_too_large, .message = "transaction op or payload limit exceeded" } },
                 error.OutOfMemory => .{ .err = .{ .code = .internal_error, .message = "oom buffering txn op" } },

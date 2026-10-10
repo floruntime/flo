@@ -83,6 +83,9 @@ pub const ApplyResult = enum(u8) {
 pub const ProjectionRouter = struct {
     /// Last applied UAL index — for idempotency.
     applied_index: u64,
+    /// The latest stamp applied. A snapshot records it, so a node restored
+    /// from one stamps after it.
+    applied_stamp: u64 = 0,
 
     /// Registered projection engines (optional — set to null if not present).
     kv: ?ProjectionHandle,
@@ -157,6 +160,7 @@ pub const ProjectionRouter = struct {
 
         // Advance applied_index regardless of routing outcome
         self.applied_index = @max(self.applied_index, entry.header.index);
+        self.applied_stamp = @max(self.applied_stamp, entry.header.timestamp_ns);
         return result;
     }
 

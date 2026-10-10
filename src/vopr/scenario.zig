@@ -127,6 +127,10 @@ pub const Scenario = struct {
     /// Each node's clock runs at 1 ± up to this many parts per million of
     /// the simulation's.
     clock_drift_ppm: u32 = 0,
+    /// Each node's wall clock is set up to this far either side of true,
+    /// and now and then one steps by up to this much: what the leader's
+    /// stamps must stay ordered through.
+    clock_skew_ms: u32 = 0,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -185,6 +189,7 @@ pub const Scenario = struct {
             .max_lost_nodes = if (node_count >= 5 and r.boolean()) 2 else 1,
             .config_change_permille = if (r.uintLessThan(u8, 3) == 0) r.intRangeAtMost(u16, 1, 5) else 0,
             .clock_drift_ppm = r.intRangeAtMost(u32, 0, 2000),
+            .clock_skew_ms = if (r.boolean()) r.intRangeAtMost(u32, 1, 10_000) else 0,
         };
     }
 
@@ -248,6 +253,7 @@ pub const Scenario = struct {
         s.payload_max = 2048;
         s.config_change_permille = 0;
         s.clock_drift_ppm = 0;
+        s.clock_skew_ms = 0;
         return s;
     }
 
@@ -285,7 +291,8 @@ pub const Scenario = struct {
             \\  "heartbeat_interval_ms": {d},
             \\  "rpc_timeout_ms": {d},
             \\  "config_change_permille": {d},
-            \\  "clock_drift_ppm": {d}
+            \\  "clock_drift_ppm": {d},
+            \\  "clock_skew_ms": {d}
             \\}}
             \\
         , .{
@@ -298,7 +305,7 @@ pub const Scenario = struct {
             self.wipe_permille,           self.max_lost_nodes,        self.request_percent,
             self.payload_min,             self.payload_max,           self.election_timeout_min_ms,
             self.election_timeout_max_ms, self.heartbeat_interval_ms, self.rpc_timeout_ms,
-            self.config_change_permille,  self.clock_drift_ppm,
+            self.config_change_permille,  self.clock_drift_ppm,       self.clock_skew_ms,
         });
     }
 
@@ -344,6 +351,8 @@ pub const Scenario = struct {
             .rpc_timeout_ms = try jsonU64(obj, "rpc_timeout_ms"),
             .config_change_permille = try jsonInt(u16, obj, "config_change_permille"),
             .clock_drift_ppm = try jsonInt(u32, obj, "clock_drift_ppm"),
+            // Absent from pins written before it: those ran without skew.
+            .clock_skew_ms = if (obj.get("clock_skew_ms") == null) 0 else try jsonInt(u32, obj, "clock_skew_ms"),
         };
     }
 };
@@ -452,9 +461,10 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 29), obj.count());
+    try testing.expectEqual(@as(usize, 30), obj.count());
     try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);
     try testing.expectEqual(@as(i64, s.clock_drift_ppm), obj.get("clock_drift_ppm").?.integer);
+    try testing.expectEqual(@as(i64, s.clock_skew_ms), obj.get("clock_skew_ms").?.integer);
     try testing.expectEqual(@as(i64, s.wipe_permille), obj.get("wipe_permille").?.integer);
     try testing.expectEqual(@as(i64, 99), obj.get("seed").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.log_capacity)), obj.get("log_capacity").?.integer);

@@ -587,6 +587,10 @@ pub const ShardMetrics = struct {
     /// request waits for room to go to another shard, or their answers are
     /// unsent.
     connections_paused: [PAUSE_REASONS.len]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// On a leader, how far its clock was from the last stamp it gave, in
+    /// ms: positive when the voters' clock held the stamp back, negative
+    /// when its own clock was behind the log's time.
+    stamp_skew_ms: Atomic(i64) = Atomic(i64).init(0),
 
     /// Labels for `connections_paused`: the shard's wait reasons, in order,
     /// then paused for unsent answers.
@@ -677,6 +681,10 @@ pub const ShardMetrics = struct {
         _ = self.handler_no_answer.fetchAdd(1, .monotonic);
     }
 
+    pub fn setStampSkew(self: *ShardMetrics, ms: i64) void {
+        self.stamp_skew_ms.store(ms, .monotonic);
+    }
+
     pub fn recordStreamSkippedAppend(self: *ShardMetrics) void {
         _ = self.stream_skipped_appends.fetchAdd(1, .monotonic);
     }
@@ -700,6 +708,7 @@ pub const ShardMetrics = struct {
         cross_shard_timeouts: u64,
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
+        stamp_skew_ms: i64,
     };
 
     pub fn snapshot(self: *const ShardMetrics) Snapshot {
@@ -721,6 +730,7 @@ pub const ShardMetrics = struct {
             .stream_skipped_appends = self.stream_skipped_appends.load(.monotonic),
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
+            .stamp_skew_ms = self.stamp_skew_ms.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
                 for (&out, &self.connections_paused) |*o, *g| o.* = g.load(.monotonic);
@@ -1505,6 +1515,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
     try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
+    const skew = @abs(snap.stamp_skew_ms);
+    try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });
     inline for (ShardMetrics.PAUSE_REASONS, 0..) |reason, i| {
         try writer.print("flo_shard_connections_paused{{shard_id=\"{d}\",reason=\"" ++ reason ++ "\"}} {d}\n", .{ snap.shard_id, snap.connections_paused[i] });

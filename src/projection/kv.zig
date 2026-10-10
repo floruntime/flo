@@ -18,6 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
+const time_units = @import("../util/time_units.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -102,6 +103,30 @@ pub const KVProjection = struct {
 
     /// Stats.
     stats: Stats,
+    /// What "now" is when a read judges expiry.
+    read_clock: ReadClock = .{},
+
+    /// The shard points this at its Raft node, so a read judges expiry by
+    /// the same time line the entry stamps follow: a key a replica has
+    /// already treated as expired at apply never reads back as live. The
+    /// default, the wall clock, is for a projection on its own.
+    pub const ReadClock = struct {
+        ctx: ?*const anyopaque = null,
+        now_ns: *const fn (?*const anyopaque) u64 = wallNs,
+
+        fn wallNs(_: ?*const anyopaque) u64 {
+            return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
+        }
+    };
+
+    fn readNow(self: *const KVProjection) u64 {
+        return self.read_clock.now_ns(self.read_clock.ctx);
+    }
+
+    /// Whether `entry` has a TTL that had run out by `at_ns`.
+    fn expiredAt(entry: *const KVEntry, at_ns: u64) bool {
+        return entry.expiry_ns > 0 and entry.expiry_ns <= at_ns;
+    }
 
     pub const Stats = struct {
         puts: u64 = 0,
@@ -212,7 +237,7 @@ pub const KVProjection = struct {
         const entry = self.map.getPtr(key) orelse return null;
         if (entry.tombstone) return null;
         // Check TTL
-        if (entry.expiry_ns > 0 and entry.expiry_ns <= @import("stdx").time.nanoTimestamp()) {
+        if (expiredAt(entry, self.readNow())) {
             // Lazily expire — don't remove yet, just return null
             return null;
         }
@@ -264,9 +289,11 @@ pub const KVProjection = struct {
     /// the new value. Returns error.NotACounter if the existing value is not
     /// the expected width, and error.Overflow on signed-integer overflow.
     pub fn applyIncr(self: *KVProjection, key: []const u8, delta: i64, lsn: u64, term: u64, timestamp_ns: u64) !i64 {
+        // A counter whose TTL ran out by this entry's stamp starts again
+        // from zero, on every replica alike.
         var current: i64 = 0;
         if (self.map.getPtr(key)) |existing| {
-            if (!existing.tombstone) {
+            if (!existing.tombstone and !expiredAt(existing, timestamp_ns)) {
                 if (existing.value.len != 8) return error.NotACounter;
                 current = std.mem.readInt(i64, existing.value[0..8], .little);
             }
@@ -284,10 +311,11 @@ pub const KVProjection = struct {
     /// Update the TTL of an existing key without rewriting the value.
     /// `expiry_ns = 0` clears the TTL (PERSIST). Updates lsn/term/timestamp_ns
     /// but leaves `version` unchanged (TTL changes are not value mutations).
-    /// Returns error.NotFound if the key does not exist or is tombstoned.
+    /// Returns error.NotFound if the key does not exist, is tombstoned, or
+    /// its TTL ran out by `timestamp_ns`.
     pub fn applyTouch(self: *KVProjection, key: []const u8, expiry_ns: u64, lsn: u64, term: u64, timestamp_ns: u64) !void {
         const existing = self.map.getPtr(key) orelse return error.NotFound;
-        if (existing.tombstone) return error.NotFound;
+        if (existing.tombstone or expiredAt(existing, timestamp_ns)) return error.NotFound;
         existing.expiry_ns = expiry_ns;
         existing.lsn = lsn;
         existing.term = term;
@@ -298,14 +326,14 @@ pub const KVProjection = struct {
     /// Caller provides a bounded output buffer.
     pub fn scan(self: *KVProjection, out: []ScanEntry) usize {
         self.stats.scans += 1;
-        const now = @import("stdx").time.nanoTimestamp();
+        const now = self.readNow();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
             if (count_written >= out.len) break;
             const entry = kv.value_ptr;
             if (entry.tombstone) continue;
-            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue; // expired
+            if (expiredAt(entry, now)) continue;
             out[count_written] = .{
                 .key = entry.key,
                 .value = entry.value,
@@ -319,14 +347,14 @@ pub const KVProjection = struct {
     /// Scan entries matching a key prefix.
     pub fn scanPrefix(self: *KVProjection, prefix: []const u8, out: []ScanEntry) usize {
         self.stats.scans += 1;
-        const now = @import("stdx").time.nanoTimestamp();
+        const now = self.readNow();
         var count_written: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
             if (count_written >= out.len) break;
             const entry = kv.value_ptr;
             if (entry.tombstone) continue;
-            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue; // expired
+            if (expiredAt(entry, now)) continue;
             if (entry.key.len >= prefix.len and
                 std.mem.eql(u8, entry.key[0..prefix.len], prefix))
             {
@@ -347,14 +375,14 @@ pub const KVProjection = struct {
     /// projection while references are alive (guaranteed by single-threaded shard).
     pub fn scanKeyNames(self: *KVProjection, prefix: []const u8, out: [][]const u8) usize {
         self.stats.scans += 1;
-        const now = @import("stdx").time.nanoTimestamp();
+        const now = self.readNow();
         var n_found: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
             if (n_found >= out.len) break;
             const entry = kv.value_ptr;
             if (entry.tombstone) continue;
-            if (entry.expiry_ns > 0 and entry.expiry_ns <= now) continue;
+            if (expiredAt(entry, now)) continue;
             if (prefix.len > 0) {
                 if (entry.key.len < prefix.len or
                     !std.mem.eql(u8, entry.key[0..prefix.len], prefix)) continue;
@@ -544,7 +572,7 @@ pub const KVProjection = struct {
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
-                    extractExpiry(entry, &cmd),
+                    time_units.expiryAfter(entry.header.timestamp_ns, extractTtlMs(entry, &cmd)),
                 );
             },
             .kv_delete => {
@@ -571,7 +599,7 @@ pub const KVProjection = struct {
                             entry.header.index,
                             entry.header.term,
                             entry.header.timestamp_ns,
-                            op.expiry_ns,
+                            time_units.expiryAfter(entry.header.timestamp_ns, op.ttl_ms),
                         ),
                         .delete => try self.delete(
                             op.key,
@@ -597,7 +625,8 @@ pub const KVProjection = struct {
                         .touch, .persist => {
                             const expiry_ns: u64 = if (op.kind == .persist) 0 else blk: {
                                 if (op.value.len != 8) return error.InvalidPayload;
-                                break :blk std.mem.readInt(u64, op.value[0..8], .little);
+                                const ttl_ms = std.mem.readInt(u64, op.value[0..8], .little);
+                                break :blk time_units.expiryAfter(entry.header.timestamp_ns, ttl_ms);
                             };
                             self.applyTouch(
                                 op.key,
@@ -633,15 +662,15 @@ pub const KVProjection = struct {
                 };
             },
             .kv_touch => {
-                // Payload: CommandPayload where value is the 8-byte u64 LE expiry_ns
-                // (0 = clear TTL / PERSIST).
+                // Payload: CommandPayload where value is the 8-byte u64 LE TTL
+                // in milliseconds from this entry's stamp (0 = clear TTL / PERSIST).
                 const cmd = CommandPayload.deserialize(entry.payload) orelse
                     return error.InvalidPayload;
                 if (cmd.value.len != 8) return error.InvalidPayload;
-                const expiry_ns = std.mem.readInt(u64, cmd.value[0..8], .little);
+                const ttl_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
                 self.applyTouch(
                     cmd.key,
-                    expiry_ns,
+                    time_units.expiryAfter(entry.header.timestamp_ns, ttl_ms),
                     entry.header.index,
                     entry.header.term,
                     entry.header.timestamp_ns,
@@ -657,9 +686,10 @@ pub const KVProjection = struct {
         self.applied_index = entry.header.index;
     }
 
-    /// Extract expiry_ns from a UAL entry if the HAS_TTL flag is set.
-    /// TTL is encoded as 8 bytes of u64 LE appended after the CommandPayload data.
-    fn extractExpiry(entry: *const Entry, cmd: *const CommandPayload) u64 {
+    /// The TTL in milliseconds a UAL entry carries if the HAS_TTL flag is set,
+    /// encoded as 8 bytes of u64 LE after the CommandPayload data. It counts
+    /// from the entry's stamp, so every replica computes the same expiry.
+    fn extractTtlMs(entry: *const Entry, cmd: *const CommandPayload) u64 {
         const Flags = entry_mod.Flags;
         if (entry.header.flags & Flags.HAS_TTL == 0) return 0;
 
@@ -1206,4 +1236,109 @@ test "kv: serialize empty projection" {
 
     try kv2.deserialize(data);
     try testing.expectEqual(@as(usize, 0), kv2.count());
+}
+
+// ── Time: TTLs count from the entry's stamp ──────────────────────────────
+
+/// A clock a test sets, for reads.
+const TestReadClock = struct {
+    ns: u64,
+
+    fn read(ctx: ?*const anyopaque) u64 {
+        const self: *const TestReadClock = @ptrCast(@alignCast(ctx.?));
+        return self.ns;
+    }
+};
+
+/// A kv entry of `entry_type` for `key` at `index`, stamped `stamp`;
+/// `value` is the command's value, and a non-zero `ttl_ms` goes after it.
+fn stampedEntry(buf: []u8, entry_type: entry_mod.EntryType, key: []const u8, value: []const u8, index: u64, stamp: u64, ttl_ms: u64) entry_mod.Entry {
+    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = @intCast(key.len), .value_length = @intCast(value.len), .key = key, .value = value };
+    var len = cmd.serialize(buf) orelse unreachable;
+    var flags: u16 = 0;
+    if (ttl_ms > 0) {
+        flags = entry_mod.Flags.HAS_TTL;
+        std.mem.writeInt(u64, buf[len..][0..8], ttl_ms, .little);
+        len += 8;
+    }
+    return entry_mod.buildEntry(entry_type, flags, 1, index, stamp, buf[0..len]);
+}
+
+test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on every replica alike, and reads judge it by the read clock" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    var clock: TestReadClock = .{ .ns = 0 };
+    kv.read_clock = .{ .ctx = &clock, .now_ns = TestReadClock.read };
+    const stamp: u64 = 1_000 * std.time.ns_per_s;
+    var buf: [128]u8 = undefined;
+    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "k", "v", 1, stamp, 5_000));
+    try testing.expectEqual(stamp + 5 * std.time.ns_per_s, kv.getRaw("k").?.expiry_ns);
+
+    clock.ns = stamp + 5 * std.time.ns_per_s - 1;
+    try testing.expect(kv.get("k") != null);
+    var out: [4]ScanEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), kv.scan(&out));
+    clock.ns += 1;
+    try testing.expect(kv.get("k") == null);
+    try testing.expectEqual(@as(usize, 0), kv.scan(&out));
+    try testing.expectEqual(@as(usize, 0), kv.scanPrefix("k", &out));
+    var names: [4][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), kv.scanKeyNames("", &names));
+
+    // TOUCH counts from its own entry's stamp; PERSIST clears it.
+    var tb: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tb, 60_000, .little);
+    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "t", "v", 2, stamp, 1_000));
+    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 3, stamp + 500 * std.time.ns_per_ms, 0));
+    try testing.expectEqual(stamp + 60_500 * std.time.ns_per_ms, kv.getRaw("t").?.expiry_ns);
+    std.mem.writeInt(u64, &tb, 0, .little);
+    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 4, stamp + std.time.ns_per_s, 0));
+    try testing.expectEqual(@as(u64, 0), kv.getRaw("t").?.expiry_ns);
+}
+
+test "kv: a key whose TTL ran out by an entry's stamp is gone to that entry: incr starts again from zero and touch finds nothing" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    const stamp: u64 = 1_000 * std.time.ns_per_s;
+    var buf: [128]u8 = undefined;
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(i64, &counter, 7, .little);
+    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "c", &counter, 1, stamp, 1_000));
+    var delta: [8]u8 = undefined;
+    std.mem.writeInt(i64, &delta, 1, .little);
+    // Before the TTL runs out it counts on; after, it starts again.
+    try kv.applyEntry(&stampedEntry(&buf, .kv_incr, "c", &delta, 2, stamp + 999 * std.time.ns_per_ms, 0));
+    try testing.expectEqual(@as(i64, 8), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
+    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "c", &counter, 3, stamp + 2 * std.time.ns_per_s, 1_000));
+    try kv.applyEntry(&stampedEntry(&buf, .kv_incr, "c", &delta, 4, stamp + 3 * std.time.ns_per_s, 0));
+    try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
+    try testing.expectEqual(@as(u64, 0), kv.getRaw("c").?.expiry_ns);
+
+    // TOUCH after the TTL ran out does not bring the key back.
+    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "t", "v", 5, stamp, 1_000));
+    var tb: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tb, 60_000, .little);
+    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 6, stamp + std.time.ns_per_s, 0));
+    try testing.expectEqual(stamp + std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
+}
+
+test "kv: a transaction's TTLs count from its batch's stamp" {
+    const txn = @import("../kv/txn.zig");
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    const stamp: u64 = 1_000 * std.time.ns_per_s;
+    var eb: [64]u8 = undefined;
+    try kv.applyEntry(&stampedEntry(&eb, .kv_put, "t", "v", 1, stamp, 0));
+    var ttl: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ttl, 30_000, .little);
+    const ops = [_]txn.TxnOp{
+        .{ .kind = .put, .key = @constCast("p"), .value = @constCast("v"), .ttl_ms = 2_000 },
+        .{ .kind = .touch, .key = @constCast("t"), .value = &ttl, .ttl_ms = 0 },
+    };
+    var buf: [256]u8 = undefined;
+    const n = try txn.serializeBatch(&buf, 0, &ops);
+    const later = stamp + 10 * std.time.ns_per_s;
+    try kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 2, later, buf[0..n]));
+    try testing.expectEqual(later + 2 * std.time.ns_per_s, kv.getRaw("p").?.expiry_ns);
+    try testing.expectEqual(later + 30 * std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
 }

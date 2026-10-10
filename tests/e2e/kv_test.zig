@@ -966,6 +966,63 @@ test "e2e/kv/cluster: delete replicates across cluster" {
     defer testing.allocator.free(after);
 }
 
+test "e2e/kv/cluster: a TTL runs out on every node, the leader included" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    const set_at = stdx.time.milliTimestamp();
+    try cluster.execOn(0, &.{ "kv", "set", "ttl_everywhere", "short_lived", "--ttl", "3s" });
+    for (0..3) |node| {
+        const seen = try cluster.pollUntilContains(node, &.{ "kv", "get", "ttl_everywhere" }, "short_lived", 20, 100);
+        testing.allocator.free(seen);
+    }
+    // Past the TTL, with room for the stamp to trail the set by a second.
+    const wait_ms = (set_at + 4_500) - stdx.time.milliTimestamp();
+    if (wait_ms > 0) stdx.time.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
+    for (0..3) |node| {
+        const out = try cluster.execCaptureAnyOn(node, &.{ "kv", "get", "ttl_everywhere", "--output", "table" });
+        defer testing.allocator.free(out);
+        if (std.mem.indexOf(u8, out, "(nil)") == null or std.mem.indexOf(u8, out, "short_lived") != null) {
+            std.debug.print("node {d} still has the key: {s}\n", .{ node, out });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "e2e/kv/cluster: a replicated leader stamps entries at the wall clock" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    // Stamps taken seconds apart move with the clock: a leader that could
+    // not hear its voters' clocks would stamp each entry 1 ns after the
+    // last, frozen at the time the cluster formed.
+    const first = try probeStamp(&cluster);
+    stdx.time.sleep(3 * std.time.ns_per_s);
+    const second = try probeStamp(&cluster);
+    if (second - first < 2_500) {
+        std.debug.print("stamps {d} and {d} ms are 3 s apart in wall time\n", .{ first, second });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Write a point without a timestamp, which takes its entry's stamp, and
+/// return that stamp from the answer ("OK (<ms>-<sequence>)"), checked to
+/// be within a second or so of the wall clock around the write.
+fn probeStamp(cluster: *ClusterContext) !i64 {
+    const before = stdx.time.milliTimestamp();
+    const out = try cluster.execCaptureOn(0, &.{ "ts", "write", "stamp_probe", "--value", "1" });
+    defer testing.allocator.free(out);
+    const after = stdx.time.milliTimestamp();
+    const open = std.mem.indexOf(u8, out, "OK (") orelse return error.TestUnexpectedResult;
+    const dash = std.mem.indexOfScalarPos(u8, out, open, '-') orelse return error.TestUnexpectedResult;
+    const stamp_ms = try std.fmt.parseInt(i64, out[open + 4 .. dash], 10);
+    if (stamp_ms < before - 1_500 or stamp_ms > after + 1_500) {
+        std.debug.print("stamp {d} ms is not near the wall clock ({d}..{d} ms)\n", .{ stamp_ms, before, after });
+        return error.TestUnexpectedResult;
+    }
+    return stamp_ms;
+}
+
 // =============================================================================
 // Blocking GET Operations
 // =============================================================================
@@ -1693,6 +1750,18 @@ test "e2e/kv: incr rejects non-counter values" {
     var result = try ctx.cli.run(&.{ "kv", "incr", "not_a_counter" });
     defer result.deinit();
     try stdx.testing.assertFailed(result);
+}
+
+test "e2e/kv: incr on a string whose TTL has run out starts a new counter" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "was_a_string", "hello", "--ttl", "500ms" });
+    @import("stdx").time.sleep(1200 * std.time.ns_per_ms);
+    var result = try ctx.cli.run(&.{ "kv", "incr", "was_a_string" });
+    defer result.deinit();
+    try stdx.testing.assertSucceeded(result);
+    try testing.expectEqualStrings("1", std.mem.trim(u8, result.stdout, " \n"));
 }
 
 test "e2e/kv: exists returns 1 for existing, 0 for missing" {

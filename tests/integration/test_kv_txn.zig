@@ -65,7 +65,7 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     defer table.deinit();
 
     const tid = try table.begin(0, 99, 1);
-    try table.appendOp(tid, .put, "k1", "v1", 1_000_000);
+    try table.appendOp(tid, .put, "k1", "v1", 1_000);
     try table.appendOp(tid, .put, "k2", "v2", 0);
     try table.appendOp(tid, .delete, "k3", "", 0);
 
@@ -85,12 +85,12 @@ test "integration: kv_txn — batch payload round-trips through codec" {
                 try testing.expectEqual(txn_mod.TxnOpKind.put, op.kind);
                 try testing.expectEqualStrings("k1", op.key);
                 try testing.expectEqualStrings("v1", op.value);
-                try testing.expectEqual(@as(u64, 1_000_000), op.expiry_ns);
+                try testing.expectEqual(@as(u64, 1_000), op.ttl_ms);
             },
             1 => {
                 try testing.expectEqual(txn_mod.TxnOpKind.put, op.kind);
                 try testing.expectEqualStrings("k2", op.key);
-                try testing.expectEqual(@as(u64, 0), op.expiry_ns);
+                try testing.expectEqual(@as(u64, 0), op.ttl_ms);
             },
             2 => {
                 try testing.expectEqual(txn_mod.TxnOpKind.delete, op.kind);
@@ -115,12 +115,11 @@ test "integration: kv_txn — projection applies kv_batch atomically" {
     var delta_value: [8]u8 = undefined;
     std.mem.writeInt(i64, &delta_value, 7, .little);
 
-    ops[0] = .{ .kind = .put, .key = @constCast("alice"), .value = @constCast("100"), .expiry_ns = 0 };
-    ops[1] = .{ .kind = .delete, .key = @constCast("doomed"), .value = @constCast(""), .expiry_ns = 0 };
-    ops[2] = .{ .kind = .incr, .key = @constCast("counter"), .value = &delta_value, .expiry_ns = 0 };
-    // Far-future absolute ns timestamp (~year 2100).
-    const future_ns: u64 = 4_102_444_800_000_000_000;
-    ops[3] = .{ .kind = .put, .key = @constCast("ephemeral"), .value = @constCast("temp"), .expiry_ns = future_ns };
+    ops[0] = .{ .kind = .put, .key = @constCast("alice"), .value = @constCast("100"), .ttl_ms = 0 };
+    ops[1] = .{ .kind = .delete, .key = @constCast("doomed"), .value = @constCast(""), .ttl_ms = 0 };
+    ops[2] = .{ .kind = .incr, .key = @constCast("counter"), .value = &delta_value, .ttl_ms = 0 };
+    // A minute's TTL, counted from the batch's stamp.
+    ops[3] = .{ .kind = .put, .key = @constCast("ephemeral"), .value = @constCast("temp"), .ttl_ms = 60_000 };
 
     const size = txn_mod.batchPayloadSize(&ops);
     const payload = try testing.allocator.alloc(u8, size);
@@ -144,9 +143,10 @@ test "integration: kv_txn — projection applies kv_batch atomically" {
         try testing.expectEqual(@as(i64, 17), v); // 10 + 7
     }
     {
-        const e = kv.get("ephemeral").?;
+        // Raw: the stamp is long past by the wall clock a read judges by.
+        const e = kv.getRaw("ephemeral").?;
         try testing.expectEqualStrings("temp", e.value);
-        try testing.expectEqual(future_ns, e.expiry_ns);
+        try testing.expectEqual(@as(u64, 12345 + 60 * std.time.ns_per_s), e.expiry_ns);
     }
 }
 

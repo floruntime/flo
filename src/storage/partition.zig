@@ -356,7 +356,8 @@ pub const Partition = struct {
     /// Returns the sealed snapshot bytes. Caller owns the allocation.
     pub fn snapshot(self: *Partition) ![]u8 {
         const applied = self.router.applied_index;
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
+        // The header's time is the last applied stamp, not this node's clock.
+        const timestamp = self.router.applied_stamp;
         log.debug("Partition: taking snapshot, partition_id={d}, applied_index={d}", .{ self.id, applied });
 
         var builder = snapshot_mod.SnapshotBuilder.init(
@@ -402,6 +403,7 @@ pub const Partition = struct {
         log.debug("Partition: recovering from snapshot, partition_id={d}, snap_index={d}, data_len={d}", .{ self.id, snap_index, snapshot_data.len });
         self.current_term = reader.snapshotTerm();
         self.router.applied_index = snap_index;
+        self.router.applied_stamp = reader.header.timestamp_ns;
         self.committed_index = snap_index; // at snapshot time, committed == applied
 
         // ── KV Projection ──────────────────────────────────────────────
@@ -635,6 +637,9 @@ test "partition: snapshot and recover" {
     // Applied index and committed_index restored
     try testing.expectEqual(part.router.applied_index, part2.router.applied_index);
     try testing.expectEqual(part.committed_index, part2.committed_index);
+    // And the last applied stamp, the floor for the next one this node
+    // gives once the log below the snapshot is gone.
+    try testing.expectEqual(@as(u64, 2000), part2.router.applied_stamp);
 }
 
 test "partition: contains check" {
