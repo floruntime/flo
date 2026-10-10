@@ -68,14 +68,10 @@ pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []c
     return client.sendRequest(.queue_fail, namespace, queue, writer.bytes());
 }
 
-/// List DLQ messages
-pub fn dlqList(client: *Client, namespace: []const u8, queue: []const u8, limit: u32) !Response {
-    var options_buf: [16]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    try builder.addU32(.limit, limit);
-
-    return client.sendRequestWithOptions(.queue_dlq_list, namespace, queue, "", builder.getOptions());
+/// A queue's dead-letter count; listing the messages themselves isn't
+/// supported yet.
+pub fn dlqList(client: *Client, namespace: []const u8, queue: []const u8) !Response {
+    return client.sendRequest(.queue_dlq_list, namespace, queue, "");
 }
 
 /// Requeue messages from DLQ

@@ -332,7 +332,9 @@ pub const TSHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
 
-        const count_pts = result.points_in_buffer;
+        // The earliest `limit` points; absent or 0 is every point read.
+        const limit = req.getLimit() orelse 0;
+        const count_pts = if (limit > 0) @min(result.points_in_buffer, limit) else result.points_in_buffer;
         const data = serializeDataPoints(self.allocator, point_buf[0..count_pts]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read serialization failed" } };
         };
@@ -980,6 +982,26 @@ test "ts handler: read" {
             defer handler.freeResult(result);
             const count_pts = std.mem.readInt(u32, r.data[0..4], .little);
             try testing.expectEqual(@as(u32, 3), count_pts);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ts handler: read returns at most limit points" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+    var handler = TSHandler.init(allocator, &ts);
+    for ([_]f64{ 10.0, 20.0, 30.0 }) |v| _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(v), ""));
+
+    var opts_buf: [16]u8 = undefined;
+    var builder = OptionsBuilder.init(&opts_buf);
+    try builder.addU32(.limit, 2);
+    const result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", builder.getOptions()));
+    switch (result) {
+        .ts_read_result => |r| {
+            defer handler.freeResult(result);
+            try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, r.data[0..4], .little));
         },
         else => return error.TestUnexpectedResult,
     }

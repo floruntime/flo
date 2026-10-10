@@ -851,9 +851,10 @@ pub const ActionsHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *ActionsHandler = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(handler.actions.count());
         handler.runs_mu.lock();
         defer handler.runs_mu.unlock();
+        // Sized under the lock, so an insert can't outgrow it mid-scan.
+        const name_buf = dispatcher_mod.scanScratch(handler.actions.count());
 
         const effective_ns = if (namespace.len == 0) "default" else namespace;
 

@@ -109,9 +109,8 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("list")
-                        .about("List DLQ messages")
+                        .about("Show a queue's dead-letter count")
                         .arg("queue", "Queue name")
-                        .uintFlag("limit", 'l', 100, "Maximum messages")
                         .action(wrapHandler(runDlqList)),
                 )
                 .subcommand(
@@ -382,8 +381,6 @@ fn runNack(ctx: *commander.Context) commander.Error!void {
 
 fn runDlqList(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
-
-    const limit = ctx.getUint("limit") orelse 100;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -395,7 +392,7 @@ fn runDlqList(ctx: *commander.Context) commander.Error!void {
         return;
     };
 
-    var result = client_mod.queue.dlqList(&client, namespace, queue, @intCast(limit)) catch |err| {
+    var result = client_mod.queue.dlqList(&client, namespace, queue) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return;
     };

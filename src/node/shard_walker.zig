@@ -237,13 +237,28 @@ pub fn ShardWalker(comptime ResultT: type) type {
 /// them by offset. One per thread: a walk copies a scan's names out before
 /// the next scan runs.
 threadlocal var scan_scratch: std.ArrayListUnmanaged([]const u8) = .empty;
+/// Set when a scan couldn't hold all its names; the walk refuses its page
+/// rather than answer one with names missing.
+threadlocal var scan_short: bool = false;
 
 pub fn scanScratch(n: usize) [][]const u8 {
     scan_scratch.ensureTotalCapacity(std.heap.page_allocator, n) catch {
-        log.err("list scan: no memory for {d} names; this page lists what fits", .{n});
+        log.err("list scan: no memory for {d} names; the page is refused", .{n});
+        noteScanShort();
     };
     const all = scan_scratch.allocatedSlice();
     return all[0..@min(n, all.len)];
+}
+
+/// Marks this thread's walk as having a scan that couldn't hold its names.
+pub fn noteScanShort() void {
+    scan_short = true;
+}
+
+/// Whether a scan since the last call came up short; clears it.
+pub fn takeScanShort() bool {
+    defer scan_short = false;
+    return scan_short;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

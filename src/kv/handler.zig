@@ -1471,9 +1471,12 @@ pub const KVHandler = struct {
 
         // Fetch version history from projection
         var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
-        const n = self.kv.getHistory(qkey, &hist_buf);
+        const found = self.kv.getHistory(qkey, &hist_buf);
 
-        if (n == 0) return .kv_not_found;
+        if (found == 0) return .kv_not_found;
+        // The newest `limit` versions; absent or 0 is all of them.
+        const limit = req.getLimit() orelse 0;
+        const n = if (limit > 0) @min(found, limit) else found;
 
         // Serialize: [count:u32] ([value_len:u32][value][version:u64])*
         var total_size: usize = 4; // count header
@@ -2105,6 +2108,30 @@ test "kv handler: history returns not found for missing key" {
     var handler = KVHandler.init(allocator, &kv);
     const result = handler.handleCommand(makeRequest(.kv_history, "k", "", ""));
     try testing.expectEqual(CommandResult.kv_not_found, result);
+}
+
+test "kv handler: history returns the newest limit versions" {
+    const allocator = testing.allocator;
+    var kv = KVProjection.init(allocator, 0);
+    defer kv.deinit();
+    try kv.put("k", "v1", 1, 1, 100, 0);
+    try kv.put("k", "v2", 2, 1, 200, 0);
+    try kv.put("k", "v3", 3, 1, 300, 0);
+
+    var handler = KVHandler.init(allocator, &kv);
+    var opts_buf: [16]u8 = undefined;
+    var builder = OptionsBuilder.init(&opts_buf);
+    try builder.addU32(.limit, 2);
+    const result = handler.handleCommand(makeRequest(.kv_history, "k", "", builder.getOptions()));
+    defer handler.freeResult(result);
+    switch (result) {
+        .kv_history_result => |hist| {
+            try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, hist.data[0..4], .little));
+            const first_len = std.mem.readInt(u32, hist.data[4..8], .little);
+            try testing.expectEqualSlices(u8, "v3", hist.data[8..][0..first_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "kv handler: history returns versions" {

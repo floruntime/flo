@@ -46,6 +46,8 @@ const shard_walker_mod = @import("shard_walker.zig");
 /// All list/scan walk opcodes return `[]const u8` names.
 pub const NameWalker = shard_walker_mod.ShardWalker([]const u8);
 pub const scanScratch = shard_walker_mod.scanScratch;
+pub const takeScanShort = shard_walker_mod.takeScanShort;
+pub const noteScanShort = shard_walker_mod.noteScanShort;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Types

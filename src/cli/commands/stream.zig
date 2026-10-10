@@ -149,8 +149,8 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     "flo stream alter audit --retention-count 100000",
                 })
                 .arg("stream", "Stream name")
-                .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
-                .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 = no count bound)")
+                .uintFlag("retention", 'r', 0, "Keep records this many hours (0 keeps the current bound)")
+                .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 keeps the current bound)")
                 .action(wrapHandler(runAlter)),
         )
         .subcommand(

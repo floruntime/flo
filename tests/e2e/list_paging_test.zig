@@ -171,35 +171,36 @@ test "e2e/list: queue, ts and kv lists take --limit as the page size" {
     try expectThreeListed(ctx, &.{ "kv", "list", "--limit", "3" });
 }
 
-test "e2e/list: a shard holding more names than one page lists them all" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 1 } });
-    defer ctx.deinit();
+/// [key_len:u16][key][value_len:u32][value]
+fn scanEntryWithValue(d: []const u8, pos: *usize) []const u8 {
+    const name = scanEntry(d, pos);
+    pos.* += std.mem.readInt(u32, d[pos.* - 4 ..][0..4], .little);
+    return name;
+}
+
+/// More than the 1024 names a local scan once held.
+const BIG = 1100;
+
+/// Writes BIG names "big-NNNN" through `write`, then pages `list` 300 at a
+/// time and checks each comes back once.
+fn expectBigShardListed(ctx: *stdx.testing.TestContext, write: proto.OpCode, value: []const u8, list: proto.OpCode, entry: Entry) !void {
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
-
-    // More than the 1024 names a local scan once held.
-    const total = 1100;
     var out: [256 * 1024]u8 = undefined;
-    for (0..total) |i| {
+    for (0..BIG) |i| {
         var key_buf: [16]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i});
-        _ = try call(fd, .kv_put, key, "x", &out);
+        _ = try call(fd, write, try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i}), value, &out);
     }
 
-    var seen = [_]u8{0} ** total;
+    var seen = [_]u8{0} ** BIG;
     var cursor_buf: [256]u8 = undefined;
     var cursor: []const u8 = "";
     for (0..20) |_| {
-        const d = try listPageOn(fd, .kv_scan, 300, cursor, &out);
+        const d = try listPageOn(fd, list, 300, cursor, &out);
         const count = std.mem.readInt(u32, d[0..4], .little);
         try testing.expect(count <= 300);
         var pos: usize = 4;
-        for (0..count) |_| {
-            const name = scanEntry(d, &pos);
-            const vlen = std.mem.readInt(u32, d[pos - 4 ..][0..4], .little);
-            pos += vlen;
-            seen[try std.fmt.parseInt(usize, name[4..], 10)] += 1;
-        }
+        for (0..count) |_| seen[try std.fmt.parseInt(usize, entry(d, &pos)[4..], 10)] += 1;
         const has_more = d[pos] != 0;
         const clen = std.mem.readInt(u16, d[pos + 1 ..][0..2], .little);
         if (!has_more) break;
@@ -207,4 +208,62 @@ test "e2e/list: a shard holding more names than one page lists them all" {
         cursor = cursor_buf[0..clen];
     }
     for (seen) |n| try testing.expectEqual(@as(u8, 1), n);
+}
+
+test "e2e/list: a shard holding more names than one page lists them all" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 1 } });
+    defer ctx.deinit();
+    // One record: [count:u32][len:u32][payload][header_count:u16]
+    const one_record = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 'x', 0, 0 };
+    try expectBigShardListed(ctx, .kv_put, "x", .kv_scan, scanEntryWithValue);
+    try expectBigShardListed(ctx, .stream_append, &one_record, .stream_list, streamEntry);
+    try expectBigShardListed(ctx, .queue_enqueue, "x", .queue_list, queueEntry);
+}
+
+const cli = @import("src").cli_client;
+
+/// Runs one CLI list call against a socketpair holding a canned ok answer
+/// and checks the request it sent: its limit in the value, no options.
+fn expectLimitInValue(comptime list: fn (*cli.Client) anyerror!cli.Response, op: proto.OpCode) !void {
+    var pair: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    var client = cli.Client.init(testing.allocator, "127.0.0.1:0");
+    client.stream = .{ .handle = pair[0] };
+    defer client.deinit();
+
+    var answer_buf: [64]u8 = undefined;
+    const answer = try proto.Response.serializeNew(.ok, 0, "", &answer_buf);
+    try testing.expectEqual(@as(isize, @intCast(answer.len)), std.c.write(pair[1], answer.ptr, answer.len));
+    var resp = try list(&client);
+    resp.deinit();
+
+    var sent: [1024]u8 = undefined;
+    const n = std.c.read(pair[1], &sent, sent.len);
+    try testing.expect(n > 0);
+    const req = try proto.Request.parse(sent[0..@intCast(n)]);
+    try testing.expectEqual(@intFromEnum(op), req.header.op_code);
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, req.value);
+    try testing.expectEqual(@as(usize, 0), req.options.len);
+}
+
+test "e2e/list: each CLI list client sends its limit in the value" {
+    const Calls = struct {
+        fn stream(c: *cli.Client) anyerror!cli.Response {
+            return cli.stream.list(c, "default", 3, null);
+        }
+        fn queue(c: *cli.Client) anyerror!cli.Response {
+            return cli.queue.list(c, "default", 3, null);
+        }
+        fn ts(c: *cli.Client) anyerror!cli.Response {
+            return cli.ts.list(c, "default", 3, null);
+        }
+        fn kv(c: *cli.Client) anyerror!cli.Response {
+            return cli.kv.scan(c, "default", "", null, 3);
+        }
+    };
+    try expectLimitInValue(Calls.stream, .stream_list);
+    try expectLimitInValue(Calls.queue, .queue_list);
+    try expectLimitInValue(Calls.ts, .ts_list);
+    try expectLimitInValue(Calls.kv, .kv_scan);
 }

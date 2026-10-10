@@ -67,7 +67,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .arg("name", "Action name")
                 .arg("input", "Input payload (JSON)")
                 .stringFlag("labels", 'l', "", "Required worker labels (JSON, e.g. '{\"gpu\":true}')")
-                .boolFlag("async", 'a', "Don't wait for result")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runInvoke)),

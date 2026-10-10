@@ -1627,6 +1627,7 @@ pub const Shard = struct {
         }
         const filter: []const u8 = req.key; // prefix filter (empty = no filter)
 
+        _ = dispatcher_mod.takeScanShort();
         const result = walker.walk(
             contexts,
             req.namespace,
@@ -1636,6 +1637,10 @@ pub const Shard = struct {
             &result_buf,
             &cursor_buf,
         );
+        if (dispatcher_mod.takeScanShort()) {
+            self.sendErrorResponse(conn, req.header.request_id, .overloaded, "overloaded: no memory to list this page; retry");
+            return;
+        }
 
         // Dedup names (defensive — routing hashes should prevent duplicates,
         // but edge cases during rebalance could produce them).
@@ -9514,4 +9519,36 @@ test "Shard: a replica sends writers to the leader by name, and a quiet replica 
     // No leader for longer than an election: it may have been aged out
     // without being told, so it asks again.
     try std.testing.expect(t.shard.joinWanted(now + raft.config.election_timeout_max_ms + 1));
+}
+
+test "Shard: a list page whose scan couldn't hold its names is refused, not cut short" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    const Short = struct {
+        fn scan(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
+            dispatcher_mod.noteScanShort();
+            return .{ .items = &.{}, .next_cursor = null };
+        }
+        fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
+    };
+    shard.dispatcher.registerWalk(.stream_list, Short.handle, Short.scan);
+    const contexts = [_]*anyopaque{@ptrCast(&shard)};
+    shard.dispatcher.setWalkContexts(.stream_list, &contexts);
+
+    const frame = try testRequest(.stream_list, 14, "", &.{ 0, 0, 0, 0 });
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    var out: [1024]u8 = undefined;
+    const resp = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u64, 14), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expect(!dispatcher_mod.takeScanShort());
 }

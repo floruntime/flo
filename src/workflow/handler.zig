@@ -448,9 +448,10 @@ pub const WorkflowHandler = struct {
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(handler.definitions.count());
         handler.mu.lock();
         defer handler.mu.unlock();
+        // Sized under the lock, so an insert can't outgrow it mid-scan.
+        const name_buf = dispatcher_mod.scanScratch(handler.definitions.count());
 
         var count: usize = 0;
         var dit = handler.definitions.iterator();
