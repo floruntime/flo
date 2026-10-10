@@ -1,9 +1,19 @@
-//! The harness itself: a server that never becomes ready fails its test
-//! within a bound and leaves nothing running.
+//! The harness itself: a server process starts out stopped, and one that
+//! never becomes ready fails its test within a bound and leaves nothing
+//! running. (These need the built flo binary, so they live here, not in
+//! stdx's own tests.)
 
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+
+test "harness: a new server process is stopped and has a data dir" {
+    var server = try stdx.testing.ServerProcess.init(testing.allocator);
+    defer server.deinit();
+
+    try testing.expect(!server.isRunning());
+    try testing.expect(server.data_dir.len > 0);
+}
 
 test "harness: a server that never becomes ready fails within a bound" {
     var server = try stdx.testing.ServerProcess.init(testing.allocator);

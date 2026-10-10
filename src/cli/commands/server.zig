@@ -465,8 +465,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     }
 
     // Apply log configuration
-    const root = @import("root");
-    root.log.configure(.{
+    stdx.log.configure(.{
         .level = switch (config.log_level) {
             .debug => .debug,
             .info => .info,
