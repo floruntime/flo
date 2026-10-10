@@ -96,7 +96,7 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("nack")
-                .about("Negative-acknowledge (requeue or DLQ)")
+                .about("Negative-acknowledge a message; it isn't redelivered (queues are at-most-once)")
                 .aliases(&.{"fail"})
                 .arg("queue", "Queue name")
                 .arg("seq", "Sequence number(s)")

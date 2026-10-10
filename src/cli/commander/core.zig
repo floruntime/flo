@@ -950,7 +950,8 @@ pub const Command = struct {
         if (self.version != null and !self.version_flag_added and self.parent == null) {
             self.addFlag(.{
                 .long = "version",
-                .short = 'v',
+                // -v is --verbose, everywhere; on the root it used to be this.
+                .short = 'V',
                 .description = "Show version information",
                 .value_type = .bool,
                 .default = .{ .bool = false },
@@ -1495,31 +1496,50 @@ pub const Command = struct {
         self.printf("\n", .{});
     }
 
+    /// How a closer flag hides an inherited one in help. A shared name
+    /// hides it whole (parsing takes the closer one); a shared letter only
+    /// hides its letter, since its long name still parses.
+    const Shadow = enum { none, letter, name };
+
+    fn shadowing(closer: []const HelpFlag, flag: *const Flag) Shadow {
+        var by = Shadow.none;
+        for (closer) |c| {
+            if (std.mem.eql(u8, c.flag.long, flag.long)) return .name;
+            if (flag.short != 0 and c.flag.short == flag.short and c.letter) by = .letter;
+        }
+        return by;
+    }
+
+    const HelpFlag = struct { flag: *const Flag, letter: bool = true };
+
     fn printFlagsHelp(self: *Command) void {
         // Collect all flags (local + inherited persistent)
-        var all_flags: std.ArrayListUnmanaged(*const Flag) = .empty;
+        var all_flags: std.ArrayListUnmanaged(HelpFlag) = .empty;
         defer all_flags.deinit(self.allocator);
 
         // Local flags
         for (self.flags.items) |*flag| {
             if (!flag.hidden) {
-                all_flags.append(self.allocator, flag) catch {};
+                all_flags.append(self.allocator, .{ .flag = flag }) catch {};
             }
         }
 
         // Own persistent flags
         for (self.persistent_flags.items) |*flag| {
             if (!flag.hidden) {
-                all_flags.append(self.allocator, flag) catch {};
+                all_flags.append(self.allocator, .{ .flag = flag }) catch {};
             }
         }
 
-        // Inherited persistent flags
+        // Inherited persistent flags, as parsing sees them from here.
         var parent_ptr = self.parent;
         while (parent_ptr) |p| {
             for (p.persistent_flags.items) |*flag| {
-                if (!flag.hidden) {
-                    all_flags.append(self.allocator, flag) catch {};
+                if (flag.hidden) continue;
+                switch (shadowing(all_flags.items, flag)) {
+                    .name => {},
+                    .letter => all_flags.append(self.allocator, .{ .flag = flag, .letter = false }) catch {},
+                    .none => all_flags.append(self.allocator, .{ .flag = flag }) catch {},
                 }
             }
             parent_ptr = p.parent;
@@ -1531,7 +1551,8 @@ pub const Command = struct {
 
         // Find max flag name length for alignment
         var max_len: usize = 0;
-        for (all_flags.items) |flag| {
+        for (all_flags.items) |entry| {
+            const flag = entry.flag;
             var len = flag.long.len + 2; // --
             if (flag.value_type != .bool) {
                 len += 1 + (if (flag.placeholder.len > 0) flag.placeholder.len else flag.long.len);
@@ -1539,9 +1560,10 @@ pub const Command = struct {
             if (len > max_len) max_len = len;
         }
 
-        for (all_flags.items) |flag| {
+        for (all_flags.items) |entry| {
+            const flag = entry.flag;
             // Short flag
-            if (flag.short != 0) {
+            if (flag.short != 0 and entry.letter) {
                 self.printf("  \x1b[36m-{c}\x1b[0m, ", .{flag.short});
             } else {
                 self.printf("      ", .{});
@@ -1569,8 +1591,9 @@ pub const Command = struct {
             // Description
             self.printf("{s}", .{flag.description});
 
-            // Default value
-            if (flag.default) |def| {
+            // Default value, unless the description already says what it is
+            // (a 0 that stands for "the config's" would contradict it).
+            if (std.mem.indexOf(u8, flag.description, "(default:") != null) {} else if (flag.default) |def| {
                 switch (def) {
                     .bool => |v| if (!v) {} else self.printf(" (default: true)", .{}),
                     .string => |v| if (v.len > 0) self.printf(" (default: \"{s}\")", .{v}),
@@ -1742,4 +1765,35 @@ test "port flag past 65535 is refused with the flag named" {
             try std.testing.expectEqual(@as(?Error, error.CommandFailed), result.err);
         }
     }
+}
+
+test "help shows an inherited flag as it parses from the command: hidden by a shared name, letterless by a shared letter" {
+    const allocator = std.testing.allocator;
+    const root = Command.init(allocator, .{ .name = "app" });
+    defer root.deinit();
+    try root.addPersistentFlag(.{ .long = "port", .short = 'p', .description = "Root port", .value_type = .uint });
+    try root.addPersistentFlag(.{ .long = "namespace", .short = 'n', .description = "Root namespace", .value_type = .string });
+    try root.addPersistentFlag(.{ .long = "output", .short = 'o', .description = "Root output", .value_type = .string });
+    const child = Command.init(allocator, .{ .name = "start" });
+    try root.addCommand(child);
+    // Same name, another letter: the root's --port never parses here.
+    try child.uintFlag("port", 'P', 0, "Child port");
+    // Same letter, another name: -n is the child's, --namespace still the root's.
+    try child.uintFlag("node-id", 'n', 0, "Child node");
+
+    const fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(fds[0]);
+    child.setOut(fds[1]);
+    child.printFlagsHelp();
+    _ = std.c.close(fds[1]);
+    var buf: [4096]u8 = undefined;
+    const n: usize = @intCast(std.c.read(fds[0], &buf, buf.len));
+    const help = buf[0..n];
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "Root port") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "-P\x1b[0m, --port") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "      --namespace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "-n\x1b[0m, --namespace") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "-n\x1b[0m, --node-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "-o\x1b[0m, --output") != null);
 }
