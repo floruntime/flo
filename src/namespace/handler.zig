@@ -436,13 +436,19 @@ pub const NamespaceHandler = struct {
     /// name, its id and the cap are checked again here, the same on every
     /// replica, whatever proposed it.
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) CreateOutcome {
+        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
+        return self.applyCreateAt(name, now_ns);
+    }
+
+    /// `applyCreate` from a log entry: created when the entry was stamped,
+    /// the same on every replica.
+    pub fn applyCreateAt(self: *NamespaceHandler, name: []const u8, created_at_ns: u64) CreateOutcome {
         if (self.namespaces.contains(name)) return .existed; // idempotent
         if (nameRefusal(name) != null) return .invalid;
         if (self.collides(name)) return .collision;
         if (!isDefault(name) and self.namespaces.count() >= MAX_NAMESPACES) return .full;
         const owned = self.allocator.dupe(u8, name) catch return .failed;
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-        self.insertNamespace(owned, .{ .created_at_ns = now_ns }) catch {
+        self.insertNamespace(owned, .{ .created_at_ns = created_at_ns }) catch {
             self.allocator.free(owned);
             return .failed;
         };
@@ -608,7 +614,7 @@ pub const NamespaceHandler = struct {
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
         switch (etype) {
             .namespace_create => {
-                self.last_create = self.applyCreate(name);
+                self.last_create = self.applyCreateAt(name, entry.header.timestamp_ns);
                 if (std.mem.eql(u8, cmd.value, IMPLICIT_CREATE)) {
                     if (self.namespaces.getPtr(name)) |meta| meta.data_count = @max(meta.data_count, 1);
                 }
@@ -1178,6 +1184,15 @@ test "namespace handler: applyCreate adds to local registry" {
     _ = handler.applyCreate("test-ns");
     try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
     try testing.expect(handler.namespaces.contains("test-ns"));
+}
+
+test "namespace handler: a namespace created through the log was created at its entry's stamp" {
+    var handler = try NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+    var buf: [128]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.namespace_create, 0, 1, 1, 1234 * std.time.ns_per_s, 0, "stamped", "", &buf) orelse unreachable;
+    handler.replayEntry(&e);
+    try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), handler.namespaces.get("stamped").?.created_at_ns);
 }
 
 test "namespace handler: applyCreate is idempotent" {

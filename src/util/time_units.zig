@@ -40,6 +40,15 @@ pub fn msToNsSat(ms: u64) u64 {
     return ms *| std.time.ns_per_ms;
 }
 
+/// When a TTL of `ttl_ms`, written by the entry stamped `stamp_ns`, runs out;
+/// 0 when there is no TTL. Every replica applies the same entry, so every
+/// replica gets the same answer. Saturates: a TTL past the end of time never
+/// runs out.
+pub fn expiryAfter(stamp_ns: u64, ttl_ms: u64) u64 {
+    if (ttl_ms == 0) return 0;
+    return stamp_ns +| msToNsSat(ttl_ms);
+}
+
 test "time units: conversions that don't fit are refused or saturate" {
     try std.testing.expectEqual(@as(?u64, 3 * std.time.ns_per_ms), msToNs(3));
     try std.testing.expectEqual(@as(?u64, null), msToNs(std.math.maxInt(u64)));
@@ -47,6 +56,9 @@ test "time units: conversions that don't fit are refused or saturate" {
     try std.testing.expectEqual(@as(?u64, null), expiryNs(std.math.maxInt(u64) - 1, 1));
     try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), msToNsSat(2));
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), msToNsSat(std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 0), expiryAfter(7, 0));
+    try std.testing.expectEqual(@as(u64, 7 + 2 * std.time.ns_per_ms), expiryAfter(7, 2));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), expiryAfter(std.math.maxInt(u64) - 1, 1));
 }
 
 test "time units: a written duration needs a unit, and a bare 0 clears" {

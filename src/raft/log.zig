@@ -57,6 +57,11 @@ pub const RaftLog = struct {
     /// (or the latest was truncated away, when the owner falls back to the
     /// committed membership it remembers).
     last_config_index: u64 = 0,
+    /// The stamp of the last entry: what the next leader-side stamp must
+    /// exceed. After a truncation it is read back from the new last entry;
+    /// if that has left the ring it stays where it was, higher, which keeps
+    /// stamps rising.
+    last_stamp: u64 = 0,
 
     /// Term index, run-length encoded and ascending by `first_index`. Terms
     /// change per election, not per entry, so this stays a few dozen runs for
@@ -117,6 +122,7 @@ pub const RaftLog = struct {
         }
         self.last_idx = idx;
         if (e.header.entry_type == @intFromEnum(EntryType.raft_config)) self.last_config_index = idx;
+        self.last_stamp = e.header.timestamp_ns;
 
         return idx;
     }
@@ -180,6 +186,7 @@ pub const RaftLog = struct {
         self.trimRunsAbove(after_index);
         self.last_idx = after_index;
         if (self.last_config_index > after_index) self.last_config_index = 0;
+        if (self.ual.readHeader(after_index)) |h| self.last_stamp = h.timestamp_ns;
         if (self.on_truncate) |cb| cb(self.on_truncate_ctx.?, after_index);
     }
 

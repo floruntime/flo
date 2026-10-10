@@ -190,9 +190,9 @@ test "integration: raft leader propose and replicate" {
     try testing.expectEqual(Role.leader, cluster.nodes[0].role);
 
     // Propose 3 entries
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "key1=val1");
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "key2=val2");
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "key3=val3");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "key1=val1");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "key2=val2");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "key3=val3");
 
     // Not committed yet (no replication)
     try testing.expectEqual(@as(u64, 0), cluster.nodes[0].commit_index);
@@ -218,8 +218,8 @@ test "integration: raft leader failover and re-election" {
     const original_term = cluster.nodes[0].current_term;
 
     // Propose and replicate some entries
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "before-crash-1");
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "before-crash-2");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "before-crash-1");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "before-crash-2");
     _ = try cluster.replicate(0);
     try testing.expectEqual(@as(u64, 3), cluster.nodes[0].commit_index);
     try testing.expectEqual(@as(u64, 3), cluster.nodes[1].log.lastIndex());
@@ -240,7 +240,7 @@ test "integration: raft leader failover and re-election" {
     try testing.expect(cluster.nodes[1].current_term > original_term);
 
     // ── Phase 4: New leader proposes and commits ───────────────────────
-    _ = try cluster.nodes[1].propose(.kv_put, 0, 0, "after-crash-1");
+    _ = try cluster.nodes[1].propose(.kv_put, 0, "after-crash-1");
     _ = try cluster.replicate(1);
 
     // Committed: new leader + node 2 form majority (node 0 is dead); the
@@ -257,7 +257,7 @@ test "integration: raft old leader rejoins as follower" {
 
     // Elect node 0 and replicate some data
     _ = cluster.runElection(0);
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "entry-1");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "entry-1");
     _ = try cluster.replicate(0);
 
     // Kill node 0
@@ -269,7 +269,7 @@ test "integration: raft old leader rejoins as follower" {
     const new_term = cluster.nodes[1].current_term;
 
     // Propose on new leader
-    _ = try cluster.nodes[1].propose(.kv_put, 0, 0, "new-leader-entry");
+    _ = try cluster.nodes[1].propose(.kv_put, 0, "new-leader-entry");
     _ = try cluster.replicate(1);
 
     // ── Revive old leader ──────────────────────────────────────────────
@@ -305,7 +305,7 @@ test "integration: raft no quorum blocks commit" {
     cluster.kill(2);
 
     // Propose entry — should be appended to log but NOT committed
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "lonely-entry");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "lonely-entry");
     _ = try cluster.replicate(0); // no alive followers to replicate to
     try testing.expectEqual(@as(u64, 2), cluster.nodes[0].log.lastIndex());
     try testing.expectEqual(@as(u64, 0), cluster.nodes[0].commit_index); // stuck!
@@ -325,7 +325,7 @@ test "integration: raft multiple term transitions" {
 
     // ── Term 1: Node 0 leads ───────────────────────────────────────────
     _ = cluster.runElection(0);
-    _ = try cluster.nodes[0].propose(.kv_put, 0, 0, "term1-data");
+    _ = try cluster.nodes[0].propose(.kv_put, 0, "term1-data");
     _ = try cluster.replicate(0);
     try testing.expectEqual(@as(u64, 1), cluster.nodes[0].current_term);
 
@@ -333,7 +333,7 @@ test "integration: raft multiple term transitions" {
     cluster.kill(0);
     _ = cluster.runElection(1);
     try testing.expect(cluster.nodes[1].current_term > 1);
-    _ = try cluster.nodes[1].propose(.kv_put, 0, 0, "term2-data");
+    _ = try cluster.nodes[1].propose(.kv_put, 0, "term2-data");
     _ = try cluster.replicate(1);
 
     // ── Term 3: Node 1 fails, Node 2 takes over ───────────────────────
@@ -347,7 +347,7 @@ test "integration: raft multiple term transitions" {
     try testing.expectEqual(Role.leader, cluster.nodes[2].role);
     try testing.expect(cluster.nodes[2].current_term > cluster.nodes[1].current_term);
 
-    _ = try cluster.nodes[2].propose(.kv_put, 0, 0, "term3-data");
+    _ = try cluster.nodes[2].propose(.kv_put, 0, "term3-data");
 
     // Need multiple rounds: node 0 has stale log, backtracking required
     try cluster.replicateFull(2);

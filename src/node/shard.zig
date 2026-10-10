@@ -156,6 +156,7 @@ pub const Shard = struct {
     /// Unanswered requests given up on since that was last said, and when.
     slots_expired: u64 = 0,
     expire_warn_ms: u64 = 0,
+    stamp_warn_ms: u64 = 0,
 
     /// Opcode → handler routing table.
     dispatcher: Dispatcher,
@@ -542,6 +543,8 @@ pub const Shard = struct {
         errdefer allocator.destroy(raft_node);
         raft_node.* = try RaftNode.init(allocator, node_id, @as(u32, shard_id), raftRingCapacity(ual_capacity), raft_config);
         errdefer raft_node.deinit();
+        // KV reads judge expiry by the time line the stamps follow.
+        partition.kv.read_clock = .{ .ctx = raft_node, .now_ns = RaftNode.nowOpaque };
         const rpc_entries = try allocator.alloc(entry_mod.Entry, RPC_MAX_ENTRIES);
         errdefer allocator.free(rpc_entries);
         const rpc_arena = try allocator.alloc(u8, RPC_BATCH_BYTES);
@@ -716,6 +719,10 @@ pub const Shard = struct {
             if (raft_node.log.lastIndex() < replay_from) {
                 raft_node.log.resetToSnapshot(replay_from, partition.current_term);
             }
+            // A snapshot's prefix may be gone from the segments; its stamp
+            // is the floor for the next one this node gives.
+            raft_node.log.last_stamp = @max(raft_node.log.last_stamp, partition.router.applied_stamp);
+            raft_node.noteApplied(partition.router.applied_stamp);
 
             shard_data_dir = shard_dir;
         }
@@ -1974,6 +1981,30 @@ pub const Shard = struct {
         self.slots_expired = 0;
     }
 
+    /// A leader whose clock and stamps disagree by more than a clock should
+    /// says so, naming the node on each side, and gauges it either way.
+    fn reportStampSkew(self: *Shard) void {
+        const raft = self.raft_node;
+        if (raft.role != .leader) {
+            if (self.shard_metrics) |sm| sm.setStampSkew(0);
+            return;
+        }
+        const skew_ms: i64 = @intCast(raft.stamp_skew_ns / std.time.ns_per_ms);
+        if (self.shard_metrics) |sm| sm.setStampSkew(if (raft.stamp_clock_behind) -skew_ms else skew_ms);
+        if (raft.stamp_skew_ns < raft_node_mod.STAMP_SKEW_WARN_NS) return;
+        const now = nowMs();
+        if (now -| self.stamp_warn_ms < WARN_INTERVAL_MS) return;
+        self.stamp_warn_ms = now;
+        const me = self.cluster_node_id;
+        if (!raft.stamp_clock_behind) {
+            log.warn("shard {d}: node {d}'s clock is at least {d} ms ahead of node {d}'s, the clock a majority of the voters keep; entries are stamped at the voters' time: check the clocks on nodes {d} and {d}", .{ self.id, me, skew_ms, raft.stamp_held_by, me, raft.stamp_held_by });
+        } else if (raft.voterPeers() == 0) {
+            log.warn("shard {d}: node {d}'s clock is {d} ms behind the last stamp in the log (was it set back?); entries are stamped 1 ns apart until it catches up", .{ self.id, me, skew_ms });
+        } else {
+            log.warn("shard {d}: node {d}'s clock is {d} ms behind the last stamp in the log, which an earlier leader gave; entries are stamped 1 ns apart until it catches up: check the clock on node {d} against node {d}'s, the voters' clock", .{ self.id, me, skew_ms, me, raft.stamp_held_by });
+        }
+    }
+
     /// Every frame the network queued since the last drain.
     fn drainRaftQueue(self: *Shard) void {
         const q = self.raft_queue orelse return;
@@ -3013,6 +3044,7 @@ pub const Shard = struct {
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
                 if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                    raft.noteApplied(e.header.timestamp_ns);
                     const applied = self.applyEntry(&e);
                     if (!applied) all_applied = false;
                     self.last_entry_applied = applied;
@@ -3166,6 +3198,7 @@ pub const Shard = struct {
         _ = self.drainInbox();
         self.drainRaftQueue();
         self.tickRaft();
+        self.reportStampSkew();
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
@@ -4125,7 +4158,8 @@ pub const Shard = struct {
                 return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             }
         }
-        const next = raft.latest_config.without(id, @intCast(@max(0, @import("stdx").time.milliTimestamp())));
+        // Dated 0: the config entry dates it with its own stamp.
+        const next = raft.latest_config.without(id, 0);
         shard.proposeAdminChange(conn, req, &next);
     }
 
@@ -8675,6 +8709,77 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
     try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
     // Nothing the snapshot covers was offered to the projections again.
     try std.testing.expectEqual(@as(u64, 0), shard.partitions[0].router.stats.entries_skipped);
+}
+
+test "a restarted node stamps after the last entry its log replays, though its clock is now behind it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    // A clock a day ahead stamps the first run's writes.
+    const Ahead = struct {
+        ns: u64,
+        fn read(ctx: ?*anyopaque) u64 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            return self.ns;
+        }
+    };
+    var ahead: Ahead = .{ .ns = @intCast(@import("stdx").time.nanoTimestamp() + std.time.ns_per_day) };
+    var last: u64 = 0;
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
+        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+        last = (try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' })).timestamp_ns;
+        try std.testing.expect(shard.applyCommitted());
+    }
+
+    // Back on the true clock, a day behind what it stamped.
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.applyDeferredTail();
+    const next = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'C' });
+    try std.testing.expect(next.timestamp_ns > last);
+    try std.testing.expect(shard.raft_node.stamp_clock_behind);
+}
+
+test "KV reads on a shard judge expiry by its Raft node's time, not the host's wall clock" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // The node's clock runs a day ahead of the host's: a read by the
+    // host's clock would see the key live a day longer.
+    const Ahead = struct {
+        ns: u64,
+        fn read(ctx: ?*anyopaque) u64 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            return self.ns;
+        }
+    };
+    var ahead: Ahead = .{ .ns = @intCast(@import("stdx").time.nanoTimestamp() + std.time.ns_per_day) };
+    shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
+    var buf: [64]u8 = undefined;
+    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 1, .value_length = 1, .key = "k", .value = "v" };
+    var len = cmd.serialize(&buf).?;
+    std.mem.writeInt(u64, buf[len..][0..8], 1_000, .little);
+    len += 8;
+    _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.HAS_TTL, buf[0..len]);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(shard.kv_handler.kv.get("k") != null);
+    ahead.ns += 2 * std.time.ns_per_s;
+    try std.testing.expect(shard.kv_handler.kv.get("k") == null);
 }
 
 /// A lone shard answering one client over a socket pair; `client` is the

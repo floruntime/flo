@@ -70,6 +70,10 @@ pub const PeerState = struct {
     /// When this leader first saw the peer as a member that had not caught
     /// up: the aging clock. A new leader starts it again.
     joining_since_ms: u64 = 0,
+    /// The peer's wall clock as it last reported it, and this node's
+    /// monotonic time when the report arrived (0: none yet).
+    clock_ns: u64 = 0,
+    clock_at_ms: u64 = 0,
 };
 
 /// Acks in a row at the commit index that make a peer caught up.
@@ -216,6 +220,9 @@ pub const VoteResponse = struct {
     vote_granted: bool,
     from: NodeId,
     is_pre_vote: bool = false,
+    /// The responder's wall clock, so a leader holds its voters' clocks the
+    /// moment it wins (`RaftNode.nextStamp`).
+    clock_ns: u64 = 0,
 };
 
 /// AppendEntries request (simplified for state machine testing).
@@ -246,7 +253,28 @@ pub const AppendResponse = struct {
     /// The responder is guarded (`LostLog`): the leader counts none of its
     /// acks toward commit.
     guarded: bool = false,
+    /// The responder's wall clock (`RaftNode.nextStamp`).
+    clock_ns: u64 = 0,
 };
+
+/// Where a node reads the wall clock. A simulation gives each node its own.
+pub const WallClock = struct {
+    ctx: ?*anyopaque = null,
+    now_ns: *const fn (ctx: ?*anyopaque) u64 = systemWallNs,
+
+    fn systemWallNs(_: ?*anyopaque) u64 {
+        return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
+    }
+
+    pub fn read(self: WallClock) u64 {
+        return self.now_ns(self.ctx);
+    }
+};
+
+/// How far a leader's stamps may run ahead of its voters' clocks.
+pub const STAMP_LEAD_NS: u64 = std.time.ns_per_s;
+/// A stamp held this far behind the leader's own clock is worth saying.
+pub const STAMP_SKEW_WARN_NS: u64 = 5 * std.time.ns_per_s;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RaftNode
@@ -375,6 +403,17 @@ pub const RaftNode = struct {
     /// down; the owner says why.
     left_group: bool = false,
     log_flush_sink: ?LogFlushSink = null,
+    wall_clock: WallClock = .{},
+    /// The stamp of the last entry applied, and this node's monotonic time
+    /// when it was: a follower's "now" for reads (`now`).
+    applied_stamp: u64 = 0,
+    applied_at_ms: u64 = 0,
+    /// How far the last stamp was from this leader's own clock, which way,
+    /// and the voter whose clock set the voters' clock, for the skew metric
+    /// and warning.
+    stamp_skew_ns: u64 = 0,
+    stamp_clock_behind: bool = false,
+    stamp_held_by: NodeId = NO_VOTE,
     /// Index of the config entry the current membership came from, so a
     /// truncation reaching below it reverts to the committed one.
     membership_index: u64,
@@ -557,14 +596,14 @@ pub const RaftNode = struct {
     /// far as the configs this node still records go: more than now means
     /// the last such change was a removal.
     pub fn voterCountBefore(self: *const RaftNode) ?u8 {
-        const now = self.latest_config.voterCount();
+        const current = self.latest_config.voterCount();
         var i = self.config_record_count;
         while (i > 0) {
             i -= 1;
             const rec = &self.config_records[i];
             if (rec.index >= self.membership_index) continue;
             const before = rec.config.voterCount();
-            if (before != now) return before;
+            if (before != current) return before;
         }
         return null;
     }
@@ -675,7 +714,7 @@ pub const RaftNode = struct {
             entry_mod.Flags.NONE,
             self.current_term,
             self.log.lastIndex() + 1,
-            0,
+            self.nextStamp(),
             "",
         );
         noop.header.crc32c = noop.computeCrc();
@@ -867,6 +906,12 @@ pub const RaftNode = struct {
 
     /// Handle an incoming VoteRequest. Returns the VoteResponse.
     pub fn handleVoteRequest(self: *RaftNode, req: VoteRequest) VoteResponse {
+        var resp = self.voteRequest(req);
+        resp.clock_ns = self.wall_clock.read();
+        return resp;
+    }
+
+    fn voteRequest(self: *RaftNode, req: VoteRequest) VoteResponse {
         if (!self.termPlausible(req.term)) {
             log.warn("Raft: vote request for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
@@ -947,6 +992,7 @@ pub const RaftNode = struct {
             const idx = self.voterIndex(resp.from) orelse return .none;
             if (self.vote_granted_by[idx]) return .none;
             self.vote_granted_by[idx] = true;
+            self.noteClock(idx, resp.clock_ns);
             self.votes_received += 1;
             if (self.votes_received < self.votes_needed) return .none;
             // A majority would vote: spend the term.
@@ -973,6 +1019,7 @@ pub const RaftNode = struct {
             const idx = self.voterIndex(resp.from) orelse return .none;
             if (self.vote_granted_by[idx]) return .none;
             self.vote_granted_by[idx] = true;
+            self.noteClock(idx, resp.clock_ns);
             self.votes_received += 1;
             if (self.votes_received >= self.votes_needed) {
                 self.becomeLeader();
@@ -992,6 +1039,7 @@ pub const RaftNode = struct {
         var resp = try self.appendEntries(req);
         resp.guarded = self.lost_log != .none;
         resp.leader_commit = req.leader_commit;
+        resp.clock_ns = self.wall_clock.read();
         return resp;
     }
 
@@ -1152,6 +1200,7 @@ pub const RaftNode = struct {
             if (self.peer_ids[i] == resp.from) {
                 self.peers[i].inflight = false;
                 self.peers[i].last_contact_ms = self.current_time_ms;
+                self.noteClock(i, resp.clock_ns);
                 self.peers[i].guarded = resp.guarded;
                 if (resp.success) {
                     // A late or duplicated ack may report less than we already
@@ -1196,12 +1245,14 @@ pub const RaftNode = struct {
 
     // ── Propose (Leader) ────────────────────────────────────────────────
 
-    /// Propose a new entry (leader only). Returns error if not leader.
-    /// Flags and timestamp are written into the entry header (e.g. HAS_TTL, TOMBSTONE).
-    pub fn propose(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
+    /// Propose an entry (leader only), with `flags` in its header (e.g.
+    /// HAS_TTL, TOMBSTONE), stamped here (`nextStamp`): no caller chooses
+    /// an entry's time.
+    pub fn propose(self: *RaftNode, entry_type: EntryType, flags: u16, payload: []const u8) !ProposeResult {
         // A config is checked against the one before it (`proposeConfig`).
         if (entry_type == .raft_config) return error.ConfigNotChecked;
-        return self.appendProposal(entry_type, flags, timestamp_ns, payload);
+        if (self.role != .leader) return error.NotLeader;
+        return self.appendProposal(entry_type, flags, self.nextStamp(), payload);
     }
 
     fn appendProposal(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
@@ -1265,13 +1316,11 @@ pub const RaftNode = struct {
     /// after the first.
     pub fn proposeConfig(self: *RaftNode, next: *const membership.Config) !ConfigProposal {
         if (self.role != .leader) return error.NotLeader;
-        var buf: [membership.MAX_SIZE]u8 = undefined;
-        const payload = membership.encode(next, &buf);
         // The first config founds the group: there is nothing before it to
         // disagree with, and the founder must be one of its voters.
         if (self.latest_config.member_count == 0) {
             if (!next.isVoter(self.id)) return .{ .refused = .no_voter };
-            return .{ .proposed = try self.appendProposal(.raft_config, entry_mod.Flags.NONE, 0, payload) };
+            return .{ .proposed = try self.appendConfig(next) };
         }
         // Leading without a vote is only the time it takes the change that
         // dropped it to commit; it starts none.
@@ -1279,7 +1328,20 @@ pub const RaftNode = struct {
         if (self.membership_index > self.commit_index) return .in_flight;
         if (self.commit_index == 0 or self.log.entryTerm(self.commit_index) != self.current_term) return .no_own_commit;
         if (membership.checkChange(&self.latest_config, next, self.id)) |why| return .{ .refused = why };
-        return .{ .proposed = try self.appendProposal(.raft_config, entry_mod.Flags.NONE, 0, payload) };
+        return .{ .proposed = try self.appendConfig(next) };
+    }
+
+    /// Stamp and append a config. A removal the caller left undated
+    /// (`when_ms` 0) is dated by the entry's stamp, so the removal time is
+    /// the log's, not the proposer's clock.
+    fn appendConfig(self: *RaftNode, next: *const membership.Config) !ProposeResult {
+        const stamp = self.nextStamp();
+        var dated = next.*;
+        for (dated.removed[0..dated.removed_count]) |*rm| {
+            if (rm.when_ms == 0) rm.when_ms = stamp / std.time.ns_per_ms;
+        }
+        var buf: [membership.MAX_SIZE]u8 = undefined;
+        return self.appendProposal(.raft_config, entry_mod.Flags.NONE, stamp, membership.encode(&dated, &buf));
     }
 
     /// The leader's view of each peer that has not caught up, or may yet be
@@ -1575,7 +1637,7 @@ pub const RaftNode = struct {
         // own term's entries, and without this one it would wait for a
         // client to write. Alone, the majority is this node and the whole
         // log commits now.
-        var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, self.current_term, next, 0, "");
+        var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, self.current_term, next, self.nextStamp(), "");
         noop.header.crc32c = noop.computeCrc();
         if (self.log.append(&noop)) |idx| {
             if (self.voterPeers() == 0) self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
@@ -1618,6 +1680,96 @@ pub const RaftNode = struct {
     /// copies count only once on disk.
     fn selfCountedThrough(self: *const RaftNode, idx: u64) u64 {
         return if (self.config.self_counts_when_durable) @min(idx, self.durable_index) else idx;
+    }
+
+    // ── Time ────────────────────────────────────────────────────────────
+
+    fn noteClock(self: *RaftNode, peer: usize, clock_ns: u64) void {
+        if (clock_ns == 0) return;
+        self.peers[peer].clock_ns = clock_ns;
+        self.peers[peer].clock_at_ms = self.current_time_ms;
+    }
+
+    /// The voters' clock as a majority holds it: the quorum-th highest of
+    /// this node's clock (when it votes) and each voter's last report, aged
+    /// by this node's monotonic time since it arrived. The commit rule's
+    /// shape: one runaway clock cannot set it. A voter that has not
+    /// reported counts as 0, which holds time back rather than forward.
+    fn quorumClock(self: *const RaftNode, own: u64) struct { ns: u64, by: NodeId } {
+        var clocks: [MAX_PEERS + 1]u64 = undefined;
+        var ids: [MAX_PEERS + 1]NodeId = undefined;
+        var n: usize = 0;
+        if (self.timer_enabled) {
+            clocks[0] = own;
+            ids[0] = self.id;
+            n = 1;
+        }
+        for (self.peers[0..self.peer_count], self.peer_ids[0..self.peer_count]) |p, id| {
+            if (!p.voter) continue;
+            clocks[n] = if (p.clock_ns == 0) 0 else p.clock_ns +| (self.current_time_ms -| p.clock_at_ms) *| std.time.ns_per_ms;
+            ids[n] = id;
+            n += 1;
+        }
+        // Sort descending, carrying ids.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            while (j > 0 and clocks[j] > clocks[j - 1]) : (j -= 1) {
+                std.mem.swap(u64, &clocks[j], &clocks[j - 1]);
+                std.mem.swap(NodeId, &ids[j], &ids[j - 1]);
+            }
+        }
+        const q = self.quorum() - 1;
+        return .{ .ns = clocks[q], .by = ids[q] };
+    }
+
+    /// The stamp for the next entry this leader appends: after the last
+    /// one, and at its own clock, but never more than `STAMP_LEAD_NS` past
+    /// the voters' clock, so one fast clock cannot carry the log's time
+    /// ahead. Alone, its clock is trusted, as any single-node store does.
+    /// Where the formula holds time still, stamps advance 1 ns an entry.
+    pub fn nextStamp(self: *RaftNode) u64 {
+        const prev = self.log.last_stamp;
+        const clock = self.wall_clock.read();
+        var allowed = clock;
+        if (self.voterPeers() > 0) {
+            const q = self.quorumClock(clock);
+            allowed = @min(clock, q.ns +| STAMP_LEAD_NS);
+            self.stamp_held_by = q.by;
+        } else {
+            self.stamp_held_by = self.id;
+        }
+        const stamp = @max(prev +| 1, allowed);
+        self.stamp_clock_behind = stamp > clock;
+        self.stamp_skew_ns = if (self.stamp_clock_behind) stamp - clock else clock - stamp;
+        return stamp;
+    }
+
+    /// What time it is for a read on this node, so a read and the next
+    /// conditional write agree on what has expired: on a leader, what it
+    /// would stamp now; on a follower, the last applied stamp moved on by
+    /// this node's monotonic time, never past its own clock.
+    pub fn now(self: *const RaftNode) u64 {
+        const clock = self.wall_clock.read();
+        if (self.role == .leader) {
+            if (self.voterPeers() == 0) return @max(self.log.last_stamp, clock);
+            return @max(self.log.last_stamp, @min(clock, self.quorumClock(clock).ns +| STAMP_LEAD_NS));
+        }
+        if (self.applied_stamp == 0) return clock;
+        const moved = self.applied_stamp +| (self.current_time_ms -| self.applied_at_ms) *| std.time.ns_per_ms;
+        return @max(self.applied_stamp, @min(clock, moved));
+    }
+
+    /// `now` behind an opaque pointer, for a projection's read clock.
+    pub fn nowOpaque(ctx: ?*const anyopaque) u64 {
+        const self: *const RaftNode = @ptrCast(@alignCast(ctx.?));
+        return self.now();
+    }
+
+    /// The owner applied an entry stamped `stamp`.
+    pub fn noteApplied(self: *RaftNode, stamp: u64) void {
+        self.applied_stamp = @max(self.applied_stamp, stamp);
+        self.applied_at_ms = self.current_time_ms;
     }
 
     /// The owner has everything through `idx` on disk. A leader's own copy
@@ -1731,12 +1883,12 @@ test "raft node: single-node propose" {
     try node.bootstrap();
 
     // Propose entries — should commit immediately in single-node mode
-    const r1 = try node.propose(.kv_put, 0, 0, "key1val1");
+    const r1 = try node.propose(.kv_put, 0, "key1val1");
     try testing.expectEqual(@as(u64, 2), r1.index); // 1 is noop
     try testing.expectEqual(@as(u64, 1), r1.term);
     try testing.expectEqual(@as(u64, 2), node.commit_index);
 
-    const r2 = try node.propose(.kv_put, 0, 0, "key2val2");
+    const r2 = try node.propose(.kv_put, 0, "key2val2");
     try testing.expectEqual(@as(u64, 3), r2.index);
     try testing.expectEqual(@as(u64, 3), node.commit_index);
 }
@@ -1747,7 +1899,7 @@ test "raft node: propose rejected when not leader" {
     var node = try RaftNode.init(allocator, 1, 1000, 4096, .{});
     defer node.deinit();
 
-    const result = node.propose(.kv_put, 0, 0, "data");
+    const result = node.propose(.kv_put, 0, "data");
     try testing.expectError(error.NotLeader, result);
 }
 
@@ -2017,7 +2169,7 @@ test "raft node: leader commit advancement with 3-node cluster" {
     try testing.expectEqual(Role.leader, node.role);
 
     // The win put a noop at 1; the entry goes at 2.
-    _ = try node.propose(.kv_put, 0, 0, "key1val1");
+    _ = try node.propose(.kv_put, 0, "key1val1");
     try testing.expectEqual(@as(u64, 0), node.commit_index); // not committed yet
 
     // Peer 2 acks everything sent.
@@ -2345,7 +2497,7 @@ test "raft node: a success ack from an earlier term does not advance match or co
     _ = candidacy(&node).?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
-    _ = try node.propose(.kv_put, 0, 0, "t1");
+    _ = try node.propose(.kv_put, 0, "t1");
 
     // Deposed (a term-2 candidate appears), then re-elected in term 3: the
     // win's noop goes at 3 and a term-3 entry at 4.
@@ -2355,7 +2507,7 @@ test "raft node: a success ack from an earlier term does not advance match or co
     _ = node.handleVoteResponse(.{ .term = 3, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
     try testing.expectEqual(@as(u64, 3), node.current_term);
-    _ = try node.propose(.kv_put, 0, 0, "t3");
+    _ = try node.propose(.kv_put, 0, "t3");
     sentAll(&node);
 
     // The delayed term-1 ack finally arrives, for an index this leadership
@@ -2385,7 +2537,7 @@ test "raft node: reordered success acks keep match_index monotonic" {
     node.addPeer(3);
     _ = candidacy(&node).?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
-    for (0..3) |_| _ = try node.propose(.kv_put, 0, 0, "e");
+    for (0..3) |_| _ = try node.propose(.kv_put, 0, "e");
     sentAll(&node);
 
     // A late ack for 1 lands after the ack for 1-3. It must not rewind
@@ -2604,7 +2756,7 @@ test "raft node: bootstrap after a restart opens a new term and continues the lo
     // Nothing was applied by bootstrapping; the restored tail and the noop
     // are the owner's to drain.
     try testing.expectEqual(@as(u64, 0), node.last_applied);
-    const r = try node.propose(.kv_put, 0, 0, "next");
+    const r = try node.propose(.kv_put, 0, "next");
     try testing.expectEqual(@as(u64, 6), r.index);
     try testing.expectEqual(@as(u64, 4), r.term);
 }
@@ -3185,7 +3337,7 @@ test "raft node: counting its own copy only once durable, a lone leader commits 
     node.markDurable(node.log.lastIndex());
     try testing.expectEqual(@as(u64, 1), node.commit_index);
 
-    const p = try node.propose(.kv_put, entry_mod.Flags.NONE, 0, "v");
+    const p = try node.propose(.kv_put, entry_mod.Flags.NONE, "v");
     try testing.expectEqual(@as(u64, 1), node.commit_index);
     // Nothing past the log counts, however far the owner says it flushed.
     node.markDurable(p.index + 5);
@@ -3201,7 +3353,7 @@ test "raft node: a leader's own copy counts toward a majority only once durable"
     _ = candidacy(&leader).?;
     _ = leader.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 3 });
     try testing.expectEqual(Role.leader, leader.role);
-    const p = try leader.propose(.kv_put, entry_mod.Flags.NONE, 0, "v");
+    const p = try leader.propose(.kv_put, entry_mod.Flags.NONE, "v");
     sentAll(&leader);
 
     // One follower has it; the leader's copy isn't on disk: one of three.
@@ -3436,7 +3588,7 @@ test "raft node: a leader counts a guarded follower's ack toward no commit" {
     _ = candidacy(&leader);
     _ = leader.handleVoteResponse(.{ .term = leader.current_term, .vote_granted = true, .from = 3 });
     try testing.expectEqual(Role.leader, leader.role);
-    const p = try leader.propose(.raft_noop, entry_mod.Flags.NONE, 0, "");
+    const p = try leader.propose(.raft_noop, entry_mod.Flags.NONE, "");
     leader.peers[0].sent_up_to = p.index;
     leader.peers[1].sent_up_to = p.index;
     leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = p.index, .from = 2, .guarded = true });
@@ -3480,7 +3632,7 @@ test "raft node: a delayed unguarded ack from before a wipe does not make a guar
     _ = candidacy(&node).?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
-    _ = try node.propose(.kv_put, 0, 0, "a");
+    _ = try node.propose(.kv_put, 0, "a");
     sentAll(&node);
     // Peer 2, guarded (it lost its disk), acks index 2: no commit.
     node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 2, .from = 2, .guarded = true });
@@ -3546,8 +3698,28 @@ test "raft node: a truncated config falls back to the newest one the log still h
 /// Node 1 leading `cfg` (which names it a voter), elected by every voter
 /// peer, with its leadership noop committed.
 fn leading(cfg: membership.Config) !RaftNode {
+    return leadingAt(cfg, null);
+}
+
+/// A wall clock a test sets.
+const TestClock = struct {
+    ns: u64,
+
+    fn read(ctx: ?*anyopaque) u64 {
+        const self: *const TestClock = @ptrCast(@alignCast(ctx.?));
+        return self.ns;
+    }
+
+    fn wall(self: *TestClock) WallClock {
+        return .{ .ctx = self, .now_ns = read };
+    }
+};
+
+/// `leading`, on `clock` when given.
+fn leadingAt(cfg: membership.Config, clock: ?*TestClock) !RaftNode {
     var node = try RaftNode.init(testing.allocator, 1, 1, 16384, .{});
     errdefer node.deinit();
+    if (clock) |c| node.wall_clock = c.wall();
     node.setMembership(&cfg, 0);
     _ = candidacy(&node);
     for (cfg.memberSlice()) |m| {
@@ -3590,14 +3762,14 @@ test "raft node: a replica counts toward no quorum: its ack and its vote count f
     var alone = try leading(membership.Config.ofVoters(&.{1}).withJoiner(2, true));
     defer alone.deinit();
     try testing.expectEqual(@as(u8, 1), alone.clusterSize());
-    const r = try alone.propose(.kv_put, 0, 0, "x");
+    const r = try alone.propose(.kv_put, 0, "x");
     try testing.expectEqual(r.index, alone.commit_index);
 
     // Voters 1 and 3, replica 2: only 3's ack commits.
     var leader = try leading(membership.Config.ofVoters(&.{ 1, 3 }).withJoiner(2, true));
     defer leader.deinit();
     try testing.expectEqual(@as(u8, 2), leader.clusterSize());
-    const w = try leader.propose(.kv_put, 0, 0, "y");
+    const w = try leader.propose(.kv_put, 0, "y");
     ackAll(&leader, 2);
     try testing.expect(leader.commit_index < w.index);
     ackAll(&leader, 3);
@@ -3636,7 +3808,7 @@ test "raft node: membership changes go through proposeConfig, one at a time, aft
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
     var buf: [membership.MAX_SIZE]u8 = undefined;
-    try testing.expectError(error.ConfigNotChecked, node.propose(.raft_config, 0, 0, membership.encode(&two, &buf)));
+    try testing.expectError(error.ConfigNotChecked, node.propose(.raft_config, 0, membership.encode(&two, &buf)));
 
     // The leadership noop has not committed: a change now could ride on an
     // uncommitted config of an earlier term.
@@ -3719,7 +3891,7 @@ test "raft node: a peer acking at the commit index three times in a row is caugh
     ackAll(&leader, 2);
     try testing.expect(leader.memberProgress(&out)[0].caught_up_now);
     // Behind, the run starts over.
-    _ = try leader.propose(.kv_put, 0, 0, "z");
+    _ = try leader.propose(.kv_put, 0, "z");
     const i = leader.peerIndex(2).?;
     leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = leader.log.lastIndex() - 1, .from = 2, .leader_commit = leader.log.lastIndex() });
     try testing.expectEqual(@as(u8, 0), leader.peers[i].caught_up_streak);
@@ -3727,7 +3899,7 @@ test "raft node: a peer acking at the commit index three times in a row is caugh
     // arrives; an ack holding what was committed when its batch left still
     // counts, or a joiner would never catch up.
     const sent_at = leader.commit_index;
-    _ = try leader.propose(.kv_put, 0, 0, "later");
+    _ = try leader.propose(.kv_put, 0, "later");
     try testing.expect(leader.commit_index > sent_at);
     leader.peers[i].sent_up_to = sent_at;
     leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = sent_at, .from = 2, .leader_commit = sent_at });
@@ -3837,7 +4009,7 @@ test "raft node: a new leader changes membership only after committing in its te
     // Its first try lands in term 2, where 4 already voted; the next is
     // decided by whose log is newer.
     if (stand(n1, &.{ n4, n5 }) or stand(n1, &.{ n4, n5 })) {
-        _ = try n1.propose(.kv_put, 0, 0, "x");
+        _ = try n1.propose(.kv_put, 0, "x");
         try replicate(n1, n4, 1);
         try replicate(n1, n5, 1);
     }
@@ -3901,4 +4073,157 @@ test "raft node: caught up means acking at the commit index lately: a silent or 
     leader.handleAppendResponse(.{ .term = leader.current_term, .success = false, .match_index = 0, .hint_index = 0, .from = 2 });
     try testing.expect(!leader.memberProgress(&out)[0].caught_up_now);
     try testing.expect(membership.nextAutomatic(&leader.latest_config, leader.memberProgress(&out), 1000, leader.voterCountBefore()) == null);
+}
+
+// ── Stamps ──────────────────────────────────────────────────────────────
+
+/// `from` acks everything, reporting its wall clock as `clock_ns`.
+fn ackWithClock(node: *RaftNode, from: NodeId, clock_ns: u64) void {
+    const i = node.peerIndex(from).?;
+    node.peers[i].sent_up_to = node.log.lastIndex();
+    node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = node.log.lastIndex(), .from = from, .leader_commit = node.commit_index, .clock_ns = clock_ns });
+}
+
+const s_ns = std.time.ns_per_s;
+
+test "raft node: a lone leader stamps at its clock, and after its last stamp when the clock is set back" {
+    var clock: TestClock = .{ .ns = 1_000 * s_ns };
+    var node = try leadingAt(membership.Config.ofVoters(&.{1}), &clock);
+    defer node.deinit();
+    clock.ns += s_ns;
+    const a = try node.propose(.kv_put, 0, "a");
+    try testing.expectEqual(clock.ns, a.timestamp_ns);
+    // The same instant: the next is 1 ns on.
+    const b = try node.propose(.kv_put, 0, "b");
+    try testing.expectEqual(a.timestamp_ns + 1, b.timestamp_ns);
+    // Set back 10 s: still after the last, and the skew says so.
+    clock.ns -= 10 * s_ns;
+    const c = try node.propose(.kv_put, 0, "c");
+    try testing.expectEqual(b.timestamp_ns + 1, c.timestamp_ns);
+    try testing.expect(node.stamp_clock_behind);
+    try testing.expect(node.stamp_skew_ns >= 10 * s_ns);
+    // Past it again: back on the clock.
+    clock.ns += 20 * s_ns;
+    const d = try node.propose(.kv_put, 0, "d");
+    try testing.expectEqual(clock.ns, d.timestamp_ns);
+    try testing.expect(!node.stamp_clock_behind);
+    try testing.expectEqual(d.timestamp_ns, node.log.last_stamp);
+}
+
+test "raft node: a leader stamps no more than a second past the clock a majority of the voters keep, and one fast clock moves nothing" {
+    const t = 1_000 * s_ns;
+    var clock: TestClock = .{ .ns = t };
+    var leader = try leadingAt(membership.Config.ofVoters(&.{ 1, 2, 3 }), &clock);
+    defer leader.deinit();
+    // Its own clock is 100 s fast; both voters keep true time.
+    ackWithClock(&leader, 2, t);
+    ackWithClock(&leader, 3, t);
+    clock.ns = t + 100 * s_ns;
+    const p = try leader.propose(.kv_put, 0, "x");
+    try testing.expectEqual(t + s_ns, p.timestamp_ns);
+    try testing.expectEqual(99 * s_ns, leader.stamp_skew_ns);
+    try testing.expect(!leader.stamp_clock_behind);
+    try testing.expect(leader.stamp_held_by == 2 or leader.stamp_held_by == 3);
+    // A report ages by this node's monotonic time since it came.
+    leader.observeTime(leader.current_time_ms + 2_000);
+    const q = try leader.propose(.kv_put, 0, "y");
+    try testing.expectEqual(t + 3 * s_ns, q.timestamp_ns);
+
+    // A leader on true time, with one voter an hour fast: true time.
+    var clock2: TestClock = .{ .ns = t };
+    var other = try leadingAt(membership.Config.ofVoters(&.{ 1, 2, 3 }), &clock2);
+    defer other.deinit();
+    ackWithClock(&other, 2, t + std.time.ns_per_hour);
+    ackWithClock(&other, 3, t);
+    clock2.ns = t + 5 * s_ns;
+    ackWithClock(&other, 3, t + 5 * s_ns);
+    const r = try other.propose(.kv_put, 0, "z");
+    try testing.expectEqual(t + 5 * s_ns, r.timestamp_ns);
+}
+
+test "raft node: a new leader stamps from the clocks its votes carried, and after the last leader's stamps when its own clock is behind" {
+    var clocks = [_]TestClock{ .{ .ns = 2_000 * s_ns }, .{ .ns = 1_000 * s_ns }, .{ .ns = 1_000 * s_ns } };
+    var nodes: [3]RaftNode = undefined;
+    for (&nodes, &clocks, 1..) |*n, *c, id| {
+        n.* = try RaftNode.init(testing.allocator, @intCast(id), 1, 16384, .{ .enable_pre_vote = false });
+        n.wall_clock = c.wall();
+    }
+    defer for (&nodes) |*n| n.deinit();
+    const c0 = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    for (&nodes) |*n| {
+        n.setMembership(&c0, 0);
+        n.commitMembership(&c0);
+    }
+    const n1 = &nodes[0];
+    const n2 = &nodes[1];
+    const n3 = &nodes[2];
+    // Node 1, its clock 1000 s fast, wins with node 2's vote. The vote
+    // carried node 2's clock, so its first stamp is within a second of
+    // that rather than at its own.
+    try testing.expect(stand(n1, &.{n2}));
+    try testing.expectEqual(1_001 * s_ns, n1.log.last_stamp);
+    const a = try n1.propose(.kv_put, 0, "a");
+    // The acks carry their clocks too.
+    clocks[1].ns += 3 * s_ns;
+    for ([_]*RaftNode{ n2, n3 }) |f| try replicate(n1, f, 1);
+    try testing.expectEqual(clocks[1].ns, n1.peers[n1.peerIndex(2).?].clock_ns);
+    clocks[1].ns -= 3 * s_ns;
+
+    // Node 2, its clock now 1 s behind node 1's last stamp, takes over:
+    // its stamps still follow node 1's.
+    try testing.expect(stand(n2, &.{n3}));
+    try testing.expect(n2.log.last_stamp > a.timestamp_ns);
+    const b = try n2.propose(.kv_put, 0, "b");
+    try testing.expect(b.timestamp_ns > n2.log.ual.readHeader(b.index - 1).?.timestamp_ns);
+    try testing.expect(n2.stamp_clock_behind);
+}
+
+test "raft node: a follower's time is its last applied stamp moved on by its own monotonic time, never past its clock" {
+    var clock: TestClock = .{ .ns = 1_000 * s_ns };
+    var node = try RaftNode.init(testing.allocator, 2, 1, 16384, .{});
+    defer node.deinit();
+    node.wall_clock = clock.wall();
+    // Nothing applied: its clock.
+    try testing.expectEqual(clock.ns, node.now());
+    // Applied a stamp 5 s ahead of its clock: never behind that stamp.
+    node.observeTime(10_000);
+    node.noteApplied(1_005 * s_ns);
+    try testing.expectEqual(1_005 * s_ns, node.now());
+    node.observeTime(10_500);
+    try testing.expectEqual(1_005 * s_ns, node.now());
+    // Its clock jumps far ahead: time moves on only as fast as its
+    // monotonic clock since that apply.
+    clock.ns = 2_000 * s_ns;
+    try testing.expectEqual(1_005 * s_ns + 500 * std.time.ns_per_ms, node.now());
+}
+
+test "raft node: a config that fails to reach the disk leaves the next stamp after the entry before it" {
+    var rec: FlushRecorder = .{};
+    var clock: TestClock = .{ .ns = 1_000 * s_ns };
+    var leader = try leadingAt(membership.Config.ofVoters(&.{1}), &clock);
+    defer leader.deinit();
+    leader.log_flush_sink = rec.sink();
+    const a = try leader.propose(.kv_put, 0, "a");
+    clock.ns -= 10 * s_ns;
+    rec.fail = true;
+    try testing.expectError(error.ConfigNotDurable, leader.proposeConfig(&membership.Config.ofVoters(&.{1}).withJoiner(2, true)));
+    rec.fail = false;
+    const b = try leader.propose(.kv_put, 0, "b");
+    try testing.expectEqual(a.index + 1, b.index);
+    try testing.expect(b.timestamp_ns > a.timestamp_ns);
+}
+
+test "raft node: a replica's clock has no say in the voters' clock" {
+    const t = 1_000 * s_ns;
+    var clock: TestClock = .{ .ns = t };
+    var leader = try leadingAt(membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true), &clock);
+    defer leader.deinit();
+    // The leader is 100 s fast and its one other voter keeps true time; a
+    // replica an hour fast would, if it counted, side with the leader.
+    ackWithClock(&leader, 2, t);
+    ackWithClock(&leader, 3, t + std.time.ns_per_hour);
+    clock.ns = t + 100 * s_ns;
+    const p = try leader.propose(.kv_put, 0, "x");
+    try testing.expectEqual(t + s_ns, p.timestamp_ns);
+    try testing.expectEqual(@as(NodeId, 2), leader.stamp_held_by);
 }

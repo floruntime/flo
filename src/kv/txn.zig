@@ -41,7 +41,7 @@ const stdx_time = @import("stdx").time;
 pub const MAX_OPS_PER_TXN: u16 = 256;
 pub const MAX_PAYLOAD_PER_TXN: usize = 1 * 1024 * 1024;
 /// Upper bound of `batchPayloadSize`: the key+value budget plus the fixed
-/// framing of every op (kind, flags, namespace, key len, value len, expiry).
+/// framing of every op (kind, flags, namespace, key len, value len, TTL).
 pub const MAX_BATCH_ENTRY_PAYLOAD: usize = 3 + MAX_OPS_PER_TXN * 20 + MAX_PAYLOAD_PER_TXN;
 pub const MAX_OPEN_TXNS: usize = 1024;
 
@@ -64,12 +64,12 @@ pub const TxnOp = struct {
     ///   put     → arbitrary value
     ///   delete  → empty
     ///   incr    → 8-byte i64 LE delta
-    ///   touch   → 8-byte u64 LE absolute expiry_ns (0 = clear)
-    ///   persist → empty (equivalent to touch with expiry_ns=0)
+    ///   touch   → 8-byte u64 LE TTL in milliseconds (0 = clear)
+    ///   persist → empty (equivalent to touch with a TTL of 0)
     value: []u8,
-    /// Absolute expiry_ns for puts that carry a TTL. 0 = no TTL.
-    /// Only meaningful for `kind == .put`.
-    expiry_ns: u64,
+    /// TTL in milliseconds for a put, counted from the batch's stamp at
+    /// apply. 0 = no TTL. Only meaningful for `kind == .put`.
+    ttl_ms: u64,
 };
 
 // ─── Per-txn state ────────────────────────────────────────────────────────
@@ -161,7 +161,7 @@ pub const TxnTable = struct {
         kind: TxnOpKind,
         key: []const u8,
         value: []const u8,
-        expiry_ns: u64,
+        ttl_ms: u64,
     ) AppendError!void {
         const txn = self.map.getPtr(txn_id) orelse return error.TxnTooLarge; // unreachable in practice — caller checks
         if (txn.ops.items.len >= MAX_OPS_PER_TXN) return error.TxnTooLarge;
@@ -179,7 +179,7 @@ pub const TxnTable = struct {
             .kind = kind,
             .key = owned_key,
             .value = owned_val,
-            .expiry_ns = expiry_ns,
+            .ttl_ms = ttl_ms,
         });
         txn.payload_bytes += key.len + value.len;
         txn.last_active_ms = stdx_time.milliTimestamp();
@@ -245,13 +245,13 @@ pub const TxnTable = struct {
 //   [op_count: u16 LE]
 //   for each op:
 //     [kind: u8]             // TxnOpKind
-//     [flags: u8]            // bit 0 = HAS_TTL (expiry_ns appended after value)
+//     [flags: u8]            // bit 0 = HAS_TTL (ttl_ms appended after value)
 //     [namespace_hash: u32 LE]
 //     [key_len: u16 LE]
 //     [val_len: u32 LE]
 //     [key bytes]
 //     [val bytes]
-//     [expiry_ns: u64 LE]    // only if flags & HAS_TTL
+//     [ttl_ms: u64 LE]       // only if flags & HAS_TTL
 
 pub const BATCH_VERSION: u8 = 1;
 pub const FLAG_HAS_TTL: u8 = 0x01;
@@ -261,7 +261,7 @@ pub fn batchPayloadSize(ops: []const TxnOp) usize {
     var size: usize = 1 + 2; // version + op_count
     for (ops) |op| {
         size += 1 + 1 + 4 + 2 + 4 + op.key.len + op.value.len;
-        if (op.kind == .put and op.expiry_ns != 0) size += 8;
+        if (op.kind == .put and op.ttl_ms != 0) size += 8;
     }
     return size;
 }
@@ -279,7 +279,7 @@ pub fn serializeBatch(buf: []u8, namespace_hash: u32, ops: []const TxnOp) !usize
     off += 2;
 
     for (ops) |op| {
-        const has_ttl = op.kind == .put and op.expiry_ns != 0;
+        const has_ttl = op.kind == .put and op.ttl_ms != 0;
         buf[off] = @intFromEnum(op.kind);
         off += 1;
         buf[off] = if (has_ttl) FLAG_HAS_TTL else 0;
@@ -295,7 +295,7 @@ pub fn serializeBatch(buf: []u8, namespace_hash: u32, ops: []const TxnOp) !usize
         @memcpy(buf[off..][0..op.value.len], op.value);
         off += op.value.len;
         if (has_ttl) {
-            std.mem.writeInt(u64, buf[off..][0..8], op.expiry_ns, .little);
+            std.mem.writeInt(u64, buf[off..][0..8], op.ttl_ms, .little);
             off += 8;
         }
     }
@@ -308,8 +308,9 @@ pub const BatchedOp = struct {
     namespace_hash: u32,
     key: []const u8,
     value: []const u8,
-    /// Absolute expiry_ns. 0 = no TTL. Only meaningful for `.put`.
-    expiry_ns: u64,
+    /// TTL in milliseconds from the batch's stamp. 0 = no TTL. Only
+    /// meaningful for `.put`.
+    ttl_ms: u64,
 };
 
 pub const BatchIterator = struct {
@@ -338,10 +339,10 @@ pub const BatchIterator = struct {
         const value = self.payload[self.off .. self.off + val_len];
         self.off += val_len;
 
-        var expiry_ns: u64 = 0;
+        var ttl_ms: u64 = 0;
         if (flags & FLAG_HAS_TTL != 0) {
             if (self.off + 8 > self.payload.len) return null;
-            expiry_ns = std.mem.readInt(u64, self.payload[self.off..][0..8], .little);
+            ttl_ms = std.mem.readInt(u64, self.payload[self.off..][0..8], .little);
             self.off += 8;
         }
 
@@ -352,7 +353,7 @@ pub const BatchIterator = struct {
             .namespace_hash = ns_hash,
             .key = key,
             .value = value,
-            .expiry_ns = expiry_ns,
+            .ttl_ms = ttl_ms,
         };
     }
 };
@@ -446,9 +447,9 @@ test "kv_batch: serializeBatch / iterateBatch round-trip" {
     const t = std.testing;
 
     var ops: [3]TxnOp = .{
-        .{ .kind = .put, .key = @constCast("default\x00alpha"), .value = @constCast("hello"), .expiry_ns = 1_000_000_000 },
-        .{ .kind = .delete, .key = @constCast("default\x00beta"), .value = @constCast(""), .expiry_ns = 0 },
-        .{ .kind = .incr, .key = @constCast("default\x00counter"), .value = @constCast("\x07\x00\x00\x00\x00\x00\x00\x00"), .expiry_ns = 0 },
+        .{ .kind = .put, .key = @constCast("default\x00alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
+        .{ .kind = .delete, .key = @constCast("default\x00beta"), .value = @constCast(""), .ttl_ms = 0 },
+        .{ .kind = .incr, .key = @constCast("default\x00counter"), .value = @constCast("\x07\x00\x00\x00\x00\x00\x00\x00"), .ttl_ms = 0 },
     };
 
     const need = batchPayloadSize(&ops);
@@ -464,13 +465,13 @@ test "kv_batch: serializeBatch / iterateBatch round-trip" {
     try t.expectEqual(TxnOpKind.put, a.kind);
     try t.expectEqualStrings("default\x00alpha", a.key);
     try t.expectEqualStrings("hello", a.value);
-    try t.expectEqual(@as(u64, 1_000_000_000), a.expiry_ns);
+    try t.expectEqual(@as(u64, 1_000), a.ttl_ms);
     try t.expectEqual(@as(u32, 0xCAFEBABE), a.namespace_hash);
 
     const b = it.next().?;
     try t.expectEqual(TxnOpKind.delete, b.kind);
     try t.expectEqualStrings("default\x00beta", b.key);
-    try t.expectEqual(@as(u64, 0), b.expiry_ns);
+    try t.expectEqual(@as(u64, 0), b.ttl_ms);
 
     const c = it.next().?;
     try t.expectEqual(TxnOpKind.incr, c.kind);

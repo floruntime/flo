@@ -83,7 +83,8 @@ pub const ProposeResult = @import("../raft/types.zig").ProposeResult;
 /// Propose a key-value command through Raft: a CommandPayload
 /// (namespace_hash + key + value) in the log, not yet committed or
 /// applied. The caller parks on the result or, for a producer that does
-/// not read the outcome, moves on.
+/// not read the outcome, moves on. The leader stamps the entry; the
+/// result carries the stamp for a responder that answers from it.
 ///
 /// `shard` is `anytype` to avoid a circular import with node/shard.zig.
 pub fn proposeEntry(
@@ -93,21 +94,6 @@ pub fn proposeEntry(
     namespace: []const u8,
     key: []const u8,
     value: []const u8,
-) !ProposeResult {
-    const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-    return proposeEntryAt(shard, entry_type, flags, namespace, key, value, timestamp_ns);
-}
-
-/// `proposeEntry` with the entry's header timestamp chosen by the caller,
-/// for a responder that answers from it.
-pub fn proposeEntryAt(
-    shard: anytype,
-    entry_type: EntryType,
-    flags: u16,
-    namespace: []const u8,
-    key: []const u8,
-    value: []const u8,
-    timestamp_ns: u64,
 ) !ProposeResult {
     if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
     const ns_hash = router.namespaceHash(namespace);
@@ -121,7 +107,7 @@ pub fn proposeEntryAt(
         .value = value,
     };
     const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
-    return shard.raft_node.propose(entry_type, flags, timestamp_ns, payload_buf[0..payload_len]);
+    return shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
 }
 
 /// What a client is told when its write cannot be proposed. The Raft
@@ -173,13 +159,13 @@ test "persistence: a write too large to encode is the request's fault, not a ret
 
 test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
     const FakeRaft = struct {
-        pub fn propose(_: *const @This(), _: EntryType, _: u16, _: u64, _: []const u8) !ProposeResult {
+        pub fn propose(_: *const @This(), _: EntryType, _: u16, _: []const u8) !ProposeResult {
             return error.NotLeader;
         }
     };
     const shard = struct { raft_node: FakeRaft }{ .raft_node = .{} };
     const long = [_]u8{'k'} ** (MAX_ENTRY_KEY + 1);
-    try std.testing.expectError(error.KeyTooLarge, proposeEntryAt(&shard, .stream_append, 0, "", &long, "v", 0));
-    try std.testing.expectError(error.NotLeader, proposeEntryAt(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v", 0));
+    try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
+    try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
     try std.testing.expectEqual(proto.StatusCode.bad_request, failureStatus(error.KeyTooLarge));
 }
