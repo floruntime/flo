@@ -36,6 +36,10 @@ pub fn parseDurationMs(text: []const u8) ?u64 {
     return null;
 }
 
+/// The longest age or retention a request may give: past it a value is a
+/// mistake, not a policy, and is refused rather than saturated.
+pub const MAX_AGE_MS: u64 = 100 * 366 * std.time.ms_per_day;
+
 pub fn msToNsSat(ms: u64) u64 {
     return ms *| std.time.ns_per_ms;
 }

@@ -480,6 +480,8 @@ pub const ActionsHandler = struct {
             }
 
             run.status = .running;
+            // The claim is off the log: its time is this node's clock until
+            // claims are logged with stamps of their own.
             run.started_at_ms = @import("stdx").time.milliTimestamp();
             run.attempt += 1;
             if (worker_id.len > 0) {
@@ -580,14 +582,10 @@ pub const ActionsHandler = struct {
         }
 
         // Wire format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
-        const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-
-        // The applier stores the record from the entry; the same applier runs
-        // on restart and on followers.
-        var value_buf: [65536]u8 = undefined;
-        const value = encodeRegisterValue(&value_buf, now_ns, req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "action definition too large" } };
-        };
+        // The entry carries it as sent; the applier stores the record from
+        // it, created at the entry's stamp, on the leader, followers and
+        // restart alike.
+        const value = req.value;
         var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_keys.qualifyKey(&qbuf, namespace, name) catch {
             return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
@@ -598,7 +596,7 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        self.replayRegister(qkey, value);
+        self.replayRegister(qkey, value, wallNs());
         var ver_buf: [12]u8 = undefined;
         return self.registerOutcome(req.namespace, name, &ver_buf);
     }
@@ -657,11 +655,10 @@ pub const ActionsHandler = struct {
 
         // Parse the invoke value to extract labels and actual input.
         const parsed_value = parseInvokeValue(req.value);
-        const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // The applier creates the run from the entry.
         var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
-        const value = encodeInvokeValue(&value_buf, homeOf(req.namespace), action_name, now_ms, parsed_value.input, parsed_value.labels, null, null) orelse {
+        const value = encodeInvokeValue(&value_buf, homeOf(req.namespace), action_name, parsed_value.input, parsed_value.labels, null, null) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         };
         if (shard) |s| {
@@ -670,7 +667,7 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        self.replayInvoke(run_id_str, value);
+        self.replayInvoke(run_id_str, value, wallNs());
         return self.invoked();
     }
 
@@ -960,7 +957,6 @@ pub const ActionsHandler = struct {
         const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
         return self.applyRunUpdate(shard, req.namespace, task_id, .{
             .status = .completed,
-            .completed_at_ms = @import("stdx").time.milliTimestamp(),
             .started_at_ms = run.started_at_ms,
             .result = result_data,
             .worker_id = worker_id,
@@ -1040,7 +1036,6 @@ pub const ActionsHandler = struct {
             // Back to pending for another attempt (within the limit).
             return self.applyRunUpdate(shard, req.namespace, task_id, .{
                 .status = .pending,
-                .completed_at_ms = null,
                 .started_at_ms = null,
                 .result = "",
                 .worker_id = worker_id,
@@ -1050,7 +1045,6 @@ pub const ActionsHandler = struct {
         }
         return self.applyRunUpdate(shard, req.namespace, task_id, .{
             .status = .failed,
-            .completed_at_ms = @import("stdx").time.milliTimestamp(),
             .started_at_ms = run.started_at_ms,
             .result = "",
             .worker_id = worker_id,
@@ -1152,7 +1146,7 @@ pub const ActionsHandler = struct {
         // The applier creates the run from the entry, exactly as a client
         // invoke does; the caller fields mark it as workflow-driven.
         var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
-        const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, @import("stdx").time.milliTimestamp(), input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
+        const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
         const index = proposeInvoke(shard, homeOf(namespace), run_id_str, value) orelse return null;
         return .{ .id = run_id_str, .index = index };
     }
@@ -1186,7 +1180,7 @@ pub const ActionsHandler = struct {
     /// with `allocator`; the receiving shard frees it.
     pub fn encodeStartRunMessage(allocator: Allocator, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]u8 {
         var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
-        const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, @import("stdx").time.milliTimestamp(), input, null, caller_run_id, caller_workflow_name) orelse return null;
+        const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, input, null, caller_run_id, caller_workflow_name) orelse return null;
         const out = allocator.alloc(u8, 2 + run_id.len + value.len) catch return null;
         std.mem.writeInt(u16, out[0..2], @intCast(run_id.len), .little);
         @memcpy(out[2 .. 2 + run_id.len], run_id);
@@ -1196,7 +1190,9 @@ pub const ActionsHandler = struct {
 
     const RunUpdate = struct {
         status: ActionRunStatus,
-        completed_at_ms: ?i64,
+        /// When the worker claimed the run. The claim happens off the log,
+        /// so its time is the claiming node's clock, carried here; it moves
+        /// to the claim's own stamp when claims are logged.
         started_at_ms: ?i64,
         result: []const u8,
         worker_id: ?[]const u8,
@@ -1209,7 +1205,7 @@ pub const ActionsHandler = struct {
         var value_buf: [65536]u8 = undefined;
         const value = encodeRunUpdateValue(&value_buf, u) orelse return .{ .refused = .{ .status = .bad_request, .message = "run update too large" } };
         const s = shard orelse {
-            self.replayUpdateRun(run_id, value);
+            self.replayUpdateRun(run_id, value, wallNs());
             return .applied;
         };
         // Proposed, not waited for: the dispatcher parks the worker on it.
@@ -1234,18 +1230,6 @@ pub const ActionsHandler = struct {
     // Entry encoders — the layouts the appliers decode
     // ═══════════════════════════════════════════════════════════════════
 
-    /// Register entry value: [created_at_ns:u64][original_value...]. The
-    /// version is the applier's to number, in log order: two registers
-    /// can both be proposed before either applies.
-    fn encodeRegisterValue(value_buf: []u8, created_at_ns: u64, req_value: []const u8) ?[]const u8 {
-        if (8 + req_value.len > value_buf.len) return null;
-        std.mem.writeInt(u64, value_buf[0..8], created_at_ns, .little);
-        if (req_value.len > 0) {
-            @memcpy(value_buf[8 .. 8 + req_value.len], req_value);
-        }
-        return value_buf[0 .. 8 + req_value.len];
-    }
-
     fn putLenPrefixed(buf: []u8, off: *usize, comptime L: type, bytes: []const u8) bool {
         const n = @sizeOf(L);
         if (off.* + n + bytes.len > buf.len) return false;
@@ -1256,18 +1240,16 @@ pub const ActionsHandler = struct {
         return true;
     }
 
-    /// Invoke entry value: [action_name_len:u16][action_name][status:u8][created_at_ms:i64]
+    /// Invoke entry value: [action_name_len:u16][action_name][status:u8]
     ///   [input_len:u32][input][labels_len:u32][labels]
     ///   [caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf]
     ///   [namespace_len:u16][namespace]
-    fn encodeInvokeValue(value_buf: []u8, namespace: []const u8, action_name: []const u8, created_at_ms: i64, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
+    fn encodeInvokeValue(value_buf: []u8, namespace: []const u8, action_name: []const u8, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         var off: usize = 0;
         if (!putLenPrefixed(value_buf, &off, u16, action_name)) return null;
-        if (off + 9 > value_buf.len) return null;
+        if (off + 1 > value_buf.len) return null;
         value_buf[off] = @intFromEnum(ActionRunStatus.pending);
         off += 1;
-        std.mem.writeInt(i64, value_buf[off..][0..8], created_at_ms, .little);
-        off += 8;
         if (!putLenPrefixed(value_buf, &off, u32, input)) return null;
         if (!putLenPrefixed(value_buf, &off, u32, labels orelse "")) return null;
         if (!putLenPrefixed(value_buf, &off, u16, caller_run_id orelse "")) return null;
@@ -1276,26 +1258,18 @@ pub const ActionsHandler = struct {
         return value_buf[0..off];
     }
 
-    /// Run update value: [status:u8][has_started:u8][started_at:i64]?[has_completed:u8][completed_at:i64]?
+    /// Run update value: [status:u8][has_started:u8][started_at:i64]?
     ///   [result_len:u32][result][worker_id_len:u16][worker_id][outcome_len:u16][outcome][error_len:u16][error]
+    /// A run that finishes finishes at the entry's stamp.
     fn encodeRunUpdateValue(value_buf: []u8, u: RunUpdate) ?[]const u8 {
         var off: usize = 0;
-        if (off + 1 + 9 + 9 > value_buf.len) return null;
+        if (off + 1 + 9 > value_buf.len) return null;
         value_buf[off] = @intFromEnum(u.status);
         off += 1;
         if (u.started_at_ms) |sa| {
             value_buf[off] = 1;
             off += 1;
             std.mem.writeInt(i64, value_buf[off..][0..8], sa, .little);
-            off += 8;
-        } else {
-            value_buf[off] = 0;
-            off += 1;
-        }
-        if (u.completed_at_ms) |ts| {
-            value_buf[off] = 1;
-            off += 1;
-            std.mem.writeInt(i64, value_buf[off..][0..8], ts, .little);
             off += 8;
         } else {
             value_buf[off] = 0;
@@ -1341,19 +1315,17 @@ pub const ActionsHandler = struct {
         }
         const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
         switch (etype) {
-            .action_register => self.replayRegister(cmd.key, cmd.value),
+            .action_register => self.replayRegister(cmd.key, cmd.value, e.header.timestamp_ns),
             .action_delete => self.replayDelete(cmd.key),
-            .action_invoke => self.replayInvoke(cmd.key, cmd.value),
-            .action_update_run => self.replayUpdateRun(cmd.key, cmd.value),
+            .action_invoke => self.replayInvoke(cmd.key, cmd.value, e.header.timestamp_ns),
+            .action_update_run => self.replayUpdateRun(cmd.key, cmd.value, e.header.timestamp_ns),
             else => {},
         }
     }
 
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8) void {
-        if (value.len < 8) return;
-
+    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) void {
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
         var name = key;
@@ -1363,10 +1335,9 @@ pub const ActionsHandler = struct {
         }
 
         const version: u32 = if (self.actions.get(key)) |old| old.version + 1 else 1;
-        const created_at_ns = std.mem.readInt(u64, value[0..8], .little);
-        // The client's register value follows, so owner, timeout and
-        // retries replay from it.
-        const meta = parseRegisterValue(value[8..]);
+        // The client's register value, so owner, timeout and retries
+        // replay from it.
+        const meta = parseRegisterValue(value);
 
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(key)) |old| self.freeAction(old.value);
@@ -1395,7 +1366,7 @@ pub const ActionsHandler = struct {
             .action_type = meta.action_type,
             .version = version,
             .enabled = true,
-            .created_at_ns = created_at_ns,
+            .created_at_ns = stamp_ns,
             .timeout_ms = meta.timeout_ms,
             .max_retries = meta.max_retries,
         }) catch {
@@ -1420,7 +1391,7 @@ pub const ActionsHandler = struct {
     }
 
     /// Rebuild a RunRecord from a persisted invoke entry.
-    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
+    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) void {
         // An id already taken is refused, not overwritten: the run under it
         // may be running or finished, and its caller waits on that run.
         if (self.runs.contains(run_id)) {
@@ -1429,69 +1400,15 @@ pub const ActionsHandler = struct {
             log.warn("action invoke refused: run id '{s}' is already in use", .{run_id});
             return;
         }
-        var off: usize = 0;
-
-        // action_name
-        if (off + 2 > value.len) return;
-        const aname_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + aname_len > value.len) return;
-        const action_name = value[off .. off + aname_len];
-        off += aname_len;
-
-        // status
-        if (off >= value.len) return;
-        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return;
-        off += 1;
-
-        // created_at_ms
-        if (off + 8 > value.len) return;
-        const created_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
-        off += 8;
-
-        // input
-        if (off + 4 > value.len) return;
-        const input_len: usize = std.mem.readInt(u32, value[off..][0..4], .little);
-        off += 4;
-        var input: ?[]const u8 = null;
-        if (input_len > 0) {
-            if (off + input_len > value.len) return;
-            input = self.allocator.dupe(u8, value[off .. off + input_len]) catch null;
-            off += input_len;
-        }
-
-        // labels
-        if (off + 4 > value.len) return;
-        const labels_len: usize = std.mem.readInt(u32, value[off..][0..4], .little);
-        off += 4;
-        var labels: ?[]const u8 = null;
-        if (labels_len > 0) {
-            if (off + labels_len <= value.len) {
-                labels = self.allocator.dupe(u8, value[off .. off + labels_len]) catch null;
-            }
-            off += labels_len;
-        }
-
-        // caller (workflow-driven runs)
-        var caller_run_id: ?[]const u8 = null;
-        var caller_workflow_name: ?[]const u8 = null;
-        if (off + 2 <= value.len) {
-            const crid_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (crid_len > 0 and off + crid_len <= value.len) {
-                caller_run_id = self.allocator.dupe(u8, value[off .. off + crid_len]) catch null;
-            }
-            off += crid_len;
-        }
-        if (off + 2 <= value.len) {
-            const cwn_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
-            off += 2;
-            if (cwn_len > 0 and off + cwn_len <= value.len) {
-                caller_workflow_name = self.allocator.dupe(u8, value[off .. off + cwn_len]) catch null;
-            }
-            off += cwn_len;
-        }
-        const namespace = invokeNamespace(value);
+        const v = InvokeValue.parse(value) orelse return;
+        const action_name = v.action_name;
+        const status = v.status;
+        const created_at_ms: i64 = @intCast(stamp_ns / std.time.ns_per_ms);
+        const input: ?[]const u8 = if (v.input.len > 0) self.allocator.dupe(u8, v.input) catch null else null;
+        const labels: ?[]const u8 = if (v.labels.len > 0) self.allocator.dupe(u8, v.labels) catch null else null;
+        const caller_run_id: ?[]const u8 = if (v.caller_run_id.len > 0) self.allocator.dupe(u8, v.caller_run_id) catch null else null;
+        const caller_workflow_name: ?[]const u8 = if (v.caller_workflow_name.len > 0) self.allocator.dupe(u8, v.caller_workflow_name) catch null else null;
+        const namespace = v.namespace;
 
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const arec = if (defKey(&kbuf, namespace, action_name)) |k| self.actions.get(k) else null;
@@ -1536,16 +1453,44 @@ pub const ActionsHandler = struct {
     /// The namespace an invoke value names (its last field), "default" if
     /// none.
     fn invokeNamespace(value: []const u8) []const u8 {
-        var off: usize = 0;
-        _ = readLenPrefixed(value, &off, u16) orelse return "default"; // action name
-        off += 1 + 8; // status, created_at
-        _ = readLenPrefixed(value, &off, u32) orelse return "default"; // input
-        _ = readLenPrefixed(value, &off, u32) orelse return "default"; // labels
-        _ = readLenPrefixed(value, &off, u16) orelse return "default"; // caller run id
-        _ = readLenPrefixed(value, &off, u16) orelse return "default"; // caller workflow
-        const ns = readLenPrefixed(value, &off, u16) orelse return "default";
-        return if (ns.len == 0) "default" else ns;
+        return if (InvokeValue.parse(value)) |v| v.namespace else "default";
     }
+
+    /// An invoke entry's value (`encodeInvokeValue`), read in one place:
+    /// the applier and the cross-shard start both read it from here. Slices
+    /// borrow from the value; an empty field reads as empty. Null when the
+    /// value is cut short or its status unknown.
+    const InvokeValue = struct {
+        action_name: []const u8,
+        status: ActionRunStatus,
+        input: []const u8,
+        labels: []const u8,
+        caller_run_id: []const u8,
+        caller_workflow_name: []const u8,
+        namespace: []const u8,
+
+        fn parse(value: []const u8) ?InvokeValue {
+            var off: usize = 0;
+            const action_name = readLenPrefixed(value, &off, u16) orelse return null;
+            if (off >= value.len) return null;
+            const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return null;
+            off += 1;
+            const input = readLenPrefixed(value, &off, u32) orelse return null;
+            const labels = readLenPrefixed(value, &off, u32) orelse return null;
+            const caller_run_id = readLenPrefixed(value, &off, u16) orelse return null;
+            const caller_workflow_name = readLenPrefixed(value, &off, u16) orelse return null;
+            const ns = readLenPrefixed(value, &off, u16) orelse return null;
+            return .{
+                .action_name = action_name,
+                .status = status,
+                .input = input,
+                .labels = labels,
+                .caller_run_id = caller_run_id,
+                .caller_workflow_name = caller_workflow_name,
+                .namespace = if (ns.len == 0) "default" else ns,
+            };
+        }
+    };
 
     fn readLenPrefixed(value: []const u8, off: *usize, comptime L: type) ?[]const u8 {
         if (off.* + @sizeOf(L) > value.len) return null;
@@ -1571,7 +1516,7 @@ pub const ActionsHandler = struct {
     }
 
     /// Apply a run status update from its entry.
-    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8) void {
+    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) void {
         var off: usize = 0;
 
         // status
@@ -1587,17 +1532,6 @@ pub const ActionsHandler = struct {
         if (has_started) {
             if (off + 8 > value.len) return;
             started_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
-            off += 8;
-        }
-
-        // completed_at_ms
-        if (off >= value.len) return;
-        const has_ts = value[off] == 1;
-        off += 1;
-        var timestamp_ms: ?i64 = null;
-        if (has_ts) {
-            if (off + 8 > value.len) return;
-            timestamp_ms = std.mem.readInt(i64, value[off..][0..8], .little);
             off += 8;
         }
 
@@ -1646,7 +1580,7 @@ pub const ActionsHandler = struct {
         if (self.runs.getPtr(run_id)) |run| {
             run.status = status;
             if (status == .completed or status == .failed) {
-                run.completed_at_ms = timestamp_ms;
+                run.completed_at_ms = @intCast(stamp_ns / std.time.ns_per_ms);
             } else if (status == .pending) {
                 run.started_at_ms = null;
             }
@@ -1688,6 +1622,12 @@ pub const ActionsHandler = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const Waiter = waiter_pool_mod.Waiter;
+
+/// The wall clock, as the stamp of an apply with no shard (tests), where
+/// there is no log to stamp it.
+fn wallNs() u64 {
+    return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
+}
 
 /// Action await resolver: claim a pending run matching any action the worker handles.
 /// Waiter key is compound: [namespace\x00][action_name][worker_id]
@@ -2193,17 +2133,17 @@ test "actions handler: an invoke naming a run id already taken is refused, and t
     _ = handler.handleCommand(null, makeRequest(.action_register, "process", ""));
 
     var buf: [256]u8 = undefined;
-    const value = ActionsHandler.encodeInvokeValue(&buf, "default", "process", 1, "first", null, null, null).?;
+    const value = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "first", null, null, null).?;
     handler.last_invoked_run_id = null;
     handler.last_invoke_existed = false;
-    handler.replayInvoke("act-1", value);
+    handler.replayInvoke("act-1", value, 1);
     try testing.expect(handler.invoked() == .action_invoked);
     handler.runs.getPtr("act-1").?.status = .running;
 
-    const again = ActionsHandler.encodeInvokeValue(&buf, "default", "process", 2, "second", null, null, null).?;
+    const again = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "second", null, null, null).?;
     handler.last_invoked_run_id = null;
     handler.last_invoke_existed = false;
-    handler.replayInvoke("act-1", again);
+    handler.replayInvoke("act-1", again, 2);
     switch (handler.invoked()) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.internal_error, e.code),
         else => return error.TestUnexpectedResult,
@@ -2378,13 +2318,11 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
 
-    var reg_buf: [256]u8 = undefined;
-    const reg = ActionsHandler.encodeRegisterValue(&reg_buf, 1, "") orelse return error.EncodeFailed;
-    h.replayRegister("echo", reg);
+    h.replayRegister("echo", "", 1);
 
     var inv_buf: [512]u8 = undefined;
-    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", 1000, "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
-    h.replayInvoke("act-1", inv);
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
+    h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms);
     const created = h.runs.get("act-1") orelse return error.RunMissing;
     try std.testing.expectEqualStrings("gpu", created.labels_owned.?);
     try std.testing.expectEqualStrings("wf-run-9", created.caller_run_id_owned.?);
@@ -2393,7 +2331,6 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     // A failed attempt keeps its error and worker; a completion clears the error.
     try std.testing.expect(h.applyRunUpdate(null, "default", "act-1", .{
         .status = .failed,
-        .completed_at_ms = 2000,
         .started_at_ms = 1500,
         .result = "",
         .worker_id = "w-1",
@@ -2407,7 +2344,6 @@ test "actions: a run update applied from its entry carries outcome, error and wo
 
     try std.testing.expect(h.applyRunUpdate(null, "default", "act-1", .{
         .status = .completed,
-        .completed_at_ms = 3000,
         .started_at_ms = 1500,
         .result = "{\"ok\":true}",
         .worker_id = "w-2",
@@ -2420,6 +2356,52 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     try std.testing.expectEqualStrings("{\"ok\":true}", done.result_owned.?);
     try std.testing.expectEqualStrings("w-2", done.worker_id_owned.?);
     try std.testing.expect(done.error_owned == null);
+}
+
+test "actions: an action's created, run's created and run's finished times are their entries' stamps, not the host's clock" {
+    const host_ms = @import("stdx").time.milliTimestamp();
+    // One stamp far behind the host's clock and one a day ahead: an applier
+    // reading the clock misses one or the other.
+    for ([_]i64{ 1_000, host_ms + std.time.ms_per_day }) |stamp_ms| {
+        var h = ActionsHandler.init(std.testing.allocator);
+        defer h.deinit();
+        const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
+        var pbuf: [512]u8 = undefined;
+        // Through `replayEntry`, as the log applies them.
+        h.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, stamp_ns, 0, "echo", "", &pbuf).?);
+        try std.testing.expectEqual(stamp_ns, h.actions.get("echo").?.created_at_ns);
+
+        var inv_buf: [512]u8 = undefined;
+        // A namespace other than default: its field comes last, after every
+        // field the layout has.
+        const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "ns1", "echo", "", null, null, null).?;
+        h.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, stamp_ns + 5 * std.time.ns_per_ms, 0, "act-1", inv, &pbuf).?);
+        try std.testing.expectEqual(stamp_ms + 5, h.runs.get("act-1").?.created_at_ms);
+        try std.testing.expectEqualStrings("ns1", h.runs.get("act-1").?.namespace_owned);
+
+        var upd_buf: [256]u8 = undefined;
+        const upd = ActionsHandler.encodeRunUpdateValue(&upd_buf, .{ .status = .completed, .started_at_ms = 7, .result = "", .worker_id = null, .outcome = "", .error_message = "" }).?;
+        h.replayEntry(&entry_mod.buildCommandEntry(.action_update_run, 0, 1, 3, stamp_ns + 9 * std.time.ns_per_ms, 0, "act-1", upd, &pbuf).?);
+        const done = h.runs.get("act-1").?;
+        try std.testing.expectEqual(@as(?i64, stamp_ms + 9), done.completed_at_ms);
+        // The claim's time is carried as the claiming node took it.
+        try std.testing.expectEqual(@as(?i64, 7), done.started_at_ms);
+    }
+}
+
+test "actions: an invoke value reads back every field it was written with, and a value cut short reads as nothing" {
+    var buf: [256]u8 = undefined;
+    const value = ActionsHandler.encodeInvokeValue(&buf, "ns1", "echo", "in", "gpu", "wf-run-9", "parent-wf").?;
+    const v = ActionsHandler.InvokeValue.parse(value).?;
+    try std.testing.expectEqualStrings("echo", v.action_name);
+    try std.testing.expectEqual(ActionRunStatus.pending, v.status);
+    try std.testing.expectEqualStrings("in", v.input);
+    try std.testing.expectEqualStrings("gpu", v.labels);
+    try std.testing.expectEqualStrings("wf-run-9", v.caller_run_id);
+    try std.testing.expectEqualStrings("parent-wf", v.caller_workflow_name);
+    try std.testing.expectEqualStrings("ns1", v.namespace);
+    try std.testing.expectEqualStrings("ns1", ActionsHandler.invokeNamespace(value));
+    for (0..value.len) |n| try std.testing.expect(ActionsHandler.InvokeValue.parse(value[0..n]) == null);
 }
 
 test "actions: an action name holding a NUL has no registry key" {
