@@ -98,9 +98,10 @@ pub const ClusterConfig = struct {
     log_level: []const u8 = "debug",
     /// Durability mode for all nodes
     durability: ServerProcess.Durability = .sync,
-    /// Time to wait for cluster formation (nanoseconds)
-    /// Increased to allow peer discovery and stable leader election
-    formation_delay_ns: u64 = 6 * std.time.ns_per_s,
+    /// Longest wait for the cluster to form: every node a voter, or past
+    /// the third, a caught-up replica (joiners vote only once the leader
+    /// promotes them, and it promotes up to three).
+    formation_delay_ns: u64 = 30 * std.time.ns_per_s,
     /// Number of shards per node
     shards: u8 = 1,
     /// Tiered-log config applied to every node (e.g. a small hot_buffer_capacity
@@ -124,6 +125,8 @@ pub const ClusterContext = struct {
     clis: [MAX_NODES]?*CliRunner,
     endpoints: [MAX_NODES]?[]const u8,
     node_count: u8,
+    /// Every joiner's `--join`, kept for as long as a node may restart.
+    seed_endpoint: ?[]const u8 = null,
 
     /// Initialize a cluster with the given configuration
     pub fn init(allocator: Allocator, config: ClusterConfig) !Self {
@@ -174,7 +177,7 @@ pub const ClusterContext = struct {
 
         // Get seed node's raft endpoint
         const seed_endpoint = try self.servers[0].?.getRaftEndpoint(allocator);
-        defer allocator.free(seed_endpoint);
+        self.seed_endpoint = seed_endpoint;
 
         // Start remaining nodes (join seed)
         // Note: Don't set explicit node_id - let it be auto-generated from host:port
@@ -200,10 +203,33 @@ pub const ClusterContext = struct {
             errdefer if (self.clis[i]) |c| c.deinit();
         }
 
-        // Give cluster time to form (Raft election + replication setup)
-        stdx.time.sleep(config.formation_delay_ns);
-
+        try self.awaitFormed(config.formation_delay_ns);
         return self;
+    }
+
+    /// Wait until three nodes report a voter's role and the rest a
+    /// replica's; which joiners the leader promotes is whichever catch up
+    /// first. With fewer than three, the seed alone votes: the leader
+    /// promotes only into an odd count.
+    fn awaitFormed(self: *Self, limit_ns: u64) !void {
+        const want_voters: usize = if (self.node_count >= 3) 3 else 1;
+        const step_ms = 250;
+        var waited_ns: u64 = 0;
+        while (waited_ns < limit_ns) : (waited_ns += step_ms * std.time.ns_per_ms) {
+            var voters: usize = 0;
+            var replicas: usize = 0;
+            for (0..self.node_count) |i| {
+                const out = self.execCaptureAnyOn(i, &.{ "cluster", "status", "-o", "json" }) catch break;
+                defer self.allocator.free(out);
+                if (std.mem.indexOf(u8, out, "\"role\":\"leader\"") != null or std.mem.indexOf(u8, out, "\"role\":\"follower\"") != null) voters += 1;
+                if (std.mem.indexOf(u8, out, "\"role\":\"replica\"") != null) replicas += 1;
+            }
+            if (voters == want_voters and voters + replicas == self.node_count) return;
+            stdx.time.sleep(step_ms * std.time.ns_per_ms);
+        }
+        std.debug.print("[cluster] not formed within {d} s\n", .{limit_ns / std.time.ns_per_s});
+        self.printLogs();
+        return error.ClusterNotFormed;
     }
 
     /// Initialize with default 3-node configuration
@@ -221,6 +247,8 @@ pub const ClusterContext = struct {
                 self.servers[i] = null;
             }
         }
+        if (self.seed_endpoint) |e| self.allocator.free(e);
+        self.seed_endpoint = null;
     }
 
     /// Clean up all resources
@@ -240,6 +268,8 @@ pub const ClusterContext = struct {
                 self.servers[i] = null;
             }
         }
+        if (self.seed_endpoint) |e| self.allocator.free(e);
+        self.seed_endpoint = null;
     }
 
     /// Execute command on specific node (fire-and-forget, asserts success)

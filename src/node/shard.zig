@@ -298,6 +298,19 @@ pub const Shard = struct {
     join_warned_ms: u64,
     join_refused_warn_ms: u64,
     stranger_warn_ms: u64,
+    /// The group removed this node, at this time on the removing leader's
+    /// clock: it takes no part and answers clients that it is gone.
+    removed_at_ms: ?u64 = null,
+    removed_warn_ms: u64 = 0,
+    /// What clients are told once removed, with the time in it.
+    removed_message_buf: [128]u8 = undefined,
+    removed_message: []const u8 = REMOVED_MESSAGE,
+    /// Last "you were removed" told to a removed node, and last line about
+    /// a replica speaking out of turn.
+    removed_notice_ms: u64 = 0,
+    replica_frame_warn_ms: u64 = 0,
+    /// The config index whose voters the peer network last heard.
+    voters_published_index: u64 = std.math.maxInt(u64),
     /// Last "lost-log guard" line: a node waiting on a leader or a quorum
     /// that never comes says so, and names the way out.
     lost_log_warn_ms: u64 = 0,
@@ -739,6 +752,9 @@ pub const Shard = struct {
         WorkflowHandler.register(&dispatcher);
         ProcessingHandler.register(&dispatcher);
         dispatcher.register(.cluster_status, dispatchClusterStatus);
+        dispatcher.register(.cluster_members, dispatchClusterMembers);
+        dispatcher.register(.cluster_promote, dispatchClusterPromote);
+        dispatcher.register(.cluster_remove, dispatchClusterRemove);
 
         // Register ping handler
         dispatcher.register(.ping, handlePing);
@@ -846,9 +862,22 @@ pub const Shard = struct {
     /// Wire shard back-pointers into handlers that need Raft access.
     /// Must be called after shards are at their final heap addresses.
     pub fn wireHandlerShardPtrs(self: *Shard) void {
+        self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
+    }
+
+    /// A config entry is about to take effect: the log goes to disk first,
+    /// whatever the durability mode.
+    fn flushForConfig(ctx: *anyopaque) bool {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        self.flushSegmentToDisk() catch |err| {
+            self.persist_failures += 1;
+            log.err("shard {d}: flushing a membership change failed: {s}; it does not take effect (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+            return false;
+        };
+        return true;
     }
 
     /// Flush buffered Raft log entries to a .flseg file under `shard_data_dir/segs/`,
@@ -924,7 +953,7 @@ pub const Shard = struct {
             }
             // Alone, nothing else can make these writes durable: tell their
             // clients now rather than leave them waiting on the disk.
-            if (raft.role == .leader and raft.peer_count == 0) {
+            if (raft.role == .leader and raft.voterPeers() == 0) {
                 self.failPendingAbove(raft.durable_index, if (raft.writes_stopped) LOST_AT_RESTART else NOT_ON_DISK);
             }
             return;
@@ -1370,11 +1399,18 @@ pub const Shard = struct {
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
     fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request) void {
+        if (self.removed_at_ms != null and req.header.op_code != @intFromEnum(proto.OpCode.cluster_status) and req.header.op_code != @intFromEnum(proto.OpCode.cluster_members)) {
+            self.sendErrorResponse(conn, req.header.request_id, .unavailable, self.removed_message);
+            return;
+        }
         if (self.raft_network != null and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and (self.diverged or self.raft_node.role != .leader)) {
             if (self.diverged) {
                 self.sendErrorResponse(conn, req.header.request_id, .unavailable, DIVERGED_MESSAGE);
                 return;
             }
+            // A replica serves reads and sends writers to the leader
+            // rather than carrying their writes.
+            if (!self.raft_node.timer_enabled and self.raft_node.self_named) return self.redirectToLeader(conn, req);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -2053,6 +2089,21 @@ pub const Shard = struct {
 
     // ─── Writes on a node that does not lead ─────────────────────────────
 
+    fn redirectToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
+        const leader = self.raft_node.leader_id;
+        var buf: [160]u8 = undefined;
+        const addr = if (leader != 0) if (self.raft_network) |rn| rn.clientAddress(leader) else null else null;
+        const msg = if (addr) |a|
+            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; send writes to the leader, node {d} at {d}.{d}.{d}.{d}:{d}", .{ leader, a.ip4[0], a.ip4[1], a.ip4[2], a.ip4[3], a.port }) catch REPLICA_MESSAGE
+        else if (leader != 0)
+            std.fmt.bufPrint(&buf, "unavailable: this node is a replica; send writes to the leader, node {d}", .{leader}) catch REPLICA_MESSAGE
+        else
+            REPLICA_MESSAGE;
+        self.sendErrorResponse(conn, req.header.request_id, .unavailable, msg);
+    }
+
+    const REPLICA_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
+
     /// Send a client's write to the leader, and
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
@@ -2346,10 +2397,17 @@ pub const Shard = struct {
     /// group; a node with the secret but no seat can still ask for one.
     fn handleRaftFrame(self: *Shard, frame: RaftFrame) void {
         const raft = self.raft_node;
-        if (self.diverged) return;
-        if (frame.msg_type != .join_request and (raft.peer_count > 0 or raft.timer_enabled)) {
+        if (self.diverged or self.removed_at_ms != null) return;
+        if (frame.msg_type != .join_request and (raft.peer_count > 0 or raft.self_named)) {
+            // Members of the latest config, and of the committed one until
+            // the change commits: a leader removing itself leads the group
+            // that drops it until the group has taken that.
             var ids: [membership.MAX_MEMBERS]u32 = undefined;
-            if (!membership.names(raft.memberIds(&ids), frame.source_node)) return self.strangerFrame(frame);
+            if (!membership.names(raft.memberIds(&ids), frame.source_node) and !raft.committed_config.names(frame.source_node)) return self.strangerFrame(frame);
+            // A joiner keeps its guard while it catches up: the configs it
+            // passes through on the way are history, and may call it a
+            // replica it no longer is.
+            if (raft.isReplicaPeer(frame.source_node) and !replicaMaySend(frame.msg_type)) return self.replicaFrame(frame);
         }
         switch (frame.msg_type) {
             .append_entries => {
@@ -2404,8 +2462,17 @@ pub const Shard = struct {
                 if (resp.from != frame.source_node) return self.impostorFrame(frame, resp.from);
                 const was = raft.role;
                 raft.handleAppendResponse(resp);
-                if (was == .leader and raft.role != .leader) self.leadershipLost("a follower is at a newer term");
+                // Applied first: a leader whose own removal just committed
+                // answers what it parked on that commit before it lets go.
                 if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                if (was == .leader and raft.role != .leader) {
+                    if (raft.left_group) {
+                        raft.left_group = false;
+                        self.leadershipLost("this node is no longer a voter");
+                    } else {
+                        self.leadershipLost("a follower is at a newer term");
+                    }
+                }
                 if (raft.role == .leader) self.pump(nowMs());
             },
             .request_vote => {
@@ -2451,6 +2518,7 @@ pub const Shard = struct {
                 if (was != .none and raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term + 1 });
             },
             .join_request => self.handleJoinRequest(frame.source_node),
+            .removed_notice => self.takeRemovedNotice(frame),
             .forward_write => self.runForwardedWrite(frame),
             .forward_reply => self.takeForwardReply(frame),
             .install_snapshot, .peer_info, .hello, .hello_back, .verify, .welcome => {},
@@ -2488,11 +2556,84 @@ pub const Shard = struct {
     }
 
     fn strangerFrame(self: *Shard, frame: RaftFrame) void {
+        // Only a committed removal is told: an uncommitted one may yet be
+        // cut from the log.
+        if (self.raft_node.committed_config.removedAt(frame.source_node)) |when| return self.sendRemovedNotice(frame.source_node, when);
         const now = nowMs();
         if (now -| self.stranger_warn_ms < WARN_INTERVAL_MS) return;
         self.stranger_warn_ms = now;
         log.warn("shard {d}: node {d} sent a {s} frame but is not a member; ignored (a node with the secret is a member only once the leader adds it)", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
     }
+
+    /// What a peer this node sees as a replica may send: everything but a
+    /// write to carry to the leader, which a replica answers itself. Votes
+    /// and appends are not judged by this node's view of the sender, which
+    /// may be stale: a replica promoted by a config this node has not taken
+    /// yet must still reach it to elect and to replicate, and term rules
+    /// keep both safe.
+    fn replicaMaySend(t: transport.MsgType) bool {
+        return t != .forward_write;
+    }
+
+    fn replicaFrame(self: *Shard, frame: RaftFrame) void {
+        const now = nowMs();
+        if (now -| self.replica_frame_warn_ms < WARN_INTERVAL_MS) return;
+        self.replica_frame_warn_ms = now;
+        log.warn("shard {d}: replica {d} sent a {s} frame; a replica only takes the log, so it was dropped", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
+    }
+
+    /// Tell a removed node so, at most once a second: it stops, rather than
+    /// campaign or ask to join forever.
+    fn sendRemovedNotice(self: *Shard, to: u32, when_ms: u64) void {
+        const now = nowMs();
+        if (now -| self.removed_notice_ms < 1000) return;
+        self.removed_notice_ms = now;
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, when_ms, .little);
+        self.sendRaft(to, .removed_notice, &buf);
+    }
+
+    fn takeRemovedNotice(self: *Shard, frame: RaftFrame) void {
+        if (frame.payload.len != 8) return self.badFrame(frame);
+        self.enterRemoved(std.mem.readInt(u64, frame.payload[0..8], .little));
+    }
+
+    /// The group removed this node. It stops taking part, says so to
+    /// clients, and says how to come back.
+    fn enterRemoved(self: *Shard, when_ms: u64) void {
+        if (self.removed_at_ms != null) return;
+        self.removed_at_ms = when_ms;
+        var at: [32]u8 = undefined;
+        self.removed_message = std.fmt.bufPrint(&self.removed_message_buf, "{s} at {s}", .{ REMOVED_MESSAGE, formatUtc(&at, when_ms) }) catch REMOVED_MESSAGE;
+        const raft = self.raft_node;
+        if (raft.role == .leader) {
+            raft.role = .follower;
+            raft.leader_id = 0;
+        }
+        raft.timer_enabled = false;
+        if (self.raft_network) |rn| rn.stopDialing();
+        self.stoppedLeading(self.removed_message);
+        self.warnRemoved(nowMs());
+    }
+
+    fn warnRemoved(self: *Shard, now: u64) void {
+        const when = self.removed_at_ms orelse return;
+        if (self.removed_warn_ms != 0 and now -| self.removed_warn_ms < 30_000) return;
+        self.removed_warn_ms = now;
+        var at: [32]u8 = undefined;
+        log.err("shard {d}: removed from the cluster at {s} (the removing leader's clock); this node takes no part. To bring this machine back, start it with a new node id and an empty data directory, then --join a live member", .{ self.id, formatUtc(&at, when) });
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS UTC` of a time in ms since the epoch.
+    fn formatUtc(buf: *[32]u8, ms: u64) []const u8 {
+        const secs = std.time.epoch.EpochSeconds{ .secs = ms / 1000 };
+        const day = secs.getDaySeconds();
+        const yd = secs.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{ yd.year, md.month.numeric(), @as(u32, md.day_index) + 1, day.getHoursIntoDay(), day.getMinutesIntoHour(), day.getSecondsIntoMinute() }) catch buf[0..0];
+    }
+
+    pub const REMOVED_MESSAGE = "unavailable: this node was removed from the cluster";
 
     /// Committed, applied history and the leader's log disagree. The
     /// projections cannot be rebuilt in place, so the node stops taking
@@ -2527,6 +2668,17 @@ pub const Shard = struct {
         if (self.raft_network == null or self.diverged) return;
         const raft = self.raft_node;
         const now = nowMs();
+        if (self.removed_at_ms != null) return self.warnRemoved(now);
+        if (raft.committed_config.removedAt(self.cluster_node_id)) |when| return self.enterRemoved(when);
+        if (raft.left_group) {
+            raft.left_group = false;
+            self.leadershipLost("this node is no longer a voter");
+        }
+        if (raft.membership_index != self.voters_published_index and raft.latest_config.member_count > 0) {
+            self.voters_published_index = raft.membership_index;
+            var voters: [membership.MAX_MEMBERS]u32 = undefined;
+            if (self.raft_network) |rn| rn.setVoters(raft.latest_config.voterIds(&voters));
+        }
         const r = raft.tick(now);
         // A leader found or won ends the outage the attempt lines count.
         if (raft.role == .leader or raft.leader_id != 0) {
@@ -2564,7 +2716,10 @@ pub const Shard = struct {
         }
         if (raft.lost_log != .none) self.warnLostLog(now);
         if (r.step_down) self.leadershipLost("no contact with a majority");
-        if (raft.role == .leader) self.pump(now);
+        if (raft.role == .leader) {
+            self.pump(now);
+            self.adjustMembership(now);
+        }
         if (self.joinWanted(now)) self.askToJoin(now);
         if (self.forward_count > 0) self.sweepForwards(now);
     }
@@ -2602,8 +2757,15 @@ pub const Shard = struct {
     /// it.
     fn joinWanted(self: *Shard, now: u64) bool {
         const raft = self.raft_node;
-        if (raft.peer_count == 0 and !raft.timer_enabled) return true;
-        return raft.role != .leader and raft.membership_index > raft.commit_index and now -| raft.last_leader_contact_ms > raft.config.election_timeout_max_ms;
+        if (!raft.self_named) return true;
+        if (raft.role == .leader) return false;
+        const quiet = now -| raft.last_leader_contact_ms > raft.config.election_timeout_max_ms;
+        // A replica that no leader speaks to may have been dropped (a
+        // joiner that never caught up is aged out without being told):
+        // asking again is answered by a leader only when it is not a
+        // member.
+        if (!raft.timer_enabled and quiet) return true;
+        return raft.membership_index > raft.commit_index and quiet;
     }
 
     fn broadcastVote(self: *Shard, req: raft_node_mod.VoteRequest) void {
@@ -2710,56 +2872,92 @@ pub const Shard = struct {
         for (rn.linkedPeers(&ids)) |peer| self.sendRaft(peer, .join_request, "");
     }
 
-    /// A proven peer wants in. The leader appends the config that names
-    /// it, one change at a time: a second change before the first commits
-    /// could let two majorities disagree.
+    /// A proven peer wants in. The leader appends the config that names it
+    /// as a replica: it votes only once it has caught up and the leader
+    /// promotes it. Under the shared secret every joiner already holds the
+    /// cluster's keys, so each may be promoted on its own (`may_vote`).
     fn handleJoinRequest(self: *Shard, from: u32) void {
         const raft = self.raft_node;
+        if (raft.committed_config.removedAt(from)) |when| return self.sendRemovedNotice(from, when);
         if (raft.role != .leader) return;
-        var ids: [membership.MAX_MEMBERS]u32 = undefined;
-        const members = raft.memberIds(&ids);
-        if (membership.names(members, from)) return;
-        if (raft.membership_index > raft.commit_index) {
-            // A change that never commits (the node it added died before
-            // acking) blocks every later join; name who has not answered.
+        if (raft.latest_config.names(from)) return;
+        if (raft.latest_config.member_count >= membership.MAX_MEMBERS) {
             const now = nowMs();
             if (now -| self.join_refused_warn_ms >= JOIN_WARN_INTERVAL_MS) {
                 self.join_refused_warn_ms = now;
-                var waiting: [raft_node_mod.MAX_PEERS]u32 = undefined;
-                var n: usize = 0;
-                for (0..raft.peer_count) |i| {
-                    if (raft.peers[i].match_index < raft.membership_index) {
-                        waiting[n] = raft.peer_ids[i];
-                        n += 1;
-                    }
-                }
-                if (n == 0) {
-                    log.warn("shard {d}: node {d} asked to join while an earlier membership change waits for a majority; nothing else is added until it commits", .{ self.id, from });
-                } else {
-                    log.warn("shard {d}: node {d} asked to join while an earlier membership change waits for {any} to answer; nothing else is added until it does", .{ self.id, from, waiting[0..n] });
-                }
+                log.warn("shard {d}: node {d} asked to join but the group already has {d} members, the most it can hold", .{ self.id, from, raft.latest_config.member_count });
             }
             return;
         }
-        if (members.len >= membership.MAX_MEMBERS) {
-            const now = nowMs();
-            if (now -| self.join_refused_warn_ms >= JOIN_WARN_INTERVAL_MS) {
-                self.join_refused_warn_ms = now;
-                log.warn("shard {d}: node {d} asked to join but the group already has {d} members, the most it can hold", .{ self.id, from, members.len });
-            }
-            return;
+        const next = raft.latest_config.withJoiner(from, true);
+        if (self.proposeMembership(&next, "adding node")) {
+            log.info("shard {d}: adding node {d} as a replica", .{ self.id, from });
         }
-        var grown: [membership.MAX_MEMBERS]u32 = undefined;
-        @memcpy(grown[0..members.len], members);
-        grown[members.len] = from;
-        var buf: [membership.MAX_SIZE]u8 = undefined;
-        const payload = membership.encode(grown[0 .. members.len + 1], &buf);
-        _ = raft.propose(.raft_config, entry_mod.Flags.NONE, 0, payload) catch |err| {
-            log.err("shard {d}: could not propose adding node {d}: {s}", .{ self.id, from, @errorName(err) });
-            return;
+    }
+
+    /// Propose a membership change, saying why one could not be made. True
+    /// when proposed.
+    fn proposeMembership(self: *Shard, next: *const membership.Config, what: []const u8) bool {
+        const raft = self.raft_node;
+        const outcome = raft.proposeConfig(next) catch |err| {
+            log.err("shard {d}: could not propose {s}: {s}", .{ self.id, what, @errorName(err) });
+            return false;
         };
-        log.info("shard {d}: adding node {d}; members {any}", .{ self.id, from, grown[0 .. members.len + 1] });
-        self.pump(nowMs());
+        switch (outcome) {
+            .proposed => {
+                self.pump(nowMs());
+                return true;
+            },
+            // The leadership noop commits within a round trip.
+            .no_own_commit => return false,
+            .in_flight => {
+                const now = nowMs();
+                if (now -| self.join_refused_warn_ms >= JOIN_WARN_INTERVAL_MS) {
+                    self.join_refused_warn_ms = now;
+                    var waiting: [raft_node_mod.MAX_PEERS]u32 = undefined;
+                    log.warn("shard {d}: {s} waits: an earlier membership change has not committed{s}{any}", .{ self.id, what, if (self.changeWaitsOn(&waiting).len > 0) "; waiting on " else "", self.changeWaitsOn(&waiting) });
+                }
+                return false;
+            },
+            .refused => |why| {
+                log.warn("shard {d}: {s} refused: {s}", .{ self.id, what, why.message() });
+                return false;
+            },
+        }
+    }
+
+    /// The voters that have not acked the change in flight.
+    fn changeWaitsOn(self: *Shard, out: *[raft_node_mod.MAX_PEERS]u32) []u32 {
+        const raft = self.raft_node;
+        var n: usize = 0;
+        for (raft.peers[0..raft.peer_count], raft.peer_ids[0..raft.peer_count]) |p, id| {
+            if (p.voter and p.match_index < raft.membership_index) {
+                out[n] = id;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    /// The changes a leader makes on its own: promote caught-up replicas,
+    /// age out joiners that never caught up (`membership.nextAutomatic`).
+    fn adjustMembership(self: *Shard, now: u64) void {
+        const raft = self.raft_node;
+        if (raft.membership_index > raft.commit_index) return;
+        var progress: [raft_node_mod.MAX_PEERS]membership.Progress = undefined;
+        const p = raft.memberProgress(&progress);
+        if (p.len == 0) return;
+        const next = membership.nextAutomatic(&raft.latest_config, p, now, raft.voterCountBefore()) orelse return;
+        const before = raft.latest_config;
+        if (!self.proposeMembership(&next, "an automatic membership change")) return;
+        for (before.memberSlice()) |m| {
+            const after = next.find(m.id) orelse {
+                log.warn("shard {d}: node {d} never caught up within {d} min of joining; removed (it may ask to join again)", .{ self.id, m.id, membership.JOIN_AGE_LIMIT_MS / 60_000 });
+                continue;
+            };
+            if (after.voter and !m.voter) log.info("shard {d}: node {d} caught up; now a voter ({d} voters)", .{ self.id, m.id, next.voterCount() });
+            if (!after.voter and after.caught_up and !m.caught_up) log.info("shard {d}: node {d} caught up; a replica{s}", .{ self.id, m.id, if (after.may_vote) " (promoted when that leaves an odd number of voters)" else " until promoted: flo cluster promote" });
+        }
     }
 
     // ─── The one applier ─────────────────────────────────────────────────
@@ -3802,14 +4000,18 @@ pub const Shard = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
 
         const raft = shard.raft_node;
-        const state: u8 = if (shard.diverged)
+        const state: u8 = if (shard.removed_at_ms != null)
+            8
+        else if (shard.diverged)
             4
         else if (raft.lost_log == .catching_up)
             5
         else if (raft.lost_log == .confirming)
             6
-        else if (shard.raft_network != null and !raft.timer_enabled)
+        else if (shard.raft_network != null and !raft.self_named)
             3
+        else if (shard.raft_network != null and !raft.timer_enabled)
+            7
         else switch (raft.role) {
             .follower => 0,
             .candidate => 1,
@@ -3830,6 +4032,135 @@ pub const Shard = struct {
         std.mem.writeInt(u32, buf[17..21], member_count, .little);
 
         shard.sendOkResponse(conn, req.header.request_id, &buf);
+    }
+
+    /// `[leader:u32][commit:u64][members:u8]`, then per member
+    /// `[id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64]`,
+    /// then `[removed:u8]` and per removed id `[id:u32][when_ms:u64]`. Role
+    /// 0 voter, 1 replica, 2 joining (never caught up). Contact and match
+    /// are the leader's; elsewhere, and for the answering node, they are
+    /// all ones (unknown). The address is 0 where no link is up.
+    fn dispatchClusterMembers(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const raft = shard.raft_node;
+        // A node running alone, or one not yet named, is a group of itself.
+        const cfg = if (raft.latest_config.member_count > 0) raft.latest_config else membership.Config.ofVoters(&.{shard.cluster_node_id});
+        var buf: [13 + membership.MAX_MEMBERS * 23 + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id, .little);
+        std.mem.writeInt(u64, buf[4..12], raft.commit_index, .little);
+        buf[12] = cfg.member_count;
+        var off: usize = 13;
+        const now = nowMs();
+        for (cfg.memberSlice()) |m| {
+            std.mem.writeInt(u32, buf[off..][0..4], m.id, .little);
+            buf[off + 4] = if (m.voter) 0 else if (m.caught_up) 1 else 2;
+            const addr = if (shard.raft_network) |rn| rn.clientAddress(m.id) else null;
+            @memcpy(buf[off + 5 ..][0..4], &(if (addr) |a| a.ip4 else [4]u8{ 0, 0, 0, 0 }));
+            std.mem.writeInt(u16, buf[off + 9 ..][0..2], if (addr) |a| a.port else 0, .little);
+            var contact: u32 = std.math.maxInt(u32);
+            var match: u64 = std.math.maxInt(u64);
+            if (raft.role == .leader) {
+                if (raft.peerProgress(m.id)) |p| {
+                    contact = @intCast(@min(now -| @max(p.last_contact_ms, raft.leader_since_ms), std.math.maxInt(u32) - 1));
+                    match = p.match_index;
+                }
+            }
+            std.mem.writeInt(u32, buf[off + 11 ..][0..4], contact, .little);
+            std.mem.writeInt(u64, buf[off + 15 ..][0..8], match, .little);
+            off += 23;
+        }
+        buf[off] = cfg.removed_count;
+        off += 1;
+        for (cfg.removedSlice()) |rm| {
+            std.mem.writeInt(u32, buf[off..][0..4], rm.id, .little);
+            std.mem.writeInt(u64, buf[off + 4 ..][0..8], rm.when_ms, .little);
+            off += 12;
+        }
+        shard.sendOkResponse(conn, req.header.request_id, buf[0..off]);
+    }
+
+    /// Make a caught-up replica a voter, answered once the change commits.
+    fn dispatchClusterPromote(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        if (shard.raft_network == null) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, ALONE_MESSAGE);
+        if (req.value.len != 4) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "promote takes one node id");
+        const id = std.mem.readInt(u32, req.value[0..4], .little);
+        const raft = shard.raft_node;
+        var msg: [200]u8 = undefined;
+        const m = raft.latest_config.find(id) orelse
+            return shard.sendErrorResponse(conn, req.header.request_id, .not_found, std.fmt.bufPrint(&msg, "node {d} is not a member", .{id}) catch "not a member");
+        // Asked twice, or raced by the leader's own promotion: done either way.
+        if (m.voter) return shard.sendOkResponse(conn, req.header.request_id, "");
+        // Caught up now, as the leader's own promotions are: a replica that
+        // fell behind or lost its disk would be a voter that blocks commit.
+        const caught_up = if (raft.peerProgress(id)) |p| raft.caughtUpNow(p) else false;
+        if (!caught_up) return shard.sendErrorResponse(conn, req.header.request_id, .unavailable, std.fmt.bufPrint(&msg, "unavailable: node {d} has not caught up yet; a voter that is behind slows every commit — retry once it has", .{id}) catch "unavailable: not caught up");
+        const next = raft.latest_config.withMember(.{ .id = id, .voter = true, .may_vote = true, .caught_up = true });
+        shard.proposeAdminChange(conn, req, &next);
+    }
+
+    /// Remove a member, answered once the change commits. The id is
+    /// remembered, so the node cannot join again.
+    fn dispatchClusterRemove(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        if (shard.raft_network == null) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, ALONE_MESSAGE);
+        if (req.value.len != 5) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "remove takes one node id");
+        const id = std.mem.readInt(u32, req.value[0..4], .little);
+        const yes = req.value[4] != 0;
+        const raft = shard.raft_node;
+        var msg: [240]u8 = undefined;
+        const m = raft.latest_config.find(id) orelse
+            return shard.sendErrorResponse(conn, req.header.request_id, .not_found, std.fmt.bufPrint(&msg, "node {d} is not a member", .{id}) catch "not a member");
+        if (m.voter) {
+            const left = raft.latest_config.voterCount() - 1;
+            if (left == 0) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&msg, "node {d} is the only voter; removing it would leave a group that can never commit", .{id}) catch "the only voter");
+            if (!yes and left % 2 == 0) {
+                const why = if (left == 2)
+                    std.fmt.bufPrint(&msg, "removing node {d} leaves 2 voters, which tolerate no failure; add --yes to remove it anyway", .{id}) catch "add --yes"
+                else
+                    std.fmt.bufPrint(&msg, "removing node {d} leaves {d} voters, which tolerate no more failures than {d} would; add --yes to remove it anyway", .{ id, left, left - 1 }) catch "add --yes";
+                return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            }
+        }
+        const next = raft.latest_config.without(id, @intCast(@max(0, @import("stdx").time.milliTimestamp())));
+        shard.proposeAdminChange(conn, req, &next);
+    }
+
+    const ALONE_MESSAGE = "this node runs alone (started without --cluster or --join); there is no membership to change";
+
+    fn proposeAdminChange(self: *Shard, conn: *Connection, req: proto.Request, next: *const membership.Config) void {
+        const raft = self.raft_node;
+        const outcome = raft.proposeConfig(next) catch |err| return self.sendErrorResponse(conn, req.header.request_id, .unavailable, switch (err) {
+            error.NotLeader => "unavailable: the leader changed — retry",
+            else => "unavailable: the change could not be put in the log — retry",
+        });
+        var msg: [200]u8 = undefined;
+        switch (outcome) {
+            .proposed => |p| {
+                self.pump(nowMs());
+                self.park(conn, req, p, respondChangeCommitted);
+            },
+            .refused => |why| self.sendErrorResponse(conn, req.header.request_id, .bad_request, why.message()),
+            .no_own_commit => self.sendErrorResponse(conn, req.header.request_id, .unavailable, "unavailable: a leader was just elected; retry in a moment"),
+            .in_flight => {
+                var waiting: [raft_node_mod.MAX_PEERS]u32 = undefined;
+                const w = self.changeWaitsOn(&waiting);
+                const text = if (w.len > 0)
+                    std.fmt.bufPrint(&msg, "unavailable: an earlier membership change waits on node(s) {any}; retry once it commits", .{w}) catch "unavailable: an earlier membership change has not committed"
+                else
+                    "unavailable: an earlier membership change has not committed; retry";
+                self.sendErrorResponse(conn, req.header.request_id, .unavailable, text);
+            },
+        }
+    }
+
+    fn respondChangeCommitted(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
     /// A refusal is always sent: one too long for its frame is cut, never
@@ -4705,13 +5036,13 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess whether this data directory belonged to a group", .{ shard_id, cfg_index });
                 return error.MembershipUnreadable;
             };
-            var ids: [membership.MAX_MEMBERS]u32 = undefined;
-            const members = membership.decode(e.payload, &ids) orelse {
-                log.err("shard {d}: the config entry at index {d} is not a member list", .{ shard_id, cfg_index });
+            const cfg = membership.decode(e.payload) orelse {
+                log.err("shard {d}: the config entry at index {d} is not a membership", .{ shard_id, cfg_index });
                 return error.MembershipUnreadable;
             };
-            if (members.len > 1 or !membership.names(members, node_id)) {
-                log.err("shard {d}: this data directory belonged to a group of {d} (members {any}); start with --join to rejoin them, or point --data-dir at an empty directory to start alone", .{ shard_id, members.len, members });
+            if (cfg.member_count > 1 or !cfg.names(node_id)) {
+                var ids: [membership.MAX_MEMBERS]u32 = undefined;
+                log.err("shard {d}: this data directory belonged to a group of {d} (members {any}); start with --join to rejoin them, or point --data-dir at an empty directory to start alone", .{ shard_id, cfg.member_count, cfg.ids(&ids) });
                 return error.DataDirWasClustered;
             }
         }
@@ -4729,22 +5060,23 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
             log.err("shard {d}: the config entry at index {d} could not be read; refusing to guess the membership", .{ shard_id, cfg_index });
             return error.MembershipUnreadable;
         };
-        var ids: [membership.MAX_MEMBERS]u32 = undefined;
-        const members = membership.decode(e.payload, &ids) orelse {
-            log.err("shard {d}: the config entry at index {d} is not a member list", .{ shard_id, cfg_index });
+        const cfg = membership.decode(e.payload) orelse {
+            log.err("shard {d}: the config entry at index {d} is not a membership", .{ shard_id, cfg_index });
             return error.MembershipUnreadable;
         };
-        raft.setMembership(members, cfg_index);
+        raft.setMembership(&cfg, cfg_index);
         raft.membership_term = e.header.term;
-        raft.recordConfig(cfg_index, e.header.term, members);
-        if (cfg_index <= raft.last_applied) raft.commitMembership(members);
+        raft.recordConfig(cfg_index, e.header.term, &cfg);
+        if (cfg_index <= raft.last_applied) raft.commitMembership(&cfg);
         // What the segments flushed under a commit watermark is committed;
         // the rest of the log waits for a leader to say so.
         raft.commit_index = raft.last_applied;
-        log.info("shard {d}: members {any} from the log (config index {d}); following until a leader speaks{s}", .{ shard_id, members, cfg_index, if (raft.timer_enabled) "" else " (this node is not a member)" });
+        var ids: [membership.MAX_MEMBERS]u32 = undefined;
+        log.info("shard {d}: members {any} (voters {d}) from the log (config index {d}); following until a leader speaks{s}", .{ shard_id, cfg.ids(&ids), cfg.voterCount(), cfg_index, if (!cfg.names(node_id)) " (this node is not a member)" else if (!raft.timer_enabled) " (this node is a replica)" else "" });
         // The log survived but the hard state did not: the vote cast in
-        // the current term is gone, so the term is confirmed first.
-        if (!had_hard_state and raft.lost_log == .none) {
+        // the current term is gone, so the term is confirmed first. A
+        // replica cast none.
+        if (!had_hard_state and raft.lost_log == .none and raft.timer_enabled) {
             try raft.enterLostVote();
             log.warn("shard {d}: this node has a log but no {s}; it votes only once the members have confirmed the term", .{ shard_id, hard_state_mod.FILENAME });
         }
@@ -4760,13 +5092,17 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 return error.LostLogFounding;
             }
             try raft.bootstrap();
-            var cfg: [membership.MAX_SIZE]u8 = undefined;
-            _ = try raft.propose(.raft_config, entry_mod.Flags.NONE, 0, membership.encode(&.{node_id}, &cfg));
+            const founding = membership.Config.ofVoters(&.{node_id});
+            switch (try raft.proposeConfig(&founding)) {
+                .proposed => {},
+                else => return error.FoundingRefused,
+            }
             if (empty) log.warn("shard {d}: founding a new cluster at term 1; if this node was a member of an existing cluster, stop it and restart with --join", .{shard_id}) else log.info("shard {d}: first member; leading a group of one", .{shard_id});
         },
         .join => {
             raft.commit_index = raft.last_applied;
             raft.timer_enabled = false;
+            raft.self_named = false;
             // No log, or a log with no config and no hard state: a new node
             // and one that lost its disk look the same, and whatever the
             // latter voted for or acked is gone. Durable before it answers
@@ -4782,14 +5118,15 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
 /// truncation falls back to.
 fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     const raft: *RaftNode = @ptrCast(@alignCast(ctx));
-    var ids: [membership.MAX_MEMBERS]u32 = undefined;
-    const members = membership.decode(entry.payload, &ids) orelse return;
-    raft.commitMembership(members);
+    const cfg = membership.decode(entry.payload) orelse return;
+    raft.commitMembership(&cfg);
     // At boot, replay applies the committed configs before the group comes
     // up: a node that lost its hard state checks the committed set even
     // when its latest config is not.
-    raft.recordConfig(entry.header.index, entry.header.term, members);
-    log.info("Raft: membership committed: {any} (config index {d})", .{ members, entry.header.index });
+    raft.recordConfig(entry.header.index, entry.header.term, &cfg);
+    var ids: [membership.MAX_MEMBERS]u32 = undefined;
+    var voters: [membership.MAX_MEMBERS]u32 = undefined;
+    log.info("Raft: membership committed: {any}, voters {any} (config index {d})", .{ cfg.ids(&ids), cfg.voterIds(&voters), entry.header.index });
 }
 
 pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
@@ -5037,8 +5374,8 @@ test "Shard: a first member leads a group of itself from the log; a joiner waits
     try std.testing.expect(first.applyCommitted());
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     try std.testing.expectEqualSlices(u32, &.{7}, first.raft_node.memberIds(&ids));
-    try std.testing.expectEqual(@as(u8, 1), first.raft_node.committed_member_count);
-    try std.testing.expectEqual(@as(u32, 7), first.raft_node.committed_member_ids[0]);
+    try std.testing.expectEqual(@as(u8, 1), first.raft_node.committed_config.member_count);
+    try std.testing.expectEqual(@as(u32, 7), first.raft_node.committed_config.members[0].id);
 
     var joiner = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
     defer joiner.deinit();
@@ -5048,7 +5385,7 @@ test "Shard: a first member leads a group of itself from the log; a joiner waits
     try std.testing.expectEqual(@as(usize, 0), joiner.raft_node.memberIds(&ids).len);
 }
 
-test "Shard: a join request adds the peer, one change at a time" {
+test "Shard: a joiner enters as a replica the lone voter commits alone; caught up, two become voters in one entry; a later change waits for the one in flight" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -5058,24 +5395,46 @@ test "Shard: a join request adds the peer, one change at a time" {
     const raft = shard.raft_node;
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
 
+    // No ack needed: a replica counts toward nothing, so a joiner that
+    // never answers cannot hold the leader.
     shard.handleJoinRequest(2);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, raft.memberIds(&ids));
-    try std.testing.expectEqual(@as(u64, 3), raft.membership_index);
-    // With a peer, nothing commits without its ack; a second change waits.
-    try std.testing.expect(raft.commit_index < 3);
-    shard.handleJoinRequest(3);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, raft.memberIds(&ids));
-    // Node 2 acks everything sent: the config commits and applies.
-    raft.peers[0].sent_up_to = 3;
-    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = 3, .from = 2 });
+    try std.testing.expect(!raft.latest_config.isVoter(2));
+    try std.testing.expectEqual(raft.membership_index, raft.commit_index);
     try std.testing.expect(shard.applyCommitted());
-    try std.testing.expectEqual(@as(u64, 3), raft.commit_index);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, raft.committed_member_ids[0..raft.committed_member_count]);
     shard.handleJoinRequest(3);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, raft.memberIds(&ids));
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, raft.committed_config.ids(&ids));
+
+    // Both catch up: one entry makes three voters.
+    const Ack = struct {
+        fn all(r: *RaftNode, from: u32) void {
+            const last = r.log.lastIndex();
+            r.peers[r.peerIndex(from).?].sent_up_to = last;
+            r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = from });
+        }
+    };
+    for (0..raft_node_mod.CAUGHT_UP_ACKS) |_| {
+        Ack.all(raft, 2);
+        Ack.all(raft, 3);
+    }
+    shard.adjustMembership(Shard.nowMs());
+    try std.testing.expectEqual(@as(u8, 3), raft.latest_config.voterCount());
+    Ack.all(raft, 2);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(raft.membership_index, raft.commit_index);
+
+    // With voters to answer, a change waits for its majority; the next one
+    // waits for it.
+    shard.handleJoinRequest(4);
+    const pending = raft.membership_index;
+    try std.testing.expect(raft.commit_index < pending);
+    shard.handleJoinRequest(5);
+    try std.testing.expect(!raft.latest_config.names(5));
+    try std.testing.expectEqual(pending, raft.membership_index);
     // A member asking again changes nothing.
     shard.handleJoinRequest(2);
-    try std.testing.expectEqual(@as(u64, 4), raft.membership_index);
+    try std.testing.expectEqual(pending, raft.membership_index);
 }
 
 test "Shard: a write on a node that does not lead waits for a leader, then is answered unavailable" {
@@ -5114,6 +5473,38 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "electing a leader") != null);
 }
 
+test "Shard: a node with a stale config takes a promoted voter's append and vote request, and drops only a write it would forward" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 3, .join, .{});
+    defer shard.deinit();
+    const raft = shard.raft_node;
+    // Its latest config: 1 votes, 2 and 3 are replicas. 1 has since made 2
+    // a voter and died before 3 heard.
+    const stale = membership.Config.ofVoters(&.{1}).withJoiner(2, true).withJoiner(3, true);
+    raft.setMembership(&stale, 1);
+    raft.lost_log = .none;
+    const term0 = raft.current_term;
+
+    var vbuf: [transport.VOTE_REQ_SIZE]u8 = undefined;
+    const vn = transport.serializeVoteRequest(.{ .term = term0 + 5, .candidate_id = 2, .last_log_index = 10, .last_log_term = term0 + 4 }, &vbuf).?;
+    shard.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .request_vote, .payload = vbuf[0..vn] });
+    try std.testing.expectEqual(term0 + 5, raft.current_term);
+    try std.testing.expectEqual(@as(u32, 2), raft.voted_for);
+
+    var buf: [transport.APPEND_REQ_PREFIX + 64]u8 = undefined;
+    const n = transport.serializeAppendRequest(.{ .term = term0 + 6, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} }, &buf).?;
+    shard.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .append_entries, .payload = buf[0..n] });
+    try std.testing.expectEqual(term0 + 6, raft.current_term);
+    try std.testing.expectEqual(@as(u32, 2), raft.leader_id);
+
+    // A write a replica would carry to the leader is not its to carry.
+    try std.testing.expectEqual(@as(u64, 0), shard.replica_frame_warn_ms);
+    shard.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = &.{} });
+    try std.testing.expect(shard.replica_frame_warn_ms != 0);
+}
+
 test "Shard: a frame from a node the membership does not name is dropped, a join request is not, and the ids inside must be the sender's" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -5134,6 +5525,9 @@ test "Shard: a frame from a node the membership does not name is dropped, a join
     // Its request to join is heard.
     shard.handleRaftFrame(.{ .source_node = 9, .group_id = 0, .msg_type = .join_request, .payload = &.{} });
     try std.testing.expectEqualSlices(u32, &.{ 1, 9 }, raft.memberIds(&ids));
+    try std.testing.expect(shard.applyCommitted());
+    const voter = raft.latest_config.withMember(.{ .id = 9, .voter = true, .may_vote = true, .caught_up = true });
+    try std.testing.expect((try raft.proposeConfig(&voter)) == .proposed);
     // A member speaking for another node is dropped; speaking for itself
     // it is heard.
     var buf2: [transport.APPEND_REQ_PREFIX + 64]u8 = undefined;
@@ -7023,7 +7417,7 @@ test "Shard: a data directory that belonged to a group refuses to run alone, and
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
-    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf));
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
     cfg.header.crc32c = cfg.computeCrc();
     try w.addEntry(&cfg);
     w.commit_index_at_seal = 2;
@@ -7075,7 +7469,7 @@ test "Shard: a member with no log starts guarded, durably, and one with hard sta
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
-    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf));
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
     cfg.header.crc32c = cfg.computeCrc();
     try w.addEntry(&cfg);
     w.commit_index_at_seal = 2;
@@ -7102,7 +7496,7 @@ test "Shard: a member that kept its log but lost its hard state confirms the ter
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
-    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf));
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
     cfg.header.crc32c = cfg.computeCrc();
     try w.addEntry(&cfg);
     w.commit_index_at_seal = 2;
@@ -7147,11 +7541,15 @@ test "Shard: --join with a log but no config entry and no hard state is guarded 
 /// Writes parked behind a second member's ack, driven over a socket pair
 /// the way a client drives them.
 const ParkTest = struct {
-    /// The shard leads alone, then adds member 2: from here nothing
-    /// commits until `ack`.
+    /// The shard leads alone, then adds member 2 and makes it a voter:
+    /// from here nothing commits until `ack`.
     fn joinPeer(sh: *Shard) !void {
         try std.testing.expect(sh.applyCommitted());
         sh.handleJoinRequest(2);
+        try ack(sh);
+        const r = sh.raft_node;
+        const voter = r.latest_config.withMember(.{ .id = 2, .voter = true, .may_vote = true, .caught_up = true });
+        try std.testing.expect((try r.proposeConfig(&voter)) == .proposed);
         try ack(sh);
     }
 
@@ -8032,9 +8430,9 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     };
     Probe.shard_ptr = &shard;
     var ctx: u8 = 0;
-    shard.replay_registry.register(.raft_config, @ptrCast(&ctx), Probe.apply);
+    shard.replay_registry.register(.raft_snapshot, @ptrCast(&ctx), Probe.apply);
 
-    const idx = (try persistence_mod.proposeEntry(&shard, .raft_config, entry_mod.Flags.NONE, "", "probe", "")).index;
+    const idx = (try persistence_mod.proposeEntry(&shard, .raft_snapshot, entry_mod.Flags.NONE, "", "probe", "")).index;
     try std.testing.expect(shard.applyCommitted());
 
     // The entry in hand was marked applied before its applier ran, so a
@@ -8841,4 +9239,174 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+}
+
+/// A clustered shard leading alone (node 1), with a client connection.
+const AdminTest = struct {
+    pipe_fds: [2]std.posix.fd_t,
+    rn: RaftNetwork,
+    shard: Shard,
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+
+    fn init(self: *AdminTest, node_id: u32, role: ClusterRole) !void {
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.rn = try RaftNetwork.init(std.testing.allocator, node_id, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, role, .{});
+        self.shard.raft_network = &self.rn;
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *AdminTest) void {
+        self.shard.deinit();
+        self.rn.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+    }
+
+    /// Send `op` with `value`; return the one answer's status and text.
+    fn ask(self: *AdminTest, op: proto.OpCode, value: []const u8, buf: []u8) !proto.Response {
+        self.shard.dispatchRequest(self.conn, try ParkTest.request(op, 7, "", "", value, ""));
+        var into: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &into);
+        return into[0];
+    }
+
+    fn promote(self: *AdminTest, id: u32, buf: []u8) !proto.Response {
+        var v: [4]u8 = undefined;
+        std.mem.writeInt(u32, &v, id, .little);
+        return self.ask(.cluster_promote, &v, buf);
+    }
+
+    fn remove(self: *AdminTest, id: u32, yes: bool, buf: []u8) !proto.Response {
+        var v: [5]u8 = undefined;
+        std.mem.writeInt(u32, v[0..4], id, .little);
+        v[4] = @intFromBool(yes);
+        return self.ask(.cluster_remove, &v, buf);
+    }
+
+    fn caughtUp(self: *AdminTest, id: u32) void {
+        const raft = self.shard.raft_node;
+        const p = &raft.peers[raft.peerIndex(id).?];
+        p.caught_up_streak = raft_node_mod.CAUGHT_UP_ACKS;
+        p.last_contact_ms = raft.current_time_ms;
+    }
+};
+
+fn expectAnswer(r: proto.Response, status: proto.StatusCode, text: []const u8) !void {
+    try std.testing.expectEqual(status, r.getStatus());
+    if (std.mem.indexOf(u8, r.data, text) == null) {
+        std.debug.print("answer: {s}\n", .{r.data});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "Shard: promote and remove refuse by name; promoting a voter is done already" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    var buf: [512]u8 = undefined;
+
+    try expectAnswer(try t.remove(1, false, &buf), .bad_request, "node 1 is the only voter");
+    try expectAnswer(try t.promote(9, &buf), .not_found, "node 9 is not a member");
+    try expectAnswer(try t.remove(9, false, &buf), .not_found, "node 9 is not a member");
+    t.shard.handleJoinRequest(2);
+    try std.testing.expect(t.shard.applyCommitted());
+    // Once caught up is not enough: it must be caught up now.
+    try expectAnswer(try t.promote(2, &buf), .unavailable, "node 2 has not caught up yet");
+    var m = raft.latest_config.find(2).?;
+    m.caught_up = true;
+    raft.latest_config = raft.latest_config.withMember(m);
+    try expectAnswer(try t.promote(2, &buf), .unavailable, "node 2 has not caught up yet");
+
+    // Caught up now: promoted, answered once it commits.
+    t.caughtUp(2);
+    t.shard.dispatchRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""));
+    try ParkTest.ack(&t.shard);
+    var into: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+    try std.testing.expectEqual(proto.StatusCode.ok, into[0].getStatus());
+    try std.testing.expect(raft.latest_config.isVoter(2));
+    // Again: nothing to do, and said so plainly.
+    try std.testing.expectEqual(proto.StatusCode.ok, (try t.promote(2, &buf)).getStatus());
+
+    // Three to two, and five to four, ask for --yes; each says what it leaves.
+    const five = membership.Config.ofVoters(&.{ 1, 2, 3, 4, 5 });
+    raft.setMembership(&five, raft.commit_index);
+    try expectAnswer(try t.remove(5, false, &buf), .bad_request, "leaves 4 voters, which tolerate no more failures than 3 would; add --yes");
+    const three = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    raft.setMembership(&three, raft.commit_index);
+    try expectAnswer(try t.remove(3, false, &buf), .bad_request, "leaves 2 voters, which tolerate no failure; add --yes");
+}
+
+test "Shard: a removed node answers clients with when, takes no frames, ticks nothing and dials no one" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    raft.setMembership(&cfg, 1);
+    raft.lost_log = .none;
+
+    t.shard.enterRemoved(1_791_563_614_450);
+    var buf: [512]u8 = undefined;
+    try expectAnswer(try t.ask(.kv_get, "", &buf), .unavailable, "this node was removed from the cluster at 2026-10-09 ");
+    // Its status still answers, as removed.
+    try std.testing.expectEqual(proto.StatusCode.ok, (try t.ask(.cluster_status, "", &buf)).getStatus());
+    try std.testing.expect(t.rn.dialing_stopped.load(.acquire));
+
+    const term0 = raft.current_term;
+    var abuf: [transport.APPEND_REQ_PREFIX + 64]u8 = undefined;
+    const n = transport.serializeAppendRequest(.{ .term = term0 + 5, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} }, &abuf).?;
+    t.shard.handleRaftFrame(.{ .source_node = 1, .group_id = 0, .msg_type = .append_entries, .payload = abuf[0..n] });
+    try std.testing.expectEqual(term0, raft.current_term);
+    t.shard.tickRaft();
+    try std.testing.expect(!raft.mayCampaign());
+    try std.testing.expectEqual(@as(u64, 0), t.shard.join_asked_ms);
+}
+
+test "Shard: a node whose removal committed is told so; one only removed in an uncommitted config is not" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    var abuf: [transport.APPEND_REQ_PREFIX + 64]u8 = undefined;
+    const n = transport.serializeAppendRequest(.{ .term = 9, .leader_id = 9, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} }, &abuf).?;
+    const frame: RaftFrame = .{ .source_node = 9, .group_id = 0, .msg_type = .append_entries, .payload = abuf[0..n] };
+
+    const uncommitted = raft.latest_config.withJoiner(9, false).without(9, 1234);
+    raft.setMembership(&uncommitted, raft.log.lastIndex());
+    t.shard.handleRaftFrame(frame);
+    try std.testing.expectEqual(@as(u64, 0), t.shard.removed_notice_ms);
+    raft.commitMembership(&uncommitted);
+    t.shard.handleRaftFrame(frame);
+    try std.testing.expect(t.shard.removed_notice_ms != 0);
+}
+
+test "Shard: a replica sends writers to the leader by name, and a quiet replica asks to join again" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true);
+    raft.setMembership(&cfg, 1);
+    raft.lost_log = .none;
+    raft.leader_id = 1;
+    var buf: [512]u8 = undefined;
+    try expectAnswer(try t.ask(.kv_put, "v", &buf), .unavailable, "this node is a replica; send writes to the leader, node 1");
+
+    // Its config committed, so only the replica rule can make it ask.
+    raft.commit_index = raft.membership_index;
+    const now = Shard.nowMs();
+    raft.last_leader_contact_ms = now;
+    try std.testing.expect(!t.shard.joinWanted(now));
+    // No leader for longer than an election: it may have been aged out
+    // without being told, so it asks again.
+    try std.testing.expect(t.shard.joinWanted(now + raft.config.election_timeout_max_ms + 1));
 }

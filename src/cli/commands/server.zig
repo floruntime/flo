@@ -14,6 +14,7 @@ const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
 const runtime_mod = @import("../../node/runtime.zig");
 const offline = @import("../../node/offline.zig");
+const membership = @import("../../raft/membership.zig");
 const RuntimeConfig = @import("../../node/runtime.zig").RuntimeConfig;
 const posix = std.posix;
 
@@ -636,7 +637,8 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         ctx.print("committed:   through {d} (as last flushed)\n", .{sum.commit});
     }
     if (sum.member_count > 0) {
-        ctx.print("members:     {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config_index, sum.config_term });
+        var voters: [membership.MAX_MEMBERS]u32 = undefined;
+        ctx.print("members:     {any}, voters {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config.voterIds(&voters), sum.config_index, sum.config_term });
     } else {
         ctx.print("members:     no member list in the log\n", .{});
     }

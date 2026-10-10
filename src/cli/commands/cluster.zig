@@ -3,7 +3,8 @@
 //! Usage:
 //!   flo cluster status [--endpoint <host:port>]     Show cluster health
 //!   flo cluster members [--endpoint <host:port>]    List cluster members
-//!   flo cluster transfer-leader <node-id>           Transfer leadership
+//!   flo cluster promote <id>...                     Make caught-up replicas voters
+//!   flo cluster remove <id> [--yes]                 Remove a member
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -59,13 +60,34 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("transfer-leader")
-                .about("Transfer leadership to another node")
+                .name("promote")
+                .about("Make caught-up replicas voters, one at a time")
+                .longAbout(
+                    \\A node joins as a replica: it takes the log but does not vote. The
+                    \\leader makes up to three voters on its own; past that, promote a
+                    \\replica here. Odd numbers of voters tolerate more failures.
+                )
                 .examples(&.{
-                    "flo cluster transfer-leader 2",
-                    "flo cluster transfer-leader 2 --endpoint localhost:9000",
+                    "flo cluster promote 4",
+                    "flo cluster promote 4 5",
                 })
-                .action(wrapHandler(runTransferLeader)),
+                .action(wrapHandler(runPromote)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("remove")
+                .about("Remove a member from the cluster")
+                .longAbout(
+                    \\The node stops taking part and cannot rejoin under its id. Removing
+                    \\the leader works: it hands over after the change commits. A
+                    \\removal that leaves an even number of voters, or two, needs --yes.
+                )
+                .boolFlag("yes", 0, "Remove even when it leaves an even number of voters, or two")
+                .examples(&.{
+                    "flo cluster remove 3",
+                    "flo cluster remove 3 --yes",
+                })
+                .action(wrapHandler(runRemove)),
         )
         .build();
 }
@@ -231,6 +253,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         4 => "diverged",
         5 => "guarded: catching up",
         6 => "guarded: confirming the term",
+        7 => "replica",
+        8 => "removed",
         else => "unknown",
     };
     // No leader is known while electing or joining.
@@ -298,161 +322,131 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     }
 
-    // Parse response data
-    // Format: [count: u32] + [node_id: u32][state: u8][addr_len: u16][addr: bytes]...
-    if (response.data.len < 4) {
+    // [leader:u32][commit:u64][members:u8], per member
+    // [id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64],
+    // then [removed:u8], per removed id [id:u32][when_ms:u64].
+    const data = response.data;
+    if (data.len < 13) {
+        ctx.printErr("Invalid response format\n", .{});
+        return error.CommandFailed;
+    }
+    const leader_id = std.mem.readInt(u32, data[0..4], .little);
+    const commit = std.mem.readInt(u64, data[4..12], .little);
+    const count = data[12];
+    if (data.len < 13 + @as(usize, count) * 23 + 1) {
+        ctx.printErr("Invalid response format\n", .{});
+        return error.CommandFailed;
+    }
+    const removed_count = data[13 + @as(usize, count) * 23];
+    if (data.len != 14 + @as(usize, count) * 23 + @as(usize, removed_count) * 12) {
         ctx.printErr("Invalid response format\n", .{});
         return error.CommandFailed;
     }
 
-    const count = std.mem.readInt(u32, response.data[0..4], .little);
-
-    // Format the endpoint address for local node display
-    var endpoint_buf: [64]u8 = undefined;
-    const endpoint_addr = std.fmt.bufPrint(&endpoint_buf, "{s}:{d}", .{ ep.host, ep.port }) catch endpoint;
-
-    if (json_output) {
-        ctx.print("{{\"members\":[", .{});
+    var table = output.Table.init(ctx.allocator);
+    defer table.deinit();
+    if (!json_output) {
+        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG" }) |col| table.addColumn(col, .left) catch return error.CommandFailed;
     } else {
-        // Use Table for clean formatting
-        var table = output.Table.init(ctx.allocator);
-        defer table.deinit();
-
-        table.addColumn("NODE ID", .left) catch return error.CommandFailed;
-        table.addColumn("ADDRESS", .left) catch return error.CommandFailed;
-        table.addColumn("ROLE", .left) catch return error.CommandFailed;
-        table.addColumn("STATE", .left) catch return error.CommandFailed;
-
-        var offset: usize = 4;
-        var i: u32 = 0;
-        while (i < count and offset + 7 <= response.data.len) : (i += 1) {
-            const member_node_id = std.mem.readInt(u32, response.data[offset..][0..4], .little);
-            offset += 4;
-            const member_state = response.data[offset];
-            offset += 1;
-            const addr_len = std.mem.readInt(u16, response.data[offset..][0..2], .little);
-            offset += 2;
-
-            if (offset + addr_len > response.data.len) break;
-            const addr = response.data[offset..][0..addr_len];
-            offset += addr_len;
-
-            // Generate human-readable node name (short display of full hash)
-            var member_name_buf: [11]u8 = undefined;
-            const member_name = formatNodeId(&member_name_buf, member_node_id);
-
-            // Role from Raft state
-            const role_str = switch (member_state) {
-                0 => "follower",
-                1 => "candidate",
-                2 => "leader",
-                else => "unknown",
-            };
-
-            // Address: use response addr, or endpoint for local node
-            const address = if (addr.len > 0) addr else endpoint_addr;
-
-            // For now, state is always "alive" for members we can see
-            const state_str = "alive";
-
-            table.addRow(&.{ member_name, address, role_str, state_str }) catch return error.CommandFailed;
-        }
-
-        ctx.print("\n", .{});
-        table.print(ctx);
-        ctx.print("\n", .{});
-        return;
+        ctx.print("{{\"leader\":{d},\"members\":[", .{leader_id});
     }
-
-    // JSON output path
-    var offset: usize = 4;
-    var i: u32 = 0;
-    while (i < count and offset + 7 <= response.data.len) : (i += 1) {
-        const member_node_id = std.mem.readInt(u32, response.data[offset..][0..4], .little);
-        offset += 4;
-        const member_state = response.data[offset];
-        offset += 1;
-        const addr_len = std.mem.readInt(u16, response.data[offset..][0..2], .little);
-        offset += 2;
-
-        if (offset + addr_len > response.data.len) break;
-        const addr = response.data[offset..][0..addr_len];
-        offset += addr_len;
-
-        // Generate human-readable node name
-        var member_name_buf: [11]u8 = undefined;
-        const member_name = formatNodeId(&member_name_buf, member_node_id);
-
-        const role_str = switch (member_state) {
-            0 => "follower",
-            1 => "candidate",
-            2 => "leader",
+    var cells: [5][32]u8 = undefined;
+    for (0..count) |i| {
+        const m = data[13 + i * 23 ..][0..23];
+        const id = std.mem.readInt(u32, m[0..4], .little);
+        const role: []const u8 = switch (m[4]) {
+            0 => if (id == leader_id) "voter (leader)" else "voter",
+            1 => "replica",
+            2 => "joining",
             else => "unknown",
         };
-
-        // Address: use response addr, or endpoint for local node
-        const address = if (addr.len > 0) addr else endpoint_addr;
-        const state_str = "alive";
-
-        if (i > 0) ctx.print(",", .{});
-        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}\",\"role\":\"{s}\",\"state\":\"{s}\"}}", .{
-            member_name,
-            address,
-            role_str,
-            state_str,
-        });
+        const port = std.mem.readInt(u16, m[9..11], .little);
+        const contact = std.mem.readInt(u32, m[11..15], .little);
+        const match = std.mem.readInt(u64, m[15..23], .little);
+        const address = if (port != 0) std.fmt.bufPrint(&cells[0], "{d}.{d}.{d}.{d}:{d}", .{ m[5], m[6], m[7], m[8], port }) catch "?" else "-";
+        const contact_s = if (contact == std.math.maxInt(u32)) "-" else std.fmt.bufPrint(&cells[1], "{d} ms ago", .{contact}) catch "?";
+        const lag_s = if (match == std.math.maxInt(u64)) "-" else std.fmt.bufPrint(&cells[2], "{d}", .{commit -| match}) catch "?";
+        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{id}) catch "?";
+        if (json_output) {
+            if (i > 0) ctx.print(",", .{});
+            ctx.print("{{\"id\":{d},\"role\":\"{s}\",\"address\":\"{s}\"", .{ id, if (m[4] == 0) "voter" else role, address });
+            if (contact != std.math.maxInt(u32)) ctx.print(",\"last_contact_ms\":{d}", .{contact});
+            if (match != std.math.maxInt(u64)) ctx.print(",\"lag\":{d}", .{commit -| match});
+            ctx.print("}}", .{});
+        } else {
+            table.addRow(&.{ id_s, role, address, contact_s, lag_s }) catch return error.CommandFailed;
+        }
     }
-
-    ctx.print("]}}\n", .{});
+    const removed_at = 14 + @as(usize, count) * 23;
+    if (json_output) {
+        ctx.print("],\"removed\":[", .{});
+        for (0..removed_count) |i| {
+            const rm = data[removed_at + i * 12 ..][0..12];
+            if (i > 0) ctx.print(",", .{});
+            ctx.print("{{\"id\":{d},\"removed_at_ms\":{d}}}", .{ std.mem.readInt(u32, rm[0..4], .little), std.mem.readInt(u64, rm[4..12], .little) });
+        }
+        ctx.print("]}}\n", .{});
+        return;
+    }
+    for (0..removed_count) |i| {
+        const rm = data[removed_at + i * 12 ..][0..12];
+        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{std.mem.readInt(u32, rm[0..4], .little)}) catch "?";
+        table.addRow(&.{ id_s, "removed", "-", "-", "-" }) catch return error.CommandFailed;
+    }
+    ctx.print("\n", .{});
+    table.print(ctx);
+    if (leader_id == 0) ctx.print("\nNo leader known; contact and lag are the leader's to report.\n", .{});
+    ctx.print("\n", .{});
 }
 
-fn runTransferLeader(ctx: *commander.Context) commander.Error!void {
-    const endpoint = cli_config.getEndpoint(ctx);
-    const args = ctx.args;
-
-    if (args.len == 0) {
-        ctx.printErr("Error: target node ID required\n", .{});
-        ctx.printErr("Usage: flo cluster transfer-leader <node-id>\n", .{});
+fn runPromote(ctx: *commander.Context) commander.Error!void {
+    if (ctx.args.len == 0) {
+        ctx.printErr("Error: give the id of a replica to promote: flo cluster promote <id>...\n", .{});
         return error.CommandFailed;
     }
+    // One change at a time: each waits until the one before has committed.
+    for (ctx.args) |arg| {
+        const id = std.fmt.parseInt(u32, arg, 10) catch {
+            ctx.printErr("Error: {s} is not a node id\n", .{arg});
+            return error.CommandFailed;
+        };
+        var value: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value, id, .little);
+        try sendChange(ctx, .cluster_promote, &value);
+        ctx.print("node {d} is a voter\n", .{id});
+    }
+}
 
-    const target_node_id = std.fmt.parseInt(u32, args[0], 10) catch {
-        ctx.printErr("Invalid node ID: {s}\n", .{args[0]});
+fn runRemove(ctx: *commander.Context) commander.Error!void {
+    if (ctx.args.len != 1) {
+        ctx.printErr("Error: give one node id: flo cluster remove <id> [--yes]\n", .{});
+        return error.CommandFailed;
+    }
+    const id = std.fmt.parseInt(u32, ctx.args[0], 10) catch {
+        ctx.printErr("Error: {s} is not a node id\n", .{ctx.args[0]});
         return error.CommandFailed;
     };
+    var value: [5]u8 = undefined;
+    std.mem.writeInt(u32, value[0..4], id, .little);
+    value[4] = @intFromBool(ctx.getBool("yes"));
+    try sendChange(ctx, .cluster_remove, &value);
+    ctx.print("node {d} removed; it cannot rejoin under that id\n", .{id});
+}
 
+/// Send a membership change; it is answered once it commits.
+fn sendChange(ctx: *commander.Context, op: proto.OpCode, value: []const u8) commander.Error!void {
+    const endpoint = cli_config.getEndpoint(ctx);
     const ep = parseEndpoint(endpoint) catch {
         ctx.printErr("Invalid endpoint format: {s}\n", .{endpoint});
         return error.CommandFailed;
     };
-
-    // Send cluster_transfer_leader request with target node ID
-    var value_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &value_buf, target_node_id, .little);
-
-    var owned = sendRequest(
-        ctx.allocator,
-        ep.host,
-        ep.port,
-        .cluster_transfer_leader,
-        &value_buf,
-    ) catch |err| {
-        ctx.printErr("Failed to send transfer request: {}\n", .{err});
+    var owned = sendRequest(ctx.allocator, ep.host, ep.port, op, value) catch |err| {
+        ctx.printErr("Error: could not reach {s}: {}\n", .{ endpoint, err });
         return error.CommandFailed;
     };
     defer owned.deinit();
-
-    const response = owned.response;
-
-    if (response.getStatus() == .ok) {
-        ctx.print("✓ Leadership transfer to node {d} initiated successfully\n", .{target_node_id});
-    } else {
-        // Error message is in response.data
-        if (response.data.len > 0) {
-            ctx.printErr("✗ Leadership transfer failed: {s}\n", .{response.data});
-        } else {
-            ctx.printErr("✗ Leadership transfer failed: {}\n", .{response.getStatus()});
-        }
+    if (owned.response.getStatus() != .ok) {
+        ctx.printErr("Error: {s}\n", .{if (owned.response.data.len > 0) owned.response.data else @tagName(owned.response.getStatus())});
         return error.CommandFailed;
     }
 }

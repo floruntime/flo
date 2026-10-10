@@ -62,7 +62,18 @@ pub const PeerState = struct {
     /// keep this leader in office but count toward no commit, since what
     /// it acks it may hold for a leader the group has already replaced.
     guarded: bool = false,
+    /// Counts toward quorum, commit and votes; a replica only takes the log.
+    voter: bool = true,
+    /// Successful acks in a row at or past the commit index; three make
+    /// it caught up (`membership.Progress`).
+    caught_up_streak: u8 = 0,
+    /// When this leader first saw the peer as a member that had not caught
+    /// up: the aging clock. A new leader starts it again.
+    joining_since_ms: u64 = 0,
 };
+
+/// Acks in a row at the commit index that make a peer caught up.
+pub const CAUGHT_UP_ACKS = 3;
 
 /// Configuration for RaftNode behavior.
 pub const Config = struct {
@@ -88,6 +99,9 @@ pub const Config = struct {
     /// Seed for election-timeout jitter. 0 draws one from OS entropy; a
     /// simulation passes a per-node seed so a run replays exactly.
     rng_seed: u64 = 0,
+    /// How long a sent batch may go unanswered; 0 means twice the
+    /// heartbeat. A simulation whose network is slower than that sets it.
+    rpc_timeout_ms: u64 = 0,
 
     /// Production timing from one knob: the election window is [½, 1] × the
     /// failover timeout, the heartbeat a sixth of it, so a busy disk's fsync
@@ -103,7 +117,7 @@ pub const Config = struct {
 
     /// How long a sent batch may go unanswered before it is sent again.
     pub fn rpcTimeoutMs(self: Config) u64 {
-        return 2 * self.heartbeat_interval_ms;
+        return if (self.rpc_timeout_ms != 0) self.rpc_timeout_ms else 2 * self.heartbeat_interval_ms;
     }
 };
 
@@ -116,6 +130,15 @@ pub const Config = struct {
 pub const HardStateSink = struct {
     ctx: *anyopaque,
     persist: *const fn (ctx: *anyopaque, term: u64, voted_for: NodeId, lost_log: bool) bool,
+};
+
+/// Puts everything the log holds on disk, before a config entry takes
+/// effect: a member that acted on a config, then crashed and came back
+/// without it, would count a different majority than the rest. True once
+/// durable.
+pub const LogFlushSink = struct {
+    ctx: *anyopaque,
+    flush: *const fn (ctx: *anyopaque) bool,
 };
 
 /// Where a node that lost its log or its hard state stands (a new node
@@ -146,8 +169,8 @@ pub const TermCheckResponse = struct {
     /// The responder is guarded itself: its term is no evidence of the
     /// votes this node cast, and its answer does not count.
     guarded: bool = false,
-    /// The responder's latest config: when newer than any the asker knows,
-    /// its members are checked too.
+    /// The responder's latest config and its voters: when newer than any
+    /// the asker knows, those voters are checked too.
     config_index: u64,
     config_term: u64,
     member_count: u8,
@@ -216,6 +239,10 @@ pub const AppendResponse = struct {
     /// the conflicting term. The leader jumps there instead of walking
     /// back one index per round trip.
     hint_index: u64 = 0,
+    /// The commit index of the batch this answers, echoed: whether the
+    /// peer was caught up is judged against what the leader had committed
+    /// when it sent, not by the time the answer arrives.
+    leader_commit: u64 = 0,
     /// The responder is guarded (`LostLog`): the leader counts none of its
     /// acks toward commit.
     guarded: bool = false,
@@ -251,8 +278,20 @@ const MemberSet = struct {
 const ConfigRecord = struct {
     index: u64,
     term: u64,
-    members: MemberSet,
+    config: membership.Config,
 };
+
+/// The voters of `cfg`, for the term check: only their votes made a
+/// leader, so only they can say which terms were spent.
+fn voterSet(cfg: *const membership.Config) MemberSet {
+    var set: MemberSet = .{};
+    for (cfg.memberSlice()) |m| {
+        if (!m.voter) continue;
+        set.ids[set.count] = m.id;
+        set.count += 1;
+    }
+    return set;
+}
 
 /// A guarded node's term check: the configs whose members must answer, and
 /// who has.
@@ -322,9 +361,20 @@ pub const RaftNode = struct {
     /// When this node became leader; counts as contact with every peer for
     /// check-quorum until they answer.
     leader_since_ms: u64,
-    /// False for a joiner whose log does not yet name it: it must not
-    /// elect itself into a cluster it is not a member of.
+    /// This node is a voter in its latest config, or, with none, stands
+    /// alone: it may campaign and counts toward its own quorum. False for
+    /// a joiner the log does not yet name, and for a replica.
     timer_enabled: bool,
+    /// The latest config names this node, as a voter or a replica.
+    self_named: bool = true,
+    /// The latest config appended, and the latest committed: proposals are
+    /// checked against the one, a truncation falls back to the other.
+    latest_config: membership.Config = .{},
+    committed_config: membership.Config = .{},
+    /// A leader whose committed config no longer makes it a voter stepped
+    /// down; the owner says why.
+    left_group: bool = false,
+    log_flush_sink: ?LogFlushSink = null,
     /// Index of the config entry the current membership came from, so a
     /// truncation reaching below it reverts to the committed one.
     membership_index: u64,
@@ -333,8 +383,6 @@ pub const RaftNode = struct {
     /// Only possible without durable commits; the owner watches it, since
     /// what it applied above the cut is not what the log now says.
     committed_conflicts: u64,
-    committed_member_ids: [MAX_PEERS + 1]NodeId,
-    committed_member_count: u8,
     /// Term of the config entry at `membership_index`, 0 when unknown.
     membership_term: u64 = 0,
     /// The most recent config entries appended, oldest first; a truncation
@@ -406,8 +454,6 @@ pub const RaftNode = struct {
             .timer_enabled = true,
             .membership_index = 0,
             .committed_conflicts = 0,
-            .committed_member_ids = std.mem.zeroes([MAX_PEERS + 1]NodeId),
-            .committed_member_count = 0,
             .log = raft_log_inst,
             .config = config,
             .allocator = allocator,
@@ -436,54 +482,104 @@ pub const RaftNode = struct {
     }
 
     /// Membership is what the log's latest config entry says. The peers
-    /// become exactly `member_ids` minus this node, keeping the progress of
-    /// any that stay; a node counts toward quorum from the moment the entry
-    /// is appended. Whether this node may elect itself follows from whether
-    /// it is named. `index` is the entry's; when it commits the caller
+    /// become exactly its members minus this node, keeping the progress of
+    /// any that stay; a voter counts toward quorum from the moment the
+    /// entry is appended, a replica never. This node campaigns as a voter
+    /// (and in one case besides: `mayCampaign`). `index` is the entry's;
+    /// when it commits the caller
     /// passes it again through `commitMembership`, and a truncation below
     /// it reverts to the committed one.
-    pub fn setMembership(self: *RaftNode, member_ids: []const NodeId, index: u64) void {
+    pub fn setMembership(self: *RaftNode, cfg: *const membership.Config, index: u64) void {
         var new_peers: [MAX_PEERS]PeerState = undefined;
         var new_ids: [MAX_PEERS]NodeId = undefined;
+        // Votes granted so far follow their peer, not its position.
+        var new_granted: [MAX_PEERS]bool = @splat(false);
         var n: u8 = 0;
-        var named = false;
-        for (member_ids) |id| {
-            if (id == self.id) {
-                named = true;
-                continue;
-            }
+        for (cfg.memberSlice()) |m| {
+            if (m.id == self.id) continue;
             if (n >= MAX_PEERS) break;
-            new_ids[n] = id;
+            new_ids[n] = m.id;
+            if (self.peerIndex(m.id)) |i| new_granted[n] = self.vote_granted_by[i];
             // A peer named just now has not spoken yet; it counts as heard
             // from now, or check-quorum would depose a leader that adds a
             // member more than a failover after it began.
-            new_peers[n] = if (self.peerIndex(id)) |i| self.peers[i] else .{
+            new_peers[n] = if (self.peerIndex(m.id)) |i| self.peers[i] else .{
                 .next_index = self.log.lastIndex() + 1,
                 .match_index = 0,
                 .inflight = false,
                 .last_contact_ms = self.current_time_ms,
+                .joining_since_ms = self.current_time_ms,
             };
+            new_peers[n].voter = m.voter;
             n += 1;
         }
         self.peers = new_peers;
         self.peer_ids = new_ids;
+        self.vote_granted_by = new_granted;
         self.peer_count = n;
-        self.timer_enabled = named;
+        self.self_named = cfg.names(self.id);
+        self.timer_enabled = cfg.isVoter(self.id);
+        self.latest_config = cfg.*;
         self.membership_index = index;
-        if (self.role == .candidate) self.votes_needed = self.quorum();
+        if (self.role == .candidate or self.pollOpen()) {
+            self.votes_needed = self.quorum();
+            self.votes_received = @intFromBool(self.timer_enabled);
+            for (self.peers[0..n], new_granted[0..n]) |p, g| self.votes_received += @intFromBool(g and p.voter);
+        }
     }
 
-    /// The config entry at `index` committed: what it named is now the
-    /// membership a truncation falls back to.
-    pub fn commitMembership(self: *RaftNode, member_ids: []const NodeId) void {
-        self.committed_member_count = @intCast(@min(member_ids.len, self.committed_member_ids.len));
-        @memcpy(self.committed_member_ids[0..self.committed_member_count], member_ids[0..self.committed_member_count]);
+    /// Set a membership of voters only: a group founded or forced into
+    /// being, and tests.
+    pub fn setVoters(self: *RaftNode, member_ids: []const NodeId, index: u64) void {
+        const cfg = membership.Config.ofVoters(member_ids);
+        self.setMembership(&cfg, index);
+    }
+
+    /// The config entry at `index` committed: it is now the membership a
+    /// truncation falls back to. (A leader it drops has already stepped
+    /// down, at commit: `advanceCommitIndex`.)
+    pub fn commitMembership(self: *RaftNode, cfg: *const membership.Config) void {
+        self.committed_config = cfg.*;
+    }
+
+    /// A voter campaigns. So does a voter of the committed config that a
+    /// newer, uncommitted one drops (a leader that removed itself and lost
+    /// office before the change committed): its log may be the only one
+    /// holding the change, so the voters it leaves would elect no one
+    /// without it. It counts only their votes, finishes the change and
+    /// steps down.
+    pub fn mayCampaign(self: *const RaftNode) bool {
+        if (self.timer_enabled) return true;
+        return self.membership_index > self.commit_index and self.committed_config.isVoter(self.id);
+    }
+
+    /// How many voters there were before the voter count last changed, as
+    /// far as the configs this node still records go: more than now means
+    /// the last such change was a removal.
+    pub fn voterCountBefore(self: *const RaftNode) ?u8 {
+        const now = self.latest_config.voterCount();
+        var i = self.config_record_count;
+        while (i > 0) {
+            i -= 1;
+            const rec = &self.config_records[i];
+            if (rec.index >= self.membership_index) continue;
+            const before = rec.config.voterCount();
+            if (before != now) return before;
+        }
+        return null;
+    }
+
+    /// Peers that vote.
+    pub fn voterPeers(self: *const RaftNode) u8 {
+        var n: u8 = 0;
+        for (self.peers[0..self.peer_count]) |p| n += @intFromBool(p.voter);
+        return n;
     }
 
     /// The current member ids, this node included when named.
     pub fn memberIds(self: *const RaftNode, out: *[MAX_PEERS + 1]NodeId) []NodeId {
         var n: usize = 0;
-        if (self.timer_enabled) {
+        if (self.self_named) {
             out[n] = self.id;
             n += 1;
         }
@@ -498,19 +594,18 @@ pub const RaftNode = struct {
     /// on the leader that wrote it and on every follower that took it.
     fn noteAppended(self: *RaftNode, e: *const Entry) void {
         if (e.header.entry_type != @intFromEnum(EntryType.raft_config)) return;
-        var ids: [membership.MAX_MEMBERS]NodeId = undefined;
-        const members = membership.decode(e.payload, &ids) orelse {
-            log.err("Raft: config entry at index {d} is not a member list; membership unchanged", .{e.header.index});
+        const cfg = membership.decode(e.payload) orelse {
+            log.err("Raft: config entry at index {d} is not a membership; membership unchanged", .{e.header.index});
             return;
         };
-        self.setMembership(members, e.header.index);
+        self.setMembership(&cfg, e.header.index);
         self.membership_term = e.header.term;
-        self.recordConfig(e.header.index, e.header.term, members);
+        self.recordConfig(e.header.index, e.header.term, &cfg);
     }
 
     /// A config entry in the log, for the term check: what the owner
     /// replays at boot, and every one appended after.
-    pub fn recordConfig(self: *RaftNode, index: u64, term: u64, members: []const NodeId) void {
+    pub fn recordConfig(self: *RaftNode, index: u64, term: u64, cfg: *const membership.Config) void {
         // Recorded once, in index order: applying a committed config
         // records it again, and boot replay records earlier ones.
         for (self.config_records[0..self.config_record_count]) |rec| {
@@ -521,11 +616,7 @@ pub const RaftNode = struct {
             std.mem.copyForwards(ConfigRecord, self.config_records[0 .. self.config_records.len - 1], self.config_records[1..]);
             self.config_record_count -= 1;
         }
-        var rec: ConfigRecord = .{ .index = index, .term = term, .members = .{} };
-        const n = @min(members.len, rec.members.ids.len);
-        @memcpy(rec.members.ids[0..n], members[0..n]);
-        rec.members.count = @intCast(n);
-        self.config_records[self.config_record_count] = rec;
+        self.config_records[self.config_record_count] = .{ .index = index, .term = term, .config = cfg.* };
         self.config_record_count += 1;
     }
 
@@ -540,24 +631,22 @@ pub const RaftNode = struct {
         }
         if (self.membership_index == 0 or self.membership_index <= after_index) return;
         if (self.config_record_count > 0) {
-            const rec = self.config_records[self.config_record_count - 1];
-            self.setMembership(rec.members.slice(), rec.index);
+            const rec = &self.config_records[self.config_record_count - 1];
+            self.setMembership(&rec.config, rec.index);
             self.membership_term = rec.term;
             return;
         }
-        var ids: [MAX_PEERS + 1]NodeId = undefined;
-        const n = self.committed_member_count;
-        @memcpy(ids[0..n], self.committed_member_ids[0..n]);
-        self.setMembership(ids[0..n], 0);
+        const committed = self.committed_config;
+        self.setMembership(&committed, 0);
         self.membership_term = 0;
     }
 
-    /// Total cluster size (self + peers).
+    /// Voters: this node when it is one, and every voting peer.
     pub fn clusterSize(self: *const RaftNode) u8 {
-        return self.peer_count + 1;
+        return @as(u8, @intFromBool(self.timer_enabled)) + self.voterPeers();
     }
 
-    /// Quorum size (majority).
+    /// Quorum size: a majority of the voters.
     pub fn quorum(self: *const RaftNode) u8 {
         return self.clusterSize() / 2 + 1;
     }
@@ -612,7 +701,7 @@ pub const RaftNode = struct {
                 // A leader that cannot reach a majority is not one: a
                 // partitioned leader would otherwise hold its clients'
                 // proposals forever, since there is no per-proposal timer.
-                if (self.peer_count > 0 and now_ms -| self.quorumContactMs() > self.config.election_timeout_max_ms) {
+                if (self.voterPeers() > 0 and now_ms -| self.quorumContactMs() > self.config.election_timeout_max_ms) {
                     log.warn("Raft: no contact with a majority for {d} ms; stepping down from term {d}", .{ now_ms - self.quorumContactMs(), self.current_term });
                     self.role = .follower;
                     self.leader_id = NO_VOTE;
@@ -641,7 +730,7 @@ pub const RaftNode = struct {
                     }
                     return result;
                 }
-                if (!self.timer_enabled) return result;
+                if (!self.mayCampaign()) return result;
                 // First tick: arm here rather than in init, which has no
                 // clock, so a node whose leader never speaks still elects.
                 if (self.election_deadline_ms == 0) {
@@ -665,14 +754,22 @@ pub const RaftNode = struct {
         self.current_time_ms = now_ms;
     }
 
-    /// The tick by which a majority (this node included) had last answered:
-    /// the quorum-th most recent contact. A peer that has never answered
-    /// this leadership counts from when it began.
+    /// The tick by which a majority of the voters (this node included when
+    /// it is one) had last answered: the quorum-th most recent contact. A
+    /// peer that has never answered this leadership counts from when it
+    /// began.
     fn quorumContactMs(self: *const RaftNode) u64 {
         var contacts: [MAX_PEERS + 1]u64 = undefined;
-        contacts[0] = self.current_time_ms;
-        for (0..self.peer_count) |i| contacts[i + 1] = @max(self.peers[i].last_contact_ms, self.leader_since_ms);
-        const n = self.peer_count + 1;
+        var n: usize = 0;
+        if (self.timer_enabled) {
+            contacts[0] = self.current_time_ms;
+            n = 1;
+        }
+        for (self.peers[0..self.peer_count]) |p| {
+            if (!p.voter) continue;
+            contacts[n] = @max(p.last_contact_ms, self.leader_since_ms);
+            n += 1;
+        }
         std.mem.sort(u64, contacts[0..n], {}, std.sort.desc(u64));
         return contacts[self.quorum() - 1];
     }
@@ -704,9 +801,9 @@ pub const RaftNode = struct {
         // lost touch must not spend a term and depose a live leader on
         // reconnect. A poll that gets no majority before the timer fires
         // again is simply asked again; only a passed poll spends the term.
-        if (self.config.enable_pre_vote and self.peer_count > 0) {
+        if (self.config.enable_pre_vote and self.voterPeers() > 0) {
             self.pre_vote_term = self.current_term + 1;
-            self.votes_received = 1;
+            self.votes_received = @intFromBool(self.timer_enabled);
             self.votes_needed = self.quorum();
             self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
             self.rearmElectionTimer();
@@ -744,14 +841,15 @@ pub const RaftNode = struct {
         self.role = .candidate;
         log.debug("Raft: starting election, node_id={d}, new_term={d}", .{ self.id, self.current_term });
         self.leader_id = NO_VOTE;
-        self.votes_received = 1; // vote for self
+        // Its own vote counts only where it is a voter.
+        self.votes_received = @intFromBool(self.timer_enabled);
         self.votes_needed = self.quorum();
         self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
         self.elections_started += 1;
         self.terms_seen += 1;
         self.rearmElectionTimer();
-        // The only member votes for itself and that is the majority.
-        if (self.peer_count == 0) self.becomeLeader();
+        // The only voter votes for itself and that is the majority.
+        if (self.voterPeers() == 0) self.becomeLeader();
         return .{
             .term = self.current_term,
             .candidate_id = self.id,
@@ -846,7 +944,7 @@ pub const RaftNode = struct {
             }
             // A yes to an earlier poll says nothing about this one.
             if (resp.term != self.pre_vote_term) return .none;
-            const idx = self.peerIndex(resp.from) orelse return .none;
+            const idx = self.voterIndex(resp.from) orelse return .none;
             if (self.vote_granted_by[idx]) return .none;
             self.vote_granted_by[idx] = true;
             self.votes_received += 1;
@@ -870,9 +968,9 @@ pub const RaftNode = struct {
         // stood.
         if (self.election_deadline_ms != 0 and self.current_time_ms >= self.election_deadline_ms) return .none;
         if (resp.vote_granted) {
-            // Count each peer at most once; grants from unknown nodes (or a
-            // duplicated response for self) never count toward quorum.
-            const idx = self.peerIndex(resp.from) orelse return .none;
+            // Count each voter at most once; grants from replicas, unknown
+            // nodes or a duplicated response for self never count.
+            const idx = self.voterIndex(resp.from) orelse return .none;
             if (self.vote_granted_by[idx]) return .none;
             self.vote_granted_by[idx] = true;
             self.votes_received += 1;
@@ -893,6 +991,7 @@ pub const RaftNode = struct {
     pub fn handleAppendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
         var resp = try self.appendEntries(req);
         resp.guarded = self.lost_log != .none;
+        resp.leader_commit = req.leader_commit;
         return resp;
     }
 
@@ -952,7 +1051,12 @@ pub const RaftNode = struct {
             if (e.header.index != req.prev_log_index + 1 + k) return error.MalformedBatch;
         }
 
-        // Append new entries (truncate conflicts)
+        // Append new entries (truncate conflicts). A config entry becomes
+        // the membership only once the batch is on disk: acting on it (a
+        // campaign counting its voters) and then crashing without it would
+        // leave this node having used a majority it no longer knows.
+        var first_new: ?u64 = null;
+        var has_config = false;
         for (req.entries) |*e| {
             const existing_term = self.log.entryTerm(e.header.index);
             if (existing_term) |t| {
@@ -972,13 +1076,29 @@ pub const RaftNode = struct {
                     self.durable_index = @min(self.durable_index, e.header.index - 1);
                     self.truncatedBelowMembership(e.header.index - 1);
                     _ = try self.log.append(e);
-                    self.noteAppended(e);
+                    if (first_new == null) first_new = e.header.index;
+                    has_config = has_config or e.header.entry_type == @intFromEnum(EntryType.raft_config);
                 }
                 // Same term, same index — already have it, skip
             } else {
                 // New entry
                 _ = try self.log.append(e);
-                self.noteAppended(e);
+                if (first_new == null) first_new = e.header.index;
+                has_config = has_config or e.header.entry_type == @intFromEnum(EntryType.raft_config);
+            }
+        }
+        if (has_config) {
+            const first = first_new.?;
+            if (!self.flushLog()) {
+                // Not kept: the leader sends the batch again, and this
+                // node adopts it then.
+                self.log.truncateAfter(first - 1);
+                self.durable_index = @min(self.durable_index, first - 1);
+                return error.ConfigNotDurable;
+            }
+            self.markDurable(self.log.lastIndex());
+            for (req.entries) |*e| {
+                if (e.header.index >= first) self.noteAppended(e);
             }
         }
 
@@ -1047,9 +1167,12 @@ pub const RaftNode = struct {
                         // back to unguarded and this one would count. Its
                         // first unguarded ack reports the real match.
                         self.peers[i].next_index = @max(self.peers[i].next_index, acked + 1);
+                        self.peers[i].caught_up_streak = 0;
                     } else {
                         self.peers[i].match_index = @max(self.peers[i].match_index, acked);
                         self.peers[i].next_index = self.peers[i].match_index + 1;
+                        const p = &self.peers[i];
+                        p.caught_up_streak = if (acked >= resp.leader_commit) p.caught_up_streak +| 1 else 0;
                     }
                 } else {
                     // Retry from where the follower says its log stops
@@ -1061,6 +1184,7 @@ pub const RaftNode = struct {
                     const back_one = self.peers[i].next_index -| 1;
                     self.peers[i].next_index = @max(1, @min(hinted, back_one));
                     self.peers[i].match_index = @min(self.peers[i].match_index, resp.hint_index);
+                    self.peers[i].caught_up_streak = 0;
                 }
                 break;
             }
@@ -1075,11 +1199,17 @@ pub const RaftNode = struct {
     /// Propose a new entry (leader only). Returns error if not leader.
     /// Flags and timestamp are written into the entry header (e.g. HAS_TTL, TOMBSTONE).
     pub fn propose(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
+        // A config is checked against the one before it (`proposeConfig`).
+        if (entry_type == .raft_config) return error.ConfigNotChecked;
+        return self.appendProposal(entry_type, flags, timestamp_ns, payload);
+    }
+
+    fn appendProposal(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
         if (self.writes_stopped) return error.WritesStopped;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
-        if (self.peer_count > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
+        if (self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
 
         var e = entry_mod.buildEntry(
             entry_type,
@@ -1091,16 +1221,94 @@ pub const RaftNode = struct {
         );
         e.header.crc32c = e.computeCrc();
         const idx = try self.log.append(&e);
+        if (entry_type == .raft_config) {
+            // On disk before it is the membership, or a crash could bring
+            // this leader back counting the majority it had before.
+            if (!self.flushLog()) {
+                self.log.truncateAfter(idx - 1);
+                return error.ConfigNotDurable;
+            }
+        }
         self.noteAppended(&e);
+        // Counted only once it is the membership: a config commits by a
+        // majority of the voters it names, never by the ones before it
+        // (a lone voter would otherwise commit a second voter's promotion
+        // on its own disk).
+        if (entry_type == .raft_config) self.markDurable(idx);
 
-        // Alone, the node is the majority: its copy commits the entry, at
+        // The lone voter is the majority: its copy commits the entry, at
         // once unless it must be on disk first.
-        if (self.peer_count == 0) {
+        if (self.voterPeers() == 0) {
             self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         }
 
         log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @intFromEnum(entry_type), payload.len });
         return .{ .index = idx, .term = self.current_term, .timestamp_ns = timestamp_ns };
+    }
+
+    /// What became of a membership change.
+    pub const ConfigProposal = union(enum) {
+        proposed: ProposeResult,
+        /// It may not follow the latest config.
+        refused: membership.Refusal,
+        /// An earlier change has not committed: two in flight could let two
+        /// majorities disagree.
+        in_flight,
+        /// This leader has not yet committed an entry of its own term. Until
+        /// it has, a config from an earlier term may still be in the log
+        /// uncommitted, and a change made on top of it can commit beside
+        /// one made on the config before it (Ongaro, 2015).
+        no_own_commit,
+    };
+
+    /// Propose a membership change: the one way a config enters the log
+    /// after the first.
+    pub fn proposeConfig(self: *RaftNode, next: *const membership.Config) !ConfigProposal {
+        if (self.role != .leader) return error.NotLeader;
+        var buf: [membership.MAX_SIZE]u8 = undefined;
+        const payload = membership.encode(next, &buf);
+        // The first config founds the group: there is nothing before it to
+        // disagree with, and the founder must be one of its voters.
+        if (self.latest_config.member_count == 0) {
+            if (!next.isVoter(self.id)) return .{ .refused = .no_voter };
+            return .{ .proposed = try self.appendProposal(.raft_config, entry_mod.Flags.NONE, 0, payload) };
+        }
+        // Leading without a vote is only the time it takes the change that
+        // dropped it to commit; it starts none.
+        if (!self.timer_enabled) return .{ .refused = .not_a_voter };
+        if (self.membership_index > self.commit_index) return .in_flight;
+        if (self.commit_index == 0 or self.log.entryTerm(self.commit_index) != self.current_term) return .no_own_commit;
+        if (membership.checkChange(&self.latest_config, next, self.id)) |why| return .{ .refused = why };
+        return .{ .proposed = try self.appendProposal(.raft_config, entry_mod.Flags.NONE, 0, payload) };
+    }
+
+    /// The leader's view of each peer that has not caught up, or may yet be
+    /// promoted: what `membership.nextAutomatic` decides from.
+    pub fn memberProgress(self: *const RaftNode, out: *[MAX_PEERS]membership.Progress) []membership.Progress {
+        var n: usize = 0;
+        for (self.peers[0..self.peer_count], self.peer_ids[0..self.peer_count]) |p, id| {
+            if (p.voter) continue;
+            out[n] = .{ .id = id, .caught_up_now = self.caughtUpNow(p), .joining_since_ms = p.joining_since_ms };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// Acked at the commit index on its last `CAUGHT_UP_ACKS` answers, and
+    /// heard from lately: a run of acks says nothing about a peer that has
+    /// since gone silent.
+    pub fn caughtUpNow(self: *const RaftNode, p: PeerState) bool {
+        const heard = self.current_time_ms -| p.last_contact_ms <= self.config.election_timeout_max_ms;
+        return heard and p.caught_up_streak >= CAUGHT_UP_ACKS;
+    }
+
+    /// Hand the log to the owner's disk. True when durable, or when there
+    /// is no sink (an ephemeral node has nothing to flush to).
+    fn flushLog(self: *RaftNode) bool {
+        const sink = self.log_flush_sink orelse return true;
+        if (sink.flush(sink.ctx)) return true;
+        self.persist_failures += 1;
+        return false;
     }
 
     // ── Lost-log guard ──────────────────────────────────────────────────
@@ -1148,15 +1356,14 @@ pub const RaftNode = struct {
             if (rec.index <= self.commit_index) committed = i;
         }
         if (committed) |i| {
-            self.addCheckSet(recs[i].members.slice());
-        } else if (self.committed_member_count > 0) {
-            self.addCheckSet(self.committed_member_ids[0..self.committed_member_count]);
+            self.addCheckSet(voterSet(&recs[i].config).slice());
+        } else if (self.committed_config.member_count > 0) {
+            self.addCheckSet(voterSet(&self.committed_config).slice());
         }
         for (recs) |*rec| {
-            if (rec.index > self.commit_index) self.addCheckSet(rec.members.slice());
+            if (rec.index > self.commit_index) self.addCheckSet(voterSet(&rec.config).slice());
         }
-        var ids: [MAX_PEERS + 1]NodeId = undefined;
-        self.addCheckSet(self.memberIds(&ids));
+        self.addCheckSet(self.ownCheckSet().slice());
         log.info("Raft: guarded node {d} at index {d} (term {d}); confirming the term with {d} member set(s)", .{ self.id, self.log.lastIndex(), self.current_term, self.check.set_count });
         // No other member in any set: no other vote could have counted.
         if (self.checkSatisfied()) _ = self.confirmTerm();
@@ -1260,12 +1467,19 @@ pub const RaftNode = struct {
             .member_count = 0,
             .members = undefined,
         };
-        var ids: [MAX_PEERS + 1]NodeId = undefined;
-        const members = self.memberIds(&ids);
-        const n = @min(members.len, resp.members.len);
-        @memcpy(resp.members[0..n], members[0..n]);
-        resp.member_count = @intCast(n);
+        const voters = self.ownCheckSet();
+        @memcpy(resp.members[0..voters.count], voters.slice());
+        resp.member_count = voters.count;
         return resp;
+    }
+
+    /// The voters of the latest config; with none, the members this node
+    /// knows.
+    fn ownCheckSet(self: *const RaftNode) MemberSet {
+        if (self.latest_config.member_count > 0) return voterSet(&self.latest_config);
+        var set: MemberSet = .{};
+        set.count = @intCast(self.memberIds(&set.ids).len);
+        return set;
     }
 
     /// One member's answer. A newer term sends the node back to catch up
@@ -1353,6 +1567,8 @@ pub const RaftNode = struct {
             self.peers[i].inflight = false;
             self.peers[i].sent_up_to = 0;
             self.peers[i].last_contact_ms = 0;
+            self.peers[i].caught_up_streak = 0;
+            self.peers[i].joining_since_ms = self.current_time_ms;
         }
         // An entry of this term, so the entries of earlier terms commit as
         // soon as it replicates: a leader may only count a majority for its
@@ -1362,17 +1578,34 @@ pub const RaftNode = struct {
         var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, self.current_term, next, 0, "");
         noop.header.crc32c = noop.computeCrc();
         if (self.log.append(&noop)) |idx| {
-            if (self.peer_count == 0) self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
+            if (self.voterPeers() == 0) self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         } else |err| {
             log.err("Raft: cannot append the leadership noop at index {d}: {s}; earlier terms' entries commit only after the next client write", .{ next, @errorName(err) });
         }
     }
 
-    fn peerIndex(self: *const RaftNode, peer_id: NodeId) ?usize {
+    pub fn peerIndex(self: *const RaftNode, peer_id: NodeId) ?usize {
         for (0..self.peer_count) |i| {
             if (self.peer_ids[i] == peer_id) return i;
         }
         return null;
+    }
+
+    /// What this leader tracks for a peer, if it is one.
+    pub fn peerProgress(self: *const RaftNode, peer_id: NodeId) ?PeerState {
+        const i = self.peerIndex(peer_id) orelse return null;
+        return self.peers[i];
+    }
+
+    /// A peer the latest config names as a replica.
+    pub fn isReplicaPeer(self: *const RaftNode, peer_id: NodeId) bool {
+        const i = self.peerIndex(peer_id) orelse return false;
+        return !self.peers[i].voter;
+    }
+
+    fn voterIndex(self: *const RaftNode, peer_id: NodeId) ?usize {
+        const i = self.peerIndex(peer_id) orelse return null;
+        return if (self.peers[i].voter) i else null;
     }
 
     fn isLogUpToDate(self: *const RaftNode, last_index: u64, last_term: u64) bool {
@@ -1394,8 +1627,8 @@ pub const RaftNode = struct {
         if (through <= self.durable_index) return;
         self.durable_index = through;
         if (self.role != .leader) return;
-        if (self.peer_count == 0) {
-            // A single node's disk is the whole quorum, whatever term the
+        if (self.voterPeers() == 0) {
+            // A lone voter's disk is the whole quorum, whatever term the
             // entries are from.
             self.commit_index = @max(self.commit_index, self.durable_index);
         } else {
@@ -1414,9 +1647,10 @@ pub const RaftNode = struct {
             // Only commit entries from current term (Raft safety)
             if (term != self.current_term) continue;
 
-            var replicas: u8 = if (self.selfCountedThrough(idx) >= idx) 1 else 0;
+            var replicas: u8 = if (self.timer_enabled and self.selfCountedThrough(idx) >= idx) 1 else 0;
             for (0..self.peer_count) |i| {
-                if (self.peers[i].match_index >= idx and !self.peers[i].guarded) {
+                const p = self.peers[i];
+                if (p.voter and p.match_index >= idx and !p.guarded) {
                     replicas += 1;
                 }
             }
@@ -1427,6 +1661,17 @@ pub const RaftNode = struct {
         }
 
         self.commit_index = new_commit;
+        // A leader whose own removal (or demotion) just committed leaves
+        // office now, not when its owner applies the entry: until then every
+        // gate would be open to it, and anything it proposed would be counted
+        // by voters that have moved on.
+        if (self.role == .leader and !self.timer_enabled and self.membership_index <= self.commit_index) {
+            log.info("Raft: node {d} is no longer a voter and the change committed; stepping down from term {d}", .{ self.id, self.current_term });
+            self.role = .follower;
+            self.leader_id = NO_VOTE;
+            self.pre_vote_term = 0;
+            self.left_group = true;
+        }
     }
 };
 
@@ -2824,8 +3069,8 @@ test "raft node: a config entry is the membership from the moment it is appended
     _ = candidacy(&leader).?;
     _ = leader.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     var buf: [membership.MAX_SIZE]u8 = undefined;
-    const three = membership.encode(&.{ 1, 2, 3 }, &buf);
-    const r = try leader.propose(.raft_config, 0, 0, three);
+    const three = membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &buf);
+    const r = (try leader.proposeConfig(&membership.Config.ofVoters(&.{ 1, 2, 3 }))).proposed;
     // Not committed (one peer, no ack), yet the peers are already 2 and 3.
     try testing.expectEqual(@as(u8, 2), leader.peer_count);
     try testing.expectEqual(r.index, leader.membership_index);
@@ -2852,7 +3097,7 @@ test "raft node: a config entry is the membership from the moment it is appended
 test "raft node: membership is what the config entry says, and an unnamed node does not elect itself" {
     var node = try RaftNode.init(testing.allocator, 5, 1, 4096, .{});
     defer node.deinit();
-    node.setMembership(&.{ 1, 2, 3 }, 7);
+    node.setVoters(&.{ 1, 2, 3 }, 7);
     try testing.expectEqual(@as(u8, 3), node.peer_count);
     try testing.expect(!node.timer_enabled);
     _ = node.tick(1000);
@@ -2860,9 +3105,9 @@ test "raft node: membership is what the config entry says, and an unnamed node d
     try testing.expect(!node.tick(1000 + node.config.election_timeout_max_ms * 4).start_election);
 
     // Named now: peers are the others, progress for kept peers survives.
-    node.setMembership(&.{ 1, 2, 3 }, 7);
+    node.setVoters(&.{ 1, 2, 3 }, 7);
     node.peers[0].match_index = 9;
-    node.setMembership(&.{ 1, 2, 3, 5 }, 8);
+    node.setVoters(&.{ 1, 2, 3, 5 }, 8);
     try testing.expect(node.timer_enabled);
     try testing.expectEqual(@as(u8, 3), node.peer_count);
     try testing.expectEqual(@as(u64, 9), node.peers[0].match_index);
@@ -2872,7 +3117,7 @@ test "raft node: membership is what the config entry says, and an unnamed node d
 
     // A truncation below the entry that named this node reverts to the
     // committed membership, which did not.
-    node.commitMembership(&.{ 1, 2, 3 });
+    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }));
     node.log.truncateAfter(5);
     node.truncatedBelowMembership(5);
     try testing.expect(!node.timer_enabled);
@@ -2909,9 +3154,9 @@ test "raft node: a lone member elected from a restored log commits its noop and 
 test "raft node: a membership naming nobody leaves the timer off, and a bootstrapped leader is not deposed by the member it adds" {
     var node = try RaftNode.init(testing.allocator, 1, 1000, 16384, .{ .rng_seed = 3 });
     defer node.deinit();
-    node.setMembership(&.{}, 0);
+    node.setVoters(&.{}, 0);
     try testing.expect(!node.timer_enabled);
-    node.setMembership(&.{1}, 5);
+    node.setVoters(&.{1}, 5);
     try testing.expect(node.timer_enabled);
 
     var leader = try RaftNode.init(testing.allocator, 1, 1000, 16384, .{ .rng_seed = 3 });
@@ -2923,7 +3168,7 @@ test "raft node: a membership naming nobody leaves the timer off, and a bootstra
     // as heard from now, so the leader is not deposed for adding it...
     const joined_at = 1000 + 10 * max;
     _ = leader.tick(joined_at);
-    leader.setMembership(&.{ 1, 2 }, 2);
+    leader.setVoters(&.{ 1, 2 }, 2);
     const r = leader.tick(joined_at + max);
     try testing.expect(!r.step_down);
     try testing.expectEqual(Role.leader, leader.role);
@@ -2992,7 +3237,7 @@ fn guardedCaughtUp(node: *RaftNode, rec: *SinkRecorder) !void {
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 3, 0, ""),
     };
     // Short of what the leader had committed: still catching up, and its
@@ -3090,8 +3335,8 @@ test "raft node: the latest committed config is checked as well as an uncommitte
     node.hard_state_sink = rec.sink();
     // {1,2,3} committed; {1,2,3,4} appended by a leader the group may
     // have replaced.
-    node.commitMembership(&.{ 1, 2, 3 });
-    node.setMembership(&.{ 1, 2, 3, 4 }, 9);
+    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    node.setVoters(&.{ 1, 2, 3, 4 }, 9);
     node.membership_term = 3;
     node.current_term = 3;
     try node.enterLostVote();
@@ -3114,7 +3359,7 @@ test "raft node: a guarded node in a group of two confirms with the other member
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2 }, &cfg_buf)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf)),
     };
     _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 1 });
     try testing.expectEqual(LostLog.confirming, node.lost_log);
@@ -3129,7 +3374,7 @@ test "raft node: a guarded node sends no term check and counts no answer within 
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9, .election_timeout_max_ms = 300, .heartbeat_interval_ms = 50 });
     defer node.deinit();
     node.hard_state_sink = rec.sink();
-    node.setMembership(&.{ 1, 2 }, 1);
+    node.setVoters(&.{ 1, 2 }, 1);
     try node.enterLostVote();
     // Before the first tick there is no clock: it waits. The wait is one
     // maximum election timeout plus an RPC timeout: 300 + 100.
@@ -3152,7 +3397,7 @@ test "raft node: a node that kept its log but lost its hard state confirms the t
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
     };
     _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
     // Restarted without HARDSTATE: no vote on record (the owner boots at
@@ -3177,7 +3422,7 @@ test "raft node: a group of one has no other vote to wait for" {
     var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
     defer node.deinit();
     node.hard_state_sink = rec.sink();
-    node.setMembership(&.{2}, 1);
+    node.setVoters(&.{2}, 1);
     try node.enterLostVote();
     try testing.expectEqual(LostLog.none, node.lost_log);
     try testing.expect(!rec.lost_log);
@@ -3259,8 +3504,8 @@ test "raft node: an empty-log node checks the committed config it caught up to, 
     // (term 3), not committed.
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 3, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&.{ 1, 2, 3 }, &a)),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 3, 0, membership.encode(&.{ 1, 2, 3, 4 }, &b)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &a)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 3, 3, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3, 4 }), &b)),
     };
     _ = try node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
     try testing.expectEqual(LostLog.confirming, node.lost_log);
@@ -3283,8 +3528,8 @@ test "raft node: a truncated config falls back to the newest one the log still h
     // {1,2,3,4} at 3, uncommitted.
     var es = [_]Entry{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2, 3 }, &a)),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 3, 0, membership.encode(&.{ 1, 2, 3, 4 }, &b)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &a)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 3, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3, 4 }), &b)),
     };
     _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
     try testing.expectEqual(@as(u8, 3), node.peer_count);
@@ -3294,4 +3539,366 @@ test "raft node: a truncated config falls back to the newest one the log still h
     var ids: [MAX_PEERS + 1]NodeId = undefined;
     try testing.expectEqualSlices(NodeId, &.{ 2, 1, 3 }, node.memberIds(&ids));
     try testing.expect(node.timer_enabled);
+}
+
+// ── Membership roles ─────────────────────────────────────────────────
+
+/// Node 1 leading `cfg` (which names it a voter), elected by every voter
+/// peer, with its leadership noop committed.
+fn leading(cfg: membership.Config) !RaftNode {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 16384, .{});
+    errdefer node.deinit();
+    node.setMembership(&cfg, 0);
+    _ = candidacy(&node);
+    for (cfg.memberSlice()) |m| {
+        if (m.id != 1 and m.voter) _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = m.id });
+    }
+    try testing.expectEqual(Role.leader, node.role);
+    for (cfg.memberSlice()) |m| if (m.id != 1) ackAll(&node, m.id);
+    try testing.expectEqual(node.log.lastIndex(), node.commit_index);
+    return node;
+}
+
+/// `from` acks everything in the leader's log.
+fn ackAll(node: *RaftNode, from: NodeId) void {
+    const i = node.peerIndex(from).?;
+    node.peers[i].sent_up_to = node.log.lastIndex();
+    node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = node.log.lastIndex(), .from = from, .leader_commit = node.commit_index });
+}
+
+const FlushRecorder = struct {
+    fail: bool = false,
+    calls: u32 = 0,
+    node: ?*const RaftNode = null,
+    /// The membership the node held when the flush ran.
+    membership_at_flush: u64 = 0,
+
+    fn flush(ctx: *anyopaque) bool {
+        const self: *FlushRecorder = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.node) |n| self.membership_at_flush = n.membership_index;
+        return !self.fail;
+    }
+
+    fn sink(self: *FlushRecorder) LogFlushSink {
+        return .{ .ctx = @ptrCast(self), .flush = flush };
+    }
+};
+
+test "raft node: a replica counts toward no quorum: its ack and its vote count for nothing, and it never campaigns" {
+    // A lone voter with a replica leads at once and commits alone.
+    var alone = try leading(membership.Config.ofVoters(&.{1}).withJoiner(2, true));
+    defer alone.deinit();
+    try testing.expectEqual(@as(u8, 1), alone.clusterSize());
+    const r = try alone.propose(.kv_put, 0, 0, "x");
+    try testing.expectEqual(r.index, alone.commit_index);
+
+    // Voters 1 and 3, replica 2: only 3's ack commits.
+    var leader = try leading(membership.Config.ofVoters(&.{ 1, 3 }).withJoiner(2, true));
+    defer leader.deinit();
+    try testing.expectEqual(@as(u8, 2), leader.clusterSize());
+    const w = try leader.propose(.kv_put, 0, 0, "y");
+    ackAll(&leader, 2);
+    try testing.expect(leader.commit_index < w.index);
+    ackAll(&leader, 3);
+    try testing.expectEqual(w.index, leader.commit_index);
+
+    // A candidate needs 3, not 2.
+    var cand = try RaftNode.init(testing.allocator, 1, 1, 16384, .{});
+    defer cand.deinit();
+    const cfg = membership.Config.ofVoters(&.{ 1, 3 }).withJoiner(2, true);
+    cand.setMembership(&cfg, 0);
+    _ = candidacy(&cand);
+    _ = cand.handleVoteResponse(.{ .term = cand.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.candidate, cand.role);
+    _ = cand.handleVoteResponse(.{ .term = cand.current_term, .vote_granted = true, .from = 3 });
+    try testing.expectEqual(Role.leader, cand.role);
+
+    // A replica never campaigns, but answers a candidate as any node does:
+    // its vote counts only where the candidate's config names it a voter,
+    // and one promoted before it has heard so must still be able to elect.
+    var replica = try RaftNode.init(testing.allocator, 2, 1, 16384, .{});
+    defer replica.deinit();
+    replica.setMembership(&cfg, 0);
+    try testing.expect(!replica.timer_enabled and replica.self_named);
+    try testing.expect(!replica.tick(1_000_000).start_election);
+    const yes = replica.handleVoteRequest(.{ .term = 5, .candidate_id = 3, .last_log_index = 10, .last_log_term = 4 });
+    try testing.expect(yes.vote_granted);
+}
+
+test "raft node: membership changes go through proposeConfig, one at a time, after the leader has committed in its term, voters by one" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 16384, .{});
+    defer node.deinit();
+    const two = membership.Config.ofVoters(&.{ 1, 2 });
+    node.setMembership(&two, 0);
+    node.commitMembership(&two);
+    _ = candidacy(&node);
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    var buf: [membership.MAX_SIZE]u8 = undefined;
+    try testing.expectError(error.ConfigNotChecked, node.propose(.raft_config, 0, 0, membership.encode(&two, &buf)));
+
+    // The leadership noop has not committed: a change now could ride on an
+    // uncommitted config of an earlier term.
+    const three = two.withJoiner(3, true);
+    try testing.expectEqual(RaftNode.ConfigProposal.no_own_commit, try node.proposeConfig(&three));
+    ackAll(&node, 2);
+    const first = (try node.proposeConfig(&three)).proposed;
+    try testing.expectEqual(first.index, node.membership_index);
+    try testing.expectEqual(RaftNode.ConfigProposal.in_flight, try node.proposeConfig(&three.withJoiner(4, true)));
+    ackAll(&node, 2);
+    try testing.expectEqual(first.index, node.commit_index);
+    // Two voters at once from two is refused; one is not.
+    const jump = membership.Config.ofVoters(&.{ 1, 2, 3, 4 });
+    try testing.expectEqual(RaftNode.ConfigProposal{ .refused = .voters_jump }, try node.proposeConfig(&jump));
+}
+
+test "raft node: a config is the membership only once it is on disk, on the leader and on a follower" {
+    var rec: FlushRecorder = .{};
+    var leader = try leading(membership.Config.ofVoters(&.{1}));
+    defer leader.deinit();
+    leader.log_flush_sink = rec.sink();
+    rec.node = &leader;
+    const before = leader.log.lastIndex();
+    const was = leader.membership_index;
+    rec.fail = true;
+    try testing.expectError(error.ConfigNotDurable, leader.proposeConfig(&membership.Config.ofVoters(&.{1}).withJoiner(2, true)));
+    try testing.expectEqual(before, leader.log.lastIndex());
+    try testing.expectEqual(was, leader.membership_index);
+    rec.fail = false;
+    const p = (try leader.proposeConfig(&membership.Config.ofVoters(&.{1}).withJoiner(2, true))).proposed;
+    try testing.expectEqual(was, rec.membership_at_flush);
+    try testing.expectEqual(p.index, leader.membership_index);
+
+    // A follower: the batch holding the config is flushed, then adopted.
+    var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{});
+    defer follower.deinit();
+    var frec: FlushRecorder = .{ .fail = true };
+    follower.log_flush_sink = frec.sink();
+    frec.node = &follower;
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var cfg = testEntry(1, 1, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
+    cfg.header.entry_type = @intFromEnum(EntryType.raft_config);
+    cfg.header.crc32c = cfg.computeCrc();
+    const req: AppendRequest = .{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{cfg}, .leader_commit = 0 };
+    try testing.expectError(error.ConfigNotDurable, follower.handleAppendEntries(req));
+    try testing.expectEqual(@as(u64, 0), follower.log.lastIndex());
+    try testing.expectEqual(@as(u64, 0), follower.membership_index);
+    frec.fail = false;
+    const resp = try follower.handleAppendEntries(req);
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 0), frec.membership_at_flush);
+    try testing.expectEqual(@as(u64, 1), follower.membership_index);
+}
+
+test "raft node: a leader that removes itself leads on without counting itself, and steps down once the change commits" {
+    var leader = try leading(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer leader.deinit();
+    const out = leader.latest_config.without(1, 42);
+    const p = (try leader.proposeConfig(&out)).proposed;
+    try testing.expectEqual(@as(u8, 2), leader.clusterSize());
+    try testing.expectEqual(Role.leader, leader.role);
+    // Its own copy no longer counts: one of the two remaining is not enough.
+    ackAll(&leader, 2);
+    try testing.expect(leader.commit_index < p.index);
+    ackAll(&leader, 3);
+    try testing.expectEqual(p.index, leader.commit_index);
+    // Applied, the change takes it out of office.
+    leader.commitMembership(&out);
+    try testing.expectEqual(Role.follower, leader.role);
+    try testing.expect(leader.left_group);
+}
+
+test "raft node: a peer acking at the commit index three times in a row is caught up" {
+    var leader = try leading(membership.Config.ofVoters(&.{1}).withJoiner(2, true));
+    defer leader.deinit();
+    var out: [MAX_PEERS]membership.Progress = undefined;
+    // `leading` acked once already.
+    for (0..CAUGHT_UP_ACKS - 2) |_| ackAll(&leader, 2);
+    try testing.expect(!leader.memberProgress(&out)[0].caught_up_now);
+    ackAll(&leader, 2);
+    try testing.expect(leader.memberProgress(&out)[0].caught_up_now);
+    // Behind, the run starts over.
+    _ = try leader.propose(.kv_put, 0, 0, "z");
+    const i = leader.peerIndex(2).?;
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = leader.log.lastIndex() - 1, .from = 2, .leader_commit = leader.log.lastIndex() });
+    try testing.expectEqual(@as(u8, 0), leader.peers[i].caught_up_streak);
+    // Under steady writes the commit index has moved on by the time an ack
+    // arrives; an ack holding what was committed when its batch left still
+    // counts, or a joiner would never catch up.
+    const sent_at = leader.commit_index;
+    _ = try leader.propose(.kv_put, 0, 0, "later");
+    try testing.expect(leader.commit_index > sent_at);
+    leader.peers[i].sent_up_to = sent_at;
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = sent_at, .from = 2, .leader_commit = sent_at });
+    try testing.expectEqual(@as(u8, 1), leader.peers[i].caught_up_streak);
+}
+
+test "raft node: a lone voter promoting a second does not commit the promotion on its own disk" {
+    var rec: FlushRecorder = .{};
+    var leader = try leading(membership.Config.ofVoters(&.{1}).withJoiner(2, true));
+    defer leader.deinit();
+    leader.log_flush_sink = rec.sink();
+    const promoted = leader.latest_config.withMember(.{ .id = 2, .voter = true, .may_vote = true, .caught_up = true });
+    const p = (try leader.proposeConfig(&promoted)).proposed;
+    try testing.expect(leader.commit_index < p.index);
+    ackAll(&leader, 2);
+    try testing.expectEqual(p.index, leader.commit_index);
+}
+
+test "raft node: a leader that removed itself and lost office before the change committed may still stand, counting only the voters it leaves" {
+    var leader = try leading(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer leader.deinit();
+    leader.commitMembership(&leader.latest_config);
+    _ = (try leader.proposeConfig(&leader.latest_config.without(1, 42))).proposed;
+    // A higher term deposes it before the change commits.
+    leader.handleAppendResponse(.{ .term = leader.current_term + 1, .success = false, .match_index = 0, .from = 2 });
+    try testing.expectEqual(Role.follower, leader.role);
+    try testing.expect(!leader.timer_enabled);
+    try testing.expect(leader.mayCampaign());
+    _ = leader.tick(1);
+    try testing.expect(leader.tick(1_000_000).start_election);
+    const req = candidacy(&leader).?;
+    _ = req;
+    // Its own vote does not count: both remaining voters must grant.
+    _ = leader.handleVoteResponse(.{ .term = leader.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.candidate, leader.role);
+    _ = leader.handleVoteResponse(.{ .term = leader.current_term, .vote_granted = true, .from = 3 });
+    try testing.expectEqual(Role.leader, leader.role);
+}
+
+/// `leader` sends `follower` everything from `from`, and takes the answer.
+fn replicate(leader: *RaftNode, follower: *RaftNode, from: u64) !void {
+    var entries: [16]Entry = undefined;
+    var arena: [4096]u8 = undefined;
+    const n = leader.log.getRange(from, &entries, &arena);
+    const resp = try follower.handleAppendEntries(.{
+        .term = leader.current_term,
+        .leader_id = leader.id,
+        .prev_log_index = from - 1,
+        .prev_log_term = leader.log.entryTerm(from - 1) orelse 0,
+        .entries = entries[0..n],
+        .leader_commit = leader.commit_index,
+    });
+    leader.peers[leader.peerIndex(follower.id).?].sent_up_to = leader.log.lastIndex();
+    leader.handleAppendResponse(resp);
+}
+
+/// `candidate` stands; each of `voters` answers. True when it won.
+fn stand(candidate: *RaftNode, voters: []const *RaftNode) bool {
+    const req = candidacy(candidate) orelse return false;
+    for (voters) |v| {
+        v.observeTime(0);
+        _ = candidate.handleVoteResponse(v.handleVoteRequest(req));
+    }
+    return candidate.role == .leader;
+}
+
+test "raft node: a new leader changes membership only after committing in its term, or two configs commit apart (Ongaro, 2015)" {
+    // Voters 1-4, replica 5. Node 1 leads term 1, promotes 5, gets that
+    // only to 5, and stops.
+    var nodes: [5]RaftNode = undefined;
+    for (&nodes, 1..) |*n, id| n.* = try RaftNode.init(testing.allocator, @intCast(id), 1, 16384, .{ .enable_pre_vote = false });
+    defer for (&nodes) |*n| n.deinit();
+    const c0 = membership.Config.ofVoters(&.{ 1, 2, 3, 4 }).withJoiner(5, true);
+    for (&nodes) |*n| {
+        n.setMembership(&c0, 0);
+        n.commitMembership(&c0);
+    }
+    const n1 = &nodes[0];
+    const n2 = &nodes[1];
+    const n3 = &nodes[2];
+    const n4 = &nodes[3];
+    const n5 = &nodes[4];
+    try testing.expect(stand(n1, &.{ n2, n3 }));
+    for ([_]*RaftNode{ n2, n3, n4, n5 }) |f| try replicate(n1, f, 1);
+    const c1 = c0.withMember(.{ .id = 5, .voter = true, .may_vote = true, .caught_up = true });
+    _ = (try n1.proposeConfig(&c1)).proposed;
+    try replicate(n1, n5, 2);
+
+    // Node 2 leads term 2 without it, with 3 and 4, and at once removes
+    // node 1. The gate holds the change until its term's noop commits,
+    // which takes a majority of the old voters: 4 among them.
+    try testing.expect(stand(n2, &.{ n3, n4 }));
+    const c2 = n2.latest_config.without(1, null);
+    var change = try n2.proposeConfig(&c2);
+    if (change == .no_own_commit) {
+        try replicate(n2, n3, 2);
+        try replicate(n2, n4, 2);
+        change = try n2.proposeConfig(&c2);
+    }
+    const p = change.proposed;
+    try replicate(n2, n3, p.index - 1);
+    try testing.expectEqual(p.index, n2.commit_index);
+
+    // Node 1 comes back and stands with its config naming 5 a voter. With
+    // the gate, 4 holds node 2's term and refuses it; without it, 1, 4 and
+    // 5 would elect 1, and it would overwrite what 2 and 3 committed.
+    // Its first try lands in term 2, where 4 already voted; the next is
+    // decided by whose log is newer.
+    if (stand(n1, &.{ n4, n5 }) or stand(n1, &.{ n4, n5 })) {
+        _ = try n1.propose(.kv_put, 0, 0, "x");
+        try replicate(n1, n4, 1);
+        try replicate(n1, n5, 1);
+    }
+    // Every index both sides committed holds the same entry.
+    const both = @min(n1.commit_index, n2.commit_index);
+    var i: u64 = 1;
+    while (i <= both) : (i += 1) try testing.expectEqual(n2.log.entryTerm(i), n1.log.entryTerm(i));
+    try testing.expect(n1.role != .leader);
+}
+
+test "raft node: a leader leaves office when its removal commits, before any apply, and starts no change meanwhile" {
+    // Voters 1 and 2, replicas 3 and 4 that may vote.
+    const c0 = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true).withJoiner(4, true);
+    var nodes: [4]RaftNode = undefined;
+    for (&nodes, 1..) |*n, id| n.* = try RaftNode.init(testing.allocator, @intCast(id), 1, 16384, .{ .enable_pre_vote = false });
+    defer for (&nodes) |*n| n.deinit();
+    for (&nodes) |*n| {
+        n.setMembership(&c0, 0);
+        n.commitMembership(&c0);
+    }
+    const n1 = &nodes[0];
+    const n2 = &nodes[1];
+    try testing.expect(stand(n1, &.{n2}));
+    for ([_]*RaftNode{ n2, &nodes[2], &nodes[3] }) |f| try replicate(n1, f, 1);
+    const c1 = n1.latest_config.without(1, 42);
+    const p1 = (try n1.proposeConfig(&c1)).proposed;
+    // Before the change commits it still leads, without a vote, and starts
+    // nothing: 2 alone making 3 and 4 voters would leave 2 able to commit
+    // alone beside them.
+    var c2 = c1.withMember(.{ .id = 3, .voter = true, .may_vote = true, .caught_up = true });
+    c2 = c2.withMember(.{ .id = 4, .voter = true, .may_vote = true, .caught_up = true });
+    try testing.expectEqual(RaftNode.ConfigProposal{ .refused = .not_a_voter }, try n1.proposeConfig(&c2));
+    try replicate(n1, n2, p1.index);
+    // Committed: out of office at once, with no apply (no commitMembership).
+    try testing.expectEqual(p1.index, n1.commit_index);
+    try testing.expect(n1.role != .leader);
+    try testing.expect(n1.left_group);
+    try testing.expectError(error.NotLeader, n1.proposeConfig(&c2));
+}
+
+test "raft node: caught up means acking at the commit index lately: a silent or failing replica is not" {
+    var leader = try leading(membership.Config.ofVoters(&.{1}).withJoiner(2, true).withJoiner(3, true));
+    defer leader.deinit();
+    var out: [MAX_PEERS]membership.Progress = undefined;
+    for (0..CAUGHT_UP_ACKS) |_| ackAll(&leader, 2);
+    try testing.expect(leader.memberProgress(&out)[0].caught_up_now);
+    // 2 goes silent past an election timeout.
+    leader.current_time_ms += leader.config.election_timeout_max_ms + 1;
+    try testing.expect(!leader.memberProgress(&out)[0].caught_up_now);
+    // Back and caught up, then it answers guarded (it lost its disk): the
+    // run starts over.
+    for (0..CAUGHT_UP_ACKS) |_| ackAll(&leader, 2);
+    try testing.expect(leader.memberProgress(&out)[0].caught_up_now);
+    const i = leader.peerIndex(2).?;
+    leader.peers[i].sent_up_to = leader.log.lastIndex();
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = true, .match_index = leader.log.lastIndex(), .from = 2, .guarded = true });
+    try testing.expect(!leader.memberProgress(&out)[0].caught_up_now);
+    // Caught up again, then an append fails: the run starts over.
+    for (0..CAUGHT_UP_ACKS) |_| ackAll(&leader, 2);
+    try testing.expect(leader.memberProgress(&out)[0].caught_up_now);
+    leader.handleAppendResponse(.{ .term = leader.current_term, .success = false, .match_index = 0, .hint_index = 0, .from = 2 });
+    try testing.expect(!leader.memberProgress(&out)[0].caught_up_now);
+    try testing.expect(membership.nextAutomatic(&leader.latest_config, leader.memberProgress(&out), 1000, leader.voterCountBefore()) == null);
 }

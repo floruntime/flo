@@ -26,6 +26,8 @@ pub const Summary = struct {
     commit: u64 = 0,
     config_index: u64 = 0,
     config_term: u64 = 0,
+    config: membership.Config = .{},
+    /// The config's member ids, voters and replicas.
     members: [membership.MAX_MEMBERS]u32 = undefined,
     member_count: usize = 0,
     /// The latest snapshot's file name; its entries are not in the segments.
@@ -93,8 +95,8 @@ pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
         for (batch[0..n]) |*e| {
             sum.last_term = e.header.term;
             if (e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config)) continue;
-            const members = membership.decode(e.payload, &sum.members) orelse continue;
-            sum.member_count = members.len;
+            sum.config = membership.decode(e.payload) orelse continue;
+            sum.member_count = sum.config.ids(&sum.members).len;
             sum.config_index = e.header.index;
             sum.config_term = e.header.term;
         }
@@ -129,7 +131,16 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     const term = @max(hs.term, sum.last_term);
     const index = sum.last_index + 1;
-    var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, term, index, 0, membership.encode(&.{hs.node_id}, &cfg_buf));
+    // The only voter; removed ids stay removed, except this one: a node
+    // forced back after its removal is a member again, and a config naming
+    // it both ways would not decode.
+    var forced = membership.Config.ofVoters(&.{hs.node_id});
+    for (sum.config.removedSlice()) |rm| {
+        if (rm.id == hs.node_id) continue;
+        forced.removed[forced.removed_count] = rm;
+        forced.removed_count += 1;
+    }
+    var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, term, index, 0, membership.encode(&forced, &cfg_buf));
     e.header.crc32c = e.computeCrc();
     try writer.addEntry(&e);
     try dl.flush(index);
@@ -234,7 +245,7 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es: [3]Entry = .{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&.{ 1, 2, 3 }, &cfg_buf)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 4, 3, 0, ""),
     };
     for (&es) |*e| e.header.crc32c = e.computeCrc();

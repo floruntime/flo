@@ -90,6 +90,12 @@ test "e2e/cluster: peers are reached at the address they advertise" {
     defer set2.deinit();
     try pollUntilStdout(cli2, &.{ "kv", "get", "after-join" }, "after-join-v");
     try pollUntilStdout(cli3, &.{ "kv", "get", "after-join" }, "after-join-v");
+    // Holding the log is not voting: a joiner enters as a replica and the
+    // seed makes both voters once both have caught up. Stopped before that,
+    // the seed would leave two replicas and no voter, and rightly no
+    // election.
+    try pollUntilStdout(cli2, &.{ "cluster", "status", "-o", "json" }, "\"role\":\"follower\"");
+    try pollUntilStdout(cli3, &.{ "cluster", "status", "-o", "json" }, "\"role\":\"follower\"");
 
     // The mesh: node 3 learned node 2's address from the seed's peer info.
     // With the seed gone, the only path from 2 to 3 is that link.

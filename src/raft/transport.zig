@@ -71,6 +71,9 @@ pub const MsgType = enum(u8) {
     /// the answer.
     term_check = 14,
     term_check_response = 15,
+    /// A member telling a node the group removed it, and when (u64 ms on
+    /// the removing leader's clock).
+    removed_notice = 16,
 };
 
 /// Write one frame (header, checksum, payload) into `buf`; returns the
@@ -241,7 +244,7 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
 // Serialization — AppendResponse (30 bytes; the last is the guarded flag)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 30;
+pub const APPEND_RESP_SIZE: usize = 38;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -258,6 +261,8 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 8;
     buf[off] = @intFromBool(resp.guarded);
     off += 1;
+    std.mem.writeInt(u64, buf[off..][0..8], resp.leader_commit, .little);
+    off += 8;
     return off;
 }
 
@@ -281,6 +286,7 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
         .from = from,
         .hint_index = hint_index,
         .guarded = data[off] & 1 != 0,
+        .leader_commit = std.mem.readInt(u64, data[off + 1 ..][0..8], .little),
     };
 }
 
@@ -600,13 +606,15 @@ test "transport: AppendResponse roundtrip" {
         .success = false,
         .match_index = 999,
         .from = 2,
+        .leader_commit = 990,
     };
 
-    var buf: [32]u8 = undefined;
+    var buf: [APPEND_RESP_SIZE]u8 = undefined;
     const written = serializeAppendResponse(resp, &buf);
     try testing.expect(written != null);
 
     const recovered = deserializeAppendResponse(&buf).?;
+    try testing.expectEqual(resp.leader_commit, recovered.leader_commit);
     try testing.expectEqual(resp.term, recovered.term);
     try testing.expectEqual(resp.success, recovered.success);
     try testing.expectEqual(resp.match_index, recovered.match_index);
@@ -737,7 +745,7 @@ test "transport: multiple messages in a stream" {
     const m2 = encodeMessage(.request_vote_response, 1000, 2, pb2[0..p2], stream_buf[offset..]).?;
     offset += m2;
 
-    var pb3: [32]u8 = undefined;
+    var pb3: [APPEND_RESP_SIZE]u8 = undefined;
     const p3 = serializeAppendResponse(.{ .term = 1, .success = true, .match_index = 5, .from = 2 }, &pb3).?;
     const m3 = encodeMessage(.append_entries_response, 1000, 2, pb3[0..p3], stream_buf[offset..]).?;
     offset += m3;

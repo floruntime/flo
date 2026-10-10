@@ -59,11 +59,11 @@ pub const OpCode = enum(u16) {
     // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
     cluster_status = 0x030,
     cluster_members = 0x031,
-    cluster_join = 0x032,
-    cluster_leave = 0x033,
-    cluster_transfer_leader = 0x034,
-    cluster_add_node = 0x035,
-    cluster_remove_node = 0x036,
+    /// `[id:u32]`: make a caught-up replica a voter.
+    cluster_promote = 0x032,
+    /// `[id:u32][yes:u8]`: remove a member; `yes` accepts a change that
+    /// leaves an even number of voters, or two.
+    cluster_remove = 0x033,
 
     // 0x050–0x0FF: infra reserve (auth, rate-limit, telemetry, audit)
 

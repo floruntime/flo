@@ -50,6 +50,10 @@ pub const Invariant = enum {
     durability,
     term_monotonicity,
     applied_integrity,
+    /// A committed config that is not a legal next step from the one
+    /// committed before it: two in flight, or voters changed by more than
+    /// one.
+    config_safety,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -163,6 +167,14 @@ const SimDisk = struct {
         return true;
     }
 
+    /// Everything the log holds is on disk: a config entry is made durable
+    /// before it takes effect, in either durability mode.
+    fn flushLog(ctx: *anyopaque) bool {
+        const self: *SimDisk = @ptrCast(@alignCast(ctx));
+        self.durable_len = self.entries.items.len;
+        return true;
+    }
+
     /// The disk is gone: log and hard state alike, as a replaced volume.
     fn wipe(self: *SimDisk) void {
         for (self.entries.items) |e| self.allocator.free(e.payload);
@@ -203,9 +215,13 @@ const SimNode = struct {
     lost_hard_state: bool = false,
     /// A lost-log node the convergence phase waits on to finish its guard.
     guard_watched: bool = false,
-    // Pump state, parallel to raft.peer_ids.
-    sent_at: [MAX_PEERS]u64,
-    last_heartbeat: [MAX_PEERS]u64,
+    // Pump state, by peer id: membership changes reorder the peers.
+    sent_at: [network_mod.MAX_NODES + 1]u64,
+    last_heartbeat: [network_mod.MAX_NODES + 1]u64,
+    /// Its clock runs at 1 + this / 1e6 of the simulation's.
+    clock_rate_ppm: i32 = 0,
+    /// The last config this node applied, for `config_safety`.
+    applied_config: membership.Config = .{},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -438,6 +454,10 @@ pub const Simulator = struct {
     restarts: u64 = 0,
     wipes: u64 = 0,
     config_written: bool = false,
+    /// What was acked when convergence began: every member must apply it.
+    /// The probes acked after are the leader's to commit; the final
+    /// durability check holds every acked op either way.
+    convergence_target: u64 = 0,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
     catch_up_reads: u64 = 0,
@@ -483,6 +503,11 @@ pub const Simulator = struct {
                 .sent_at = @splat(0),
                 .last_heartbeat = @splat(0),
             };
+            // Drawn only with drift on, so a run without it replays as before.
+            if (scenario.clock_drift_ppm > 0) {
+                const d: i32 = @intCast(scenario.clock_drift_ppm);
+                node.clock_rate_ppm = self.prng.random().intRangeAtMost(i32, -d, d);
+            }
             for (self.nodes, 0..) |_, j| {
                 if (i != j) node.raft.addPeer(@intCast(j + 1));
             }
@@ -523,6 +548,7 @@ pub const Simulator = struct {
             .enable_pre_vote = true,
             .durable_commits = self.scenario.durability == .sync,
             .rng_seed = self.prng.random().int(u64) | 1,
+            .rpc_timeout_ms = self.scenario.rpc_timeout_ms,
         };
     }
 
@@ -535,6 +561,7 @@ pub const Simulator = struct {
         node.raft.log.on_truncate_ctx = @ptrCast(&node.disk);
         node.raft.log.on_truncate = SimDisk.onTruncate;
         node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
+        node.raft.log_flush_sink = .{ .ctx = @ptrCast(&node.disk), .flush = SimDisk.flushLog };
         if (!self.options.volatile_hard_state) {
             node.raft.hard_state_sink = .{ .ctx = @ptrCast(&node.disk), .persist = SimDisk.persistHardState };
         }
@@ -599,6 +626,31 @@ pub const Simulator = struct {
         return lost >= self.scenario.max_lost_nodes;
     }
 
+    /// Whether `candidate` may be lost now: within `max_lost_nodes`, and
+    /// every config a node holds keeps a majority of voters that are not
+    /// lost. A guarded voter votes for no one until a leader has caught it
+    /// up, so losing more than a config tolerates has no way back short of
+    /// force-members — the operator's, not the protocol's, to take.
+    fn mayLose(self: *const Simulator, candidate: NodeId) bool {
+        if (self.anyLostLog()) return false;
+        for (self.nodes) |*node| {
+            if (!self.toleratesLoss(&node.raft.latest_config, candidate)) return false;
+        }
+        return true;
+    }
+
+    fn toleratesLoss(self: *const Simulator, cfg: *const membership.Config, also: NodeId) bool {
+        if (cfg.member_count == 0) return true;
+        var voters: u8 = 0;
+        var lost: u8 = 0;
+        for (cfg.memberSlice()) |m| {
+            if (!m.voter) continue;
+            voters += 1;
+            if (m.id == also or isLost(&self.nodes[m.id - 1])) lost += 1;
+        }
+        return voters - lost >= voters / 2 + 1;
+    }
+
     fn restartNode(self: *Simulator, node: *SimNode) !void {
         const prev_term = node.max_term_seen;
         node.raft.deinit();
@@ -629,8 +681,13 @@ pub const Simulator = struct {
             _ = node.raft.log.append(&entry) catch @panic("sim replay append");
             // The configs the log holds, as production's boot records them.
             if (e.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
-                var ids: [membership.MAX_MEMBERS]NodeId = undefined;
-                if (membership.decode(e.payload, &ids)) |members| node.raft.recordConfig(@intCast(idx), e.term, members);
+                if (membership.decode(e.payload)) |cfg| {
+                    node.raft.recordConfig(@intCast(idx), e.term, &cfg);
+                    // The latest config in the log is the membership, as
+                    // production's boot reads it.
+                    node.raft.setMembership(&cfg, @intCast(idx));
+                    node.raft.membership_term = e.term;
+                }
             }
         }
         // What the sink persisted is what comes back — nothing in volatile
@@ -655,6 +712,8 @@ pub const Simulator = struct {
         node.sent_at = @splat(0);
         node.last_heartbeat = @splat(0);
         self.restarts += 1;
+        // Replay applies from the start again.
+        node.applied_config = .{};
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
                 .invariant = .term_monotonicity,
@@ -672,7 +731,7 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             if (node.up) {
                 if (r.uintLessThan(u16, 1000) < self.scenario.crash_permille) {
-                    if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and !self.anyLostLog()) {
+                    if (r.uintLessThan(u16, 1000) < self.scenario.wipe_permille and self.mayLose(node.id)) {
                         if (r.boolean()) self.wipeNode(node) else self.wipeHardState(node);
                     } else {
                         self.crashNode(node);
@@ -717,7 +776,7 @@ pub const Simulator = struct {
     fn handleMessage(self: *Simulator, node: *SimNode, msg: *const Message) !void {
         // The clock before the message, as production observes it before
         // draining its queue.
-        node.raft.observeTime(self.now);
+        node.raft.observeTime(self.nodeNow(node));
         switch (msg.body) {
             .vote_req => |req| {
                 const resp = node.raft.handleVoteRequest(req);
@@ -730,6 +789,10 @@ pub const Simulator = struct {
                         self.elections_won += 1;
                         self.checker.onLeader(node, self.now);
                         self.writeConfig(node);
+                        // A change the moment a leader wins, before its
+                        // term's noop commits: what the own-term gate is for,
+                        // when an earlier term left a change uncommitted.
+                        if (self.config_written and self.scenario.config_change_permille > 0 and self.prng.random().boolean()) self.randomChange(node);
                         // Send first heartbeats immediately.
                         node.last_heartbeat = @splat(0);
                         node.sent_at = @splat(0);
@@ -795,18 +858,22 @@ pub const Simulator = struct {
     fn commitAllMembers(self: *Simulator, node: *SimNode) void {
         var ids: [network_mod.MAX_NODES]NodeId = undefined;
         for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
-        node.raft.commitMembership(ids[0..self.scenario.node_count]);
+        const cfg = membership.Config.ofVoters(ids[0..self.scenario.node_count]);
+        node.raft.commitMembership(&cfg);
     }
 
-    /// The first leader writes a config naming every node, as production's
-    /// founder does: membership the logs carry, so a wiped node's term
-    /// check reads its committed config from the log it caught up to.
+    /// A leader with no config writes one naming every node, as
+    /// production's founder does: membership the logs carry, so a wiped
+    /// node's term check reads its committed config from the log it caught
+    /// up to. Not only the first leader: one whose founding config was cut
+    /// from the log before it committed leaves the next to write it.
     fn writeConfig(self: *Simulator, node: *SimNode) void {
-        if (self.config_written) return;
+        if (node.raft.latest_config.member_count != 0) return;
         var ids: [network_mod.MAX_NODES]NodeId = undefined;
         for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
-        var buf: [membership.MAX_SIZE]u8 = undefined;
-        _ = node.raft.propose(.raft_config, entry_mod.Flags.NONE, 0, membership.encode(ids[0..self.scenario.node_count], &buf)) catch return;
+        const cfg = membership.Config.ofVoters(ids[0..self.scenario.node_count]);
+        const outcome = self.proposeConfig(node, &cfg) orelse return;
+        if (outcome != .proposed) return;
         self.config_written = true;
     }
 
@@ -815,7 +882,7 @@ pub const Simulator = struct {
     fn tickNodes(self: *Simulator) !void {
         for (self.nodes) |*node| {
             if (!node.up) continue;
-            const result = node.raft.tick(self.now);
+            const result = node.raft.tick(self.nodeNow(node));
             if (result.start_election) {
                 // The sim disk never refuses a write, so this always starts.
                 const req = node.raft.startElection() orelse unreachable;
@@ -830,9 +897,83 @@ pub const Simulator = struct {
                     try self.net.send(&self.prng, &self.scenario, self.now, node.id, peer, .{ .term_check = node.raft.termCheckRequest() });
                 }
             }
-            if (node.raft.role == .leader) try self.pump(node);
+            if (node.raft.role == .leader) {
+                self.writeConfig(node);
+                try self.pump(node);
+                self.changeMembership(node);
+            }
             node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
         }
+    }
+
+    /// A membership change through the node's own gate, checked: a leader
+    /// that is not a voter starts no change, and only the lone voter of a
+    /// config makes two voters at once, the step whose old and new
+    /// majorities need not meet. History alone cannot show who proposed.
+    fn proposeConfig(self: *Simulator, node: *SimNode, next: *const membership.Config) ?RaftNode.ConfigProposal {
+        const prev = node.raft.latest_config;
+        const was_voter = node.raft.timer_enabled;
+        const outcome = node.raft.proposeConfig(next) catch return null;
+        if (outcome != .proposed or prev.member_count == 0) return outcome;
+        const why: ?[]const u8 = if (!was_voter)
+            "a leader that is not a voter proposed a membership change"
+        else if (prev.voterCount() == 1 and next.voterCount() == 3 and !prev.isVoter(node.id))
+            "two voters added at once by a node that is not the lone voter"
+        else
+            null;
+        if (why) |detail| self.checker.fail(.{ .invariant = .config_safety, .node = node.id, .index = outcome.proposed.index, .tick = self.now, .detail = detail });
+        return outcome;
+    }
+
+    /// The node's own clock: the simulation's, run fast or slow by its
+    /// drift, as a real host's is against another's.
+    fn nodeNow(self: *const Simulator, node: *const SimNode) u64 {
+        const skew = @divTrunc(@as(i128, self.now) * node.clock_rate_ppm, 1_000_000);
+        return @intCast(@max(0, @as(i128, self.now) + skew));
+    }
+
+    /// The leader's own changes (promote caught-up replicas, age out
+    /// joiners), and now and then one the scenario makes: add a node that
+    /// is not a member as a replica, promote a replica, or remove a voter,
+    /// the leader itself included. Each goes through `proposeConfig`, so a
+    /// change too soon after an election, or with one in flight, is refused
+    /// there, and a leader cut off holds a change the others never take.
+    fn changeMembership(self: *Simulator, node: *SimNode) void {
+        // Convergence asks a fixed core to finish; the membership holds.
+        if (!self.config_written or self.phase == .convergence) return;
+        const raft = &node.raft;
+        var peers_progress: [MAX_PEERS]membership.Progress = undefined;
+        if (membership.nextAutomatic(&raft.latest_config, raft.memberProgress(&peers_progress), self.nodeNow(node), raft.voterCountBefore())) |next| {
+            _ = self.proposeConfig(node, &next);
+            return;
+        }
+        const r = self.prng.random();
+        if (self.scenario.config_change_permille == 0 or r.uintLessThan(u16, 1000) >= self.scenario.config_change_permille) return;
+        self.randomChange(node);
+    }
+
+    /// One change the scenario makes: add a node that is not a member as a
+    /// replica, promote a replica, or remove a voter.
+    fn randomChange(self: *Simulator, node: *SimNode) void {
+        const raft = &node.raft;
+        const r = self.prng.random();
+        const cfg = raft.latest_config;
+        if (cfg.member_count == 0) return;
+        var outside: ?NodeId = null;
+        for (self.nodes) |*other| {
+            if (!cfg.names(other.id)) outside = other.id;
+        }
+        const next = if (outside != null and r.boolean())
+            cfg.withJoiner(outside.?, true)
+        else blk: {
+            const pick = cfg.members[r.uintLessThan(u8, cfg.member_count)];
+            if (!pick.voter) break :blk cfg.withMember(.{ .id = pick.id, .voter = true, .may_vote = true, .caught_up = true });
+            // Without a tombstone, so the node can be added back.
+            break :blk cfg.without(pick.id, null);
+        };
+        // Within what the voters tolerate, as fault injection stays.
+        if (!self.toleratesLoss(&next, 0)) return;
+        _ = self.proposeConfig(node, &next);
     }
 
     /// The replication pump the production runtime is missing: heartbeat
@@ -845,9 +986,9 @@ pub const Simulator = struct {
             const peer_id = node.raft.peer_ids[i];
             const next = node.raft.peers[i].next_index;
             const behind = next <= last;
-            const inflight_timeout = self.now -| node.sent_at[i] >= self.scenario.rpc_timeout_ms;
+            const inflight_timeout = self.now -| node.sent_at[peer_id] >= self.scenario.rpc_timeout_ms;
             const want_data = behind and (!node.raft.peers[i].inflight or inflight_timeout);
-            const want_heartbeat = self.now -| node.last_heartbeat[i] >= self.scenario.heartbeat_interval_ms;
+            const want_heartbeat = self.now -| node.last_heartbeat[peer_id] >= self.scenario.heartbeat_interval_ms;
             if (!want_data and !want_heartbeat) continue;
 
             const prev_index = next - 1;
@@ -887,10 +1028,10 @@ pub const Simulator = struct {
                     entries = owned;
                     node.raft.peers[i].inflight = true;
                     node.raft.peers[i].sent_up_to = @max(node.raft.peers[i].sent_up_to, next + count - 1);
-                    node.sent_at[i] = self.now;
+                    node.sent_at[peer_id] = self.now;
                 }
             }
-            node.last_heartbeat[i] = self.now;
+            node.last_heartbeat[peer_id] = self.now;
             try self.net.send(&self.prng, &self.scenario, self.now, node.id, peer_id, .{ .append_req = .{
                 .term = node.raft.current_term,
                 .leader_id = node.id,
@@ -986,10 +1127,28 @@ pub const Simulator = struct {
                 // A config applied is committed, as production's applier
                 // records it.
                 if (e.header.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
-                    var ids: [membership.MAX_MEMBERS]NodeId = undefined;
-                    if (membership.decode(e.payload, &ids)) |members| {
-                        node.raft.commitMembership(members);
-                        node.raft.recordConfig(idx, e.header.term, members);
+                    if (membership.decode(e.payload)) |cfg| {
+                        // Each committed config follows from the one before:
+                        // what one change at a time, after an own-term
+                        // commit, is there to guarantee.
+                        if (node.applied_config.member_count > 0) {
+                            // Who proposed is not in the entry: a lone voter's
+                            // own two-at-once step passes here, and
+                            // `proposeConfig` checks the proposer.
+                            var lone: [membership.MAX_MEMBERS]u32 = undefined;
+                            const prev_voters = node.applied_config.voterIds(&lone);
+                            const proposer: u32 = if (prev_voters.len == 1) prev_voters[0] else 0;
+                            if (membership.checkChange(&node.applied_config, &cfg, proposer)) |why| self.checker.fail(.{
+                                .invariant = .config_safety,
+                                .node = node.id,
+                                .index = idx,
+                                .tick = self.now,
+                                .detail = why.message(),
+                            });
+                        }
+                        node.applied_config = cfg;
+                        node.raft.commitMembership(&cfg);
+                        node.raft.recordConfig(idx, e.header.term, &cfg);
                     }
                 }
                 node.raft.last_applied = idx;
@@ -1020,6 +1179,7 @@ pub const Simulator = struct {
 
     fn transitionToConvergence(self: *Simulator) !void {
         self.phase = .convergence;
+        self.convergence_target = self.max_acked_index;
         const r = self.prng.random();
         const n = self.scenario.node_count;
         const quorum = n / 2 + 1;
@@ -1031,7 +1191,9 @@ pub const Simulator = struct {
             if (!isLost(node)) whole += 1;
         }
         var chosen: u8 = 0;
-        while (chosen < quorum) {
+        if (self.scenario.config_change_permille > 0) {
+            self.chooseMembershipCore();
+        } else while (chosen < quorum) {
             const pick = r.uintLessThan(u8, n);
             const p = &self.nodes[pick];
             if (isLost(p) and whole >= quorum) continue;
@@ -1046,7 +1208,7 @@ pub const Simulator = struct {
         for (self.nodes, 0..) |*node, i| {
             if (self.core[i]) {
                 if (!node.up) try self.restartNode(node);
-            } else if (isLost(node)) {
+            } else if (isLost(node) and self.namedAnywhere(node.id)) {
                 // Connected and watched: the run converges only once every
                 // guarded node has finished its guard with the core's
                 // leader. Isolated, a guard that never completes would pass
@@ -1070,7 +1232,24 @@ pub const Simulator = struct {
         }
     }
 
+    /// With the membership changing, which nodes the group ends with is
+    /// decided in the run, so every node is healed and restarted, and the
+    /// run converges once a leader has committed its latest config and
+    /// every node that config names has applied every acked op
+    /// (`convergedMembership`).
+    fn chooseMembershipCore(self: *Simulator) void {
+        for (self.core[0..self.scenario.node_count]) |*c| c.* = true;
+    }
+
+    fn namedAnywhere(self: *const Simulator, id: NodeId) bool {
+        for (self.nodes) |*node| {
+            if (node.raft.latest_config.names(id)) return true;
+        }
+        return false;
+    }
+
     fn converged(self: *Simulator) bool {
+        if (self.scenario.config_change_permille > 0) return self.convergedMembership();
         // Every acked op applied by every core node.
         const target = self.max_acked_index;
         for (self.nodes) |*node| {
@@ -1080,6 +1259,21 @@ pub const Simulator = struct {
             if (!self.core[i]) continue;
             if (!node.up) return false;
             if (node.raft.last_applied < target) return false;
+        }
+        return true;
+    }
+
+    fn convergedMembership(self: *const Simulator) bool {
+        const leader = for (self.nodes) |*node| {
+            if (node.up and node.raft.role == .leader) break node;
+        } else return false;
+        const cfg = &leader.raft.latest_config;
+        if (cfg.member_count == 0 or leader.raft.membership_index > leader.raft.commit_index) return false;
+        if (leader.raft.last_applied < self.max_acked_index) return false;
+        for (cfg.memberSlice()) |m| {
+            const node = &self.nodes[m.id - 1];
+            if (!node.up or node.raft.lost_log != .none) return false;
+            if (node.raft.last_applied < self.convergence_target) return false;
         }
         return true;
     }
@@ -1449,7 +1643,7 @@ test "vopr sim: with two of three wiped no leader is elected, and force-members 
     // force-members: the survivor's config names only it, and the nodes
     // left out cannot reach it (in production, the retired secret).
     const s = sim.node_(l);
-    s.raft.setMembership(&.{l}, s.raft.log.lastIndex());
+    s.raft.setVoters(&.{l}, s.raft.log.lastIndex());
     for (sim.nodes) |*node| {
         if (node.id != l) sim.net.isolate(node.id);
     }
