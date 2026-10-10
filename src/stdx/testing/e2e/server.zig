@@ -44,6 +44,12 @@ pub const ServerProcess = struct {
     /// The child was already collected by a diagnostic `waitpid`; a second
     /// wait would be a syscall bug, not a result.
     reaped: bool = false,
+    /// The raw wait status, once reaped.
+    exit_status: ?c_int = null,
+    /// Signals the harness itself sent this process, so the exit they cause
+    /// is expected; any other signal death is not.
+    sent_term: bool = false,
+    sent_kill: bool = false,
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
     started: bool,
@@ -190,6 +196,9 @@ pub const ServerProcess = struct {
         self.log_thread = null;
         self.log_stop = .init(false);
         self.reaped = false;
+        self.exit_status = null;
+        self.sent_term = false;
+        self.sent_kill = false;
         self.dump_log_on_failure = true;
 
         return self;
@@ -369,6 +378,9 @@ pub const ServerProcess = struct {
         const stdout_fd = self.process.?.stdout.?.handle;
         const stderr_fd = self.process.?.stderr.?.handle;
         self.reaped = false;
+        self.exit_status = null;
+        self.sent_term = false;
+        self.sent_kill = false;
         self.log_stop.store(false, .release);
         self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd, &self.log_stop });
         log_file_handed_off = true; // Thread now owns the fd
@@ -389,59 +401,88 @@ pub const ServerProcess = struct {
         self.started = true;
     }
 
-    /// Stop the server gracefully
+    /// Stop the server gracefully, then fail the test (see `checkExit`) if
+    /// it ended in a way this didn't cause.
     pub fn stop(self: *Self) void {
         if (!self.started) return;
 
         if (self.process) |*proc| {
             const pid = proc.id;
+            var forced = false;
 
-            // Send SIGTERM for graceful shutdown
-            _ = std.c.kill(pid, .TERM);
+            if (!self.tryReap(pid)) {
+                // Send SIGTERM for graceful shutdown
+                self.sent_term = true;
+                _ = std.c.kill(pid, .TERM);
 
-            // Wait for graceful shutdown (check if process exits naturally)
-            const grace_start = stdx.time.milliTimestamp();
-            var gracefully_exited = false;
-
-            while (stdx.time.milliTimestamp() - grace_start < @as(i64, @intCast(SHUTDOWN_GRACE_PERIOD_MS))) {
-                // Try non-blocking wait to see if process exited
-                var status: c_int = 0;
-                const result_pid = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
-                if (result_pid == pid) {
-                    gracefully_exited = true;
-                    break;
+                const grace_start = stdx.time.milliTimestamp();
+                while (!self.tryReap(pid) and stdx.time.milliTimestamp() - grace_start < @as(i64, @intCast(SHUTDOWN_GRACE_PERIOD_MS))) {
+                    stdx.time.sleep(50 * std.time.ns_per_ms);
                 }
-                stdx.time.sleep(50 * std.time.ns_per_ms);
-            }
 
-            // Force kill if not gracefully exited
-            if (!gracefully_exited) {
-                // Server didn't respond to SIGTERM, force kill its group
-                if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
-
-                // Wait for process to die (blocking wait with timeout)
-                const kill_start = stdx.time.milliTimestamp();
-                while (stdx.time.milliTimestamp() - kill_start < 1000) { // 1 second max
-                    var status: c_int = 0;
-                    const result_pid = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
-                    if (result_pid == pid) {
-                        break;
+                if (!self.reaped) {
+                    // Server didn't respond to SIGTERM, force kill its group
+                    forced = true;
+                    self.sent_kill = true;
+                    if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
+                    const kill_start = stdx.time.milliTimestamp();
+                    while (!self.tryReap(pid) and stdx.time.milliTimestamp() - kill_start < 1000) {
+                        stdx.time.sleep(10 * std.time.ns_per_ms);
                     }
-                    stdx.time.sleep(10 * std.time.ns_per_ms);
                 }
             }
 
-            // Brief wait for OS resource release (only needed after forced kill;
-            // each test uses unique ports via findFreePort, so minimal delay suffices)
-            if (!gracefully_exited) {
-                stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
-            }
+            // Brief wait for OS resource release after a forced kill (each
+            // test uses unique ports via findFreePort, so minimal delay suffices)
+            if (forced) stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
 
             self.joinLogThread();
+            self.checkExit();
             self.process = null;
         }
 
         self.started = false;
+    }
+
+    /// Collect the child if it has exited, keeping its status.
+    fn tryReap(self: *Self, pid: std.c.pid_t) bool {
+        if (self.reaped) return true;
+        var status: c_int = 0;
+        if (std.c.waitpid(pid, &status, std.posix.W.NOHANG) != pid) return false;
+        self.reaped = true;
+        self.exit_status = status;
+        return true;
+    }
+
+    /// Why the server's exit wasn't one the harness caused, or null: a
+    /// non-zero exit code, or death by a signal it didn't send. A SIGKILL it
+    /// didn't send is called out, since the OOM killer is the usual sender.
+    pub fn abnormalExit(self: *const Self, buf: []u8) ?[]const u8 {
+        const raw: u32 = @bitCast(self.exit_status orelse return null);
+        const low = raw & 0x7f;
+        if (low == 0) {
+            const code = (raw >> 8) & 0xff;
+            if (code == 0) return null;
+            return std.fmt.bufPrint(buf, "exited with code {d}", .{code}) catch "exited with a non-zero code";
+        }
+        if (low == 0x7f) return null; // stopped, not ended
+        if (low == @intFromEnum(std.posix.SIG.TERM) and self.sent_term) return null;
+        if (low == @intFromEnum(std.posix.SIG.KILL)) {
+            if (self.sent_kill) return null;
+            return "killed by a SIGKILL the harness didn't send (memory pressure, or another run's cleanup?)";
+        }
+        return std.fmt.bufPrint(buf, "died of signal {d}", .{low}) catch "died of a signal";
+    }
+
+    /// A server that panics or aborts after a test's last read would leave
+    /// the test passing; stop() runs inside deinit and can't return an error,
+    /// so this panics, after the reason and the log tail, to fail loudly.
+    fn checkExit(self: *Self) void {
+        var buf: [160]u8 = undefined;
+        const why = self.abnormalExit(&buf) orelse return;
+        std.debug.print("[server] port {d}: {s}\n", .{ self.port, why });
+        self.dumpLogTail();
+        @panic("e2e server ended abnormally; its log is above");
     }
 
     /// Never through `Child.wait`: it closes the pipes the log thread is
@@ -469,12 +510,9 @@ pub const ServerProcess = struct {
         // A crash and a hang look identical in the log — output simply stops —
         // and they have different causes, so report which one this is.
         if (self.process) |*proc| {
-            var status: c_int = 0;
-            const rc = if (self.reaped) proc.id else std.c.waitpid(proc.id, &status, @as(c_int, 1)); // WNOHANG
-            if (rc == proc.id) {
-                self.reaped = true;
-                std.debug.print("[server] port {d}: process already exited (raw status {d})\n", .{ self.port, status });
-            } else if (rc == 0) {
+            if (self.tryReap(proc.id)) {
+                std.debug.print("[server] port {d}: process already exited (raw status {d})\n", .{ self.port, self.exit_status orelse 0 });
+            } else {
                 std.debug.print("[server] port {d}: process still running — hung, not crashed\n", .{self.port});
             }
         }
@@ -561,14 +599,10 @@ pub const ServerProcess = struct {
             if (!self.reaped) {
                 // The child leads its own group (spawned with pgid 0), so
                 // this reaches anything it started; fall back to the pid.
+                self.sent_kill = true;
                 if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
                 const kill_start = stdx.time.milliTimestamp();
-                while (stdx.time.milliTimestamp() - kill_start < 2000) {
-                    var status: c_int = 0;
-                    if (std.c.waitpid(pid, &status, std.posix.W.NOHANG) == pid) {
-                        self.reaped = true;
-                        break;
-                    }
+                while (!self.tryReap(pid) and stdx.time.milliTimestamp() - kill_start < 2000) {
                     stdx.time.sleep(10 * std.time.ns_per_ms);
                 }
                 // A zombie is better than a hung run.
