@@ -51,6 +51,13 @@ test "e2e/worker: register with multiple task types" {
     try stdx.testing.assertSucceeded(result);
     const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
     try testing.expect(std.mem.indexOf(u8, output, "multi-worker") != null);
+
+    // Every type given is registered, not just the first.
+    var info = try ctx.cli.run(&.{ "worker", "info", "multi-worker" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 0), info.exit_code);
+    try testing.expect(info.stdoutContains("Processes (3):"));
+    inline for (.{ "task_x", "task_y", "task_z" }) |t| try testing.expect(info.stdoutContains(t));
 }
 
 // =============================================================================
@@ -84,8 +91,7 @@ test "e2e/worker: info on non-existent worker" {
     var result = try ctx.cli.run(&.{ "worker", "info", "ghost-worker" });
     defer result.deinit();
 
-    // Should fail gracefully (not crash)
-    try testing.expect(!result.succeeded());
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 // =============================================================================
@@ -123,8 +129,7 @@ test "e2e/worker: drain non-existent worker" {
     var result = try ctx.cli.run(&.{ "worker", "drain", "no-such-worker" });
     defer result.deinit();
 
-    // Should fail gracefully
-    try testing.expect(!result.succeeded());
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
 }
 
 // =============================================================================

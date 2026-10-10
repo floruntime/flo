@@ -49,7 +49,7 @@ fn sendRaw(ctx: *stdx.testing.TestContext, op: proto.OpCode, key: []const u8, de
 
 /// Runs `args` with the definition written to a file and appended; returns
 /// the CLI's stderr with the trailing newline trimmed. The caller frees it.
-fn sendCli(ctx: *stdx.testing.TestContext, args: []const []const u8, definition: []const u8, name: []const u8) ![]const u8 {
+fn sendCli(ctx: *stdx.testing.TestContext, args: []const []const u8, definition: []const u8, name: []const u8, exit_code: u8) ![]const u8 {
     const path = try stdx.testing.writeTempYaml(testing.allocator, definition, name);
     defer stdx.testing.cleanupTempFile(testing.allocator, path);
     var argv: [8][]const u8 = undefined;
@@ -57,7 +57,7 @@ fn sendCli(ctx: *stdx.testing.TestContext, args: []const []const u8, definition:
     argv[args.len] = path;
     var result = try ctx.cli.run(argv[0 .. args.len + 1]);
     defer result.deinit();
-    try testing.expect(result.exit_code != 0);
+    try testing.expectEqual(exit_code, result.exit_code);
     return testing.allocator.dupe(u8, std.mem.trimEnd(u8, result.stderr, "\n"));
 }
 
@@ -80,7 +80,7 @@ test "definition keys: a workflow with an unknown key is refused by name, raw an
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_workflow_message, raw.message());
 
-    const cli = try sendCli(ctx, &.{ "workflow", "create", "-f" }, bad_workflow, "typo.yaml");
+    const cli = try sendCli(ctx, &.{ "workflow", "create", "-f" }, bad_workflow, "typo.yaml", 2);
     defer testing.allocator.free(cli);
     try testing.expectEqualStrings("Error: " ++ bad_workflow_message, cli);
 
@@ -126,9 +126,9 @@ test "definition keys: a pipeline with an unknown key is refused by name, raw an
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_pipeline_message, raw.message());
 
-    const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_pipeline, "typo-job.yaml");
+    const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_pipeline, "typo-job.yaml", 3);
     defer testing.allocator.free(cli);
-    try testing.expectEqualStrings("Error: " ++ bad_pipeline_message, cli);
+    try testing.expectEqualStrings("Error: " ++ bad_pipeline_message ++ " [bad_request]", cli);
 
     const op =
         \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
@@ -163,7 +163,7 @@ test "definition keys: a filter condition the operator can't evaluate is refused
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_condition_message, raw.message());
 
-    const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_condition, "typo-filter.yaml");
+    const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_condition, "typo-filter.yaml", 3);
     defer testing.allocator.free(cli);
-    try testing.expectEqualStrings("Error: " ++ bad_condition_message, cli);
+    try testing.expectEqualStrings("Error: " ++ bad_condition_message ++ " [bad_request]", cli);
 }

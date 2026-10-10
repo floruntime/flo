@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
@@ -92,22 +93,12 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.create(&client, name) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.namespace.create(&client, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Created namespace: {s}\n", .{name});
 }
@@ -120,22 +111,12 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.delete(&client, name, force) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.namespace.delete(&client, name, force) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     ctx.print("Deleted namespace: {s}\n", .{name});
 }
@@ -150,27 +131,17 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.list(&client) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.namespace.list(&client) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     if (result.asRawData()) |data| {
         output.printWireList(ctx, data, "(no namespaces)", &.{
             .{ .field = "name", .header = "NAMESPACE", .field_type = .str_u16 },
-        });
+        }) catch return outcome.malformed(ctx, "list");
     } else {
         ctx.print("(no namespaces)\n", .{});
     }
@@ -183,28 +154,16 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo server running at {s}?\n", .{endpoint});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.info(&client, name) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var result = client_mod.namespace.info(&client, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isError()) {
-        ctx.printErr("Error: {s}\n", .{result.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, result);
 
     // Parse response: [exists: u8][name_len: u16][name: bytes]
-    const data = result.asRawData() orelse {
-        ctx.printErr("Invalid response from server\n", .{});
-        return error.CommandFailed;
-    };
+    const data = result.asRawData() orelse return outcome.malformed(ctx, "namespace info");
+    if (data.len == 0) return outcome.malformed(ctx, "namespace info");
 
     const exists = data[0] != 0;
 
@@ -213,6 +172,6 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         ctx.print("Status: exists\n", .{});
     } else {
         ctx.print("Namespace '{s}' does not exist\n", .{name});
-        return error.CommandFailed;
+        return error.NotFound;
     }
 }

@@ -13,6 +13,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const output = @import("../output.zig");
+const outcome = @import("../outcome.zig");
 
 const wf_parser = @import("../../workflow/parser.zig");
 const wf_definition = @import("../../workflow/definition.zig");
@@ -72,18 +73,21 @@ pub fn createValidateCommand(allocator: Allocator) !*commander.Command {
 fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
     if (file_path.len == 0) {
-        ctx.printErr("Error: --file is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--file is required", .{});
     }
 
-    const content = readFile(ctx, file_path) orelse return error.CommandFailed;
+    const content = readFile(ctx, file_path) orelse return error.Usage;
     defer ctx.allocator.free(content);
 
     // Phase 1: Parse (with pre-flight checks for better diagnostics)
     var diag: wf_parser.Diagnostic = .{};
     var def = wf_parser.parseWorkflow(ctx.allocator, content, &diag) catch |err| {
-        ctx.printErr("FAIL  {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
-        return error.CommandFailed;
+        if (err == error.OutOfMemory) {
+            ctx.printErr("FAIL  out of memory\n", .{});
+            return error.OutOfMemory;
+        }
+        ctx.printErr("FAIL  {s}\n", .{diag.message()});
+        return error.Usage;
     };
     defer def.deinit(ctx.allocator);
 
@@ -92,7 +96,7 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
     // Phase 2: Run the canonical server-side validator
     var validation = wf_validator.validateWorkflow(ctx.allocator, &def) catch {
         ctx.printErr("FAIL  Internal validation error\n", .{});
-        return error.CommandFailed;
+        return error.Refused;
     };
     defer validation.deinit();
 
@@ -101,12 +105,7 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
 
     // Report all validator findings with error codes
     for (validation.items()) |item| {
-        const prefix: []const u8 = if (item.severity == .@"error") "ERR  " else "WARN ";
-        if (item.location) |loc| {
-            ctx.printErr("{s} [{s}] {s} (at '{s}')\n", .{ prefix, item.code.code(), item.message, loc });
-        } else {
-            ctx.printErr("{s} [{s}] {s}\n", .{ prefix, item.code.code(), item.message });
-        }
+        reportItem(ctx, item);
         if (item.severity == .@"error") {
             errors += 1;
         } else {
@@ -118,7 +117,7 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
     ctx.print("\n", .{});
     if (errors > 0) {
         ctx.printErr("FAILED: {d} error(s), {d} warning(s)\n", .{ errors, warnings });
-        return error.CommandFailed;
+        return error.Usage;
     } else if (warnings > 0) {
         ctx.print("PASSED with {d} warning(s)\n", .{warnings});
     } else {
@@ -129,18 +128,21 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
 fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
     if (file_path.len == 0) {
-        ctx.printErr("Error: --file is required\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "--file is required", .{});
     }
 
-    const content = readFile(ctx, file_path) orelse return error.CommandFailed;
+    const content = readFile(ctx, file_path) orelse return error.Usage;
     defer ctx.allocator.free(content);
 
     // Phase 1: Parse
     var diag: proc_parser.Diagnostic = .{};
     var def = proc_parser.parseJobDefinition(ctx.allocator, content, &diag) catch |err| {
-        ctx.printErr("FAIL  {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
-        return error.CommandFailed;
+        if (err == error.OutOfMemory) {
+            ctx.printErr("FAIL  out of memory\n", .{});
+            return error.OutOfMemory;
+        }
+        ctx.printErr("FAIL  {s}\n", .{diag.message()});
+        return error.Usage;
     };
     defer def.deinit(ctx.allocator);
 
@@ -269,11 +271,20 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     ctx.print("\n", .{});
     if (errors > 0) {
         ctx.printErr("FAILED: {d} error(s), {d} warning(s)\n", .{ errors, warnings });
-        return error.CommandFailed;
+        return error.Usage;
     } else if (warnings > 0) {
         ctx.print("PASSED with {d} warning(s)\n", .{warnings});
     } else {
         ctx.print("PASSED: processing definition is valid\n", .{});
+    }
+}
+
+fn reportItem(ctx: *commander.Context, item: anytype) void {
+    const prefix: []const u8 = if (item.severity == .@"error") "ERR  " else "WARN ";
+    if (item.location) |loc| {
+        ctx.printErr("{s} [{s}] {s} (at '{s}')\n", .{ prefix, item.code.code(), item.message, loc });
+    } else {
+        ctx.printErr("{s} [{s}] {s}\n", .{ prefix, item.code.code(), item.message });
     }
 }
 

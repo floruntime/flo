@@ -268,15 +268,8 @@ test "e2e/queue: dlq list empty" {
     var result = try ctx.cli.run(&.{ "queue", "dlq", "list", "dlq-test" });
     defer result.deinit();
 
-    // Should show empty or 0 messages
-    try testing.expect(
-        result.contains("0") or
-            result.contains("empty") or
-            result.contains("[]") or
-            result.contains("No") or
-            result.stdout.len == 0 or
-            result.succeeded(),
-    );
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expect(result.stdoutContains("Dead-letter queue for: dlq-test (0 messages)\n(empty)\n"));
 }
 
 // =============================================================================
@@ -640,4 +633,31 @@ test "e2e/queue: a blocking dequeue woken by an enqueue leaves the metrics regis
     const any = std.mem.count(u8, resp.body, "queue=\"");
     try testing.expect(woken > 0);
     try testing.expectEqual(any, woken);
+}
+
+test "e2e/queue: enqueue prints the sequence number ack takes" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var first = try ctx.cli.run(&.{ "queue", "enqueue", "seq-q", "a" });
+    defer first.deinit();
+    try testing.expectEqual(@as(u8, 0), first.exit_code);
+    var second = try ctx.cli.run(&.{ "queue", "enqueue", "seq-q", "b" });
+    defer second.deinit();
+    try testing.expectEqual(@as(u8, 0), second.exit_code);
+
+    const prefix = "Enqueued: ";
+    const a = std.mem.trimEnd(u8, first.stdout, "\n");
+    const b = std.mem.trimEnd(u8, second.stdout, "\n");
+    try testing.expect(std.mem.startsWith(u8, a, prefix));
+    const seq_a = try std.fmt.parseInt(u64, a[prefix.len..], 10);
+    const seq_b = try std.fmt.parseInt(u64, b[prefix.len..], 10);
+    try testing.expect(seq_b > seq_a);
+
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "seq-q" });
+    defer deq.deinit();
+    try testing.expectEqual(@as(u8, 0), deq.exit_code);
+    var ack = try ctx.cli.run(&.{ "queue", "ack", "seq-q", a[prefix.len..] });
+    defer ack.deinit();
+    try testing.expectEqual(@as(u8, 0), ack.exit_code);
 }

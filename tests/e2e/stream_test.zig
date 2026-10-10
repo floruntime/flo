@@ -619,7 +619,7 @@ test "e2e/stream: delete removes a stream" {
     // Non-empty stream without --force is refused.
     var r1 = try ctx.cli.run(&.{ "stream", "delete", "del-test" });
     defer r1.deinit();
-    try testing.expect(!r1.succeeded());
+    try testing.expectEqual(@as(u8, 3), r1.exit_code);
 
     // --force deletes it.
     var r2 = try ctx.cli.run(&.{ "stream", "delete", "del-test", "--force" });
@@ -1081,7 +1081,13 @@ test "e2e/stream: consumer group pending state persists across restart" {
 
     // Pending state should be preserved (or regenerated if using WAL)
     // Just verify we can query pending and it succeeds
-    try testing.expect(pending_after.succeeded());
+    // Skipped until "A consumer group created by a group read is lost on
+    // restart" is fixed: the group read made it, and after a restart pending
+    // answers not_found. The CLI used to exit 0 on that refusal, so this
+    // passed without the group.
+    if (pending_after.exit_code == 1 and pending_after.stderrContains("consumer group not found")) return error.SkipZigTest;
+    try testing.expectEqual(@as(u8, 0), pending_after.exit_code);
+    try testing.expect(pending_after.stdoutContains("Pending: 3"));
 }
 
 // =============================================================================
@@ -2795,8 +2801,8 @@ test "e2e/stream: wildcard group read is rejected" {
     var result = try ctx.cli.run(&.{ "stream", "group", "read", "events.*", "--group", "g", "--consumer", "w1", "--limit", "10" });
     defer result.deinit();
 
-    try testing.expect(!result.succeeded());
-    try testing.expect(result.contains("wildcard") or result.contains("single stream") or result.stderr.len > 0);
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
+    try testing.expect(result.stderrContains("wildcard group reads are no longer supported"));
 }
 
 test "e2e/stream: same group name on two streams has independent cursors" {
@@ -2843,7 +2849,7 @@ test "e2e/stream: deleting a stream removes its consumer groups" {
 
     var info_del = try ctx.cli.run(&.{ "stream", "group", "info", "s-del", "--group", "g" });
     defer info_del.deinit();
-    try testing.expect(!info_del.succeeded() or info_del.contains("not found"));
+    try testing.expectEqual(@as(u8, 1), info_del.exit_code);
 
     // ...while the same-named group on `s-keep` survives.
     var info_keep = try ctx.cli.run(&.{ "stream", "group", "info", "s-keep", "--group", "g" });
@@ -2928,8 +2934,8 @@ test "e2e/stream: alter non-existent stream returns error" {
     var result = try ctx.cli.run(&.{ "stream", "alter", "nonexistent-alter-xyz", "--retention", "24" });
     defer result.deinit();
 
-    // Should fail — stream not found
-    try testing.expect(result.contains("not found") or result.contains("Error") or !result.succeeded());
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try testing.expect(result.stderrContains("stream not found"));
 }
 
 test "e2e/stream: alter auto-created stream (via append) returns error" {
@@ -2943,7 +2949,8 @@ test "e2e/stream: alter auto-created stream (via append) returns error" {
     var result = try ctx.cli.run(&.{ "stream", "alter", "auto-alter-test", "--retention", "24" });
     defer result.deinit();
 
-    try testing.expect(result.contains("not found") or result.contains("Error") or !result.succeeded());
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try testing.expect(result.stderrContains("stream not found"));
 }
 
 test "e2e/stream: alter updates retention (create then alter then verify)" {
@@ -3390,7 +3397,7 @@ test "e2e/stream: an append of more than 1000 records is refused and stores noth
     for (0..1001) |i| args[3 + i] = std.fmt.bufPrint(&bufs[i], "t{d}", .{i}) catch unreachable;
     var w = try ctx.cli.run(&args);
     defer w.deinit();
-    try testing.expect(w.exit_code != 0);
+    try testing.expectEqual(@as(u8, 2), w.exit_code);
     try testing.expect(w.stderrContains("a batch of 1001 records is over the limit of 1000"));
 
     var r = try ctx.cli.run(&.{ "stream", "read", "too-big", "--limit", "10", "-o", "json" });

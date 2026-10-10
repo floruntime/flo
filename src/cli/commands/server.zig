@@ -9,6 +9,7 @@ const std = @import("std");
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const server_config = @import("../../config/mod.zig").server;
 const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
@@ -326,8 +327,7 @@ fn isProcessRunning(pid: posix.pid_t) bool {
 fn runSecret(ctx: *commander.Context) commander.Error!void {
     var out: [cluster_config.SECRET_PREFIX.len + cluster_config.SECRET_HEX_LEN]u8 = undefined;
     cluster_config.newSecret(&out) catch {
-        ctx.printErr("Error: no randomness available for a secret\n", .{});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "no randomness available for a secret", .{});
     };
     defer std.crypto.secureZero(u8, &out);
     ctx.print("{s}\n", .{&out});
@@ -342,13 +342,11 @@ fn resolveSecret(ctx: *commander.Context, config: *server_config.ServerConfig) c
     const env_secret: ?[]const u8 = if (@import("stdx").io.getenv("FLO_CLUSTER_SECRET")) |s| (if (s.len > 0) s else null) else null;
     const sources = @as(u8, @intFromBool(config.cluster.secret != null)) + @intFromBool(config.cluster.secret_file != null) + @intFromBool(env_secret != null);
     if (sources > 1) {
-        ctx.printErr("Error: the cluster secret is set more than once ([cluster] secret, [cluster] secret_file, FLO_CLUSTER_SECRET); keep one\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "the cluster secret is set more than once ([cluster] secret, [cluster] secret_file, FLO_CLUSTER_SECRET); keep one", .{});
     }
     if (config.cluster.secret_file) |path| {
         const s = cluster_config.readSecretFile(allocator, path) catch {
-            ctx.printErr("Error: [cluster] secret_file {s} could not be used (see the log line above)\n", .{path});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "[cluster] secret_file {s} could not be used (see the log line above)", .{path});
         };
         defer {
             std.crypto.secureZero(u8, s);
@@ -408,7 +406,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
             error.InvalidShardCount, error.InvalidPartitionCount, error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
             else => ctx.printErr("Error loading configuration: {}\n", .{err}),
         }
-        return error.CommandFailed;
+        return error.Usage;
     };
     defer config.deinit();
 
@@ -445,14 +443,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
             while (iter.next()) |addr| {
                 const trimmed = std.mem.trim(u8, addr, " \t");
                 if (trimmed.len > 0) {
-                    const owned = allocator.dupe(u8, trimmed) catch {
-                        ctx.printErr("Error parsing --join addresses\n", .{});
-                        return error.CommandFailed;
-                    };
-                    join_seeds_list.append(allocator, owned) catch {
-                        ctx.printErr("Error parsing --join addresses\n", .{});
-                        return error.CommandFailed;
-                    };
+                    try join_seeds_list.append(allocator, try allocator.dupe(u8, trimmed));
                 }
             }
             // Replace config seeds with CLI seeds
@@ -480,8 +471,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 
     // Expand ~ in data_dir path
     const expanded_data_dir = expandTilde(allocator, config.data_dir) catch |err| {
-        ctx.printErr("Error expanding data directory path: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     };
     defer allocator.free(expanded_data_dir);
 
@@ -542,8 +532,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // Ensure data directory exists
     @import("stdx").fs.makePath(expanded_data_dir) catch |err| {
         if (err != error.PathAlreadyExists) {
-            ctx.printErr("Error creating data directory '{s}': {}\n", .{ expanded_data_dir, err });
-            return error.CommandFailed;
+            return outcome.localRefusal(ctx, "cannot create data directory '{s}': {}", .{ expanded_data_dir, err });
         }
     };
 
@@ -559,15 +548,13 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     setupSignalHandlers();
 
     var runtime = Runtime.init(allocator, runtime_config) catch |err| {
-        ctx.printErr("Error initializing runtime: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot initialize runtime: {}", .{err});
     };
     defer runtime.deinit();
 
     // Start the runtime
     runtime.start() catch |err| {
-        ctx.printErr("Error starting runtime: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot start runtime: {}", .{err});
     };
 
     ctx.print("\n", .{});
@@ -604,24 +591,20 @@ fn offlineConfig(ctx: *commander.Context) commander.Error!server_config.ServerCo
             error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},
             else => ctx.printErr("Error loading configuration: {}\n", .{err}),
         }
-        return error.CommandFailed;
+        return error.Usage;
     };
 }
 
 /// Lock the data dir and read its cluster group, printing what it holds.
 fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.File) commander.Error!offline.Summary {
-    lock.* = runtime_mod.lockExistingDataDir(data_dir) catch |err| {
-        switch (err) {
-            error.DataDirMissing => ctx.printErr("Error: data directory {s} does not exist\n", .{data_dir}),
-            error.DataDirInUse => ctx.printErr("Error: data directory {s} is in use by a running flo server; stop it first\n", .{data_dir}),
-            else => ctx.printErr("Error: cannot lock data directory {s}: {}\n", .{ data_dir, err }),
-        }
-        return error.CommandFailed;
+    lock.* = runtime_mod.lockExistingDataDir(data_dir) catch |err| return switch (err) {
+        error.DataDirMissing => outcome.usage(ctx, "data directory {s} does not exist", .{data_dir}),
+        error.DataDirInUse => outcome.localRefusal(ctx, "data directory {s} is in use by a running flo server; stop it first", .{data_dir}),
+        else => outcome.localRefusal(ctx, "cannot lock data directory {s}: {}", .{ data_dir, err }),
     };
     const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
         stdx.fs.closeFile(lock.*);
-        ctx.printErr("Error: cannot read the cluster group in {s}: {}\n", .{ data_dir, err });
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
     };
     ctx.print("data dir:    {s} (cluster group)\n", .{data_dir});
     if (sum.hard_state) |hs| {
@@ -649,7 +632,8 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
 fn runInspect(ctx: *commander.Context) commander.Error!void {
     var config = try offlineConfig(ctx);
     defer config.deinit();
-    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch return error.CommandFailed;
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     defer ctx.allocator.free(data_dir);
     var lock: stdx.fs.File = undefined;
     var sum = try openOffline(ctx, data_dir, &lock);
@@ -662,10 +646,10 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     defer config.deinit();
     try resolveSecret(ctx, &config);
     const secret = config.cluster.secret orelse {
-        ctx.printErr("Error: force-members retires this node's cluster secret, and none is set; set it as the server does ([cluster] secret, secret_file or FLO_CLUSTER_SECRET)\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "force-members retires this node's cluster secret, and none is set; set it as the server does ([cluster] secret, secret_file or FLO_CLUSTER_SECRET)", .{});
     };
-    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch return error.CommandFailed;
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     defer ctx.allocator.free(data_dir);
     var lock: stdx.fs.File = undefined;
     var sum = try openOffline(ctx, data_dir, &lock);
@@ -673,16 +657,13 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     defer sum.deinit(ctx.allocator);
 
     if (sum.last_index == 0) {
-        ctx.printErr("Error: this node has no log; there is nothing to recover from. Run force-members on a node that has one (see inspect)\n", .{});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "this node has no log; there is nothing to recover from. Run force-members on a node that has one (see inspect)", .{});
     }
     const hs = sum.hard_state orelse {
-        ctx.printErr("Error: this node has a log but no hard state, so its node id is not on disk and force-members cannot name it. Start it once with --join and --node-id set to its id from the member list above (it writes its hard state and waits guarded), stop it, then run force-members again\n", .{});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "this node has a log but no hard state, so its node id is not on disk and force-members cannot name it. Start it once with --join and --node-id set to its id from the member list above (it writes its hard state and waits guarded), stop it, then run force-members again", .{});
     };
     if (sum.truncation_pending) {
-        ctx.printErr("Error: a log truncation is pending; start and stop the server once to finish it, then run force-members again\n", .{});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "a log truncation is pending; start and stop the server once to finish it, then run force-members again", .{});
     }
     if (!ctx.getBool("yes")) {
         if (hs.lost_log) ctx.print("\nWarning: this node's lost-log guard never finished; its log may be behind what the group committed. Prefer a survivor whose guard is off.\n", .{});
@@ -692,12 +673,10 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     // Retired first: a crash after the member list is written must not
     // leave the old secret usable.
     offline.retire(ctx.allocator, data_dir, secret, @intCast(@divFloor(@max(0, stdx.time.milliTimestamp()), 1000))) catch |err| {
-        ctx.printErr("Error: cannot record the retired secret in {s}: {}\n", .{ data_dir, err });
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot record the retired secret in {s}: {}", .{ data_dir, err });
     };
     offline.forceMembers(ctx.allocator, data_dir, &sum) catch |err| {
-        ctx.printErr("Error: cannot write the member list: {}. This node's secret is already retired and its members are unchanged, which fails safe: fix the cause and run force-members again\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot write the member list: {}. This node's secret is already retired and its members are unchanged, which fails safe: fix the cause and run force-members again", .{err});
     };
     ctx.print("\nNode {d} is now the only voter (member list at index {d}).\n", .{ hs.node_id, sum.last_index + 1 });
     ctx.print("Restart it with a new [cluster] secret (flo server secret); with it the nodes left out cannot link.\n", .{});
@@ -717,19 +696,16 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
     const data_dir_raw = getDataDir(ctx);
 
     const data_dir = expandTilde(allocator, data_dir_raw) catch |err| {
-        ctx.printErr("Error expanding data directory path: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     };
     defer allocator.free(data_dir);
 
     const pid = readPidFile(allocator, data_dir) catch |err| {
-        ctx.printErr("Error reading PID file: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot read PID file: {}", .{err});
     };
 
     if (pid == null) {
-        ctx.printErr("No server running (PID file not found in {s})\n", .{data_dir});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "no server running (PID file not found in {s})", .{data_dir});
     }
 
     const server_pid = pid.?;
@@ -746,8 +722,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
     ctx.print("Sending {s} to server (PID {d})...\n", .{ sig_name, server_pid });
 
     _ = posix.kill(server_pid, sig) catch |err| {
-        ctx.printErr("Failed to send signal: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot send signal: {}", .{err});
     };
 
     if (!force) {
@@ -761,8 +736,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
                 return;
             }
         }
-        ctx.printErr("Server did not stop within 30 seconds. Use --force to kill immediately.\n", .{});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "server did not stop within 30 seconds. Use --force to kill immediately.", .{});
     } else {
         ctx.print("Server killed.\n", .{});
     }
@@ -773,14 +747,12 @@ fn runServerStatus(ctx: *commander.Context) commander.Error!void {
     const data_dir_raw = getDataDir(ctx);
 
     const data_dir = expandTilde(allocator, data_dir_raw) catch |err| {
-        ctx.printErr("Error expanding data directory path: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     };
     defer allocator.free(data_dir);
 
     const pid = readPidFile(allocator, data_dir) catch |err| {
-        ctx.printErr("Error reading PID file: {}\n", .{err});
-        return error.CommandFailed;
+        return outcome.localRefusal(ctx, "cannot read PID file: {}", .{err});
     };
 
     // Header
@@ -855,26 +827,24 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
 
     // Make HTTP request to /metrics endpoint
     const address = @import("stdx").net.Address.parseIp4(resolved_host, port) catch {
-        ctx.printErr("Error: Invalid address: {s}\n", .{resolved_host});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "invalid address: {s}", .{resolved_host});
     };
 
     const stream = @import("stdx").net.tcpConnectToAddress(address) catch |err| {
         ctx.printErr("Connection failed: {}\n", .{err});
         ctx.printErr("Is the Flo metrics server running at {s}:{d}?\n", .{ resolved_host, port });
-        return error.CommandFailed;
+        return error.Transport;
     };
     defer stream.close();
 
     // Send HTTP GET request
     var request_buf: [256]u8 = undefined;
     const request = std.fmt.bufPrint(&request_buf, "GET /metrics HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{resolved_host}) catch {
-        ctx.printErr("Error: Request buffer too small\n", .{});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "host name too long for the request: {s}", .{resolved_host});
     };
     _ = stream.write(request) catch |err| {
         ctx.printErr("Write failed: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Transport;
     };
 
     // Read response
@@ -883,7 +853,7 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     while (true) {
         const n = stream.read(buf[total..]) catch |err| {
             ctx.printErr("Read failed: {}\n", .{err});
-            return error.CommandFailed;
+            return error.Transport;
         };
         if (n == 0) break;
         total += n;

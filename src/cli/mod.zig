@@ -14,6 +14,7 @@ pub const toml = @import("toml.zig");
 
 // Client config for context management
 const cli_config = @import("config.zig");
+const outcome = @import("outcome.zig");
 // Server config for flo.toml generation
 const server_config = @import("../config/server.zig");
 
@@ -44,7 +45,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const workflow = try commands.createWorkflowCommand(allocator);
     const processing = try commands.createProcessingCommand(allocator);
     const ts = try commands.createTsCommand(allocator);
-    const auth = try commands.createAuthCommand(allocator);
     const validate = try commands.createValidateCommand(allocator);
 
     var root = try commander.newBuilder(allocator)
@@ -65,6 +65,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             .{
                 .title = "Configuration",
                 .content = "Server config: ./flo.toml\nClient config: ~/.flo/config.json",
+            },
+            .{
+                .title = "Exit codes",
+                .content =
+                \\0  ok
+                \\1  not found: something named is absent
+                \\2  usage: a flag, an argument, or a file or stdin to read
+                \\3  refused by the server (bad request, conflict, unauthorized, a server bug)
+                \\4  retryable: the server is overloaded or has no leader; try again
+                \\5  transport failure, timeout, version mismatch, a cut-off answer, or the CLI out of memory
+                ,
             },
         })
         .flag("verbose", .{ .short = 'v', .desc = "Enable verbose output", .persistent = true })
@@ -95,9 +106,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         // Admin Commands (pre-built)
         .addCommand(namespace)
-
-        // Auth Commands (pre-built)
-        .addCommand(auth)
 
         // Validation (offline)
         .addCommand(validate)
@@ -159,21 +167,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const argv = args;
 
     // Execute
-    root.executeSlice(argv) catch |err| {
-        switch (err) {
-            error.HelpRequested, error.VersionRequested => {},
-            error.CommandFailed => {
-                // Command already printed its own error message, just exit
-                std.process.exit(1);
-            },
-            else => {
-                var stderr_buf: [512]u8 = undefined;
-                const msg = std.fmt.bufPrint(&stderr_buf, "Error: {}\n", .{err}) catch "Error\n";
-                _ = @import("stdx").io.writeFd(std.posix.STDERR_FILENO, msg);
-                std.process.exit(1);
-            },
-        }
+    const result = root.executeSlice(argv);
+    result catch |err| switch (err) {
+        // Each of these already said why.
+        error.HelpRequested, error.VersionRequested => {},
+        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Transport => {},
+        // The commander names the word or flag it couldn't use.
+        error.UnknownCommand, error.UnknownFlag, error.MissingFlagValue, error.InvalidFlagValue => {},
+        error.MissingRequiredFlag, error.MissingRequiredArg, error.TooManyArgs => {},
+        else => {
+            var stderr_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&stderr_buf, "Error: {s}\n", .{@errorName(err)}) catch "Error\n";
+            _ = @import("stdx").io.writeFd(std.posix.STDERR_FILENO, msg);
+        },
     };
+    const code = outcome.exitCode(result);
+    if (code != 0) std.process.exit(code);
 }
 
 // ==================== Command Handlers ====================
@@ -181,7 +190,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn configShow(ctx: *commander.Context) commander.Error!void {
     var cfg = cli_config.Config.load(ctx.allocator) catch |err| {
         ctx.printErr("Error loading config: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Usage;
     };
     defer cfg.deinit();
 
@@ -205,36 +214,36 @@ fn configSetContext(ctx: *commander.Context) commander.Error!void {
     if (ctx.args.len < 1) {
         ctx.printErr("Error: missing context name\n", .{});
         ctx.printErr("Usage: flo config set-context <name> --endpoint <host:port>\n", .{});
-        return error.InvalidArgs;
+        return error.Usage;
     }
 
     const name = ctx.args[0];
     const endpoint = ctx.getString("endpoint") orelse {
         ctx.printErr("Error: --endpoint is required\n", .{});
         ctx.printErr("Usage: flo config set-context <name> --endpoint <host:port>\n", .{});
-        return error.InvalidArgs;
+        return error.Usage;
     };
 
     if (endpoint.len == 0) {
         ctx.printErr("Error: --endpoint is required\n", .{});
         ctx.printErr("Usage: flo config set-context <name> --endpoint <host:port>\n", .{});
-        return error.InvalidArgs;
+        return error.Usage;
     }
 
     var cfg = cli_config.Config.load(ctx.allocator) catch |err| {
         ctx.printErr("Error loading config: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Usage;
     };
     defer cfg.deinit();
 
     cfg.setContext(name, endpoint, null) catch |err| {
         ctx.printErr("Error setting context: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
 
     cfg.save() catch |err| {
         ctx.printErr("Error saving config: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
 
     ctx.print("Context '{s}' created with endpoint {s}\n", .{ name, endpoint });
@@ -244,14 +253,14 @@ fn configUseContext(ctx: *commander.Context) commander.Error!void {
     if (ctx.args.len < 1) {
         ctx.printErr("Error: missing context name\n", .{});
         ctx.printErr("Usage: flo config use-context <name>\n", .{});
-        return error.InvalidArgs;
+        return error.Usage;
     }
 
     const name = ctx.args[0];
 
     var cfg = cli_config.Config.load(ctx.allocator) catch |err| {
         ctx.printErr("Error loading config: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Usage;
     };
     defer cfg.deinit();
 
@@ -259,15 +268,15 @@ fn configUseContext(ctx: *commander.Context) commander.Error!void {
         if (err == error.ContextNotFound) {
             ctx.printErr("Error: Context '{s}' not found\n", .{name});
             ctx.printErr("Use 'flo config show' to see available contexts\n", .{});
-            return error.CommandFailed;
+            return error.NotFound;
         }
         ctx.printErr("Error switching context: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
 
     cfg.save() catch |err| {
         ctx.printErr("Error saving config: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
 
     ctx.print("Switched to context '{s}'\n", .{name});
@@ -280,16 +289,16 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
     const file = @import("stdx").fs.createFile("flo.toml", .{ .exclusive = true }) catch |err| {
         if (err == error.PathAlreadyExists) {
             ctx.printErr("Error: flo.toml already exists\n", .{});
-            return error.CommandFailed;
+            return error.Refused;
         }
         ctx.printErr("Error creating flo.toml: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
     defer @import("stdx").fs.closeFile(file);
 
     @import("stdx").fs.writeAll(file, default_config) catch |err| {
         ctx.printErr("Error writing flo.toml: {}\n", .{err});
-        return error.CommandFailed;
+        return error.Refused;
     };
 
     ctx.print("Created flo.toml with default configuration\n", .{});

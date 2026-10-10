@@ -539,8 +539,8 @@ test "builder pattern" {
                 const ptr: *bool = @ptrCast(@alignCast(ctx.user_data.?));
                 ptr.* = true;
                 // Verify flags are as expected - use simple condition checks
-                if (ctx.getBool("verbose")) return error.CommandFailed;
-                if ((ctx.getInt("port") orelse 0) != 8080) return error.CommandFailed;
+                if (ctx.getBool("verbose")) return error.Refused;
+                if ((ctx.getInt("port") orelse 0) != 8080) return error.Refused;
             }
         }.run))
         .build();

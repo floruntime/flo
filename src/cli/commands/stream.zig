@@ -22,6 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const wire = @import("../../util/wire.zig");
@@ -85,7 +86,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("start", 's', "0-0", "Read records after this StreamID (exclusive; timestamp-sequence, 0-0=beginning, $=latest)")
                 .stringFlag("end", 'e', "", "Ending StreamID (timestamp-sequence, inclusive)")
                 .uintFlag("limit", 'l', 10, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
-                .boolFlag("follow", 'f', "Follow mode - continuously tail for new records (like tail -f)")
+                .boolFlag("follow", 'f', "Keep reading new records (like tail -f); Ctrl-C ends it (exit 0), a retryable answer exits 4")
                 .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait). Single read unlike --follow.")
                 .uintFlag("partition", 'P', 0, "Partition to read from (default: 0)")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing (reads from same partition as append)")
@@ -312,6 +313,12 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
         .build();
 }
 
+/// A client call that failed with `error.ServerError`: the client kept the
+/// refusal's message and status.
+fn serverRefused(ctx: *commander.Context, client: *Client) commander.Error {
+    return outcome.refusal(ctx, client.server_error_status, client.serverError(), "", .{});
+}
+
 fn runAppend(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
     const payloads = ctx.getVariadicArgs("payloads") orelse &[_][]const u8{};
@@ -321,8 +328,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         return error.MissingRequiredArg;
     }
     if (payloads.len > MAX_BATCH_RECORDS) {
-        ctx.printErr("Error: a batch of {d} records is over the limit of {d}\n", .{ payloads.len, MAX_BATCH_RECORDS });
-        return error.CommandFailed;
+        return outcome.usage(ctx, "a batch of {d} records is over the limit of {d}", .{ payloads.len, MAX_BATCH_RECORDS });
     }
 
     const namespace = cli_config.getNamespace(ctx);
@@ -344,8 +350,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
                 if (trimmed.len == 0) continue;
                 if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
                     if (header_count >= 64) {
-                        ctx.printErr("Error: too many headers (max 64)\n", .{});
-                        return error.CommandFailed;
+                        return outcome.usage(ctx, "too many headers (max 64)", .{});
                     }
                     parsed_headers[header_count] = .{
                         .key = trimmed[0..eq],
@@ -353,8 +358,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
                     };
                     header_count += 1;
                 } else {
-                    ctx.printErr("Error: invalid header format '{s}', expected key=value\n", .{trimmed});
-                    return error.CommandFailed;
+                    return outcome.usage(ctx, "invalid header format '{s}', expected key=value", .{trimmed});
                 }
             }
         }
@@ -374,10 +378,7 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     const result = client_mod.stream.appendEx(
         &client,
@@ -388,12 +389,8 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
         partition_key,
         if (partition_opt) |p| @intCast(p) else null,
     ) catch |err| {
-        if (err == error.ServerError) {
-            ctx.printErr("Error: {s}\n", .{client.serverError()});
-        } else {
-            ctx.printErr("Request failed: {}\n", .{err});
-        }
-        return error.CommandFailed;
+        if (err == error.ServerError) return serverRefused(ctx, &client);
+        return outcome.requestFailed(ctx, err);
     };
 
     // Construct StreamID from the append response
@@ -436,26 +433,21 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
 
     // Parse StreamID from start string
     var current_start = StreamID.parse(start_str) catch {
-        ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{start_str});
-        return error.CommandFailed;
+        return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{start_str});
     };
 
     // Parse optional end StreamID
     const end_id: ?StreamID = if (end_str) |es| blk: {
         if (es.len == 0) break :blk null;
         break :blk StreamID.parse(es) catch {
-            ctx.printErr("Error: Invalid end StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{es});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "Invalid end StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{es});
         };
     } else null;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Follow mode: continuous blocking reads with auto-advancing start position.
     // --follow implies --block 5000 (5 second polling interval).
@@ -463,23 +455,24 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     // Neither: single non-blocking read.
     const block_ms: ?u32 = if (follow) 5000 else if (block) |b| @intCast(b) else null;
 
-    // For --follow mode, loop continuously; otherwise single read.
+    // For --follow mode, loop continuously until Ctrl-C; otherwise single read.
+    if (follow) outcome.endOnInterrupt();
     var first_batch = true;
     while (true) {
         const start_mode: client_mod.stream.StartMode = if (current_start.eql(StreamID.MAX)) .tail else .stream_id;
 
         var response = client_mod.stream.read(&client, namespace, stream, start_mode, current_start, end_id, @intCast(limit), block_ms, if (read_partition) |rp| @intCast(rp) else null, partition_key) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return error.CommandFailed;
+            if (follow and outcome.interrupted()) return;
+            return outcome.requestFailed(ctx, err);
         };
         defer response.deinit();
 
-        if (response.isError()) {
-            ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-            return error.CommandFailed;
-        }
+        try outcome.check(ctx, response);
 
-        const result = parseAndPrintRecords(ctx, &response, json_output, first_batch, follow);
+        _ = parseAndPrintRecords(null, &response, json_output, first_batch, follow) catch
+            return outcome.malformed(ctx, "stream records");
+        const result = parseAndPrintRecords(ctx, &response, json_output, first_batch, follow) catch
+            return outcome.malformed(ctx, "stream records");
         first_batch = false;
 
         if (result.last_id) |last_id| {
@@ -487,12 +480,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
             current_start = last_id;
         }
 
-        // If not in follow mode, we're done after one read
-        if (!follow) break;
-    }
-
-    if (json_output and !follow) {
-        // JSON array was already closed by parseAndPrintRecords for non-follow
+        if (!follow or outcome.interrupted()) break;
     }
 }
 
@@ -503,15 +491,24 @@ const ParseResult = struct {
 };
 
 /// Parse response wire format and print records. Returns the last StreamID seen.
+/// With no `out`, it only checks the answer: the caller checks first and
+/// then prints, so a cut answer prints no partial records.
 fn parseAndPrintRecords(
-    ctx: *commander.Context,
+    out: ?*commander.Context,
     response: *client_mod.Response,
     json_output: bool,
     first_batch: bool,
     is_follow: bool,
-) ParseResult {
+) error{Truncated}!ParseResult {
+    const ctx: struct {
+        c: ?*commander.Context,
+        fn print(self: @This(), comptime fmt: []const u8, args: anytype) void {
+            if (self.c) |c| c.print(fmt, args);
+        }
+    } = .{ .c = out };
     _ = first_batch;
-    if (response.data.len < 4) {
+    // An empty answer is no records; anything shorter than a count is cut.
+    if (response.data.len == 0) {
         if (!is_follow) {
             if (json_output) {
                 ctx.print("[]\n", .{});
@@ -523,16 +520,7 @@ fn parseAndPrintRecords(
     }
 
     var reader = wire.WireReader.init(response.data);
-    const count = reader.readU32() orelse {
-        if (!is_follow) {
-            if (json_output) {
-                ctx.print("[]\n", .{});
-            } else {
-                ctx.print("No records\n", .{});
-            }
-        }
-        return .{ .count = 0, .last_id = null };
-    };
+    const count = reader.readU32() orelse return error.Truncated;
 
     if (count == 0) {
         if (!is_follow) {
@@ -552,17 +540,17 @@ fn parseAndPrintRecords(
     var last_id: ?StreamID = null;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const msg_sequence = reader.readU64() orelse break;
-        const timestamp_ms = reader.readI64() orelse break;
-        const tier = reader.readU8() orelse break;
-        _ = reader.readU32() orelse break; // partition
-        const key_present = reader.readU8() orelse break;
+        const msg_sequence = reader.readU64() orelse return error.Truncated;
+        const timestamp_ms = reader.readI64() orelse return error.Truncated;
+        const tier = reader.readU8() orelse return error.Truncated;
+        _ = reader.readU32() orelse return error.Truncated; // partition
+        const key_present = reader.readU8() orelse return error.Truncated;
         if (key_present != 0) {
             // Skip key if present
-            _ = reader.readLengthPrefixed(u32) orelse break;
+            _ = reader.readLengthPrefixed(u32) orelse return error.Truncated;
         }
-        const payload = reader.readLengthPrefixed(u32) orelse break;
-        const header_count = reader.readU32() orelse break;
+        const payload = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+        const header_count = reader.readU32() orelse return error.Truncated;
 
         // Read headers into stack-allocated buffers
         var hdr_keys: [64][]const u8 = undefined;
@@ -570,8 +558,8 @@ fn parseAndPrintRecords(
         const hdr_n = @min(header_count, 64);
         var h: u32 = 0;
         while (h < header_count) : (h += 1) {
-            const hk = reader.readLengthPrefixed(u32) orelse break;
-            const hv = reader.readLengthPrefixed(u32) orelse break;
+            const hk = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+            const hv = reader.readLengthPrefixed(u32) orelse return error.Truncated;
             if (h < 64) {
                 hdr_keys[h] = hk;
                 hdr_vals[h] = hv;
@@ -638,23 +626,14 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Convert retention hours to seconds for retention_age, or null
     const retention_age: ?u64 = if (retention) |r| r * 3600 else null;
-    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), ctx.getUint64("retention-count"), retention_age) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.create(&client, namespace, stream, @intCast(partitions), ctx.getUint64("retention-count"), retention_age) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"name\":\"{s}\",\"partitions\":{d},\"status\":\"created\"}}\n", .{ stream, partitions });
@@ -677,21 +656,12 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.alter(&client, namespace, stream, ctx.getUint64("retention-count"), retention_age) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.alter(&client, namespace, stream, ctx.getUint64("retention-count"), retention_age) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"name\":\"{s}\",\"status\":\"altered\"}}\n", .{stream});
@@ -711,21 +681,12 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.delete(&client, namespace, stream, force) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.delete(&client, namespace, stream, force) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"name\":\"{s}\",\"status\":\"deleted\"}}\n", .{stream});
@@ -744,48 +705,27 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // info(client, namespace, stream)
-    var response = client_mod.stream.info(&client, namespace, stream) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.info(&client, namespace, stream) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     // Parse wire format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32][retention_age_s:u64][retention_count:u64][retention_bytes:u64]
-    var first_ts: u64 = 0;
-    var first_seq: u64 = 0;
-    var last_ts: u64 = 0;
-    var last_seq: u64 = 0;
-    var msg_count: u64 = 0;
-    var bytes: u64 = 0;
-    var partitions: u32 = 1;
-    var retention_age_s: u64 = 0;
-    var retention_count: u64 = 0;
-    var retention_bytes: u64 = 0;
-
-    if (response.data.len >= 52) {
-        var reader = wire.WireReader.init(response.data);
-        first_ts = reader.readU64() orelse 0;
-        first_seq = reader.readU64() orelse 0;
-        last_ts = reader.readU64() orelse 0;
-        last_seq = reader.readU64() orelse 0;
-        msg_count = reader.readU64() orelse 0;
-        bytes = reader.readU64() orelse 0;
-        partitions = reader.readU32() orelse 1;
-        retention_age_s = reader.readU64() orelse 0;
-        retention_count = reader.readU64() orelse 0;
-        retention_bytes = reader.readU64() orelse 0;
-    }
+    var reader = wire.WireReader.init(response.data);
+    const what = "stream info";
+    const first_ts = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const first_seq = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const last_ts = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const last_seq = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const msg_count = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const bytes = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const partitions = reader.readU32() orelse return outcome.malformed(ctx, what);
+    const retention_age_s = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const retention_count = reader.readU64() orelse return outcome.malformed(ctx, what);
+    const retention_bytes = reader.readU64() orelse return outcome.malformed(ctx, what);
 
     // Reconstruct full StreamIDs with timestamp + sequence
     const first_id = StreamID{ .timestamp_ms = first_ts, .sequence = first_seq };
@@ -846,10 +786,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Accumulate raw row bytes from paginated wire responses.
     // Server sends: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]?
@@ -871,57 +808,51 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     defer if (cursor_owned) |c| ctx.allocator.free(c);
 
     while (entry_count < limit) {
-        var response = client_mod.stream.list(&client, namespace, @intCast(limit), cursor) catch |err| {
-            ctx.printErr("Request failed: {}\n", .{err});
-            return error.CommandFailed;
-        };
+        var response = client_mod.stream.list(&client, namespace, @intCast(limit), cursor) catch |err| return outcome.requestFailed(ctx, err);
         defer response.deinit();
 
-        if (response.isError()) {
-            ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-            return error.CommandFailed;
-        }
+        try outcome.check(ctx, response);
 
-        if (response.data.len < 4) break;
+        if (response.data.len == 0) break;
 
         var reader = wire.WireReader.init(response.data);
-        const count = reader.readU32() orelse break;
+        const count = reader.readU32() orelse return outcome.malformed(ctx, "stream list");
 
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             // Mark row start to capture raw bytes
             const row_start = reader.pos;
 
-            const name_len = reader.readU32() orelse break;
-            const name = reader.readSlice(name_len) orelse break;
-            _ = reader.readU32() orelse break; // partition_count
+            const name_len = reader.readU32() orelse return outcome.malformed(ctx, "stream list");
+            const name = reader.readSlice(name_len) orelse return outcome.malformed(ctx, "stream list");
+            _ = reader.readU32() orelse return outcome.malformed(ctx, "stream list"); // partition_count
 
             const row_end = reader.pos;
 
             // Dedup by name
             if (seen.get(name) != null) continue;
-            const name_copy = ctx.allocator.dupe(u8, name) catch break;
-            seen.put(ctx.allocator, name_copy, {}) catch {
+            const name_copy = try ctx.allocator.dupe(u8, name);
+            seen.put(ctx.allocator, name_copy, {}) catch |err| {
                 ctx.allocator.free(name_copy);
-                break;
+                return err;
             };
 
             // Copy raw row bytes
-            row_bytes.appendSlice(ctx.allocator, response.data[row_start..row_end]) catch break;
+            try row_bytes.appendSlice(ctx.allocator, response.data[row_start..row_end]);
             entry_count += 1;
             if (entry_count >= limit) break;
         }
 
-        const has_more = (reader.readU8() orelse 0) != 0;
-        const cursor_len = reader.readU16() orelse 0;
-        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) else null;
+        const has_more = (reader.readU8() orelse return outcome.malformed(ctx, "stream list")) != 0;
+        const cursor_len = reader.readU16() orelse return outcome.malformed(ctx, "stream list");
+        const next_cursor = if (cursor_len > 0) reader.readSlice(cursor_len) orelse return outcome.malformed(ctx, "stream list") else null;
 
         if (cursor_owned) |c| ctx.allocator.free(c);
         cursor_owned = null;
 
         if (!has_more or next_cursor == null) break;
 
-        cursor_owned = ctx.allocator.dupe(u8, next_cursor.?) catch break;
+        cursor_owned = try ctx.allocator.dupe(u8, next_cursor.?);
         cursor = cursor_owned;
     }
 
@@ -936,7 +867,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     }
 
     // Build final wire buffer: [count:u32][accumulated_raw_rows]
-    const buf = ctx.allocator.alloc(u8, 4 + row_bytes.items.len) catch return;
+    const buf = try ctx.allocator.alloc(u8, 4 + row_bytes.items.len);
     defer ctx.allocator.free(buf);
 
     std.mem.writeInt(u32, buf[0..4], entry_count, .little);
@@ -945,7 +876,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     output.printWireList(ctx, buf, "No streams found", &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u32 },
         .{ .field = "partitions", .header = "PARTITIONS", .field_type = .uint_u32, .alignment = .right },
-    });
+    }) catch return outcome.malformed(ctx, "list");
 }
 
 fn runTrim(ctx: *commander.Context) commander.Error!void {
@@ -964,41 +895,27 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     if (before_str) |bs| {
         if (bs.len > 0) {
             const before_id = StreamID.parse(bs) catch {
-                ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{bs});
-                return error.CommandFailed;
+                return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{bs});
             };
             min_id = before_id;
         }
     }
 
     if (maxlen == null and min_id == null and maxage == null) {
-        ctx.printErr("Error: Specify one of --before, --maxlen or --maxage\n", .{});
-        return;
+        return outcome.usage(ctx, "Specify one of --before, --maxlen or --maxage", .{});
     }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_id, maxage, dry_run) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return;
-    };
+    var response = client_mod.stream.trim(&client, namespace, stream, maxlen, min_id, maxage, dry_run) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
-    const t = client_mod.stream.parseTrimmed(response) orelse {
-        ctx.printErr("Error: malformed trim response\n", .{});
-        return error.CommandFailed;
-    };
+    const t = client_mod.stream.parseTrimmed(response) orelse return outcome.malformed(ctx, "trim response");
     if (json_output) {
         ctx.print("{{\"status\":\"{s}\",\"trimmed\":{d},\"first_seq\":{d}}}\n", .{ if (dry_run) "dry_run" else "ok", t.removed, t.first_seq });
     } else if (dry_run) {
@@ -1019,22 +936,13 @@ fn runGroupJoin(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // groupJoin(client, namespace, stream, group, consumer)
-    var response = client_mod.stream.groupJoin(&client, namespace, stream, group, consumer) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupJoin(&client, namespace, stream, group, consumer) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     ctx.print("Joined group '{s}' as consumer '{s}'\n", .{ group, consumer });
 }
@@ -1062,10 +970,7 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     var response = client_mod.stream.groupRead(
         &client,
@@ -1075,19 +980,14 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         consumer,
         @intCast(limit),
         if (block) |b| @intCast(b) else null,
-    ) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    ) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
-    // Parse response data - wire format similar to stream read
-    if (response.data.len < 4) {
+    // Parse response data - wire format similar to stream read. Empty is no
+    // messages; anything shorter than a count is cut.
+    if (response.data.len == 0) {
         if (json_output) {
             ctx.print("[]\n", .{});
         } else {
@@ -1096,15 +996,21 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         return;
     }
 
-    var reader = wire.WireReader.init(response.data);
-    const msg_count = reader.readU32() orelse {
-        if (json_output) {
-            ctx.print("[]\n", .{});
-        } else {
-            ctx.print("(no messages)\n", .{});
+    // Checked whole first, then printed, so a cut answer prints nothing.
+    printGroupRecords(null, response.data, stream, json_output) catch return outcome.malformed(ctx, "group records");
+    printGroupRecords(ctx, response.data, stream, json_output) catch return outcome.malformed(ctx, "group records");
+}
+
+/// Prints a group read's records; with no `out`, only checks them.
+fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const u8, json_output: bool) error{Truncated}!void {
+    const ctx: struct {
+        c: ?*commander.Context,
+        fn print(self: @This(), comptime fmt: []const u8, args: anytype) void {
+            if (self.c) |c| c.print(fmt, args);
         }
-        return;
-    };
+    } = .{ .c = out };
+    var reader = wire.WireReader.init(data);
+    const msg_count = reader.readU32() orelse return error.Truncated;
 
     if (msg_count == 0) {
         if (json_output) {
@@ -1121,18 +1027,18 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
 
     var i: u32 = 0;
     while (i < msg_count) : (i += 1) {
-        const msg_sequence = reader.readU64() orelse break;
-        const timestamp_ms = reader.readI64() orelse break;
-        _ = reader.readU8() orelse break; // tier
-        _ = reader.readU32() orelse break; // partition
-        const key_present = reader.readU8() orelse break;
+        const msg_sequence = reader.readU64() orelse return error.Truncated;
+        const timestamp_ms = reader.readI64() orelse return error.Truncated;
+        _ = reader.readU8() orelse return error.Truncated; // tier
+        _ = reader.readU32() orelse return error.Truncated; // partition
+        const key_present = reader.readU8() orelse return error.Truncated;
         // The server leaves the name out; it's the stream that was read.
         var stream_name: ?[]const u8 = stream;
         if (key_present != 0) {
-            stream_name = reader.readLengthPrefixed(u32) orelse break;
+            stream_name = reader.readLengthPrefixed(u32) orelse return error.Truncated;
         }
-        const payload = reader.readLengthPrefixed(u32) orelse break;
-        const header_count = reader.readU32() orelse break;
+        const payload = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+        const header_count = reader.readU32() orelse return error.Truncated;
 
         // Read headers
         var hdr_keys: [64][]const u8 = undefined;
@@ -1140,8 +1046,8 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
         const hdr_n = @min(header_count, 64);
         var h: u32 = 0;
         while (h < header_count) : (h += 1) {
-            const hk = reader.readLengthPrefixed(u32) orelse break;
-            const hv = reader.readLengthPrefixed(u32) orelse break;
+            const hk = reader.readLengthPrefixed(u32) orelse return error.Truncated;
+            const hv = reader.readLengthPrefixed(u32) orelse return error.Truncated;
             if (h < 64) {
                 hdr_keys[h] = hk;
                 hdr_vals[h] = hv;
@@ -1217,13 +1123,9 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
         if (trimmed.len == 0) continue;
 
         const stream_id = StreamID.parse(trimmed) catch {
-            ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
         };
-        ids.append(ctx.allocator, stream_id) catch {
-            ctx.printErr("Error: Out of memory\n", .{});
-            return error.CommandFailed;
-        };
+        try ids.append(ctx.allocator, stream_id);
     }
 
     if (ids.items.len == 0) {
@@ -1234,22 +1136,13 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // groupAck(client, namespace, stream, group, consumer, ids)
-    var response = client_mod.stream.groupAck(&client, namespace, stream, group, consumer, ids.items) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupAck(&client, namespace, stream, group, consumer, ids.items) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"status\":\"ok\",\"acknowledged\":{d}}}\n", .{ids.items.len});
@@ -1274,28 +1167,19 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.groupInfo(&client, namespace, stream, group) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupInfo(&client, namespace, stream, group) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     // Wire format (serializeGroupInfo):
     // [pel_count:u64][member_count:u32][created_at_ns:u64]
     var reader = wire.WireReader.init(response.data);
-    const pel_count = reader.readU64() orelse 0;
-    const member_count = reader.readU32() orelse 0;
-    const created_at_ns = reader.readU64() orelse 0;
+    const pel_count = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const member_count = reader.readU32() orelse return outcome.malformed(ctx, "group info");
+    const created_at_ns = reader.readU64() orelse return outcome.malformed(ctx, "group info");
 
     if (json_output) {
         // JSON keeps the raw epoch-ns for machine consumers.
@@ -1330,25 +1214,16 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     // Optional consumer filter
     const consumer_filter = ctx.getString("consumer") orelse "";
     const consumer_arg: ?[]const u8 = if (consumer_filter.len > 0) consumer_filter else null;
 
-    var response = client_mod.stream.groupPendingForConsumer(&client, namespace, stream, group, consumer_arg) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupPendingForConsumer(&client, namespace, stream, group, consumer_arg) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     const data = response.data;
 
@@ -1447,13 +1322,9 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
         if (trimmed.len == 0) continue;
 
         const stream_id = StreamID.parse(trimmed) catch {
-            ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
         };
-        ids.append(ctx.allocator, stream_id) catch {
-            ctx.printErr("Error: Out of memory\n", .{});
-            return error.CommandFailed;
-        };
+        try ids.append(ctx.allocator, stream_id);
     }
 
     if (ids.items.len == 0) {
@@ -1464,10 +1335,7 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     var response = client_mod.stream.groupNack(
         &client,
@@ -1476,16 +1344,10 @@ fn runGroupNack(ctx: *commander.Context) commander.Error!void {
         group,
         consumer,
         ids.items,
-    ) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    ) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"status\":\"ok\",\"released\":{d}}}\n", .{ids.items.len});
@@ -1529,13 +1391,9 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
         if (trimmed.len == 0) continue;
 
         const stream_id = StreamID.parse(trimmed) catch {
-            ctx.printErr("Error: Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')\n", .{trimmed});
-            return error.CommandFailed;
+            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
         };
-        ids.append(ctx.allocator, stream_id) catch {
-            ctx.printErr("Error: Out of memory\n", .{});
-            return error.CommandFailed;
-        };
+        try ids.append(ctx.allocator, stream_id);
     }
 
     if (ids.items.len == 0) {
@@ -1546,10 +1404,7 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     const result = client_mod.stream.groupTouch(
         &client,
@@ -1559,8 +1414,8 @@ fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
         consumer,
         ids.items,
     ) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
+        if (err == error.ServerError) return serverRefused(ctx, &client);
+        return outcome.requestFailed(ctx, err);
     };
 
     if (json_output) {
@@ -1589,10 +1444,7 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
     var response = client_mod.stream.groupCreate(&client, .{
         .namespace = namespace,
@@ -1600,16 +1452,10 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
         .group = group,
         .ack_timeout_ms = ack_timeout,
         .max_deliver = max_deliver,
-    }) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    }) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\"}}\n", .{ group, stream });
@@ -1640,21 +1486,12 @@ fn runGroupLeave(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.groupLeave(&client, namespace, stream, group, consumer) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupLeave(&client, namespace, stream, group, consumer) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"status\":\"ok\",\"consumer\":\"{s}\",\"group\":\"{s}\"}}\n", .{ consumer, group });
@@ -1679,21 +1516,12 @@ fn runGroupDelete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
-    client.connect() catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var response = client_mod.stream.groupDelete(&client, namespace, stream, group) catch |err| {
-        ctx.printErr("Request failed: {}\n", .{err});
-        return error.CommandFailed;
-    };
+    var response = client_mod.stream.groupDelete(&client, namespace, stream, group) catch |err| return outcome.requestFailed(ctx, err);
     defer response.deinit();
 
-    if (response.isError()) {
-        ctx.printErr("Error: {s}\n", .{response.errorMessage()});
-        return error.CommandFailed;
-    }
+    try outcome.check(ctx, response);
 
     if (json_output) {
         ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\",\"deleted\":true}}\n", .{ group, stream });
@@ -1712,4 +1540,51 @@ test "create stream command" {
 
     try std.testing.expectEqualStrings("stream", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 5);
+}
+
+test "stream read: records cut short are Truncated, not fewer records" {
+    var q = try outcome.QuietContext.init(std.testing.allocator);
+    defer q.deinit();
+    // [count:u32] then [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload][headers:u32]
+    const record = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++ [_]u8{0} ** 4;
+    // The second record carries one header, [klen u32][k][vlen u32][v], so a
+    // cut inside a header's value is caught too.
+    const with_header = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
+        [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 3, 0, 0, 0 } ++ "val".*;
+    const answer = [_]u8{ 2, 0, 0, 0 } ++ record ++ with_header;
+    const data = try std.testing.allocator.dupe(u8, &answer);
+    var whole: client_mod.Response = .{ .status = .ok, .data = data, .allocator = std.testing.allocator };
+    defer whole.deinit();
+
+    const got = try parseAndPrintRecords(&q.ctx, &whole, false, true, false);
+    try std.testing.expectEqual(@as(u32, 2), got.count);
+
+    var cut = whole;
+    for (1..whole.data.len) |n| {
+        cut.data = whole.data[0..n];
+        try std.testing.expectError(error.Truncated, parseAndPrintRecords(null, &cut, false, true, false));
+    }
+    cut.data = whole.data[0..0];
+    try std.testing.expectEqual(@as(u32, 0), (try parseAndPrintRecords(&q.ctx, &cut, false, true, false)).count);
+}
+
+test "stream read --follow ends with retryable (exit 4) on an unavailable answer, not a retry loop" {
+    const allocator = std.testing.allocator;
+    const server = try outcome.FakeServer.start(.unavailable, "no leader");
+    defer server.stop();
+    var ep: [32]u8 = undefined;
+    const root = try outcome.testRoot(allocator, try createStreamCommand(allocator));
+    defer root.deinit();
+    const result = root.executeSlice(&.{ "flo", "stream", "read", "s", "--follow", "--endpoint", server.endpoint(&ep) });
+    try std.testing.expectError(error.Retryable, result);
+    try std.testing.expectEqual(@as(u8, 4), outcome.exitCode(result));
+}
+
+test "stream group read: records cut short are Truncated before anything prints" {
+    // [count:u32] then [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload][headers:u32]([klen:u32][k][vlen:u32][v])*
+    const record = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
+        [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 1, 0, 0, 0 } ++ "v".*;
+    const answer = [_]u8{ 2, 0, 0, 0 } ++ record ++ record;
+    try printGroupRecords(null, &answer, "s", false);
+    for (1..answer.len) |n| try std.testing.expectError(error.Truncated, printGroupRecords(null, answer[0..n], "s", false));
 }
