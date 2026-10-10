@@ -524,7 +524,7 @@ pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, qu
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.action.invoke(&client, ns_q, name, input, null, null, null) catch
+    var resp = client_mod.action.invoke(&client, ns_q, name, input, null) catch
         return try h.jsonError(allocator, "Action invoke failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

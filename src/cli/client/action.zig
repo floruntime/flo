@@ -51,38 +51,22 @@ pub fn register(
 
 /// Invoke an action
 /// Wire format in value:
-///   [priority:u8][delay_ms:i64][has_caller:u8]...[input...]
+///   [priority:u8][delay_ms:i64][has_caller:u8][has_idem:u8][has_labels:u8]...[input...]
+/// The server reads only the labels and input, so the bytes before them
+/// are sent as zeros.
 /// key = action_name
 pub fn invoke(
     client: *Client,
     namespace: []const u8,
     action_name: []const u8,
     input: []const u8,
-    priority: ?u8,
-    idempotency_key: ?[]const u8,
     required_labels: ?[]const u8,
 ) !Response {
     var value_buf: [8192]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&value_buf);
     const writer = &fbs;
 
-    // Write priority
-    try writer.writeByte(priority orelse 10);
-
-    // Write delay_ms (i64, default 0)
-    try writer.writeInt(i64, 0, .little);
-
-    // Write caller_id (optional, none)
-    try writer.writeByte(0);
-
-    // Write idempotency_key (optional)
-    if (idempotency_key) |key| {
-        try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(key.len), .little);
-        try writer.writeAll(key);
-    } else {
-        try writer.writeByte(0);
-    }
+    try writer.writeAll(&([_]u8{0} ** (1 + 8 + 1 + 1)));
 
     // Write required_labels (optional)
     if (required_labels) |labels| {

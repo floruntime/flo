@@ -121,47 +121,6 @@ test "e2e/action: invoke registered action" {
     try stdx.testing.assertSucceeded(invoke_result);
 }
 
-test "e2e/action: invoke with priority" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Register
-    try ctx.exec(&.{ "action", "register", "priority-test" });
-
-    // Invoke with priority
-    var result = try ctx.cli.run(&.{
-        "action",     "invoke", "priority-test", "{\"data\":1}",
-        "--priority", "100",
-    });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-}
-
-test "e2e/action: invoke with idempotency key" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Register
-    try ctx.exec(&.{ "action", "register", "idem-test" });
-
-    // First invoke with idempotency key
-    var result1 = try ctx.cli.run(&.{
-        "action",            "invoke",         "idem-test", "{\"x\":1}",
-        "--idempotency-key", "unique-key-123",
-    });
-    defer result1.deinit();
-    try stdx.testing.assertSucceeded(result1);
-
-    // Second invoke with SAME idempotency key should return same run_id
-    var result2 = try ctx.cli.run(&.{
-        "action",            "invoke",         "idem-test", "{\"x\":1}",
-        "--idempotency-key", "unique-key-123",
-    });
-    defer result2.deinit();
-    try stdx.testing.assertSucceeded(result2);
-}
-
 // NOTE: This test verifies current behavior - invoke on non-existent action
 // currently succeeds (creates run in pending state). This may change.
 test "e2e/action: invoke non-existent action behavior" {

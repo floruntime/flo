@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   flo action register <name> [--owner <owner>] [--timeout <ms>]
-//!   flo action invoke <name> <input> [--priority <0-255>] [--idempotency-key <key>]
+//!   flo action invoke <name> <input> [--labels <json>]
 //!   flo action status <run_id>
 //!   flo action list [--limit <n>]
 //!   flo action delete <name>
@@ -62,14 +62,10 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"call"})
                 .examples(&.{
                     "flo action invoke myaction '{\"key\":\"value\"}'",
-                    "flo action invoke process --priority 100 '{\"data\":1}'",
-                    "flo action invoke handler --idempotency-key req-123 input",
                     "flo action invoke render '{\"frame\":1}' --labels '{\"gpu\":true}'",
                 })
                 .arg("name", "Action name")
                 .arg("input", "Input payload (JSON)")
-                .uintFlag("priority", 'p', 0, "Priority (0-255)")
-                .stringFlag("idempotency-key", 'k', "", "Idempotency key for dedup")
                 .stringFlag("labels", 'l', "", "Required worker labels (JSON, e.g. '{\"gpu\":true}')")
                 .boolFlag("async", 'a', "Don't wait for result")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
@@ -268,9 +264,6 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
     const input = ctx.getPositional("input").?; // validated by commander
 
-    const priority_val = ctx.getUint("priority") orelse 0;
-    const priority: u8 = if (priority_val > 255) 255 else @intCast(priority_val);
-    const idempotency_key = ctx.getString("idempotency-key");
     const labels_str = ctx.getString("labels") orelse "";
     const required_labels: ?[]const u8 = if (labels_str.len > 0) labels_str else null;
     const namespace = ctx.getString("namespace") orelse "default";
@@ -284,7 +277,7 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
         return error.CommandFailed;
     };
 
-    var result = client_mod.action.invoke(&client, namespace, name, input, priority, idempotency_key, required_labels) catch |err| {
+    var result = client_mod.action.invoke(&client, namespace, name, input, required_labels) catch |err| {
         ctx.printErr("Request failed: {}\n", .{err});
         return error.CommandFailed;
     };
