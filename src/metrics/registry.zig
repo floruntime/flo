@@ -571,6 +571,9 @@ pub const ShardMetrics = struct {
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
     replies_dropped: Atomic(u64) = Atomic(u64).init(0),
+    /// Requests whose handler neither answered nor parked them; each was
+    /// answered internal_error. A count is a handler bug.
+    handler_no_answer: Atomic(u64) = Atomic(u64).init(0),
     /// Client requests another shard did not answer by their deadline;
     /// clients still connected were told.
     cross_shard_timeouts: Atomic(u64) = Atomic(u64).init(0),
@@ -667,6 +670,10 @@ pub const ShardMetrics = struct {
         _ = self.replies_dropped.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordHandlerNoAnswer(self: *ShardMetrics) void {
+        _ = self.handler_no_answer.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         shard_id: u16,
         connections: u64,
@@ -681,6 +688,7 @@ pub const ShardMetrics = struct {
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [2]u64,
         replies_dropped: u64,
+        handler_no_answer: u64,
         cross_shard_timeouts: u64,
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
@@ -701,6 +709,7 @@ pub const ShardMetrics = struct {
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic) },
             .replies_dropped = self.replies_dropped.load(.monotonic),
+            .handler_no_answer = self.handler_no_answer.load(.monotonic),
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
             .connections_paused = blk: {
@@ -1486,6 +1495,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
+    try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
     inline for (ShardMetrics.PAUSE_REASONS, 0..) |reason, i| {
         try writer.print("flo_shard_connections_paused{{shard_id=\"{d}\",reason=\"" ++ reason ++ "\"}} {d}\n", .{ snap.shard_id, snap.connections_paused[i] });
     }

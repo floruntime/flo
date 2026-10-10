@@ -458,7 +458,7 @@ pub const ActionsHandler = struct {
 
     /// Try to claim a pending run for the given action. Returns the run_id and input if found.
     /// If worker_labels is provided, only claims runs whose required labels match.
-    fn claimPendingRun(self: *ActionsHandler, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
+    pub fn claimPendingRun(self: *ActionsHandler, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
 
@@ -660,7 +660,7 @@ pub const ActionsHandler = struct {
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // The applier creates the run from the entry.
-        var value_buf: [65536]u8 = undefined;
+        var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
         const value = encodeInvokeValue(&value_buf, homeOf(req.namespace), action_name, now_ms, parsed_value.input, parsed_value.labels, null, null) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         };
@@ -1152,7 +1152,7 @@ pub const ActionsHandler = struct {
 
         // The applier creates the run from the entry, exactly as a client
         // invoke does; the caller fields mark it as workflow-driven.
-        var value_buf: [65536]u8 = undefined;
+        var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
         const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, @import("stdx").time.milliTimestamp(), input orelse "", null, caller_run_id, caller_workflow_name) orelse return null;
         const index = proposeInvoke(shard, homeOf(namespace), run_id_str, value) orelse return null;
         return .{ .id = run_id_str, .index = index };
@@ -1186,7 +1186,7 @@ pub const ActionsHandler = struct {
     /// Encode the inbox payload `startRunFromInbox` consumes. Heap-allocated
     /// with `allocator`; the receiving shard frees it.
     pub fn encodeStartRunMessage(allocator: Allocator, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]u8 {
-        var value_buf: [65536]u8 = undefined;
+        var value_buf: [MAX_INVOKE_VALUE]u8 = undefined;
         const value = encodeInvokeValue(&value_buf, homeOf(namespace), action_name, @import("stdx").time.milliTimestamp(), input, null, caller_run_id, caller_workflow_name) orelse return null;
         const out = allocator.alloc(u8, 2 + run_id.len + value.len) catch return null;
         std.mem.writeInt(u16, out[0..2], @intCast(run_id.len), .little);
@@ -1821,22 +1821,35 @@ fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task
     shard.deliverDeferredResponse(reply_to, request_id, .ok, body);
 }
 
+/// Largest invoke entry value; every run, and so every task, is built from
+/// one. An invoke is a log entry, so it can be no larger than an entry's
+/// payload, whichever path proposed it.
+const MAX_INVOKE_VALUE = persistence.MAX_PERSIST_PAYLOAD;
+
 const TASK_NOT_SENT = "internal error: the task could not be sent; it is pending again";
 
-/// The task's answer body, or null with the claim released when it can't
-/// be built or wouldn't fit one answer.
+/// The task's answer body, or null with the claim released when there is
+/// no memory to build it. A task holds its invoke value's fields plus the
+/// run id and a few fixed ones, so it always fits one answer: no run is
+/// left that can never be sent.
 fn encodeForAnswer(shard: *Shard, task: ActionsHandler.ClaimedTask) ?[]u8 {
+    comptime std.debug.assert(MAX_INVOKE_VALUE + run_id_mod.MAX_ID_LEN + 64 <= shard_mod.MAX_REQUEST_SIZE);
     const body = encodeTaskAssignment(shard.allocator, task) catch {
-        task.owner.releaseClaim(task.run_id);
+        releaseAndWake(shard, task);
         return null;
     };
-    if (body.len > shard_mod.MAX_REQUEST_SIZE) {
-        log.err("actions: run {s}'s task is {d} bytes, over one answer; left pending", .{ task.run_id, body.len });
-        shard.allocator.free(body);
-        task.owner.releaseClaim(task.run_id);
-        return null;
-    }
+    std.debug.assert(body.len <= shard_mod.MAX_REQUEST_SIZE);
     return body;
+}
+
+/// Put the run back to pending and have every shard's waiting workers try
+/// it on their next tick: a flag, not a wake now, since this can run inside
+/// a waiter's own resolution.
+pub fn releaseAndWake(shard: *Shard, task: ActionsHandler.ClaimedTask) void {
+    task.owner.releaseClaim(task.run_id);
+    if (shard.peer_mailboxes) |mailboxes| {
+        for (mailboxes) |mb| mb.wake.set(.action_invoked);
+    }
 }
 
 /// Extract the first task type (action name) from the action_await value.
