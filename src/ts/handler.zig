@@ -189,15 +189,13 @@ pub const TSHandler = struct {
         else
             "value";
 
-        // Parse value from payload
-        const value: f64 = if (req.value.len >= 8)
-            @bitCast(std.mem.readInt(u64, req.value[0..8], .little))
-        else if (req.value.len > 0)
-            parseF64FromString(req.value) orelse {
-                return .{ .err = .{ .code = .invalid_request, .message = "invalid value" } };
-            }
-        else
-            0.0;
+        if (req.value.len != 8) {
+            return .{ .err = .{ .code = .invalid_request, .message = "ts write: value must be 8 bytes (f64, little-endian)" } };
+        }
+        const value: f64 = @bitCast(std.mem.readInt(u64, req.value[0..8], .little));
+        if (!std.math.isFinite(value)) {
+            return .{ .err = .{ .code = .invalid_request, .message = "ts write: value must be a finite number" } };
+        }
 
         // Timestamp: from options, or server-generated
         const client_ts = clientTimestampNs(req) catch {
@@ -664,14 +662,6 @@ pub const TSHandler = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Parsing Helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn parseF64FromString(s: []const u8) ?f64 {
-    return std.fmt.parseFloat(f64, s) catch null;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Response Dispatch
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -846,6 +836,12 @@ fn serializeListResult(allocator: Allocator, names: []const []const u8) ![]u8 {
 const testing = std.testing;
 const OptionsBuilder = proto.OptionsBuilder;
 
+fn f64Bytes(v: f64) [8]u8 {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, @bitCast(v), .little);
+    return b;
+}
+
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
     return .{
         .header = .{
@@ -887,7 +883,7 @@ test "ts handler: write with string value" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", "42.5", ""));
+    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(42.5), ""));
     switch (result) {
         .ts_write_ok => |w| {
             try testing.expect(w.series_hash != 0);
@@ -933,7 +929,7 @@ test "ts handler: write with field name option" {
     try builder.addString(.ts_field, "usage_percent");
     const opts = builder.getOptions();
 
-    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", "82.5", opts));
+    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), opts));
     switch (result) {
         .ts_write_ok => {},
         else => return error.TestUnexpectedResult,
@@ -949,7 +945,7 @@ test "ts handler: a client timestamp past what nanoseconds hold is refused, not 
     var opts_buf: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
     try builder.addI64(.ts_timestamp, std.math.maxInt(i64) / 1_000);
-    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", "82.5", builder.getOptions()));
+    const result = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(82.5), builder.getOptions()));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
@@ -964,7 +960,7 @@ test "ts handler: write empty measurement" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    const result = handler.handleCommand(makeRequest(.ts_write, "", "42.0", ""));
+    const result = handler.handleCommand(makeRequest(.ts_write, "", &f64Bytes(42.0), ""));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
         else => return error.TestUnexpectedResult,
@@ -979,9 +975,9 @@ test "ts handler: read" {
     var handler = TSHandler.init(allocator, &ts);
 
     // Write some data points
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "10.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "20.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "30.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(10.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(20.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(30.0), ""));
 
     // Read all
     const result = handler.handleCommand(makeRequest(.ts_read, "cpu", "", ""));
@@ -1034,9 +1030,9 @@ test "ts handler: query avg" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    _ = handler.handleCommand(makeRequest(.ts_write, "disk", "10.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "disk", "20.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "disk", "30.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "disk", &f64Bytes(10.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "disk", &f64Bytes(20.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "disk", &f64Bytes(30.0), ""));
 
     // Query avg
     var opts_buf: [64]u8 = undefined;
@@ -1064,8 +1060,8 @@ test "ts handler: query count" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    _ = handler.handleCommand(makeRequest(.ts_write, "net", "1.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "net", "2.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "net", &f64Bytes(1.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "net", &f64Bytes(2.0), ""));
 
     var opts_buf: [64]u8 = undefined;
     var builder = OptionsBuilder.init(&opts_buf);
@@ -1109,8 +1105,8 @@ test "ts handler: list" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "1.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "memory", "2.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(1.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "memory", &f64Bytes(2.0), ""));
 
     const result = handler.handleCommand(makeRequest(.ts_list, "", "", ""));
     switch (result) {
@@ -1140,6 +1136,38 @@ test "ts handler: pre-route by measurement" {
     try testing.expect(TSHandler.preRouteByMeasurement(req1) != TSHandler.preRouteByMeasurement(req_ns));
 }
 
+test "ts handler: write refuses a value that is not one finite f64" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+
+    const bad = [_][]const u8{ "", "1234567", "123456789", "1234.5678", &f64Bytes(std.math.nan(f64)), &f64Bytes(std.math.inf(f64)), &f64Bytes(-std.math.inf(f64)) };
+    for (bad) |v| {
+        switch (handler.handleCommand(makeRequest(.ts_write, "cpu", v, ""))) {
+            .err => |e| try testing.expectEqual(@as(@TypeOf(e.code), .invalid_request), e.code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 0), ts.stats.points_inserted);
+}
+
+test "ts handler: write accepts negative zero and subnormals" {
+    const allocator = testing.allocator;
+    var ts = TSProjection.init(allocator, .{});
+    defer ts.deinit();
+
+    var handler = TSHandler.init(allocator, &ts);
+    for ([_]f64{ -0.0, std.math.floatTrueMin(f64), -std.math.floatTrueMin(f64) }) |v| {
+        switch (handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(v), ""))) {
+            .ts_write_ok => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
+}
+
 test "ts handler: multiple writes same measurement" {
     const allocator = testing.allocator;
     var ts = TSProjection.init(allocator, .{});
@@ -1148,9 +1176,7 @@ test "ts handler: multiple writes same measurement" {
     var handler = TSHandler.init(allocator, &ts);
 
     for (0..10) |i| {
-        var val_buf: [32]u8 = undefined;
-        const val_str = std.fmt.bufPrint(&val_buf, "{d}.0", .{i}) catch unreachable;
-        const result = handler.handleCommand(makeRequest(.ts_write, "temp", val_str, ""));
+        const result = handler.handleCommand(makeRequest(.ts_write, "temp", &f64Bytes(@floatFromInt(i)), ""));
         switch (result) {
             .ts_write_ok => {},
             else => return error.TestUnexpectedResult,
@@ -1181,9 +1207,9 @@ test "ts handler: floql basic pipeline" {
     var handler = TSHandler.init(allocator, &ts);
 
     // Write data points
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "10.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "20.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "30.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(10.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(20.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(30.0), ""));
 
     // Execute FloQL query: get all points from cpu in a large time range
     const result = handler.handleCommand(makeRequest(.ts_floql, "", "cpu[24h]", ""));
@@ -1239,9 +1265,7 @@ test "ts handler: floql with pipeline stages" {
 
     // Write some data
     for (0..6) |i| {
-        var val_buf: [32]u8 = undefined;
-        const val_str = std.fmt.bufPrint(&val_buf, "{d}.0", .{(i + 1) * 10}) catch unreachable;
-        _ = handler.handleCommand(makeRequest(.ts_write, "mem", val_str, ""));
+        _ = handler.handleCommand(makeRequest(.ts_write, "mem", &f64Bytes(@floatFromInt((i + 1) * 10)), ""));
     }
 
     // Execute: mem[24h] | where(> 30)
@@ -1267,9 +1291,9 @@ test "ts handler: delete measurement" {
 
     var handler = TSHandler.init(allocator, &ts);
 
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "10.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", "20.0", ""));
-    _ = handler.handleCommand(makeRequest(.ts_write, "memory", "30.0", ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(10.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "cpu", &f64Bytes(20.0), ""));
+    _ = handler.handleCommand(makeRequest(.ts_write, "memory", &f64Bytes(30.0), ""));
 
     try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
 

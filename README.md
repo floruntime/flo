@@ -113,15 +113,15 @@ flo kv get user:alice
 
 # Streams
 flo stream append events '{"type": "signup", "user": "alice"}'
-flo stream read events --last 10
+flo stream read events --limit 10
 
 # Queues
-flo queue push jobs '{"task": "send-welcome-email", "to": "alice"}'
-flo queue pop jobs
+flo queue enqueue jobs '{"task": "send-welcome-email", "to": "alice"}'
+flo queue dequeue jobs
 
 # Time-Series
-flo ts write cpu host=web-01 usage=82.5
-flo ts query "cpu{host=web-01}[1h] | avg(5m)"
+flo ts write cpu --tags host=web-01 --value 82.5
+flo ts floql 'cpu{host=web-01}[1h] | window(5m) | avg()'
 ```
 
 ## Architecture
