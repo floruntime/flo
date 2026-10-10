@@ -35,12 +35,7 @@ fn taskId(output: []const u8) ?[]const u8 {
 /// one never reaches the server through it.
 fn createRaw(ctx: *stdx.testing.TestContext, name: []const u8, json: []const u8) !u8 {
     const proto = @import("src").protocol.proto;
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.workflow_create);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(.workflow_create, 7);
     const req: proto.Request = .{ .header = header, .namespace = "default", .key = name, .value = json, .options = "" };
     var buf: [1024]u8 = undefined;
     const bytes = try req.serialize(&buf);

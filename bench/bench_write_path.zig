@@ -22,10 +22,7 @@ const ITERS = 200_000;
 const QUEUE_ITERS = 20_000;
 
 fn request(op: proto.OpCode, id: u64, namespace: []const u8, key: []const u8, value: []const u8) proto.Request {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.op_code = @intFromEnum(op);
-    header.request_id = id;
+    const header = proto.RequestHeader.init(op, id);
     return .{ .header = header, .namespace = namespace, .key = key, .value = value };
 }
 

@@ -182,6 +182,13 @@ pub const Shard = struct {
     /// Total requests dispatched (stats).
     requests_dispatched: u64,
 
+    /// Clients refused for being built from another protocol version or
+    /// table, and when the last was logged: they are logged at most once
+    /// every 10 s, with a count of the ones in between.
+    foreign_refused: u64 = 0,
+    foreign_logged_ms: u64 = 0,
+    foreign_unlogged: u64 = 0,
+
     /// Total inbox messages processed (stats).
     inbox_messages_processed: u64,
 
@@ -3607,6 +3614,9 @@ pub const Shard = struct {
             // A request that cannot fit is refused as soon as its header
             // says so; waiting for its bytes would never end.
             const promised = std.mem.bytesToValue(proto.RequestHeader, parse_buf[0..header_size]);
+            // Past the version byte, a foreign header's layout is unknown:
+            // refuse it before trusting its length.
+            if (promised.magic == proto.MAGIC and promised.foreign()) return self.refuseForeign(fd, conn, promised);
             if (promised.magic == proto.MAGIC and @as(u64, header_size) + promised.payload_length > MAX_REQUEST_SIZE) {
                 self.sendErrorResponse(conn, promised.request_id, .bad_request, "bad request: request over 256 KiB");
                 self.flushToClient(fd);
@@ -3618,6 +3628,14 @@ pub const Shard = struct {
                 switch (err) {
                     // Not enough data yet — wait for more
                     error.IncompleteRequest, error.IncompletePayload => break,
+                    error.UnknownFlag => {
+                        var msg_buf: [96]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&msg_buf, "bad request: header flags 0x{x:0>2} are set; no flag is defined", .{promised.flags}) catch unreachable;
+                        self.sendErrorResponse(conn, promised.request_id, .bad_request, msg);
+                        self.flushToClient(fd);
+                        self.markClosing(fd);
+                        return;
+                    },
                     else => {
                         // Bad request — send error and close
                         self.sendErrorResponse(conn, 0, .bad_request, "Invalid request");
@@ -4200,6 +4218,39 @@ pub const Shard = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         shard.sendOkResponse(conn, req.header.request_id, "");
+    }
+
+    /// Answers a client built from another protocol version or table in its
+    /// own version byte, so it can read the refusal, then closes the
+    /// connection: nothing more it sends can be read.
+    fn refuseForeign(self: *Shard, fd: i32, conn: *Connection, theirs: proto.RequestHeader) void {
+        var text_buf: [128]u8 = undefined;
+        const text = (if (theirs.version == proto.VERSION)
+            std.fmt.bufPrint(&text_buf, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, theirs.table_hash })
+        else
+            std.fmt.bufPrint(&text_buf, "server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, theirs.version })) catch unreachable;
+        var answer = proto.Response.init(theirs.request_id, .bad_request, text);
+        answer.header.version = theirs.version;
+        var buf: [@sizeOf(proto.ResponseHeader) + text_buf.len]u8 = undefined;
+        _ = conn.queueWrite(answer.serialize(&buf) catch unreachable);
+
+        self.foreign_refused += 1;
+        if (self.metrics_registry) |m| m.server.recordClientVersionRefused();
+        const now = nowMs();
+        if (now -| self.foreign_logged_ms >= 10_000) {
+            var peer_buf: [24]u8 = undefined;
+            const peer = if (@import("stdx").net.sysPeerIp4(fd)) |p|
+                std.fmt.bufPrint(&peer_buf, "{d}.{d}.{d}.{d}:{d}", .{ p.ip4[0], p.ip4[1], p.ip4[2], p.ip4[3], p.port }) catch unreachable
+            else |_|
+                "a local socket";
+            log.warn("shard {d}: refused a client at {s} built from protocol {d} table 0x{x:0>16}; this server is protocol {d} table 0x{x:0>16} ({d} more refused since the last report)", .{
+                self.id, peer, theirs.version, theirs.table_hash, proto.VERSION, proto.TABLE_HASH, self.foreign_unlogged,
+            });
+            self.foreign_logged_ms = now;
+            self.foreign_unlogged = 0;
+        } else self.foreign_unlogged += 1;
+        self.flushToClient(fd);
+        self.markClosing(fd);
     }
 
     /// A refusal is always sent: one too long for its frame is cut, never
@@ -5352,10 +5403,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     const conn = try shard.addConnection(conn_pipe[0]);
 
     // Build a ping request
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.op_code = @intFromEnum(proto.OpCode.ping);
-    header.request_id = 1;
+    const header = proto.RequestHeader.init(.ping, 1);
     const req = proto.Request{
         .header = header,
         .namespace = "",
@@ -5491,10 +5539,7 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
 
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.op_code = @intFromEnum(proto.OpCode.kv_put);
-    header.request_id = 5;
+    const header = proto.RequestHeader.init(.kv_put, 5);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     // Held for the leader, not answered.
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
@@ -5619,12 +5664,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     const value = try std.testing.allocator.alloc(u8, 200 * 1024);
     defer std.testing.allocator.free(value);
     for (value, 0..) |*b, i| b.* = @truncate(i *% 7);
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.kv_put);
-    header.request_id = 1;
+    var header = proto.RequestHeader.init(.kv_put, 1);
     const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
     defer std.testing.allocator.free(put);
     shard.dispatchRequest(conn, try proto.Request.parse(put));
@@ -5764,13 +5804,23 @@ fn testRequest(op: proto.OpCode, request_id: u64, key: []const u8, value: []cons
 }
 
 fn testRequestWith(op: proto.OpCode, request_id: u64, key: []const u8, value: []const u8, options: []const u8) ![]u8 {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(op);
-    header.request_id = request_id;
+    const header = proto.RequestHeader.init(op, request_id);
     return Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
+}
+
+test "Shard: a forward's copy of a request keeps the client's table hash, and a foreign one doesn't parse" {
+    const put = try testRequest(.kv_put, 3, "k", "v");
+    defer std.testing.allocator.free(put);
+    const copy = try Shard.serializeRequest(std.testing.allocator, try proto.Request.parse(put));
+    defer std.testing.allocator.free(copy);
+    try std.testing.expectEqualSlices(u8, put, copy);
+    try std.testing.expectEqual(proto.TABLE_HASH, (try proto.Request.parse(copy)).header.table_hash);
+
+    var header = std.mem.bytesToValue(proto.RequestHeader, copy[0..@sizeOf(proto.RequestHeader)]);
+    header.table_hash +%= 1;
+    header.crc32 = header.computeCRC32(copy[@sizeOf(proto.RequestHeader)..]);
+    @memcpy(copy[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
+    try std.testing.expectError(error.TableMismatch, proto.Request.parse(copy));
 }
 
 /// A shard alone and a connected client socket pair, both ends non-blocking
@@ -7126,6 +7176,71 @@ test "Shard: a first frame in another protocol is answered as an invalid request
     }
 }
 
+test "Shard: a client from another table or protocol is answered in its own version byte and closed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+
+    var want_table: [128]u8 = undefined;
+    const cases = [_]struct { version: u8, table_hash: u64, text: []const u8 }{
+        .{ .version = proto.VERSION, .table_hash = proto.TABLE_HASH +% 1, .text = try std.fmt.bufPrint(&want_table, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, proto.TABLE_HASH +% 1 }) },
+        .{ .version = 1, .table_hash = 0, .text = std.fmt.comptimePrint("server protocol {d}, client protocol 1: upgrade the client", .{proto.VERSION}) },
+        // Another version carrying this table's hash: the version alone decides.
+        .{ .version = proto.VERSION +% 1, .table_hash = proto.TABLE_HASH, .text = std.fmt.comptimePrint("server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, proto.VERSION +% 1 }) },
+    };
+    for (cases, 1..) |case, refused| {
+        const c = try TestClient.open(&shard);
+        defer _ = std.c.close(c.pair[1]);
+        const fd = c.conn.fd;
+        // A ping as a client from another build would send it, with a
+        // length its payload never arrives for: the header alone decides.
+        var header = proto.RequestHeader.init(.ping, 9);
+        header.version = case.version;
+        header.table_hash = case.table_hash;
+        header.payload_length = 1000;
+        try std.testing.expectEqual(@sizeOf(proto.RequestHeader), feedClient(c.pair[1], &shard, fd, std.mem.asBytes(&header)));
+        try std.testing.expect(c.conn.closing);
+        try std.testing.expectEqual(@as(u64, refused), shard.foreign_refused);
+
+        var out: [256]u8 = undefined;
+        const n = try readAnswer(c.pair[1], &shard, fd, &out, @sizeOf(proto.ResponseHeader) + case.text.len);
+        const answer = std.mem.bytesToValue(proto.ResponseHeader, out[0..@sizeOf(proto.ResponseHeader)]);
+        try std.testing.expectEqual(case.version, answer.version);
+        try std.testing.expectEqual(proto.TABLE_HASH, answer.table_hash);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.status);
+        try std.testing.expectEqual(@as(u64, 9), answer.request_id);
+        const body = out[@sizeOf(proto.ResponseHeader)..n];
+        try std.testing.expectEqualStrings(case.text, body);
+        try std.testing.expectEqual(answer.crc32, answer.computeCRC32(body));
+    }
+}
+
+test "Shard: a request with a header flag set is refused, naming the flags" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const ping = try testRequest(.ping, 7, "", "");
+    defer std.testing.allocator.free(ping);
+    var header = std.mem.bytesToValue(proto.RequestHeader, ping[0..@sizeOf(proto.RequestHeader)]);
+    header.flags = 0x04;
+    header.crc32 = header.computeCRC32(ping[@sizeOf(proto.RequestHeader)..]);
+    @memcpy(ping[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
+    try std.testing.expectEqual(ping.len, feedClient(c.pair[1], &shard, c.conn.fd, ping));
+    try std.testing.expect(c.conn.closing);
+    var out: [256]u8 = undefined;
+    const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
+    try std.testing.expectEqualStrings("bad request: header flags 0x04 are set; no flag is defined", resp.data);
+}
+
 test "Shard: requests resumed at the end of a tick run, and keep the next poll from waiting on a leader only" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -7261,12 +7376,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
         rn.outbound.clearRetainingCapacity();
     }
     // A well-formed write behind three bytes of fields.
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.kv_put);
-    header.request_id = 9;
+    const header = proto.RequestHeader.init(.kv_put, 9);
     const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     defer std.testing.allocator.free(wire);
     const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + 3 + wire.len);
@@ -7307,12 +7417,7 @@ test "Shard: a diverged node refuses writes even if it led" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.kv_put);
-    header.request_id = 5;
+    var header = proto.RequestHeader.init(.kv_put, 5);
     header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     shard.raft_node.role = .leader;
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
@@ -7338,12 +7443,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.kv_put);
-    header.request_id = 5;
+    var header = proto.RequestHeader.init(.kv_put, 5);
     shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
@@ -7602,12 +7702,7 @@ const ParkTest = struct {
     }
 
     fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
-        var header: proto.RequestHeader = undefined;
-        @memset(std.mem.asBytes(&header), 0);
-        header.magic = proto.MAGIC;
-        header.version = proto.VERSION;
-        header.op_code = @intFromEnum(op);
-        header.request_id = id;
+        const header = proto.RequestHeader.init(op, id);
         return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
     }
 
@@ -9048,12 +9143,7 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
 
 test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
     const payload = [_]u8{ 0, 0, 2, 0, 'k', '0', 0, 0, 0, 0 };
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.kv_get);
-    header.request_id = 5;
+    var header = proto.RequestHeader.init(.kv_get, 5);
     header.payload_length = payload.len;
     header.crc32 = header.computeCRC32(&payload);
     var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;

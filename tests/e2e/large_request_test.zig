@@ -19,12 +19,7 @@ test "e2e/read: a request larger than the read buffer is answered" {
     std.mem.writeInt(u32, value[4..8], @intCast(value.len - 10), .little);
     @memset(value[8 .. value.len - 2], 'v');
     std.mem.writeInt(u16, value[value.len - 2 ..][0..2], 0, .little);
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(proto.OpCode.stream_append);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(.stream_append, 7);
     const req: proto.Request = .{ .header = header, .namespace = "", .key = "big", .value = value, .options = "" };
     const buf = try testing.allocator.alloc(u8, @sizeOf(proto.RequestHeader) + 10 + 3 + value.len);
     defer testing.allocator.free(buf);

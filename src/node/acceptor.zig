@@ -8,8 +8,8 @@
 //!
 //! | Outcome | Condition | Routing |
 //! |---------|-----------|---------|
-//! | A: Full header | 24-byte RequestHeader | hash(ns, key) → shard |
-//! | B: Insufficient | < 24 bytes peeked | Round-robin |
+//! | A: Full header | 32-byte RequestHeader | hash(ns, key) → shard |
+//! | B: Insufficient | < 32 bytes peeked | Round-robin |
 //! | C: HTTP/WS | Starts with `GET` etc. | Dashboard shard (0) |
 //!
 //! ## FD Hand-Off
@@ -196,8 +196,9 @@ pub const Acceptor = struct {
         // header's u64 fields.
         const header = std.mem.bytesToValue(proto.RequestHeader, data[0..@sizeOf(proto.RequestHeader)]);
 
-        // Validate magic
-        if (header.magic != proto.MAGIC) return null;
+        // Not a frame this build can read past its version byte: the shard
+        // it lands on refuses it.
+        if (header.magic != proto.MAGIC or header.foreign()) return null;
 
         // For system commands (ping, auth, etc.), route to shard 0
         if (header.op_code <= 0x0F) {
@@ -314,15 +315,17 @@ test "Acceptor: round-robin routing" {
 test "Acceptor: a header at an odd offset in the peek buffer is read, not trapped on" {
     var pipes: [2]i32 = .{ -1, -1 };
     var acceptor = Acceptor.init(&pipes, Router.init(4096, 2, 0));
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = 0x01;
+    const header = proto.RequestHeader.init(@enumFromInt(0x01), 0);
     // One byte past an 8-byte boundary: a cast would trap in a safe build.
     var buf: [128]u8 align(8) = undefined;
     @memcpy(buf[1..][0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));
     try std.testing.expectEqual(@as(?u16, 0), acceptor.routeFromHeader(buf[1 .. 1 + @sizeOf(proto.RequestHeader)]));
+
+    // A header from another build isn't read for a key.
+    var foreign = header;
+    foreign.table_hash +%= 1;
+    @memcpy(buf[1..][0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&foreign));
+    try std.testing.expectEqual(@as(?u16, null), acceptor.routeFromHeader(buf[1 .. 1 + @sizeOf(proto.RequestHeader)]));
 }
 
 test "Acceptor: extractKeyFromPayload" {

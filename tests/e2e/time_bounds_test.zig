@@ -12,12 +12,7 @@ const Reply = struct { status: u8, data: []const u8 };
 /// Sends a hand-built request and returns the status: the CLI exits 0 on a
 /// refused request, so its exit says nothing.
 fn rawCall(ctx: *stdx.testing.TestContext, op: proto.OpCode, key: []const u8, value: []const u8, options: []const u8, out: []u8) !Reply {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(op);
-    header.request_id = 7;
+    const header = proto.RequestHeader.init(op, 7);
     const req: proto.Request = .{ .header = header, .namespace = "default", .key = key, .value = value, .options = options };
     var buf: [1024]u8 = undefined;
     const bytes = try req.serialize(&buf);

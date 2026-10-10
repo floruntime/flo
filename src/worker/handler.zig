@@ -642,9 +642,7 @@ pub const WorkerHandler = struct {
 };
 
 fn testRequest(namespace: []const u8, id: []const u8) Request {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.op_code = @intFromEnum(OpCode.worker_register);
+    const header = proto.RequestHeader.init(.worker_register, 0);
     return .{ .header = header, .namespace = namespace, .key = id, .value = "", .options = "" };
 }
 

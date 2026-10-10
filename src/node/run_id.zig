@@ -281,7 +281,7 @@ test "preRouteByRunId extracts partition" {
     const id = gen.next(.workflow, 777, &buf);
 
     const req = proto.Request{
-        .header = std.mem.zeroes(proto.RequestHeader),
+        .header = proto.RequestHeader.init(.ping, 0),
         .namespace = "default",
         .key = id,
         .value = "",

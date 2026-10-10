@@ -19,12 +19,7 @@ const Answer = struct {
 
 /// Sends a definition straight to the server, past the CLI's own parse.
 fn sendRaw(ctx: *stdx.testing.TestContext, op: proto.OpCode, key: []const u8, definition: []const u8) !Answer {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.magic = proto.MAGIC;
-    header.version = proto.VERSION;
-    header.op_code = @intFromEnum(op);
-    header.request_id = 11;
+    const header = proto.RequestHeader.init(op, 11);
     const req: proto.Request = .{ .header = header, .namespace = "default", .key = key, .value = definition, .options = "" };
     var buf: [2048]u8 = undefined;
     const bytes = try req.serialize(&buf);

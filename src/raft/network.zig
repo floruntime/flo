@@ -340,6 +340,9 @@ pub const RaftNetwork = struct {
     // Counters, written by the loop thread, read by anyone.
     handshake_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     frames_rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Handshakes refused because the peer was built from another protocol
+    /// version or table (also counted in handshake_failures).
+    version_refusals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peer_disconnects: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     slow_peer_drops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Frames queued for a peer that had no link up when the loop reached
@@ -1003,10 +1006,12 @@ pub const RaftNetwork = struct {
     fn handleLinkFrame(self: *RaftNetwork, l: *Link, hdr: RaftHeader, payload: []const u8, frame: []const u8, rest: []const u8) void {
         switch (l.stage) {
             .hello_awaited => {
-                // Acceptor: the dialer says who it is.
+                // Acceptor: the dialer says who it is. Another version's
+                // hello has another size, so its version is read first.
+                if (hdr.msgType() == .hello) if (handshake.foreignVersion(payload)) |v| return self.versionMismatch(l, v, null);
                 if (hdr.msgType() != .hello or payload.len != handshake.Hello.SIZE) return self.failLink(l, "expected hello");
                 const hello = handshake.Hello.decode(payload[0..handshake.Hello.SIZE]);
-                if (hello.version != handshake.VERSION) return self.versionMismatch(l, hello.version);
+                if (!hello.compatible()) return self.versionMismatch(l, hello.version, hello.table_hash);
                 if (hdr.source_node != hello.node_id) return self.failLink(l, "hello id does not match its frame");
                 if (hello.node_id == self.node_id) {
                     // Our own seed list names us, or another node carries
@@ -1046,10 +1051,11 @@ pub const RaftNetwork = struct {
                     return self.failLink(l, "verdict before proof");
                 }
                 // Dialer: the acceptor proves itself first.
+                if (hdr.msgType() == .hello_back) if (handshake.foreignVersion(payload)) |v| return self.versionMismatch(l, v, null);
                 if (hdr.msgType() != .hello_back or payload.len != handshake.HELLO_BACK_SIZE) return self.failLink(l, "expected hello back");
                 const hello = handshake.Hello.decode(payload[0..handshake.Hello.SIZE]);
                 const their_mac = payload[handshake.Hello.SIZE..][0..handshake.MAC_LEN];
-                if (hello.version != handshake.VERSION) return self.versionMismatch(l, hello.version);
+                if (!hello.compatible()) return self.versionMismatch(l, hello.version, hello.table_hash);
                 if (hdr.source_node != hello.node_id) return self.failLink(l, "hello id does not match its frame");
                 // Our own id coming back is our own listener reached through
                 // a stranger relaying both ways, or a twin; never a peer.
@@ -1156,10 +1162,18 @@ pub const RaftNetwork = struct {
         }
     }
 
-    /// A peer on another version cannot link; say both, and what to do.
-    fn versionMismatch(self: *RaftNetwork, l: *Link, theirs: u16) void {
+    /// A peer on another version or table cannot link; say both, and what
+    /// to do.
+    /// `table` is null when the peer's hello is another version's layout,
+    /// which can't be read past its version.
+    fn versionMismatch(self: *RaftNetwork, l: *Link, version: u16, table: ?u64) void {
+        _ = self.version_refusals.fetchAdd(1, .monotonic);
         if (self.fail_warn.due()) |_| {
-            log.err("raft: a peer speaks protocol version {d} and this node {d}; nodes on different versions cannot link — stop all nodes and upgrade together", .{ theirs, handshake.VERSION });
+            if (table) |t| {
+                log.err("raft: a peer speaks protocol version {d} with table 0x{x:0>16}, and this node {d} with table 0x{x:0>16}; nodes built differently cannot link — stop all nodes and upgrade together", .{ version, t, handshake.VERSION, handshake.TABLE_HASH });
+            } else {
+                log.err("raft: a peer speaks protocol version {d} and this node {d}; nodes built differently cannot link — stop all nodes and upgrade together", .{ version, handshake.VERSION });
+            }
         }
         self.failLink(l, "protocol version mismatch");
     }
@@ -1173,6 +1187,7 @@ pub const RaftNetwork = struct {
             .main_port = self.main_port,
             .ip4 = self.advertise_ip4,
             .nonce = l.my_nonce,
+            .table_hash = handshake.TABLE_HASH,
         }).encode(&out);
         return out;
     }
@@ -1902,9 +1917,9 @@ fn rawDial(port: u16, sent_ip4: [4]u8, proved_ip4: [4]u8) !void {
     defer _ = std.c.close(fd);
     const nonce = [_]u8{9} ** handshake.NONCE_LEN;
     var sent: [handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = sent_ip4, .nonce = nonce }).encode(&sent);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = sent_ip4, .nonce = nonce }).encode(&sent);
     var proved: [handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = proved_ip4, .nonce = nonce }).encode(&proved);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = proved_ip4, .nonce = nonce }).encode(&proved);
     var wire: [256]u8 = undefined;
     const n = transport.frameMessage(.hello, 0, 2, &sent, &wire);
     _ = std.c.write(fd, &wire, n);
@@ -1969,7 +1984,7 @@ test "raft network: a sealed frame that arrives in the same read as the verdict 
     try readFrame(fd, &hello);
     t.add(&hello);
     var ours: [handshake.HELLO_BACK_SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{5} ** handshake.NONCE_LEN }).encode(ours[0..handshake.Hello.SIZE]);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{5} ** handshake.NONCE_LEN }).encode(ours[0..handshake.Hello.SIZE]);
     var with_ours = t;
     with_ours.add(ours[0..handshake.Hello.SIZE]);
     ours[handshake.Hello.SIZE..].* = handshake.proof("s", &with_ours.peek(), 3, 1);
@@ -2051,21 +2066,88 @@ test "raft network: a frame altered on an established link drops the link" {
     try testing.expectEqual(@as(u64, 1), rn.frames_rejected.load(.monotonic));
 }
 
-test "raft network: a hello from a node on another protocol version is refused" {
+/// A version-2 hello: 46 bytes, ending at the nonce, with no table hash.
+fn v2Hello(node_id: u32, raft_port: u16) [46]u8 {
+    var b: [46]u8 = undefined;
+    std.mem.writeInt(u16, b[0..2], 2, .little);
+    std.mem.writeInt(u32, b[2..6], node_id, .little);
+    std.mem.writeInt(u16, b[6..8], raft_port, .little);
+    std.mem.writeInt(u16, b[8..10], 9002, .little);
+    b[10..14].* = .{ 127, 0, 0, 1 };
+    b[14..46].* = [_]u8{7} ** handshake.NONCE_LEN;
+    return b;
+}
+
+test "raft network: a hello from a node on another protocol version or table is refused as such" {
     var seed = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer seed.deinit();
     try seed.start();
-    const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&seed), 1000);
-    defer _ = std.c.close(fd);
-    var hello_payload: [handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION - 1, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{7} ** handshake.NONCE_LEN }).encode(&hello_payload);
-    var wire: [256]u8 = undefined;
-    const n = transport.frameMessage(.hello, 0, 2, &hello_payload, &wire);
-    _ = std.c.write(fd, &wire, n);
-    var waited: u64 = 0;
-    while (waited < 3000 and seed.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u64, 1), seed.handshake_failures.load(.monotonic));
-    try testing.expectEqual(@as(u8, 0), seed.peer_count);
+    var hellos: [2][handshake.Hello.SIZE]u8 = undefined;
+    (handshake.Hello{ .version = handshake.VERSION +% 1, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{7} ** handshake.NONCE_LEN }).encode(&hellos[0]);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{7} ** handshake.NONCE_LEN }).encode(&hellos[1]);
+    const old = v2Hello(2, 9001);
+    // A node on the last release sends its own, shorter hello: it is still
+    // told which version it speaks, not just that the frame was wrong.
+    const payloads = [_][]const u8{ &hellos[0], &hellos[1], &old };
+    for (payloads, 1..) |payload, refused| {
+        const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&seed), 1000);
+        defer _ = std.c.close(fd);
+        var wire: [256]u8 = undefined;
+        const n = transport.frameMessage(.hello, 0, 2, payload, &wire);
+        _ = std.c.write(fd, &wire, n);
+        var waited: u64 = 0;
+        while (waited < 3000 and seed.handshake_failures.load(.monotonic) < refused) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+        try testing.expectEqual(@as(u64, refused), seed.handshake_failures.load(.monotonic));
+        try testing.expectEqual(@as(u64, refused), seed.version_refusals.load(.monotonic));
+        try testing.expectEqual(@as(u8, 0), seed.peer_count);
+    }
+}
+
+test "raft network: a dialer refuses an acceptor built from another table or version" {
+    const listener = try plainListener();
+    defer _ = std.c.close(listener.fd);
+    var dialer = try RaftNetwork.init(testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer dialer.deinit();
+    dialer.dialSeed(.{ 127, 0, 0, 1 }, listener.port);
+    try dialer.start();
+    defer dialer.stop();
+
+    for (0..2) |case| {
+        // Play an acceptor from another build: one with a proof that would
+        // verify, then one on the last release with its shorter hello.
+        var fd: posix.socket_t = -1;
+        var waited: u64 = 0;
+        while (fd < 0 and waited < 5000) : (waited += 20) {
+            fd = sysAccept(listener.fd, null, null) catch -1;
+            if (fd < 0) stdx.time.sleep(20 * std.time.ns_per_ms);
+        }
+        try testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        try stdx_net.sysFcntlSetNonblocking(fd);
+        var t: seal.Transcript = .{};
+        var hello: [HEADER_SIZE + handshake.Hello.SIZE]u8 = undefined;
+        try readFrame(fd, &hello);
+        t.add(&hello);
+        var wire: [512]u8 = undefined;
+        const n = if (case == 0) foreign: {
+            var theirs: [handshake.HELLO_BACK_SIZE]u8 = undefined;
+            (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{5} ** handshake.NONCE_LEN }).encode(theirs[0..handshake.Hello.SIZE]);
+            t.add(theirs[0..handshake.Hello.SIZE]);
+            theirs[handshake.Hello.SIZE..].* = handshake.proof("s", &t.peek(), 3, 1);
+            break :foreign transport.frameMessage(.hello_back, 0, 3, &theirs, &wire);
+        } else old: {
+            var theirs: [46 + handshake.MAC_LEN]u8 = undefined;
+            theirs[0..46].* = v2Hello(3, listener.port);
+            @memset(theirs[46..], 0);
+            break :old transport.frameMessage(.hello_back, 0, 3, &theirs, &wire);
+        };
+        _ = std.c.write(fd, &wire, n);
+
+        waited = 0;
+        while (waited < 3000 and dialer.version_refusals.load(.monotonic) <= case) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
+        try testing.expectEqual(@as(u64, case + 1), dialer.version_refusals.load(.monotonic));
+        try testing.expectEqual(@as(u8, 0), dialer.peer_count);
+    }
 }
 
 test "raft network: a send never waits on a dial, and one to a peer with no link is dropped and counted" {
@@ -2133,7 +2215,7 @@ test "raft network: a dialer that ignores our proof and sends a wrong one is ref
     var nonce: [handshake.NONCE_LEN]u8 = undefined;
     @memset(&nonce, 7);
     var hello_payload: [handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = nonce }).encode(&hello_payload);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = nonce }).encode(&hello_payload);
     var wire: [256]u8 = undefined;
     const n = transport.frameMessage(.hello, 0, 2, &hello_payload, &wire);
     _ = std.c.write(fd, &wire, n);
@@ -2240,7 +2322,7 @@ test "raft network: a stranger that relays a node's own proof back to it is refu
     const back_fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&a), 1000);
     defer _ = std.c.close(back_fd);
     var forged: [handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .node_id = 2, .raft_port = 1, .main_port = 1, .ip4 = .{ 127, 0, 0, 1 }, .nonce = a_hello.nonce }).encode(&forged);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 1, .main_port = 1, .ip4 = .{ 127, 0, 0, 1 }, .nonce = a_hello.nonce }).encode(&forged);
     var wire: [256]u8 = undefined;
     const fn_ = transport.frameMessage(.hello, 0, 2, &forged, &wire);
     _ = std.c.write(back_fd, &wire, fn_);

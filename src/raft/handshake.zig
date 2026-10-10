@@ -17,7 +17,11 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Nodes speaking different versions cannot link; upgrading is stopping
 /// every node and starting them on the new version together.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+/// The op and entry tables a node serves: nodes built from other tables
+/// cannot link either, since they would misread each other's requests and
+/// log entries.
+pub const TABLE_HASH: u64 = @import("../protocol/proto.zig").TABLE_HASH;
 pub const NONCE_LEN: usize = 32;
 pub const MAC_LEN: usize = HmacSha256.mac_length;
 
@@ -29,8 +33,14 @@ pub const Hello = struct {
     main_port: u16,
     ip4: [4]u8,
     nonce: [NONCE_LEN]u8,
+    table_hash: u64,
 
-    pub const SIZE: usize = 2 + 4 + 2 + 2 + 4 + NONCE_LEN;
+    pub const SIZE: usize = 2 + 4 + 2 + 2 + 4 + NONCE_LEN + 8;
+
+    /// Whether the far side was built from this node's protocol and tables.
+    pub fn compatible(self: Hello) bool {
+        return self.version == VERSION and self.table_hash == TABLE_HASH;
+    }
 
     pub fn encode(self: Hello, buf: *[SIZE]u8) void {
         std.mem.writeInt(u16, buf[0..2], self.version, .little);
@@ -39,6 +49,7 @@ pub const Hello = struct {
         std.mem.writeInt(u16, buf[8..10], self.main_port, .little);
         buf[10..14].* = self.ip4;
         buf[14..46].* = self.nonce;
+        std.mem.writeInt(u64, buf[46..54], self.table_hash, .little);
     }
 
     pub fn decode(buf: *const [SIZE]u8) Hello {
@@ -49,9 +60,19 @@ pub const Hello = struct {
             .main_port = std.mem.readInt(u16, buf[8..10], .little),
             .ip4 = buf[10..14].*,
             .nonce = buf[14..46].*,
+            .table_hash = std.mem.readInt(u64, buf[46..54], .little),
         };
     }
 };
+
+/// The version a hello from another protocol version declares, or null
+/// when it is this version's (or too short to say). Every version's hello
+/// starts with its u16 version, so a peer from any version is told which.
+pub fn foreignVersion(payload: []const u8) ?u16 {
+    if (payload.len < 2) return null;
+    const v = std.mem.readInt(u16, payload[0..2], .little);
+    return if (v == VERSION) null else v;
+}
 
 /// The acceptor's hello carries its proof; the dialer's proof travels alone.
 pub const HELLO_BACK_SIZE: usize = Hello.SIZE + MAC_LEN;
@@ -117,7 +138,7 @@ const testing = std.testing;
 
 test "handshake: hello and welcome round-trip" {
     var buf: [Hello.SIZE]u8 = undefined;
-    const h = Hello{ .version = VERSION, .node_id = 7, .raft_port = 9500, .main_port = 9000, .ip4 = .{ 10, 0, 1, 12 }, .nonce = [_]u8{0x11} ** NONCE_LEN };
+    const h = Hello{ .version = VERSION, .table_hash = TABLE_HASH, .node_id = 7, .raft_port = 9500, .main_port = 9000, .ip4 = .{ 10, 0, 1, 12 }, .nonce = [_]u8{0x11} ** NONCE_LEN };
     h.encode(&buf);
     const d = Hello.decode(&buf);
     try testing.expectEqual(h.node_id, d.node_id);
@@ -125,6 +146,8 @@ test "handshake: hello and welcome round-trip" {
     try testing.expectEqual(h.main_port, d.main_port);
     try testing.expectEqual(h.ip4, d.ip4);
     try testing.expectEqual(h.nonce, d.nonce);
+    try testing.expectEqual(h.table_hash, d.table_hash);
+    try testing.expect(d.compatible());
 
     var wbuf: [Welcome.SIZE]u8 = undefined;
     (Welcome{ .verdict = .rejected_live_link, .node_id = 3 }).encode(&wbuf);

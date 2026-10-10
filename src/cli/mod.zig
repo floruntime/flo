@@ -6,6 +6,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const commander = @import("commander/mod.zig");
 const commands = @import("commands/mod.zig");
+const proto = @import("../protocol/proto.zig");
 
 // Re-export useful modules
 pub const output = @import("output.zig");
@@ -51,7 +52,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .name("flo")
         .about("Flo - High-performance distributed platform")
         .usage("flo <command> [args...]")
-        .version(build_options.version)
+        .version(version_line)
         .examples(&.{
             "flo server start --port 9000 --data-dir ./data",
             "flo status --endpoint localhost:9000",
@@ -304,8 +305,12 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
     ctx.print("Created flo.toml with default configuration\n", .{});
 }
 
+/// The release, and the protocol version and op table this build speaks: a
+/// client or SDK must carry the same table hash to be served.
+const version_line = std.fmt.comptimePrint("{s} (protocol {d}, table 0x{x:0>16})", .{ build_options.version, proto.VERSION, proto.TABLE_HASH });
+
 fn showVersion(ctx: *commander.Context) commander.Error!void {
-    ctx.print("flo version {s}\n", .{build_options.version});
+    ctx.print("flo version {s}\n", .{version_line});
 }
 
 fn showHelp(ctx: *commander.Context) commander.Error!void {

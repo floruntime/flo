@@ -289,10 +289,7 @@ fn mockErrorHandler(_: *anyopaque, conn: *anyopaque, _: u64, op_code: u16) void 
 }
 
 fn makeRequest(opcode: proto.OpCode) proto.Request {
-    var header: proto.RequestHeader = undefined;
-    @memset(std.mem.asBytes(&header), 0);
-    header.op_code = @intFromEnum(opcode);
-    header.request_id = 42;
+    const header = proto.RequestHeader.init(opcode, 42);
     return .{
         .header = header,
         .namespace = "",
