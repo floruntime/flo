@@ -37,6 +37,7 @@ test {
     _ = prng;
     _ = @import("net.zig");
     _ = @import("fs.zig");
+    _ = @import("testing/e2e/yaml_builder.zig");
 }
 /// Copy memory from source to destination.
 /// Asserts that the slices do not overlap.

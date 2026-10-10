@@ -714,7 +714,7 @@ pub fn validateInlinePlan(result: *ValidationResult, plan: *const InlinePlan) !v
         }
         if (cache.key_template.len == 0) {
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' cache key_template cannot be empty", .{plan.name}) catch "Invalid cache config";
+            const msg = std.fmt.bufPrint(&buf, "Plan '{s}' cache key cannot be empty", .{plan.name}) catch "Invalid cache config";
             try result.addError(.invalid_cache_config, msg, plan.name);
         }
     }

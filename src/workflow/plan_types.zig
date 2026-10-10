@@ -15,7 +15,7 @@
 //! Plans can have various features auto-detected from config:
 //! - Circuit breaker (from `breaker:` config)
 //! - Health-weighted routing (from `selection: health-weighted`)
-//! - Rate limiting (from `rateLimit:` config)
+//! - Rate limiting (from `rate_limit:` config)
 //! - Caching (from `cache:` config)
 //! - Async tracking (from `tracking: { mode: async }`)
 //! - Fallback values (from `fallback:` config)
@@ -79,7 +79,7 @@ pub const PlanFeatures = struct {
     health_tracking: bool = false,
     /// true if any executor has async tracking
     async_tracking: bool = false,
-    /// true if any executor has rateLimit config
+    /// true if any executor has rate_limit config
     rate_limiting: bool = false,
     /// true if cache config exists
     caching: bool = false,

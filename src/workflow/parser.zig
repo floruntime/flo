@@ -1,24 +1,17 @@
 //! Workflow YAML/JSON Parser
 //!
-//! Parses workflow and plan definitions from YAML or JSON format.
-//!
-//! # Supported Formats
-//!
-//! - YAML (primary, converted to JSON internally)
-//! - JSON (native via std.json)
-//!
-//! # Usage
+//! Parses workflow definitions from YAML (converted to JSON internally) or
+//! JSON. Every key is spelled one way, in snake_case; a key the parser
+//! doesn't read, a value of the wrong kind, or an unknown enum value is
+//! refused, naming the key and where it is. A typo must not change how a
+//! workflow runs.
 //!
 //! ```zig
-//! const parser = @import("workflow/parser.zig");
-//!
-//! // Parse workflow definition
-//! var def = try parser.parseWorkflow(allocator, yaml_content);
+//! var diag: parser.Diagnostic = .{};
+//! var def = parser.parseWorkflow(allocator, yaml, &diag) catch |err| {
+//!     // diag.message(): e.g. `unknown key "trasitions" at steps.charge`
+//! };
 //! defer def.deinit(allocator);
-//!
-//! // Parse plan definition
-//! var plan = try parser.parsePlan(allocator, yaml_content);
-//! defer plan.deinit(allocator);
 //! ```
 
 const std = @import("std");
@@ -29,6 +22,9 @@ const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const types = @import("types.zig");
 const yaml_to_json = @import("../util/yaml_to_json.zig");
+const definition_diag = @import("../util/definition_diag.zig");
+
+pub const Diagnostic = definition_diag.Diagnostic;
 
 // Re-export types for convenience
 pub const WorkflowDefinition = definition.WorkflowDefinition;
@@ -67,6 +63,8 @@ pub const ParseError = error{
     InvalidFormat,
     MissingRequiredField,
     InvalidFieldType,
+    UnknownKey,
+    DuplicateKey,
     InvalidKind,
     InvalidIdempotencyMode,
     InvalidSelectionStrategy,
@@ -82,106 +80,160 @@ pub const ParseError = error{
 };
 
 // =============================================================================
-// JSON Value Helpers
+// Strict JSON Value Helpers
 // =============================================================================
 
 const JsonValue = std.json.Value;
+const D = *Diagnostic;
+const kindName = definition_diag.kindName;
 
-fn getString(obj: JsonValue, key: []const u8) ?[]const u8 {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .string) val.string else null;
+fn checkKeys(d: D, obj: JsonValue, comptime allowed: []const []const u8) ParseError!void {
+    return definition_diag.checkKeys(d, obj, allowed, ParseError.UnknownKey);
 }
 
-/// `v` as the field's type, or refused when it doesn't fit (a negative
-/// count, or more than the field holds).
-fn castInt(comptime T: type, v: i64) ParseError!T {
-    return std.math.cast(T, v) orelse ParseError.InvalidFieldType;
+fn wrongKind(d: D, key: []const u8, want: []const u8, v: JsonValue) ParseError {
+    return d.fail(ParseError.InvalidFieldType, "\"{s}\" must be {s}, not {s}", .{ key, want, kindName(v) });
 }
 
-fn getInt(obj: JsonValue, key: []const u8) ?i64 {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .integer) val.integer else null;
+fn missing(d: D, key: []const u8) ParseError {
+    return d.fail(ParseError.MissingRequiredField, "missing required key \"{s}\"", .{key});
 }
 
-fn getFloat(obj: JsonValue, key: []const u8) ?f64 {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return switch (val) {
-        .float => val.float,
-        .integer => @floatFromInt(val.integer),
-        else => null,
+fn optString(d: D, obj: JsonValue, key: []const u8) ParseError!?[]const u8 {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .string) v.string else wrongKind(d, key, "a string", v);
+}
+
+fn reqString(d: D, obj: JsonValue, key: []const u8) ParseError![]const u8 {
+    return try optString(d, obj, key) orelse missing(d, key);
+}
+
+fn optInt(d: D, obj: JsonValue, key: []const u8) ParseError!?i64 {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .integer) v.integer else wrongKind(d, key, "an integer", v);
+}
+
+/// An integer key as the field's type, or refused when it doesn't fit (a
+/// negative count, or more than the field holds).
+fn optIntAs(comptime T: type, d: D, obj: JsonValue, key: []const u8) ParseError!?T {
+    const v = try optInt(d, obj, key) orelse return null;
+    return std.math.cast(T, v) orelse d.fail(
+        ParseError.InvalidFieldType,
+        "\"{s}\" must be from {d} to {d}, not {d}",
+        .{ key, std.math.minInt(T), std.math.maxInt(T), v },
+    );
+}
+
+/// An integer key that must be at least `min` (0 where zero means "now",
+/// 1 where a zero would never fire or never expire).
+fn optAtLeast(d: D, obj: JsonValue, key: []const u8, min: i64) ParseError!?i64 {
+    const v = try optInt(d, obj, key) orelse return null;
+    if (v < min) return d.fail(ParseError.InvalidFieldType, "\"{s}\" must be at least {d}, not {d}", .{ key, min, v });
+    return v;
+}
+
+fn optFloat(d: D, obj: JsonValue, key: []const u8) ParseError!?f64 {
+    const v = obj.object.get(key) orelse return null;
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => wrongKind(d, key, "a number", v),
     };
 }
 
-fn getBool(obj: JsonValue, key: []const u8) ?bool {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .bool) val.bool else null;
+fn optBool(d: D, obj: JsonValue, key: []const u8) ParseError!?bool {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .bool) v.bool else wrongKind(d, key, "true or false", v);
 }
 
-fn getObject(obj: JsonValue, key: []const u8) ?JsonValue {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .object) val else null;
+fn optObject(d: D, obj: JsonValue, key: []const u8) ParseError!?JsonValue {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .object) v else wrongKind(d, key, "a map", v);
 }
 
-fn getArray(obj: JsonValue, key: []const u8) ?[]const JsonValue {
-    if (obj != .object) return null;
-    const val = obj.object.get(key) orelse return null;
-    return if (val == .array) val.array.items else null;
+fn optArray(d: D, obj: JsonValue, key: []const u8) ParseError!?[]const JsonValue {
+    const v = obj.object.get(key) orelse return null;
+    return if (v == .array) v.array.items else wrongKind(d, key, "a list", v);
+}
+
+/// `s` as one of `names`, or refused listing them.
+fn oneOf(
+    comptime T: type,
+    d: D,
+    key: []const u8,
+    s: []const u8,
+    comptime names: []const struct { []const u8, T },
+    err: ParseError,
+) ParseError!T {
+    inline for (names) |n| {
+        if (mem.eql(u8, s, n[0])) return n[1];
+    }
+    const list = comptime blk: {
+        var l: []const u8 = "";
+        for (names, 0..) |n, i| l = l ++ (if (i == 0) "" else "|") ++ n[0];
+        break :blk l;
+    };
+    return d.fail(err, "\"{s}\" must be one of " ++ list ++ ", not \"{s}\"", .{ key, s });
+}
+
+fn dupe(allocator: Allocator, s: []const u8) ParseError![]u8 {
+    return allocator.dupe(u8, s) catch ParseError.OutOfMemory;
 }
 
 // =============================================================================
 // Workflow Parser
 // =============================================================================
 
-/// Parse a workflow definition from YAML or JSON
-pub fn parseWorkflow(allocator: Allocator, content: []const u8) ParseError!WorkflowDefinition {
-    // First, try to parse as JSON directly
+/// Parse a workflow definition from YAML or JSON. On a refusal other than
+/// OutOfMemory, `diag` (when given) says what and where.
+pub fn parseWorkflow(allocator: Allocator, content: []const u8, diag: ?*Diagnostic) ParseError!WorkflowDefinition {
+    var scratch: Diagnostic = .{};
+    const d = diag orelse &scratch;
+
     if (std.json.parseFromSlice(JsonValue, allocator, content, .{})) |parsed| {
         defer parsed.deinit();
-        return parseWorkflowFromJson(allocator, parsed.value);
-    } else |_| {
-        // JSON parse failed - try converting from YAML
-        const json_content = yaml_to_json.convert(allocator, content) catch {
-            return ParseError.InvalidFormat;
-        };
-        defer allocator.free(json_content);
-
-        const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch {
-            return ParseError.InvalidFormat;
-        };
-        defer parsed.deinit();
-
-        return parseWorkflowFromJson(allocator, parsed.value);
+        return parseWorkflowFromJson(allocator, parsed.value, d);
+    } else |err| switch (err) {
+        error.OutOfMemory => return ParseError.OutOfMemory,
+        error.DuplicateField => return definition_diag.failDuplicateKey(allocator, d, content, ParseError.DuplicateKey),
+        else => {},
     }
+
+    // Not JSON: YAML, converted to JSON.
+    const json_content = yaml_to_json.convert(allocator, content) catch
+        return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{});
+    defer allocator.free(json_content);
+
+    const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return ParseError.OutOfMemory,
+        error.DuplicateField => return definition_diag.failDuplicateKey(allocator, d, json_content, ParseError.DuplicateKey),
+        else => return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{}),
+    };
+    defer parsed.deinit();
+
+    return parseWorkflowFromJson(allocator, parsed.value, d);
 }
 
-/// Parse workflow from parsed JSON value
-pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!WorkflowDefinition {
-    if (root != .object) return ParseError.InvalidFormat;
+fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue, d: D) ParseError!WorkflowDefinition {
+    if (root != .object) return d.fail(ParseError.InvalidFormat, "a workflow definition must be a map, not {s}", .{kindName(root)});
+    try checkKeys(d, root, &.{
+        "kind",     "name",     "version",  "description", "idempotency", "search_attributes",
+        "plans",    "start",    "steps",    "terminals",   "schedule",    "trigger",
+        "output",
+    });
 
-    // Validate kind
-    const kind = getString(root, "kind") orelse return ParseError.MissingRequiredField;
-    if (!mem.eql(u8, kind, "Workflow")) return ParseError.InvalidKind;
+    const kind = try reqString(d, root, "kind");
+    if (!mem.eql(u8, kind, "Workflow")) return d.fail(ParseError.InvalidKind, "\"kind\" must be Workflow, not \"{s}\"", .{kind});
 
-    // Required fields
-    const name = getString(root, "name") orelse return ParseError.MissingRequiredField;
-    const version = getString(root, "version") orelse return ParseError.MissingRequiredField;
+    const name = try reqString(d, root, "name");
+    const version = try reqString(d, root, "version");
+    const description = try optString(d, root, "description") orelse "";
 
-    // Optional description (defaults to "")
-    const description = getString(root, "description") orelse "";
+    const idempotency = try oneOf(IdempotencyMode, d, "idempotency", try optString(d, root, "idempotency") orelse "none", &.{
+        .{ "none", .none }, .{ "optional", .optional }, .{ "required", .required },
+    }, ParseError.InvalidIdempotencyMode);
 
-    // Idempotency mode
-    const idempotency = blk: {
-        const idem_str = getString(root, "idempotency") orelse "none";
-        break :blk IdempotencyMode.fromString(idem_str) orelse return ParseError.InvalidIdempotencyMode;
-    };
-
-    // Search attributes (optional)
-    const search_attributes = try parseSearchAttributes(allocator, root);
+    const search_attributes = try parseSearchAttributes(allocator, root, d);
     errdefer {
         for (search_attributes) |*attr| {
             var ma = attr.*;
@@ -190,70 +242,58 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
         allocator.free(search_attributes);
     }
 
-    // Inline plans (optional map)
-    const plans = try parseInlinePlans(allocator, root);
+    const plans = try parseInlinePlans(allocator, root, d);
     errdefer {
-        for (plans) |*p| {
-            p.deinit(allocator);
-        }
+        for (plans) |*p| p.deinit(allocator);
         allocator.free(plans);
     }
 
-    // Start step (required)
-    const start_obj = getObject(root, "start") orelse return ParseError.MissingRequiredField;
-    const start = try parseStep(allocator, start_obj);
+    const start_obj = try optObject(d, root, "start") orelse return missing(d, "start");
+    const start_mark = d.push("start");
+    const start = try parseStep(allocator, start_obj, d);
+    d.pop(start_mark);
     errdefer {
         var s = start;
         s.deinit(allocator);
     }
 
-    // Steps (optional map)
-    const steps = try parseSteps(allocator, root);
+    const steps = try parseSteps(allocator, root, d);
     errdefer {
-        for (steps) |*step| {
-            step.deinit(allocator);
-        }
+        for (steps) |*step| step.deinit(allocator);
         allocator.free(steps);
     }
 
-    // Terminals (optional map for custom terminals)
-    const terminals = try parseTerminals(allocator, root);
+    const terminals = try parseTerminals(allocator, root, d);
     errdefer {
-        for (terminals) |*t| {
-            t.deinit(allocator);
-        }
+        for (terminals) |*t| t.deinit(allocator);
         allocator.free(terminals);
     }
 
-    // Schedule (optional)
-    const schedule = try parseSchedule(allocator, root);
-    errdefer {
-        if (schedule) |*s| {
-            var ms = s.*;
-            ms.deinit(allocator);
-        }
-    }
+    const schedule = try parseSchedule(allocator, root, d);
+    errdefer if (schedule) |*s| {
+        var ms = s.*;
+        ms.deinit(allocator);
+    };
 
-    // Stream trigger (optional)
-    const trigger = try parseTrigger(allocator, root);
-    errdefer {
-        if (trigger) |*t| {
-            var mt = t.*;
-            mt.deinit(allocator);
-        }
-    }
+    const trigger = try parseTrigger(allocator, root, d);
+    errdefer if (trigger) |*t| {
+        var mt = t.*;
+        mt.deinit(allocator);
+    };
 
     // Output expression (optional JSONPath, e.g. "$.steps.process_expense.output")
-    const output_expr: ?[]const u8 = if (getString(root, "output")) |expr|
-        allocator.dupe(u8, expr) catch return ParseError.OutOfMemory
-    else
-        null;
+    const output_expr: ?[]const u8 = if (try optString(d, root, "output")) |expr| try dupe(allocator, expr) else null;
     errdefer if (output_expr) |o| allocator.free(o);
 
+    const name_d = try dupe(allocator, name);
+    errdefer allocator.free(name_d);
+    const description_d = try dupe(allocator, description);
+    errdefer allocator.free(description_d);
+
     return WorkflowDefinition{
-        .name = allocator.dupe(u8, name) catch return ParseError.OutOfMemory,
-        .description = allocator.dupe(u8, description) catch return ParseError.OutOfMemory,
-        .version = allocator.dupe(u8, version) catch return ParseError.OutOfMemory,
+        .name = name_d,
+        .description = description_d,
+        .version = try dupe(allocator, version),
         .idempotency = idempotency,
         .search_attributes = search_attributes,
         .plans = plans,
@@ -266,37 +306,40 @@ pub fn parseWorkflowFromJson(allocator: Allocator, root: JsonValue) ParseError!W
     };
 }
 
-fn parseSearchAttributes(allocator: Allocator, root: JsonValue) ParseError![]SearchAttrDef {
-    const arr = getArray(root, "searchAttributes") orelse return allocator.alloc(SearchAttrDef, 0) catch return ParseError.OutOfMemory;
+fn parseSearchAttributes(allocator: Allocator, root: JsonValue, d: D) ParseError![]SearchAttrDef {
+    const arr = try optArray(d, root, "search_attributes") orelse return allocator.alloc(SearchAttrDef, 0) catch ParseError.OutOfMemory;
+    const list_mark = d.push("search_attributes");
+    defer d.pop(list_mark);
 
     var attrs: std.ArrayList(SearchAttrDef) = .empty;
     errdefer {
-        for (attrs.items) |*a| {
-            a.deinit(allocator);
-        }
+        for (attrs.items) |*a| a.deinit(allocator);
         attrs.deinit(allocator);
     }
 
-    for (arr) |item| {
-        if (item != .object) continue;
+    for (arr, 0..) |item, i| {
+        const mark = d.pushIndex(i);
+        defer d.pop(mark);
+        if (item != .object) return d.fail(ParseError.InvalidFieldType, "a search attribute must be a map, not {s}", .{kindName(item)});
+        try checkKeys(d, item, &.{ "name", "type", "from" });
 
-        const attr_name = getString(item, "name") orelse continue;
-        const type_str = getString(item, "type") orelse "string";
-        const from = getString(item, "from") orelse continue;
+        const attr_name = try reqString(d, item, "name");
+        const from = try reqString(d, item, "from");
+        const attr_type = try oneOf(SearchAttrType, d, "type", try optString(d, item, "type") orelse "string", &.{
+            .{ "string", .string }, .{ "number", .number }, .{ "timestamp", .timestamp },
+        }, ParseError.InvalidSearchAttrType);
 
-        const attr_type = SearchAttrType.fromString(type_str) orelse return ParseError.InvalidSearchAttrType;
-
-        attrs.append(allocator, .{
-            .name = allocator.dupe(u8, attr_name) catch return ParseError.OutOfMemory,
-            .attr_type = attr_type,
-            .from = allocator.dupe(u8, from) catch return ParseError.OutOfMemory,
-        }) catch return ParseError.OutOfMemory;
+        const name_d = try dupe(allocator, attr_name);
+        errdefer allocator.free(name_d);
+        const from_d = try dupe(allocator, from);
+        errdefer allocator.free(from_d);
+        attrs.append(allocator, .{ .name = name_d, .attr_type = attr_type, .from = from_d }) catch return ParseError.OutOfMemory;
     }
 
-    return attrs.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return attrs.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-/// Parse inline plans from workflow YAML
+/// Inline plans, a map of plan name to plan:
 /// plans:
 ///   payment:
 ///     selection: health-weighted
@@ -304,17 +347,14 @@ fn parseSearchAttributes(allocator: Allocator, root: JsonValue) ParseError![]Sea
 ///       - name: stripe
 ///         run: "@actions/stripe-charge"
 ///         priority: 1
-fn parseInlinePlans(allocator: Allocator, root: JsonValue) ParseError![]InlinePlan {
-    const plans_obj = getObject(root, "plans") orelse
-        return allocator.alloc(InlinePlan, 0) catch return ParseError.OutOfMemory;
-
-    if (plans_obj != .object) return ParseError.InvalidFieldType;
+fn parseInlinePlans(allocator: Allocator, root: JsonValue, d: D) ParseError![]InlinePlan {
+    const plans_obj = try optObject(d, root, "plans") orelse return allocator.alloc(InlinePlan, 0) catch ParseError.OutOfMemory;
+    const plans_mark = d.push("plans");
+    defer d.pop(plans_mark);
 
     var plans: std.ArrayList(InlinePlan) = .empty;
     errdefer {
-        for (plans.items) |*p| {
-            p.deinit(allocator);
-        }
+        for (plans.items) |*p| p.deinit(allocator);
         plans.deinit(allocator);
     }
 
@@ -322,34 +362,32 @@ fn parseInlinePlans(allocator: Allocator, root: JsonValue) ParseError![]InlinePl
     while (iter.next()) |entry| {
         const plan_name = entry.key_ptr.*;
         const plan_obj = entry.value_ptr.*;
+        if (plan_obj != .object) return wrongKind(d, plan_name, "a map", plan_obj);
 
-        if (plan_obj != .object) continue;
-
-        const plan = try parseInlinePlan(allocator, plan_name, plan_obj);
+        const mark = d.push(plan_name);
+        defer d.pop(mark);
+        const plan = try parseInlinePlan(allocator, plan_name, plan_obj, d);
         plans.append(allocator, plan) catch return ParseError.OutOfMemory;
     }
 
-    return plans.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return plans.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-/// Parse a single inline plan definition
-fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue) ParseError!InlinePlan {
-    // Selection strategy (default: static_order)
-    const selection = blk: {
-        const sel_str = getString(obj, "selection") orelse "static-order";
-        break :blk SelectionStrategy.fromString(sel_str) orelse return ParseError.InvalidSelectionStrategy;
-    };
+fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue, d: D) ParseError!InlinePlan {
+    try checkKeys(d, obj, &.{ "selection", "errors", "executors", "health", "cache", "fallback" });
 
-    // Error classification (optional)
-    const error_classification = try parseErrorClassification(allocator, obj);
+    const selection = try oneOf(SelectionStrategy, d, "selection", try optString(d, obj, "selection") orelse "static-order", &.{
+        .{ "static-order", .static_order },       .{ "round-robin", .round_robin },
+        .{ "random", .random },                   .{ "health-weighted", .health_weighted },
+    }, ParseError.InvalidSelectionStrategy);
+
+    const error_classification = try parseErrorClassification(allocator, obj, d);
     errdefer if (error_classification) |*ec| {
         var mec = ec.*;
         mec.deinit(allocator);
     };
 
-    // Executors (required, at least one)
-    const executors = try parseExecutors(allocator, obj);
-    if (executors.len == 0) return ParseError.EmptyExecutors;
+    const executors = try parseExecutors(allocator, obj, d);
     errdefer {
         for (executors) |*e| {
             var me = e.*;
@@ -357,26 +395,24 @@ fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue) Parse
         }
         allocator.free(executors);
     }
+    if (executors.len == 0) return d.fail(ParseError.EmptyExecutors, "\"executors\" must name at least one executor", .{});
 
-    // Health config (optional)
-    const health_config = try parseHealthConfig(obj);
+    const health_config = try parseHealthConfig(obj, d);
 
-    // Cache config (optional)
-    const cache_config = try parseCacheConfig(allocator, obj);
+    const cache_config = try parseCacheConfig(allocator, obj, d);
     errdefer if (cache_config) |*cc| {
         var mcc = cc.*;
         mcc.deinit(allocator);
     };
 
-    // Fallback config (optional)
-    const fallback_config = try parseFallbackConfig(allocator, obj);
+    const fallback_config = try parseFallbackConfig(allocator, obj, d);
     errdefer if (fallback_config) |*fc| {
         var mfc = fc.*;
         mfc.deinit(allocator);
     };
 
     return InlinePlan{
-        .name = allocator.dupe(u8, name) catch return ParseError.OutOfMemory,
+        .name = try dupe(allocator, name),
         .selection = selection,
         .error_classification = error_classification,
         .executors = executors,
@@ -386,47 +422,42 @@ fn parseInlinePlan(allocator: Allocator, name: []const u8, obj: JsonValue) Parse
     };
 }
 
-fn parseStep(allocator: Allocator, obj: JsonValue) ParseError!Step {
-    if (obj != .object) return ParseError.InvalidFieldType;
+fn parseStep(allocator: Allocator, obj: JsonValue, d: D) ParseError!Step {
+    if (obj != .object) return d.fail(ParseError.InvalidFieldType, "a step must be a map, not {s}", .{kindName(obj)});
 
-    // Check if it's a run step or waitForSignal step
-    if (getObject(obj, "waitForSignal")) |wait_obj| {
-        return parseWaitForSignalStep(allocator, obj, wait_obj);
-    } else if (getString(obj, "run")) |_| {
-        return parseRunStep(allocator, obj);
-    } else {
-        return ParseError.MissingRequiredField;
-    }
+    const has_wait = obj.object.contains("wait_for_signal");
+    const has_run = obj.object.contains("run");
+    if (has_wait and has_run) return d.fail(ParseError.InvalidFieldType, "a step has \"run\" or \"wait_for_signal\", not both", .{});
+    if (has_wait) return parseWaitForSignalStep(allocator, obj, d);
+    if (has_run) return parseRunStep(allocator, obj, d);
+    return d.fail(ParseError.MissingRequiredField, "a step needs \"run\" or \"wait_for_signal\"", .{});
 }
 
-fn parseRunStep(allocator: Allocator, obj: JsonValue) ParseError!Step {
-    const target = getString(obj, "run") orelse return ParseError.MissingRequiredField;
+fn parseRunStep(allocator: Allocator, obj: JsonValue, d: D) ParseError!Step {
+    try checkKeys(d, obj, &.{ "run", "input_mapping", "retry", "poll", "transitions" });
+    const target = try reqString(d, obj, "run");
 
-    // Input mapping (optional)
-    const input_mapping: ?[]u8 = if (getString(obj, "inputMapping") orelse getString(obj, "input_mapping")) |m|
-        allocator.dupe(u8, m) catch return ParseError.OutOfMemory
-    else
-        null;
+    const input_mapping: ?[]u8 = if (try optString(d, obj, "input_mapping")) |m| try dupe(allocator, m) else null;
     errdefer if (input_mapping) |m| allocator.free(m);
 
-    // Retry policy (optional)
-    const retry: ?RetryPolicy = if (getObject(obj, "retry")) |r|
-        try parseRetryPolicy(r)
-    else
-        null;
+    const retry: ?RetryPolicy = if (try optObject(d, obj, "retry")) |r| blk: {
+        const mark = d.push("retry");
+        defer d.pop(mark);
+        break :blk try parseRetryPolicy(r, d);
+    } else null;
 
-    // Poll config (optional)
-    const poll: ?definition.PollConfig = if (getObject(obj, "poll")) |p|
-        try parsePollConfig(p)
-    else
-        null;
+    const poll: ?definition.PollConfig = if (try optObject(d, obj, "poll")) |p| blk: {
+        const mark = d.push("poll");
+        defer d.pop(mark);
+        break :blk try parsePollConfig(p, d);
+    } else null;
 
-    // Transitions
-    const transitions = try parseTransitions(allocator, obj);
+    const transitions = try parseTransitions(allocator, obj, d);
+    errdefer freeTransitions(allocator, transitions);
 
     return .{
         .run = .{
-            .target = allocator.dupe(u8, target) catch return ParseError.OutOfMemory,
+            .target = try dupe(allocator, target),
             .input_mapping = input_mapping,
             .retry = retry,
             .poll = poll,
@@ -435,21 +466,24 @@ fn parseRunStep(allocator: Allocator, obj: JsonValue) ParseError!Step {
     };
 }
 
-fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, wait_obj: JsonValue) ParseError!Step {
-    const signal_type = getString(wait_obj, "type") orelse return ParseError.MissingRequiredField;
-    const timeout_ms: ?i64 = getInt(wait_obj, "timeoutMs") orelse getInt(wait_obj, "timeout_ms");
-    const on_timeout: ?[]u8 = if (getString(wait_obj, "onTimeout") orelse getString(wait_obj, "on_timeout")) |t|
-        allocator.dupe(u8, t) catch return ParseError.OutOfMemory
-    else
-        null;
-    errdefer if (on_timeout) |t| allocator.free(t);
+fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, d: D) ParseError!Step {
+    try checkKeys(d, obj, &.{ "wait_for_signal", "transitions" });
+    const wait_obj = (try optObject(d, obj, "wait_for_signal")).?;
 
-    // Transitions
-    const transitions = try parseTransitions(allocator, obj);
+    const mark = d.push("wait_for_signal");
+    try checkKeys(d, wait_obj, &.{ "type", "timeout_ms", "on_timeout" });
+    const signal_type = try reqString(d, wait_obj, "type");
+    const timeout_ms = try optAtLeast(d, wait_obj, "timeout_ms", 1);
+    const on_timeout: ?[]u8 = if (try optString(d, wait_obj, "on_timeout")) |t| try dupe(allocator, t) else null;
+    errdefer if (on_timeout) |t| allocator.free(t);
+    d.pop(mark);
+
+    const transitions = try parseTransitions(allocator, obj, d);
+    errdefer freeTransitions(allocator, transitions);
 
     return .{
         .wait_for_signal = .{
-            .signal_type = allocator.dupe(u8, signal_type) catch return ParseError.OutOfMemory,
+            .signal_type = try dupe(allocator, signal_type),
             .timeout_ms = timeout_ms,
             .on_timeout = on_timeout,
             .transitions = transitions,
@@ -457,77 +491,74 @@ fn parseWaitForSignalStep(allocator: Allocator, obj: JsonValue, wait_obj: JsonVa
     };
 }
 
-fn parseTransitions(allocator: Allocator, obj: JsonValue) ParseError![]Transition {
-    const trans_obj = getObject(obj, "transitions") orelse {
-        return allocator.alloc(Transition, 0) catch return ParseError.OutOfMemory;
-    };
+fn freeTransitions(allocator: Allocator, transitions: []Transition) void {
+    for (transitions) |*t| t.deinit(allocator);
+    allocator.free(transitions);
+}
+
+/// `transitions` maps an outcome (any name) to the step or terminal it leads to.
+fn parseTransitions(allocator: Allocator, obj: JsonValue, d: D) ParseError![]Transition {
+    const trans_obj = try optObject(d, obj, "transitions") orelse return allocator.alloc(Transition, 0) catch ParseError.OutOfMemory;
+    const mark = d.push("transitions");
+    defer d.pop(mark);
 
     var transitions: std.ArrayList(Transition) = .empty;
     errdefer {
-        for (transitions.items) |*t| {
-            t.deinit(allocator);
-        }
+        for (transitions.items) |*t| t.deinit(allocator);
         transitions.deinit(allocator);
     }
 
     var iter = trans_obj.object.iterator();
     while (iter.next()) |entry| {
         const outcome = entry.key_ptr.*;
-        const target = if (entry.value_ptr.* == .string)
-            entry.value_ptr.string
-        else
-            continue;
+        const target = entry.value_ptr.*;
+        if (target != .string) return wrongKind(d, outcome, "a step or terminal name", target);
 
-        transitions.append(allocator, .{
-            .outcome = allocator.dupe(u8, outcome) catch return ParseError.OutOfMemory,
-            .target = allocator.dupe(u8, target) catch return ParseError.OutOfMemory,
-        }) catch return ParseError.OutOfMemory;
+        const outcome_d = try dupe(allocator, outcome);
+        errdefer allocator.free(outcome_d);
+        const target_d = try dupe(allocator, target.string);
+        errdefer allocator.free(target_d);
+        transitions.append(allocator, .{ .outcome = outcome_d, .target = target_d }) catch return ParseError.OutOfMemory;
     }
 
-    return transitions.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return transitions.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-fn parseSteps(allocator: Allocator, root: JsonValue) ParseError![]NamedStep {
-    const steps_obj = getObject(root, "steps") orelse {
-        return allocator.alloc(NamedStep, 0) catch return ParseError.OutOfMemory;
-    };
+fn parseSteps(allocator: Allocator, root: JsonValue, d: D) ParseError![]NamedStep {
+    const steps_obj = try optObject(d, root, "steps") orelse return allocator.alloc(NamedStep, 0) catch ParseError.OutOfMemory;
+    const steps_mark = d.push("steps");
+    defer d.pop(steps_mark);
 
     var steps: std.ArrayList(NamedStep) = .empty;
     errdefer {
-        for (steps.items) |*s| {
-            s.deinit(allocator);
-        }
+        for (steps.items) |*s| s.deinit(allocator);
         steps.deinit(allocator);
     }
 
     var iter = steps_obj.object.iterator();
     while (iter.next()) |entry| {
         const step_name = entry.key_ptr.*;
-        const step_obj = entry.value_ptr.*;
+        const mark = d.push(step_name);
+        defer d.pop(mark);
 
-        if (step_obj != .object) continue;
-
-        const step = try parseStep(allocator, step_obj);
-
-        steps.append(allocator, .{
-            .name = allocator.dupe(u8, step_name) catch return ParseError.OutOfMemory,
-            .step = step,
-        }) catch return ParseError.OutOfMemory;
+        var step = try parseStep(allocator, entry.value_ptr.*, d);
+        errdefer step.deinit(allocator);
+        const name_d = try dupe(allocator, step_name);
+        errdefer allocator.free(name_d);
+        steps.append(allocator, .{ .name = name_d, .step = step }) catch return ParseError.OutOfMemory;
     }
 
-    return steps.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return steps.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-fn parseTerminals(allocator: Allocator, root: JsonValue) ParseError![]Terminal {
-    const terms_obj = getObject(root, "terminals") orelse {
-        return allocator.alloc(Terminal, 0) catch return ParseError.OutOfMemory;
-    };
+fn parseTerminals(allocator: Allocator, root: JsonValue, d: D) ParseError![]Terminal {
+    const terms_obj = try optObject(d, root, "terminals") orelse return allocator.alloc(Terminal, 0) catch ParseError.OutOfMemory;
+    const terms_mark = d.push("terminals");
+    defer d.pop(terms_mark);
 
     var terminals: std.ArrayList(Terminal) = .empty;
     errdefer {
-        for (terminals.items) |*t| {
-            t.deinit(allocator);
-        }
+        for (terminals.items) |*t| t.deinit(allocator);
         terminals.deinit(allocator);
     }
 
@@ -535,22 +566,22 @@ fn parseTerminals(allocator: Allocator, root: JsonValue) ParseError![]Terminal {
     while (iter.next()) |entry| {
         const term_name = entry.key_ptr.*;
         const term_obj = entry.value_ptr.*;
+        if (term_obj != .object) return wrongKind(d, term_name, "a map", term_obj);
 
-        if (term_obj != .object) continue;
+        const mark = d.push(term_name);
+        defer d.pop(mark);
+        try checkKeys(d, term_obj, &.{"status"});
+        const status = try oneOf(types.RunStatus, d, "status", try optString(d, term_obj, "status") orelse "failed", &.{
+            .{ "completed", .completed }, .{ "failed", .failed }, .{ "cancelled", .cancelled }, .{ "timed_out", .timed_out },
+        }, ParseError.InvalidFieldType);
 
-        const status_str = getString(term_obj, "status") orelse "failed";
-        const status = types.RunStatus.fromString(status_str) orelse types.RunStatus.failed;
-
-        terminals.append(allocator, .{
-            .name = allocator.dupe(u8, term_name) catch return ParseError.OutOfMemory,
-            .status = status,
-        }) catch return ParseError.OutOfMemory;
+        terminals.append(allocator, .{ .name = try dupe(allocator, term_name), .status = status }) catch return ParseError.OutOfMemory;
     }
 
-    return terminals.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return terminals.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-/// Parse optional schedule block from workflow YAML
+/// Optional schedule block:
 /// ```yaml
 /// schedule:
 ///   cron: "*/5 * * * *"        # or interval: 30000
@@ -558,48 +589,31 @@ fn parseTerminals(allocator: Allocator, root: JsonValue) ParseError![]Terminal {
 ///   input: '{"mode": "full"}'
 ///   paused: false
 /// ```
-fn parseSchedule(allocator: Allocator, root: JsonValue) ParseError!?ScheduleDef {
-    const sched_obj = getObject(root, "schedule") orelse return null;
+fn parseSchedule(allocator: Allocator, root: JsonValue, d: D) ParseError!?ScheduleDef {
+    const sched_obj = try optObject(d, root, "schedule") orelse return null;
+    const mark = d.push("schedule");
+    defer d.pop(mark);
+    try checkKeys(d, sched_obj, &.{ "cron", "interval", "max_concurrent", "input", "paused" });
 
-    var sched = ScheduleDef{};
+    const cron = try optString(d, sched_obj, "cron");
+    const interval = try optAtLeast(d, sched_obj, "interval", 1);
+    if ((cron == null) == (interval == null)) return d.fail(ParseError.InvalidFieldType, "a schedule needs exactly one of \"cron\" or \"interval\"", .{});
+    const max_concurrent = try optIntAs(u32, d, sched_obj, "max_concurrent") orelse 1;
+    const input = try optString(d, sched_obj, "input");
+    const paused = try optBool(d, sched_obj, "paused") orelse false;
 
-    // cron expression
-    if (getString(sched_obj, "cron")) |cron| {
-        sched.cron_expr = allocator.dupe(u8, cron) catch return ParseError.OutOfMemory;
-    }
-
-    // interval in ms
-    if (getInt(sched_obj, "interval")) |iv| {
-        sched.interval_ms = iv;
-    }
-
-    // Must have exactly one of cron or interval
-    if (!sched.isValid()) {
-        if (sched.cron_expr) |c| allocator.free(c);
-        return ParseError.InvalidFieldType;
-    }
-
-    // max_concurrent (default 1)
-    if (getInt(sched_obj, "maxConcurrent")) |mc| {
-        sched.max_concurrent = try castInt(u32, mc);
-    } else if (getInt(sched_obj, "max_concurrent")) |mc| {
-        sched.max_concurrent = try castInt(u32, mc);
-    }
-
-    // input override
-    if (getString(sched_obj, "input")) |inp| {
-        sched.input = allocator.dupe(u8, inp) catch return ParseError.OutOfMemory;
-    }
-
-    // paused
-    if (getBool(sched_obj, "paused")) |p| {
-        sched.paused = p;
-    }
-
-    return sched;
+    const cron_d: ?[]u8 = if (cron) |c| try dupe(allocator, c) else null;
+    errdefer if (cron_d) |c| allocator.free(c);
+    return ScheduleDef{
+        .cron_expr = cron_d,
+        .interval_ms = interval,
+        .max_concurrent = max_concurrent,
+        .input = if (input) |inp| try dupe(allocator, inp) else null,
+        .paused = paused,
+    };
 }
 
-/// Parse optional stream trigger block from workflow YAML
+/// Optional stream trigger block:
 /// ```yaml
 /// trigger:
 ///   stream: "orders"               # source stream (required)
@@ -607,208 +621,173 @@ fn parseSchedule(allocator: Allocator, root: JsonValue) ParseError!?ScheduleDef 
 ///   consumer_group: "wf-orders"    # consumer group name (optional)
 ///   mode: shared                   # shared | exclusive | key_shared
 ///   batch_size: 1                  # events per workflow run
+///   batch_timeout_ms: 5000
 /// ```
-fn parseTrigger(allocator: Allocator, root: JsonValue) ParseError!?StreamTriggerDef {
-    const trig_obj = getObject(root, "trigger") orelse return null;
+fn parseTrigger(allocator: Allocator, root: JsonValue, d: D) ParseError!?StreamTriggerDef {
+    const trig_obj = try optObject(d, root, "trigger") orelse return null;
+    const mark = d.push("trigger");
+    defer d.pop(mark);
+    try checkKeys(d, trig_obj, &.{ "stream", "namespace", "consumer_group", "mode", "batch_size", "batch_timeout_ms" });
 
-    // stream is required
-    const stream = getString(trig_obj, "stream") orelse return ParseError.MissingRequiredField;
+    const stream = try reqString(d, trig_obj, "stream");
+    if (stream.len == 0) return d.fail(ParseError.InvalidFieldType, "\"stream\" must not be empty", .{});
+    const namespace = try optString(d, trig_obj, "namespace");
+    const consumer_group = try optString(d, trig_obj, "consumer_group");
+    const mode = try oneOf(TriggerMode, d, "mode", try optString(d, trig_obj, "mode") orelse "shared", &.{
+        .{ "shared", .shared }, .{ "exclusive", .exclusive }, .{ "key_shared", .key_shared },
+    }, ParseError.InvalidFieldType);
+    const batch_size = try optIntAs(u32, d, trig_obj, "batch_size") orelse 1;
+    if (batch_size == 0) return d.fail(ParseError.InvalidFieldType, "\"batch_size\" must be at least 1", .{});
+    const batch_timeout_ms = try optIntAs(u32, d, trig_obj, "batch_timeout_ms") orelse 5000;
 
     var trig = StreamTriggerDef{
-        .stream = allocator.dupe(u8, stream) catch return ParseError.OutOfMemory,
+        .stream = try dupe(allocator, stream),
+        .mode = mode,
+        .batch_size = batch_size,
+        .batch_timeout_ms = batch_timeout_ms,
     };
-    errdefer allocator.free(trig.stream);
-
-    // namespace (optional)
-    if (getString(trig_obj, "namespace")) |ns| {
-        trig.namespace = allocator.dupe(u8, ns) catch return ParseError.OutOfMemory;
-    }
-    errdefer if (trig.namespace) |ns| allocator.free(ns);
-
-    // consumer_group (optional, supports both camelCase and snake_case)
-    if (getString(trig_obj, "consumerGroup") orelse getString(trig_obj, "consumer_group")) |cg| {
-        trig.consumer_group = allocator.dupe(u8, cg) catch return ParseError.OutOfMemory;
-    }
-    errdefer if (trig.consumer_group) |cg| allocator.free(cg);
-
-    // mode (default shared)
-    if (getString(trig_obj, "mode")) |mode_str| {
-        trig.mode = TriggerMode.fromString(mode_str) orelse return ParseError.InvalidFieldType;
-    }
-
-    // batch_size (default 1)
-    if (getInt(trig_obj, "batchSize") orelse getInt(trig_obj, "batch_size")) |bs| {
-        if (bs < 1) return ParseError.InvalidFieldType;
-        trig.batch_size = try castInt(u32, bs);
-    }
-
-    // batch_timeout_ms (default 5000)
-    if (getInt(trig_obj, "batchTimeoutMs") orelse getInt(trig_obj, "batch_timeout_ms")) |bt| {
-        if (bt < 0) return ParseError.InvalidFieldType;
-        trig.batch_timeout_ms = try castInt(u32, bt);
-    }
-
-    if (!trig.isValid()) {
-        return ParseError.InvalidFieldType;
-    }
-
+    errdefer trig.deinit(allocator);
+    if (namespace) |ns| trig.namespace = try dupe(allocator, ns);
+    if (consumer_group) |cg| trig.consumer_group = try dupe(allocator, cg);
     return trig;
 }
 
-/// Parse a backoff strategy string. Accepts both the canonical spellings
-/// ("constant", "linear", "exponential", "exponential_jitter") and the
-/// duration-suffixed forms used elsewhere ("exp-jitter-200ms", "constant-500ms").
-/// The jitter variants are matched before the bare "exp" prefix so the
-/// documented "exponential_jitter" does not silently degrade to "exponential".
-fn parseBackoffStr(backoff_str: []const u8) BackoffType {
-    if (mem.startsWith(u8, backoff_str, "exp-jitter") or
-        mem.startsWith(u8, backoff_str, "exponential_jitter") or
-        mem.startsWith(u8, backoff_str, "exponential-jitter"))
-    {
-        return .exponential_jitter;
-    } else if (mem.startsWith(u8, backoff_str, "exp")) {
-        return .exponential;
-    } else if (mem.startsWith(u8, backoff_str, "linear")) {
-        return .linear;
-    } else if (mem.startsWith(u8, backoff_str, "constant")) {
-        return .constant;
-    } else {
-        return BackoffType.fromString(backoff_str) orelse .exponential;
+fn parseBackoff(d: D, obj: JsonValue) ParseError!BackoffType {
+    return oneOf(BackoffType, d, "backoff", try optString(d, obj, "backoff") orelse "exponential", &.{
+        .{ "constant", .constant },       .{ "linear", .linear },
+        .{ "exponential", .exponential }, .{ "exponential_jitter", .exponential_jitter },
+    }, ParseError.InvalidBackoffType);
+}
+
+fn parseRetryPolicy(obj: JsonValue, d: D) ParseError!RetryPolicy {
+    try checkKeys(d, obj, &.{ "max_attempts", "initial_delay_ms", "max_delay_ms", "within_ms", "backoff" });
+    return .{
+        .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 3,
+        .backoff = try parseBackoff(d, obj),
+        .initial_delay_ms = try optIntAs(u32, d, obj, "initial_delay_ms") orelse 1000,
+        .max_delay_ms = try optIntAs(u32, d, obj, "max_delay_ms") orelse 30000,
+        .within_ms = try optIntAs(u64, d, obj, "within_ms"),
+    };
+}
+
+fn parsePollConfig(obj: JsonValue, d: D) ParseError!definition.PollConfig {
+    try checkKeys(d, obj, &.{ "initial_delay_ms", "max_attempts", "base_delay_ms", "max_delay_ms", "backoff" });
+    return .{
+        .initial_delay_ms = try optAtLeast(d, obj, "initial_delay_ms", 0) orelse 0,
+        .max_attempts = try optIntAs(u32, d, obj, "max_attempts") orelse 10,
+        .backoff = try parseBackoff(d, obj),
+        .base_delay_ms = try optIntAs(u32, d, obj, "base_delay_ms") orelse 1000,
+        .max_delay_ms = try optIntAs(u32, d, obj, "max_delay_ms") orelse 60000,
+    };
+}
+
+// =============================================================================
+// Plan Parsers
+// =============================================================================
+
+fn parseStringList(allocator: Allocator, d: D, obj: JsonValue, key: []const u8, list: *std.ArrayList([]const u8)) ParseError!void {
+    const arr = try optArray(d, obj, key) orelse return;
+    const mark = d.push(key);
+    defer d.pop(mark);
+    for (arr, 0..) |item, i| {
+        if (item != .string) {
+            const im = d.pushIndex(i);
+            defer d.pop(im);
+            return d.fail(ParseError.InvalidFieldType, "must be a string, not {s}", .{kindName(item)});
+        }
+        const s = try dupe(allocator, item.string);
+        list.append(allocator, s) catch {
+            allocator.free(s);
+            return ParseError.OutOfMemory;
+        };
     }
 }
 
-fn parseRetryPolicy(obj: JsonValue) ParseError!RetryPolicy {
-    if (obj != .object) return ParseError.InvalidFieldType;
-
-    const max_attempts: u32 = if (getInt(obj, "max") orelse getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts")) |m| try castInt(u32, m) else 3;
-    const initial_delay_ms: u32 = if (getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms")) |d| try castInt(u32, d) else 1000;
-    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| try castInt(u32, d) else 30000;
-    const within_ms: ?u64 = if (getInt(obj, "withinMs") orelse getInt(obj, "within_ms")) |w| try castInt(u64, w) else null;
-
-    const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
-
-    return .{
-        .max_attempts = max_attempts,
-        .backoff = backoff,
-        .initial_delay_ms = initial_delay_ms,
-        .max_delay_ms = max_delay_ms,
-        .within_ms = within_ms,
-    };
+fn freeStringList(allocator: Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |s| allocator.free(s);
+    list.deinit(allocator);
 }
 
-fn parsePollConfig(obj: JsonValue) ParseError!definition.PollConfig {
-    if (obj != .object) return ParseError.InvalidFieldType;
-
-    const initial_delay_ms: i64 = getInt(obj, "initialDelayMs") orelse getInt(obj, "initial_delay_ms") orelse 0;
-    const max_attempts: u32 = if (getInt(obj, "maxAttempts") orelse getInt(obj, "max_attempts") orelse getInt(obj, "max")) |m| try castInt(u32, m) else 10;
-    const base_delay_ms: u32 = if (getInt(obj, "baseDelayMs") orelse getInt(obj, "base_delay_ms")) |d| try castInt(u32, d) else 1000;
-    const max_delay_ms: u32 = if (getInt(obj, "maxDelayMs") orelse getInt(obj, "max_delay_ms")) |d| try castInt(u32, d) else 60000;
-
-    const backoff: BackoffType = parseBackoffStr(getString(obj, "backoff") orelse "exponential");
-
-    return .{
-        .initial_delay_ms = initial_delay_ms,
-        .max_attempts = max_attempts,
-        .backoff = backoff,
-        .base_delay_ms = base_delay_ms,
-        .max_delay_ms = max_delay_ms,
-    };
-}
-
-// =============================================================================
-// Error Classification Parser
-// =============================================================================
-
-fn parseErrorClassification(allocator: Allocator, root: JsonValue) ParseError!?ErrorClassification {
-    const classify_obj = getObject(root, "classifyError") orelse return null;
+fn parseErrorClassification(allocator: Allocator, root: JsonValue, d: D) ParseError!?ErrorClassification {
+    const classify_obj = try optObject(d, root, "errors") orelse return null;
+    const mark = d.push("errors");
+    defer d.pop(mark);
+    try checkKeys(d, classify_obj, &.{ "retryable", "fatal" });
 
     var retryable: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (retryable.items) |s| allocator.free(s);
-        retryable.deinit(allocator);
-    }
-
+    errdefer freeStringList(allocator, &retryable);
     var fatal: std.ArrayList([]const u8) = .empty;
+    errdefer freeStringList(allocator, &fatal);
+
+    try parseStringList(allocator, d, classify_obj, "retryable", &retryable);
+    try parseStringList(allocator, d, classify_obj, "fatal", &fatal);
+
+    const retryable_s = retryable.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
     errdefer {
-        for (fatal.items) |s| allocator.free(s);
-        fatal.deinit(allocator);
+        for (retryable_s) |s| allocator.free(s);
+        allocator.free(retryable_s);
     }
-
-    if (getArray(classify_obj, "retryable")) |arr| {
-        for (arr) |item| {
-            if (item == .string) {
-                retryable.append(allocator, allocator.dupe(u8, item.string) catch return ParseError.OutOfMemory) catch return ParseError.OutOfMemory;
-            }
-        }
-    }
-
-    if (getArray(classify_obj, "fatal")) |arr| {
-        for (arr) |item| {
-            if (item == .string) {
-                fatal.append(allocator, allocator.dupe(u8, item.string) catch return ParseError.OutOfMemory) catch return ParseError.OutOfMemory;
-            }
-        }
-    }
-
     return ErrorClassification{
-        .retryable = retryable.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
+        .retryable = retryable_s,
         .fatal = fatal.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
     };
 }
 
-fn parseExecutors(allocator: Allocator, root: JsonValue) ParseError![]ExecutorConfig {
-    const arr = getArray(root, "executors") orelse return ParseError.MissingRequiredField;
+fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]ExecutorConfig {
+    const arr = try optArray(d, root, "executors") orelse return missing(d, "executors");
+    const list_mark = d.push("executors");
+    defer d.pop(list_mark);
 
     var executors: std.ArrayList(ExecutorConfig) = .empty;
     errdefer {
-        for (executors.items) |*e| {
-            e.deinit(allocator);
-        }
+        for (executors.items) |*e| e.deinit(allocator);
         executors.deinit(allocator);
     }
 
-    for (arr) |item| {
-        if (item != .object) continue;
-
-        const exec = try parseExecutorConfig(allocator, item);
+    for (arr, 0..) |item, i| {
+        const mark = d.pushIndex(i);
+        defer d.pop(mark);
+        if (item != .object) return d.fail(ParseError.InvalidFieldType, "an executor must be a map, not {s}", .{kindName(item)});
+        var exec = try parseExecutorConfig(allocator, item, d);
+        errdefer exec.deinit(allocator);
         executors.append(allocator, exec) catch return ParseError.OutOfMemory;
     }
 
-    return executors.toOwnedSlice(allocator) catch return ParseError.OutOfMemory;
+    return executors.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
-fn parseExecutorConfig(allocator: Allocator, obj: JsonValue) ParseError!ExecutorConfig {
-    const name = getString(obj, "name") orelse return ParseError.MissingRequiredField;
-    const action = getString(obj, "run") orelse return ParseError.MissingRequiredField;
-    const priority: i32 = if (getInt(obj, "priority")) |p| try castInt(i32, p) else 100;
+fn parseExecutorConfig(allocator: Allocator, obj: JsonValue, d: D) ParseError!ExecutorConfig {
+    try checkKeys(d, obj, &.{ "name", "run", "priority", "retry", "breaker", "tracking", "rate_limit" });
+    const name = try reqString(d, obj, "name");
+    const action = try reqString(d, obj, "run");
+    const priority = try optIntAs(i32, d, obj, "priority") orelse 100;
 
-    // Retry policy
-    const retry: ?RetryPolicy = if (getObject(obj, "retry")) |r|
-        try parseRetryPolicy(r)
-    else
-        null;
+    const retry: ?RetryPolicy = if (try optObject(d, obj, "retry")) |r| blk: {
+        const mark = d.push("retry");
+        defer d.pop(mark);
+        break :blk try parseRetryPolicy(r, d);
+    } else null;
+    const breaker: ?CircuitBreakerConfig = if (try optObject(d, obj, "breaker")) |b| blk: {
+        const mark = d.push("breaker");
+        defer d.pop(mark);
+        break :blk try parseCircuitBreakerConfig(b, d);
+    } else null;
+    const tracking: ?TrackingConfig = if (try optObject(d, obj, "tracking")) |t| blk: {
+        const mark = d.push("tracking");
+        defer d.pop(mark);
+        break :blk try parseTrackingConfig(t, d);
+    } else null;
+    const rate_limit: ?RateLimitConfig = if (try optObject(d, obj, "rate_limit")) |r| blk: {
+        const mark = d.push("rate_limit");
+        defer d.pop(mark);
+        break :blk try parseRateLimitConfig(r, d);
+    } else null;
 
-    // Circuit breaker
-    const breaker: ?CircuitBreakerConfig = if (getObject(obj, "breaker")) |b|
-        try parseCircuitBreakerConfig(b)
-    else
-        null;
-
-    // Tracking
-    const tracking: ?TrackingConfig = if (getObject(obj, "tracking")) |t|
-        try parseTrackingConfig(t)
-    else
-        null;
-
-    // Rate limit
-    const rate_limit: ?RateLimitConfig = if (getObject(obj, "rateLimit")) |r|
-        try parseRateLimitConfig(r)
-    else
-        null;
-
+    const name_d = try dupe(allocator, name);
+    errdefer allocator.free(name_d);
     return ExecutorConfig{
-        .name = allocator.dupe(u8, name) catch return ParseError.OutOfMemory,
-        .action_name = allocator.dupe(u8, action) catch return ParseError.OutOfMemory,
+        .name = name_d,
+        .action_name = try dupe(allocator, action),
         .priority = priority,
         .retry = retry,
         .breaker = breaker,
@@ -817,120 +796,89 @@ fn parseExecutorConfig(allocator: Allocator, obj: JsonValue) ParseError!Executor
     };
 }
 
-fn parseCircuitBreakerConfig(obj: JsonValue) ParseError!CircuitBreakerConfig {
-    if (obj != .object) return ParseError.InvalidFieldType;
-
+fn parseCircuitBreakerConfig(obj: JsonValue, d: D) ParseError!CircuitBreakerConfig {
+    try checkKeys(d, obj, &.{ "failure_threshold", "cooldown_ms", "half_open_max_calls" });
     return .{
-        .failure_threshold = if (getInt(obj, "failureThreshold") orelse getInt(obj, "failure_threshold")) |f| try castInt(u32, f) else 5,
-        .cooldown_ms = getInt(obj, "cooldownMs") orelse getInt(obj, "cooldown_ms") orelse 60000,
-        .half_open_max_calls = if (getInt(obj, "halfOpenMaxCalls") orelse getInt(obj, "half_open_max_calls")) |h| try castInt(u32, h) else 2,
+        .failure_threshold = try optIntAs(u32, d, obj, "failure_threshold") orelse 5,
+        .cooldown_ms = try optAtLeast(d, obj, "cooldown_ms", 1) orelse 60000,
+        .half_open_max_calls = try optIntAs(u32, d, obj, "half_open_max_calls") orelse 2,
     };
 }
 
-fn parseTrackingConfig(obj: JsonValue) ParseError!TrackingConfig {
-    if (obj != .object) return ParseError.InvalidFieldType;
-
-    const mode_str = getString(obj, "mode") orelse "sync";
-    const mode: TrackingMode = if (mem.eql(u8, mode_str, "async"))
-        .async_mode
-    else
-        .sync;
-
+fn parseTrackingConfig(obj: JsonValue, d: D) ParseError!TrackingConfig {
+    try checkKeys(d, obj, &.{ "mode", "timeout_ms" });
     return .{
-        .mode = mode,
-        .timeout_ms = getInt(obj, "timeoutMs") orelse getInt(obj, "timeout_ms"),
+        .mode = try oneOf(TrackingMode, d, "mode", try optString(d, obj, "mode") orelse "sync", &.{
+            .{ "sync", .sync }, .{ "async", .async_mode },
+        }, ParseError.InvalidTrackingMode),
+        .timeout_ms = try optAtLeast(d, obj, "timeout_ms", 1),
     };
 }
 
-fn parseRateLimitConfig(obj: JsonValue) ParseError!RateLimitConfig {
-    if (obj != .object) return ParseError.InvalidFieldType;
-
+fn parseRateLimitConfig(obj: JsonValue, d: D) ParseError!RateLimitConfig {
+    try checkKeys(d, obj, &.{ "max_per_second", "max_per_minute", "max_per_hour" });
     return .{
-        .max_per_second = if (getInt(obj, "maxPerSecond")) |m| try castInt(u32, m) else null,
-        .max_per_minute = if (getInt(obj, "maxPerMinute")) |m| try castInt(u32, m) else null,
-        .max_per_hour = if (getInt(obj, "maxPerHour")) |m| try castInt(u32, m) else null,
+        .max_per_second = try optIntAs(u32, d, obj, "max_per_second"),
+        .max_per_minute = try optIntAs(u32, d, obj, "max_per_minute"),
+        .max_per_hour = try optIntAs(u32, d, obj, "max_per_hour"),
     };
 }
 
-fn parseHealthConfig(root: JsonValue) ParseError!?HealthConfig {
-    const health_obj = getObject(root, "health") orelse return null;
+fn parseHealthConfig(root: JsonValue, d: D) ParseError!?HealthConfig {
+    const health_obj = try optObject(d, root, "health") orelse return null;
+    const mark = d.push("health");
+    defer d.pop(mark);
+    try checkKeys(d, health_obj, &.{ "window_ms", "decay", "min_samples" });
 
-    // Parse window like "5m" -> 300000 ms
-    const window_ms: i64 = blk: {
-        const window_str = getString(health_obj, "window") orelse "5m";
-        break :blk parseTimeString(window_str) orelse 300000;
-    };
+    const window_ms: i64 = try optIntAs(u32, d, health_obj, "window_ms") orelse 300000;
+    if (window_ms == 0) return d.fail(ParseError.InvalidFieldType, "\"window_ms\" must be at least 1", .{});
 
     return .{
         .window_ms = window_ms,
-        .decay = getFloat(health_obj, "decay") orelse 0.9,
-        .min_samples = if (getInt(health_obj, "minSamples")) |m| try castInt(u32, m) else 50,
+        .decay = try optFloat(d, health_obj, "decay") orelse 0.9,
+        .min_samples = try optIntAs(u32, d, health_obj, "min_samples") orelse 50,
     };
 }
 
-fn parseCacheConfig(allocator: Allocator, root: JsonValue) ParseError!?CacheConfig {
-    const cache_obj = getObject(root, "cache") orelse return null;
+fn parseCacheConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?CacheConfig {
+    const cache_obj = try optObject(d, root, "cache") orelse return null;
+    const mark = d.push("cache");
+    defer d.pop(mark);
+    try checkKeys(d, cache_obj, &.{ "ttl_ms", "key", "invalidate_on" });
 
-    const ttl_ms = getInt(cache_obj, "ttlMs") orelse 300000;
-    const key_template = getString(cache_obj, "keyTemplate") orelse return null;
+    const ttl_ms = try optAtLeast(d, cache_obj, "ttl_ms", 1) orelse 300000;
+    const key_template = try reqString(d, cache_obj, "key");
 
     var invalidate_on: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (invalidate_on.items) |s| allocator.free(s);
-        invalidate_on.deinit(allocator);
-    }
+    errdefer freeStringList(allocator, &invalidate_on);
+    try parseStringList(allocator, d, cache_obj, "invalidate_on", &invalidate_on);
 
-    if (getArray(cache_obj, "invalidateOn")) |arr| {
-        for (arr) |item| {
-            if (item == .string) {
-                invalidate_on.append(allocator, allocator.dupe(u8, item.string) catch return ParseError.OutOfMemory) catch return ParseError.OutOfMemory;
-            }
-        }
-    }
-
+    const key_d = try dupe(allocator, key_template);
+    errdefer allocator.free(key_d);
     return CacheConfig{
         .ttl_ms = ttl_ms,
-        .key_template = allocator.dupe(u8, key_template) catch return ParseError.OutOfMemory,
+        .key_template = key_d,
         .invalidate_on = invalidate_on.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
     };
 }
 
-fn parseFallbackConfig(allocator: Allocator, root: JsonValue) ParseError!?FallbackConfig {
-    const fallback_obj = getObject(root, "fallback") orelse return null;
+fn parseFallbackConfig(allocator: Allocator, root: JsonValue, d: D) ParseError!?FallbackConfig {
+    const fallback_obj = try optObject(d, root, "fallback") orelse return null;
+    const mark = d.push("fallback");
+    defer d.pop(mark);
+    try checkKeys(d, fallback_obj, &.{ "value", "condition" });
 
-    const value = getString(fallback_obj, "value") orelse return null;
-
-    const condition: FallbackCondition = blk: {
-        const cond_str = getString(fallback_obj, "condition") orelse "exhausted";
-        if (mem.eql(u8, cond_str, "any_error")) {
-            break :blk .any_error;
-        } else {
-            break :blk .exhausted;
-        }
-    };
+    const value = try reqString(d, fallback_obj, "value");
+    const condition = try oneOf(FallbackCondition, d, "condition", try optString(d, fallback_obj, "condition") orelse "exhausted", &.{
+        .{ "exhausted", .exhausted }, .{ "any_error", .any_error },
+    }, ParseError.InvalidFallbackCondition);
 
     return FallbackConfig{
-        .value = allocator.dupe(u8, value) catch return ParseError.OutOfMemory,
+        .value = try dupe(allocator, value),
         .condition = condition,
     };
 }
 
-/// Parse time string like "5m", "1h", "30s" to milliseconds
-fn parseTimeString(s: []const u8) ?i64 {
-    if (s.len < 2) return null;
-
-    const unit = s[s.len - 1];
-    const num_str = s[0 .. s.len - 1];
-    const num = std.fmt.parseInt(i64, num_str, 10) catch return null;
-    const ms_per: i64 = switch (unit) {
-        's' => 1000,
-        'm' => 60 * 1000,
-        'h' => 60 * 60 * 1000,
-        'd' => 24 * 60 * 60 * 1000,
-        else => return null,
-    };
-    return std.math.mul(i64, num, ms_per) catch null;
-}
 
 // =============================================================================
 // Tests
@@ -965,7 +913,7 @@ test "parseWorkflow: basic workflow" {
         \\}
     ;
 
-    var def = try parseWorkflow(allocator, json);
+    var def = try parseWorkflow(allocator, json, null);
     defer def.deinit(allocator);
 
     try testing.expectEqualStrings("process-order", def.name);
@@ -992,13 +940,13 @@ test "parseWorkflow: exponential_jitter backoff parses to jitter" {
         \\  "start": {
         \\    "run": "@actions/x",
         \\    "retry": { "max_attempts": 3, "backoff": "exponential_jitter", "initial_delay_ms": 10 },
-        \\    "poll":  { "maxAttempts": 3, "backoff": "exponential_jitter", "baseDelayMs": 10 },
+        \\    "poll":  { "max_attempts": 3, "backoff": "exponential_jitter", "base_delay_ms": 10 },
         \\    "transitions": { "success": "flo.Completed", "failure": "flo.Failed" }
         \\  }
         \\}
     ;
 
-    var def = try parseWorkflow(allocator, json);
+    var def = try parseWorkflow(allocator, json, null);
     defer def.deinit(allocator);
 
     try testing.expectEqual(BackoffType.exponential_jitter, def.start.run.retry.?.backoff);
@@ -1014,7 +962,7 @@ test "parseWorkflow: with search attributes" {
         \\  "kind": "Workflow",
         \\  "name": "order-flow",
         \\  "version": "1.0.0",
-        \\  "searchAttributes": [
+        \\  "search_attributes": [
         \\    {"name": "customer_id", "type": "string", "from": "input.customer_id"},
         \\    {"name": "order_amount", "type": "number", "from": "input.amount"}
         \\  ],
@@ -1025,7 +973,7 @@ test "parseWorkflow: with search attributes" {
         \\}
     ;
 
-    var def = try parseWorkflow(allocator, json);
+    var def = try parseWorkflow(allocator, json, null);
     defer def.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 2), def.search_attributes.len);
@@ -1058,21 +1006,12 @@ test "parseWorkflow: with custom terminals" {
         \\}
     ;
 
-    var def = try parseWorkflow(allocator, json);
+    var def = try parseWorkflow(allocator, json, null);
     defer def.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 2), def.terminals.len);
 }
 
-test "parseTimeString" {
-    const testing = std.testing;
-
-    try testing.expectEqual(@as(?i64, 5000), parseTimeString("5s"));
-    try testing.expectEqual(@as(?i64, 300000), parseTimeString("5m"));
-    try testing.expectEqual(@as(?i64, 3600000), parseTimeString("1h"));
-    try testing.expectEqual(@as(?i64, 86400000), parseTimeString("1d"));
-    try testing.expectEqual(@as(?i64, null), parseTimeString("x"));
-}
 
 test "parseWorkflow: YAML with inline plans" {
     const testing = std.testing;
@@ -1099,7 +1038,7 @@ test "parseWorkflow: YAML with inline plans" {
         \\    failure: flo.Failed
     ;
 
-    var def = parseWorkflow(allocator, yaml) catch |err| {
+    var def = parseWorkflow(allocator, yaml, null) catch |err| {
         std.debug.print("Parse error: {any}\n", .{err});
         return err;
     };
@@ -1139,7 +1078,7 @@ test "parseWorkflow: YAML with schedule block" {
         \\      failure: flo.Failed
     ;
 
-    var def = parseWorkflow(allocator, yaml) catch |err| {
+    var def = parseWorkflow(allocator, yaml, null) catch |err| {
         std.debug.print("Parse error: {any}\n", .{err});
         return err;
     };
@@ -1168,7 +1107,7 @@ test "parseWorkflow: YAML with output mapping" {
         \\    success: flo.Completed
     ;
 
-    var def = parseWorkflow(allocator, yaml) catch |err| {
+    var def = parseWorkflow(allocator, yaml, null) catch |err| {
         std.debug.print("Parse error: {any}\n", .{err});
         return err;
     };
@@ -1197,7 +1136,7 @@ test "parseWorkflow: YAML with direct step output passthrough" {
         \\    success: flo.Completed
     ;
 
-    var def = parseWorkflow(allocator, yaml) catch |err| {
+    var def = parseWorkflow(allocator, yaml, null) catch |err| {
         std.debug.print("Parse error: {any}\n", .{err});
         return err;
     };
@@ -1214,8 +1153,8 @@ test "parseWorkflow: a count or delay that doesn't fit its field is refused" {
     for ([_][]const u8{
         "\"retry\": { \"max_attempts\": -1 }",
         "\"retry\": { \"initial_delay_ms\": 5000000000 }",
-        "\"poll\": { \"maxAttempts\": 5000000000 }",
-        "\"poll\": { \"baseDelayMs\": -1 }",
+        "\"poll\": { \"max_attempts\": 5000000000 }",
+        "\"poll\": { \"base_delay_ms\": -1 }",
     }) |field| {
         const json = try std.fmt.allocPrint(allocator,
             \\{{ "kind": "Workflow", "name": "w", "version": "1",
@@ -1223,11 +1162,174 @@ test "parseWorkflow: a count or delay that doesn't fit its field is refused" {
             \\    "transitions": {{ "success": "flo.Completed", "failure": "flo.Failed" }} }} }}
         , .{field});
         defer allocator.free(json);
-        try testing.expectError(ParseError.InvalidFieldType, parseWorkflow(allocator, json));
+        try testing.expectError(ParseError.InvalidFieldType, parseWorkflow(allocator, json, null));
     }
 }
 
-test "parseTimeString: a duration that doesn't fit is invalid" {
-    try std.testing.expectEqual(@as(?i64, null), parseTimeString("106751991168d"));
-    try std.testing.expectEqual(@as(?i64, null), parseTimeString("9223372036854775807s"));
+
+/// The diagnostic a definition is refused with.
+fn expectRefused(content: []const u8, expected: ParseError, message: []const u8) !void {
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(expected, parseWorkflow(std.testing.allocator, content, &diag));
+    try std.testing.expectEqualStrings(message, diag.message());
+}
+
+fn wrap(comptime start_extra: []const u8, comptime top_extra: []const u8) []const u8 {
+    return
+    \\{ "kind": "Workflow", "name": "w", "version": "1",
+    ++ top_extra ++
+    \\  "start": { "run": "@actions/x",
+    ++ start_extra ++
+    \\    "transitions": { "success": "flo.Completed" } } }
+    ;
+}
+
+test "parseWorkflow: an unknown key is refused by name and place" {
+    try expectRefused(wrap("", "\"trasitions\": {},"), ParseError.UnknownKey, "unknown key \"trasitions\" at the top level");
+    try expectRefused(wrap("\"transition\": {},", ""), ParseError.UnknownKey, "unknown key \"transition\" at start");
+    try expectRefused(wrap("\"retry\": { \"max\": 3 },", ""), ParseError.UnknownKey, "unknown key \"max\" at start.retry");
+    try expectRefused(wrap("\"poll\": { \"maxAttempts\": 3 },", ""), ParseError.UnknownKey, "unknown key \"maxAttempts\" at start.poll");
+    try expectRefused(wrap("\"inputMapping\": \"{}\",", ""), ParseError.UnknownKey, "unknown key \"inputMapping\" at start");
+    try expectRefused(wrap("", "\"steps\": { \"b\": { \"wait_for_signal\": { \"type\": \"go\", \"timeoutMs\": 5 } } },"), ParseError.UnknownKey, "unknown key \"timeoutMs\" at steps.b.wait_for_signal");
+    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"s\", \"consumerGroup\": \"g\" },"), ParseError.UnknownKey, "unknown key \"consumerGroup\" at trigger");
+    try expectRefused(wrap("", "\"search_attributes\": [ { \"name\": \"a\", \"from\": \"$.input.a\", \"kind\": \"string\" } ],"), ParseError.UnknownKey, "unknown key \"kind\" at search_attributes[0]");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldownMs": 1 } } ] } },
+    ), ParseError.UnknownKey, "unknown key \"cooldownMs\" at plans.p.executors[0].breaker");
+    try expectRefused(wrap("", "\"terminals\": { \"T\": { \"status\": \"failed\", \"code\": 1 } },"), ParseError.UnknownKey, "unknown key \"code\" at terminals.T");
+}
+
+test "parseWorkflow: a value of the wrong kind is refused, not defaulted" {
+    try expectRefused(wrap("\"retry\": \"3\",", ""), ParseError.InvalidFieldType, "\"retry\" must be a map, not a string at start");
+    try expectRefused(wrap("\"retry\": { \"max_attempts\": \"3\" },", ""), ParseError.InvalidFieldType, "\"max_attempts\" must be an integer, not a string at start.retry");
+    try expectRefused(wrap("", "\"steps\": { \"b\": \"oops\" },"), ParseError.InvalidFieldType, "a step must be a map, not a string at steps.b");
+    try expectRefused(
+        \\{ "kind": "Workflow", "name": "w", "version": "1",
+        \\  "start": { "run": "@actions/x", "transitions": { "success": 3 } } }
+    , ParseError.InvalidFieldType, "\"success\" must be a step or terminal name, not an integer at start.transitions");
+    try expectRefused(wrap("", "\"search_attributes\": [ \"a\" ],"), ParseError.InvalidFieldType, "a search attribute must be a map, not a string at search_attributes[0]");
+}
+
+test "parseWorkflow: an unknown enum value is refused, not defaulted" {
+    try expectRefused(wrap("\"retry\": { \"backoff\": \"exp-jitter-200ms\" },", ""), ParseError.InvalidBackoffType, "\"backoff\" must be one of constant|linear|exponential|exponential_jitter, not \"exp-jitter-200ms\" at start.retry");
+    try expectRefused(wrap("", "\"terminals\": { \"T\": { \"status\": \"done\" } },"), ParseError.InvalidFieldType, "\"status\" must be one of completed|failed|cancelled|timed_out, not \"done\" at terminals.T");
+    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"s\", \"mode\": \"key-shared\" },"), ParseError.InvalidFieldType, "\"mode\" must be one of shared|exclusive|key_shared, not \"key-shared\" at trigger");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "selection": "round_robin", "executors": [ { "name": "e", "run": "@actions/e" } ] } },
+    ), ParseError.InvalidSelectionStrategy, "\"selection\" must be one of static-order|round-robin|random|health-weighted, not \"round_robin\" at plans.p");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "tracking": { "mode": "later" } } ] } },
+    ), ParseError.InvalidTrackingMode, "\"mode\" must be one of sync|async, not \"later\" at plans.p.executors[0].tracking");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "fallback": { "value": "{}", "condition": "any" } } },
+    ), ParseError.InvalidFallbackCondition, "\"condition\" must be one of exhausted|any_error, not \"any\" at plans.p.fallback");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "health": { "window": "5m" } } },
+    ), ParseError.UnknownKey, "unknown key \"window\" at plans.p.health");
+}
+
+test "parseWorkflow: a required key that was silently optional is required" {
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e" } ], "cache": { "ttl_ms": 5 } } },
+    ), ParseError.MissingRequiredField, "missing required key \"key\" at plans.p.cache");
+    try expectRefused(wrap("", "\"search_attributes\": [ { \"name\": \"a\" } ],"), ParseError.MissingRequiredField, "missing required key \"from\" at search_attributes[0]");
+    try expectRefused(
+        \\{ "kind": "Workflow", "name": "w", "version": "1", "start": { "transitions": {} } }
+    , ParseError.MissingRequiredField, "a step needs \"run\" or \"wait_for_signal\" at start");
+}
+
+test "parseWorkflow: a duplicated key is refused by name, in JSON and YAML" {
+    try expectRefused(
+        \\{ "kind": "Workflow", "name": "w", "version": "1",
+        \\  "start": { "run": "@actions/x", "run": "@actions/y", "transitions": {} } }
+    , ParseError.DuplicateKey, "key \"run\" appears twice at start");
+    try expectRefused(
+        \\kind: Workflow
+        \\name: w
+        \\version: "1"
+        \\start:
+        \\  run: "@actions/x"
+        \\  transitions:
+        \\    success: flo.Completed
+        \\    success: flo.Failed
+    , ParseError.DuplicateKey, "key \"success\" appears twice at start.transitions");
+}
+
+test "parseWorkflow: snake_case keys parse" {
+    const allocator = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var def = parseWorkflow(allocator,
+        \\kind: Workflow
+        \\name: all-keys
+        \\version: "1"
+        \\search_attributes:
+        \\  - name: customer
+        \\    from: $.input.customer
+        \\trigger:
+        \\  stream: orders
+        \\  consumer_group: g
+        \\  batch_size: 2
+        \\  batch_timeout_ms: 100
+        \\plans:
+        \\  pay:
+        \\    selection: round-robin
+        \\    errors:
+        \\      retryable: [timeout]
+        \\    executors:
+        \\      - name: a
+        \\        run: "@actions/a"
+        \\        rate_limit:
+        \\          max_per_second: 5
+        \\        breaker:
+        \\          failure_threshold: 3
+        \\          cooldown_ms: 100
+        \\          half_open_max_calls: 1
+        \\    health:
+        \\      window_ms: 60000
+        \\      min_samples: 10
+        \\    cache:
+        \\      ttl_ms: 1000
+        \\      key: "k"
+        \\      invalidate_on: [x]
+        \\start:
+        \\  run: "@plan/pay"
+        \\  input_mapping: '{"a": "$.input.a"}'
+        \\  poll:
+        \\    initial_delay_ms: 0
+        \\    max_attempts: 2
+        \\    base_delay_ms: 10
+        \\    max_delay_ms: 20
+        \\  transitions:
+        \\    success: wait
+        \\steps:
+        \\  wait:
+        \\    wait_for_signal:
+        \\      type: approval
+        \\      timeout_ms: 1000
+        \\      on_timeout: flo.Failed
+        \\    transitions:
+        \\      success: flo.Completed
+    , &diag) catch |err| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return err;
+    };
+    defer def.deinit(allocator);
+    try std.testing.expectEqualStrings("{\"a\": \"$.input.a\"}", def.start.run.input_mapping.?);
+    try std.testing.expectEqual(@as(u32, 2), def.start.run.poll.?.max_attempts);
+    try std.testing.expectEqual(@as(?i64, 1000), def.steps[0].step.wait_for_signal.timeout_ms);
+    try std.testing.expectEqualStrings("g", def.trigger.?.consumer_group.?);
+    try std.testing.expectEqual(@as(?u32, 5), def.plans[0].executors[0].rate_limit.?.max_per_second);
+    try std.testing.expectEqual(@as(u32, 10), def.plans[0].health_config.?.min_samples);
+    try std.testing.expectEqual(@as(i64, 60000), def.plans[0].health_config.?.window_ms);
+    try std.testing.expectEqualStrings("k", def.plans[0].cache_config.?.key_template);
+    try std.testing.expectEqual(@as(usize, 1), def.plans[0].error_classification.?.retryable.len);
+}
+
+test "parseWorkflow: a negative or zero duration is refused" {
+    try expectRefused(wrap("\"poll\": { \"initial_delay_ms\": -1 },", ""), ParseError.InvalidFieldType, "\"initial_delay_ms\" must be at least 0, not -1 at start.poll");
+    try expectRefused(wrap("", "\"steps\": { \"b\": { \"wait_for_signal\": { \"type\": \"go\", \"timeout_ms\": 0 } } },"), ParseError.InvalidFieldType, "\"timeout_ms\" must be at least 1, not 0 at steps.b.wait_for_signal");
+    try expectRefused(wrap("", "\"schedule\": { \"interval\": -5 },"), ParseError.InvalidFieldType, "\"interval\" must be at least 1, not -5 at schedule");
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldown_ms": -1 }, "tracking": { "timeout_ms": 0 } } ] } },
+    ), ParseError.InvalidFieldType, "\"cooldown_ms\" must be at least 1, not -1 at plans.p.executors[0].breaker");
 }

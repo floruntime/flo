@@ -489,8 +489,13 @@ pub const ProcessingHandler = struct {
 
         // Parse the YAML/JSON definition, using the request namespace as fallback
         const req_ns: ?[]const u8 = if (req.namespace.len > 0) req.namespace else null;
-        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, req_ns) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid job definition");
+        var diag: parser.Diagnostic = .{};
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, req_ns, &diag) catch |err| {
+            if (err == error.OutOfMemory) {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
+            } else {
+                shard.sendErrorResponse(conn, req.header.request_id, .bad_request, diag.message());
+            }
             return;
         };
         defer def.deinit(self.allocator);
@@ -943,7 +948,11 @@ pub const ProcessingHandler = struct {
         // endpoints and lookups that name none resolve alike on every replica
         // and restart. `def` stays alive for createPipeline, which deep-copies
         // what it keeps.
-        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw) catch return;
+        var diag: parser.Diagnostic = .{};
+        var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw, &diag) catch |err| {
+            log.err("processing job {s} not started: {s}", .{ job_id, if (err == error.OutOfMemory) "out of memory" else diag.message() });
+            return;
+        };
         defer def.deinit(self.allocator);
         // The submit checked these; the applier holds every replica to them.
         var why_buf: [256]u8 = undefined;
@@ -2008,7 +2017,6 @@ test "ProcessingHandler: applyOperatorChain with passthrough operator" {
     var spec = definition.OperatorSpec{
         .type_name = "passthrough",
         .name = "test-pass",
-        .module = "",
         .config = null,
     };
     var create_result = try native_registry.create(allocator, &spec, null);
@@ -2036,7 +2044,6 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
     var spec = definition.OperatorSpec{
         .type_name = "filter",
         .name = "test-filter",
-        .module = "",
         .config = &config_entries,
     };
     var create_result = try native_registry.create(allocator, &spec, null);

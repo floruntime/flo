@@ -390,7 +390,7 @@ plans:
       - name: stripe
         run: "@actions/charge-stripe"
         priority: 100
-        breaker: { failureThreshold: 5, cooldownMs: 60000 }
+        breaker: { failure_threshold: 5, cooldown_ms: 60000 }
       - name: braintree
         run: "@actions/charge-braintree"
         priority: 90

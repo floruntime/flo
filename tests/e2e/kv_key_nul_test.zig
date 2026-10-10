@@ -79,7 +79,7 @@ test "e2e/kv: a pipeline's KV sink drops a record whose key holds a NUL" {
         \\operators.[0].type: keyby
         \\operators.[0].name: by-id
         \\operators.[0].key_expression: $.id
-        \\sinks.[0].kv.write_mode: upsert
+        \\sinks.[0].kv.namespace: default
     ;
     const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "nul-sink.yaml");
     defer stdx.testing.cleanupTempFile(testing.allocator, path);

@@ -80,11 +80,9 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
     defer ctx.allocator.free(content);
 
     // Phase 1: Parse (with pre-flight checks for better diagnostics)
-    var def = wf_parser.parseWorkflow(ctx.allocator, content) catch |err| {
-        ctx.printErr("FAIL  {s}\n", .{workflowParseErrorString(err)});
-        if (err == error.MissingRequiredField) {
-            printWorkflowFieldHints(ctx, content);
-        }
+    var diag: wf_parser.Diagnostic = .{};
+    var def = wf_parser.parseWorkflow(ctx.allocator, content, &diag) catch |err| {
+        ctx.printErr("FAIL  {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
         return error.CommandFailed;
     };
     defer def.deinit(ctx.allocator);
@@ -128,101 +126,6 @@ fn runValidateWorkflow(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-fn workflowParseErrorString(err: wf_parser.ParseError) []const u8 {
-    return switch (err) {
-        error.InvalidFormat => "invalid YAML/JSON format",
-        error.MissingRequiredField => "missing required field",
-        error.InvalidFieldType => "field has wrong type",
-        error.InvalidKind => "kind must be 'Workflow'",
-        error.InvalidIdempotencyMode => "idempotency must be 'none', 'optional', or 'required'",
-        error.InvalidSelectionStrategy => "invalid selection strategy (use: static-order, round-robin, random, or health-weighted)",
-        error.InvalidBackoffType => "invalid backoff type (use: constant, linear, or exponential)",
-        error.InvalidSearchAttrType => "invalid search attribute type (use: string, number, or timestamp)",
-        error.InvalidFallbackCondition => "invalid fallback condition",
-        error.InvalidTrackingMode => "invalid tracking mode (use: sync or async)",
-        error.DuplicateStepName => "duplicate step name",
-        error.DuplicateExecutorName => "duplicate executor name in plan",
-        error.DuplicatePlanName => "duplicate inline plan name",
-        error.EmptyExecutors => "plan has empty executors list",
-        error.OutOfMemory => "out of memory",
-    };
-}
-
-/// When MissingRequiredField fires, scan the raw YAML to hint at what's actually missing.
-fn printWorkflowFieldHints(ctx: *commander.Context, content: []const u8) void {
-    // Check top-level required fields
-    if (!yamlHasKey(content, "kind"))
-        ctx.printErr("HINT  missing top-level 'kind: Workflow'\n", .{});
-    if (!yamlHasKey(content, "name"))
-        ctx.printErr("HINT  missing top-level 'name:'\n", .{});
-    if (!yamlHasKey(content, "version"))
-        ctx.printErr("HINT  missing top-level 'version:'\n", .{});
-    if (!yamlHasKey(content, "start"))
-        ctx.printErr("HINT  missing top-level 'start:' step\n", .{});
-
-    // Check common executor mistakes inside plans
-    if (yamlHasKey(content, "executors")) {
-        const has_action_in_list = yamlHasArrayItemKey(content, "action");
-        const has_run_in_list = yamlHasArrayItemKey(content, "run");
-        const has_name_in_list = yamlHasArrayItemKey(content, "name");
-
-        if (has_action_in_list and !has_run_in_list) {
-            ctx.printErr("HINT  executor uses 'action:' — did you mean 'run:'? (executors need 'name:' and 'run:' fields)\n", .{});
-        } else if (!has_run_in_list) {
-            ctx.printErr("HINT  executor may be missing 'run:' field (executors need 'name:' and 'run:')\n", .{});
-        }
-        if (!has_name_in_list) {
-            ctx.printErr("HINT  executor is missing 'name:' field\n", .{});
-        }
-    }
-
-    // Check signal steps
-    if (yamlHasKey(content, "waitForSignal")) {
-        if (!yamlLineHasKey(content, "type:")) {
-            ctx.printErr("HINT  waitForSignal step is missing 'type:'\n", .{});
-        }
-    }
-}
-
-/// Quick heuristic: does the YAML contain a line starting with this key at any indent?
-fn yamlHasKey(content: []const u8, key: []const u8) bool {
-    var iter = mem.splitScalar(u8, content, '\n');
-    while (iter.next()) |line| {
-        const trimmed = mem.trimStart(u8, line, " \t");
-        if (mem.startsWith(u8, trimmed, key)) return true;
-    }
-    return false;
-}
-
-/// Check if any line contains this exact token (e.g. "run:" not inside a comment)
-fn yamlLineHasKey(content: []const u8, key: []const u8) bool {
-    var iter = mem.splitScalar(u8, content, '\n');
-    while (iter.next()) |line| {
-        const trimmed = mem.trimStart(u8, line, " \t-");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (mem.startsWith(u8, trimmed, key)) return true;
-    }
-    return false;
-}
-
-/// Check if any YAML array item line (starting with "- ") contains "key:"
-fn yamlHasArrayItemKey(content: []const u8, key: []const u8) bool {
-    var iter = mem.splitScalar(u8, content, '\n');
-    while (iter.next()) |line| {
-        const trimmed = mem.trimStart(u8, line, " \t");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        // Must be an array item line
-        if (!mem.startsWith(u8, trimmed, "- ")) continue;
-        const item = mem.trimStart(u8, trimmed[2..], " \t");
-        if (mem.startsWith(u8, item, key) and item.len > key.len and item[key.len] == ':') return true;
-    }
-    return false;
-}
-
-// =============================================================================
-// Processing Validation
-// =============================================================================
-
 fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getString("file") orelse "";
     if (file_path.len == 0) {
@@ -234,8 +137,9 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     defer ctx.allocator.free(content);
 
     // Phase 1: Parse
-    var def = proc_parser.parseJobDefinition(ctx.allocator, content) catch |err| {
-        ctx.printErr("FAIL  Parse error: {s}\n", .{processingParseErrorString(err)});
+    var diag: proc_parser.Diagnostic = .{};
+    var def = proc_parser.parseJobDefinition(ctx.allocator, content, &diag) catch |err| {
+        ctx.printErr("FAIL  {s}\n", .{if (err == error.OutOfMemory) "out of memory" else diag.message()});
         return error.CommandFailed;
     };
     defer def.deinit(ctx.allocator);
@@ -372,25 +276,6 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
         ctx.print("PASSED: processing definition is valid\n", .{});
     }
 }
-
-fn processingParseErrorString(err: proc_parser.ParseError) []const u8 {
-    return switch (err) {
-        error.MissingRequiredField => "missing required field (kind or name)",
-        error.InvalidKind => "kind must be 'Processing'",
-        error.MissingSource => "missing source definition",
-        error.MissingSink => "missing sink definition",
-        error.MissingSourceStream => "source is missing stream name",
-        error.MissingSinkTarget => "sink is missing target name",
-        error.InvalidParallelism => "parallelism must be a positive integer",
-        error.InvalidPartitions => "invalid partitions value",
-        error.InvalidFormat => "invalid YAML/JSON format",
-        error.OutOfMemory => "out of memory",
-    };
-}
-
-// =============================================================================
-// Shared Helpers
-// =============================================================================
 
 fn readFile(ctx: *commander.Context, file_path: []const u8) ?[]u8 {
     const file = @import("stdx").fs.openFile(file_path, .{}) catch |err| {

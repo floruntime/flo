@@ -661,7 +661,7 @@ pub const TimestampAttr = struct {
 };
 
 /// Custom searchable fields set by workflow definition
-/// Extracted from input JSON based on `searchAttributes` config
+/// Extracted from input JSON based on `search_attributes` config
 pub const SearchAttributes = struct {
     /// String attributes (indexed for exact match)
     string_attrs: []StringAttr,
@@ -1233,7 +1233,7 @@ pub const RunSnapshot = struct {
 pub const Signal = struct {
     /// Unique signal identifier
     signal_id: []const u8,
-    /// Signal type (matches waitForSignal.type in definition)
+    /// Signal type (matches wait_for_signal.type in definition)
     signal_type: []const u8,
     /// Optional payload JSON
     payload: ?[]const u8,
