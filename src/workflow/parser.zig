@@ -551,6 +551,8 @@ fn parseSteps(allocator: Allocator, root: JsonValue, d: D) ParseError![]NamedSte
     return steps.toOwnedSlice(allocator) catch ParseError.OutOfMemory;
 }
 
+pub const MAX_TERMINAL_NAME: usize = 256;
+
 fn parseTerminals(allocator: Allocator, root: JsonValue, d: D) ParseError![]Terminal {
     const terms_obj = try optObject(d, root, "terminals") orelse return allocator.alloc(Terminal, 0) catch ParseError.OutOfMemory;
     const terms_mark = d.push("terminals");
@@ -566,6 +568,8 @@ fn parseTerminals(allocator: Allocator, root: JsonValue, d: D) ParseError![]Term
     while (iter.next()) |entry| {
         const term_name = entry.key_ptr.*;
         const term_obj = entry.value_ptr.*;
+        // A terminal's name is the detail of the run's last history event.
+        if (term_name.len > MAX_TERMINAL_NAME) return d.fail(ParseError.InvalidFieldType, "a terminal name is at most {d} bytes, not {d}", .{ MAX_TERMINAL_NAME, term_name.len });
         if (term_obj != .object) return wrongKind(d, term_name, "a map", term_obj);
 
         const mark = d.push(term_name);
@@ -799,7 +803,8 @@ fn parseExecutorConfig(allocator: Allocator, obj: JsonValue, d: D) ParseError!Ex
 fn parseCircuitBreakerConfig(obj: JsonValue, d: D) ParseError!CircuitBreakerConfig {
     try checkKeys(d, obj, &.{ "failure_threshold", "cooldown_ms", "half_open_max_calls" });
     return .{
-        .failure_threshold = try optIntAs(u32, d, obj, "failure_threshold") orelse 5,
+        // Compared with a signed count of failures, so it stays in i32 range.
+        .failure_threshold = try optIntAs(u31, d, obj, "failure_threshold") orelse 5,
         .cooldown_ms = try optAtLeast(d, obj, "cooldown_ms", 1) orelse 60000,
         .half_open_max_calls = try optIntAs(u32, d, obj, "half_open_max_calls") orelse 2,
     };
@@ -1194,6 +1199,17 @@ test "parseWorkflow: an unknown key is refused by name and place" {
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "cooldownMs": 1 } } ] } },
     ), ParseError.UnknownKey, "unknown key \"cooldownMs\" at plans.p.executors[0].breaker");
     try expectRefused(wrap("", "\"terminals\": { \"T\": { \"status\": \"failed\", \"code\": 1 } },"), ParseError.UnknownKey, "unknown key \"code\" at terminals.T");
+}
+
+test "parseWorkflow: a breaker threshold past what a failure count holds is refused" {
+    try expectRefused(wrap("",
+        \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "failure_threshold": 3000000000 } } ] } },
+    ), ParseError.InvalidFieldType, "\"failure_threshold\" must be from 0 to 2147483647, not 3000000000 at plans.p.executors[0].breaker");
+}
+
+test "parseWorkflow: a terminal name past its limit is refused" {
+    const name = "T" ** (MAX_TERMINAL_NAME + 1);
+    try expectRefused(wrap("", "\"terminals\": { \"" ++ name ++ "\": { \"status\": \"cancelled\" } },"), ParseError.InvalidFieldType, "a terminal name is at most 256 bytes, not 257 at terminals");
 }
 
 test "parseWorkflow: a value of the wrong kind is refused, not defaulted" {

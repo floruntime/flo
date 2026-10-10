@@ -58,8 +58,9 @@ test "e2e/dashboard: workflow signal reaches a running run" {
     });
     defer ctx.deinit();
 
-    // Define + start a run via the CLI (reliable). The start action has no
-    // worker, so the run stays RUNNING and is signalable.
+    // Define + start a run via the CLI (reliable). The start action is
+    // registered but has no worker, so the run waits on it and takes a
+    // signal; a finished run refuses one.
     const def =
         \\kind: Workflow
         \\name: sig-wf
@@ -70,8 +71,14 @@ test "e2e/dashboard: workflow signal reaches a running run" {
     ;
     const path = try writeDottedToTempYaml(testing.allocator, def, "sig-wf.yaml");
     defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "action", "register", "approval-action" });
     try ctx.exec(&.{ "workflow", "create", "-f", path });
     try ctx.exec(&.{ "workflow", "start", "sig-wf", "{}", "--run-id", "sig-run-1" });
+
+    var status = try ctx.cli.run(&.{ "workflow", "status", "sig-run-1" });
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.exit_code);
+    try testing.expect(status.stdoutContains("\nStatus:   waiting\n"));
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
