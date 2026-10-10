@@ -4,6 +4,11 @@
 //! hot (RAM ring buffer) → warm (disk segments) → cold (archive) tiers.
 //! All settings live under the [storage] TOML section.
 
+/// The smallest hot buffer: it sizes each partition's ring, and an entry
+/// larger than the ring is refused, so the largest entry (a full
+/// transaction batch) must fit.
+pub const MIN_HOT_BUFFER: usize = 2 * 1024 * 1024;
+
 /// Configuration for tiered storage (parsed from [storage] section)
 pub const TieredLogConfig = struct {
     /// Hot tier RAM buffer capacity in bytes (default: 64MB).

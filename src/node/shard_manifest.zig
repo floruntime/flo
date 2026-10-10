@@ -89,6 +89,7 @@ pub const ShardManifest = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
         defer parsed.deinit();
 
+        if (parsed.value != .object) return error.InvalidManifest;
         const root = parsed.value.object;
 
         var result = ShardManifest{};

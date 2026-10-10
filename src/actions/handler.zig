@@ -596,7 +596,7 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        self.replayRegister(qkey, value, wallNs());
+        _ = self.replayRegister(qkey, value, wallNs());
         var ver_buf: [12]u8 = undefined;
         return self.registerOutcome(req.namespace, name, &ver_buf);
     }
@@ -672,7 +672,7 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        self.replayInvoke(run_id_str, value, wallNs());
+        _ = self.replayInvoke(run_id_str, value, wallNs());
         return self.invoked();
     }
 
@@ -895,7 +895,7 @@ pub const ActionsHandler = struct {
                 };
                 return .{ .parked = proposed };
             }
-            self.replayDelete(qkey);
+            _ = self.replayDelete(qkey);
             return .{ .action_deleted = {} };
         }
 
@@ -1210,7 +1210,7 @@ pub const ActionsHandler = struct {
         var value_buf: [65536]u8 = undefined;
         const value = encodeRunUpdateValue(&value_buf, u) orelse return .{ .refused = .{ .status = .bad_request, .message = "run update too large" } };
         const s = shard orelse {
-            self.replayUpdateRun(run_id, value, wallNs());
+            _ = self.replayUpdateRun(run_id, value, wallNs());
             return .applied;
         };
         // Proposed, not waited for: the dispatcher parks the worker on it.
@@ -1301,13 +1301,13 @@ pub const ActionsHandler = struct {
     }
 
     /// Thunk for ReplayRegistry → ActionsHandler.replayEntry.
-    fn replayEntryThunk(ctx: *anyopaque, e: *const Entry) void {
+    fn replayEntryThunk(ctx: *anyopaque, e: *const Entry) persistence.ApplyOutcome {
         const self: *ActionsHandler = @ptrCast(@alignCast(ctx));
-        self.replayEntry(e);
+        return self.replayEntry(e);
     }
 
     /// Dispatch a replayed entry to the appropriate replay handler.
-    pub fn replayEntry(self: *ActionsHandler, e: *const Entry) void {
+    pub fn replayEntry(self: *ActionsHandler, e: *const Entry) persistence.ApplyOutcome {
         const etype: EntryType = @enumFromInt(e.header.entry_type);
         // Workflows on other shard threads read the runs map under this
         // lock. Nothing holds it across an apply, so taking it here cannot
@@ -1318,19 +1318,19 @@ pub const ActionsHandler = struct {
             self.last_invoked_run_id = null;
             self.last_invoke_existed = false;
         }
-        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return;
-        switch (etype) {
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return .failed;
+        return switch (etype) {
             .action_register => self.replayRegister(cmd.key, cmd.value, e.header.timestamp_ns),
             .action_delete => self.replayDelete(cmd.key),
             .action_invoke => self.replayInvoke(cmd.key, cmd.value, e.header.timestamp_ns),
             .action_update_run => self.replayUpdateRun(cmd.key, cmd.value, e.header.timestamp_ns),
-            else => {},
-        }
+            else => .failed,
+        };
     }
 
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) void {
+    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
         var name = key;
@@ -1347,21 +1347,21 @@ pub const ActionsHandler = struct {
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(key)) |old| self.freeAction(old.value);
 
-        const owned_key = self.allocator.dupe(u8, key) catch return;
+        const owned_key = self.allocator.dupe(u8, key) catch return .failed;
         const owned_name = self.allocator.dupe(u8, name) catch {
             self.allocator.free(owned_key);
-            return;
+            return .failed;
         };
         const owned_ns = self.allocator.dupe(u8, namespace) catch {
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
-            return;
+            return .failed;
         };
         const owned_owner = self.allocator.dupe(u8, meta.owner) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
-            return;
+            return .failed;
         };
         self.actions.put(owned_key, .{
             .key_owned = owned_key,
@@ -1379,7 +1379,9 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
+            return .failed;
         };
+        return .applied;
     }
 
     fn freeAction(self: *ActionsHandler, rec: ActionRecord) void {
@@ -1391,45 +1393,49 @@ pub const ActionsHandler = struct {
 
     /// Remove an action on replay of a delete entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    fn replayDelete(self: *ActionsHandler, key: []const u8) void {
+    fn replayDelete(self: *ActionsHandler, key: []const u8) persistence.ApplyOutcome {
         if (self.actions.fetchRemove(key)) |old| self.freeAction(old.value);
+        return .applied;
     }
 
     /// Rebuild a RunRecord from a persisted invoke entry.
-    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) void {
+    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
         // An id already taken is refused, not overwritten: the run under it
         // may be running or finished, and its caller waits on that run.
         if (self.runs.contains(run_id)) {
             self.last_invoke_existed = true;
             // A workflow's own invoke has no client to see the refusal.
             log.warn("action invoke refused: run id '{s}' is already in use", .{run_id});
-            return;
+            // Refused, and the client is answered so: not a loss.
+            return .applied;
         }
-        const v = InvokeValue.parse(value) orelse return;
-        const action_name = v.action_name;
-        const status = v.status;
-        const created_at_ms: i64 = @intCast(stamp_ns / std.time.ns_per_ms);
-        const input: ?[]const u8 = if (v.input.len > 0) self.allocator.dupe(u8, v.input) catch null else null;
-        const labels: ?[]const u8 = if (v.labels.len > 0) self.allocator.dupe(u8, v.labels) catch null else null;
-        const caller_run_id: ?[]const u8 = if (v.caller_run_id.len > 0) self.allocator.dupe(u8, v.caller_run_id) catch null else null;
-        const caller_workflow_name: ?[]const u8 = if (v.caller_workflow_name.len > 0) self.allocator.dupe(u8, v.caller_workflow_name) catch null else null;
-        const namespace = v.namespace;
+        const v = InvokeValue.parse(value) orelse return .failed;
+        self.last_invoked_run_id = self.insertRun(run_id, v, stamp_ns) catch return .failed;
+        return .applied;
+    }
+
+    /// Add the run an invoke entry creates, all of it or nothing.
+    fn insertRun(self: *ActionsHandler, run_id: []const u8, v: InvokeValue, stamp_ns: u64) ![]const u8 {
+        const input = try self.dupeNonEmpty(v.input);
+        errdefer if (input) |x| self.allocator.free(x);
+        const labels = try self.dupeNonEmpty(v.labels);
+        errdefer if (labels) |x| self.allocator.free(x);
+        const caller_run_id = try self.dupeNonEmpty(v.caller_run_id);
+        errdefer if (caller_run_id) |x| self.allocator.free(x);
+        const caller_workflow_name = try self.dupeNonEmpty(v.caller_workflow_name);
+        errdefer if (caller_workflow_name) |x| self.allocator.free(x);
 
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const arec = if (defKey(&kbuf, namespace, action_name)) |k| self.actions.get(k) else null;
+        const arec = if (defKey(&kbuf, v.namespace, v.action_name)) |k| self.actions.get(k) else null;
         const max_retries: u32 = if (arec) |a| a.max_retries else 3;
-        const owned_run_id = self.allocator.dupe(u8, run_id) catch return;
-        const owned_action_name = self.allocator.dupe(u8, action_name) catch {
-            self.allocator.free(owned_run_id);
-            return;
-        };
-        const owned_ns = self.allocator.dupe(u8, namespace) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_action_name);
-            return;
-        };
+        const owned_run_id = try self.allocator.dupe(u8, run_id);
+        errdefer self.allocator.free(owned_run_id);
+        const owned_action_name = try self.allocator.dupe(u8, v.action_name);
+        errdefer self.allocator.free(owned_action_name);
+        const owned_ns = try self.allocator.dupe(u8, v.namespace);
+        errdefer self.allocator.free(owned_ns);
 
-        self.runs.put(owned_run_id, .{
+        try self.runs.put(owned_run_id, .{
             .run_id_owned = owned_run_id,
             .action_name_owned = owned_action_name,
             .namespace_owned = owned_ns,
@@ -1438,21 +1444,19 @@ pub const ActionsHandler = struct {
             .caller_run_id_owned = caller_run_id,
             .caller_workflow_name_owned = caller_workflow_name,
             .source = if (caller_run_id != null) @as(u8, 1) else @as(u8, 0),
-            .status = status,
-            .created_at_ms = created_at_ms,
+            .status = v.status,
+            .created_at_ms = @intCast(stamp_ns / std.time.ns_per_ms),
             .started_at_ms = null,
             .completed_at_ms = null,
             .max_retries = max_retries,
-        }) catch {
-            self.allocator.free(owned_run_id);
-            self.allocator.free(owned_action_name);
-            self.allocator.free(owned_ns);
-            if (input) |inp| self.allocator.free(inp);
-            if (labels) |lbl| self.allocator.free(lbl);
-            if (caller_run_id) |c| self.allocator.free(c);
-            if (caller_workflow_name) |c| self.allocator.free(c);
-        };
-        self.last_invoked_run_id = owned_run_id;
+        });
+        return owned_run_id;
+    }
+
+    /// An owned copy of `bytes`, or null when it is empty.
+    fn dupeNonEmpty(self: *ActionsHandler, bytes: []const u8) !?[]const u8 {
+        if (bytes.len == 0) return null;
+        return try self.allocator.dupe(u8, bytes);
     }
 
     /// The namespace an invoke value names (its last field), "default" if
@@ -1521,103 +1525,114 @@ pub const ActionsHandler = struct {
     }
 
     /// Apply a run status update from its entry.
-    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) void {
+    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
         var off: usize = 0;
 
         // status
-        if (off >= value.len) return;
-        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return;
+        if (off >= value.len) return .failed;
+        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return .failed;
         off += 1;
 
         // started_at_ms
-        if (off >= value.len) return;
+        if (off >= value.len) return .failed;
         const has_started = value[off] == 1;
         off += 1;
         var started_at_ms: ?i64 = null;
         if (has_started) {
-            if (off + 8 > value.len) return;
+            if (off + 8 > value.len) return .failed;
             started_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
             off += 8;
         }
 
         // result data
-        if (off + 4 > value.len) return;
+        if (off + 4 > value.len) return .failed;
         const rlen: usize = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
-        var result_data: ?[]const u8 = null;
+        var fields: RunUpdateFields = .{};
         if (rlen > 0 and off + rlen <= value.len) {
-            result_data = self.allocator.dupe(u8, value[off .. off + rlen]) catch null;
+            fields.result = value[off .. off + rlen];
             off += rlen;
         }
 
         // worker_id
-        var worker_id_data: ?[]const u8 = null;
         if (off + 2 <= value.len) {
             const wid_len: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
-            if (wid_len > 0 and off + wid_len <= value.len) {
-                worker_id_data = self.allocator.dupe(u8, value[off .. off + wid_len]) catch null;
-            }
+            if (wid_len > 0 and off + wid_len <= value.len) fields.worker_id = value[off .. off + wid_len];
             off += wid_len;
         }
 
         // outcome, error
-        var outcome_data: ?[]const u8 = null;
-        var error_data: ?[]const u8 = null;
         if (off + 2 <= value.len) {
             const olen: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
-            if (olen > 0 and off + olen <= value.len) {
-                outcome_data = self.allocator.dupe(u8, value[off .. off + olen]) catch null;
-            }
+            if (olen > 0 and off + olen <= value.len) fields.outcome = value[off .. off + olen];
             off += olen;
         }
         if (off + 2 <= value.len) {
             const elen: usize = std.mem.readInt(u16, value[off..][0..2], .little);
             off += 2;
-            if (elen > 0 and off + elen <= value.len) {
-                error_data = self.allocator.dupe(u8, value[off .. off + elen]) catch null;
-            }
+            if (elen > 0 and off + elen <= value.len) fields.err = value[off .. off + elen];
             off += elen;
         }
 
-        // Apply to existing run
-        if (self.runs.getPtr(run_id)) |run| {
-            run.status = status;
-            if (status == .completed or status == .failed) {
-                run.completed_at_ms = @intCast(stamp_ns / std.time.ns_per_ms);
-            } else if (status == .pending) {
-                run.started_at_ms = null;
-            }
-            if (started_at_ms) |sa| {
-                run.started_at_ms = sa;
-            }
-            if (worker_id_data) |wid| {
-                if (run.worker_id_owned) |old| self.allocator.free(old);
-                run.worker_id_owned = wid;
-            }
-            if (result_data) |rd| {
-                if (run.result_owned) |old| self.allocator.free(old);
-                run.result_owned = rd;
-            }
-            if (outcome_data) |od| {
-                if (run.outcome_owned) |old| self.allocator.free(old);
-                run.outcome_owned = od;
-            }
-            if (error_data) |ed| {
-                if (run.error_owned) |old| self.allocator.free(old);
-                run.error_owned = ed;
-            } else if (status == .completed) {
-                // A completion clears the error of an earlier failed attempt.
-                if (run.error_owned) |old| self.allocator.free(old);
-                run.error_owned = null;
-            }
-        } else {
-            // Run entry replayed before invoke entry (shouldn't happen with ordered log)
-            if (result_data) |rd| self.allocator.free(rd);
-            if (worker_id_data) |wid| self.allocator.free(wid);
-            if (outcome_data) |od| self.allocator.free(od);
-            if (error_data) |ed| self.allocator.free(ed);
+        const run = self.runs.getPtr(run_id) orelse {
+            // An update for a run this shard never created: the log
+            // orders invoke first, so the update has nothing to change.
+            log.err("action run update for unknown run '{s}' skipped", .{run_id});
+            return .failed;
+        };
+        self.updateRun(run, status, started_at_ms, @intCast(stamp_ns / std.time.ns_per_ms), fields) catch return .failed;
+        return .applied;
+    }
+
+    /// The optional fields of a run update, borrowed from its entry.
+    const RunUpdateFields = struct {
+        result: ?[]const u8 = null,
+        worker_id: ?[]const u8 = null,
+        outcome: ?[]const u8 = null,
+        err: ?[]const u8 = null,
+    };
+
+    /// Apply a run update, all of it or none: every copy is made before the
+    /// run changes.
+    fn updateRun(self: *ActionsHandler, run: *RunRecord, status: ActionRunStatus, started_at_ms: ?i64, stamp_ms: i64, fields: RunUpdateFields) !void {
+        const result_data = if (fields.result) |x| try self.allocator.dupe(u8, x) else null;
+        errdefer if (result_data) |x| self.allocator.free(x);
+        const worker_id_data = if (fields.worker_id) |x| try self.allocator.dupe(u8, x) else null;
+        errdefer if (worker_id_data) |x| self.allocator.free(x);
+        const outcome_data = if (fields.outcome) |x| try self.allocator.dupe(u8, x) else null;
+        errdefer if (outcome_data) |x| self.allocator.free(x);
+        const error_data = if (fields.err) |x| try self.allocator.dupe(u8, x) else null;
+
+        run.status = status;
+        if (status == .completed or status == .failed) {
+            run.completed_at_ms = stamp_ms;
+        } else if (status == .pending) {
+            run.started_at_ms = null;
+        }
+        if (started_at_ms) |sa| {
+            run.started_at_ms = sa;
+        }
+        if (worker_id_data) |wid| {
+            if (run.worker_id_owned) |old| self.allocator.free(old);
+            run.worker_id_owned = wid;
+        }
+        if (result_data) |rd| {
+            if (run.result_owned) |old| self.allocator.free(old);
+            run.result_owned = rd;
+        }
+        if (outcome_data) |od| {
+            if (run.outcome_owned) |old| self.allocator.free(old);
+            run.outcome_owned = od;
+        }
+        if (error_data) |ed| {
+            if (run.error_owned) |old| self.allocator.free(old);
+            run.error_owned = ed;
+        } else if (status == .completed) {
+            // A completion clears the error of an earlier failed attempt.
+            if (run.error_owned) |old| self.allocator.free(old);
+            run.error_owned = null;
         }
     }
 };
@@ -2147,14 +2162,14 @@ test "actions handler: an invoke naming a run id already taken is refused, and t
     const value = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "first", null, null, null).?;
     handler.last_invoked_run_id = null;
     handler.last_invoke_existed = false;
-    handler.replayInvoke("act-1", value, 1);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, handler.replayInvoke("act-1", value, 1));
     try testing.expect(handler.invoked() == .action_invoked);
     handler.runs.getPtr("act-1").?.status = .running;
 
     const again = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "second", null, null, null).?;
     handler.last_invoked_run_id = null;
     handler.last_invoke_existed = false;
-    handler.replayInvoke("act-1", again, 2);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, handler.replayInvoke("act-1", again, 2));
     switch (handler.invoked()) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.internal_error, e.code),
         else => return error.TestUnexpectedResult,
@@ -2329,11 +2344,11 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
 
-    h.replayRegister("echo", "", 1);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
 
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
-    h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
     const created = h.runs.get("act-1") orelse return error.RunMissing;
     try std.testing.expectEqualStrings("gpu", created.labels_owned.?);
     try std.testing.expectEqualStrings("wf-run-9", created.caller_run_id_owned.?);
@@ -2369,6 +2384,68 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     try std.testing.expect(done.error_owned == null);
 }
 
+test "actions: an apply that runs out of memory fails and changes nothing" {
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
+    var upd_buf: [256]u8 = undefined;
+    const upd = ActionsHandler.encodeRunUpdateValue(&upd_buf, .{
+        .status = .completed,
+        .started_at_ms = 1500,
+        .result = "{\"ok\":true}",
+        .worker_id = "w-2",
+        .outcome = "success",
+        .error_message = "late",
+    }) orelse return error.EncodeFailed;
+
+    // Each allocation of each apply, failed in turn, after the applies
+    // before it succeed.
+    for (0..3) |stage| {
+        var fail_at: usize = 0;
+        while (true) : (fail_at += 1) {
+            var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var h = ActionsHandler.init(fa.allocator());
+            defer h.deinit();
+
+            if (stage == 0) fa.fail_index = fa.alloc_index + fail_at;
+            const registered = h.replayRegister("echo", "", 1);
+            if (stage == 0 and fa.has_induced_failure) {
+                try testing.expectEqual(persistence.ApplyOutcome.failed, registered);
+                try testing.expectEqual(@as(usize, 0), h.actions.count());
+                continue;
+            }
+            try testing.expectEqual(persistence.ApplyOutcome.applied, registered);
+            if (stage == 0) break;
+
+            if (stage == 1) fa.fail_index = fa.alloc_index + fail_at;
+            h.last_invoked_run_id = null;
+            const invoked = h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms);
+            if (stage == 1 and fa.has_induced_failure) {
+                try testing.expectEqual(persistence.ApplyOutcome.failed, invoked);
+                try testing.expectEqual(@as(usize, 0), h.runs.count());
+                // The client's answer must not name a run that is not there.
+                try testing.expect(h.last_invoked_run_id == null);
+                continue;
+            }
+            try testing.expectEqual(persistence.ApplyOutcome.applied, invoked);
+            if (stage == 1) break;
+
+            fa.fail_index = fa.alloc_index + fail_at;
+            const updated = h.replayUpdateRun("act-1", upd, 2000 * std.time.ns_per_ms);
+            const run = h.runs.get("act-1") orelse return error.RunMissing;
+            if (fa.has_induced_failure) {
+                try testing.expectEqual(persistence.ApplyOutcome.failed, updated);
+                // All or nothing: the run is as the invoke left it.
+                try testing.expectEqual(ActionRunStatus.pending, run.status);
+                try testing.expect(run.result_owned == null and run.worker_id_owned == null and run.outcome_owned == null and run.error_owned == null);
+                continue;
+            }
+            try testing.expectEqual(persistence.ApplyOutcome.applied, updated);
+            try testing.expectEqualStrings("late", run.error_owned.?);
+            break;
+        }
+    }
+}
+
 test "actions: an action's created, run's created and run's finished times are their entries' stamps, not the host's clock" {
     const host_ms = @import("stdx").time.milliTimestamp();
     // One stamp far behind the host's clock and one a day ahead: an applier
@@ -2379,20 +2456,20 @@ test "actions: an action's created, run's created and run's finished times are t
         const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
         var pbuf: [512]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
-        h.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, stamp_ns, 0, "echo", "", &pbuf).?);
+        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, stamp_ns, 0, "echo", "", &pbuf).?));
         try std.testing.expectEqual(stamp_ns, h.actions.get("echo").?.created_at_ns);
 
         var inv_buf: [512]u8 = undefined;
         // A namespace other than default: its field comes last, after every
         // field the layout has.
         const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "ns1", "echo", "", null, null, null).?;
-        h.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, stamp_ns + 5 * std.time.ns_per_ms, 0, "act-1", inv, &pbuf).?);
+        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, stamp_ns + 5 * std.time.ns_per_ms, 0, "act-1", inv, &pbuf).?));
         try std.testing.expectEqual(stamp_ms + 5, h.runs.get("act-1").?.created_at_ms);
         try std.testing.expectEqualStrings("ns1", h.runs.get("act-1").?.namespace_owned);
 
         var upd_buf: [256]u8 = undefined;
         const upd = ActionsHandler.encodeRunUpdateValue(&upd_buf, .{ .status = .completed, .started_at_ms = 7, .result = "", .worker_id = null, .outcome = "", .error_message = "" }).?;
-        h.replayEntry(&entry_mod.buildCommandEntry(.action_update_run, 0, 1, 3, stamp_ns + 9 * std.time.ns_per_ms, 0, "act-1", upd, &pbuf).?);
+        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_update_run, 0, 1, 3, stamp_ns + 9 * std.time.ns_per_ms, 0, "act-1", upd, &pbuf).?));
         const done = h.runs.get("act-1").?;
         try std.testing.expectEqual(@as(?i64, stamp_ms + 9), done.completed_at_ms);
         // The claim's time is carried as the claiming node took it.

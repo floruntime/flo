@@ -1,4 +1,5 @@
 const std = @import("std");
+const silent_loss = @import("../node/silent_loss.zig");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 const StreamMetrics = @import("../stream/metrics.zig").Metrics;
@@ -599,6 +600,11 @@ pub const ShardMetrics = struct {
     /// ms: positive when the voters' clock held the stamp back, negative
     /// when its own clock was behind the log's time.
     stamp_skew_ms: Atomic(i64) = Atomic(i64).init(0),
+    /// Entries and segments lost without anyone being told, by path
+    /// (`silent_loss.Path`), as the shard last published them.
+    silent_loss: [silent_loss.PATH_COUNT]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// 1 while the shard is offline on this node.
+    offline: Atomic(u8) = Atomic(u8).init(0),
 
     /// Labels for `connections_paused`: the shard's wait reasons, in order,
     /// then paused for unsent answers.
@@ -689,6 +695,11 @@ pub const ShardMetrics = struct {
         _ = self.handler_no_answer.fetchAdd(1, .monotonic);
     }
 
+    pub fn setSilentLoss(self: *ShardMetrics, counts: [silent_loss.PATH_COUNT]u64, offline: bool) void {
+        for (counts, &self.silent_loss) |n, *c| c.store(n, .monotonic);
+        self.offline.store(@intFromBool(offline), .monotonic);
+    }
+
     pub fn setStampSkew(self: *ShardMetrics, ms: i64) void {
         self.stamp_skew_ms.store(ms, .monotonic);
     }
@@ -717,6 +728,8 @@ pub const ShardMetrics = struct {
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
         stamp_skew_ms: i64,
+        silent_loss: [silent_loss.PATH_COUNT]u64,
+        offline: u8,
     };
 
     pub fn snapshot(self: *const ShardMetrics) Snapshot {
@@ -739,6 +752,12 @@ pub const ShardMetrics = struct {
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
             .stamp_skew_ms = self.stamp_skew_ms.load(.monotonic),
+            .silent_loss = blk: {
+                var out: [silent_loss.PATH_COUNT]u64 = undefined;
+                for (&out, &self.silent_loss) |*o, *c| o.* = c.load(.monotonic);
+                break :blk out;
+            },
+            .offline = self.offline.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
                 for (&out, &self.connections_paused) |*o, *g| o.* = g.load(.monotonic);
@@ -1527,6 +1546,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
     try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
+    inline for (@typeInfo(silent_loss.Path).@"enum".fields, 0..) |f, i| {
+        try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ f.name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
+    }
+    try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });

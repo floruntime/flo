@@ -182,7 +182,7 @@ const sections = [_]Section{
     },
     .{ .name = "storage", .keys = &.{
         .{ .name = "durability", .kind = .string },
-        .{ .name = "hot_buffer_capacity", .kind = .integer, .min = 1 },
+        .{ .name = "hot_buffer_capacity", .kind = .integer, .min = tiered_log_config.MIN_HOT_BUFFER },
         .{ .name = "max_hot_entries", .kind = .integer },
         .{ .name = "hot_flush_seconds", .kind = .integer },
     } },
@@ -767,6 +767,8 @@ test "config: what flo.toml can't hold is refused, not ignored" {
         .{ .body = "[server]\nport = 70000\n", .err = error.InvalidSetting },
         .{ .body = "[metrics]\nport = -1\n", .err = error.InvalidSetting },
         .{ .body = "[storage]\nhot_buffer_capacity = 0\n", .err = error.InvalidSetting },
+        // Smaller than the largest entry: every such write would be refused.
+        .{ .body = "[storage]\nhot_buffer_capacity = 1048576\n", .err = error.InvalidSetting },
         .{ .body = "[storage]\ndurability = \"fast\"\n", .err = error.InvalidSetting },
         .{ .body = "[logging]\nlevel = \"loud\"\n", .err = error.InvalidSetting },
         .{ .body = "[logging]\nformat = \"xml\"\n", .err = error.InvalidSetting },

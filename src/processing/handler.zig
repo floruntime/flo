@@ -897,41 +897,41 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
-        self.replayEntry(entry);
+        return self.replayEntry(entry);
     }
 
     /// Apply a processing entry (live commit and boot replay alike).
-    pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) void {
+    pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const etype: EntryType = @enumFromInt(entry.header.entry_type);
         switch (etype) {
             .processing_submit => self.last_submitted_job_id = null,
             .processing_savepoint => self.last_savepoint_id = null,
             else => {},
         }
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
         const stamp_ms: i64 = @intCast(entry.header.timestamp_ns / std.time.ns_per_ms);
 
-        switch (etype) {
+        return switch (etype) {
             .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
             .processing_savepoint => self.replaySavepoint(cmd.key, cmd.value, stamp_ms),
             .processing_rescale => self.replayRescale(cmd.key, cmd.value),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
-            else => {},
-        }
+            else => .failed,
+        };
     }
 
     /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
     /// Value format: [status:u8][parallelism:u32][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) void {
-        if (value.len < 11) return; // 1+4+4+2 minimum
+    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
+        if (value.len < 11) return .failed; // 1+4+4+2 minimum
         const job_id = key;
 
         var off: usize = 0;
-        const status = std.enums.fromInt(JobStatus, value[off]) orelse return;
+        const status = std.enums.fromInt(JobStatus, value[off]) orelse return .failed;
         off += 1;
         const parallelism = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
@@ -941,7 +941,7 @@ pub const ProcessingHandler = struct {
         // Read embedded namespace
         const ns_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + ns_len > value.len) return;
+        if (off + ns_len > value.len) return .failed;
         const ns_raw = value[off .. off + ns_len];
         off += ns_len;
 
@@ -954,33 +954,33 @@ pub const ProcessingHandler = struct {
         var diag: parser.Diagnostic = .{};
         var def = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw, &diag) catch |err| {
             log.err("processing job {s} not started: {s}", .{ job_id, if (err == error.OutOfMemory) "out of memory" else diag.message() });
-            return;
+            return .failed;
         };
         defer def.deinit(self.allocator);
         // The submit checked these; the applier holds every replica to them.
         var why_buf: [256]u8 = undefined;
         if (def.namespaceRefusal() orelse def.homeRefusal(ns_raw, &why_buf)) |why| {
             log.err("processing job {s} not started: {s}", .{ job_id, why });
-            return;
+            return .failed;
         }
-        const name = self.allocator.dupe(u8, def.name) catch return;
+        const name = self.allocator.dupe(u8, def.name) catch return .failed;
 
         // Use the embedded namespace (authoritative from original submit)
         const namespace = self.allocator.dupe(u8, ns_raw) catch {
             self.allocator.free(name);
-            return;
+            return .failed;
         };
 
         const owned_id = self.allocator.dupe(u8, job_id) catch {
             self.allocator.free(name);
             self.allocator.free(namespace);
-            return;
+            return .failed;
         };
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
             self.allocator.free(namespace);
-            return;
+            return .failed;
         };
 
         // Remove old entry if exists (idempotent replay)
@@ -1003,7 +1003,7 @@ pub const ProcessingHandler = struct {
             self.allocator.free(name);
             self.allocator.free(namespace);
             self.allocator.free(owned_yaml);
-            return;
+            return .failed;
         };
         self.last_submitted_job_id = owned_id;
 
@@ -1015,32 +1015,35 @@ pub const ProcessingHandler = struct {
         if (status == .running and self.pipelines.getPtr(owned_id) == null) {
             self.startPipelines(owned_id, &def);
         }
+        return .applied;
     }
 
     /// Replay a status change (stop/cancel).
-    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) void {
-        if (self.jobs.getPtr(key)) |job| {
-            job.status = status;
-        }
+    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) persistence_mod.ApplyOutcome {
+        // Jobs are never removed, so a change for one this shard lacks has
+        // nothing to change.
+        const job = self.jobs.getPtr(key) orelse return .failed;
+        job.status = status;
+        return .applied;
     }
 
     /// Replay a savepoint entry.
     /// Value format: [job_id_len:u16][job_id][records_at:u64]
-    fn replaySavepoint(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) void {
-        if (value.len < 2) return;
+    fn replaySavepoint(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
+        if (value.len < 2) return .failed;
         var off: usize = 0;
 
         const job_id_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + job_id_len + 8 > value.len) return;
+        if (off + job_id_len + 8 > value.len) return .failed;
         const job_id = value[off .. off + job_id_len];
         off += job_id_len;
         const records_at = std.mem.readInt(u64, value[off..][0..8], .little);
 
-        const owned_sp_id = self.allocator.dupe(u8, key) catch return;
+        const owned_sp_id = self.allocator.dupe(u8, key) catch return .failed;
         const owned_job_id = self.allocator.dupe(u8, job_id) catch {
             self.allocator.free(owned_sp_id);
-            return;
+            return .failed;
         };
 
         // Remove old entry if exists (idempotent replay)
@@ -1059,15 +1062,16 @@ pub const ProcessingHandler = struct {
             self.allocator.free(owned_job_id);
         };
         self.last_savepoint_id = owned_sp_id;
+        return .applied;
     }
 
     /// Replay a rescale entry. Value = [parallelism:u32].
-    fn replayRescale(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
-        if (value.len < 4) return;
+    fn replayRescale(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyOutcome {
+        if (value.len < 4) return .failed;
         const parallelism = std.mem.readInt(u32, value[0..4], .little);
-        if (self.jobs.getPtr(key)) |job| {
-            job.parallelism = parallelism;
-        }
+        const job = self.jobs.getPtr(key) orelse return .failed;
+        job.parallelism = parallelism;
+        return .applied;
     }
 
     /// Replay a processing_checkpoint entry: restore a pipeline's persisted
@@ -1076,9 +1080,11 @@ pub const ProcessingHandler = struct {
     /// cursor so it resumes where it left off instead of from the start.
     /// Key = pipeline_key; value = [a:u64 LE][b:u64 LE] — a stream source's
     /// (timestamp, sequence), or a TS source's next timestamp and 0.
-    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) void {
-        if (value.len < 16) return;
-        const pipe = self.pipelines.getPtr(key) orelse return;
+    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyOutcome {
+        if (value.len < 16) return .failed;
+        // A pipeline stopped since its checkpoint was proposed has no
+        // cursor left to move.
+        const pipe = self.pipelines.getPtr(key) orelse return .applied;
         const a = std.mem.readInt(u64, value[0..8], .little);
         const b = std.mem.readInt(u64, value[8..16], .little);
         // Forward only: this is also the live applier, and a leader may
@@ -1092,6 +1098,7 @@ pub const ProcessingHandler = struct {
         }
         pipe.persisted_cursor_ts = a;
         pipe.persisted_cursor_seq = b;
+        return .applied;
     }
 
     // ── Pipeline Execution ──────────────────────────────────────────────
@@ -1936,7 +1943,7 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1700, .little);
     std.mem.writeInt(u64, val[8..16], 5, .little);
-    handler.replayCheckpoint("job-cp", &val);
+    _ = handler.replayCheckpoint("job-cp", &val);
 
     const pipe = handler.pipelines.getPtr("job-cp").?;
     try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
@@ -1947,8 +1954,8 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     try std.testing.expectEqual(@as(u64, 5), pipe.persisted_cursor_seq);
 
     // Unknown key is a no-op; short value is ignored (no crash, cursor unchanged).
-    handler.replayCheckpoint("missing", &val);
-    handler.replayCheckpoint("job-cp", &[_]u8{0});
+    _ = handler.replayCheckpoint("missing", &val);
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replayCheckpoint("job-cp", &[_]u8{0}));
     try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
 }
 
@@ -1970,7 +1977,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
     std.mem.writeInt(u64, val[8..16], 0, .little);
-    handler.replayCheckpoint("job-ts", &val);
+    _ = handler.replayCheckpoint("job-ts", &val);
     const pipe = handler.pipelines.getPtr("job-ts").?;
     try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.ts_cursor_ns);
     try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
@@ -1979,7 +1986,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
     // A checkpoint that commits after the pipeline read further does not
     // move it back.
     pipe.ts_cursor_ns = 1_700_000_000_500;
-    handler.replayCheckpoint("job-ts", &val);
+    _ = handler.replayCheckpoint("job-ts", &val);
     try std.testing.expectEqual(@as(u64, 1_700_000_000_500), pipe.ts_cursor_ns);
 }
 
@@ -1996,13 +2003,13 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     for ([_][2]u64{ .{ 1999, 9 }, .{ 2000, 2 } }) |older| {
         std.mem.writeInt(u64, val[0..8], older[0], .little);
         std.mem.writeInt(u64, val[8..16], older[1], .little);
-        handler.replayCheckpoint("job-fw", &val);
+        _ = handler.replayCheckpoint("job-fw", &val);
         try std.testing.expectEqual(@as(u64, 2000), pipe.stream_cursor_ts);
         try std.testing.expectEqual(@as(u64, 3), pipe.stream_cursor_seq);
     }
     std.mem.writeInt(u64, val[0..8], 2000, .little);
     std.mem.writeInt(u64, val[8..16], 4, .little);
-    handler.replayCheckpoint("job-fw", &val);
+    _ = handler.replayCheckpoint("job-fw", &val);
     try std.testing.expectEqual(@as(u64, 4), pipe.stream_cursor_seq);
 }
 
@@ -2070,7 +2077,7 @@ test "ProcessingHandler: a savepoint is created at its entry's stamp, not the ho
         const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ [_]u8{0} ** 8;
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies it.
-        handler.replayEntry(&entry_mod.buildCommandEntry(.processing_savepoint, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "sp-1", &value, &pbuf).?);
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_savepoint, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "sp-1", &value, &pbuf).?));
         try std.testing.expectEqual(stamp_ms, handler.savepoints.get("sp-1").?.created_at_ms);
     }
 }
@@ -2102,7 +2109,7 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
         @memcpy(value[11..18], "default");
         @memcpy(value[18 .. 18 + yaml.len], yaml);
         var pbuf: [1024]u8 = undefined;
-        handler.replayEntry(&entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 18 + yaml.len], &pbuf).?);
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 18 + yaml.len], &pbuf).?));
         try std.testing.expectEqual(stamp_ms, (handler.jobs.get("job-1") orelse return error.JobNotCreated).created_at_ms);
     }
 }
@@ -2115,6 +2122,6 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     // [status=0xee][parallelism][batch_size][ns_len=0]
     var val = [_]u8{0} ** 13;
     val[0] = 0xee;
-    handler.replaySubmit("job-bad", &val, 1);
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }

@@ -1478,8 +1478,9 @@ pub const StreamProjection = struct {
         if (name.len == 0) return;
         const gop = try self.stream_names.getOrPut(name);
         if (!gop.found_existing) {
-            const owned = try self.allocator.dupe(u8, name);
-            gop.key_ptr.* = owned;
+            // The new slot's key is the caller's slice until the copy lands.
+            errdefer self.stream_names.removeByPtr(gop.key_ptr);
+            gop.key_ptr.* = try self.allocator.dupe(u8, name);
         }
     }
 
@@ -1488,8 +1489,9 @@ pub const StreamProjection = struct {
         if (name.len == 0) return;
         const gop = try self.stream_metadata.getOrPut(name);
         if (!gop.found_existing) {
-            const owned = try self.allocator.dupe(u8, name);
-            gop.key_ptr.* = owned;
+            // The new slot's key is the caller's slice until the copy lands.
+            errdefer self.stream_metadata.removeByPtr(gop.key_ptr);
+            gop.key_ptr.* = try self.allocator.dupe(u8, name);
         }
         gop.value_ptr.* = .{
             .partition_count = @max(1, meta.partition_count),

@@ -41,13 +41,22 @@ pub const MAX_ENTRY_KEY: usize = ns_keys.MAX_QUALIFIED_KEY;
 // ReplayRegistry
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// What an applier made of an entry. `failed` means the entry changed
+/// nothing it should have (a payload that would not decode, a write the
+/// state could not take); the applier has logged why, and the shard
+/// counts it.
+pub const ApplyOutcome = enum { applied, failed };
+
 /// An applier: called for every committed entry of a registered type.
-pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry) void;
+pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry) ApplyOutcome;
 
 /// Maps EntryType → applier. Handlers register their owned entry types
 /// during init; every committed entry of such a type is dispatched here.
 pub const ReplayRegistry = struct {
     callbacks: [256]?ReplayEntry = [_]?ReplayEntry{null} ** 256,
+    /// A type registered twice. The first applier is kept; the shard
+    /// refuses to start, since one of the two would never run.
+    duplicate: ?EntryType = null,
 
     const ReplayEntry = struct {
         ctx: *anyopaque,
@@ -56,21 +65,23 @@ pub const ReplayRegistry = struct {
 
     /// Register a handler for a specific entry type.
     pub fn register(self: *ReplayRegistry, etype: EntryType, ctx: *anyopaque, func: ReplayFn) void {
-        self.callbacks[@intFromEnum(etype)] = .{ .ctx = ctx, .func = func };
+        const slot = &self.callbacks[@intFromEnum(etype)];
+        if (slot.* != null) {
+            if (self.duplicate == null) self.duplicate = etype;
+            return;
+        }
+        slot.* = .{ .ctx = ctx, .func = func };
     }
 
     pub fn has(self: *const ReplayRegistry, etype: EntryType) bool {
         return self.callbacks[@intFromEnum(etype)] != null;
     }
 
-    /// Dispatch an entry to its registered handler (if any).
-    /// Returns true if a handler was found and called.
-    pub fn dispatch(self: *const ReplayRegistry, entry: *const Entry) bool {
-        if (self.callbacks[entry.header.entry_type]) |cb| {
-            cb.func(cb.ctx, entry);
-            return true;
-        }
-        return false;
+    /// Dispatch an entry to its registered handler. Null when its type has
+    /// none.
+    pub fn dispatch(self: *const ReplayRegistry, entry: *const Entry) ?ApplyOutcome {
+        if (self.callbacks[entry.header.entry_type]) |cb| return cb.func(cb.ctx, entry);
+        return null;
     }
 };
 

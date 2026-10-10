@@ -2739,7 +2739,7 @@ pub const WorkflowHandler = struct {
         // The applier applies the same record again at commit, at the same
         // stamp; it replaces the terminal state wholesale, so a second
         // apply is a no-op.
-        self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms));
+        _ = self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms));
 
         // Every terminal transition passes through here, so this is the one
         // place the outcome counters need to be recorded.
@@ -3660,9 +3660,9 @@ pub const WorkflowHandler = struct {
     /// `completed_at_ms`; the producer and replay both apply it here. A
     /// value cut short, or an allocation that fails, leaves the run as it
     /// was.
-    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) void {
-        const entry = CompleteEntry.parse(value) orelse return;
-        const built = self.buildComplete(&entry) catch return;
+    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyOutcome {
+        const entry = CompleteEntry.parse(value) orelse return .failed;
+        const built = self.buildComplete(&entry) catch return .failed;
 
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
@@ -3685,6 +3685,7 @@ pub const WorkflowHandler = struct {
             if (run.search_tags_owned) |old| self.allocator.free(old);
             run.search_tags_owned = t;
         }
+        return .applied;
     }
 
     /// Register this handler's entry types with the shared ReplayRegistry.
@@ -3694,13 +3695,13 @@ pub const WorkflowHandler = struct {
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-        self.replayEntry(entry);
+        return self.replayEntry(entry);
     }
 
     /// Apply a workflow entry: live commit, replicated entry or boot replay alike.
-    pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) void {
+    pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
         // Other shard threads walk these maps under this lock. Nothing
         // holds it across an apply, so taking it here cannot nest.
@@ -3711,24 +3712,24 @@ pub const WorkflowHandler = struct {
             self.last_start_existed = false;
             self.last_start_collided = false;
         }
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
 
-        switch (etype) {
+        return switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000)),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
-            else => {},
-        }
+            else => .failed,
+        };
     }
 
     /// Apply a workflow_create entry. The key is "namespace:name" (ns-qualified).
-    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64) void {
+    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
         // "namespace:name"
         const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
         const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
         const raw_name = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
 
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return .failed;
         // Remove old definition if exists
         if (self.definitions.fetchRemove(ns_key)) |old| {
             self.allocator.free(old.key); // old ns-qualified key
@@ -3739,24 +3740,24 @@ pub const WorkflowHandler = struct {
 
         var def = self.parseStored(yaml, ns_key_raw) catch {
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
         defer def.deinit(self.allocator);
 
         const version = self.allocator.dupe(u8, def.version) catch {
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
         const owned_name = self.allocator.dupe(u8, raw_name) catch {
             self.allocator.free(ns_key);
             self.allocator.free(version);
-            return;
+            return .failed;
         };
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             self.allocator.free(version);
-            return;
+            return .failed;
         };
         self.definitions.put(ns_key, .{
             .name_owned = owned_name,
@@ -3769,13 +3770,13 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_name);
             self.allocator.free(version);
             self.allocator.free(owned_yaml);
-            return;
+            return .failed;
         };
 
         // A definition's trigger and schedule are part of it: (re)register
         // them here so a restart keeps them and a redefinition without one
         // drops it.
-        if (!self.install_producers) return;
+        if (!self.install_producers) return .applied;
         if (def.trigger) |trigger| {
             self.registerStreamTrigger(namespace, raw_name, trigger);
         } else {
@@ -3786,45 +3787,46 @@ pub const WorkflowHandler = struct {
         } else {
             self.unregisterSchedule(namespace, raw_name);
         }
+        return .applied;
     }
 
     /// Apply a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
-    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64) void {
+    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
         // "namespace:run_id"
         const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
         const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
         const raw_run_id = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
 
         var off: usize = 0;
-        if (off + 2 > value.len) return;
+        if (off + 2 > value.len) return .failed;
         const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + wf_name_len > value.len) return;
+        if (off + wf_name_len > value.len) return .failed;
         const wf_name = value[off .. off + wf_name_len];
         off += wf_name_len;
 
-        if (off + 2 > value.len) return;
+        if (off + 2 > value.len) return .failed;
         const ver_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + ver_len > value.len) return;
+        if (off + ver_len > value.len) return .failed;
         const version = value[off .. off + ver_len];
         off += ver_len;
 
-        if (off + 1 > value.len) return;
-        const status = std.enums.fromInt(RunStatus, value[off]) orelse return;
+        if (off + 1 > value.len) return .failed;
+        const status = std.enums.fromInt(RunStatus, value[off]) orelse return .failed;
         off += 1;
 
-        if (off + 2 > value.len) return;
+        if (off + 2 > value.len) return .failed;
         const evt_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + evt_len > value.len) return;
+        if (off + evt_len > value.len) return .failed;
         const event_type = value[off .. off + evt_len];
         off += evt_len;
 
-        if (off + 2 > value.len) return;
+        if (off + 2 > value.len) return .failed;
         const idem_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + idem_len > value.len) return;
+        if (off + idem_len > value.len) return .failed;
         const idem: ?[]const u8 = if (idem_len > 0) value[off .. off + idem_len] else null;
         off += idem_len;
 
@@ -3839,7 +3841,7 @@ pub const WorkflowHandler = struct {
             if (self.runKeyForIdempotencyKey(namespace, wf_name, k)) |run_key| {
                 self.last_started_key = run_key;
                 self.last_start_existed = true;
-                return;
+                return .applied;
             }
         }
 
@@ -3849,14 +3851,14 @@ pub const WorkflowHandler = struct {
         if (self.runs.getEntry(ns_key_raw)) |e| {
             self.last_started_key = e.key_ptr.*;
             self.last_start_collided = true;
-            return;
+            return .applied;
         }
 
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return;
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return .failed;
         var run = RunRecord{
             .run_id_owned = self.allocator.dupe(u8, raw_run_id) catch {
                 self.allocator.free(ns_key);
-                return;
+                return .failed;
             },
             .workflow_name_owned = "",
             .workflow_version_owned = "",
@@ -3872,22 +3874,29 @@ pub const WorkflowHandler = struct {
         run.workflow_name_owned = self.allocator.dupe(u8, wf_name) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
         run.workflow_version_owned = self.allocator.dupe(u8, version) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(run.workflow_name_owned);
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
         run.input_owned = self.allocator.dupe(u8, input) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(run.workflow_name_owned);
             self.allocator.free(run.workflow_version_owned);
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
-        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch null else null;
+        run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch {
+            self.allocator.free(run.run_id_owned);
+            self.allocator.free(run.workflow_name_owned);
+            self.allocator.free(run.workflow_version_owned);
+            self.allocator.free(run.input_owned);
+            self.allocator.free(ns_key);
+            return .failed;
+        } else null;
         // The run's first history event, as the start path recorded it.
         if (event_type.len > 0) self.addHistoryEvent(&run, event_type, input, created_at_ms);
         if (idem) |k| {
@@ -3899,7 +3908,7 @@ pub const WorkflowHandler = struct {
         self.runs.put(ns_key, run) catch {
             self.freeRunRecord(&run);
             self.allocator.free(ns_key);
-            return;
+            return .failed;
         };
         self.last_started_key = ns_key;
         if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
@@ -3911,6 +3920,7 @@ pub const WorkflowHandler = struct {
                 stored.search_tags_owned = self.buildSearchTags(def_ns_key, stored);
             }
         }
+        return .applied;
     }
 
     /// Apply a workflow_complete entry. Updates the run's terminal status,
@@ -3919,9 +3929,9 @@ pub const WorkflowHandler = struct {
     ///   [has_output:u8][output_len:u32][output]?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) void {
-        const run = self.runs.getPtr(ns_key_raw) orelse return;
-        self.applyComplete(run, value, completed_at_ms);
+    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyOutcome {
+        const run = self.runs.getPtr(ns_key_raw) orelse return .failed;
+        return self.applyComplete(run, value, completed_at_ms);
     }
 
     /// A workflow_complete value, checked against its length:
@@ -4293,6 +4303,9 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     // under test reads must be assigned here or it holds garbage.
     shard.metrics_registry = null;
     shard.shard_metrics = null;
+    shard.offline = null;
+    shard.offline_published = .init(false);
+    shard.losses = .{};
     const raft_node = try std.testing.allocator.create(RaftNode);
     // Room for an entry at the payload limit, which a 64 KiB ring can't hold.
     raft_node.* = try RaftNode.init(std.testing.allocator, 1, 0, 256 * 1024, .{});
@@ -5045,6 +5058,30 @@ test "list-runs query: a length that overruns the value is refused" {
     try testing.expect(WorkflowHandler.parseListRunsQuery(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 'a', 'b' }) == null);
 }
 
+test "workflow replay: a start that runs out of memory fails and creates nothing, and one that applies keeps its idempotency key" {
+    // [wf_len][wf][ver_len][ver][status][evt_len][idem_len][idem]
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1, 0, 0, 3, 0, 'k', 'e', 'y' };
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var handler = WorkflowHandler.init(fa.allocator());
+        defer handler.deinit();
+        // Room for the run up front: a failed copy must not be masked by
+        // the map's insert failing after it.
+        try handler.runs.ensureTotalCapacity(1);
+        fa.fail_index = fa.alloc_index + fail_at;
+        const outcome = handler.replayStart("default:r1", &start, 1);
+        if (outcome == .failed) {
+            try testing.expect(fa.has_induced_failure);
+            try testing.expectEqual(@as(usize, 0), handler.runCount());
+            continue;
+        }
+        const run = handler.runs.get("default:r1") orelse return error.RunMissing;
+        try testing.expectEqualStrings("key", run.idempotency_key_owned orelse return error.IdempotencyKeyLost);
+        if (!fa.has_induced_failure) break;
+    }
+}
+
 test "workflow replay: an unknown status, or a complete entry without its output flag, is skipped" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -5054,15 +5091,15 @@ test "workflow replay: an unknown status, or a complete entry without its output
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var bad_status = start;
     bad_status[7] = 0xee;
-    handler.replayStart("default:r0", &bad_status, 1);
+    try testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replayStart("default:r0", &bad_status, 1));
     try testing.expectEqual(@as(usize, 0), handler.runCount());
 
-    handler.replayStart("default:r1", &start, 1);
+    _ = handler.replayStart("default:r1", &start, 1);
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 
     // Missing has_output byte; then an unknown status. Neither may change the run.
-    handler.replayComplete("default:r1", &[_]u8{3}, 2);
-    handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2);
+    _ = handler.replayComplete("default:r1", &[_]u8{3}, 2);
+    _ = handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2);
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
 }
 
@@ -5077,10 +5114,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
-        handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?);
+        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?));
         try testing.expectEqual(stamp_ms, handler.runs.get("default:r1").?.created_at_ms);
         // completed, no output, no steps, no history, no tags
-        handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?);
+        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?));
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
@@ -5093,7 +5130,7 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     defer handler.deinit();
 
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
-    handler.replayStart("default:r1", &start, 1);
+    _ = handler.replayStart("default:r1", &start, 1);
 
     // completed, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
     const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
@@ -5111,14 +5148,14 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     const history_before = handler.runs.get("default:r1").?.history.items.len;
     try testing.expectEqual(@as(usize, 1), history_before);
     for (1..whole.len - 3) |n| {
-        handler.replayComplete("default:r1", whole[0..n], 2);
+        _ = handler.replayComplete("default:r1", whole[0..n], 2);
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
         try testing.expectEqual(history_before, run.history.items.len);
     }
 
-    handler.replayComplete("default:r1", &whole, 2);
+    _ = handler.replayComplete("default:r1", &whole, 2);
     const run = handler.runs.get("default:r1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
@@ -5180,7 +5217,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
     var follower = WorkflowHandler.init(allocator);
     defer follower.deinit();
     createTestRun(&follower, "default:big", "big", "test-wf");
-    follower.replayComplete("default:big", record, 2);
+    _ = follower.replayComplete("default:big", record, 2);
     const f = follower.runs.get("default:big").?;
     try testing.expectEqual(done.status, f.status);
     try testing.expectEqual(done.history.items.len, f.history.items.len);
@@ -5230,7 +5267,7 @@ test "a completion record that fits round-trips through replay" {
     };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit("default:r"));
     defer allocator.free(record);
-    handler.applyComplete(run, record, 7);
+    _ = handler.applyComplete(run, record, 7);
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     try testing.expectEqualStrings("out", run.output_owned.?);
     try testing.expectEqualStrings("{\"a\":1}", run.search_tags_owned.?);

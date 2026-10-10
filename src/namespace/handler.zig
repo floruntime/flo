@@ -596,18 +596,20 @@ pub const NamespaceHandler = struct {
         registry.register(.namespace_config, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        self.replayEntry(entry);
+        return self.replayEntry(entry);
     }
 
     /// Replay a namespace UAL entry to rebuild in-memory state.
-    /// Called during segment replay on startup and after Raft commit.
-    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry) void {
+    /// Called during segment replay on startup and after Raft commit. A
+    /// create refused for its name or the cap is applied: the proposer
+    /// answers its client with the refusal.
+    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         self.last_create = .created;
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
         const name = cmd.key;
-        if (name.len == 0) return;
+        if (name.len == 0) return .failed;
 
         const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
         switch (etype) {
@@ -617,11 +619,16 @@ pub const NamespaceHandler = struct {
                     if (self.namespaces.getPtr(name)) |meta| meta.data_count = @max(meta.data_count, 1);
                 }
                 if (self.pending_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
+                if (self.last_create == .failed) return .failed;
             },
             .namespace_delete => self.applyDelete(name),
-            .namespace_config => log.warn("namespace: skipped a settings entry for namespace={s}: namespace settings aren't supported", .{name}),
-            else => {},
+            .namespace_config => {
+                log.warn("namespace: skipped a settings entry for namespace={s}: namespace settings aren't supported", .{name});
+                return .failed;
+            },
+            else => return .failed,
         }
+        return .applied;
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -1177,7 +1184,7 @@ test "namespace handler: a namespace created through the log was created at its 
     defer handler.deinit();
     var buf: [128]u8 = undefined;
     const e = entry_mod.buildCommandEntry(.namespace_create, 0, 1, 1, 1234 * std.time.ns_per_s, 0, "stamped", "", &buf) orelse unreachable;
-    handler.replayEntry(&e);
+    try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&e));
     try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), handler.namespaces.get("stamped").?.created_at_ns);
 }
 

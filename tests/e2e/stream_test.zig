@@ -1692,7 +1692,8 @@ test "e2e/stream: tiered storage - warm tier spill and read" {
         .server = .{
             .durability = .sync,
             .tiered_log = .{
-                .hot_buffer_capacity = 4096, // 4KB - very small to force spills
+                // The smallest ring the server takes; the entry cap forces the spill.
+                .hot_buffer_capacity = 2 * 1024 * 1024,
                 .max_hot_entries = 10, // Spill after 10 entries
             },
         },
@@ -1737,7 +1738,7 @@ test "e2e/stream: tiered storage - read range across tiers" {
         .server = .{
             .durability = .sync,
             .tiered_log = .{
-                .hot_buffer_capacity = 4096,
+                .hot_buffer_capacity = 2 * 1024 * 1024,
                 .max_hot_entries = 5, // Very small hot tier
             },
         },
@@ -1781,7 +1782,7 @@ test "e2e/stream: tiered storage - every record readable with a tiny hot tier" {
         .server = .{
             .durability = .sync,
             .tiered_log = .{
-                .hot_buffer_capacity = 2048, // Very small to force spills
+                .hot_buffer_capacity = 2 * 1024 * 1024,
                 .max_hot_entries = 3, // Very small hot tier
             },
         },
@@ -3133,7 +3134,7 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
     var cluster = ClusterContext.init(testing.allocator, .{
         .node_count = 3,
         .durability = .sync,
-        .tiered_log = .{ .hot_buffer_capacity = 4096, .max_hot_entries = 10 },
+        .tiered_log = .{ .hot_buffer_capacity = 2 * 1024 * 1024, .max_hot_entries = 10 },
     }) catch |err| {
         // Multi-process cluster bring-up can be flaky under heavy CI load
         // (ports / formation timing). Skip rather than false-fail.
