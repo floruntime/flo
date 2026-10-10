@@ -605,8 +605,6 @@ pub const StreamHandler = struct {
         return out[0..stream_mod.wholeEntriesWithin(out[0..count], window.limit)];
     }
 
-
-
     /// The window's records and their answer, past any appends that can't
     /// be read: an answer with none of a read's records would leave the
     /// reader's cursor where it was, and a follower re-reading them forever.
