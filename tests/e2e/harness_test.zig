@@ -47,7 +47,7 @@ test "harness: a server that never becomes ready fails within a bound" {
     const pid = try std.fmt.parseInt(std.c.pid_t, std.mem.trim(u8, pid_text, " \n"), 10);
     var gone = false;
     for (0..100) |_| {
-        if (std.c.kill(pid, @enumFromInt(0)) != 0) {
+        if (processGone(pid)) {
             gone = true;
             break;
         }
@@ -91,4 +91,22 @@ test "harness: only an exit the harness caused is normal" {
         }
     }
     server.exit_status = null;
+}
+
+/// Whether `pid` no longer runs. A killed process stays a zombie until its
+/// parent reaps it, and an orphan's parent is PID 1: in a container where
+/// PID 1 is the build runner rather than an init, nothing reaps it, so
+/// `kill(pid, 0)` keeps succeeding. On Linux a zombie (or dead) state in
+/// /proc counts as gone.
+fn processGone(pid: std.c.pid_t) bool {
+    if (std.c.kill(pid, @enumFromInt(0)) != 0) return true;
+    if (@import("builtin").os.tag != .linux) return false;
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
+    var stat_buf: [512]u8 = undefined;
+    const stat = stdx.fs.readFile(path, &stat_buf) catch return true;
+    // "pid (comm) S ...": the state follows the last ')', since comm may hold one.
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return false;
+    if (close + 2 >= stat.len) return false;
+    return stat[close + 2] == 'Z' or stat[close + 2] == 'X';
 }
