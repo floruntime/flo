@@ -9085,7 +9085,7 @@ test "Shard: an await that claims a pending run at once gets exactly one answer,
 
     // Register the action, then invoke it: one pending run.
     // invoke value: [priority:u8][delay_ms:i64][has_caller:u8][has_idem:u8][has_labels:u8][input]
-    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job-input";
+    const invoke_value: []const u8 = "\x00job-input";
     for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
         .{ .op = .action_register, .id = 1, .value = "" },
         .{ .op = .action_invoke, .id = 2, .value = invoke_value },
@@ -9149,7 +9149,7 @@ test "Shard: a parked await and an invoke reusing its request id each get one an
     // An invoke under the same id wakes it while being dispatched: the
     // await's task is a deferred answer to "request 7", which isn't this
     // request's own.
-    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job";
+    const invoke_value: []const u8 = "\x00job";
     const inv = try testRequest(.action_invoke, 7, "act", invoke_value);
     defer std.testing.allocator.free(inv);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, inv);
@@ -9314,7 +9314,7 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     const ca = try TestClient.open(owner);
     defer _ = std.c.close(ca.pair[1]);
     var out: [4096]u8 = undefined;
-    const invoke_value: []const u8 = [_]u8{10} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0 } ++ "job";
+    const invoke_value: []const u8 = "\x00job";
     for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
         .{ .op = .action_register, .id = 1, .value = "" },
         .{ .op = .action_invoke, .id = 2, .value = invoke_value },

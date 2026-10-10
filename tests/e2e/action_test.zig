@@ -1206,3 +1206,72 @@ test "e2e/action: each await on one connection gets its own task and nothing els
     // No stray frame follows either answer.
     try testing.expectEqual(@as(?proto.Response, null), try readFrame(fd, &buf, 300));
 }
+
+// =============================================================================
+// Invoke value layout
+// =============================================================================
+
+/// Sends one request on `fd` and returns its answer.
+fn rawCall(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, buf: []u8) !proto.Response {
+    var h: proto.RequestHeader = undefined;
+    @memset(std.mem.asBytes(&h), 0);
+    h.magic = proto.MAGIC;
+    h.version = proto.VERSION;
+    h.op_code = @intFromEnum(op);
+    h.request_id = 1;
+    const req: proto.Request = .{ .header = h, .namespace = "", .key = key, .value = value, .options = "" };
+    var frame_buf: [512]u8 = undefined;
+    const frame = try req.serialize(&frame_buf);
+    if (std.c.write(fd, frame.ptr, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
+    return (try readFrame(fd, buf, 5000)) orelse error.NoAnswer;
+}
+
+/// The payload that closes a task assignment with no caller.
+fn assignedPayload(data: []const u8) ![]const u8 {
+    var pos: usize = 0;
+    pos += 2 + std.mem.readInt(u16, data[pos..][0..2], .little); // task id
+    pos += 2 + std.mem.readInt(u16, data[pos..][0..2], .little); // task type
+    pos += 8 + 4; // created_at, attempt
+    try testing.expectEqual(@as(u8, 0), data[pos]); // has_caller
+    return data[pos + 1 ..];
+}
+
+test "e2e/action: an invoke value is a has_labels byte, the labels if set, then the input, byte for byte" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "layout" });
+    try ctx.exec(&.{ "worker", "register", "w-plain", "layout" });
+    try ctx.exec(&.{ "worker", "register", "w-gpu", "layout", "--labels", "{\"gpu\":true}" });
+
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    var buf: [4096]u8 = undefined;
+
+    // The labelled run first: a worker without the label must skip it.
+    const labelled = try rawCall(fd, .action_invoke, "layout", "\x01\x0c\x00{\"gpu\":true}xy", &buf);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), labelled.header.status);
+    const plain = try rawCall(fd, .action_invoke, "layout", "\x00z", &buf);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), plain.header.status);
+
+    // await value: [count:u32][type_len:u16][type]
+    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 6, 0 } ++ "layout";
+    const to_plain = try rawCall(fd, .action_await, "w-plain", await_value, &buf);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), to_plain.header.status);
+    try testing.expectEqualStrings("z", try assignedPayload(to_plain.data));
+
+    const to_gpu = try rawCall(fd, .action_await, "w-gpu", await_value, &buf);
+    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), to_gpu.header.status);
+    try testing.expectEqualStrings("xy", try assignedPayload(to_gpu.data));
+
+    // Malformed values are refused, not read some other way.
+    for ([_][]const u8{
+        "",
+        "\x02x",
+        "\x01\x0d\x00{\"gpu\":true}",
+        "\x01\x04\x00true",
+    }) |value| {
+        const r = try rawCall(fd, .action_invoke, "layout", value, &buf);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
+    }
+}
