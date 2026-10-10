@@ -643,6 +643,14 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .not_found, .message = "action not found" } };
         }
 
+        const parsed_value = parseInvokeValue(self.allocator, req.value) catch |err| return .{ .err = switch (err) {
+            error.OutOfMemory => .{ .code = .internal_error, .message = "out of memory" },
+            error.Empty => .{ .code = .invalid_request, .message = "invoke value is empty: it starts with a has_labels byte" },
+            error.BadFlag => .{ .code = .invalid_request, .message = "invoke has_labels must be 0 or 1" },
+            error.Truncated => .{ .code = .invalid_request, .message = "invoke labels run past the end of the value" },
+            error.LabelsNotObject => .{ .code = .invalid_request, .message = "invoke labels must be a JSON object" },
+        } };
+
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const run_id_str = if (shard) |s| blk: {
@@ -655,8 +663,6 @@ pub const ActionsHandler = struct {
             break :blk std.fmt.bufPrint(&run_id_buf, "act-{d}-{d}", .{ @import("stdx").time.milliTimestamp(), seq }) catch unreachable;
         };
 
-        // Parse the invoke value to extract labels and actual input.
-        const parsed_value = parseInvokeValue(req.value);
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
 
         // The applier creates the run from the entry.
@@ -1894,49 +1900,27 @@ const TaskTypeIterator = struct {
     }
 };
 
-/// Parse the invoke value wire format to extract labels and actual input.
-/// Wire format:
-///   [priority:u8][delay_ms:i64][has_caller:u8]
-///   [has_idempotency:u8]([idem_len:u16][idem_key])?
-///   [has_labels:u8]([labels_len:u16][labels])?
-///   [input...]
-/// If the value is too short for the header, returns it as-is (backward compat).
-fn parseInvokeValue(value: []const u8) struct { labels: ?[]const u8, input: []const u8 } {
-    // Minimum header: priority(1) + delay_ms(8) + has_caller(1) + has_idem(1) = 11 bytes
-    if (value.len < 11) return .{ .labels = null, .input = value };
-
-    var offset: usize = 0;
-    offset += 1; // priority
-    offset += 8; // delay_ms
-    offset += 1; // has_caller (always 0 currently)
-    if (offset >= value.len) return .{ .labels = null, .input = "" };
-
-    // Idempotency key (optional)
-    const has_idem = value[offset];
-    offset += 1;
-    if (has_idem == 1) {
-        if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
-        const idem_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
-        offset += 2 + idem_len;
+/// An invoke request value: `[has_labels:u8]([labels_len:u16][labels])?[input...]`.
+/// Labels are refused unless they are a JSON object: anything else could
+/// never match a worker, and the run would wait forever.
+fn parseInvokeValue(allocator: Allocator, value: []const u8) error{ Empty, BadFlag, Truncated, LabelsNotObject, OutOfMemory }!struct { labels: ?[]const u8, input: []const u8 } {
+    if (value.len == 0) return error.Empty;
+    switch (value[0]) {
+        0 => return .{ .labels = null, .input = value[1..] },
+        1 => {},
+        else => return error.BadFlag,
     }
-    if (offset >= value.len) return .{ .labels = null, .input = "" };
-
-    // Labels (optional)
-    var labels: ?[]const u8 = null;
-    const has_labels = value[offset];
-    offset += 1;
-    if (has_labels == 1) {
-        if (offset + 2 > value.len) return .{ .labels = null, .input = "" };
-        const labels_len: usize = std.mem.readInt(u16, value[offset..][0..2], .little);
-        offset += 2;
-        if (offset + labels_len <= value.len) {
-            labels = value[offset .. offset + labels_len];
-            offset += labels_len;
-        }
-    }
-
-    const input = if (offset < value.len) value[offset..] else "";
-    return .{ .labels = labels, .input = input };
+    if (value.len < 3) return error.Truncated;
+    const labels_len: usize = std.mem.readInt(u16, value[1..3], .little);
+    if (3 + labels_len > value.len) return error.Truncated;
+    const labels = value[3 .. 3 + labels_len];
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, labels, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.LabelsNotObject,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.LabelsNotObject;
+    return .{ .labels = labels, .input = value[3 + labels_len ..] };
 }
 
 /// Check if worker_labels satisfy all required_labels.
@@ -2167,6 +2151,43 @@ test "actions handler: register empty name" {
     }
 }
 
+test "actions handler: an invoke value is a has_labels byte, the labels if set, then the input" {
+    const a = testing.allocator;
+
+    const plain = try parseInvokeValue(a, "\x00x");
+    try testing.expectEqual(@as(?[]const u8, null), plain.labels);
+    try testing.expectEqualStrings("x", plain.input);
+
+    const empty_input = try parseInvokeValue(a, "\x00");
+    try testing.expectEqualStrings("", empty_input.input);
+
+    const labelled = try parseInvokeValue(a, "\x01\x0c\x00{\"gpu\":true}x");
+    try testing.expectEqualStrings("{\"gpu\":true}", labelled.labels.?);
+    try testing.expectEqualStrings("x", labelled.input);
+
+    try testing.expectError(error.Empty, parseInvokeValue(a, ""));
+    try testing.expectError(error.BadFlag, parseInvokeValue(a, "\x02x"));
+    try testing.expectError(error.Truncated, parseInvokeValue(a, "\x01\x0c"));
+    try testing.expectError(error.Truncated, parseInvokeValue(a, "\x01\x0d\x00{\"gpu\":true}"));
+    try testing.expectError(error.LabelsNotObject, parseInvokeValue(a, "\x01\x04\x00truex"));
+    try testing.expectError(error.LabelsNotObject, parseInvokeValue(a, "\x01\x03\x00{\"gx"));
+}
+
+test "actions handler: a malformed invoke value is refused before a run is created" {
+    const allocator = testing.allocator;
+    var handler = ActionsHandler.init(allocator);
+    defer handler.deinit();
+
+    _ = handler.handleCommand(null, makeRequest(.action_register, "process", ""));
+    for ([_][]const u8{ "", "\x02x", "\x01\x05\x00ab", "\x01\x02\x00[]" }) |value| {
+        switch (handler.handleCommand(null, makeRequest(.action_invoke, "process", value))) {
+            .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), handler.runCount());
+}
+
 test "actions handler: invoke" {
     const allocator = testing.allocator;
     var handler = ActionsHandler.init(allocator);
@@ -2174,7 +2195,7 @@ test "actions handler: invoke" {
 
     _ = handler.handleCommand(null, makeRequest(.action_register, "process", ""));
 
-    const result = handler.handleCommand(null, makeRequest(.action_invoke, "process", "input-data"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "process", "\x00input-data"));
     switch (result) {
         .action_invoked => |r| {
             try testing.expect(r.run_id.len > 0);
@@ -2219,7 +2240,7 @@ test "actions handler: invoke non-existent action" {
     var handler = ActionsHandler.init(allocator);
     defer handler.deinit();
 
-    const result = handler.handleCommand(null, makeRequest(.action_invoke, "ghost", "data"));
+    const result = handler.handleCommand(null, makeRequest(.action_invoke, "ghost", "\x00data"));
     switch (result) {
         .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
         else => return error.TestUnexpectedResult,
@@ -2232,7 +2253,7 @@ test "actions handler: status" {
     defer handler.deinit();
 
     _ = handler.handleCommand(null, makeRequest(.action_register, "job", ""));
-    const invoke_result = handler.handleCommand(null, makeRequest(.action_invoke, "job", ""));
+    const invoke_result = handler.handleCommand(null, makeRequest(.action_invoke, "job", "\x00"));
 
     // Get the run_id from invoke result
     var run_id: []const u8 = "";
@@ -2330,18 +2351,18 @@ test "actions handler: delete non-existent is idempotent" {
 }
 
 test "actions handler: pre-route by action" {
-    const req1 = makeRequest(.action_invoke, "action-a", "");
-    const req2 = makeRequest(.action_invoke, "action-a", "");
-    const req3 = makeRequest(.action_invoke, "action-b", "");
+    const req1 = makeRequest(.action_invoke, "action-a", "\x00");
+    const req2 = makeRequest(.action_invoke, "action-a", "\x00");
+    const req3 = makeRequest(.action_invoke, "action-b", "\x00");
 
     try testing.expectEqual(ActionsHandler.preRouteByAction(req1), ActionsHandler.preRouteByAction(req2));
     try testing.expect(ActionsHandler.preRouteByAction(req1) != ActionsHandler.preRouteByAction(req3));
 
-    const req_empty = makeRequest(.action_invoke, "", "");
+    const req_empty = makeRequest(.action_invoke, "", "\x00");
     try testing.expectEqual(@as(?u64, 0), ActionsHandler.preRouteByAction(req_empty));
 
     // Same action, different namespace → different hash (namespace isolation)
-    var req_ns = makeRequest(.action_invoke, "action-a", "");
+    var req_ns = makeRequest(.action_invoke, "action-a", "\x00");
     req_ns.namespace = "other";
     try testing.expect(ActionsHandler.preRouteByAction(req1) != ActionsHandler.preRouteByAction(req_ns));
 }
@@ -2354,7 +2375,7 @@ test "actions handler: multiple invocations" {
     _ = handler.handleCommand(null, makeRequest(.action_register, "worker", ""));
 
     for (0..5) |_| {
-        const result = handler.handleCommand(null, makeRequest(.action_invoke, "worker", "task"));
+        const result = handler.handleCommand(null, makeRequest(.action_invoke, "worker", "\x00task"));
         switch (result) {
             .action_invoked => {},
             else => return error.TestUnexpectedResult,

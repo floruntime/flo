@@ -49,12 +49,8 @@ pub fn register(
     return client.sendRequest(.action_register, namespace, action_name, fbs.buffered());
 }
 
-/// Invoke an action
-/// Wire format in value:
-///   [priority:u8][delay_ms:i64][has_caller:u8][has_idem:u8][has_labels:u8]...[input...]
-/// The server reads only the labels and input, so the bytes before them
-/// are sent as zeros.
-/// key = action_name
+/// Invoke an action. key = action_name; value =
+/// `[has_labels:u8]([labels_len:u16][labels])?[input...]`.
 pub fn invoke(
     client: *Client,
     namespace: []const u8,
@@ -66,18 +62,14 @@ pub fn invoke(
     var fbs: std.Io.Writer = .fixed(&value_buf);
     const writer = &fbs;
 
-    try writer.writeAll(&([_]u8{0} ** (1 + 8 + 1 + 1)));
-
-    // Write required_labels (optional)
     if (required_labels) |labels| {
         try writer.writeByte(1);
-        try writer.writeInt(u16, @intCast(labels.len), .little);
+        try writer.writeInt(u16, std.math.cast(u16, labels.len) orelse return error.LabelsTooLong, .little);
         try writer.writeAll(labels);
     } else {
         try writer.writeByte(0);
     }
 
-    // Write input (rest of value)
     try writer.writeAll(input);
 
     const value = fbs.buffered();
