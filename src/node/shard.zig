@@ -110,7 +110,7 @@ const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
-pub const MAX_REQUEST_SIZE = 256 * 1024; // 256 KB
+pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);

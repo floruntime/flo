@@ -30,7 +30,7 @@ const Entry = entry_mod.Entry;
 const CommandPayload = entry_mod.CommandPayload;
 const Flags = entry_mod.Flags;
 
-pub const MAX_PERSIST_PAYLOAD: usize = 65536;
+pub const MAX_PERSIST_PAYLOAD: usize = @import("../protocol/limits.zig").MAX_PERSIST_PAYLOAD;
 
 /// Longest key proposeEntry accepts, the same bound KV puts on its qualified
 /// keys. Streams, series, queues, groups, actions and workflows propose
