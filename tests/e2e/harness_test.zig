@@ -57,6 +57,14 @@ test "harness: a server that never becomes ready fails within a bound" {
     try testing.expect(gone);
 }
 
+test "harness: a server spawned and never awaited is stopped when its process is freed" {
+    var server = try stdx.testing.ServerProcess.init(testing.allocator);
+    try server.spawn();
+    const pid = server.process.?.id;
+    server.deinit();
+    try testing.expect(processGone(pid));
+}
+
 test "harness: only an exit the harness caused is normal" {
     var server = try stdx.testing.ServerProcess.init(testing.allocator);
     defer server.deinit();

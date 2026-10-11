@@ -1,7 +1,9 @@
 //! HTTP Metrics Server
 //!
 //! Lightweight HTTP server for Prometheus metrics scraping.
-//! Listens on a dedicated port and serves GET /metrics requests.
+//! Listens on a dedicated port and serves GET /metrics, and the node's
+//! probes: /health (the process answers), /ready (every shard can serve)
+//! and /status (each shard's state).
 //!
 //! Usage:
 //! ```zig
@@ -17,6 +19,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const MetricsRegistry = @import("registry.zig").MetricsRegistry;
 const http = @import("../util/http/mod.zig");
+const NodeHealth = @import("../node/health.zig").NodeHealth;
 
 pub const HttpMetricsServer = struct {
     const Self = @This();
@@ -25,6 +28,8 @@ pub const HttpMetricsServer = struct {
     port: u16,
     bind: []const u8,
     registry: *MetricsRegistry,
+    /// Each shard's published state; null in a test with no shards.
+    health: ?*const NodeHealth = null,
     listener: ?std.posix.socket_t = null,
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -119,8 +124,12 @@ pub const HttpMetricsServer = struct {
             return http.writeResponse(client, .bad_request, .text, "Bad Request\n");
         if (parsed.pathStartsWith("/metrics")) {
             try self.sendMetrics(client);
-        } else if (parsed.pathStartsWith("/health") or std.mem.eql(u8, parsed.path, "/")) {
-            try self.sendHealth(client);
+        } else if (std.mem.eql(u8, parsed.path, "/health") or std.mem.eql(u8, parsed.path, "/")) {
+            try http.writeResponse(client, .ok, .text, "ok\n");
+        } else if (std.mem.eql(u8, parsed.path, "/ready")) {
+            try self.sendReady(client);
+        } else if (std.mem.eql(u8, parsed.path, "/status")) {
+            try self.sendStatus(client);
         } else {
             try http.writeResponse(client, .not_found, .text, "Not Found\n");
         }
@@ -138,22 +147,20 @@ pub const HttpMetricsServer = struct {
         try writeAll(client, body);
     }
 
-    /// Send JSON health response with shard and uptime info
-    fn sendHealth(self: *Self, client: std.posix.socket_t) !void {
-        const server_snap = self.registry.server.snapshot();
-        var body_buf: [256]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, "{{\"status\":\"ok\",\"shards\":{d},\"uptime_seconds\":{d},\"connections\":{d}}}\n", .{
-            self.registry.shardCount(),
-            server_snap.uptime_seconds,
-            server_snap.connections,
-        }) catch return http.writeResponse(client, .ok, .text, "ok\n");
+    fn sendReady(self: *Self, client: std.posix.socket_t) !void {
+        const h = self.health orelse return http.writeResponse(client, .service_unavailable, .text, "loading\n");
+        const r = h.readiness();
+        var buf: [32]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf, "{s}\n", .{r.word}) catch unreachable;
+        try http.writeResponse(client, if (r.ready) .ok else .service_unavailable, .text, body);
+    }
 
-        var header_buf: [256]u8 = undefined;
-        const header = http.formatResponseHeaders(&header_buf, .ok, .json, body.len) orelse
-            return error.BufferTooSmall;
-
-        try writeAll(client, header);
-        try writeAll(client, body);
+    fn sendStatus(self: *Self, client: std.posix.socket_t) !void {
+        const h = self.health orelse return http.writeResponse(client, .service_unavailable, .text, "loading\n");
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        h.writeStatus(&out.writer, self.registry) catch return error.OutOfMemory;
+        try http.writeResponse(client, .ok, .json, out.written());
     }
 
     /// Get the actual bound port (useful when port was 0)

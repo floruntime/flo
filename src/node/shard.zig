@@ -59,6 +59,7 @@ const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
+const health_mod = @import("health.zig");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
 const stream_proj_mod = @import("../projection/stream.zig");
@@ -312,6 +313,8 @@ pub const Shard = struct {
     offline_published: std.atomic.Value(bool),
     /// Entries and segments lost without anyone being told, by path.
     losses: silent_loss.Counts,
+    /// Where this shard publishes its state for `/ready` and `/status`.
+    health: ?*health_mod.ShardSlot = null,
     conflicts_seen: u64,
     join_first_asked_ms: u64,
     join_warned_ms: u64,
@@ -2773,6 +2776,38 @@ pub const Shard = struct {
         self.stopTakingPart(DIVERGED_MESSAGE);
     }
 
+    /// What this shard is doing, from the fields that decide it, so no
+    /// path that changes one of them has to remember to publish.
+    fn healthState(self: *const Shard) health_mod.ShardState {
+        if (self.removed_at_ms != null) return .removed;
+        if (self.diverged) return .diverged;
+        if (self.offline != null) return .offline;
+        const raft = self.raft_node;
+        if (raft.writes_stopped) return .cannot_flush;
+        // A node no config names is joining. It is guarded too, since an
+        // empty log could be a lost one, but it holds nothing a group
+        // counts on yet, and joining says what it waits for.
+        if (self.raft_network != null and !raft.self_named) return .joining;
+        if (raft.lost_log != .none) return .guarded;
+        if (self.raft_network != null) {
+            if (raft.latest_config.find(raft.id)) |m| {
+                if (!m.voter and !m.caught_up) return .catching_up;
+            }
+        }
+        return .ok;
+    }
+
+    /// Publish this shard's state and losses. The runtime calls it once
+    /// before the client port opens, so the first answers are already right.
+    pub fn publishHealth(self: *Shard) void {
+        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.offline != null);
+        const slot = self.health orelse return;
+        // The reason before the state: a reader that sees offline finds it.
+        if (self.offline) |*damage| slot.setReason(damage.reason());
+        const raft = self.raft_node;
+        slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
+    }
+
     /// A shard on this node that is offline, if any.
     fn offlineShard(self: *const Shard) ?*const Shard {
         const shards = self.peer_shards orelse return if (self.offline != null) self else null;
@@ -3323,7 +3358,7 @@ pub const Shard = struct {
         self.drainRaftQueue();
         self.tickRaft();
         self.reportStampSkew();
-        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.offline != null);
+        self.publishHealth();
 
         // Expire stale blocking waiters across all subsystems
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
@@ -10478,5 +10513,70 @@ test "a MANIFEST that will not load takes its shard offline, not a full replay" 
         defer std.testing.allocator.free(manifest);
         try DamageTest.writeFile(manifest, content);
         try t.expectOffline(.snapshot_unloadable, 0);
+    }
+}
+
+test "Shard: the state it publishes follows the fields that decide it, the one needing an operator first" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    // Alone: each field, in turn, outranks the ones set before it.
+    {
+        var slot: health_mod.ShardSlot = .{};
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        defer shard.deinit();
+        shard.health = &slot;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.ok, slot.get());
+
+        shard.raft_node.lost_log = .catching_up;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.guarded, slot.get());
+        shard.raft_node.writes_stopped = true;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.cannot_flush, slot.get());
+        shard.offline = silent_loss.Damage.init(.segment_unreadable, "segment {d} is unreadable", .{7});
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.offline, slot.get());
+        try std.testing.expectEqualStrings("segment 7 is unreadable", slot.reason().?);
+        shard.diverged = true;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.diverged, slot.get());
+        shard.removed_at_ms = 1;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.removed, slot.get());
+        shard.raft_node.lost_log = .none;
+        shard.raft_node.writes_stopped = false;
+    }
+
+    // Joining: no config names it; then a replica the leader has not seen
+    // caught up; then one it has.
+    {
+        var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        defer rn.deinit();
+        var slot: health_mod.ShardSlot = .{};
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+        defer shard.deinit();
+        shard.raft_network = &rn;
+        shard.health = &slot;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.joining, slot.get());
+
+        const raft = shard.raft_node;
+        // Named, it is guarded until its log holds what the leader
+        // committed, then catching up until the leader sees it has.
+        const leader = raft.latest_config.withJoiner(1, true).withMember(.{ .id = 1, .voter = true, .may_vote = true, .caught_up = true });
+        const behind = leader.withJoiner(raft.id, true);
+        raft.setMembership(&behind, 1);
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.guarded, slot.get());
+        raft.lost_log = .none;
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.catching_up, slot.get());
+        const caught_up = behind.withMember(.{ .id = raft.id, .voter = false, .may_vote = true, .caught_up = true });
+        raft.setMembership(&caught_up, 2);
+        shard.publishHealth();
+        try std.testing.expectEqual(health_mod.ShardState.ok, slot.get());
     }
 }

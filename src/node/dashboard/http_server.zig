@@ -7,7 +7,8 @@
 //! on a private interface.
 //!
 //! Endpoints:
-//! - GET /health         - Health check (always public)
+//! - GET /health         - Liveness: `ok` while the process answers (always public)
+//! - GET /ready          - `ready`, or 503 and the state keeping the node out (always public)
 //! - GET /api/v1/*       - REST API for dashboard data
 //! - GET /api/v1/kv/keys/:key/watch?namespace=:ns — SSE live updates (stub)
 //! - GET /api/v1/workflow/runs/:run_id/watch?namespace=:ns — SSE workflow run updates (stub)
@@ -21,6 +22,7 @@ const api = @import("api.zig");
 const assets = @import("assets.zig");
 const http = @import("../../util/http/mod.zig");
 const DashboardContext = api.DashboardContext;
+const Readiness = @import("../health.zig").Readiness;
 const log = @import("stdx").log;
 const auth = @import("../../auth/mod.zig");
 const auth_session = @import("../../auth/session.zig");
@@ -149,9 +151,13 @@ pub const DashboardServer = struct {
         else
             "";
 
-        // Liveness answers anyone: probes name pod or host addresses.
+        // Probes answer anyone: they name pod or host addresses.
         if (std.mem.eql(u8, parsed.path, "/health")) {
-            self.sendResponse(client, .ok, .json, "{\"status\":\"ok\"}", null);
+            self.sendResponse(client, .ok, .text, "ok\n", null);
+            return;
+        }
+        if (std.mem.eql(u8, parsed.path, "/ready")) {
+            self.sendReady(client);
             return;
         }
         if (self.refusal(parsed.method, request)) |r| {
@@ -210,6 +216,11 @@ pub const DashboardServer = struct {
 
         // Route request
         if (parsed.pathStartsWith("/api/v1/")) {
+            // Cluster stats read no shard, and say what the node is doing.
+            if (!self.ctx.shards_ready.load(.acquire) and !std.mem.eql(u8, parsed.path, "/api/v1/cluster/stats")) {
+                self.sendError(client, .service_unavailable, "replaying");
+                return;
+            }
             log.debug("Dashboard: API request path={s}", .{parsed.path});
             self.handleApiRequest(client, parsed, body, cors_headers);
         } else if (parsed.method == .GET) {
@@ -218,6 +229,13 @@ pub const DashboardServer = struct {
         } else {
             self.sendError(client, .method_not_allowed, "Method not allowed");
         }
+    }
+
+    fn sendReady(self: *Self, client: std.posix.socket_t) void {
+        const r: Readiness = if (self.ctx.health) |h| h.readiness() else .{ .ready = false, .word = "loading" };
+        var buf: [32]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf, "{s}\n", .{r.word}) catch return;
+        self.sendResponse(client, if (r.ready) .ok else .service_unavailable, .text, body, null);
     }
 
     fn handleApiRequest(self: *Self, client: std.posix.socket_t, parsed: http.ParsedRequest, body: []const u8, cors_headers: ?[]const u8) void {
@@ -712,4 +730,50 @@ test "dashboard: CORS grants only a listed origin, echoed with Vary, never null 
     try std.testing.expect(srv.getCorsHeaders("GET / HTTP/1.1\r\n\r\n", &buf) == null);
     srv = testServer(.{});
     try std.testing.expect(srv.getCorsHeaders("GET / HTTP/1.1\r\nOrigin: https://ops.example.com:8443\r\n\r\n", &buf) == null);
+}
+
+/// What the dashboard answers `request` with, status line first.
+fn answerFor(srv: *DashboardServer, request: []const u8, buf: []u8) ![]const u8 {
+    var pair: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    defer _ = std.c.close(pair[1]);
+    srv.handle(pair[0], request);
+    _ = std.c.close(pair[0]);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = std.c.read(pair[1], buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    return buf[0..len];
+}
+
+test "dashboard: until the shards are wired the data APIs answer replaying, while health, ready and cluster stats answer" {
+    const allocator = std.testing.allocator;
+    var metrics = api.helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var health = try api.helpers.NodeHealth.init(allocator, 1, 1);
+    defer health.deinit(allocator);
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.health = &health;
+    var srv = DashboardServer.init(allocator, .{}, &ctx);
+    var buf: [4096]u8 = undefined;
+
+    health.shards[0].set(.replaying);
+    try std.testing.expect(std.mem.startsWith(u8, try answerFor(&srv, "GET /api/v1/streams HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf), "HTTP/1.1 503"));
+    try std.testing.expect(std.mem.endsWith(u8, try answerFor(&srv, "GET /api/v1/streams HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf), "{\"error\":\"replaying\"}"));
+    try std.testing.expect(std.mem.startsWith(u8, try answerFor(&srv, "GET /api/v1/cluster/stats HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf), "HTTP/1.1 200"));
+    const alive = try answerFor(&srv, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, alive, "HTTP/1.1 200") and std.mem.endsWith(u8, alive, "\r\n\r\nok\n"));
+    const replaying = try answerFor(&srv, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, replaying, "HTTP/1.1 503") and std.mem.endsWith(u8, replaying, "\r\n\r\nreplaying\n"));
+
+    const no_shards = [_]u8{};
+    try ctx.wireShards(allocator, &no_shards);
+    defer allocator.free(ctx.shard_ptrs.?);
+    health.shards[0].set(.ok);
+    health.accepting.store(true, .release);
+    try std.testing.expect(std.mem.startsWith(u8, try answerFor(&srv, "GET /api/v1/streams HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf), "HTTP/1.1 200"));
+    const ready = try answerFor(&srv, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, ready, "HTTP/1.1 200") and std.mem.endsWith(u8, ready, "\r\n\r\nready\n"));
 }

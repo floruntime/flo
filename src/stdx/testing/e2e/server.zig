@@ -289,10 +289,9 @@ pub const ServerProcess = struct {
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Stop server if still running
-        if (self.started) {
-            self.stop();
-        }
+        // Stop the server if it runs, awaited or not: its log thread reads
+        // this struct until it is joined.
+        self.stop();
 
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.config_file);
@@ -309,7 +308,15 @@ pub const ServerProcess = struct {
 
     /// Start the server with custom timeout
     pub fn startWithTimeout(self: *Self, timeout_ms: u64) !void {
-        if (self.started) return error.AlreadyStarted;
+        try self.spawn();
+        try self.awaitReady(timeout_ms);
+    }
+
+    /// Pick the ports, write the config and start the process, without
+    /// waiting for it: `port`, `metrics_port` and `dashboard_port` are set
+    /// on return. Follow with `awaitReady`.
+    pub fn spawn(self: *Self) !void {
+        if (self.started or self.process != null) return error.AlreadyStarted;
 
         try claimCheckout();
 
@@ -469,8 +476,11 @@ pub const ServerProcess = struct {
         self.log_stop.store(false, .release);
         self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd, &self.log_stop });
         log_file_handed_off = true; // Thread now owns the fd
+    }
 
-        // Wait for server to be ready
+    /// Wait for a server `spawn` started to accept connections; on failure
+    /// show its log tail and kill it.
+    pub fn awaitReady(self: *Self, timeout_ms: u64) !void {
         self.waitForReady(timeout_ms) catch |err| {
             // The server's own output goes to a log file, so without this a
             // startup failure surfaces only as this harness's timeout and the
@@ -489,7 +499,8 @@ pub const ServerProcess = struct {
     /// Stop the server gracefully, then fail the test (see `checkExit`) if
     /// it ended in a way this didn't cause.
     pub fn stop(self: *Self) void {
-        if (!self.started) return;
+        // A server `spawn` started that was never awaited is stopped too.
+        if (!self.started and self.process == null) return;
 
         if (self.process) |*proc| {
             const pid = proc.id;
