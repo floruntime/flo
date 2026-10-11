@@ -378,22 +378,33 @@ fn writeJsonField(writer: anytype, key: []const u8, first: *bool) !void {
     try writer.writeAll("\":");
 }
 
+/// `s` as the inside of a JSON string. Bytes that aren't valid UTF-8 (a
+/// client-supplied key can be anything) become U+FFFD, so the line still
+/// parses; no byte grows past six (`\u00XX`, `\ufffd`).
 pub fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c >= 0x80) {
+            const n = std.unicode.utf8ByteSequenceLength(c) catch 0;
+            if (n != 0 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n])) {
+                try writer.writeAll(s[i .. i + n]);
+                i += n;
+            } else {
+                try writer.writeAll("\\ufffd");
+                i += 1;
+            }
+            continue;
+        }
         switch (c) {
             '"' => try writer.writeAll("\\\""),
             '\\' => try writer.writeAll("\\\\"),
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
+            else => if (c < 0x20) try writer.print("\\u{x:0>4}", .{c}) else try writer.writeByte(c),
         }
+        i += 1;
     }
 }
 

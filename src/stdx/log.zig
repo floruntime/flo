@@ -583,9 +583,10 @@ const cut_marker = "…";
 /// boundary and ends with "…", so it is never dropped and never splits a
 /// character.
 fn formatMessage(buf: *[max_message_len]u8, comptime fmt: []const u8, args: anytype) []const u8 {
-    var w: std.Io.Writer = .fixed(buf[0 .. max_message_len - cut_marker.len]);
+    var w: std.Io.Writer = .fixed(buf);
     w.print(fmt, args) catch {
-        const kept = utf8Prefix(w.buffered());
+        // Overflowed: make room for the marker, then back off to a boundary.
+        const kept = utf8Prefix(w.buffered()[0 .. max_message_len - cut_marker.len]);
         @memcpy(buf[kept.len..][0..cut_marker.len], cut_marker);
         return buf[0 .. kept.len + cut_marker.len];
     };
@@ -750,12 +751,9 @@ pub fn stdLogFn(
         return;
     }
 
-    var msg_buf: [max_message_len]u8 = undefined;
-    const msg = formatMessage(&msg_buf, fmt, args);
-
     var buf: [line_buf_len]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
-    formatStdEntry(&fbs, log_level, @tagName(scope), msg, time.nanoTimestamp());
+    renderStdLine(&fbs, log_level, @tagName(scope), fmt, args, time.nanoTimestamp());
 
     const output_bytes = fbs.buffered();
     const use_stderr = (log_level == .err or log_level == .fatal);
@@ -764,6 +762,13 @@ pub fn stdLogFn(
     } else {
         _ = @import("io.zig").writeFd(std.posix.STDOUT_FILENO, output_bytes);
     }
+}
+
+/// What `stdLogFn` writes: the message formatted (an overlong one cut, never
+/// dropped) and rendered in the configured format.
+fn renderStdLine(writer: *std.Io.Writer, log_level: Level, scope_name: []const u8, comptime fmt: []const u8, args: anytype, timestamp: i128) void {
+    var msg_buf: [max_message_len]u8 = undefined;
+    formatStdEntry(writer, log_level, scope_name, formatMessage(&msg_buf, fmt, args), timestamp);
 }
 
 /// A std.log line in the configured format, so a JSON stream has no text
@@ -1012,14 +1017,58 @@ test "a cut that would split a character drops the whole character" {
     try std.testing.expectEqualStrings(("a" ** (room - 1)) ++ cut_marker, msg);
 }
 
-test "a formatted JSON message over 1 KiB is kept, not replaced by its format string" {
+test "a formatted JSON message is kept, not replaced by its format string" {
     const saved = withGlobal(.json, true);
     defer global = saved;
-    const body = "y" ** 2000;
+    var buf: [line_buf_len]u8 = undefined;
+
+    // Fits: kept whole.
+    const fits = "y" ** 2000;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatFmtJsonEntry(&w, .info, "n={s}", .{fits}, 0, null, .{});
+    const whole = try parseLine(w.buffered());
+    defer whole.deinit();
+    try std.testing.expectEqualStrings("n=" ++ fits, whole.value.object.get("msg").?.string);
+
+    // Longer than a message may be: cut and marked, never the format string.
+    const long = "z" ** (max_message_len + 500);
+    w = .fixed(&buf);
+    formatFmtJsonEntry(&w, .info, "n={s}", .{long}, 0, null, .{});
+    const cut = try parseLine(w.buffered());
+    defer cut.deinit();
+    const msg = cut.value.object.get("msg").?.string;
+    try std.testing.expect(std.mem.startsWith(u8, msg, "n=zzz"));
+    try std.testing.expect(std.mem.endsWith(u8, msg, cut_marker));
+    try std.testing.expectEqual(max_message_len, msg.len);
+}
+
+test "the installed std.log function keeps a message over the limit, cut and marked" {
+    const saved = withGlobal(.json, true);
+    defer global = saved;
+    const long = "q" ** (max_message_len + 1000);
     var buf: [line_buf_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    formatFmtJsonEntry(&w, .info, "n={s}", .{body}, 0, null, .{});
+    renderStdLine(&w, .info, "reactor", "{s}", .{long}, 0);
     const parsed = try parseLine(w.buffered());
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("n=" ++ body, parsed.value.object.get("msg").?.string);
+    const msg = parsed.value.object.get("msg").?.string;
+    try std.testing.expectEqual(max_message_len, msg.len);
+    try std.testing.expect(std.mem.endsWith(u8, msg, cut_marker));
+}
+
+test "a message exactly at the limit is not cut" {
+    const exact = "e" ** max_message_len;
+    var msg_buf: [max_message_len]u8 = undefined;
+    try std.testing.expectEqualStrings(exact, formatMessage(&msg_buf, "{s}", .{exact}));
+}
+
+test "bytes that aren't UTF-8 become U+FFFD, and the JSON line parses" {
+    const saved = withGlobal(.json, true);
+    defer global = saved;
+    var buf: [line_buf_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatStdEntry(&w, .info, "default", "k\xff\xfe\"\\ é \xc3", 0);
+    const parsed = try parseLine(w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("k\u{fffd}\u{fffd}\"\\ é \u{fffd}", parsed.value.object.get("msg").?.string);
 }
