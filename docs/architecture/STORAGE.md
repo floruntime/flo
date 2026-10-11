@@ -277,7 +277,7 @@ The atomic rename in step 6 is the key safety property. If the process crashes a
 | Crash during snapshot write | The in-progress snapshot | Previous snapshot is still valid |
 | Crash after snapshot, before compaction | Nothing | Snapshot is valid; extra UAL entries are harmless |
 | Crash after compaction | Nothing | Snapshot covers all compacted entries |
-| Power loss (no fsync) | At most ~1ms of entries | Bounded by group commit interval |
+| Power loss under `async_flush` | Up to about a second of acknowledged entries | Segments flush once a second; use `sync` durability where that isn't acceptable |
 
 ---
 
