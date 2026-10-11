@@ -1,8 +1,19 @@
-/// Hardware-accelerated CRC32c implementation
-/// Uses inline assembly for maximum performance and falls back to a software
-/// implementation if hardware support is not available.
+/// CRC32C (Castagnoli), with a hardware instruction where the build can use
+/// one (see `hw_path`) and a table-driven software path otherwise.
 const std = @import("std");
 const builtin = @import("builtin");
+
+/// The CRC32C instruction this build uses, decided at comptime so a build
+/// that can't use one never compiles its asm: the target must have the
+/// instruction, and the code generator must be able to emit it (Zig 0.16's
+/// self-hosted x86_64 backend, the Debug default there, can't encode crc32).
+/// The release targets are baseline CPUs, which have neither SSE4.2 nor ARM
+/// CRC, so they take the software path.
+const hw_path: enum { x86_64, aarch64, none } = switch (builtin.cpu.arch) {
+    .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2) and builtin.zig_backend != .stage2_x86_64) .x86_64 else .none,
+    .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc) and builtin.zig_backend != .stage2_aarch64) .aarch64 else .none,
+    else => .none,
+};
 
 /// Streaming checksum using hardware acceleration if available.
 pub const HardwareCrc32 = struct {
@@ -24,27 +35,12 @@ pub const HardwareCrc32 = struct {
         return self.crc ^ 0xFFFFFFFF;
     }
 
-    /// Selects the best implementation at runtime based on CPU features.
-    /// Note: For now, we use compile-time detection. True runtime detection would require CPUID.
     fn selectUpdateFn() *const fn (*HardwareCrc32, []const u8) void {
-        switch (builtin.cpu.arch) {
-            .x86_64 => {
-                // Check if SSE4.2 is in the compile-time feature set
-                // Since we build with skylake CPU model, SSE4.2 should be available
-                if (builtin.cpu.features.isEnabled(@intFromEnum(std.Target.x86.Feature.sse4_2))) {
-                    return update_hw_x86_64;
-                }
-            },
-            .aarch64 => {
-                // Check if CRC is in the compile-time feature set
-                if (builtin.cpu.features.isEnabled(@intFromEnum(std.Target.aarch64.Feature.crc))) {
-                    return update_hw_aarch64;
-                }
-            },
-            else => {},
-        }
-        // Fallback for all other cases.
-        return update_sw;
+        return switch (hw_path) {
+            .x86_64 => update_hw_x86_64,
+            .aarch64 => update_hw_aarch64,
+            .none => update_sw,
+        };
     }
 
     /// Hardware-accelerated update for x86_64 SSE4.2.
@@ -155,12 +151,18 @@ pub const HardwareChecksumStream = struct {
     }
 };
 
-/// Detect if CPU supports hardware CRC32c acceleration
-/// Note: This uses compile-time feature detection. True runtime detection would require CPUID.
-pub fn hasHardwareAcceleration() bool {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => builtin.cpu.features.isEnabled(@intFromEnum(std.Target.x86.Feature.sse4_2)),
-        .aarch64 => builtin.cpu.features.isEnabled(@intFromEnum(std.Target.aarch64.Feature.crc)),
-        else => false,
-    };
+test "CRC32C: the check value, and the hardware path agrees with software" {
+    var c = HardwareCrc32.init();
+    c.update("123456789");
+    try std.testing.expectEqual(@as(u32, 0xE3069283), c.final());
+
+    var data: [4096 + 9]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    for ([_]usize{ 0, 1, 7, 8, 9, 15, 16, 4096, data.len }) |n| {
+        var hw = HardwareCrc32.init();
+        hw.update(data[0..n]);
+        var sw = HardwareCrc32{ .crc = 0xFFFFFFFF, .update_fn = HardwareCrc32.update_sw };
+        sw.update(data[0..n]);
+        try std.testing.expectEqual(sw.final(), hw.final());
+    }
 }
