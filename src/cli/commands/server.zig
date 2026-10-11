@@ -80,14 +80,13 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     "flo server start --join 192.168.1.10:9500,192.168.1.11:9500",
                 })
                 .stringFlag("config", 'c', "", "Path to flo.toml config file")
-                .uintFlag("port", 'p', 0, "TCP port to listen on (default: 9000)")
+                .uintFlag("port", 'p', 0, "TCP port to listen on (default: 9000; 0 picks a free one, printed when ready)")
                 .stringFlag("data-dir", 'd', "", "Data directory for storage")
                 .stringFlag("durability", 0, "", "Storage durability: sync, async_flush, ephemeral")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
                 .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
                 .stringFlag("log-format", 0, "", "Log format: text, json")
-                .uintFlag("threads", 't', 0, "Number of worker threads (0=auto)")
                 .stringFlag("bind", 0, "", "Address to listen on (default: 0.0.0.0)")
                 .boolFlag("cluster", 0, "Start as the first member of a cluster: listen for peers, lead a group of one until others join")
                 .stringFlag("join", 'j', "", "Join existing cluster (host:port[,host:port,...])")
@@ -163,7 +162,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
             commander.newBuilder(allocator)
                 .name("stop")
                 .about("Stop the Flo server")
-                .stringFlag("data-dir", 'd', "", "Data directory (to find PID file)")
+                .stringFlag("config", 'c', "", "Config file naming the data directory")
+                .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
                 .boolFlag("force", 'f', "Force immediate shutdown (SIGKILL)")
                 .action(wrapHandler(runStop)),
         )
@@ -171,7 +171,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
             commander.newBuilder(allocator)
                 .name("status")
                 .about("Show server process status")
-                .stringFlag("data-dir", 'd', "", "Data directory (to find PID file)")
+                .stringFlag("config", 'c', "", "Config file naming the data directory")
+                .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
                 .action(wrapHandler(runServerStatus)),
         )
         .subcommand(
@@ -184,7 +185,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     "flo server metrics --format json",
                 })
                 .stringFlag("endpoint", 'e', "localhost:9001", "Metrics endpoint (host:port)")
-                .stringFlag("format", 'f', "text", "Output format: text, json, prometheus")
+                .stringFlag("format", 'f', "text", "Output format: text (the Prometheus exposition) or json")
                 .action(wrapHandler(runMetrics)),
         )
         .build();
@@ -272,7 +273,9 @@ fn getPidFilePath(allocator: Allocator, data_dir: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, PID_FILENAME });
 }
 
-fn writePidFile(data_dir: []const u8) !void {
+/// The PID file holds `<pid> <port>`: the process to signal, and the port
+/// it bound, for `server status`.
+fn writePidFile(data_dir: []const u8, port: u16) !void {
     const pid = std.c.getpid();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pid_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ data_dir, PID_FILENAME }) catch return error.PathTooLong;
@@ -283,15 +286,17 @@ fn writePidFile(data_dir: []const u8) !void {
     };
     defer @import("stdx").fs.closeFile(file);
 
-    var buf: [20]u8 = undefined;
-    const pid_str = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch return error.InvalidPid;
+    var buf: [32]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&buf, "{d} {d}\n", .{ pid, port }) catch return error.InvalidPid;
     @import("stdx").fs.writeAll(file, pid_str) catch |err| {
         std.log.err("Failed to write PID file: {}", .{err});
         return err;
     };
 }
 
-fn readPidFile(allocator: Allocator, data_dir: []const u8) !?posix.pid_t {
+const PidFile = struct { pid: posix.pid_t, port: ?u16 };
+
+fn readPidFile(allocator: Allocator, data_dir: []const u8) !?PidFile {
     const pid_path = try getPidFilePath(allocator, data_dir);
     defer allocator.free(pid_path);
 
@@ -301,12 +306,14 @@ fn readPidFile(allocator: Allocator, data_dir: []const u8) !?posix.pid_t {
     };
     defer @import("stdx").fs.closeFile(file);
 
-    var buf: [20]u8 = undefined;
+    var buf: [32]u8 = undefined;
     const len = @import("stdx").fs.readAll(file, &buf) catch return null;
     if (len == 0) return null;
 
-    const pid_str = std.mem.trimEnd(u8, buf[0..len], &[_]u8{ '\n', '\r', ' ' });
-    return std.fmt.parseInt(posix.pid_t, pid_str, 10) catch null;
+    var fields = std.mem.tokenizeAny(u8, buf[0..len], " \n\r");
+    const pid = std.fmt.parseInt(posix.pid_t, fields.next() orelse return null, 10) catch return null;
+    const port = if (fields.next()) |p| std.fmt.parseInt(u16, p, 10) catch null else null;
+    return .{ .pid = pid, .port = port };
 }
 
 fn removePidFile(data_dir: []const u8) void {
@@ -362,7 +369,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 
     // Get flag values (convert to appropriate types)
     const config_path = ctx.getString("config");
-    const port = stdx.nullIfZero(u16, try ctx.getPort("port"));
+    // An explicit 0 asks for a free port, as `port = 0` does in flo.toml.
+    const port = try ctx.getChangedPort("port");
     const data_dir = ctx.getString("data-dir");
     // Read wide so an out-of-range count is refused by the config check,
     // not truncated on the way in.
@@ -385,6 +393,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const dashboard_port_override = try ctx.getChangedPort("dashboard-port");
     const no_metrics = ctx.getBool("no-metrics");
     const no_dashboard = ctx.getBool("no-dashboard");
+    if (no_metrics and metrics_port_override != null) return outcome.usage(ctx, "--metrics-port names a port for the metrics server that --no-metrics turns off; give one or the other", .{});
+    if (no_dashboard and dashboard_port_override != null) return outcome.usage(ctx, "--dashboard-port names a port for the dashboard that --no-dashboard turns off; give one or the other", .{});
 
     // Load configuration with CLI overrides
     var config = server_config.loadWithOverrides(
@@ -550,23 +560,26 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     var runtime = Runtime.init(allocator, runtime_config) catch |err| {
         return outcome.localRefusal(ctx, "cannot initialize runtime: {}", .{err});
     };
-    defer runtime.deinit();
+    var runtime_done = false;
+    defer if (!runtime_done) runtime.deinit();
 
     // Start the runtime
     runtime.start() catch |err| {
         return outcome.localRefusal(ctx, "cannot start runtime: {}", .{err});
     };
 
+    // The port bound, not asked for: with port 0 it is the only way to
+    // learn where clients connect.
+    const bound_port = runtime.boundPort();
     ctx.print("\n", .{});
-    ctx.print("Flo server ready on {s}:{d}\n", .{ config.bind, config.port });
+    ctx.print("Flo server ready on {s}:{d}\n", .{ config.bind, bound_port });
     ctx.print("Press Ctrl+C to stop.\n", .{});
     ctx.print("\n", .{});
 
     // Write PID file for server stop/status commands
-    writePidFile(expanded_data_dir) catch |err| {
+    writePidFile(expanded_data_dir, bound_port) catch |err| {
         ctx.printErr("Warning: Could not write PID file: {}\n", .{err});
     };
-    defer removePidFile(expanded_data_dir);
 
     // Wait for shutdown signal
     while (!shutdown_requested.load(.acquire)) {
@@ -575,8 +588,14 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
 
     ctx.print("\nShutting down...\n", .{});
 
-    // Stop runtime (signals cores to stop and waits for threads)
+    // Stop runtime (signals cores to stop and waits for threads), and
+    // release everything it holds, the data dir's lock included, before
+    // the PID file goes: `server stop` takes its removal to mean a new
+    // server may start on this data dir.
     runtime.stop();
+    runtime.deinit();
+    runtime_done = true;
+    removePidFile(expanded_data_dir);
 
     ctx.print("Server stopped.\n", .{});
 }
@@ -683,32 +702,28 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     ctx.print("Reset the other nodes' data before they rejoin with --join and the new secret.\n", .{});
 }
 
-fn getDataDir(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("data-dir")) |dir| {
-        if (dir.len > 0) return dir;
-    }
-    return "~/.flo/data"; // Default
+/// The data directory a server's PID file is in, as `server start` would
+/// choose it: --data-dir, else the config's data_dir, else the default.
+/// Caller frees.
+fn pidDataDir(ctx: *commander.Context) commander.Error![]const u8 {
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    return expandTilde(ctx.allocator, config.data_dir) catch |err|
+        outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
 }
 
 fn runStop(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
     const force = ctx.getBool("force");
-    const data_dir_raw = getDataDir(ctx);
-
-    const data_dir = expandTilde(allocator, data_dir_raw) catch |err| {
-        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
-    };
+    const data_dir = try pidDataDir(ctx);
     defer allocator.free(data_dir);
 
-    const pid = readPidFile(allocator, data_dir) catch |err| {
+    const pid_file = readPidFile(allocator, data_dir) catch |err| {
         return outcome.localRefusal(ctx, "cannot read PID file: {}", .{err});
     };
 
-    if (pid == null) {
-        return outcome.localRefusal(ctx, "no server running (PID file not found in {s})", .{data_dir});
-    }
-
-    const server_pid = pid.?;
+    const server_pid = (pid_file orelse
+        return outcome.localRefusal(ctx, "no server running (PID file not found in {s})", .{data_dir})).pid;
     if (!isProcessRunning(server_pid)) {
         ctx.print("Server not running (stale PID file, PID {d})\n", .{server_pid});
         removePidFile(data_dir);
@@ -731,7 +746,11 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
         var waited: u32 = 0;
         while (waited < 300) : (waited += 1) {
             @import("stdx").time.sleep(100 * std.time.ns_per_ms);
-            if (!isProcessRunning(server_pid)) {
+            // A server that stopped removes its PID file. Its process may
+            // linger unreaped (a zombie still answers signal 0) until its
+            // parent collects it, so the file is what says it stopped.
+            const still = readPidFile(allocator, data_dir) catch null;
+            if (!isProcessRunning(server_pid) or still == null or still.?.pid != server_pid) {
                 ctx.print("Server stopped.\n", .{});
                 return;
             }
@@ -744,14 +763,10 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
 
 fn runServerStatus(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
-    const data_dir_raw = getDataDir(ctx);
-
-    const data_dir = expandTilde(allocator, data_dir_raw) catch |err| {
-        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
-    };
+    const data_dir = try pidDataDir(ctx);
     defer allocator.free(data_dir);
 
-    const pid = readPidFile(allocator, data_dir) catch |err| {
+    const pid_file = readPidFile(allocator, data_dir) catch |err| {
         return outcome.localRefusal(ctx, "cannot read PID file: {}", .{err});
     };
 
@@ -760,16 +775,17 @@ fn runServerStatus(ctx: *commander.Context) commander.Error!void {
     ctx.print("║            Flo Server Status             ║\n", .{});
     ctx.print("╚══════════════════════════════════════════╝\n\n", .{});
 
-    if (pid == null) {
+    const running = pid_file orelse {
         ctx.print("Server:   NOT RUNNING\n", .{});
         ctx.print("  (No PID file found in {s})\n", .{data_dir});
         return;
-    }
+    };
 
-    const server_pid = pid.?;
+    const server_pid = running.pid;
     if (isProcessRunning(server_pid)) {
         ctx.print("Server:   RUNNING\n", .{});
         ctx.print("  PID:        {d}\n", .{server_pid});
+        if (running.port) |p| ctx.print("  Port:       {d}\n", .{p});
         ctx.print("  Data dir:   {s}\n", .{data_dir});
 
         // Try to get shard count from topology manifest
@@ -810,20 +826,62 @@ fn runServerStatus(ctx: *commander.Context) commander.Error!void {
     }
 }
 
+/// `text` as a JSON string, escaped, with each byte that isn't valid UTF-8
+/// as U+FFFD: a string either way, never the byte array `std.json` writes
+/// for bytes that aren't text.
+fn jsonString(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    try out.append(allocator, '"');
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (len == 0 or i + len > text.len or (if (std.unicode.utf8Decode(text[i..][0..len])) |_| false else |_| true)) {
+            try out.appendSlice(allocator, "\\ufffd");
+            i += 1;
+            continue;
+        }
+        if (len == 1) switch (text[i]) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0...8, 11, 12, 14...0x1f, 0x7f => try out.print(allocator, "\\u{x:0>4}", .{text[i]}),
+            else => try out.append(allocator, text[i]),
+        } else try out.appendSlice(allocator, text[i..][0..len]);
+        i += len;
+    }
+    try out.append(allocator, '"');
+}
+
+test "server metrics json: quotes, newlines and bytes that aren't UTF-8 make a valid string" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try jsonString(a, &out, "a{x=\"1\"}\n\\\x01m\xffz\xe2\x82");
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a{x=\"1\"}\n\\\x01m\u{fffd}z\u{fffd}\u{fffd}", parsed.value);
+}
+
+/// The most of a metrics answer read; past it the answer is refused as cut
+/// off rather than printed in part.
+const MAX_METRICS_ANSWER: usize = 4 * 1024 * 1024;
+
 fn runMetrics(ctx: *commander.Context) commander.Error!void {
+    const allocator = ctx.allocator;
     const endpoint = ctx.getString("endpoint") orelse "localhost:9001";
     const format = ctx.getString("format") orelse "text";
+    const json = if (std.mem.eql(u8, format, "json")) true else if (std.mem.eql(u8, format, "text")) false else return outcome.usage(ctx, "--format is text or json, not '{s}'", .{format});
 
     // Parse host:port
     const colon_pos = std.mem.indexOfScalar(u8, endpoint, ':');
     const host = if (colon_pos) |pos| endpoint[0..pos] else endpoint;
     const port_str = if (colon_pos) |pos| endpoint[pos + 1 ..] else "9001";
-    const port = std.fmt.parseInt(u16, port_str, 10) catch 9001;
+    const port = std.fmt.parseInt(u16, port_str, 10) catch
+        return outcome.usage(ctx, "--endpoint {s}: '{s}' is not a port", .{ endpoint, port_str });
 
     // Resolve localhost to 127.0.0.1
     const resolved_host = if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host;
-
-    ctx.print("Fetching metrics from {s}:{d}...\n", .{ resolved_host, port });
 
     // Make HTTP request to /metrics endpoint
     const address = @import("stdx").net.Address.parseIp4(resolved_host, port) catch {
@@ -831,8 +889,7 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     };
 
     const stream = @import("stdx").net.tcpConnectToAddress(address) catch |err| {
-        ctx.printErr("Connection failed: {}\n", .{err});
-        ctx.printErr("Is the Flo metrics server running at {s}:{d}?\n", .{ resolved_host, port });
+        ctx.printErr("Error: can't reach the metrics server at {s}:{d}: {}\n", .{ resolved_host, port, err });
         return error.Transport;
     };
     defer stream.close();
@@ -842,34 +899,43 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     const request = std.fmt.bufPrint(&request_buf, "GET /metrics HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{resolved_host}) catch {
         return outcome.usage(ctx, "host name too long for the request: {s}", .{resolved_host});
     };
-    _ = stream.write(request) catch |err| {
-        ctx.printErr("Write failed: {}\n", .{err});
+    stream.writeAll(request) catch |err| {
+        ctx.printErr("Error: sending the request failed: {}\n", .{err});
         return error.Transport;
     };
 
-    // Read response
-    var buf: [8192]u8 = undefined;
-    var total: usize = 0;
+    // Read the whole answer: the server closes the connection after it.
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = stream.read(buf[total..]) catch |err| {
-            ctx.printErr("Read failed: {}\n", .{err});
+        const n = stream.read(&chunk) catch |err| {
+            ctx.printErr("Error: reading the answer failed: {}\n", .{err});
             return error.Transport;
         };
         if (n == 0) break;
-        total += n;
-        if (total >= buf.len) break;
+        if (answer.items.len + n > MAX_METRICS_ANSWER) {
+            ctx.printErr("Error: the metrics answer is over {d} MiB; not printing part of it\n", .{MAX_METRICS_ANSWER / (1024 * 1024)});
+            return error.Transport;
+        }
+        try answer.appendSlice(allocator, chunk[0..n]);
     }
 
-    // Skip HTTP headers and print body
-    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |body_start| {
-        const body = buf[body_start + 4 .. total];
-        if (std.mem.eql(u8, format, "json")) {
-            ctx.print("{{\"metrics\": \"{s}\"}}\n", .{body});
-        } else {
-            ctx.print("{s}\n", .{body});
-        }
+    const head_end = std.mem.indexOf(u8, answer.items, "\r\n\r\n") orelse
+        return outcome.malformed(ctx, "metrics answer");
+    const status_line = answer.items[0 .. std.mem.indexOf(u8, answer.items, "\r\n") orelse head_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 200") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 200")) {
+        ctx.printErr("Error: the metrics server answered '{s}'\n", .{status_line});
+        return error.Refused;
+    }
+    const body = answer.items[head_end + 4 ..];
+    if (json) {
+        var quoted: std.ArrayList(u8) = .empty;
+        defer quoted.deinit(allocator);
+        try jsonString(allocator, &quoted, body);
+        ctx.print("{{\"metrics\":{s}}}\n", .{quoted.items});
     } else {
-        ctx.print("{s}\n", .{buf[0..total]});
+        ctx.print("{s}", .{body});
     }
 }
 

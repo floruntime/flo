@@ -997,6 +997,14 @@ pub const Runtime = struct {
         self.walk_ctx_slices[7] = wf_ctxs;
     }
 
+    /// The client port this runtime bound: the configured one, or the one
+    /// the OS picked for port 0. 0 before `start`.
+    pub fn boundPort(self: *const Runtime) u16 {
+        const acceptor = self.acceptor orelse return 0;
+        const local = stdx.net.sysLocalIp4(acceptor.listen_fd) catch return self.config.listen_port;
+        return local.port;
+    }
+
     /// Graceful shutdown in reverse order.
     pub fn stop(self: *Runtime) void {
         if (!self.started) return;
