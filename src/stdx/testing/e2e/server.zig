@@ -289,10 +289,9 @@ pub const ServerProcess = struct {
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
-        // Stop server if still running
-        if (self.started) {
-            self.stop();
-        }
+        // Stop the server if it runs, awaited or not: its log thread reads
+        // this struct until it is joined.
+        self.stop();
 
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.config_file);
