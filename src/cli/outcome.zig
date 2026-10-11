@@ -70,14 +70,20 @@ pub fn check(ctx: *Context, resp: base.Response) Error!void {
 
 /// Says why the server refused `resp` and returns its outcome.
 pub fn refused(ctx: *Context, resp: base.Response) Error {
-    return refusal(ctx, resp.status, resp.errorMessage(), "", .{});
+    return refusal(ctx, resp.status, resp.reason(), resp.errorMessage(), "", .{});
 }
 
-/// A refusal with `status` and the server's `message`, after a prefix saying
-/// what was refused (e.g. "line 4: "), and its outcome.
-pub fn refusal(ctx: *Context, status: proto.StatusCode, message: []const u8, comptime prefix: []const u8, args: anytype) Error {
-    const bug = if (status == .internal_error) "server error (a bug): " else "";
-    ctx.printErr("Error: " ++ prefix ++ "{s}{s} [{s}]\n", args ++ .{ bug, message, statusName(status) });
+/// A refusal with `status`, its reason and the server's `message`, after a
+/// prefix saying what was refused (e.g. "line 4: "), and its outcome. The
+/// codes go last, as `[status/reason]`, or `[status]` when the server gave
+/// no reason.
+pub fn refusal(ctx: *Context, status: proto.StatusCode, reason: proto.Reason, message: []const u8, comptime prefix: []const u8, args: anytype) Error {
+    const bug = if (status == .internal_error and reason != .committed_not_applied and reason != .answer_lost) "server error (a bug): " else "";
+    if (reason == .unclassified) {
+        ctx.printErr("Error: " ++ prefix ++ "{s}{s} [{s}]\n", args ++ .{ bug, message, statusName(status) });
+    } else {
+        ctx.printErr("Error: " ++ prefix ++ "{s}{s} [{s}/{s}]\n", args ++ .{ bug, message, statusName(status), @tagName(reason) });
+    }
     return ofStatus(status);
 }
 
@@ -224,13 +230,13 @@ pub const FakeServer = struct {
                 left -= n;
             }
             const frame = if (self.table_hash != proto.TABLE_HASH) foreign: {
-                var answer = proto.Response.init(header.request_id, self.status, self.body);
+                var answer = proto.Response.ok(header.request_id, self.body);
                 answer.header.table_hash = self.table_hash;
                 break :foreign answer.serialize(&out) catch return;
             } else if (self.status == .ok)
-                proto.Response.serializeNew(.ok, header.request_id, self.body, &out) catch return
+                proto.Response.serializeOk(header.request_id, self.body, &out) catch return
             else
-                proto.Response.serializeError(self.status, header.request_id, self.body, &out);
+                proto.Response.serializeRefusal(self.status, header.request_id, proto.unclassified(self.status, self.body), &out);
             _ = net.sysWrite(c, frame) catch return;
             // One answer, then the connection closes: a command that retried
             // would see a lost connection (exit 5), not hang the test.

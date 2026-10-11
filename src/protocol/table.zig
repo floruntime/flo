@@ -19,7 +19,7 @@ comptime {
 /// hash can't see those layouts, so without a bump a client or node built
 /// before the change would be misread instead of refused. It goes once every
 /// layout is declared in a table.
-pub const HAND_LAYOUT_EPOCH: u32 = 1;
+pub const HAND_LAYOUT_EPOCH: u32 = 2;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);
 

@@ -316,7 +316,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
 /// A client call that failed with `error.ServerError`: the client kept the
 /// refusal's message and status.
 fn serverRefused(ctx: *commander.Context, client: *Client) commander.Error {
-    return outcome.refusal(ctx, client.server_error_status, client.serverError(), "", .{});
+    return outcome.refusal(ctx, client.server_error_status, client.server_error_reason, client.serverError(), "", .{});
 }
 
 fn runAppend(ctx: *commander.Context) commander.Error!void {

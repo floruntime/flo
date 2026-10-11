@@ -76,12 +76,22 @@ pub const Response = struct {
         return null;
     }
 
-    /// Get error message from status code (or server-provided detail)
+    /// A refusal's body, or null for an ok answer or one that isn't a
+    /// refusal body.
+    fn refused(self: Response) ?proto.Refusal {
+        if (self.status == .ok) return null;
+        return proto.Refusal.decode(self.data) catch null;
+    }
+
+    /// Why the server refused, or `unclassified` when it didn't say.
+    pub fn reason(self: Response) proto.Reason {
+        return if (self.refused()) |r| r.reason else .unclassified;
+    }
+
+    /// The server's message for a refusal, or one for its status when it
+    /// gave none.
     pub fn errorMessage(self: Response) []const u8 {
-        // If the server sent a detailed error message in the response data, use it
-        if (self.status != .ok and self.data.len > 0) {
-            return self.data;
-        }
+        if (self.refused()) |r| if (r.message.len > 0) return r.message;
         return switch (self.status) {
             .ok => "OK",
             .error_generic => "Generic error",
@@ -138,6 +148,7 @@ pub const Client = struct {
     server_error_buf: [256]u8 = undefined,
     server_error_len: usize = 0,
     server_error_status: proto.StatusCode = .ok,
+    server_error_reason: proto.Reason = .unclassified,
 
     const Self = @This();
 
@@ -146,6 +157,7 @@ pub const Client = struct {
         self.server_error_len = @min(msg.len, self.server_error_buf.len);
         @memcpy(self.server_error_buf[0..self.server_error_len], msg[0..self.server_error_len]);
         self.server_error_status = response.status;
+        self.server_error_reason = response.reason();
     }
 
     pub fn serverError(self: *const Self) []const u8 {

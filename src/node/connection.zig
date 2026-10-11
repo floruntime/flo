@@ -288,6 +288,8 @@ pub const Connection = struct {
     /// tick's events are handled, never while code up the stack still holds
     /// it.
     closing: bool = false,
+    /// Who sent this connection's requests; see `run.authorize`.
+    principal: @import("run.zig").Principal = .anonymous,
 
     /// The client's requests are not read or run while its unsent answers
     /// pile up; resumed once they drain, or once it has read nothing for a

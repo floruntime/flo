@@ -228,7 +228,7 @@ fn expectLimitInValue(comptime list: fn (*cli.Client) anyerror!cli.Response, op:
     defer client.deinit();
 
     var answer_buf: [64]u8 = undefined;
-    const answer = try proto.Response.serializeNew(.ok, 0, "", &answer_buf);
+    const answer = try proto.Response.serializeOk(0, "", &answer_buf);
     try testing.expectEqual(@as(isize, @intCast(answer.len)), std.c.write(pair[1], answer.ptr, answer.len));
     var resp = try list(&client);
     resp.deinit();

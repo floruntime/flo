@@ -28,6 +28,14 @@ pub const Reason = enum(u16) {
     unknown_flag = 8,
     /// A bug: the server can't say more.
     internal = 9,
+    /// The write committed but this node didn't apply it: resending it
+    /// writes it twice.
+    committed_not_applied = 10,
+    /// The write committed and applied, but its answer couldn't be built.
+    answer_lost = 11,
+    /// A refusal from an op family not yet on the op table; its status and
+    /// message say what happened. Goes once every family is on the table.
+    unclassified = 12,
 };
 
 /// Whether a refused request took effect.

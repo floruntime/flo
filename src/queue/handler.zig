@@ -230,7 +230,7 @@ pub const QueueHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
+    fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .queue_enqueue => self.handleEnqueue(req),
@@ -249,6 +249,12 @@ pub const QueueHandler = struct {
     }
 
     // ── ENQUEUE ─────────────────────────────────────────────────────────
+
+    /// The processing queue sink's enqueue. It runs outside `run()`, until
+    /// sinks propose through the owning shard like any other writer.
+    pub fn sinkEnqueue(self: *QueueHandler, req: Request) CommandResult {
+        return self.handleEnqueue(req);
+    }
 
     fn handleEnqueue(self: *QueueHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
@@ -295,7 +301,7 @@ pub const QueueHandler = struct {
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             const proposed = persistence_mod.proposeEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "enqueue not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
             };
             return .{ .parked = proposed };
         } else {
@@ -333,7 +339,7 @@ pub const QueueHandler = struct {
 
     /// The enqueue applied: answer with the sequence its applier recorded.
     pub fn respondEnqueue(self: *QueueHandler, id_buf: *[20]u8) CommandResult {
-        const seq = self.queue.last_enqueued_seq orelse return .{ .err = .{ .code = .internal_error, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
+        const seq = self.queue.last_enqueued_seq orelse return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
         const id_str = std.fmt.bufPrint(id_buf, "{d}", .{seq}) catch "0";
         return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
@@ -443,7 +449,10 @@ pub const QueueHandler = struct {
             if (self.shard_ptr) |sptr| {
                 const shard: *Shard = @ptrCast(@alignCast(sptr));
                 last = persistence_mod.proposeEntry(shard, kind, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
-                    return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, not_persisted) } };
+                    // Seqs before this one are in the log: the batch ran in part.
+                    var e = persistence_mod.failureError(err, not_persisted);
+                    if (last != null) e.ran = .unknown;
+                    return .{ .err = e };
                 };
                 continue;
             }
@@ -568,7 +577,7 @@ pub const QueueHandler = struct {
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             const proposed = persistence_mod.proposeEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "purge not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "purge not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -758,8 +767,7 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            const status = e.code.toStatus();
-            shard.sendErrorResponse(conn, request_id, status, e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .queue_enqueued => |q| {
             // Parse message_id string back to u64 and send as 8-byte LE
@@ -943,17 +951,17 @@ test "queue handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     QueueHandler.register(&dispatcher);
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_enqueue)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_dequeue)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_complete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_fail)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_peek)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_stats)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_dlq_list)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_dlq_requeue)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_dlq_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_purge)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.queue_list)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_enqueue));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_dequeue));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_complete));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_fail));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_peek));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_stats));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_requeue));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_purge));
+    try testing.expect(dispatcher.hasHandler(OpCode.queue_list));
 
     try testing.expectEqual(@as(u16, 11), dispatcher.handler_count);
 }

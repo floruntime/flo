@@ -1,5 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const reason_mod = @import("reason.zig");
+pub const Refusal = reason_mod.Refusal;
+pub const Reason = reason_mod.Reason;
+pub const TRUNCATED_MARKER = reason_mod.TRUNCATED_MARKER;
+pub const Ran = reason_mod.Ran;
 
 /// Flo Protocol
 /// Binary wire protocol: a 32-byte header carrying the protocol version and
@@ -880,32 +885,21 @@ pub const Response = struct {
         return buffer[0..total_size];
     }
 
-    /// Static method: create and serialize a response in one step
-    pub fn serializeNew(status: StatusCode, request_id: u64, data: []const u8, buffer: []u8) ![]const u8 {
-        const resp = Response.init(request_id, status, data);
-        return resp.serialize(buffer);
+    /// An ok answer, serialized.
+    pub fn serializeOk(request_id: u64, data: []const u8, buffer: []u8) ![]const u8 {
+        return Response.ok(request_id, data).serialize(buffer);
     }
 
-    /// Marks a refusal message cut to fit its frame.
-    pub const TRUNCATED_MARKER = " …[truncated]";
-
-    /// Serialize a refusal whatever its message's length: one that doesn't
-    /// fit `buffer` is cut at a UTF-8 code-point boundary and marked, so a
-    /// client always gets its answer and the text stays valid.
-    pub fn serializeError(status: StatusCode, request_id: u64, msg: []const u8, buffer: []u8) []const u8 {
-        const room = buffer.len - @sizeOf(ResponseHeader);
-        std.debug.assert(room >= 64);
-        if (msg.len <= room) return serializeNew(status, request_id, msg, buffer) catch unreachable;
-        var cut = room - TRUNCATED_MARKER.len;
-        // Step back over continuation bytes to the start of a code point.
-        while (cut > 0 and msg[cut] & 0b1100_0000 == 0b1000_0000) cut -= 1;
-        var text: [4096]u8 = undefined;
-        std.debug.assert(room <= text.len);
-        @memcpy(text[0..cut], msg[0..cut]);
-        @memcpy(text[cut..][0..TRUNCATED_MARKER.len], TRUNCATED_MARKER);
-        const out = text[0 .. cut + TRUNCATED_MARKER.len];
-        std.debug.assert(std.unicode.utf8ValidateSlice(out) or !std.unicode.utf8ValidateSlice(msg));
-        return serializeNew(status, request_id, out, buffer) catch unreachable;
+    /// A refusal, serialized whatever its message's length: one that
+    /// doesn't fit `buffer` is cut at a UTF-8 code-point boundary and
+    /// marked, so a client always gets its answer.
+    pub fn serializeRefusal(status: StatusCode, request_id: u64, r: Refusal, buffer: []u8) []const u8 {
+        const header_size = @sizeOf(ResponseHeader);
+        std.debug.assert(buffer.len >= header_size + 64);
+        var body: [4096]u8 = undefined;
+        const room = @min(buffer.len - header_size, body.len);
+        const encoded = r.encode(body[0..room]);
+        return Response.refusal(status, request_id, encoded).serialize(buffer) catch unreachable;
     }
 
     pub fn parse(data: []const u8) !Response {
@@ -940,8 +934,21 @@ pub const Response = struct {
         return @enumFromInt(self.header.status);
     }
 
+    /// An ok answer carrying `data`.
+    pub fn ok(request_id: u64, data: []const u8) Response {
+        return make(request_id, .ok, data);
+    }
+
+    /// A refusal carrying an encoded `Refusal` body: every non-ok answer is
+    /// one, so a client reads every refusal the same way.
+    pub fn refusal(status: StatusCode, request_id: u64, encoded: []const u8) Response {
+        std.debug.assert(status != .ok);
+        std.debug.assert(if (Refusal.decode(encoded)) |_| true else |_| false);
+        return make(request_id, status, encoded);
+    }
+
     /// Every answer this server sends is built here, carrying its table hash.
-    pub fn init(request_id: u64, status: StatusCode, data: []const u8) Response {
+    fn make(request_id: u64, status: StatusCode, data: []const u8) Response {
         return Response{
             .header = .{
                 .magic = MAGIC,
@@ -958,10 +965,34 @@ pub const Response = struct {
         };
     }
 
-    pub fn initError(request_id: u64, status: StatusCode) Response {
-        return Response.init(request_id, status, &.{});
+    /// A refusal's reason, `ran` and message; an error for an ok answer or
+    /// a body that isn't a refusal.
+    pub fn refused(self: Response) error{Malformed}!Refusal {
+        if (self.header.status == @intFromEnum(StatusCode.ok)) return error.Malformed;
+        return Refusal.decode(self.data);
     }
 };
+
+/// Whether a refused request took effect, judged from its status alone, for
+/// a refusal whose site can't say. Only `unavailable` and `internal_error`
+/// may follow a write that reached the log, so only they are `unknown`.
+pub fn ranOf(status: StatusCode) Ran {
+    return switch (status) {
+        .unavailable, .internal_error => .unknown,
+        else => .no,
+    };
+}
+
+/// A refusal from a site not yet on the op table that refused before
+/// anything ran.
+pub fn notRun(message: []const u8) Refusal {
+    return .{ .reason = .unclassified, .ran = .no, .message = message };
+}
+
+/// A refusal from a site not yet on the op table.
+pub fn unclassified(status: StatusCode, message: []const u8) Refusal {
+    return .{ .reason = .unclassified, .ran = ranOf(status), .message = message };
+}
 
 comptime {
     // Verify header sizes at compile time
@@ -1067,7 +1098,7 @@ test "Request with TLV options serialization" {
 }
 
 test "Response with prefix_u64 serialization" {
-    var resp = Response.init(123, .ok, "hello");
+    var resp = Response.ok(123, "hello");
     resp.prefix = 999;
 
     var buffer: [256]u8 = undefined;
@@ -1089,30 +1120,31 @@ test "Response with prefix_u64 serialization" {
     try std.testing.expectEqualStrings("hello", value);
 }
 
-test "Response.serializeError: a message too long for its frame is cut at a code point and marked" {
+test "Response.serializeRefusal: every refusal carries its reason and ran, and a long message is cut and marked" {
     var buf: [@sizeOf(ResponseHeader) + 64]u8 = undefined;
-    const room = 64;
+    const room = 64 - Refusal.HEADER_LEN;
 
     // Exactly the room: sent whole.
     const exact = "a" ** room;
-    var r = try Response.parse(Response.serializeError(.bad_request, 7, exact, &buf));
-    try std.testing.expectEqualStrings(exact, r.data);
+    var r = try Response.parse(Response.serializeRefusal(.bad_request, 7, notRun(exact), &buf));
+    var body = try r.refused();
+    try std.testing.expectEqualStrings(exact, body.message);
+    try std.testing.expectEqual(Reason.unclassified, body.reason);
+    try std.testing.expectEqual(Ran.no, body.ran);
     try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
 
-    // One over: cut and marked.
-    r = try Response.parse(Response.serializeError(.bad_request, 7, "a" ** (room + 1), &buf));
-    try std.testing.expect(std.mem.endsWith(u8, r.data, Response.TRUNCATED_MARKER));
-    try std.testing.expect(r.data.len <= room);
+    // One over: cut and marked, still a refusal body.
+    r = try Response.parse(Response.serializeRefusal(.unavailable, 7, unclassified(.unavailable, "a" ** (room + 1)), &buf));
+    body = try r.refused();
+    try std.testing.expect(std.mem.endsWith(u8, body.message, reason_mod.TRUNCATED_MARKER));
+    try std.testing.expectEqual(Ran.unknown, body.ran);
+    try std.testing.expect(r.data.len <= 64);
+}
 
-    // A cut that would land inside a 2-, 3- or 4-byte code point backs up to
-    // its start, so the text stays valid UTF-8.
-    inline for (.{ "é", "€", "𝄞" }) |cp| {
-        inline for (0..4) |shift| {
-            const msg = "a" ** shift ++ cp ** 40;
-            r = try Response.parse(Response.serializeError(.bad_request, 7, msg, &buf));
-            try std.testing.expect(std.unicode.utf8ValidateSlice(r.data));
-            try std.testing.expect(std.mem.endsWith(u8, r.data, Response.TRUNCATED_MARKER));
-            try std.testing.expect(std.mem.startsWith(u8, msg, r.data[0 .. r.data.len - Response.TRUNCATED_MARKER.len]));
-        }
+test "ranOf: only a status that can follow a write in the log is unknown" {
+    inline for (@typeInfo(StatusCode).@"enum".fields) |f| {
+        const status: StatusCode = @enumFromInt(f.value);
+        const want: Ran = if (status == .unavailable or status == .internal_error) .unknown else .no;
+        try std.testing.expectEqual(want, ranOf(status));
     }
 }

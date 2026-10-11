@@ -513,7 +513,7 @@ pub const WorkflowHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     /// Answers the client, or returns the write the client is parked on.
-    pub fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
+    fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         self.mu.lock();
         defer self.mu.unlock();
         const op: OpCode = @enumFromInt(req.header.op_code);
@@ -606,7 +606,7 @@ pub const WorkflowHandler = struct {
         // and schedule from the entry; the same applier runs at boot, so a
         // restart keeps them too.
         const proposed = self.proposeCreate(shard, req.namespace, name, yaml) catch |err| {
-            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "workflow not persisted"));
+            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "workflow not persisted"));
             return null;
         };
         return proposed;
@@ -621,7 +621,7 @@ pub const WorkflowHandler = struct {
         };
         defer self.allocator.free(ns_key);
         if (!self.definitions.contains(ns_key)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
             return;
         }
 
@@ -780,7 +780,7 @@ pub const WorkflowHandler = struct {
 
         // The applier creates the run from the entry.
         const proposed = self.proposeStart(shard, req.namespace, run_id_str, workflow_name, version, input, idempotency_key, "workflow_started") catch |err| {
-            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "run not persisted"));
+            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "run not persisted"));
             return null;
         };
         return proposed;
@@ -790,11 +790,11 @@ pub const WorkflowHandler = struct {
     /// leave its first step to the tick.
     fn respondStart(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const stored_key = self.last_started_key orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
             return;
         };
         const run = self.runs.get(stored_key) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
             return;
         };
         if (self.last_start_collided) {
@@ -1051,7 +1051,8 @@ pub const WorkflowHandler = struct {
                 error.BadKey => .{ .internal_error, "internal error: a run key without its namespace" },
                 else => .{ persistence_mod.failureCode(err).toStatus(), persistence_mod.failureMessage(err, "the cancel was not persisted") },
             };
-            shard.sendErrorResponse(conn, req.header.request_id, status, text);
+            // tryComplete fails only before or at the propose.
+            shard.sendRefusal(conn, req.header.request_id, status, proto.notRun(text));
             return;
         };
 
@@ -4100,17 +4101,17 @@ test "workflow handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     WorkflowHandler.register(&dispatcher);
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_create)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_start)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_signal)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_cancel)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_status)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_history)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_list_runs)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_get_definition)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_disable)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_enable)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.workflow_list_definitions)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_create));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_start));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_signal));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_cancel));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_status));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_history));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_list_runs));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_get_definition));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_disable));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_enable));
+    try testing.expect(dispatcher.hasHandler(OpCode.workflow_list_definitions));
 
     try testing.expectEqual(@as(u16, 11), dispatcher.handler_count);
 }
@@ -4145,51 +4146,6 @@ test "workflow handler: a re-created trigger keeps its cursor on the same stream
     const moved = handler.stream_triggers.getPtr(key).?;
     try testing.expectEqual(@as(u64, 0), moved.stream_cursor_ts);
     try testing.expectEqual(@as(u64, 0), moved.stream_cursor_seq);
-}
-
-test "workflow handler: a trigger cursor restored inside an append resumes with its next record" {
-    const allocator = testing.allocator;
-    var handler = WorkflowHandler.init(allocator);
-    defer handler.deinit();
-    handler.registerStreamTrigger("ns", "wf", .{ .stream = "events" });
-
-    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    const StreamHandler = @import("../stream/handler.zig").StreamHandler;
-    var streams = StreamHandler.init(allocator, &partition);
-    defer streams.deinit();
-
-    // One append of five records: [count:u32]([len:u32][payload][hdr:u16])*
-    var blob: [4 + 5 * 7]u8 = undefined;
-    std.mem.writeInt(u32, blob[0..4], 5, .little);
-    for (0..5) |i| {
-        std.mem.writeInt(u32, blob[4 + i * 7 ..][0..4], 1, .little);
-        blob[4 + i * 7 + 4] = @intCast('a' + i);
-        std.mem.writeInt(u16, blob[4 + i * 7 + 5 ..][0..2], 0, .little);
-    }
-    const header = proto.RequestHeader.init(.stream_append, 0);
-    _ = streams.handleCommand(.{ .header = header, .namespace = "ns", .key = "events", .value = &blob, .options = "" });
-
-    const all = streams.readPayloadsForStream("events", "ns", StreamID.MIN, 100);
-    defer allocator.free(all.payloads);
-    defer allocator.free(all.ids);
-    try testing.expectEqual(@as(usize, 5), all.payloads.len);
-
-    // Replay restored the run record "b" started: its id is the cursor.
-    var idem_buf: [96]u8 = undefined;
-    const idem = try std.fmt.bufPrint(&idem_buf, "trigger:events@{d}:{d}", .{ all.ids[1].timestamp_ms, all.ids[1].sequence });
-    handler.restoreTriggerCursor("ns", "wf", idem);
-    const t = handler.stream_triggers.getPtr("ns:wf").?;
-    const cursor = StreamID{ .timestamp_ms = t.stream_cursor_ts, .sequence = t.stream_cursor_seq };
-    try testing.expect(cursor.eql(all.ids[1]));
-
-    // The next poll reads c, d, e: the rest of that append, nothing skipped.
-    const rest = streams.readPayloadsForStream("events", "ns", cursor, 100);
-    defer allocator.free(rest.payloads);
-    defer allocator.free(rest.ids);
-    try testing.expectEqual(@as(usize, 3), rest.payloads.len);
-    for (rest.payloads, "cde") |p, want| try testing.expectEqual(want, p[0]);
 }
 
 // ── Step Executor Tests ─────────────────────────────────────────────────
@@ -5310,7 +5266,7 @@ test "a signal that would leave the completion no headroom is refused, holding n
     handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "s", &value));
     const answer = try queuedAnswer(&conn);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
-    try testing.expectEqualStrings("run history is full", answer.data);
+    try testing.expectEqualStrings("run history is full", (try answer.refused()).message);
     try testing.expectEqual(@as(usize, 0), run.signals.items.len);
     try testing.expectEqual(events, run.history.items.len);
 }
@@ -5467,7 +5423,7 @@ test "cancelling a run that already finished is refused and keeps its result" {
     handler.handleCancel(&shard, &conn, makeRequest(.workflow_cancel, "r", ""));
     const answer = try queuedAnswer(&conn);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
-    try testing.expectEqualStrings("run already finished", answer.data);
+    try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqual(events, run.history.items.len);
 }
@@ -5565,7 +5521,51 @@ test "a signal to a finished run is refused and leaves its history alone" {
     handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value));
     const answer = try queuedAnswer(&conn);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
-    try testing.expectEqualStrings("run already finished", answer.data);
+    try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
     try testing.expectEqual(events, run.history.items.len);
     try testing.expectEqual(@as(usize, 0), run.signals.items.len);
+}
+
+test "workflow handler: a trigger cursor restored inside an append resumes with its next record" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    handler.registerStreamTrigger("ns", "wf", .{ .stream = "events" });
+
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    const StreamHandler = @import("../stream/handler.zig").StreamHandler;
+    var streams = StreamHandler.init(allocator, &partition);
+    defer streams.deinit();
+
+    // One append of five records: [count:u32]([len:u32][payload][hdr:u16])*
+    var blob: [4 + 5 * 7]u8 = undefined;
+    std.mem.writeInt(u32, blob[0..4], 5, .little);
+    for (0..5) |i| {
+        std.mem.writeInt(u32, blob[4 + i * 7 ..][0..4], 1, .little);
+        blob[4 + i * 7 + 4] = @intCast('a' + i);
+        std.mem.writeInt(u16, blob[4 + i * 7 + 5 ..][0..2], 0, .little);
+    }
+    _ = streams.appendForTest("ns", "events", &blob);
+
+    const all = streams.readPayloadsForStream("events", "ns", StreamID.MIN, 100);
+    defer allocator.free(all.payloads);
+    defer allocator.free(all.ids);
+    try testing.expectEqual(@as(usize, 5), all.payloads.len);
+
+    // Replay restored the run record "b" started: its id is the cursor.
+    var idem_buf: [96]u8 = undefined;
+    const idem = try std.fmt.bufPrint(&idem_buf, "trigger:events@{d}:{d}", .{ all.ids[1].timestamp_ms, all.ids[1].sequence });
+    handler.restoreTriggerCursor("ns", "wf", idem);
+    const t = handler.stream_triggers.getPtr("ns:wf").?;
+    const cursor = StreamID{ .timestamp_ms = t.stream_cursor_ts, .sequence = t.stream_cursor_seq };
+    try testing.expect(cursor.eql(all.ids[1]));
+
+    // The next poll reads c, d, e: the rest of that append, nothing skipped.
+    const rest = streams.readPayloadsForStream("events", "ns", cursor, 100);
+    defer allocator.free(rest.payloads);
+    defer allocator.free(rest.ids);
+    try testing.expectEqual(@as(usize, 3), rest.payloads.len);
+    for (rest.payloads, "cde") |p, want| try testing.expectEqual(want, p[0]);
 }

@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
+const run_mod = @import("run.zig");
 const shard_walker_mod = @import("shard_walker.zig");
 
 /// ShardWalker specialized for name-list operations (ts_list, stream_list, etc.).
@@ -219,11 +220,13 @@ pub const Dispatcher = struct {
 
     // ─── Dispatch ────────────────────────────────────────────────────────
 
-    /// Dispatch a request to the registered handler.
+    /// Dispatch a request to the registered handler, given the proof
+    /// `run.authorize` gave for it.
     ///
     /// If no handler is registered, invokes the error callback (if set).
-    pub fn dispatch(self: *const Dispatcher, shard: *anyopaque, conn: *anyopaque, req: proto.Request) void {
+    pub fn dispatch(self: *const Dispatcher, auth: run_mod.Authorized, shard: *anyopaque, conn: *anyopaque, req: proto.Request) void {
         const idx = req.header.op_code;
+        std.debug.assert(auth.op == idx);
         if (idx >= proto.MAX_OPCODES) {
             if (self.on_error) |err_fn| err_fn(shard, conn, req.header.request_id, idx);
             return;
@@ -236,6 +239,11 @@ pub const Dispatcher = struct {
     }
 
     /// Check if an opcode has a registered handler.
+    /// Whether `op` has a handler: an op code past the table has none.
+    pub fn serves(self: *const Dispatcher, op: u16) bool {
+        return op < proto.MAX_OPCODES and self.handlers[op] != null;
+    }
+
     pub fn hasHandler(self: *const Dispatcher, opcode: proto.OpCode) bool {
         return self.handlers[@intFromEnum(opcode)] != null;
     }
@@ -288,6 +296,10 @@ fn mockErrorHandler(_: *anyopaque, conn: *anyopaque, _: u64, op_code: u16) void 
     ctx.last_error_opcode = op_code;
 }
 
+fn testAuth(req: proto.Request) run_mod.Authorized {
+    return run_mod.authorize(.anonymous, .client, req).ok;
+}
+
 fn makeRequest(opcode: proto.OpCode) proto.Request {
     const header = proto.RequestHeader.init(opcode, 42);
     return .{
@@ -313,7 +325,7 @@ test "Dispatcher: register and dispatch single opcode" {
     try std.testing.expectEqual(@as(u16, 1), d.handler_count);
 
     var ctx = TestContext{};
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.ping));
+    d.dispatch(testAuth(makeRequest(.ping)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.ping));
     try std.testing.expectEqual(@as(u32, 1), ctx.dispatch_count);
     try std.testing.expectEqual(@intFromEnum(proto.OpCode.ping), ctx.last_opcode);
 }
@@ -324,7 +336,7 @@ test "Dispatcher: unrecognized opcode calls error handler" {
 
     var ctx = TestContext{};
     // kv_get not registered
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
+    d.dispatch(testAuth(makeRequest(.kv_get)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
     try std.testing.expectEqual(@as(u32, 0), ctx.dispatch_count);
     try std.testing.expectEqual(@as(u32, 1), ctx.error_count);
     try std.testing.expectEqual(@intFromEnum(proto.OpCode.kv_get), ctx.last_error_opcode);
@@ -336,7 +348,7 @@ test "Dispatcher: an opcode past the table calls the error handler" {
     var ctx = TestContext{};
     var req = makeRequest(.kv_get);
     req.header.op_code = 0xFFFF;
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), req);
+    d.dispatch(testAuth(req), @ptrCast(&ctx), @ptrCast(&ctx), req);
     try std.testing.expectEqual(@as(u32, 1), ctx.error_count);
     try std.testing.expectEqual(@as(u16, 0xFFFF), ctx.last_error_opcode);
 }
@@ -345,7 +357,7 @@ test "Dispatcher: unrecognized opcode without error handler is silent" {
     const d = Dispatcher.init();
     var ctx = TestContext{};
     // Should not crash
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
+    d.dispatch(testAuth(makeRequest(.kv_get)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
     try std.testing.expectEqual(@as(u32, 0), ctx.dispatch_count);
 }
 
@@ -359,7 +371,7 @@ test "Dispatcher: register range" {
     try std.testing.expect(d.hasHandler(.kv_put));
 
     var ctx = TestContext{};
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
+    d.dispatch(testAuth(makeRequest(.kv_get)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
     try std.testing.expectEqual(@as(u32, 1), ctx.dispatch_count);
 }
 
@@ -369,10 +381,10 @@ test "Dispatcher: multiple handlers don't interfere" {
     d.register(.kv_get, mockHandler2);
 
     var ctx = TestContext{};
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.ping));
+    d.dispatch(testAuth(makeRequest(.ping)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.ping));
     try std.testing.expectEqual(@as(u32, 1), ctx.dispatch_count); // +1
 
-    d.dispatch(@ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
+    d.dispatch(testAuth(makeRequest(.kv_get)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
     try std.testing.expectEqual(@as(u32, 11), ctx.dispatch_count); // +10
 }
 

@@ -409,8 +409,16 @@ pub const StreamHandler = struct {
 
     const NAME_TOO_LONG: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream name too long" } };
 
+    /// An append through this handler's own entry point, for tests in other
+    /// files; it fails to compile outside tests, so nothing reaches the
+    /// handler around `run()`.
+    pub fn appendForTest(self: *StreamHandler, namespace: []const u8, name: []const u8, batch: []const u8) CommandResult {
+        if (!@import("builtin").is_test) @compileError("appendForTest is for tests");
+        return self.handleCommand(.{ .header = proto.RequestHeader.init(.stream_append, 0), .namespace = namespace, .key = name, .value = batch, .options = "" });
+    }
+
     /// Dispatch a stream command to the appropriate handler.
-    pub fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
+    fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
         return switch (op) {
@@ -488,7 +496,7 @@ pub const StreamHandler = struct {
             // namespace, so a namespace nobody created is created first.
             shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
             const proposed = persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "append not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "append not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -502,7 +510,7 @@ pub const StreamHandler = struct {
     /// The append applied: the applier recorded its id and registered the
     /// stream's name.
     pub fn respondAppend(self: *StreamHandler) CommandResult {
-        const id = self.last_append orelse return .{ .err = .{ .code = .internal_error, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
+        const id = self.last_append orelse return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
         return appendOk(id);
     }
 
@@ -715,7 +723,7 @@ pub const StreamHandler = struct {
 
         if (self.shard_ptr) |sptr| {
             const proposed = self.proposeTrim(shardFromPtr(sptr), req.namespace, name_hash, bound) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "trim not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "trim not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -760,7 +768,7 @@ pub const StreamHandler = struct {
 
         if (self.shard_ptr) |sptr| {
             const proposed = self.proposeDelete(shardFromPtr(sptr), req.namespace, req.key) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "delete not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "delete not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -999,7 +1007,7 @@ pub const StreamHandler = struct {
         }
         if (self.shard_ptr) |sptr| {
             const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "") catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "group delete not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "group delete not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -1886,7 +1894,7 @@ pub const StreamHandler = struct {
         // group_name is already namespace-qualified; it travels in the
         // CommandPayload key, so the namespace arg is unused on replay.
         const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch |err| {
-            return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "group state not persisted") } };
+            return .{ .err = persistence_mod.failureError(err, "group state not persisted") };
         };
         return .{ .parked = proposed };
     }
@@ -1954,8 +1962,7 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            const status = e.code.toStatus();
-            shard.sendErrorResponse(conn, request_id, status, e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .kv_not_found => {
             shard.sendErrorResponse(conn, request_id, .not_found, "not found");
@@ -2192,29 +2199,29 @@ test "stream handler: dispatcher registration" {
     StreamHandler.register(&dispatcher);
 
     // Stream opcodes
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_append)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_read)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_trim)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_info)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_list)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_create)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_append));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_read));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_trim));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_info));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_create));
 
     // Consumer group opcodes
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_create)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_join)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_leave)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_read)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_ack)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_nack)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_info)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_pending)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_touch)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_claim)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_group_configure_sweeper)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_alter)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_create));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_join));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_leave));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_read));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_ack));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_nack));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_info));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_pending));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_touch));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_claim));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_configure_sweeper));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_alter));
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.stream_delete)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_delete));
 
     try testing.expectEqual(@as(u16, 20), dispatcher.handler_count);
 }

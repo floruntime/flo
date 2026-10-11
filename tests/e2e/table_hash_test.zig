@@ -42,14 +42,17 @@ test "e2e/table: a client from another table or protocol is refused readably and
     for (cases) |case| {
         var out: [512]u8 = undefined;
         const n = try foreignPing(ctx, case.version, case.table_hash, &out);
-        try testing.expectEqual(@sizeOf(proto.ResponseHeader) + case.text.len, n);
+        try testing.expectEqual(@sizeOf(proto.ResponseHeader) + proto.Refusal.HEADER_LEN + case.text.len, n);
         const answer = std.mem.bytesToValue(proto.ResponseHeader, out[0..@sizeOf(proto.ResponseHeader)]);
         try testing.expectEqual(proto.MAGIC, answer.magic);
         try testing.expectEqual(case.version, answer.version);
         try testing.expectEqual(proto.TABLE_HASH, answer.table_hash);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.status);
         try testing.expectEqual(@as(u64, 11), answer.request_id);
-        try testing.expectEqualStrings(case.text, out[@sizeOf(proto.ResponseHeader)..n]);
+        const refusal = try proto.Refusal.decode(out[@sizeOf(proto.ResponseHeader)..n]);
+        try testing.expectEqualStrings(case.text, refusal.message);
+        try testing.expectEqual(proto.Reason.table_mismatch, refusal.reason);
+        try testing.expectEqual(proto.Ran.no, refusal.ran);
     }
 
     var http = try ctx.createMetricsHttp();
