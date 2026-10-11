@@ -29,6 +29,16 @@ DATA_DIR="/tmp/flo-cluster-test"
 LOG_DIR="$DATA_DIR"
 FLO_BIN="$PROJECT_DIR/zig-out/bin/flo"
 
+# Stop the flo servers started from this checkout's own binary, and only
+# those: a pattern any flo matches would kill other checkouts' test runs and
+# hand-started servers too. The path is regex-escaped and anchored, matching
+# how the servers are launched ("$FLO_BIN" server start ...).
+kill_own_servers() {
+    local pattern
+    pattern="^$(printf '%s' "$FLO_BIN" | sed 's/[][\.*^$|?+(){}]/\\&/g') server "
+    pkill -f "$pattern" 2>/dev/null || true
+}
+
 # Test counters
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -78,7 +88,7 @@ fail_test() {
 
 cleanup() {
     log_info "Cleaning up..."
-    pkill -f "flo server" 2>/dev/null || true
+    kill_own_servers
     rm -rf "$DATA_DIR"/{node1,node2,node3}
 }
 
@@ -120,7 +130,7 @@ start_cluster() {
 
 stop_cluster() {
     log_info "Stopping cluster..."
-    pkill -f "flo server" 2>/dev/null || true
+    kill_own_servers
     sleep 2
 }
 
