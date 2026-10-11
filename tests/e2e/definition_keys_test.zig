@@ -33,8 +33,9 @@ fn sendRaw(ctx: *stdx.testing.TestContext, op: proto.OpCode, key: []const u8, de
         if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
         if (proto.Response.parse(out[0..got])) |resp| {
             var answer: Answer = .{ .status = resp.header.status };
-            answer.message_len = @min(resp.data.len, answer.message_buf.len);
-            @memcpy(answer.message_buf[0..answer.message_len], resp.data[0..answer.message_len]);
+            const text = if (resp.header.status == 0) resp.data else (try resp.refused()).message;
+            answer.message_len = @min(text.len, answer.message_buf.len);
+            @memcpy(answer.message_buf[0..answer.message_len], text[0..answer.message_len]);
             return answer;
         } else |_| {}
         stdx.time.sleep(10 * std.time.ns_per_ms);

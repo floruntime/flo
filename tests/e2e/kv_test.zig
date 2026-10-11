@@ -1072,7 +1072,8 @@ test "e2e/kv: the longest wait receives the value, a wait of 0 answers at once, 
 
         var over = try ctx.cli.run(&.{ "kv", "get", "never_set_key", flag, "300001" });
         defer over.deinit();
-        try testing.expect(over.stderrContains("a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms"));
+        try testing.expectEqual(@as(u8, 3), over.exit_code);
+        try testing.expectEqualStrings("Error: bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes) [bad_request/out_of_range]", std.mem.trimEnd(u8, over.stderr, "\n"));
     }
 
     // Start a blocking GET with the longest wait

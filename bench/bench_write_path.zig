@@ -48,7 +48,7 @@ fn drive(shard: *Shard, conn: *src.node.connection.Connection, op: proto.OpCode,
         // measurement is the write path, not hash-map growth.
         const key = try std.fmt.bufPrint(&kbuf, "{s}-{d:0>4}", .{ key_prefix, i % 1024 });
         const value = try std.fmt.bufPrint(&vbuf, "value-{d:0>8}-padding-padding-padding-padding-padding-padding-padding", .{id});
-        shard.dispatchRequest(conn, request(op, id, "", key, value));
+        shard.runRequest(conn, request(op, id, "", key, value), .client);
         // Drop the queued response so the connection buffer never fills.
         const pending = conn.write_buf.readable();
         if (pending > 0) conn.write_buf.consume(pending);

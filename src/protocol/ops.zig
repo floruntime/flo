@@ -460,7 +460,7 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0x4760eedaa09598ed), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0x822fa2404f0ec623), comptime tableHash(&test_table, NoEntries));
 }
 
 test "ops: the hash covers which field a route names and a wait's default" {

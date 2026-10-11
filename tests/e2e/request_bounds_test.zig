@@ -19,7 +19,7 @@ fn send(ctx: *stdx.testing.TestContext, frame: []const u8, out: []u8) !Reply {
     while (waited < 300) : (waited += 1) {
         const rc = std.c.read(fd, out[got..].ptr, out.len - got);
         if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
-        if (proto.Response.parse(out[0..got])) |resp| return .{ .status = resp.header.status, .data = resp.data } else |_| {}
+        if (proto.Response.parse(out[0..got])) |resp| return .{ .status = resp.header.status, .data = if (resp.header.status == 0) resp.data else (try resp.refused()).message } else |_| {}
         stdx.time.sleep(10 * std.time.ns_per_ms);
     }
     return error.NoResponse;
@@ -183,7 +183,10 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
         const r = try roundTrip(fd, op, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
         var want: [32]u8 = undefined;
-        try testing.expectEqualStrings(std.fmt.bufPrint(&want, "unknown op 0x{x}", .{op}) catch unreachable, r.data);
+        const refusal = try r.refused();
+        try testing.expectEqualStrings(std.fmt.bufPrint(&want, "unknown op 0x{x}", .{op}) catch unreachable, refusal.message);
+        try testing.expectEqual(proto.Reason.unknown_op, refusal.reason);
+        try testing.expectEqual(proto.Ran.no, refusal.ran);
     }
     // The same connection still answers.
     const pong = try roundTrip(fd, @intFromEnum(proto.OpCode.ping), &out);

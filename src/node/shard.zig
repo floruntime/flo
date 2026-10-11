@@ -43,6 +43,7 @@ const reply_pool_mod = @import("reply_pool.zig");
 const ReplyPool = reply_pool_mod.ReplyPool;
 const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
+const run_mod = @import("run.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const HandlerFn = @import("dispatcher.zig").HandlerFn;
 const Connection = @import("connection.zig").Connection;
@@ -1020,7 +1021,7 @@ pub const Shard = struct {
         if (self.pending_count == 0) return;
         for (self.pending) |*slot| {
             if (!slot.active or slot.index <= index) continue;
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, message);
+            self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
             self.allocator.free(slot.bytes);
             slot.active = false;
             self.pending_count -= 1;
@@ -1263,10 +1264,52 @@ pub const Shard = struct {
 
     // ─── Dispatch ────────────────────────────────────────────────────────
 
-    /// Dispatch a parsed request: resolve the routing target, then forward
-    /// or handle locally. Walk opcodes (list/scan) aggregate across shards
-    /// unless the pre-route narrows to a single partition.
-    pub fn dispatchRequest(self: *Shard, conn: *Connection, req: proto.Request) void {
+    /// Every request runs through here, wherever it came from: authorized,
+    /// checked, then routed if it is a client's, or run here if another
+    /// shard or node routed it already.
+    pub fn runRequest(self: *Shard, conn: *Connection, req: proto.Request, origin: run_mod.Origin) void {
+        const auth = switch (run_mod.authorize(conn.principal, origin, req)) {
+            .ok => |a| a,
+            .refused => |r| return self.sendRefusal(conn, req.header.request_id, r.status, r.refusal),
+        };
+
+        // A wait longer than the server keeps a waiter is refused here, once
+        // for every kind, not shortened where it is registered.
+        inline for (.{ proto.OptionTag.block_ms, proto.OptionTag.wait_ms }) |tag| {
+            if (req.findOption(tag)) |opt| {
+                if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
+                    self.sendRefusal(conn, req.header.request_id, .bad_request, .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)" });
+                    return;
+                }
+            }
+        }
+
+        // Every namespace a request names meets the one rule here, before
+        // anything runs: a write to an unknown namespace creates it.
+        if (req.namespace.len > 0) {
+            if (handler_mod.nameRefusal(req.namespace)) |why| {
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun(why));
+                return;
+            }
+        }
+
+        switch (origin) {
+            .client => self.route(conn, req, auth),
+            .shard, .held => self.dispatchLocal(conn, req, auth),
+            // A node forwards only writes to its leader.
+            .peer => if (!self.dispatcher.serves(req.header.op_code))
+                answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
+            else if (dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)))
+                self.dispatchLocal(conn, req, auth)
+            else
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes are forwarded to a leader")),
+        }
+    }
+
+    /// A client's request: walked across shards, sent to the shard that
+    /// owns it, or run here. Walk opcodes (list/scan) aggregate across
+    /// shards unless the pre-route narrows to a single partition.
+    fn route(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         conn.recordRequest();
         self.requests_dispatched += 1;
         // Count every dispatched request for the cluster command counter (drives
@@ -1277,39 +1320,19 @@ pub const Shard = struct {
 
         const op = req.header.op_code;
 
-        // A wait longer than the server keeps a waiter is refused here, once
-        // for every kind, not shortened where it is registered.
-        inline for (.{ proto.OptionTag.block_ms, proto.OptionTag.wait_ms }) |tag| {
-            if (req.findOption(tag)) |opt| {
-                if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
-                    self.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)");
-                    return;
-                }
-            }
-        }
-
-        // Every namespace a request names meets the one rule here, before
-        // anything runs: a write to an unknown namespace creates it.
-        if (req.namespace.len > 0) {
-            if (handler_mod.nameRefusal(req.namespace)) |why| {
-                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
-                return;
-            }
-        }
-
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!has_single_target) {
-                self.executeWalk(conn, req);
+                self.executeWalk(conn, req, auth);
                 return;
             }
         }
 
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
-            .local => self.dispatchLocal(conn, req),
-            .shard => |s| self.forwardToShard(s.shard_id, conn, req),
+            .local => self.dispatchLocal(conn, req, auth),
+            .shard => |s| self.forwardToShard(s.shard_id, conn, req, auth),
         }
         // Apply what committed during the request: on a single node, what
         // its handler proposed on its own account (a dequeue's ack, an
@@ -1322,7 +1345,7 @@ pub const Shard = struct {
     /// is a read that may wait there on purpose.
     const ForwardTo = struct { target: u16, blocking: bool };
 
-    /// The shard `req` would be sent to, if not this one: `dispatchRequest`'s
+    /// The shard `req` would be sent to, if not this one: `route`'s
     /// routing, decided before anything runs.
     fn forwardTarget(self: *Shard, req: proto.Request) ?ForwardTo {
         const op = req.header.op_code;
@@ -1390,7 +1413,7 @@ pub const Shard = struct {
 
     /// What a client's request must wait for before it can go — to another
     /// shard, or, for a blocking read here, past this connection's cap — or
-    /// null when it can go now, or is refused by `dispatchRequest`. A
+    /// null when it can go now, or is refused by `runRequest`. A
     /// waiting request is left unread: nothing about it has run or been
     /// counted.
     fn holdForward(self: *Shard, conn: *Connection, req: proto.Request) ?Connection.Waiting {
@@ -1419,15 +1442,14 @@ pub const Shard = struct {
 
     pub const Dispatching = struct { reply_to: ReplyTo, request_id: u64, answered_deferred: bool = false };
 
-    /// Run `req` on `conn` (`local`: skip `dispatchRequest`'s checks), noting
-    /// it as the request being dispatched while it runs. Returns whether it
-    /// was answered through `deliverDeferred` meanwhile; see
-    /// `answeredAsDeferred`.
-    fn dispatchNoted(self: *Shard, conn: *Connection, req: proto.Request, comptime local: bool) bool {
+    /// Run `req` on `conn`, noting it as the request being dispatched while
+    /// it runs. Returns whether it was answered through `deliverDeferred`
+    /// meanwhile; see `answeredAsDeferred`.
+    fn dispatchNoted(self: *Shard, conn: *Connection, req: proto.Request, origin: run_mod.Origin) bool {
         const prev = self.dispatching;
         self.dispatching = .{ .reply_to = conn.replyTo(), .request_id = req.header.request_id };
         defer self.dispatching = prev;
-        if (local) self.dispatchLocal(conn, req) else self.dispatchRequest(conn, req);
+        self.runRequest(conn, req, origin);
         return self.dispatching.?.answered_deferred;
     }
 
@@ -1445,20 +1467,20 @@ pub const Shard = struct {
     /// Run a request on this shard — unless it writes and this shard's
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
-    fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request) void {
+    fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         const status_op = req.header.op_code == @intFromEnum(proto.OpCode.cluster_status) or req.header.op_code == @intFromEnum(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
-            self.sendErrorResponse(conn, req.header.request_id, .unavailable, self.removed_message);
+            self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.removed_message));
             return;
         }
         if (self.offline != null and !status_op) {
             var buf: [320]u8 = undefined;
-            self.sendErrorResponse(conn, req.header.request_id, .unavailable, self.offlineMessage(&buf));
+            self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.offlineMessage(&buf)));
             return;
         }
         if (self.raft_network != null and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and (self.diverged or self.raft_node.role != .leader)) {
             if (self.diverged) {
-                self.sendErrorResponse(conn, req.header.request_id, .unavailable, DIVERGED_MESSAGE);
+                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(DIVERGED_MESSAGE));
                 return;
             }
             // A replica serves reads and sends writers to the leader
@@ -1467,19 +1489,11 @@ pub const Shard = struct {
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
-                self.sendErrorResponse(conn, req.header.request_id, .unavailable, "unavailable: electing a leader — retry");
+                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("unavailable: electing a leader — retry"));
                 return;
             }
             self.forwardToLeader(conn, req);
             return;
-        }
-        // Requests forwarded from another node arrive here without passing
-        // `dispatchRequest`'s check.
-        if (req.namespace.len > 0) {
-            if (handler_mod.nameRefusal(req.namespace)) |why| {
-                self.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
-                return;
-            }
         }
         // A write that brings data into a namespace this shard has not seen
         // creates it. Checked after forwarding because only the leader knows
@@ -1496,7 +1510,7 @@ pub const Shard = struct {
             }
             if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
         }
-        self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+        self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
     }
 
     /// Pure routing decision: pre-route → the shard that owns the key. No
@@ -1533,22 +1547,22 @@ pub const Shard = struct {
     /// A client's request has already waited for room (`holdForward`); if
     /// there is none even so, it is answered `overloaded` — it did not run —
     /// and the client retries instead of hanging.
-    fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request) void {
+    fn forwardToShard(self: *Shard, target_shard_id: u16, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         const peers = self.peer_shards orelse {
             // No peer shards wired — fall back to local dispatch
-            self.dispatchLocal(conn, req);
+            self.dispatchLocal(conn, req, auth);
             return;
         };
         if (target_shard_id >= peers.len) {
-            self.dispatchLocal(conn, req);
+            self.dispatchLocal(conn, req, auth);
             return;
         }
         if (target_shard_id == @as(u16, @intCast(self.id))) {
             // Already on the right shard — dispatch locally.
-            self.dispatchLocal(conn, req);
+            self.dispatchLocal(conn, req, auth);
             return;
         }
-        const target = (self.peer_mailboxes orelse return self.dispatchLocal(conn, req))[target_shard_id];
+        const target = (self.peer_mailboxes orelse return self.dispatchLocal(conn, req, auth))[target_shard_id];
         // A cluster member runs one shard (`Runtime` refuses more), so what
         // goes to another shard never waits there for a leader first; the
         // deadlines below count on it.
@@ -1644,16 +1658,16 @@ pub const Shard = struct {
     /// prevent duplicates) and serialized in the standard list wire format.
     ///
     /// Wire format: [count:u32] ([name_len:u16][name])* [has_more:u8] [cursor_len:u16][cursor]
-    fn executeWalk(self: *Shard, conn: *Connection, req: proto.Request) void {
+    fn executeWalk(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
         const NameWalker = @import("dispatcher.zig").NameWalker;
         const op_idx = req.header.op_code;
 
         const scan_fn = self.dispatcher.walk_fn[op_idx] orelse {
-            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
         };
         const contexts = self.dispatcher.walk_contexts[op_idx] orelse {
-            self.dispatcher.dispatch(@ptrCast(self), @ptrCast(conn), req);
+            self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
         };
         // A walk reads every shard's projections: one offline would leave
@@ -1859,7 +1873,7 @@ pub const Shard = struct {
             var err_buf: [256]u8 = undefined;
             // The owning shard parsed it before forwarding, so the fault is
             // the server's, not the client's.
-            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: another shard could not read this request", &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: another shard could not read this request"), &err_buf);
             self.deliverDeferred(reply_to, serialized);
             return;
         };
@@ -1869,7 +1883,7 @@ pub const Shard = struct {
         proxy.protocol = .binary;
 
         proxy.recordRequest();
-        const answered_deferred = self.dispatchNoted(proxy, req, true);
+        const answered_deferred = self.dispatchNoted(proxy, req, .shard);
         // As after a client's own request: what it proposed on its own
         // account applies before the next.
         _ = self.applyCommitted();
@@ -1885,7 +1899,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, self.noAnswer(req), &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
             self.deliverDeferred(reply_to, serialized);
         }
     }
@@ -1939,12 +1953,12 @@ pub const Shard = struct {
         if (proxy.write_overflow) {
             proxy.write_overflow = false;
             proxy.write_buf.consume(pending);
-            return .{ .err = proto.Response.serializeNew(.internal_error, request_id, "internal error: answer too large to send — ask for less", err_buf) catch unreachable };
+            return .{ .err = proto.Response.serializeRefusal(.internal_error, request_id, .{ .reason = .answer_lost, .ran = .unknown, .message = "internal error: answer too large to send — ask for less" }, err_buf) };
         }
         if (pending == 0) return null;
         const answer = self.allocator.alloc(u8, pending) catch {
             proxy.write_buf.consume(pending);
-            return .{ .err = proto.Response.serializeNew(.internal_error, request_id, "internal error: out of memory for the answer", err_buf) catch unreachable };
+            return .{ .err = proto.Response.serializeRefusal(.internal_error, request_id, .{ .reason = .answer_lost, .ran = .unknown, .message = "internal error: out of memory for the answer" }, err_buf) };
         };
         _ = proxy.write_buf.read(answer);
         proxy.shrinkWriteBuffer();
@@ -2019,7 +2033,7 @@ pub const Shard = struct {
                     std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — the request may still apply", .{ slot.target, after }) catch "unavailable: no answer — the request may still apply"
                 else
                     std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — retry", .{ slot.target, after }) catch "unavailable: no answer — retry";
-                ctx.shard.sendErrorResponse(conn, slot.request_id, .unavailable, message);
+                ctx.shard.sendRefusal(conn, slot.request_id, .unavailable, .{ .reason = .unclassified, .ran = if (slot.writes) .unknown else .no, .message = message });
                 // Nothing else may touch an idle client's connection soon.
                 ctx.shard.flushToClient(slot.fd);
             }
@@ -2096,7 +2110,7 @@ pub const Shard = struct {
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
             if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
-                self.sendErrorResponse(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+                self.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
                 return;
             }
             self.answering_index = proposed.index;
@@ -2109,7 +2123,8 @@ pub const Shard = struct {
             // Cannot happen while the Raft node caps outstanding entries
             // below the table size; said out loud rather than trusted.
             log.err("shard {d}: pending slot for index {d} still holds index {d}", .{ self.id, proposed.index, slot.index });
-            self.sendErrorResponse(conn, req.header.request_id, .overloaded, persistence_mod.failureMessage(error.Overloaded, ""));
+            // Proposed already: it may still apply.
+            self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .unclassified, .ran = .unknown, .message = persistence_mod.failureMessage(error.Overloaded, "") });
             return;
         }
         const bytes = serializeRequest(self.allocator, req) catch {
@@ -2139,15 +2154,15 @@ pub const Shard = struct {
         // A different term at this index is a new leader's entry: this
         // write never committed, whatever became of that one.
         if (term != 0 and slot.term != term) {
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, "unavailable: leader changed, write not applied — retry");
+            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .unavailable, proto.notRun("unavailable: leader changed, write not applied — retry"));
             return;
         }
         if (!applied) {
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_NOT_APPLIED);
+            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
             return;
         }
         const req = proto.Request.parse(slot.bytes) catch {
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
+            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
             return;
         };
         const proxy = self.respond_proxy;
@@ -2160,7 +2175,7 @@ pub const Shard = struct {
             defer answer.free(self.allocator);
             self.deliverDeferred(slot.reply_to, answer.bytes());
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST);
+            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
         }
     }
 
@@ -2169,7 +2184,7 @@ pub const Shard = struct {
         log.warn("shard {d}: {d} write(s) were waiting for commit; answering each: {s}", .{ self.id, self.pending_count, message });
         for (self.pending) |*slot| {
             if (!slot.active) continue;
-            self.deliverDeferredResponse(slot.reply_to, slot.request_id, .unavailable, message);
+            self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
             self.allocator.free(slot.bytes);
             slot.active = false;
             self.pending_count -= 1;
@@ -2188,7 +2203,7 @@ pub const Shard = struct {
             std.fmt.bufPrint(&buf, "unavailable: this node is a replica; send writes to the leader, node {d}", .{leader}) catch REPLICA_MESSAGE
         else
             REPLICA_MESSAGE;
-        self.sendErrorResponse(conn, req.header.request_id, .unavailable, msg);
+        self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(msg));
     }
 
     const REPLICA_MESSAGE = "unavailable: this node is a replica and knows no leader yet; send writes to a voter — retry";
@@ -2290,7 +2305,11 @@ pub const Shard = struct {
                 self.sendForward(f);
                 if (f.sent_to != 0) continue;
             }
-            if (now >= f.deadline_ms) self.finishForward(f, .unavailable, if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry");
+            // Never sent: it can't have run.
+            if (now >= f.deadline_ms) {
+                self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, proto.notRun(if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry"));
+                self.dropForward(f);
+            }
         }
     }
 
@@ -2305,12 +2324,12 @@ pub const Shard = struct {
         self.dropForward(f);
         defer self.allocator.free(bytes);
         const req = proto.Request.parse(bytes) catch {
-            self.deliverDeferredResponse(reply_to, request_id, .internal_error, "internal error: the held write did not parse and was not written — retry");
+            self.deliverDeferredRefusal(reply_to, request_id, .internal_error, proto.notRun("internal error: the held write did not parse and was not written — retry"));
             return;
         };
         const proxy = self.respond_proxy;
         loadProxy(proxy, reply_to);
-        const answered_deferred = self.dispatchNoted(proxy, req, true);
+        const answered_deferred = self.dispatchNoted(proxy, req, .held);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
@@ -2318,7 +2337,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            self.deliverDeferredResponse(reply_to, request_id, .internal_error, self.noAnswer(req));
+            self.deliverDeferredError(reply_to, request_id, .internal_error, self.noAnswer(req));
         }
     }
 
@@ -2330,7 +2349,7 @@ pub const Shard = struct {
     }
 
     fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, message: []const u8) void {
-        self.deliverDeferredResponse(f.reply_to, f.request_id, status, message);
+        self.deliverDeferredError(f.reply_to, f.request_id, status, message);
         self.dropForward(f);
     }
 
@@ -2357,7 +2376,7 @@ pub const Shard = struct {
             const body = frame.payload[@min(frame.payload.len, FORWARD_PREFIX + @as(usize, fields_len))..];
             const request_id: u64 = if (body.len >= 16) std.mem.readInt(u64, body[8..16], .little) else 0;
             var err_buf: [256]u8 = undefined;
-            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: the leader cannot read this forwarded request — are all nodes on the same version?", &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: the leader cannot read this forwarded request — are all nodes on the same version?"), &err_buf);
             return self.sendForwardReply(frame.source_node, id, serialized);
         }
         const req = proto.Request.parse(frame.payload[FORWARD_PREFIX..]) catch {
@@ -2368,14 +2387,14 @@ pub const Shard = struct {
             var err_buf: [256]u8 = undefined;
             // The forwarder parsed it first, so the likely cause is two
             // nodes running different versions.
-            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: the leader could not read this request — are all nodes on the same version?", &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: the leader could not read this request — are all nodes on the same version?"), &err_buf);
             return self.sendForwardReply(frame.source_node, id, serialized);
         };
         const proxy = self.forward_proxy;
         loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
         proxy.protocol = .binary;
         proxy.recordRequest();
-        const answered_deferred = self.dispatchNoted(proxy, req, true);
+        const answered_deferred = self.dispatchNoted(proxy, req, .peer);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, req.header.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
@@ -2383,7 +2402,7 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred and answered_deferred) {
             self.answeredAsDeferred(req);
         } else if (!proxy.response_deferred) {
-            const serialized = proto.Response.serializeNew(.internal_error, req.header.request_id, self.noAnswer(req), &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
             self.sendForwardReply(frame.source_node, id, serialized);
         }
     }
@@ -2397,7 +2416,7 @@ pub const Shard = struct {
         if (12 + bytes.len > transport.MAX_PAYLOAD_SIZE) {
             var err_buf: [256]u8 = undefined;
             const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
-            const serialized = proto.Response.serializeNew(.internal_error, request_id, "internal error: answer too large to send", &err_buf) catch return;
+            const serialized = proto.Response.serializeRefusal(.internal_error, request_id, .{ .reason = .answer_lost, .ran = .unknown, .message = "internal error: answer too large to send" }, &err_buf);
             return self.sendForwardReply(peer, id, serialized);
         }
         const buf = self.allocator.alloc(u8, 12 + bytes.len) catch {
@@ -3621,7 +3640,7 @@ pub const Shard = struct {
                 // buffer growing without bound.
                 const cap = conn.read_buf.buf.len * 2;
                 if (cap > MAX_READ_BUFFER) {
-                    self.sendErrorResponse(conn, 0, .bad_request, "bad request: request over 256 KiB");
+                    self.sendRefusal(conn, 0, .bad_request, .{ .reason = .field_too_long, .ran = .no, .message = "bad request: request over 256 KiB" });
                     self.flushToClient(fd);
                     return self.markClosing(fd);
                 }
@@ -3712,7 +3731,7 @@ pub const Shard = struct {
             // refuse it before trusting its length.
             if (promised.magic == proto.MAGIC and promised.foreign()) return self.refuseForeign(fd, conn, promised);
             if (promised.magic == proto.MAGIC and @as(u64, header_size) + promised.payload_length > MAX_REQUEST_SIZE) {
-                self.sendErrorResponse(conn, promised.request_id, .bad_request, "bad request: request over 256 KiB");
+                self.sendRefusal(conn, promised.request_id, .bad_request, .{ .reason = .field_too_long, .ran = .no, .message = "bad request: request over 256 KiB" });
                 self.flushToClient(fd);
                 self.markClosing(fd);
                 return;
@@ -3725,14 +3744,14 @@ pub const Shard = struct {
                     error.UnknownFlag => {
                         var msg_buf: [96]u8 = undefined;
                         const msg = std.fmt.bufPrint(&msg_buf, "bad request: header flags 0x{x:0>2} are set; no flag is defined", .{promised.flags}) catch unreachable;
-                        self.sendErrorResponse(conn, promised.request_id, .bad_request, msg);
+                        self.sendRefusal(conn, promised.request_id, .bad_request, .{ .reason = .unknown_flag, .ran = .no, .message = msg });
                         self.flushToClient(fd);
                         self.markClosing(fd);
                         return;
                     },
                     else => {
                         // Bad request — send error and close
-                        self.sendErrorResponse(conn, 0, .bad_request, "Invalid request");
+                        self.sendRefusal(conn, 0, .bad_request, .{ .reason = .malformed, .ran = .no, .message = "Invalid request" });
                         self.flushToClient(fd);
                         self.markClosing(fd);
                         return;
@@ -3752,7 +3771,7 @@ pub const Shard = struct {
             const pending_before = conn.write_buf.readable();
             const forwards_before = conn.forwards_in_flight;
             var answered_deferred = false;
-            if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, false);
+            if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, .client);
             // Parked here as a blocking read: one more toward its cap.
             if (held == null and conn.response_deferred and conn.forwards_in_flight == forwards_before and blockingWait(req) != null) conn.local_reads +|= 1;
             // Its wait is spent (counted into its deadline if it went to
@@ -4246,7 +4265,7 @@ pub const Shard = struct {
         // Caught up now, as the leader's own promotions are: a replica that
         // fell behind or lost its disk would be a voter that blocks commit.
         const caught_up = if (raft.peerProgress(id)) |p| raft.caughtUpNow(p) else false;
-        if (!caught_up) return shard.sendErrorResponse(conn, req.header.request_id, .unavailable, std.fmt.bufPrint(&msg, "unavailable: node {d} has not caught up yet; a voter that is behind slows every commit — retry once it has", .{id}) catch "unavailable: not caught up");
+        if (!caught_up) return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(std.fmt.bufPrint(&msg, "unavailable: node {d} has not caught up yet; a voter that is behind slows every commit — retry once it has", .{id}) catch "unavailable: not caught up"));
         const next = raft.latest_config.withMember(.{ .id = id, .voter = true, .may_vote = true, .caught_up = true });
         shard.proposeAdminChange(conn, req, &next);
     }
@@ -4284,10 +4303,10 @@ pub const Shard = struct {
 
     fn proposeAdminChange(self: *Shard, conn: *Connection, req: proto.Request, next: *const membership.Config) void {
         const raft = self.raft_node;
-        const outcome = raft.proposeConfig(next) catch |err| return self.sendErrorResponse(conn, req.header.request_id, .unavailable, switch (err) {
+        const outcome = raft.proposeConfig(next) catch |err| return self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(switch (err) {
             error.NotLeader => "unavailable: the leader changed — retry",
             else => "unavailable: the change could not be put in the log — retry",
-        });
+        }));
         var msg: [200]u8 = undefined;
         switch (outcome) {
             .proposed => |p| {
@@ -4295,7 +4314,7 @@ pub const Shard = struct {
                 self.park(conn, req, p, respondChangeCommitted);
             },
             .refused => |why| self.sendErrorResponse(conn, req.header.request_id, .bad_request, why.message()),
-            .no_own_commit => self.sendErrorResponse(conn, req.header.request_id, .unavailable, "unavailable: a leader was just elected; retry in a moment"),
+            .no_own_commit => self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("unavailable: a leader was just elected; retry in a moment")),
             .in_flight => {
                 var waiting: [raft_node_mod.MAX_PEERS]u32 = undefined;
                 const w = self.changeWaitsOn(&waiting);
@@ -4303,7 +4322,7 @@ pub const Shard = struct {
                     std.fmt.bufPrint(&msg, "unavailable: an earlier membership change waits on node(s) {any}; retry once it commits", .{w}) catch "unavailable: an earlier membership change has not committed"
                 else
                     "unavailable: an earlier membership change has not committed; retry";
-                self.sendErrorResponse(conn, req.header.request_id, .unavailable, text);
+                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(text));
             },
         }
     }
@@ -4323,9 +4342,10 @@ pub const Shard = struct {
             std.fmt.bufPrint(&text_buf, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, theirs.table_hash })
         else
             std.fmt.bufPrint(&text_buf, "server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, theirs.version })) catch unreachable;
-        var answer = proto.Response.init(theirs.request_id, .bad_request, text);
+        var body: [proto.Refusal.HEADER_LEN + text_buf.len]u8 = undefined;
+        var answer = proto.Response.refusal(.bad_request, theirs.request_id, (proto.Refusal{ .reason = .table_mismatch, .ran = .no, .message = text }).encode(&body));
         answer.header.version = theirs.version;
-        var buf: [@sizeOf(proto.ResponseHeader) + text_buf.len]u8 = undefined;
+        var buf: [@sizeOf(proto.ResponseHeader) + body.len]u8 = undefined;
         _ = conn.queueWrite(answer.serialize(&buf) catch unreachable);
 
         self.foreign_refused += 1;
@@ -4347,12 +4367,18 @@ pub const Shard = struct {
         self.markClosing(fd);
     }
 
+    /// A refusal from a site not yet on the op table: its reason is
+    /// `unclassified` and whether it ran is judged from its status.
+    pub fn sendErrorResponse(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, msg: []const u8) void {
+        self.sendRefusal(conn, request_id, status, proto.unclassified(status, msg));
+    }
+
     /// A refusal is always sent: one too long for its frame is cut, never
     /// dropped (a dropped one left the client the no-answer fallback).
-    pub fn sendErrorResponse(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, msg: []const u8) void {
+    pub fn sendRefusal(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
         _ = self;
         var buf: [1024]u8 = undefined;
-        _ = conn.queueWrite(proto.Response.serializeError(status, request_id, msg, &buf));
+        _ = conn.queueWrite(proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
     /// Deliver an already-serialized answer to wherever `reply_to` says.
@@ -4416,18 +4442,33 @@ pub const Shard = struct {
         }
     }
 
-    /// Serialize a status+data response and deliver it via `deliverDeferred`.
-    pub fn deliverDeferredResponse(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, data: []const u8) void {
+    /// Serialize an ok answer and deliver it via `deliverDeferred`.
+    pub fn deliverDeferredOk(self: *Shard, reply_to: ReplyTo, request_id: u64, data: []const u8) void {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // Same rule as `sendOkResponse`: a parked client is answered, never
         // left to its own timeout because the answer is too large to frame
         // (and on another shard, never left holding its reply slot).
-        const serialized = proto.Response.serializeNew(status, request_id, data, &buf) catch blk: {
+        const serialized = proto.Response.serializeOk(request_id, data, &buf) catch blk: {
             log.warn("shard {d}: deferred answer to request {d} is {d} bytes, over the frame limit; answered with an error", .{ self.id, request_id, data.len });
-            break :blk proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
+            break :blk proto.Response.serializeRefusal(.internal_error, request_id, TOO_LARGE, &buf);
         };
         self.deliverDeferred(reply_to, serialized);
     }
+
+    /// A refusal from a site not yet on the op table, delivered via
+    /// `deliverDeferred`.
+    pub fn deliverDeferredError(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, msg: []const u8) void {
+        self.deliverDeferredRefusal(reply_to, request_id, status, proto.unclassified(status, msg));
+    }
+
+    pub fn deliverDeferredRefusal(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
+        var buf: [1024]u8 = undefined;
+        self.deliverDeferred(reply_to, proto.Response.serializeRefusal(status, request_id, r, &buf));
+    }
+
+    /// An answer that can't be framed: whatever it did stands, but its
+    /// result is gone.
+    const TOO_LARGE: proto.Refusal = .{ .reason = .answer_lost, .ran = .unknown, .message = "internal error: answer over 256 KiB — ask for less" };
 
     /// Send an OK response with data payload on a connection.
     pub fn sendOkResponse(self: *Shard, conn: *Connection, request_id: u64, data: []const u8) void {
@@ -4435,8 +4476,8 @@ pub const Shard = struct {
         var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // A client waits for every request's answer: one too large to
         // frame is answered with an error, never left out.
-        const serialized = proto.Response.serializeNew(.ok, request_id, data, &buf) catch
-            proto.Response.serializeNew(.internal_error, request_id, "internal error: answer over 256 KiB — ask for less", &buf) catch unreachable;
+        const serialized = proto.Response.serializeOk(request_id, data, &buf) catch
+            proto.Response.serializeRefusal(.internal_error, request_id, TOO_LARGE, &buf);
         _ = conn.queueWrite(serialized);
     }
 
@@ -4457,7 +4498,7 @@ pub const Shard = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         var buf: [32]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "unknown op 0x{x}", .{op}) catch unreachable;
-        self.sendErrorResponse(conn, request_id, .bad_request, message);
+        self.sendRefusal(conn, request_id, .bad_request, .{ .reason = .unknown_op, .ran = .no, .message = message });
     }
 
     // ─── Built-in handlers ───────────────────────────────────────────────
@@ -4927,7 +4968,7 @@ fn answerCancelled(waiter: *const Waiter, ctx: *anyopaque) void {
 
 /// Timeout callback: send an appropriate "no data" response based on waiter kind.
 ///
-/// Routes through `deliverDeferredResponse` so the response reaches the
+/// Routes through `deliverDeferred` so the response reaches the
 /// connection-owning shard even when the waiter expired on a different
 /// (data) shard after cross-shard request routing.
 fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
@@ -4939,18 +4980,18 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             if (shard.defaultPartition().kv.get(waiter.key())) |entry| {
                 sendKVWaiterValue(shard, waiter, entry.value, entry.version);
             } else {
-                shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .not_found, "");
+                shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .not_found, "");
             }
         },
         .queue_dequeue => {
             // Queue blocking dequeue timeout → empty messages response (count = 0)
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, 0, .little);
-            shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, &buf);
+            shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &buf);
         },
         // stream_read / action_await / stream_group_read → empty OK response
         .stream_read, .action_await, .stream_group_read => {
-            shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, "");
+            shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
         },
     }
 }
@@ -4966,7 +5007,7 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 }
 
 fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
-    var resp = proto.Response.init(waiter.request_id, .ok, value);
+    var resp = proto.Response.ok(waiter.request_id, value);
     resp.prefix = version;
     const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
     var buf: [MAX_BUF]u8 = undefined;
@@ -4975,7 +5016,7 @@ fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, ve
     } else |_| {
         // The waiter is gone once this returns; an asker left without an
         // answer would hang until its own timeout.
-        shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .internal_error, "internal error: value too large to send");
+        shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .internal_error, "internal error: value too large to send");
     }
 }
 
@@ -5000,8 +5041,8 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     }
 
     switch (result) {
-        .stream_messages => |m| shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, m.data),
-        else => shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .internal_error, ""),
+        .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
+        else => shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .internal_error, ""),
     }
     return true;
 }
@@ -5017,7 +5058,7 @@ pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const last = shard.stream_handler.stream.streamLastId(waiter.stream.name_hash);
     if (!last.greaterThan(waiter.stream.after)) return false;
 
-    shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, "");
+    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
     return true;
 }
 
@@ -5058,7 +5099,7 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         };
     }
 
-    shard.deliverDeferredResponse(waiter.reply_to, waiter.request_id, .ok, data);
+    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, data);
     return true;
 }
 
@@ -5607,7 +5648,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     };
 
     // Dispatch it
-    shard.dispatchRequest(conn, req);
+    shard.runRequest(conn, req, .client);
 
     try std.testing.expectEqual(@as(u32, 1), PingTracker.ping_count);
     try std.testing.expectEqual(@as(u64, 1), shard.requests_dispatched);
@@ -5735,7 +5776,7 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     const conn = try shard.addConnection(pair[0]);
 
     const header = proto.RequestHeader.init(.kv_put, 5);
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     // Held for the leader, not answered.
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expect(conn.response_deferred);
@@ -5862,7 +5903,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     var header = proto.RequestHeader.init(.kv_put, 1);
     const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
     defer std.testing.allocator.free(put);
-    shard.dispatchRequest(conn, try proto.Request.parse(put));
+    shard.runRequest(conn, try proto.Request.parse(put), .client);
     _ = shard.applyCommitted();
     var drain_buf: [4096]u8 = undefined;
     _ = try readAnswer(pair[1], &shard, conn.fd, &drain_buf, 1);
@@ -5892,7 +5933,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
 
     const put = try testRequest(.kv_put, 1, "w", "v1");
     defer std.testing.allocator.free(put);
-    shard.dispatchRequest(conn, try proto.Request.parse(put));
+    shard.runRequest(conn, try proto.Request.parse(put), .client);
     _ = shard.applyCommitted();
     var out: [512]u8 = undefined;
     _ = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
@@ -5948,7 +5989,7 @@ test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minut
         const bytes = try testRequestWith(case.op, 30 + i, case.key, case.value, opt_buf[0..opts.offset]);
         defer std.testing.allocator.free(bytes);
         const active = shard.waiter_pool.totalActive();
-        shard.dispatchRequest(c.conn, try proto.Request.parse(bytes));
+        shard.runRequest(c.conn, try proto.Request.parse(bytes), .client);
         if (case.waits) {
             try std.testing.expectEqual(active + 1, shard.waiter_pool.totalActive());
             continue;
@@ -5994,6 +6035,12 @@ test "Shard: a proxy answer comes out whole; one the proxy refused comes out as 
 }
 
 /// A client request as it arrives on the wire, CRC set; the caller frees it.
+/// Sends `bytes` to shard `target` as `route` would, once authorized.
+fn forwardForTest(s: *Shard, target: u16, conn: *Connection, bytes: []const u8) !void {
+    const req = try proto.Request.parse(bytes);
+    s.forwardToShard(target, conn, req, run_mod.authorize(.anonymous, .client, req).ok);
+}
+
 fn testRequest(op: proto.OpCode, request_id: u64, key: []const u8, value: []const u8) ![]u8 {
     return testRequestWith(op, request_id, key, value, "");
 }
@@ -6240,6 +6287,31 @@ fn nextAnswer(c: TestClient, shard: *Shard, out: []u8) !proto.Response {
     return proto.Response.parse(out[0..n]);
 }
 
+test "Shard: a request another shard routed here meets the same checks as a client's" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+
+    // A wait past the cap, sent on without the asking shard's checks.
+    var opts: [8]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts);
+    try ob.addU32(.block_ms, waiter_pool_mod.MAX_BLOCK_MS + 1);
+    const get = try testRequestWith(.kv_get, 44, "k", "", ob.getOptions());
+    defer std.testing.allocator.free(get);
+    try forwardForTest(a, 1, c.conn, get);
+    try std.testing.expectEqual(@as(usize, 1), b.drainInbox());
+    _ = a.drainInbox();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 44), resp.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(proto.Reason.out_of_range, (try resp.refused()).reason);
+}
+
 test "Shard: a request forwarded to another shard is answered on the asker's reply ring, once, and only by the shard asked" {
     var two: TwoShards = undefined;
     try two.init();
@@ -6254,7 +6326,7 @@ test "Shard: a request forwarded to another shard is answered on the asker's rep
 
     const ping = try testRequest(.ping, 41, "", "");
     defer std.testing.allocator.free(ping);
-    a.forwardToShard(1, c.conn, try proto.Request.parse(ping));
+    try forwardForTest(a, 1, c.conn, ping);
     try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
     try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_in_flight);
     try std.testing.expectEqual(@as(usize, 1), b.drainInbox());
@@ -6314,7 +6386,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     // the client hears its answer was lost, and the slot is free.
     const p1 = try testRequest(.ping, 51, "", "");
     defer std.testing.allocator.free(p1);
-    a.forwardToShard(1, c.conn, try proto.Request.parse(p1));
+    try forwardForTest(a, 1, c.conn, p1);
     var fwd: [1]InboxMessage = undefined;
     try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.drain(&fwd));
     std.testing.allocator.free(@as([*]u8, @ptrCast(fwd[0].payload_ptr.?))[0..fwd[0].payload_len]);
@@ -6333,7 +6405,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     const p2 = try testRequest(.ping, 52, "", "");
     defer std.testing.allocator.free(p2);
     while (a.reply_pool.take(.ordinary, 1, -1, 0, 0, false, Shard.nowMs(), Shard.nowMs(), 3000, 0)) |_| {} else |err| try std.testing.expectEqual(error.TargetBusy, err);
-    a.forwardToShard(1, c.conn, try proto.Request.parse(p2));
+    try forwardForTest(a, 1, c.conn, p2);
     resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 52), resp.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
@@ -6350,8 +6422,8 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     defer std.testing.allocator.free(p3);
     const put = try testRequest(.kv_put, 54, "k", "v");
     defer std.testing.allocator.free(put);
-    a.forwardToShard(1, c.conn, try proto.Request.parse(p3));
-    a.forwardToShard(1, c.conn, try proto.Request.parse(put));
+    try forwardForTest(a, 1, c.conn, p3);
+    try forwardForTest(a, 1, c.conn, put);
     try std.testing.expectEqual(@as(u16, 2), c.conn.forwards_in_flight);
     // Waiting since the clock's zero: shown as the oldest wait, not yet
     // past a deadline. (Times are set, not subtracted: a monotonic clock
@@ -6394,10 +6466,13 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     const write_told = if (told[0].header.request_id == 54) told[0] else told[1];
     try std.testing.expectEqual(@as(u64, 53), read_told.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), read_told.header.status);
-    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — retry", read_told.data);
+    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — retry", (try read_told.refused()).message);
+    // A read that timed out ran or not, it changed nothing; a write may yet.
+    try std.testing.expectEqual(proto.Ran.no, (try read_told.refused()).ran);
+    try std.testing.expectEqual(proto.Ran.unknown, (try write_told.refused()).ran);
     try std.testing.expectEqual(@as(u64, 54), write_told.header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), write_told.header.status);
-    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — the request may still apply", write_told.data);
+    try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — the request may still apply", (try write_told.refused()).message);
     try std.testing.expectEqual(@as(u64, 2), sm.snapshot().cross_shard_timeouts);
     // The late answers free the slots and reach no one.
     while (b.drainInbox() > 0) {}
@@ -6413,7 +6488,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     // Counted from when it is sent, however long it waited: the slot is
     // not let go before its client is told.
     c.conn.head_since_ms = 0;
-    a.forwardToShard(1, c.conn, try proto.Request.parse(dq));
+    try forwardForTest(a, 1, c.conn, dq);
     c.conn.head_since_ms = null;
     for (a.reply_pool.slots) |s| {
         if (!s.active) continue;
@@ -6432,7 +6507,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     // Never answered at all: past the slot's own deadline it comes back.
     const p4 = try testRequest(.ping, 55, "", "");
     defer std.testing.allocator.free(p4);
-    a.forwardToShard(1, c.conn, try proto.Request.parse(p4));
+    try forwardForTest(a, 1, c.conn, p4);
     for (a.reply_pool.slots) |*s| {
         if (s.active) {
             s.answer_due_ms = 0;
@@ -6823,7 +6898,7 @@ test "Shard: waiting connections go in the order they began waiting, no more tha
     try answersOn(clients[0], a, &out, &answers);
     const refused = if (answers[0].header.request_id == 601) answers[0] else answers[1];
     try std.testing.expectEqual(@as(u64, 601), refused.header.request_id);
-    try std.testing.expectEqualStrings("overloaded: shard 1 is not keeping up; this request was not run — back off and retry", refused.data);
+    try std.testing.expectEqualStrings("overloaded: shard 1 is not keeping up; this request was not run — back off and retry", (try refused.refused()).message);
 }
 
 test "Shard: a give-up survives a pause for unsent answers: the requests behind it that would wait are refused when reading resumes" {
@@ -7326,7 +7401,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
-    try std.testing.expectEqualStrings("bad request: request over 256 KiB", resp.data);
+    try std.testing.expectEqualStrings("bad request: request over 256 KiB", (try resp.refused()).message);
 
     // Not a request at all, whatever its length field says: invalid, not
     // too large.
@@ -7365,7 +7440,7 @@ test "Shard: a first frame in another protocol is answered as an invalid request
         const resp = try proto.Response.parse(out[0..n]);
         try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
         try std.testing.expectEqual(@as(u64, 0), resp.header.request_id);
-        try std.testing.expectEqualStrings("Invalid request", resp.data);
+        try std.testing.expectEqualStrings("Invalid request", (try resp.refused()).message);
         shard.settleConnections();
         try std.testing.expect(shard.getConnection(fd) == null);
     }
@@ -7407,7 +7482,8 @@ test "Shard: a client from another table or protocol is answered in its own vers
         try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.status);
         try std.testing.expectEqual(@as(u64, 9), answer.request_id);
         const body = out[@sizeOf(proto.ResponseHeader)..n];
-        try std.testing.expectEqualStrings(case.text, body);
+        try std.testing.expectEqualStrings(case.text, (try proto.Refusal.decode(body)).message);
+        try std.testing.expectEqual(proto.Reason.table_mismatch, (try proto.Refusal.decode(body)).reason);
         try std.testing.expectEqual(answer.crc32, answer.computeCRC32(body));
     }
 }
@@ -7433,7 +7509,8 @@ test "Shard: a request with a header flag set is refused, naming the flags" {
     const resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
-    try std.testing.expectEqualStrings("bad request: header flags 0x04 are set; no flag is defined", resp.data);
+    try std.testing.expectEqualStrings("bad request: header flags 0x04 are set; no flag is defined", (try resp.refused()).message);
+    try std.testing.expectEqual(proto.Reason.unknown_flag, (try resp.refused()).reason);
 }
 
 test "Shard: requests resumed at the end of a tick run, and keep the next poll from waiting on a leader only" {
@@ -7588,7 +7665,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     try std.testing.expectEqual(@as(u32, 92), std.mem.readInt(u32, reply[0..4], .little));
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
-    try std.testing.expectEqualStrings("internal error: the leader cannot read this forwarded request — are all nodes on the same version?", resp.data);
+    try std.testing.expectEqualStrings("internal error: the leader cannot read this forwarded request — are all nodes on the same version?", (try resp.refused()).message);
 }
 
 test "Shard: a diverged node refuses writes even if it led" {
@@ -7615,7 +7692,7 @@ test "Shard: a diverged node refuses writes even if it led" {
     var header = proto.RequestHeader.init(.kv_put, 5);
     header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     shard.raft_node.role = .leader;
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     var out: [512]u8 = undefined;
     const n = conn.write_buf.read(&out);
     const resp = try proto.Response.parse(out[0..n]);
@@ -7639,7 +7716,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
     var header = proto.RequestHeader.init(.kv_put, 5);
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
     // never match one in its waiter pool.
@@ -7662,7 +7739,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // Sent to a leader: it waits past any deadline for that leader's
     // answer, until the term moves on. (No network here, so the link is
     // not consulted.)
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_ms = now;
@@ -7680,7 +7757,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Sent over a link that then went down, with the term unchanged: the
     // answer will never come either.
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.sweepForwards(now);
@@ -7693,7 +7770,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // so the answer is not coming over it either.
     rn.linked_ids[0].store(2, .release);
     rn.linked_sessions[0].store(5, .release);
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_session = 4;
@@ -7706,7 +7783,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Same link, same leader, same term, and no answer: waited on until
     // the backstop, then answered.
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_session = 5;
@@ -7717,7 +7794,9 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
     n = std.c.read(pair[1], &out, out.len);
     resp = try proto.Response.parse(out[0..@intCast(n)]);
-    try std.testing.expectEqualStrings("unavailable: no answer from the leader — write may still apply", resp.data);
+    try std.testing.expectEqualStrings("unavailable: no answer from the leader — write may still apply", (try resp.refused()).message);
+    // Sent to a leader that is gone: it may still apply.
+    try std.testing.expectEqual(proto.Ran.unknown, (try resp.refused()).ran);
     rn.linked_ids[0].store(0, .release);
     rn.linked_sessions[0].store(0, .release);
 
@@ -7725,7 +7804,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // runs here as the client's own request.
     raft.leader_id = 0;
     header.request_id = 6;
-    shard.dispatchRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     raft.role = .leader;
     raft.leader_id = 8;
@@ -7902,7 +7981,7 @@ const ParkTest = struct {
     }
 
     fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
-        sh.dispatchRequest(c, try request(op, id, "", key, value, ""));
+        sh.runRequest(c, try request(op, id, "", key, value, ""), .client);
     }
 
     /// Every response the shard has for `c`, flushed and read from `fd`
@@ -7925,6 +8004,173 @@ const ParkTest = struct {
     }
 };
 
+test "Shard: a parked write that committed but didn't apply says so, with ran = yes, so it isn't resent" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    defer {
+        for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        rn.outbound.clearRetainingCapacity();
+    }
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    try ParkTest.send(&shard, conn, .kv_put, 7, "k", "v");
+    try std.testing.expectEqual(@as(usize, 1), shard.pending_count);
+    const slot = for (shard.pending) |p| {
+        if (p.active) break p;
+    } else unreachable;
+
+    shard.answerPending(slot.index, slot.term, 0, false);
+    var one: [1]proto.Response = undefined;
+    var buf: [512]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+    const r = try one[0].refused();
+    try std.testing.expectEqual(proto.Reason.committed_not_applied, r.reason);
+    try std.testing.expectEqual(proto.Ran.yes, r.ran);
+}
+
+/// A shard leading a group of two, so nothing commits until `ParkTest.ack`,
+/// and a client connection to it.
+const RanTest = struct {
+    pipe_fds: [2]std.posix.fd_t,
+    rn: RaftNetwork,
+    shard: Shard,
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+
+    fn init(t: *RanTest) !void {
+        t.pipe_fds = try @import("stdx").io.pipe();
+        t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        t.shard.raft_network = &t.rn;
+        t.shard.wireHandlerShardPtrs();
+        try ParkTest.joinPeer(&t.shard);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &t.pair));
+        t.conn = try t.shard.addConnection(t.pair[0]);
+    }
+
+    fn deinit(t: *RanTest) void {
+        for (t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        t.rn.outbound.clearRetainingCapacity();
+        t.shard.deinit();
+        t.rn.deinit();
+        _ = std.c.close(t.pair[1]);
+        _ = std.c.close(t.pipe_fds[0]);
+        _ = std.c.close(t.pipe_fds[1]);
+    }
+
+    /// The one refusal waiting for the client.
+    fn refusal(t: *RanTest, buf: []u8) !struct { status: u8, r: proto.Refusal } {
+        var one: [1]proto.Response = undefined;
+        try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, &one);
+        return .{ .status = one[0].header.status, .r = try one[0].refused() };
+    }
+
+    /// The one parked write's slot.
+    fn parked(t: *RanTest) Pending {
+        for (t.shard.pending) |p| if (p.active) return p;
+        unreachable;
+    }
+};
+
+test "Shard: ran is no for a parked write whose index another term took, and unknown for one whose flush failed" {
+    var buf: [512]u8 = undefined;
+    {
+        var t: RanTest = undefined;
+        try t.init();
+        defer t.deinit();
+        try ParkTest.send(&t.shard, t.conn, .kv_put, 7, "k", "v");
+        const slot = t.parked();
+        // Another leader's entry committed at this index: this write didn't.
+        t.shard.answerPending(slot.index, slot.term + 1, 0, true);
+        const got = try t.refusal(&buf);
+        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), got.status);
+        try std.testing.expectEqual(proto.Ran.no, got.r.ran);
+    }
+    {
+        var t: RanTest = undefined;
+        try t.init();
+        defer t.deinit();
+        try ParkTest.send(&t.shard, t.conn, .kv_put, 8, "k", "v");
+        const slot = t.parked();
+        // In the log, not on disk: it may still apply.
+        t.shard.failPendingAbove(slot.index - 1, Shard.NOT_ON_DISK);
+        const got = try t.refusal(&buf);
+        try std.testing.expectEqual(proto.Ran.unknown, got.r.ran);
+    }
+}
+
+test "Shard: a nack batch the log fills up partway says it may have run" {
+    var t: RanTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    // Two messages in q, committed.
+    var seqs: [2]u64 = undefined;
+    for (&seqs, 0..) |*seq, i| {
+        try ParkTest.send(&t.shard, t.conn, .queue_enqueue, 20 + i, "q", "m");
+        try ParkTest.ack(&t.shard);
+        var one: [1]proto.Response = undefined;
+        try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+        seq.* = std.mem.readInt(u64, one[0].data[0..8], .little);
+    }
+    // Room for one more entry before the log refuses: the batch's first
+    // nack goes in, its second is refused.
+    const raft = t.shard.raft_node;
+    while (raft.log.lastIndex() - raft.commit_index < raft_node_mod.MAX_OUTSTANDING - 1) {
+        _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, "filler");
+    }
+    var value: [4 + 16]u8 = undefined;
+    std.mem.writeInt(u32, value[0..4], 2, .little);
+    std.mem.writeInt(u64, value[4..12], seqs[0], .little);
+    std.mem.writeInt(u64, value[12..20], seqs[1], .little);
+    try ParkTest.send(&t.shard, t.conn, .queue_fail, 30, "q", &value);
+    const got = try t.refusal(&buf);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), got.status);
+    try std.testing.expectEqual(proto.Ran.unknown, got.r.ran);
+}
+
+test "Shard: a node forwards only writes to its leader; a forwarded read is refused, not run" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    try std.testing.expect(shard.applyCommitted());
+    shard.raft_network = &rn;
+    defer {
+        for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        rn.outbound.clearRetainingCapacity();
+    }
+    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = proto.RequestHeader.init(.kv_get, 9), .namespace = "", .key = "k", .value = "" });
+    defer std.testing.allocator.free(wire);
+    const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + wire.len);
+    defer std.testing.allocator.free(frame);
+    std.mem.writeInt(u32, frame[0..4], 93, .little);
+    std.mem.writeInt(u16, frame[4..6], 0, .little);
+    @memcpy(frame[FORWARD_PREFIX..], wire);
+    shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
+    try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
+    const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
+    const resp = try proto.Response.parse(reply[12..]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqualStrings("bad request: only writes are forwarded to a leader", (try resp.refused()).message);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
 test "Shard: a write to a new namespace holds its room before it commits, so writes in flight cannot overshoot the limit" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -7943,7 +8189,7 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     const conn = try shard.addConnection(pair[0]);
 
     // An explicit create in flight holds its name and id as a write's does.
-    shard.dispatchRequest(conn, try ParkTest.request(.namespace_create, 42, "", "explicit", "", ""));
+    shard.runRequest(conn, try ParkTest.request(.namespace_create, 42, "", "explicit", "", ""), .client);
     try std.testing.expect(shard.namespace_handler.pending_creates.contains("explicit"));
     try ParkTest.ack(&shard);
     try std.testing.expect(!shard.namespace_handler.pending_creates.contains("explicit"));
@@ -7959,13 +8205,13 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
 
     // Two writes to new namespaces, neither committed: the first holds
     // the last room, the second is refused at once.
-    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 40, "first", "k", "v", ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.kv_put, 41, "second", "k", "v", ""));
+    shard.runRequest(conn, try ParkTest.request(.kv_put, 40, "first", "k", "v", ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.kv_put, 41, "second", "k", "v", ""), .client);
     var buf: [1024]u8 = undefined;
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 41), one[0].header.request_id);
-    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, one[0].data);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, (try one[0].refused()).message);
 
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -8230,8 +8476,8 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
         \\{"kind":"Workflow","name":"gate","version":"1.0.0",
         \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
     ;
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 80, "a", "gate", def, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 81, "b", "gate", def, ""));
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 80, "a", "gate", def, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 81, "b", "gate", def, ""), .client);
     try ParkTest.ack(&shard);
     var two: [2]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
@@ -8248,14 +8494,14 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     long[2] = 1;
     std.mem.writeInt(u16, long[3..5], 2000, .little);
     long[long.len - 1] = 0;
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 82, "a", "gate", &keyed, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 83, "b", "gate", &keyed, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 84, "a", "gate", &named, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 85, "a", "gate", &named, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 86, "a", "gate", &both, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 87, "a", "gate", &both, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 88, "a", "gate", &long, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 89, "a", "gate", &long, ""));
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 82, "a", "gate", &keyed, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 83, "b", "gate", &keyed, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 84, "a", "gate", &named, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 85, "a", "gate", &named, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 86, "a", "gate", &both, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 87, "a", "gate", &both, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 88, "a", "gate", &long, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 89, "a", "gate", &long, ""), .client);
     try ParkTest.ack(&shard);
     var rs: [8]proto.Response = undefined;
     var big: [4096]u8 = undefined;
@@ -8278,12 +8524,12 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     // first ':') is refused, for a definition and for a start, before
     // anything is proposed.
     const before = shard.raft_node.log.lastIndex();
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""));
-    shard.dispatchRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""));
+    shard.runRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""), .client);
+    shard.runRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""), .client);
     try ParkTest.responses(&shard, conn, pair[1], &big, &two);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
-    try std.testing.expect(std.mem.startsWith(u8, two[1].data, "invalid namespace name"));
+    try std.testing.expect(std.mem.startsWith(u8, (try two[1].refused()).message, "invalid namespace name"));
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 
@@ -8405,7 +8651,7 @@ test "Shard: namespace settings are refused with their reason, and nothing is pr
         try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
         try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
         try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
-        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, one[0].data);
+        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, (try one[0].refused()).message);
     }
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
 }
@@ -8429,7 +8675,7 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
 
     // The append's applier names the stream by resolving its namespace, so
     // the namespace's create must apply first, here and on every replay.
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00", ""));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00", ""), .client);
     try ParkTest.ack(&shard);
     var buf: [256]u8 = undefined;
     var one: [1]proto.Response = undefined;
@@ -8462,7 +8708,7 @@ test "Shard: a blocking stream read wakes on its own namespace's append, even on
     // An append's value is a batch: [count:u32]([len:u32][payload][header_count:u16])*
     const first = "\x01\x00\x00\x00" ++ "\x0c\x00\x00\x00" ++ "first-record" ++ "\x00\x00";
     const second = "\x01\x00\x00\x00" ++ "\x0d\x00\x00\x00" ++ "second-record" ++ "\x00\x00";
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", first, ""));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", first, ""), .client);
     try ParkTest.ack(&shard);
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -8471,18 +8717,18 @@ test "Shard: a blocking stream read wakes on its own namespace's append, even on
 
     // Proposed, not yet applied, when the read parks: the read finds
     // nothing and must still wake when this applies.
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "app", "s", second, ""));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 2, "app", "s", second, ""), .client);
 
     var opts_buf: [64]u8 = undefined;
     var ob = proto.OptionsBuilder.init(&opts_buf);
     try ob.addStreamId(.stream_start, cursor_ms, cursor_seq);
     try ob.addU32(.block_ms, 5000);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 3, "app", "s", "", ob.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_read, 3, "app", "s", "", ob.getOptions()), .client);
     // The same stream name in another namespace has nothing to wake it.
     var other_buf: [64]u8 = undefined;
     var other = proto.OptionsBuilder.init(&other_buf);
     try other.addU32(.block_ms, 5000);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 4, "other", "s", "", other.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_read, 4, "other", "s", "", other.getOptions()), .client);
     try std.testing.expectEqual(@as(u16, 2), shard.waiter_pool.countByKind(.stream_read));
 
     try ParkTest.ack(&shard);
@@ -8521,13 +8767,13 @@ test "Shard: a blocking read on one partition skips other partitions' appends wi
     var ro = proto.OptionsBuilder.init(&read_buf);
     try ro.addU32(.partition, 2);
     try ro.addU32(.block_ms, 5000);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_read, 1, "", "s", "", ro.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_read, 1, "", "s", "", ro.getOptions()), .client);
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
 
     var p1_buf: [16]u8 = undefined;
     var p1 = proto.OptionsBuilder.init(&p1_buf);
     try p1.addU32(.partition, 1);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "", "s", other, p1.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 2, "", "s", other, p1.getOptions()), .client);
     try ParkTest.ack(&shard);
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -8540,7 +8786,7 @@ test "Shard: a blocking read on one partition skips other partitions' appends wi
     var p2_buf: [16]u8 = undefined;
     var p2 = proto.OptionsBuilder.init(&p2_buf);
     try p2.addU32(.partition, 2);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 3, "", "s", mine, p2.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 3, "", "s", mine, p2.getOptions()), .client);
     try ParkTest.ack(&shard);
     var two: [2]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
@@ -8575,17 +8821,17 @@ test "Shard: a blocking group read wakes on its own namespace's append, not a sa
     var ob_buf: [16]u8 = undefined;
     var ob = proto.OptionsBuilder.init(&ob_buf);
     try ob.addU32(.block_ms, 5000);
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_group_read, 1, "app", "s", group_consumer, ob.getOptions()));
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, 1, "app", "s", group_consumer, ob.getOptions()), .client);
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
 
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 2, "other", "s", rec, ""));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 2, "other", "s", rec, ""), .client);
     try ParkTest.ack(&shard);
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
 
-    shard.dispatchRequest(conn, try ParkTest.request(.stream_append, 3, "app", "s", rec, ""));
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 3, "app", "s", rec, ""), .client);
     try ParkTest.ack(&shard);
     var two: [2]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
@@ -8608,7 +8854,7 @@ test "Shard: a deferred answer too large to frame reaches its client as an error
     const big = try std.testing.allocator.alloc(u8, MAX_REQUEST_SIZE + 1);
     defer std.testing.allocator.free(big);
     @memset(big, 'x');
-    shard.deliverDeferredResponse(conn.replyTo(), 9, .ok, big);
+    shard.deliverDeferredOk(conn.replyTo(), 9, big);
     var buf: [512]u8 = undefined;
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -9488,7 +9734,7 @@ test "Shard: a handler answering its own request as deferred is caught, and answ
         fn handle(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
             const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
             const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-            sh.deliverDeferredResponse(conn.replyTo(), req.header.request_id, .ok, "only-answer");
+            sh.deliverDeferredOk(conn.replyTo(), req.header.request_id, "only-answer");
         }
     };
     shard.dispatcher.register(.queue_peek, SelfDeferred.handle);
@@ -9533,9 +9779,10 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
     try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 11), one[0].header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(one[0].data));
-    try std.testing.expect(std.mem.endsWith(u8, one[0].data, proto.Response.TRUNCATED_MARKER));
-    try std.testing.expect(one[0].data.len > 900);
+    const body = try one[0].refused();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body.message));
+    try std.testing.expect(std.mem.endsWith(u8, body.message, proto.TRUNCATED_MARKER));
+    try std.testing.expect(body.message.len > 900);
 }
 
 test "Shard: a request whose handler answers nothing is answered internal_error and counted" {
@@ -9565,7 +9812,7 @@ test "Shard: a request whose handler answers nothing is answered internal_error 
     try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 12), one[0].header.request_id);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
-    try std.testing.expectEqualStrings("internal error: the handler produced no answer", one[0].data);
+    try std.testing.expectEqualStrings("internal error: the handler produced no answer", (try one[0].refused()).message);
     try std.testing.expectEqual(@as(u64, 1), sm.snapshot().handler_no_answer);
 }
 
@@ -9682,7 +9929,7 @@ const AdminTest = struct {
 
     /// Send `op` with `value`; return the one answer's status and text.
     fn ask(self: *AdminTest, op: proto.OpCode, value: []const u8, buf: []u8) !proto.Response {
-        self.shard.dispatchRequest(self.conn, try ParkTest.request(op, 7, "", "", value, ""));
+        self.shard.runRequest(self.conn, try ParkTest.request(op, 7, "", "", value, ""), .client);
         var into: [1]proto.Response = undefined;
         try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &into);
         return into[0];
@@ -9739,7 +9986,7 @@ test "Shard: promote and remove refuse by name; promoting a voter is done alread
 
     // Caught up now: promoted, answered once it commits.
     t.caughtUp(2);
-    t.shard.dispatchRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""));
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .client);
     try ParkTest.ack(&t.shard);
     var into: [1]proto.Response = undefined;
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
@@ -10147,7 +10394,10 @@ const UnappliedWrite = struct {
         var buf: [512]u8 = undefined;
         try ParkTest.responses(sh, conn, fd, &buf, &one);
         try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
-        try std.testing.expectEqualStrings(persistence_mod.COMMITTED_NOT_APPLIED, one[0].data);
+        const r = try one[0].refused();
+        try std.testing.expectEqualStrings(persistence_mod.COMMITTED_NOT_APPLIED, r.message);
+        try std.testing.expectEqual(proto.Reason.committed_not_applied, r.reason);
+        try std.testing.expectEqual(proto.Ran.yes, r.ran);
     }
 };
 

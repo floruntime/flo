@@ -310,7 +310,7 @@ fn runWrite(ctx: *commander.Context) commander.Error!void {
         };
         defer result.deinit();
         if (result.isError()) {
-            return outcome.refusal(ctx, result.status, result.errorMessage(), "field {s} ({d} of {d} fields written): ", .{ name, written, n });
+            return outcome.refusal(ctx, result.status, result.reason(), result.errorMessage(), "field {s} ({d} of {d} fields written): ", .{ name, written, n });
         }
     }
     ctx.print("OK ({d} fields at {d})\n", .{ n, ts });
@@ -428,7 +428,7 @@ fn runWriteBatch(ctx: *commander.Context, client: *Client, namespace: []const u8
                 };
                 defer result.deinit();
                 if (result.isError()) {
-                    break :blk outcome.refusal(ctx, result.status, result.errorMessage(), "line {d}: field {s} ({d} of {d} fields written): ", .{ line_no, field.name, written, parsed.fields.len });
+                    break :blk outcome.refusal(ctx, result.status, result.reason(), result.errorMessage(), "line {d}: field {s} ({d} of {d} fields written): ", .{ line_no, field.name, written, parsed.fields.len });
                 }
                 points += 1;
             }

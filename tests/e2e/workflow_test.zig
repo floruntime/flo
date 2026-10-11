@@ -3115,7 +3115,7 @@ fn rawCall(ctx: *stdx.testing.TestContext, op: @import("src").protocol.proto.OpC
     while (waited < 300) : (waited += 1) {
         const rc = std.c.read(fd, out[got..].ptr, out.len - got);
         if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
-        if (proto.Response.parse(out[0..got])) |resp| return .{ .status = resp.header.status, .data = resp.data } else |_| {}
+        if (proto.Response.parse(out[0..got])) |resp| return .{ .status = resp.header.status, .data = if (resp.header.status == 0) resp.data else (try resp.refused()).message } else |_| {}
         stdx.time.sleep(10 * std.time.ns_per_ms);
     }
     return error.NoResponse;

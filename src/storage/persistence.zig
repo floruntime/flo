@@ -142,8 +142,21 @@ pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
 /// A write committed but this node did not apply it (its applier refused
 /// it, or the entry could not be read back): resending it writes it twice.
 pub const COMMITTED_NOT_APPLIED = "internal error: write committed but not applied on this node — do not resend";
+pub const COMMITTED_REFUSAL: proto.Refusal = .{ .reason = .committed_not_applied, .ran = .yes, .message = COMMITTED_NOT_APPLIED };
 /// A write committed and applied, but its answer could not be built.
 pub const ANSWER_LOST = "internal error: write committed but its answer was lost — do not resend";
+pub const ANSWER_LOST_REFUSAL: proto.Refusal = .{ .reason = .answer_lost, .ran = .yes, .message = ANSWER_LOST };
+
+/// A write that couldn't be proposed, as a refusal: `propose` fails before
+/// the entry reaches the log (or takes it back out), so it never ran.
+pub fn failureRefusal(err: anyerror, fallback: []const u8) proto.Refusal {
+    return .{ .reason = .unclassified, .ran = .no, .message = failureMessage(err, fallback) };
+}
+
+/// The same, for handlers that answer with a `CommandResult`.
+pub fn failureError(err: anyerror, fallback: []const u8) result_mod.CommandResult.Error {
+    return .{ .code = failureCode(err), .message = failureMessage(err, fallback), .ran = .no };
+}
 
 pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
     return switch (err) {
@@ -179,4 +192,14 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
     try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
     try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
     try std.testing.expectEqual(proto.StatusCode.bad_request, failureStatus(error.KeyTooLarge));
+}
+
+test "persistence: a write that couldn't be proposed never ran, whatever stopped it" {
+    inline for (.{ error.NotLeader, error.WritesStopped, error.Overloaded, error.PayloadTooLarge, error.KeyTooLarge, error.IndexGap }) |err| {
+        try std.testing.expectEqual(proto.Ran.no, failureRefusal(err, "x").ran);
+        try std.testing.expectEqual(proto.Ran.no, failureError(err, "x").refusal().ran);
+    }
+    try std.testing.expectEqual(proto.Ran.yes, COMMITTED_REFUSAL.ran);
+    try std.testing.expectEqual(proto.Reason.committed_not_applied, COMMITTED_REFUSAL.reason);
+    try std.testing.expectEqual(proto.Ran.yes, ANSWER_LOST_REFUSAL.ran);
 }

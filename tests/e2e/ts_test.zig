@@ -1685,7 +1685,7 @@ test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsampl
     } else null;
     try testing.expect(resp != null);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.?.header.status);
-    try testing.expect(std.mem.indexOf(u8, resp.?.data, "downsampling isn't supported") != null);
+    try testing.expect(std.mem.indexOf(u8, (try resp.?.refused()).message, "downsampling isn't supported") != null);
 }
 
 test "e2e/ts: a delete and a retention trim stay done across a restart" {

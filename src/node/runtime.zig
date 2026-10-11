@@ -893,7 +893,7 @@ pub const Runtime = struct {
         }
     }
 
-    /// Wire cross-shard shard pointers so dispatchRequest can forward
+    /// Wire cross-shard shard pointers so runRequest can forward
     /// pre-routed requests to the correct shard's handlers.
     fn wirePeerShards(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;

@@ -158,7 +158,7 @@ pub const TSHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *TSHandler, req: Request) CommandResult {
+    fn handleCommand(self: *TSHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .ts_write => self.handleWrite(req),
@@ -226,7 +226,7 @@ pub const TSHandler = struct {
             // A point without its own timestamp takes the entry's stamp,
             // which the responder answers with.
             const proposed = persistence_mod.proposeEntry(shard, .ts_write, entry_mod.Flags.NONE, req.namespace, measurement, encoded) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts write not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "ts write not persisted") };
             };
             return .{ .parked = proposed };
         } else {
@@ -571,7 +571,7 @@ pub const TSHandler = struct {
         // replica applies it. Without a shard (unit tests), applied here.
         if (self.shard_ptr) |sptr| {
             const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_delete, entry_mod.Flags.NONE, req.namespace, req.key, filter.canonical) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts delete not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "ts delete not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -612,7 +612,7 @@ pub const TSHandler = struct {
             var age: [8]u8 = undefined;
             std.mem.writeInt(u64, &age, age_ms, .little);
             const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .ts_retention, entry_mod.Flags.NONE, req.namespace, req.key, &age) catch |err| {
-                return .{ .err = .{ .code = persistence_mod.failureCode(err), .message = persistence_mod.failureMessage(err, "ts retention not persisted") } };
+                return .{ .err = persistence_mod.failureError(err, "ts retention not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -666,7 +666,7 @@ fn sendTSResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .ts_write_ok => |w| {
             // Send [series_hash:u64][timestamp_ms:i64][sequence:u64] (24 bytes)
@@ -851,13 +851,13 @@ test "ts handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     TSHandler.register(&dispatcher);
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_write)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_read)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_query)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_floql)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_list)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.ts_retention)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_write));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_read));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_query));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_floql));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_retention));
 
     try testing.expectEqual(@as(u16, 7), dispatcher.handler_count);
 }

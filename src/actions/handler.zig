@@ -278,7 +278,8 @@ pub const ActionsHandler = struct {
             .action_complete, .action_fail => {
                 const outcome = if (op == .action_complete) shard.actions_handler.handleActionComplete(shard, req) else shard.actions_handler.handleActionFail(shard, req);
                 switch (outcome) {
-                    .refused => |e| shard.sendErrorResponse(conn, req.header.request_id, e.status, e.message),
+                    // Refused before anything was proposed.
+                    .refused => |e| shard.sendRefusal(conn, req.header.request_id, e.status, proto.notRun(e.message)),
                     .parked => |proposed| shard.park(conn, req, proposed, respondTask),
                     .applied => respondTask(shard_ptr, conn_ptr, req),
                 }
@@ -514,7 +515,7 @@ pub const ActionsHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
+    fn handleCommand(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         // The registry key is "ns\x00name" ("name" in "default"), so a name
         // holding a NUL could spell another namespace's key.
@@ -592,7 +593,7 @@ pub const ActionsHandler = struct {
         };
         if (shard) |s| {
             const proposed = persistence.proposeEntry(s, .action_register, Flags.NONE, req.namespace, qkey, value) catch |err| {
-                return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
+                return .{ .err = persistence.failureError(err, "action not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -609,7 +610,7 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
         };
         const stored = self.actions.get(key) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
         };
         const ver_str = std.fmt.bufPrint(ver_buf, "{d}", .{stored.version}) catch "1";
         return .{
@@ -668,7 +669,7 @@ pub const ActionsHandler = struct {
         };
         if (shard) |s| {
             const proposed = persistence.proposeEntry(s, .action_invoke, Flags.NONE, req.namespace, run_id_str, value) catch |err| {
-                return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
+                return .{ .err = persistence.failureError(err, "action not persisted") };
             };
             return .{ .parked = proposed };
         }
@@ -680,10 +681,10 @@ pub const ActionsHandler = struct {
     fn invoked(self: *ActionsHandler) CommandResult {
         if (self.last_invoke_existed) return .{ .err = .{ .code = .internal_error, .message = "internal error: the server minted a run id already in use — retry" } };
         const run_id = self.last_invoked_run_id orelse {
-            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
         };
         const stored = self.runs.getPtr(run_id) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = persistence.COMMITTED_NOT_APPLIED } };
+            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
         };
         return .{
             .action_invoked = .{
@@ -891,7 +892,7 @@ pub const ActionsHandler = struct {
         if (self.actions.contains(qkey)) {
             if (shard) |s| {
                 const proposed = persistence.proposeEntry(s, .action_delete, Flags.TOMBSTONE, req.namespace, qkey, "") catch |err| {
-                    return .{ .err = .{ .code = persistence.failureCode(err), .message = persistence.failureMessage(err, "action not persisted") } };
+                    return .{ .err = persistence.failureError(err, "action not persisted") };
                 };
                 return .{ .parked = proposed };
             }
@@ -1773,11 +1774,11 @@ fn answerTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task:
 /// Deliver a task to a parked await, whose request was answered as deferred.
 fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: ActionsHandler.ClaimedTask) void {
     const body = encodeForAnswer(shard, task) orelse {
-        shard.deliverDeferredResponse(reply_to, request_id, .internal_error, TASK_NOT_SENT);
+        shard.deliverDeferredError(reply_to, request_id, .internal_error, TASK_NOT_SENT);
         return;
     };
     defer shard.allocator.free(body);
-    shard.deliverDeferredResponse(reply_to, request_id, .ok, body);
+    shard.deliverDeferredOk(reply_to, request_id, body);
 }
 
 /// Largest invoke entry value; every run, and so every task, is built from
@@ -1946,7 +1947,7 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .action_registered => |r| {
             shard.sendOkResponse(conn, request_id, r.name);
@@ -2036,16 +2037,16 @@ test "actions handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     ActionsHandler.register(&dispatcher);
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_register)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_invoke)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_status)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_list)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_await)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_complete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_fail)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_touch)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.action_list_runs)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.action_register));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_invoke));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_status));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_await));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_complete));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_fail));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_touch));
+    try testing.expect(dispatcher.hasHandler(OpCode.action_list_runs));
 
     try testing.expectEqual(@as(u16, 10), dispatcher.handler_count);
 }

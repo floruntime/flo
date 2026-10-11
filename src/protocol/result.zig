@@ -478,12 +478,26 @@ pub const CommandResult = union(enum) {
     pub const Error = struct {
         code: ErrorCode,
         message: []const u8,
+        /// Whether the request took effect, when the site knows; otherwise
+        /// it is judged from the status.
+        ran: ?flo_proto.Ran = null,
+
+        pub fn refusal(e: Error) flo_proto.Refusal {
+            const status = e.code.toStatus();
+            return .{
+                .reason = if (e.code == .committed_not_applied) .committed_not_applied else .unclassified,
+                .ran = if (e.code == .committed_not_applied) .yes else e.ran orelse flo_proto.ranOf(status),
+                .message = e.message,
+            };
+        }
     };
 
     pub const ErrorCode = enum(u16) {
         // Generic errors (0x0000-0x00FF)
         unknown = 0x0000,
         invalid_request = 0x0001,
+        /// The write committed but this node didn't apply it.
+        committed_not_applied = 0x000F,
         unauthorized = 0x0002,
         not_found = 0x0003,
         already_exists = 0x0004,
@@ -585,6 +599,7 @@ pub const CommandResult = union(enum) {
                 .unknown,
                 .timeout,
                 .internal_error,
+                .committed_not_applied,
                 .kv_txn_timeout,
                 .group_rebalancing,
                 => .internal_error,
@@ -651,3 +666,14 @@ pub const CommandResult = union(enum) {
 
     // NOTE: CircuitState moved to src/workflow/plan_types.zig as CircuitBreakerState
 };
+
+test "result: an error's refusal says whether it ran: committed is yes, the site's word next, the status last" {
+    const E = CommandResult.Error;
+    const committed = (E{ .code = .committed_not_applied, .message = "m" }).refusal();
+    try std.testing.expectEqual(flo_proto.Reason.committed_not_applied, committed.reason);
+    try std.testing.expectEqual(flo_proto.Ran.yes, committed.ran);
+    try std.testing.expectEqual(flo_proto.Ran.no, (E{ .code = .internal_error, .message = "m", .ran = .no }).refusal().ran);
+    try std.testing.expectEqual(flo_proto.Ran.unknown, (E{ .code = .internal_error, .message = "m" }).refusal().ran);
+    try std.testing.expectEqual(flo_proto.Ran.no, (E{ .code = .invalid_request, .message = "m" }).refusal().ran);
+    try std.testing.expectEqual(flo_proto.Reason.unclassified, (E{ .code = .not_found, .message = "m" }).refusal().reason);
+}

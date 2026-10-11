@@ -322,7 +322,7 @@ pub const KVHandler = struct {
     fn proposeFailed(shard: *Shard, conn: *Connection, req: Request, err: anyerror) void {
         if (err == error.TtlTooLarge) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
         if (err == error.TtlNot8Bytes) return sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } });
-        shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "propose failed"));
+        shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "propose failed"));
     }
 
     fn dispatchDelete(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -1254,7 +1254,7 @@ pub const KVHandler = struct {
     /// Used for reads, and for the processing KV sink's put, which writes
     /// the projection directly (bypasses Raft). Client writes go through
     /// dispatchPut/dispatchDelete → proposeKVEntry.
-    pub fn handleCommand(self: *KVHandler, req: Request) CommandResult {
+    fn handleCommand(self: *KVHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .kv_get => self.handleGet(req),
@@ -1289,6 +1289,13 @@ pub const KVHandler = struct {
 
     /// Direct put to the KV projection. Bypasses Raft — used for testing and
     /// internal operations. Production writes go through proposeKVEntry().
+    /// The processing KV sink's write. It runs outside `run()` and the log,
+    /// on whichever shard owns the key, until sinks propose through the
+    /// owning shard like any other writer.
+    pub fn sinkPut(self: *KVHandler, req: Request) CommandResult {
+        return self.handlePutDirect(req);
+    }
+
     fn handlePutDirect(self: *KVHandler, req: Request) CommandResult {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
@@ -1566,7 +1573,7 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
     switch (cmd_result) {
         .kv_value => |v| {
             // CLI expects: [version:u64 LE][value bytes]
-            var resp = proto.Response.init(request_id, .ok, v.value);
+            var resp = proto.Response.ok(request_id, v.value);
             resp.prefix = v.version;
             var buf: [MAX_RESPONSE_BUF]u8 = undefined;
             // The client waits for an answer; one that cannot be framed
@@ -1576,14 +1583,11 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             _ = conn.queueWrite(serialized);
         },
         .kv_not_found => {
-            var resp = proto.Response.initError(request_id, .not_found);
-            var buf: [128]u8 = undefined;
-            const serialized = resp.serialize(&buf) catch return;
-            _ = conn.queueWrite(serialized);
+            shard.sendRefusal(conn, request_id, .not_found, proto.notRun(""));
         },
         .kv_put_ok => |v| {
             // Wire: [version:u64 LE]. Clients use this for CAS without a History round-trip.
-            var resp = proto.Response.init(request_id, .ok, "");
+            var resp = proto.Response.ok(request_id, "");
             resp.prefix = v.version;
             var buf: [128]u8 = undefined;
             const serialized = resp.serialize(&buf) catch return;
@@ -1593,16 +1597,10 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, "");
         },
         .kv_cas_failed => {
-            var resp = proto.Response.initError(request_id, .conflict);
-            var buf: [128]u8 = undefined;
-            const serialized = resp.serialize(&buf) catch return;
-            _ = conn.queueWrite(serialized);
+            shard.sendRefusal(conn, request_id, .conflict, proto.notRun(""));
         },
         .kv_condition_not_met => {
-            var resp = proto.Response.initError(request_id, .conflict);
-            var buf: [128]u8 = undefined;
-            const serialized = resp.serialize(&buf) catch return;
-            _ = conn.queueWrite(serialized);
+            shard.sendRefusal(conn, request_id, .conflict, proto.notRun(""));
         },
         .kv_scan_result => |scan| {
             shard.sendOkResponse(conn, request_id, scan.data);
@@ -1630,8 +1628,7 @@ fn sendKVResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result:
             shard.sendOkResponse(conn, request_id, &buf);
         },
         .err => |e| {
-            const status = e.code.toStatus();
-            shard.sendErrorResponse(conn, request_id, status, e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         else => {
             shard.sendErrorResponse(conn, request_id, .internal_error, "unexpected result type");
@@ -2039,21 +2036,21 @@ test "kv handler: dispatcher registration" {
     KVHandler.register(&dispatcher);
 
     // Verify handlers were registered for KV opcodes
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_get)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_put)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_scan)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_history)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_mget)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_get));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_put));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_scan));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_history));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_mget));
 
     // New extended KV opcodes (KV_ENHANCEMENTS phase 1).
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_incr)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_touch)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_persist)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_exists)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_get)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_set)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.kv_json_del)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_incr));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_touch));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_persist));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_exists));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_json_get));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_json_set));
+    try testing.expect(dispatcher.hasHandler(OpCode.kv_json_del));
 
     // Verify pre-route hooks
     try testing.expect(dispatcher.pre_route[@intFromEnum(OpCode.kv_get)] != null);

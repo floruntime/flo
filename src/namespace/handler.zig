@@ -540,7 +540,7 @@ pub const NamespaceHandler = struct {
         }
 
         const proposed = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch |err| {
-            shard.sendErrorResponse(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureMessage(err, "not persisted"));
+            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "not persisted"));
             return;
         };
         shard.namespace_handler.notePending(name);
@@ -633,7 +633,7 @@ pub const NamespaceHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    pub fn handleCommand(self: *NamespaceHandler, req: Request) CommandResult {
+    fn handleCommand(self: *NamespaceHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
             .namespace_create => self.handleCreate(req),
@@ -760,7 +760,7 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
             shard.sendOkResponse(conn, request_id, "");
         },
         .err => |e| {
-            shard.sendErrorResponse(conn, request_id, e.code.toStatus(), e.message);
+            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
         },
         .namespace_list => |n| {
             shard.sendOkResponse(conn, request_id, n.data);
@@ -801,12 +801,12 @@ test "namespace handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     NamespaceHandler.register(&dispatcher);
 
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_create)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_delete)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_list)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_info)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_config_set)] != null);
-    try testing.expect(dispatcher.handlers[@intFromEnum(OpCode.namespace_config_get)] != null);
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_create));
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_info));
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_config_set));
+    try testing.expect(dispatcher.hasHandler(OpCode.namespace_config_get));
 
     try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
 }
